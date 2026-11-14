@@ -4,6 +4,9 @@ import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
 import { notifyToolConnectionHealth, writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
 import { connectionHealthSchedule } from "./tool-access/catalog/health-schedule.js";
 import { assertAgentConnectionInstallAccess, assertAgentToolAssignmentInteractions, type ConnectionManagementContext } from "./connection-management.js";
+import { lockAccountingCompany } from "./accounting-transaction.js";
+import { saveGalleryAgentAccess } from "./tool-access/gallery-agent-access.js";
+import { profileCatalogMatcher } from "./tool-access/profiles/projection.js";
 import { connectionActorUserId } from "./tool-access/actor.js";
 import { restConnectorFor } from "./connectors/rest-registry.js";
 import { createConnectionCredentialValidation } from "./tool-access/connections/credential-validation.js";
@@ -3266,6 +3269,11 @@ export function toolAccessService(
           }));
     await actor?.managementContext?.reauthorize();
     const transactionResult = await db.transaction(async (tx) => {
+      const managementActor = actor?.managementContext?.actor;
+      if (managementActor?.type === "agent" || actor?.actorType === "agent") {
+        // Same lock order as reportsTo, install PUT, and profile bind writers.
+        await lockAccountingCompany(tx as unknown as Db, companyId);
+      }
       await tx.select({ id: toolApplications.id }).from(toolApplications)
         .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)))
         .for("update");
@@ -3307,7 +3315,28 @@ export function toolAccessService(
         changedAgentTargets.push(...[...requestedAgentTargets].filter(id => !existingAgentTargets.has(id)));
         if (!input.preserveExistingAccess) changedAgentTargets.push(...[...existingAgentTargets].filter(id => !requestedAgentTargets.has(id)));
       }
-      await assertAgentToolAssignmentInteractions(tx as unknown as Db, sourceAgentId, companyId, changedAgentTargets, false);
+      // Recompute and authorize BOTH binding and install mutations under the
+      // reporting-tree mutex. A prior install does not exempt a new binding.
+      const changedCompanyTarget = [existingBindings, ...(connection.connectionPurpose === "tool" ? [existingInstalls] : [])].some(saved => {
+        const hadCompany = saved.some(target => target.targetType === "company" && target.targetId === companyId);
+        const wantsCompany = bindingInputs.some(target => target.targetType === "company" && target.targetId === companyId);
+        return wantsCompany && !hadCompany || !input.preserveExistingAccess && hadCompany && !wantsCompany;
+      });
+      const editsSharedAccess = managementActor?.type === "agent" && existingProfile && !input.preserveExistingAccess;
+      const sharedTargets = editsSharedAccess ? [...existingBindings, ...existingInstalls] : [];
+      changedAgentTargets.push(...sharedTargets.filter(target => target.targetType === "agent").map(target => target.targetId));
+      if (changedCompanyTarget || sharedTargets.some(target => target.targetType !== "agent")) {
+        const companyAgents = await tx.select({ id: agents.id }).from(agents).where(eq(agents.companyId, companyId));
+        changedAgentTargets.push(...companyAgents.map(agent => agent.id));
+      }
+      if (managementActor) {
+        await assertAgentConnectionInstallAccess(tx as unknown as Db, managementActor, companyId, changedAgentTargets);
+        if (managementActor.type === "agent") await assertAgentConnectionInstallAccess(tx as unknown as Db, {
+          type: "board", source: "session", userId: managementActor.onBehalfOfUserId, ignoreInstanceAdmin: true,
+        }, companyId, changedAgentTargets);
+      } else {
+        await assertAgentToolAssignmentInteractions(tx as unknown as Db, sourceAgentId, companyId, changedAgentTargets, false);
+      }
       // A renamed connection can leave its old profile name in use. Resolve
       // names against profiles too, including when finalizing an installed draft.
       const otherProfiles = await tx
@@ -3323,58 +3352,84 @@ export function toolAccessService(
       );
       const priorEntries = existingProfile ? await tx.select().from(toolProfileEntries)
         .where(and(eq(toolProfileEntries.companyId, companyId), eq(toolProfileEntries.profileId, existingProfile.id))) : [];
+      const preserveSharedAccess = Boolean(existingProfile && input.preserveExistingAccess && managementActor?.type === "agent");
+      let preserveConnectionState = preserveSharedAccess;
+      if (preserveSharedAccess) {
+        // Catalog review is a shared action, not an assignment. It may affect
+        // profiles other than this app profile and retains its board editor path.
+        if (reviewedIds.length || enabledRows.some(entry => entry.status !== "active")) {
+          throw forbidden("Shared action review requires authorization for the affected consumers");
+        }
+        const changesSharedResource = lockedConnection.status !== "active" || !lockedConnection.enabled || existingProfile!.status !== "active"
+          || input.agentInstructions !== undefined && input.agentInstructions !== connection.agentInstructions;
+        if (changesSharedResource) {
+          // Fresh setup can activate a hire-only connection, but activation or
+          // instruction edits must not widen authority over retained consumers.
+          const affected = [...existingBindings, ...existingInstalls];
+          const targets = affected.filter(target => target.targetType === "agent").map(target => target.targetId);
+          if (affected.some(target => target.targetType !== "agent")) {
+            const companyAgents = await tx.select({ id: agents.id }).from(agents).where(eq(agents.companyId, companyId));
+            targets.push(...companyAgents.map(agent => agent.id));
+          }
+          await assertAgentConnectionInstallAccess(tx as unknown as Db, managementActor!, companyId, targets);
+          await assertAgentConnectionInstallAccess(tx as unknown as Db, {
+            type: "board", source: "session", userId: managementActor!.onBehalfOfUserId, ignoreInstanceAdmin: true,
+          }, companyId, targets);
+          preserveConnectionState = false;
+        }
+        const included = profileCatalogMatcher(priorEntries.filter(entry => entry.effect === "include" && !entry.conditions));
+        const excluded = profileCatalogMatcher(priorEntries.filter(entry => entry.effect === "exclude"));
+        const alreadyAllowed = (entry: typeof toolCatalogEntries.$inferSelect) => !excluded(entry)
+          && (existingProfile!.defaultAction === "allow" || included(entry));
+        // Only materialize redundant catalog includes in the shared profile.
+        // New capabilities belong to recipient-specific profiles instead.
+        entries.splice(0, entries.length, ...entries.filter(entry => enabledRows.some(row => row.id === entry.catalogEntryId && alreadyAllowed(row))));
+        const scopedIds = enabledRows.filter(entry => !alreadyAllowed(entry)).map(entry => entry.id);
+        if (scopedIds.length || input.askFirstCatalogEntryIds.length) await saveGalleryAgentAccess(tx, {
+          companyId, connectionId: connection.id, applicationId: connection.applicationId,
+          actor: managementActor!, agentIds: [...requestedAgentTargets], catalogEntryIds: scopedIds,
+          askFirstCatalogEntryIds: input.askFirstCatalogEntryIds,
+        });
+      }
       let profileId: string;
       if (existingProfile) {
         if (input.preserveExistingAccess) {
           for (const prior of existingBindings)
-            if (
-              !bindingInputs.some(
-                (binding) =>
-                  binding.targetType === prior.targetType &&
-                  binding.targetId === prior.targetId,
-              )
-            )
-              bindingInputs.push({
-                targetType: prior.targetType,
-                targetId: prior.targetId,
-                priority: prior.priority,
-                metadata: prior.metadata,
-              });
-          for (const prior of priorEntries)
-            if (
-              !entries.some(
-                (entry) =>
-                  entry.catalogEntryId &&
-                  entry.catalogEntryId === prior.catalogEntryId,
-              )
-            )
-              entries.push({
-                selectorType: prior.selectorType,
-                effect: prior.effect,
-                applicationId: prior.applicationId,
-                connectionId: prior.connectionId,
-                catalogEntryId: prior.catalogEntryId,
-                toolName: prior.toolName,
-                riskLevel: prior.riskLevel,
-                conditions: prior.conditions,
-              });
+            if (!bindingInputs.some(binding => binding.targetType === prior.targetType && binding.targetId === prior.targetId))
+              bindingInputs.push({ targetType: prior.targetType, targetId: prior.targetId, priority: prior.priority, metadata: prior.metadata });
+          // Preservation means saved entries win, including exclusions. Do not
+          // substitute a requested include for a saved decision on that action.
+          const priorCatalogIds = new Set(priorEntries.flatMap(entry => entry.catalogEntryId ? [entry.catalogEntryId] : []));
+          entries.splice(0, entries.length, ...entries.filter(entry => !entry.catalogEntryId || !priorCatalogIds.has(entry.catalogEntryId)));
+          for (const prior of priorEntries) entries.push({
+            selectorType: prior.selectorType, effect: prior.effect,
+            applicationId: prior.applicationId, connectionId: prior.connectionId,
+            catalogEntryId: prior.catalogEntryId, toolName: prior.toolName,
+            riskLevel: prior.riskLevel, conditions: prior.conditions,
+          });
         }
-        const [updated] = await tx
-          .update(toolProfiles)
-          .set({
-            name: profileName,
-            description: `Access profile for ${connection.name}.`,
-            status: "active",
-            defaultAction: "deny",
-            metadata: {
-              source: "app_gallery_finish",
-              connectionId: connection.id,
-            },
-            updatedAt: new Date(),
-          })
-          .where(eq(toolProfiles.id, existingProfile.id))
-          .returning();
-        profileId = updated.id;
+        if (preserveSharedAccess) {
+          profileId = existingProfile.id;
+          if (existingProfile.status !== "active") await tx.update(toolProfiles).set({ status: "active", updatedAt: new Date() })
+            .where(and(eq(toolProfiles.companyId, companyId), eq(toolProfiles.id, profileId)));
+        } else {
+          const [updated] = await tx
+            .update(toolProfiles)
+            .set({
+              name: profileName,
+              description: `Access profile for ${connection.name}.`,
+              status: "active",
+              defaultAction: "deny",
+              metadata: {
+                source: "app_gallery_finish",
+                connectionId: connection.id,
+              },
+              updatedAt: new Date(),
+            })
+            .where(eq(toolProfiles.id, existingProfile.id))
+            .returning();
+          profileId = updated.id;
+        }
       } else {
         const [created] = await tx
           .insert(toolProfiles)
@@ -3450,8 +3505,9 @@ export function toolAccessService(
       for (const bindingInput of bindingInputs) {
         const key = `${bindingInput.targetType}:${bindingInput.targetId}`;
         const existing = existingBindingsByTarget.get(key);
-        if (existing && existing.priority === (bindingInput.priority ?? 100)
-          && stableHash(existing.metadata) === stableHash(bindingInput.metadata ?? {})) {
+        // Finish creates assignments; it is not an edit of retained bindings.
+        // Preserve the actual saved row even when it was explicitly re-requested.
+        if (existing) {
           retainedBindings.set(key, existing);
           continue;
         }
@@ -3500,7 +3556,7 @@ export function toolAccessService(
             ),
           );
       }
-      if (enabledIds.length > 0) {
+      if (enabledIds.length > 0 && !preserveSharedAccess) {
         await tx
           .update(toolCatalogEntries)
           .set({
@@ -3524,16 +3580,15 @@ export function toolAccessService(
           );
       }
 
-      const policies = await upsertAskFirstPolicies(
-        {
-          companyId,
-          connection,
-          askFirstEntries: askFirstRows,
-          disableStale: !input.preserveExistingAccess,
-          actor,
-        },
-        tx,
-      );
+      const policies = preserveSharedAccess
+        ? (await tx.select().from(toolPolicies).where(eq(toolPolicies.companyId, companyId)))
+          .filter(policy => asRecord(policy.config).connectionId === connection.id).map(toPolicy)
+        : await upsertAskFirstPolicies(
+          { companyId, connection, askFirstEntries: askFirstRows, disableStale: !input.preserveExistingAccess, actor }, tx,
+        );
+      if (preserveConnectionState) {
+        return { profileId, profileBindings, policies, updatedConnection: connection };
+      }
       await notifyGitHubCredentialChange(tx, connection);
       await notifyToolConnectionHealth(tx, connection);
       const [updatedConnection] = await tx
@@ -3556,7 +3611,7 @@ export function toolAccessService(
 
       return { profileId, profileBindings, policies, updatedConnection };
     });
-    emitConnectionUpdated(
+    if (transactionResult.updatedConnection !== connection) emitConnectionUpdated(
       transactionResult.updatedConnection,
       connection,
       "gallery",

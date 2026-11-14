@@ -5,7 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentApiKeys, authUsers, companies, companyMemberships, connectionGrants,
   createDb, principalPermissionGrants, toolApplications, toolConnections, toolConnectionInstalls,
-  toolProfiles, toolProfileEntries, toolProfileBindings, toolCatalogEntries, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  toolProfiles, toolProfileEntries, toolProfileBindings, toolCatalogEntries, toolPolicies, toolMcpGateways, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS, newStandardAgentGrantScope } from "../lib/agent-permissions.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -103,6 +103,121 @@ describe("tool grants to a manager's current reporting subtree", () => {
       .map(row => `${row.targetType}:${row.targetId}`).sort();
     return { ...f, entry, finish, bindings };
   }
+
+  it.each(["empty", "catalog_entry", "connection", "tool_name"] as const)("repair: finish scopes a new %s capability to the hire and preserves every saved row", async selector => {
+    const f = await finishFixture();
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    if (selector !== "empty") await db.insert(toolProfileEntries).values({
+      companyId: f.companyId, profileId: f.profile.id, selectorType: selector, effect: "exclude",
+      connectionId: selector === "tool_name" ? null : f.connection.id,
+      catalogEntryId: selector === "catalog_entry" ? f.entry.id : null,
+      toolName: selector === "tool_name" ? "read_mailbox" : null,
+      conditions: { preserved: "exactly" },
+    });
+    await db.update(toolProfileBindings).set({ priority: 700, metadata: { preserved: "all columns" } })
+      .where(eq(toolProfileBindings.profileId, f.profile.id));
+    const savedBindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id)).orderBy(toolProfileBindings.id);
+    const savedEntries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id)).orderBy(toolProfileEntries.id);
+    const effective = async (agentId: string) => {
+      const result = await request(f.board).get(`/api/companies/${f.companyId}/tools/profiles/effective/agents/${agentId}`);
+      expect(result.status, result.text).toBe(200);
+      return result.body.allowedToolNames as string[];
+    };
+    const outsideBefore = await effective(f.ids.other);
+    expect(outsideBefore).not.toContain("read_mailbox");
+    const response = await f.finish([f.ids.peer, f.report]);
+    expect(response.status, response.text).toBe(200);
+    expect(await effective(f.ids.other)).toEqual(outsideBefore);
+    expect(await effective(f.ids.peer)).not.toContain("read_mailbox");
+    expect(await effective(f.report)).toContain("read_mailbox");
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id)).orderBy(toolProfileEntries.id)).toEqual(savedEntries);
+    const afterBindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id)).orderBy(toolProfileBindings.id);
+    expect(afterBindings.filter(binding => binding.targetId !== f.report)).toEqual(savedBindings);
+    // A replay must not reset any shared or recipient-specific binding either.
+    const allBindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, f.companyId)).orderBy(toolProfileBindings.id);
+    const replay = await f.finish([f.ids.peer, f.report]);
+    expect(replay.status, replay.text).toBe(200);
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, f.companyId)).orderBy(toolProfileBindings.id)).toEqual(allBindings);
+    console.log("FINISH REPAIR", JSON.stringify({ selector, status: response.status, retainedBindingsExact: true, sharedEntriesExact: true, outsideBefore, outsideAfter: await effective(f.ids.other), hireAfter: await effective(f.report) }));
+  }, 60_000);
+
+  it("repair: finish grants actions to an already-bound hire without rewriting the install-created binding", async () => {
+    const f = await finishFixture();
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    const installed = await request(f.api).put(f.installUrl).set("Authorization", `Bearer ${f.token}`).send({
+      installs: [...f.retained, { targetType: "company", targetId: f.companyId }, { targetType: "agent", targetId: f.report }],
+    });
+    expect(installed.status, installed.text).toBe(200);
+    const before = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id)).orderBy(toolProfileBindings.id);
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(200);
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id)).orderBy(toolProfileBindings.id)).toEqual(before);
+    const effective = await request(f.board).get(`/api/companies/${f.companyId}/tools/profiles/effective/agents/${f.report}`);
+    expect(effective.status, effective.text).toBe(200);
+    expect(effective.body.allowedToolNames).toContain("read_mailbox");
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id))).toEqual([]);
+  }, 60_000);
+
+  it("repair: ask-first finish writes a hire-scoped policy, not a company-wide policy", async () => {
+    const f = await finishFixture();
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    const finish = () => request(f.api).post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .set("Authorization", `Bearer ${f.token}`).send({ access: { agentIds: [f.ids.peer, f.report] }, preserveExistingAccess: true,
+        enabledCatalogEntryIds: [f.entry.id], askFirstCatalogEntryIds: [f.entry.id] });
+    const response = await finish();
+    expect(response.status, response.text).toBe(200);
+    const policies = await db.select().from(toolPolicies).where(eq(toolPolicies.companyId, f.companyId));
+    expect(policies).toEqual([expect.objectContaining({ enabled: true, policyType: "require_approval",
+      selectors: { connectionId: f.connection.id, catalogEntryId: f.entry.id }, conditions: { actor: { agentId: f.report } } })]);
+    await db.update(toolPolicies).set({ enabled: false }).where(eq(toolPolicies.id, policies[0].id));
+    const replay = await finish();
+    expect(replay.status, replay.text).toBe(200);
+    expect((await db.select().from(toolPolicies).where(eq(toolPolicies.id, policies[0].id)))[0].enabled).toBe(true);
+  }, 60_000);
+
+  it.each(["binding", "gateway"] as const)("repair: a recipient-specific profile shared through a %s cannot be edited by finish", async sharedThrough => {
+    const f = await finishFixture();
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    const profileKey = `connection-intent:${f.connection.id}:${f.report}`;
+    const [shared] = await db.insert(toolProfiles).values({ companyId: f.companyId, profileKey, name: profileKey,
+      metadata: { source: "connection_intent", connectionId: f.connection.id, agentId: f.report } }).returning();
+    if (sharedThrough === "binding") await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: shared.id, targetType: "agent", targetId: f.ids.other });
+    else await db.insert(toolMcpGateways).values({ companyId: f.companyId, profileId: shared.id, name: "Previously shared gateway", slug: `shared-${shared.id}` });
+    const bindingsBefore = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, f.companyId)).orderBy(toolProfileBindings.id);
+    const installsBefore = await f.installed();
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(403);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, shared.id))).toEqual([]);
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, f.companyId)).orderBy(toolProfileBindings.id)).toEqual(bindingsBefore);
+    expect(await f.installed()).toEqual(installsBefore);
+  }, 60_000);
+
+  it("repair: non-preserving finish cannot bypass shared-consumer authority with an unchanged company recipient", async () => {
+    const f = await finishFixture();
+    await db.delete(toolProfileBindings).where(and(eq(toolProfileBindings.profileId, f.profile.id), eq(toolProfileBindings.targetType, "agent")));
+    await db.delete(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.connectionId, f.connection.id), eq(toolConnectionInstalls.targetType, "agent")));
+    const before = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    const response = await request(f.api).post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .set("Authorization", `Bearer ${f.token}`).send({ access: "all_agents", preserveExistingAccess: false, enabledCatalogEntryIds: [f.entry.id] });
+    expect(response.status, response.text).toBe(403);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id))).toEqual(before);
+  }, 60_000);
+
+  it("repair: a preserving finish can still activate a hire-only draft connection", async () => {
+    const f = await finishFixture();
+    await db.delete(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id));
+    await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.connection.id));
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: f.profile.id, targetType: "agent", targetId: f.report });
+    await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: f.connection.id, targetType: "agent", targetId: f.report });
+    await db.update(toolConnections).set({ status: "draft", enabled: false }).where(eq(toolConnections.id, f.connection.id));
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(200);
+    expect(response.body.connection).toMatchObject({ status: "active", enabled: true });
+    const effective = await request(f.board).get(`/api/companies/${f.companyId}/tools/profiles/effective/agents/${f.report}`);
+    expect(effective.status, effective.text).toBe(200);
+    expect(effective.body.allowedToolNames).toContain("read_mailbox");
+  }, 60_000);
 
   it.each([false, true])("finish preserves root/company access while enabling its own hire (already installed: %s)", async alreadyInstalled => {
     const f = await finishFixture();

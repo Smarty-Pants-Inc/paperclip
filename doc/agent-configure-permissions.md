@@ -59,11 +59,28 @@ company binding or install does not expand the check to every company agent.
 Connection and profile management grants and the responsible-user ceiling still
 apply, and added/removed agents remain inside the caller's current subtree.
 
+A finish retains existing binding rows byte-for-byte, including their priority,
+metadata, attribution and timestamps, even when explicitly requested again.
+Preserving an app also preserves its saved action decisions, including exclusions.
+An agent's preserving finish cannot use a recipient-delta exemption to edit a
+shared profile's effective capabilities. It may materialize redundant includes
+for actions that profile already allows; newly enabled actions and ask-first
+policies use the existing recipient-specific `connection-intent` profile/policy
+shape instead. Retained outside recipients get no new actions from that request.
+These recipient-specific profiles cannot be edited through finish if subsequently
+shared with another recipient or a gateway. Existing binding rows remain unchanged.
+Activating a shared connection/profile or changing shared instructions still
+checks all affected consumers; a hire-only draft can still be activated. Shared
+catalog review is not an assignment and uses the shared editor path. Non-preserving
+agent finishes also check the shared consumers before changing profile actions.
+
 Agent install PUTs never clean up a shared app profile's legacy connection-wide
 include, even for an unchanged install list. Board and trusted internal writes
 retain that cleanup; board PUTs retain full install-consumer authorization.
 The writers recheck the current target/delta under the company reporting-tree
-lock; moving an intermediate manager revokes descendant authority atomically.
+lock; finish checks binding and install deltas independently, including a new
+binding for an already-installed target. Moving an intermediate manager revokes
+descendant authority atomically.
 
 ## Grant updates
 
