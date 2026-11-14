@@ -81,11 +81,12 @@ export interface UIAdapterModule extends TranscriptParserSource {
      */
     maxVisibleEntries?: number;
     /**
-     * Live-run reasoning rendering (default "ticker", the one-line rolling
-     * view). "scrollLog" renders the full reasoning in a scrollable box that
-     * auto-follows the newest line — for backends whose delta volume
-     * overwhelms the ticker.
+     * Reasoning presentation shared by issue-chat and task-chat. Task-chat
+     * defaults to "fold"; "inline" keeps reasoning in transcript order after
+     * settlement as well as while streaming. Issue-chat's live-run values
+     * remain "ticker" (the default one-line rolling view) and "scrollLog"
+     * (full reasoning in an auto-following scroll box).
      */
-    liveReasoningView?: "ticker" | "scrollLog";
+    liveReasoningView?: "fold" | "inline" | "ticker" | "scrollLog";
   };
 }
