@@ -5,7 +5,7 @@ import { notifyInstructionCommit, type InstructionCommitScope } from "./instruct
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { registerScopedDeadlineWork } from "./scoped-deadline-work.js";
-import { agentDirectoryWorkingCopyService, isAgentDirectoryCopy, directoryCleanupBackoffMs, MAX_DIRECTORY_CLEANUP_ATTEMPTS } from "./agent-directory-working-copies.js";
+import { agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -128,36 +128,18 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
   }
   const directories = agentDirectoryWorkingCopyService(db, get, patch, options.environmentRuntime);
-  function cleanupClaim(row: Copy): Partial<typeof copies.$inferInsert> {
-    // A local warm copy without stop proof is still adoption authority. Its
-    // receipt must remain byte-for-byte unchanged by stop observation alone.
-    if (!isAgentDirectoryCopy(row) || row.location === "local" && !row.processStoppedAt)
-      return { nextAttemptAt: new Date(Date.now() + 30_000) };
-    const receipt = { ...row.receipt, cleanupAttempts: Math.min(MAX_DIRECTORY_CLEANUP_ATTEMPTS,
-      Math.max(0, Number(row.receipt?.cleanupAttempts) || 0) + 1),
-      cleanupLastReason: row.processStoppedAt ? "remote_cleanup_failed" : "stop_unconfirmed" };
-    return { receipt, nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs({ receipt })) };
-  }
-  async function finishCleanupAttempt(row: Copy, lastReason: string, error?: unknown) {
-    if (!isAgentDirectoryCopy(row) || row.location === "local" && !row.processStoppedAt) return;
-    const current = await get(row.companyId, row.runId);
-    if (!current || current.receipt?.cleanupTerminal || !collectionCandidate(current) && !directoryCleanupEntry(current)) return;
-    const attempts = Number(current.receipt?.cleanupAttempts) || 0;
-    // The claim already durably reserved this attempt's backoff before I/O.
-    // Do not shift its deadline (or publish another wake) on mere inspection.
-    if (attempts < MAX_DIRECTORY_CLEANUP_ATTEMPTS && !error) return;
-    await patch(current, { receipt: { ...current.receipt, cleanupLastReason: lastReason,
-      ...(error ? { cleanupLastError: error instanceof Error ? error.message : String(error) } : {}),
-      ...(attempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS ? { cleanupTerminal: {
-        state: "abandoned", reason: "retry_exhausted", lastReason, attempts, settledAt: new Date().toISOString(),
-      } } : {}),
-    }, nextAttemptAt: attempts >= MAX_DIRECTORY_CLEANUP_ATTEMPTS ? null : current.nextAttemptAt },
-      sql`${copies.receipt} = ${JSON.stringify(current.receipt)}::jsonb`);
-  }
   async function recoverDirectoryCleanup(row: Copy, cleanup: () => Promise<unknown>) {
-    try { await cleanup(); }
+    // Reserve a later retry before I/O, including lock waits. A blocked owner
+    // must not occupy every sweep or prevent other copies from being reclaimed.
+    try {
+      await patch(row, { nextAttemptAt: new Date(Date.now() + 30_000) });
+      await cleanup();
+    }
     catch (error) {
-      await finishCleanupAttempt(row, "cleanup_failed", error);
+      try { await patch(row, { nextAttemptAt: new Date(Date.now() + 30_000) }); }
+      catch (retryError) {
+        logger.warn({ err: retryError, runId: row.runId }, "Agent file cleanup retry could not be scheduled");
+      }
       logger.warn({ err: error, runId: row.runId }, "Agent file cleanup deferred; save receipt unchanged");
     }
   }
@@ -393,14 +375,13 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
    * proof. Terminal run status is never a substitute for that proof. Remote
    * receipts mean the environment is stopped; do not restart it just to read. */
   function collectionCandidate(row: Copy) {
-    return !row.receipt?.cleanupTerminal && !row.receipt?.retainedByRunId && (
+    return !row.receipt?.retainedByRunId && (
       row.attempts < MAX_COLLECTION_ATTEMPTS && (["prepared", "pending_collection", "unchanged_turn", "warm_saved"].includes(row.state)
         || row.state === "preparing" && isAgentDirectoryCopy(row))
       || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row));
   }
   function collectionPredicate() {
-    return and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
-      AND NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'retainedByRunId') AND (
+    return and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'retainedByRunId') AND (
       (${copies.attempts} < 3 AND (${copies.state} IN ('prepared', 'pending_collection', 'unchanged_turn', 'warm_saved')
         OR (${copies.state} = 'preparing' AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1')))
       OR (${copies.state} = 'unavailable' AND ${copies.processStoppedAt} IS NULL
@@ -434,11 +415,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       }
     } else if (row.state === "prepared") {
       await patch(row, { state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED",
-        errorMessage: "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.", nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs(row)) });
+        errorMessage: "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.", nextAttemptAt: new Date(Date.now() + 30_000) });
     } else if (["warm_saved", "pending_collection", "unchanged_turn"].includes(row.state)) {
 
 
-      await patch(row, { nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs(row)) });
+      await patch(row, { nextAttemptAt: new Date(Date.now() + 30_000) });
     }
   }
   type CollectionEntry = { id: string; companyId: string; dueAt: number };
@@ -469,21 +450,11 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     const dueAt = current.copy.nextAttemptAt?.getTime() ?? 0;
     if (dueAt > Date.now()) return { ...entry, dueAt };
     if (!admitted()) throw new Error("Instruction collection recovery stopped");
-    const claimed = await tryPatch(current.copy, cleanupClaim(current.copy), true,
-      and(sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')`,
-        sql`EXISTS (SELECT 1 FROM ${heartbeatRuns} WHERE ${heartbeatRuns.id} = ${copies.runId}
+    const claimed = await tryPatch(current.copy, { nextAttemptAt: new Date(Date.now() + 30_000) }, true,
+      sql`EXISTS (SELECT 1 FROM ${heartbeatRuns} WHERE ${heartbeatRuns.id} = ${copies.runId}
         AND ${heartbeatRuns.companyId} = ${copies.companyId}
-        AND ${heartbeatRuns.status} IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,
-        isAgentDirectoryCopy(current.copy) ? sql`${copies.receipt} = ${JSON.stringify(current.copy.receipt)}::jsonb` : undefined));
-    if (claimed && !await directories.abandonGoneSource(claimed)) {
-      try {
-        await collectRecovered(claimed, current.runtimeMode);
-        await finishCleanupAttempt(claimed, "stop_unconfirmed");
-      } catch (error) {
-        await finishCleanupAttempt(claimed, "collection_failed", error);
-        throw error;
-      }
-    }
+        AND ${heartbeatRuns.status} IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`);
+    if (claimed) await collectRecovered(claimed, current.runtimeMode);
     const remaining = await readCollection(entry);
     if (!remaining) return null;
     const next = { ...entry, dueAt: remaining.copy.nextAttemptAt?.getTime() ?? 0 };
@@ -515,15 +486,14 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
 
   type DirectoryCleanupEntry = { id: string; companyId: string; dueAt: number };
   function directoryCleanupEntry(row: Copy | null): DirectoryCleanupEntry | null {
-    return row && !row.receipt?.cleanupTerminal && ["saved", "unchanged", "resolved", "unavailable"].includes(row.state)
+    return row && ["saved", "unchanged", "resolved", "unavailable"].includes(row.state)
       && row.processStoppedAt && isAgentDirectoryCopy(row) && !row.receipt?.retainedByRunId
       && (row.receipt?.cleanupPending === false ? row.nextAttemptAt !== null
         : Object.hasOwn(row.receipt!, "baseline") || row.receipt?.cleanupPending === true)
       ? { id: row.runId, companyId: row.companyId, dueAt: row.nextAttemptAt?.getTime() ?? 0 } : null;
   }
   function directoryCleanupPredicate() {
-    return sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'cleanupTerminal')
-      AND ${copies.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
+    return sql`${copies.state} IN ('saved', 'unchanged', 'resolved', 'unavailable')
       AND ${copies.processStoppedAt} IS NOT NULL
       AND ${copies.receipt}->>'schema' = 'paperclip.agent-files.v1'
       AND coalesce(${copies.receipt}->>'retainedByRunId', '') = ''
@@ -548,21 +518,12 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     throw new Error("Directory cleanup reconstruction stopped");
   }
   async function recoverDirectoryRelease(entry: DirectoryCleanupEntry, admitted: () => boolean) {
-    const [row] = await db.select().from(copies).where(and(scope(entry.companyId, entry.id), directoryCleanupPredicate()));
-    const current = directoryCleanupEntry(row ?? null);
+    const row = await get(entry.companyId, entry.id);
+    const current = directoryCleanupEntry(row);
     if (!row || !current || current.dueAt > Date.now()) return current;
     if (!admitted()) throw new Error("Directory cleanup recovery stopped");
-    const claimed = await tryPatch(row, cleanupClaim(row), true,
-      and(directoryCleanupPredicate(), sql`${copies.receipt} = ${JSON.stringify(row.receipt)}::jsonb`));
-    if (claimed && !await directories.abandonGoneSource(claimed)) {
-      try {
-        await directories.release(claimed);
-        await finishCleanupAttempt(claimed, "remote_cleanup_failed");
-      } catch (error) {
-        await finishCleanupAttempt(claimed, "cleanup_failed", error);
-        throw error;
-      }
-    }
+    const claimed = await tryPatch(row, { nextAttemptAt: new Date(Date.now() + 30_000) }, true);
+    if (claimed) await directories.release(claimed);
     const remaining = directoryCleanupEntry(await get(entry.companyId, entry.id));
     if (remaining && remaining.dueAt <= Date.now()) throw new Error("Directory cleanup remains unresolved without a future retry");
     return remaining;

@@ -16,7 +16,7 @@ import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
-import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
 import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
 import { logger } from "../middleware/logger.js";
@@ -41,14 +41,6 @@ function sandboxTransferRoot(row: Copy, remoteCwd: string): string {
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
-}
-// Cleanup attempts are independent of collection/save attempts. A failed save
-// may already have used all three collection attempts before cleanup starts.
-export const MAX_DIRECTORY_CLEANUP_ATTEMPTS = 12;
-export function directoryCleanupBackoffMs(row: Pick<Copy, "receipt">): number {
-  const recorded = Number(row.receipt?.cleanupAttempts ?? 1);
-  const attempts = Number.isFinite(recorded) ? recorded : 1;
-  return Math.min(3_600_000, 30_000 * 2 ** Math.max(0, Math.min(MAX_DIRECTORY_CLEANUP_ATTEMPTS, attempts - 1)));
 }
 function baseline(row: Copy) {
   const snapshot = parseDirectorySnapshot(row.receipt?.baseline);
@@ -512,7 +504,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return (await get(row.companyId, row.runId))!;
   }
   function releaseIsNoop(row: Copy) {
-    return Boolean(row.receipt?.cleanupTerminal) || row.state === "superseded" || !row.processStoppedAt ||
+    return row.state === "superseded" || !row.processStoppedAt ||
       completed.has(row.state) && row.receipt?.cleanupPending === false;
   }
   async function settleCompletedCleanupRetry(row: Copy) {
@@ -565,47 +557,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         return;
       }
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
-        ...(row.receipt?.cleanupAttempts ? { cleanupAttempts: row.receipt.cleanupAttempts } : {}),
-        ...(row.receipt?.cleanupLastReason ? { cleanupLastReason: row.receipt.cleanupLastReason } : {}),
-        ...(row.receipt?.cleanupLastError ? { cleanupLastError: row.receipt.cleanupLastError } : {}),
-        ...(destroyed && !cleanupPending ? { cleanupTerminal: { state: "settled", reason: "source_gone",
-          lastReason: row.errorCode ?? "source_destroyed", attempts: row.receipt?.cleanupAttempts ?? 0, settledAt: new Date().toISOString() } } : {}),
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
-        nextAttemptAt: cleanupPending ? new Date(Date.now() + directoryCleanupBackoffMs(row)) : null });
+        nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }
-  }
-  /** Retire an unreachable cleanup obligation, not its save outcome or bytes.
-   * A missing/foreign lease is uncertainty, never proof of source loss. Exact
-   * destruction still uses the existing locked local-cleanup path below. */
-  async function abandonGoneSource(row: Copy): Promise<Copy | null> {
-    if (!isAgentDirectoryCopy(row) || !row.location.startsWith("remote:") || row.receipt?.retainedByRunId || row.receipt?.cleanupTerminal) return null;
-    const cleanup = row.receipt?.cleanup as { leaseId?: string; remoteCwd?: string } | undefined;
-    const leases = await db.select().from(environmentLeases).where(and(
-      eq(environmentLeases.companyId, row.companyId), eq(environmentLeases.heartbeatRunId, row.runId),
-      cleanup?.leaseId ? eq(environmentLeases.id, cleanup.leaseId)
-        : eq(environmentLeases.environmentId, row.location.slice("remote:".length)),
-    ));
-    if (leases.length !== 1) return null;
-    const lease = leases[0]!;
-    if (lease.environmentId !== null && row.location !== `remote:${lease.environmentId}`) return null;
-    if (lease.environmentId === null && !cleanup?.leaseId) return null;
-    const remoteCwd = cleanup?.remoteCwd ?? lease.metadata?.remoteCwd;
-    if (typeof remoteCwd !== "string" || row.executionRoot !== path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", row.agentId,
-      String(row.receipt?.materializationRunId ?? row.receipt?.directoryRunId ?? row.runId))) return null;
-    if (hasRemoteTerminationReceipt(lease) && (lease.metadata?.remoteExecutionTermination as { state?: string })?.state === "destroyed") return null;
-    const stopped = hasBoundRemoteStopReceipt(lease);
-    const terminalLease = ["released", "expired", "failed"].includes(lease.status) || lease.releasedAt !== null || stopped;
-    const termination = lease.metadata?.remoteExecutionTermination as { confirmedAt?: string } | undefined;
-    const retiredAt = lease.releasedAt?.getTime() ?? (stopped ? Date.parse(termination?.confirmedAt ?? "") : NaN);
-    // Allow the first reservation after a fresh release/stop to observe its
-    // final destruction receipt. Reinspection cannot renew this grace period.
-    if (lease.environmentId !== null && (!terminalLease || Number.isFinite(retiredAt) && retiredAt + 30_000 > Date.now())) return null;
-    return patch(row, { nextAttemptAt: null, receipt: { ...row.receipt, cleanupTerminal: {
-      state: "abandoned", reason: "source_gone", lastReason: row.errorCode ?? "source_unreachable",
-      attempts: row.receipt?.cleanupAttempts ?? 0, settledAt: new Date().toISOString(),
-    } } }, sql`${copies.receipt} = ${JSON.stringify(row.receipt)}::jsonb`);
   }
   async function destroyedRemoteCopy(row: Copy): Promise<boolean> {
     const cleanup = row.receipt?.cleanup as { leaseId?: string; remoteCwd?: string } | undefined;
@@ -659,7 +615,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // the only remaining bytes; a stop receipt is not a destruction receipt.
       return patch(row, { state: "pending_collection", errorCode: lease ? "INSTRUCTION_STOPPED_REMOTE_COLLECTION_PENDING" : "INSTRUCTION_REMOTE_LEASE_UNVERIFIED",
         errorMessage: lease ? "The remote provider stopped with its agent directory retained. Safe stopped-file retrieval is unavailable; no save or discard is claimed."
-          : "The current remote lease could not be verified. Its agent directory is preserved; no retrieval, save or discard is claimed.", nextAttemptAt: new Date(Date.now() + directoryCleanupBackoffMs(row)) });
+          : "The current remote lease could not be verified. Its agent directory is preserved; no retrieval, save or discard is claimed.", nextAttemptAt: new Date(Date.now() + 30_000) });
     }
     row = await patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(),
       errorCode: "INSTRUCTION_COLLECTION_UNAVAILABLE", errorMessage: "The exact remote sandbox was destroyed before its agent directory was retrieved. No instruction save is claimed.", nextAttemptAt: null });
@@ -711,7 +667,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, abandonGoneSource,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint"),
     collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => collectStopped(current, target), "agent_directory_collect"),
