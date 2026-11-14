@@ -11,12 +11,13 @@ vi.mock("../adapters/index.js", () => ({ requireServerAdapter: () => ({ testEnvi
 vi.mock("../vendor/paperclip-runner/index.js", async original => ({ ...await original<object>(), probeNativeRunnerEnvironment: mocks.probe }));
 vi.mock("./native-runtime/native-session-executor.js", async () => ({
   resolveLocalPiLaunchArtifacts: async () => ({ piCommand: "/selected/pi.js", piProxyPath: "/selected/proxy.cjs" }),
+  createRemoteNativeArtifactPreparation: () => ({ prepare: async () => {} }),
   resolveRemoteProviderPackSource: () => ({ configuredRoot: "/selected/pack", manifest: { digest: `sha256:${"a".repeat(64)}`, payload: { nativeProviders: { pi_rpc: { version: "1.5.2", profileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest, path: "provider-assets/pi_rpc/linux-x64", sha256: `sha256:${"b".repeat(64)}`, closureDigest: `sha256:${"c".repeat(64)}` } }, artifacts: {
     nodeCommand: { path: "node", sha256: `sha256:${"d".repeat(64)}` }, piRpcExecutable: { path: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js", sha256: `sha256:${"e".repeat(64)}` }, piRpcProxy: { path: "dist/cli/pi-rpc-app-server-proxy.cjs", sha256: `sha256:${"f".repeat(64)}` },
   } } } }), prepareRemoteProviderPackOnTarget: mocks.prepare, stageRemoteRunnerFile: vi.fn(), createRemoteRunnerProcessLauncher: mocks.launch, readRemoteRunnerState: vi.fn(), syncRemoteRunnerDirectoryOut: mocks.sync,
 }));
 vi.mock("./native-runtime/native-codex-runner.js", () => ({ resolveRemotePaperclipRunnerBinary: () => "/selected/runnerd", resolvePaperclipRunnerBinary: () => "/selected/runnerd" }));
-vi.mock("./native-runtime/native-runner-execution-driver.js", () => ({ createNativeRunnerExecutionDriver: mocks.driver, prepareNativeRemoteRunner: async (input: { prepareRemote: () => Promise<void> }) => input.prepareRemote() }));
+vi.mock("./native-runtime/native-runner-execution-driver.js", () => ({ createNativeRunnerExecutionDriver: mocks.driver, prepareNativeRemoteRunner: async (input: { prepareRemote: (mode: "listen_ws") => Promise<void> }) => input.prepareRemote("listen_ws") }));
 import { QUALIFIED_PI_RPC_PROFILE } from "../vendor/paperclip-runner/index.js";
 import { testNativeRunnerAuthentication } from "./native-runtime/setup-readiness.js";
 import { assertHarnessTestPassed } from "./agent-harness-verification.js";
