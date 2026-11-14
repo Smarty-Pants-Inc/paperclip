@@ -2760,6 +2760,18 @@ denial reason in visible, assertively announced feedback and names who may
 respond; an audience denial is permanent, so it must not degrade to a retry
 prompt. Neither surface may enable or disable a control on its own authority.
 
+A native addressed response admission refusal stops the run terminally, without
+an automatic retry; a pending card remains answerable through normal authorized
+controls. One system note per card and captured top-level refusal reason gives
+its creator/owner the cause and next action; only an agent-status refusal is
+further distinguished by paused, terminated, pending approval, or error status.
+Generic provider failures use a separate reason. Repeated runs, concurrent
+handling, and restarts do not repeat the same reason; a different reason gets its
+own note. Legacy per-run provider-failure notes suppress only another generic
+provider-failure note, not a later admission refusal. The note is neither approval
+nor an access grant, including for private or governed cards, and exposes no
+protected card payload.
+
 An open audience is not an uncapped one: when an agent run resolves an interaction
 on an issue other than its own source issue, the resolution is a cross-issue
 mutation and consumes the per-run cross-issue influence budget in
