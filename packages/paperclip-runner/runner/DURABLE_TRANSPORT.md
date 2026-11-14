@@ -19,18 +19,14 @@ sleeps in the kernel when there is no ingress. At most 16 upgrade workers run
 concurrently. If those slots are full, a new arrival **closes the oldest
 unfinished upgrade** and joins its worker before replacing it. Continuously
 replenished silent or partial-HTTP peers therefore cannot reject a controller
-merely by keeping the upgrade cap full **if it completes its HTTP upgrade within
-about 40 ms**. A slower-upgrading controller can itself be evicted under a
-replenished flood; that admission limitation remains for v3 (N2). Completed
-upgrades and live controller sockets are never eviction candidates. Silent,
-partial, and malformed HTTP peers are dropped without failing a controller
-connect attempt or consuming a ticket. Only unfinished upgrades retry
-nonblocking I/O (at most every 5 ms).
+merely by keeping the upgrade cap full. Completed upgrades and live controller
+sockets are never eviction candidates. Silent, partial, and malformed HTTP peers
+are dropped without failing a controller connect attempt or consuming a ticket.
+Only unfinished upgrades retry nonblocking I/O (at most every 5 ms).
 
 Each unauthenticated connection has **one 2.5-second deadline from TCP accept**:
-HTTP upgrade, waiting for a connecting tick, and receiving and validating the
-controller's proof all spend that same budget. HTTP upgrade also retains its
-shorter 2-second sub-limit.
+HTTP upgrade, waiting for a connecting tick, and mutual authentication all spend
+that same budget. HTTP upgrade also retains its shorter 2-second sub-limit.
 The first completed upgrade waits only for the remaining total budget; there is
 no fresh ready grace or authentication budget at handover. The connection closes
 at the total deadline even without another connect tick or incoming peer, or if
@@ -40,11 +36,10 @@ dropping an expired handle cannot release a newer controller's slot.
 Further arrivals while a completed upgrade is waiting or a controller socket is
 live receive HTTP 503 immediately, rather than joining a FIFO backlog. Dropping
 the controller socket releases admission for the next retry. Once the controller
-proof is validated within the total deadline, its socket is protected before
-the Runner sends its authentication response. Response I/O uses the existing
-authentication/lifecycle budget; authenticated welcome and runtime budgets apply
-without an ingress deadline. The execution/reconnect lifecycle deadline can
-shorten any of these budgets.
+proof is validated and the Runner's authentication response is sent within the
+total deadline, its socket is protected: the existing authenticated welcome and
+runtime budgets apply, without an ingress deadline. The execution/reconnect
+lifecycle deadline can shorten any of these budgets.
 
 Path, query and extension checks are unchanged. Warm path rotation invalidates
 pending and completed upgrades for the old path without rebinding the listener.

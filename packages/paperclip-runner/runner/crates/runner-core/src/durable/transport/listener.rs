@@ -392,7 +392,7 @@ impl ListenerSocket {
         self.deadline
     }
 
-    /// Called after validating the controller's proof, before sending ours.
+    /// Only called after validating the controller's proof and sending ours.
     pub(super) fn authenticated(&mut self) -> Result<(), DurableRunnerError> {
         let mut state = self.admission.lock().unwrap();
         if state.active != Some(self.id)
