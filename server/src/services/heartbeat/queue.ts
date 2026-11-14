@@ -3793,6 +3793,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               assigneeUserId: issues.assigneeUserId,
               monitorNextCheckAt: issues.monitorNextCheckAt,
               monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+              originKind: issues.originKind,
+              checkoutRunId: issues.checkoutRunId,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
@@ -3885,6 +3887,37 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               finishedAt: new Date(),
             });
             return { kind: "skipped" as const };
+          }
+
+          if (issueStateGuard?.initialImport) {
+            // The sweep's no-run/no-monitor snapshot is only a candidate.
+            // Revalidate after the existing issue lock, in separate statements
+            // so a competing controller's committed admission (even one already
+            // stopped) is visible. The ordinary run/wake rows consume eligibility;
+            // no process-local marker or second scheduler owns this decision.
+            if (
+              issue.originKind !== "company_import" || issue.monitorNextCheckAt ||
+              issue.monitorWakeRequestedAt || issue.checkoutRunId || issue.executionRunId ||
+              issue.conversationAgentId || issue.assigneeUserId !== null
+            ) return { kind: "skipped" as const };
+
+            const [priorRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId),
+              or(
+                eq(heartbeatRuns.issueId, issue.id),
+                eq(heartbeatRuns.nativeIssueId, issue.id),
+                sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
+                sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${issue.id}`,
+              ),
+            )).limit(1);
+            if (priorRun) return { kind: "skipped" as const };
+
+            const [priorWake] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, issue.companyId),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+              or(eq(agentWakeupRequests.status, "queued"), isNotNull(agentWakeupRequests.runId)),
+            )).limit(1);
+            if (priorWake) return { kind: "skipped" as const };
           }
 
           if (opts.failedRunId) {

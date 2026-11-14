@@ -262,6 +262,7 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    initialImport?: true;
   };
   allowRunCoalescing?: boolean;
 };
@@ -2215,7 +2216,9 @@ export function recoveryService(
     const initialDispatch = issue.status === "in_progress"
       ? "assigned_in_progress_liveness_dispatch" : "assigned_todo_liveness_dispatch";
     return deps.enqueueWakeup(agentId, {
-      ...(issue.status === "in_progress" ? { issueStateGuard: { statuses: ["in_progress"], assigneeAgentId: agentId } } : {}),
+      ...(issue.status === "in_progress" ? {
+        issueStateGuard: { statuses: ["in_progress"], assigneeAgentId: agentId, initialImport: true },
+      } : {}),
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",

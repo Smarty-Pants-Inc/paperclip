@@ -154,6 +154,8 @@ Imported agents always land with timer heartbeats disabled. Assignment/on-demand
 
 Imports can additionally request `pauseAutomations` (the default in the app's Import page) so imported agents and routines land fully paused. Use the post-import activation panel — or resume the agents and activate the routines individually — when you are ready for them to run.
 
+After activation, carried-over in-progress tasks without a local run use normal assignment admission. Recovery rechecks the current task and its run/wake history under the queue's task lock: a competing controller cannot admit that initial work again after Stop. A monitor armed before admission keeps its schedule instead of receiving an immediate assignment run.
+
 The import safety pause leaves assigned open tasks waiting without blocking them or adding stopped-task or unanswered-message notices. Resuming the assignee admits carried-over work with no local run through normal assignment recovery; it does not require an unblock comment on each task. An additional manual pause still uses the normal paused-agent notice.
 
 Task monitor notes and provenance are imported, but their schedules arrive unarmed (with an import warning). Re-arm an imported monitor from its task page when ready. Recovery preserves an already-armed monitor while its assignee waits on the import safety pause.
