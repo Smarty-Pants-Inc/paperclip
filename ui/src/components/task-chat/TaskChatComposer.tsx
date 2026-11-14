@@ -5,6 +5,7 @@ import { AgentAvatar } from "../AgentAvatar";
 import {
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ChangeEvent,
@@ -902,6 +903,30 @@ export function TaskChatComposer({
   const uploadPending = attachments.some((item) => item.status === "uploading");
   const uploadFailed = attachments.some((item) => item.status === "error");
   const takeoverVisible = Boolean(takeover && !pause);
+  // On a phone the docked card gets whatever height is left in the chat column
+  // after the composer itself, so Send stays on screen as the draft grows.
+  const composerRootRef = useRef<HTMLDivElement>(null);
+  const composerSurfaceRef = useRef<HTMLDivElement>(null);
+  const measureTakeoverBudget = mobile && takeoverVisible;
+  useLayoutEffect(() => {
+    const root = composerRootRef.current;
+    const surface = composerSurfaceRef.current;
+    if (!measureTakeoverBudget || !root || !surface) return;
+    const column = root.closest<HTMLElement>("[data-task-chat-shell]");
+    const update = () => {
+      root.style.setProperty("--tc-composer-input-h", `${surface.offsetHeight}px`);
+      if (column) root.style.setProperty("--tc-chat-column-h", `${column.clientHeight}px`);
+    };
+    update();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
+    observer?.observe(surface);
+    if (column) observer?.observe(column);
+    return () => {
+      observer?.disconnect();
+      root.style.removeProperty("--tc-composer-input-h");
+      root.style.removeProperty("--tc-chat-column-h");
+    };
+  }, [measureTakeoverBudget]);
   const previousTakeoverVisibleRef = useRef(takeoverVisible);
   useEffect(() => {
     if (previousTakeoverVisibleRef.current && !takeoverVisible && !queuedEdit) {
@@ -1276,7 +1301,8 @@ export function TaskChatComposer({
   }
 
   return (
-    <div className={cn("flex min-w-0 flex-col", creation?.contextBar ? "gap-0" : "gap-2")}>
+    <div ref={composerRootRef} data-task-chat-composer-root=""
+      className={cn("flex min-w-0 flex-col", creation?.contextBar ? "gap-0" : "gap-2")}>
       <ComposerFileDropTarget
         enabled={canAcceptFiles && !disabled && !submitting && !creation?.readOnly}
         newTask={Boolean(creation)}
@@ -1361,6 +1387,7 @@ export function TaskChatComposer({
         </TaskChatComposerBar>
       ) : null}
       <div
+        ref={composerSurfaceRef}
         data-editor-autocomplete-anchor=""
         className={taskChatComposerSurfaceClasses(mobile, streamlined)}
         onKeyDownCapture={(e) => {
