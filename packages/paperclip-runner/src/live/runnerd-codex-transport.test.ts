@@ -3767,12 +3767,17 @@ it.each(["reuse", "large-instructions", "rotated-recovery", "removed-context", "
       await attaching;
       expect(requestedRun).toBe("run-prepared-next");
       expect(requestedInstructions).toBe(coreInstructions);
-      await expect(resumed.transport.attachRun!({
+      await resumed.transport.attachRun!({
         runId: "run-prepared-changed", turnId: "turn-prepared-changed", itemId: "item-prepared-changed",
         currentRunGrant: { runtimeContext: context, instructions: composeNativeSystemInstructions(context, "Next run instructions") },
-      })).rejects.toThrow("cannot change the durable Codex provider profile");
+      });
       expect(requestedRun).toBe("run-prepared-changed");
       expect(requestedInstructions).toContain("Next run instructions");
+      const refreshed = JSON.parse(await readFile(join(root, "runner/codex-provider-state.json"), "utf8"));
+      expect(refreshed.threadId).toBe((opened.thread as { id: string }).id);
+      expect(refreshed.config.instructions).toContain("Next run instructions");
+      expect(refreshed.config.instructions).toContain("/guest/.agents");
+      expect(refreshed.config.instructions).not.toContain("/controller-only/");
     } finally {
       finishPreparation();
       if (mode === "timeout-attachment") await resumed.transport.close().catch(() => undefined);
