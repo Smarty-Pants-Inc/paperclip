@@ -11,6 +11,7 @@ import { PiRpcDriver, type PiRpcDriverOptions, type PiRpcHarnessSession } from "
 import { PiRpcCommandError, PiRpcTransport, type PiRpcExtensionUiResponseInput, type PiRpcRecord, type PiRpcTransportOptions } from "./pi-rpc-transport.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { MAX_PROVIDER_PERFORMANCE_SPANS, parseProviderPerformanceSpans, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
+import d981ToolNames from "./fixtures/d981-dynamic-tool-names.json";
 
 // Keep reason: revocable model capabilities, receipt admission, and callback refusal
 // are trust boundaries. These tests exercise the actual driver with real brokers/IPC.
@@ -400,6 +401,35 @@ describe("resident Pi model binding", () => {
     await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled")).toBe(true));
     await f.session.attachRun({ runId: "run-b" });
     expect(f.ipc.find(command => command.type === "bind")).toMatchObject({ tools: initial.tools });
+  });
+  // Recorded catch: d981's 151-tool catalog silently lost human input/API discovery.
+  // Names are the captured incident catalog; schemas are deliberately minimal.
+  it("preserves every Paperclip core tool in d981's 151-tool catalog and loudly names omitted connection counts", async () => {
+    const tools = d981ToolNames.map(name => ({ ...tool(name), paperclipToolSource: name.startsWith("app_")
+      ? { kind: "connection", connectionId: name.startsWith("app_mcp_app_gallery_gith") ? "10-github"
+        : name.startsWith("app_mcp_app_gallery_goog") ? "20-google" : "00-other",
+        connectionName: name.startsWith("app_mcp_app_gallery_gith") ? "GitHub"
+          : name.startsWith("app_mcp_app_gallery_goog") ? "Google Workspace" : "Other assigned apps" }
+      : { kind: "core" } }));
+    expect(tools).toHaveLength(151);
+    expect(tools.filter(entry => entry.paperclipToolSource.connectionId === "10-github")).toHaveLength(48);
+    expect(tools.filter(entry => entry.paperclipToolSource.connectionId === "20-google")).toHaveLength(24);
+    const f = await fixture({ dynamicTools: tools.slice().sort((a, b) => a.name.localeCompare(b.name)) });
+    const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    const core = tools.filter(entry => entry.paperclipToolSource.kind === "core").map(entry => entry.name);
+    expect(initial.tools.map((entry: { name: string }) => entry.name)).toEqual(expect.arrayContaining(core));
+    expect(initial.tools).toHaveLength(128);
+    expect(initial.tools.slice(0, core.length).map((entry: { name: string }) => entry.name).sort()).toEqual(core.sort());
+    const warning = "Pi dynamic tool cap 128: omitted 23 connection tools: Google Workspace (20-google): 23. All 58 Paperclip core tools retained.";
+    expect(initial.instructions.split(warning)).toHaveLength(2);
+    expect(initial.tools.every((entry: Record<string, unknown>) => !Object.hasOwn(entry, "paperclipToolSource"))).toBe(true);
+    await vi.waitFor(() => expect(f.events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(1));
+    expect(f.events.find(event => event.payload.code === "pi_dynamic_tool_limit")).toMatchObject({ eventType: "harness.diagnostic", payload: {
+      code: "pi_dynamic_tool_limit", message: warning, cap: 128, coreToolCount: 58, omittedToolCount: 23,
+      omittedConnections: [{ connectionId: "20-google", connectionName: "Google Workspace", omittedToolCount: 23 }],
+    } });
+    await f.session.startTurn({ message: { role: "user", text: "work with the retained tools" } }); await finish(f);
+    expect(f.events.filter(event => event.payload.code === "pi_dynamic_tool_limit")).toHaveLength(1);
   });
   it("keeps 128 usable tools and diagnoses an oversized catalog instead of rejecting the binding", async () => {
     const f = await fixture({ dynamicTools: Array.from({ length: 129 }, (_, i) => tool(`tool_${i}`)) });
