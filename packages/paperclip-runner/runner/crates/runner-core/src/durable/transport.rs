@@ -1048,6 +1048,12 @@ impl AuthenticatedTransport {
                 &[&signing_bytes],
                 &challenge.server_proof,
             )?;
+            // Protect the validated controller before sending our proof can
+            // consume the one-use ticket. Expiry before this transition is
+            // retryable; response I/O then uses the lifecycle/auth budget.
+            if let RunnerSocket::Listen(socket) = &mut socket {
+                socket.authenticated()?;
+            }
             let client_proof = hex_encode(&hmac_domain(
                 &credential.auth_key,
                 "paperclip-runner-client-proof-v1",
@@ -1070,9 +1076,6 @@ impl AuthenticatedTransport {
                 connect_deadline,
                 &mut auth_response_send_started,
             )?;
-            if let RunnerSocket::Listen(socket) = &mut socket {
-                socket.authenticated()?;
-            }
             let secure_channel = SecureChannel::client(
                 &credential.auth_key,
                 &signing_bytes,
@@ -1742,6 +1745,7 @@ mod tests {
     include!("tests/hosted_retention.rs");
     include!("tests/ack_release_poll.rs");
     include!("tests/listener_admission.rs");
+    include!("tests/listener_deadline_edge.rs");
     include!("tests/indeterminate_terminal_ack.rs");
 
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
