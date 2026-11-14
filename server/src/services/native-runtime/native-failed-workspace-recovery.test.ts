@@ -782,7 +782,7 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     expect(await readRun(f.runId)).toMatchObject({ status: "running", nativePhase: "observed" });
   });
 
-  it.each(["own", "foreign", "attempt", "accepted"])("retains files after an unstarted preparation claim is released: %s", async kind => {
+  it.each(["own", "named", "foreign", "attempt", "accepted"])("retains files after an unstarted preparation claim is released: %s", async kind => {
     const f = await seed();
     const leaseOwner = randomUUID();
     await db.update(heartbeatRuns).set({ status: "running", nativePhase: "observed", errorCode: null })
@@ -794,16 +794,18 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       .rejects.toBeInstanceOf(NativeWorkspaceFinalizationBusyError);
     if (kind === "accepted") await db.update(nativeRunFinalizations).set({ phase: "result_accepted" }).where(eq(nativeRunFinalizations.runId, f.runId));
     const released = await releaseUnstartedNativeExecutionClaim({ db, runId: f.runId, companyId: f.companyId, issueId: f.issueId,
-      leaseOwner: kind === "foreign" ? randomUUID() : leaseOwner, attempt: kind === "attempt" ? 2 : 1 });
-    expect(released).toBe(kind === "own");
-    if (kind !== "own") {
+      leaseOwner: kind === "foreign" ? randomUUID() : leaseOwner, attempt: kind === "attempt" ? 2 : 1,
+      ...(kind === "named" ? { failureCode: "native_predecessor_retirement_unproven" as const } : {}) });
+    expect(released).toBe(kind === "own" || kind === "named");
+    if (kind !== "own" && kind !== "named") {
       expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))[0].leaseOwner).toBe(leaseOwner);
       expect(await readLease(f.lease.id)).toMatchObject({ status: "active" });
       return;
     }
     await preserveNativeFailedWorkspace(db, await readRun(f.runId), { allowPreterminal: true });
     expect(await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId)))
-      .toMatchObject([{ phase: "terminal_failure", leaseOwner: null, recoveryState: "blocked" }]);
+      .toMatchObject([{ phase: "terminal_failure", leaseOwner: null, recoveryState: "blocked",
+        ...(kind === "named" ? { failureCode: "native_predecessor_retirement_unproven" } : {}) }]);
     expect(await readRun(f.runId)).toMatchObject({ status: "running", nativePhase: "terminal_failure",
       resultJson: { workspaceRestoreFailure: "restore_failed", workspaceRestoreRecovery: { leaseIds: [f.lease.id] } } });
     expect(await readLease(f.lease.id)).toMatchObject({ status: "pending_cleanup", leasePolicy: "retain_on_failure" });

@@ -43,8 +43,8 @@ export async function preparePredecessorRetirementFallback(db: Db, run: Run, err
     if (!current || !["running", "failed"].includes(current.status) || current.runnerProfileJson?.nativeWorkspaceSync != null) return null;
     const leases = (await tx.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
-      beforeProviderTurn ? inArray(environmentLeases.leasePolicy, ["reuse_by_environment", "reuse_by_execution_workspace"])
-        : eq(environmentLeases.leasePolicy, "reuse_by_environment"), isNotNull(environmentLeases.providerLeaseId),
+      inArray(environmentLeases.leasePolicy, ["reuse_by_environment", "reuse_by_execution_workspace"]),
+      isNotNull(environmentLeases.providerLeaseId),
     )).for("update")).filter(lease => !failure.providerLeaseId || lease.providerLeaseId === failure.providerLeaseId);
     if (leases.length === 0 && !beforeProviderTurn) return null;
     if (beforeProviderTurn) await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({

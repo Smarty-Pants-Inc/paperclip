@@ -1194,6 +1194,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable",
     "native_runner_refresh_required", "native_runner_launch_profile_mismatch",
+    "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   ])("RFL F5 keeps the agent idle after an execute-path D10 refusal (%s)", async code => {
@@ -1206,6 +1207,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable", "native_runner_refresh_required",
+    "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   ])("persists structured fresh-thread refusal without generic Retry (%s)", async code => {
@@ -1235,6 +1237,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each(["provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_config_changed",
     "provider_contract_changed_same_run", "provider_launch_profile_mismatch", "provider_pending_tool_calls",
     "provider_reconciliation_required", "provider_session_closed", undefined, "future_unknown",
+    "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding"])(
     "persists the precise prepare code through the server completion boundary (%s)", async refusalCode => {
@@ -1252,6 +1255,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       if (phase === "execute") await f.completion.failRun(f.failure(error));
       else await f.completion.failRunSetup(f.setup(error));
       const code = refusalCode === "runner_harness_state_mismatch: backup_without_reusable_lease"
+        || refusalCode === "runner_harness_state_mismatch: resumed_unavailable"
         || refusalCode === "native_controller_recovery_missing_evidence:retained_sandbox_binding" ? refusalCode
         : refusalCode === "provider_launch_profile_mismatch" ? "native_runner_launch_profile_mismatch" : "native_runner_refresh_required";
       expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: code,

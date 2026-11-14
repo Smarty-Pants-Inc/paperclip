@@ -10,6 +10,7 @@ export const FRESH_THREAD_REFUSAL_CODES = [
   "native_controller_recovery_unsupported:metadata_format",
   "runner_remote_state_unavailable",
   "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "runner_harness_state_mismatch: resumed_unavailable",
   "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   "native_runner_refresh_required",
   "native_runner_launch_profile_mismatch",

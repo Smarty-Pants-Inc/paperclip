@@ -35,7 +35,8 @@ introduced by the server policy.
   [`FRESH_THREAD_REFUSAL_CODES`](../../server/src/services/native-runtime/runner-reconciliation-refusal.ts).
   Structured codes and bounded error causes survive the runner boundary. Diagnostic
   prose never grants authority. The archived-chat refusals
-  `runner_harness_state_mismatch: backup_without_reusable_lease` and
+  `runner_harness_state_mismatch: backup_without_reusable_lease`,
+  `runner_harness_state_mismatch: resumed_unavailable` and
   `native_controller_recovery_missing_evidence:retained_sandbox_binding` use this
   same owner and proof predicate; C1 prepare/attach receipts preserve their exact
   codes ahead of generic refresh classification. They never claim a skill edit.
@@ -75,6 +76,27 @@ introduced by the server policy.
   budget, bypass proof, or create a generic isolated executor. Automatic restart
   hooks do not renew that budget. Repaired evidence allows the existing delivery
   owner to start exactly one fresh continuation. Repeated keys join the receipt.
+
+## Preparation failure on a warm allocation
+
+A new lease can name the same still-warm allocation while the old session's
+transport still carries its released lease. If retiring that session fails,
+`native_predecessor_retirement_unproven` is a pre-provider ownership failure,
+not evidence of a physical stop. Both early and late retirement failures join
+the existing unstarted-claim release after renewal stops. Only the exact fresh
+claim (run, company, task, lease owner, attempt, observed phase, no result) can
+be released after startup cleanup drains; a recovery claim, pending cleanup,
+restart detach, or accepted result retains its owner. The named
+cause survives workspace preservation instead of waiting for a finalization
+deadline and becoming `native_finalization_missing`.
+
+The existing predecessor-retirement fallback marks both reusable lease scopes
+for replacement. Its no-work and unchanged-files checks still apply; a prepared
+workspace that cannot be proven unchanged is retained by the existing workspace
+recovery owner before retry. A new lease, elapsed time, or failed retirement
+never authorizes a second provider thread. If later recovery cannot resume the
+harness state, the structured `resumed_unavailable` refusal uses the strict
+proof gate above, including C1 prepare/attach and the one current notice.
 
 ## Other consumers and limits
 

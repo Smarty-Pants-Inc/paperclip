@@ -13670,11 +13670,11 @@ describe("native warm session supervision", () => {
       expect(state.execute).toHaveBeenCalledTimes(2);
     });
 
-    // Staging: the follow-up on the reused sandbox failed
-    // before provider work because the previous controller's journal drain
-    // outlived the close grace. Nothing could ever start the task again.
-    it("TL08 releases the new claim after stale-lease retirement fails on the same warm box", async () => {
-      const { base, next: nextRun } = fixture("tl08-new-lease-same-box");
+    // TL08: a new lease on the same box left the old session holding a
+    // released Boat lease. Retirement failed before any new provider work,
+    // but its successor kept the fresh claim until the 80s deadline.
+    it.each([false, true])("TL08 releases the new claim after stale-lease retirement fails on the same warm box (runnerd=%s)", async useRunnerd => {
+      const { base, next: nextRun } = fixture(`tl08-new-lease-same-box-${useRunnerd}`);
       const next = { ...nextRun, session: base.session };
       const close = vi.fn().mockRejectedValue(new Error("Boat sandbox lease is no longer active."));
       const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
@@ -13685,21 +13685,54 @@ describe("native warm session supervision", () => {
         environmentId: "tl08-environment", leaseId, remoteCwd: "/tmp/tl08-warm-box",
         sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "bx_8v7gcucz" } });
       try {
-        await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner",
-          runnerExecutionTarget: target("previous-lease") });
+        await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd,
+          backend: {} as never, runnerExecutionTarget: target("previous-lease") });
         release.mockClear();
-        await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner",
-          refreshTools: true, runnerExecutionTarget: target("new-lease") })).rejects.toMatchObject({
+        await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", useRunnerd,
+          backend: {} as never, refreshTools: true, runnerExecutionTarget: target("new-lease") })).rejects.toMatchObject({
           code: "native_predecessor_retirement_unproven", predecessorRunId: base.binding.runId,
           providerLeaseId: "bx_8v7gcucz", cause: { message: "Boat sandbox lease is no longer active." } });
         expect(state.execute).toHaveBeenCalledOnce();
         expect(release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: next.binding.runId,
-          companyId: next.binding.companyId, issueId: next.binding.issueId, attempt: 1 }));
+          companyId: next.binding.companyId, issueId: next.binding.issueId, attempt: 1,
+          failureCode: "native_predecessor_retirement_unproven" }));
       } finally {
         close.mockResolvedValue(undefined);
         await closeIdleWarmNativeSessionsForRestart();
         release.mockRestore();
       }
+    });
+
+    it.each([true, false])("TL08 retains preparation ownership until startup cleanup drains (%s)", async drained => {
+      const { NativePredecessorRetirementUnprovenError } = await import("./predecessor-retirement.js");
+      const { base } = fixture(`tl08-preparation-cleanup-${drained}`);
+      const next = { ...base, binding: { ...base.binding, runId: `${base.binding.runId}-next` } };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        options.onSession?.({ close: vi.fn(async () => undefined) }); return result;
+      });
+      const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "tl08-cleanup",
+        leaseId: "next-lease", remoteCwd: "/tmp/tl08-cleanup", runnerTask: vi.fn() as never,
+        sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "tl08-cleanup-box" } };
+      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", useRunnerd: true,
+        backend: {} as never, runnerExecutionTarget: target });
+      const release = vi.spyOn(nativeLeaseRenewal, "releaseUnstartedNativeExecutionClaim").mockResolvedValue(true);
+      const drain = vi.spyOn(NativeExecutionContext.prototype, "drain").mockResolvedValue(drained);
+      const failure = new NativePredecessorRetirementUnprovenError(base.binding.runId, "tl08-cleanup-box", new Error("lease inactive"));
+      try {
+        const error = await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", useRunnerd: true,
+          backend: {} as never, runnerExecutionTarget: target,
+          onExecutionLeaseAcquired: async () => { throw failure; } }).catch(error => error);
+        expect(drain).toHaveBeenCalledOnce();
+        if (drained) {
+          expect(error).toBe(failure);
+          expect(release).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ runId: next.binding.runId,
+            attempt: 1, failureCode: "native_predecessor_retirement_unproven" }));
+        } else {
+          expect(error).toMatchObject({ name: "NativeStartupCleanupPendingError" });
+          expect(release).not.toHaveBeenCalled();
+        }
+        expect(state.execute).toHaveBeenCalledOnce();
+      } finally { drain.mockRestore(); release.mockRestore(); await closeIdleWarmNativeSessionsForRestart(); }
     });
 
     it("sends the follow-up to a fresh sandbox when its predecessor cannot be retired", async () => {

@@ -6,6 +6,7 @@ import { currentNativeControllerIdentity, type NativeControllerIdentity } from "
 import { OPERATOR_ATTESTED_CONTROLLER_HOST } from "./native-controller-host-recovery.js";
 import { NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE } from "./native-runner-ownership.js";
 import { REMOTE_CONTROLLER_LEASE_MS } from "./native-runner-recovery-contract.js";
+import type { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE } from "./predecessor-retirement.js";
 
 export const NATIVE_SESSION_EXECUTION_LEASE_TTL_MS = 20 * 60_000;
 const NATIVE_SESSION_EXECUTION_LEASE_RENEW_INTERVAL_MS = 5 * 60_000;
@@ -261,9 +262,11 @@ export async function releaseLapsedNativeRestartClaim(input: {
  */
 export async function releaseUnstartedNativeExecutionClaim(input: {
   db: Db; runId: string; companyId: string; issueId: string; leaseOwner: string; attempt: number;
+  failureCode?: typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
 }): Promise<boolean> {
   const released = await input.db.update(nativeRunFinalizations)
-    .set({ leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date() })
+    .set({ leaseOwner: null, leaseExpiresAt: null, updatedAt: new Date(),
+      ...(input.failureCode ? { failureCode: input.failureCode } : {}) })
     .where(and(eq(nativeRunFinalizations.runId, input.runId), eq(nativeRunFinalizations.companyId, input.companyId),
       eq(nativeRunFinalizations.issueId, input.issueId), eq(nativeRunFinalizations.leaseOwner, input.leaseOwner),
       eq(nativeRunFinalizations.attempt, input.attempt), eq(nativeRunFinalizations.phase, "observed"),
