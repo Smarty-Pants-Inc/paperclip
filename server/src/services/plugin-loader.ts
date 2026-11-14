@@ -45,6 +45,7 @@ import { logger } from "../middleware/logger.js";
 import { pluginManifestValidator } from "./plugin-manifest-validator.js";
 import { pluginCapabilityValidator } from "./plugin-capability-validator.js";
 import { pluginRegistryService } from "./plugin-registry.js";
+import { pluginConfigDelivery } from "./plugin-config-delivery.js";
 import type { PluginWorkerHandle, PluginWorkerManager, WorkerStartOptions, WorkerToHostHandlers } from "./plugin-worker-manager.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginJobScheduler } from "./plugin-job-scheduler.js";
@@ -1256,6 +1257,7 @@ export function pluginLoader(
   const log = logger.child({ service: "plugin-loader" });
   const hostVersion = runtimeServices?.instanceInfo.hostVersion;
 
+  const configDelivery = runtimeServices ? pluginConfigDelivery(db, runtimeServices.workerManager) : undefined;
   const configReadyWorkers = new WeakSet<PluginWorkerHandle>();
   const unsubscribeConfigReplay = runtimeServices?.workerManager.onWorkerReady?.((pluginId) => {
     if (shuttingDown) return;
@@ -1265,12 +1267,13 @@ export function pluginLoader(
       configReadyWorkers.add(worker);
       return;
     }
+    const generation = configDelivery!.current(pluginId);
     trackActivationRecovery(async () => {
       const plugin = await registry.getById(pluginId);
       if (plugin?.status !== "ready") return;
       const rows = await listStoredConfigs(plugin);
-      if (shuttingDown || runtimeServices.workerManager.getWorker(pluginId) !== worker || worker.status !== "running") return;
-      await deliverStoredConfigs(plugin, rows);
+      if (shuttingDown || !generation) return;
+      await deliverStoredConfigs(plugin, rows, generation);
     }, "plugin-loader: config replay after worker respawn failed", pluginId);
   });
 
@@ -1286,13 +1289,16 @@ export function pluginLoader(
     }
   }
 
-  async function deliverStoredConfigs(plugin: Pick<PluginRecord, "id" | "pluginKey">, rows: StoredConfigRows): Promise<void> {
+  async function deliverStoredConfigs(
+    plugin: Pick<PluginRecord, "id" | "pluginKey">,
+    rows: StoredConfigRows,
+    generation = configDelivery?.current(plugin.id),
+  ): Promise<void> {
+    if (!generation) return;
     for (const row of rows) {
+      if (shuttingDown) return;
       try {
-        await runtimeServices!.workerManager.call(plugin.id, "configChanged", {
-          config: (row.configJson ?? {}) as Record<string, unknown>,
-          companyId: row.companyId,
-        });
+        await configDelivery!.deliver(plugin.id, row.companyId, generation);
       } catch (configErr) {
         const code = (configErr as { code?: number } | null)?.code;
         const details = {
@@ -2537,9 +2543,9 @@ export function pluginLoader(
       // runtime ctx.config.get(companyId) model. onConfigChanged is idempotent
       // for well-behaved plugins, so replaying an unchanged config is safe.
       //
-      // Reuses the `configRows` loaded in step 4b (which also seeded the
-      // worker's proactive company scopes before startup); no second listConfigs
-      // round-trip is needed here.
+      // Reuse step 4b's company list, but read each row at delivery time.
+      // The shared delivery path fences process generations and coordinates
+      // with settings saves so neither stale snapshots nor duplicates win.
       await deliverStoredConfigs(activePlugin, configRows);
 
       // ------------------------------------------------------------------

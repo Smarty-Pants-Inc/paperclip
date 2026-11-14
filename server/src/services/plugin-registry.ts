@@ -393,7 +393,10 @@ export function pluginRegistryService(db: Db) {
             .set({
               configJson: input.configJson,
               lastError: null,
-              updatedAt: new Date(),
+              // updatedAt is the config delivery revision. Keep it strictly
+              // increasing at JS Date precision, even for same-ms saves or
+              // clock skew; PostgreSQL evaluates this on the locked row.
+              updatedAt: sql`greatest(clock_timestamp(), ${pluginConfig.updatedAt} + interval '1 millisecond')`,
             })
             .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
@@ -437,7 +440,7 @@ export function pluginRegistryService(db: Db) {
             .set({
               configJson: merged,
               lastError: null,
-              updatedAt: new Date(),
+              updatedAt: sql`greatest(clock_timestamp(), ${pluginConfig.updatedAt} + interval '1 millisecond')`,
             })
             .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
             .returning()
@@ -463,7 +466,7 @@ export function pluginRegistryService(db: Db) {
     setConfigError: async (pluginId: string, companyId: string, lastError: string | null) => {
       const rows = await db
         .update(pluginConfig)
-        .set({ lastError, updatedAt: new Date() })
+        .set({ lastError, updatedAt: sql`greatest(clock_timestamp(), ${pluginConfig.updatedAt} + interval '1 millisecond')` })
         .where(and(eq(pluginConfig.pluginId, pluginId), eq(pluginConfig.companyId, companyId)))
         .returning();
 
