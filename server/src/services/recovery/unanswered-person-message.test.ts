@@ -40,6 +40,8 @@ const NO_REPLY = "This run finished without a reply to your message. Sending it 
 const CHAT_NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.";
 const CHAT_NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, start a new chat with Managed Pi; this one stays readable.";
 const CHAT_HELD = "Managed Pi can't continue this chat from its saved state. Start a new chat with Managed Pi; this one stays readable.";
+// RFL (A) on seed A: while Paperclip's own recovery has not given its verdict past T0, only what is true then.
+const RETRYING = "Your message wasn't answered yet; Paperclip is retrying automatically.";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -596,6 +598,36 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const queueWake = (f: { companyId: string; agentId: string; issueId: string }, payload: Record<string, unknown>) =>
     db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
       reason: "issue_continuation_needed", status: "queued", payload }).returning().then(rows => rows[0]!);
+
+  // RFL (A) on seed A, the bound-expiry case: Paperclip's own recovery verdict (the fresh continuation) arrives AFTER
+  // B''s existing T0 window. The note posted at the bound says ONLY what is true then (retrying automatically, never
+  // "safe to resend"); the held note then supersedes it (marked, kept), one current note.
+  it.each([true, false])("seed A bound expiry (chat=%s): the recovery verdict comes after T0 -> first ONE 'retrying automatically' note, then the held note supersedes it", async chat => {
+    const f = await fixture({ status: "blocked", chat });
+    const message = await f.message("What word did I ask you to remember?");
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "native_session_interrupted",
+      error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    await settleAt(f, 0);
+    expect(await f.history(), "within T0: Paperclip's recovery is still to decide").toHaveLength(0);
+    await settleAt(f, 3 * 60_000);
+    let notes = await f.visible();
+    expect(notes, "past T0 with no verdict: one note, only what is true").toHaveLength(1);
+    expect(notes[0]!.body).toBe(RETRYING);
+    const retrying = notes[0]!;
+    await settleAt(f, 4 * 60_000);
+    expect(await f.history(), "no second note while recovery still has not decided").toHaveLength(1);
+    await f.run({ commentId: message, status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", retryOfRunId: failed });
+    await settleAt(f, 5 * 60_000);
+    notes = await f.visible();
+    expect(notes, "one current note").toHaveLength(1);
+    expect(notes[0]!.body).toBe(chat ? CHAT_HELD : HELD);
+    const history = await f.history();
+    expect(history.filter(note => /Sending it again is safe/.test(note.body)), "never 'safe to resend'").toHaveLength(0);
+    const kept = history.find(note => note.id === retrying.id)!;
+    expect(kept.body, "the retrying note is kept unchanged").toBe(retrying.body);
+    expect((kept.metadata as Record<string, unknown> | null)?.supersededBy, "and marked superseded by the held note").toBe(notes[0]!.id);
+  });
 
   it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
     const f = await fixture();
