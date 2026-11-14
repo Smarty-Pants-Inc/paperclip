@@ -58,6 +58,11 @@ const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
+/** A code-only reconciliation hold holds the conversation (RFL 09:16Z (b)). */
+export const UNANSWERED_MESSAGE_RECONCILIATION_HOLD_CODE = "native_continuation_requires_reconciliation";
+/** The held note's title: B''s held notes are recognized by it (the comment
+ * metadata schema is strict, so there is no separate marker key). */
+const HELD_NOTE_TITLE = "This conversation can't continue";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
 /** The run that carries the message is queued or scheduled and has not started. */
 export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
@@ -398,24 +403,27 @@ export async function settleUnansweredPersonMessage(
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
       || fenced.upgradeCommentId !== decision.upgradeCommentId
       || fenced.supersedeCommentId !== decision.supersedeCommentId) return null;
+    let comment: { id: string } | null | undefined;
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
         metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
         .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
           isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
-      return updated?.id ?? null;
+      comment = updated;
+    } else {
+      comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
+        authorType: "system",
+        presentation: fenced.notice.presentation,
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
+      }, tx);
     }
-    const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
-      authorType: "system",
-      presentation: fenced.notice.presentation,
-      metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
-    }, tx);
-    // One CURRENT note per held conversation (SMA-183): a held-conversation
-    // note for the person's latest message supersedes B''s live note for an
-    // earlier message. That note is kept (never deleted, org 09:18Z) and marked
-    // metadata.supersededBy; its key still marks that message noticed. Other
-    // notes stay one per message.
+    // One CURRENT held note per conversation (SMA-183; RFL np2 F2/F3): a
+    // held-conversation note for the person's latest message, inserted OR
+    // upgraded in place from its waiting note, supersedes B''s earlier HELD
+    // notes only, never progress, waiting or other history. They are kept
+    // (never deleted, org 09:18Z) and marked metadata.supersededBy; their keys
+    // still mark their messages noticed.
     if (comment?.id && fenced.supersedeCommentId) {
       await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
         || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
@@ -428,6 +436,7 @@ export async function settleUnansweredPersonMessage(
           || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
         where n.company_id = ${issue.companyId} and n.issue_id = ${issue.id} and n.author_type = 'system' and n.deleted_at is null
           and not coalesce(n.metadata ? 'supersededBy', false)
+          and n.presentation->>'title' = ${HELD_NOTE_TITLE}
           and n.id <> ${comment.id} and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
           and exists (select 1 from ${issueComments} m, ${issueComments} latest
             where m.company_id = n.company_id and m.issue_id = n.issue_id
@@ -665,6 +674,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   let stillTrying = false;
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  } else if (waitingToStart && reconciliationHold) {
+    // RFL np2 F1: a durable reconciliation hold keeps the queued message from
+    // being admitted (run-dispatch postgres.ts:905-994). Held beats waiting:
+    // the held note, never "it will start by itself".
+    code = UNANSWERED_MESSAGE_RECONCILIATION_HOLD_CODE;
   } else if (waitingToStart) {
     // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
     // carrying run has not started (a dead claim, a stuck queue): failure text.
@@ -792,7 +806,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
       title: paused ? `${pausedName} is paused` : stillTryingNote ? `${pausedName} is still trying`
-        : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+        : waiting ? "Your message is waiting to start" : held ? HELD_NOTE_TITLE : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
