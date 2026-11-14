@@ -2516,17 +2516,23 @@ owner or fence naming that boot refuses
 the fallback, even when its record is old: use the documented owned-record path and
 its actual last-write timestamp instead. An incomplete inventory also refuses.
 
-The inventory read and existing `proveControllerInstance` fence run under SHARE
-locks on every inventory table that can yield a process or fence owner:
-`agents`, `environment_leases`, `execution_workspace_runtime_leases`,
-`heartbeat_runs`, `issue_recovery_actions`,
-`native_run_finalizations`, `sandbox_creation_operations`, and
-`workspace_operations`. This includes classification inputs, and prevents both
-updates and newly inserted ownership records from slipping between the read and
-fence. Concurrent readers/preflights remain compatible; the preflight waits at
-most one second for a busy ownership-source lock, then refuses. Maintain this
-lock set when the registry gains a new process/fence-owner source. No controller-table
-SHARE lock is taken in this preflight.
+The inventory takes no table-level locks. After the inventory proves ownerlessness,
+B1 supplies `noControllerOwnedRecordsSql(bootId)` as the existing
+`proveControllerInstance` primitive's optional `ownedRecordRecheck` predicate.
+The fence UPDATE itself repeats `NOT EXISTS` over every process/fence-owning
+source: `agents`, `environment_leases`, `execution_workspace_runtime_leases`,
+`heartbeat_runs`, `issue_recovery_actions`, `native_run_finalizations`,
+`sandbox_creation_operations`, and `workspace_operations`. The predicates follow
+the registry's in-progress filters and process/token classification, including
+accepted-result remote ownership and resolved coordinator fence holders. Maintain
+this SQL counterpart beside the registry when a boot-owning kind changes.
+
+At READ COMMITTED, an ownership INSERT or UPDATE committed after inventory but
+before the fence UPDATE's statement snapshot prevents the fence. The fallback
+does not block unrelated writers, and does not claim to serialize ownership writes
+committed after that snapshot. `SET LOCAL lock_timeout = '1s'` bounds the remaining
+controller-row UPDATE wait; a timeout refuses. The optional recheck changes no
+other prover caller's default behavior.
 
 Only after proving ownerlessness does it call the documented primitive. The
 timestamp is the row's persisted `renewed_at` (`renewedAt` in the schema), its
@@ -2542,9 +2548,11 @@ is rejected by the existing lease writer.
 
 The mutating proof runs **outside and before** the settlement transaction. The
 transaction retains `SET LOCAL lock_timeout = '1s'`, coordinator rows first,
-and the controller table SHARE lock only for legacy/unstamped command sets.
-Its repeated proof is nonmutating: a newly arrived unclosed boot refuses and
-requires a fresh planning pass, rather than upgrading competing SHARE locks.
+and `FOR SHARE` on existing controller rows only for legacy/unstamped command sets.
+No `LOCK TABLE` is used. Its repeated proof is nonmutating: a newly visible
+unclosed boot refuses and requires a fresh planning pass, rather than upgrading
+competing row locks. These row locks protect existing rows through commit; they
+are not a predicate lock against boot rows inserted after the repeated proof.
 Thus a safe boot fence can persist even if another settlement guard later
 refuses; it grants no command or provider authority. Every other lifecycle,
 delivery, checkpoint, provider-work and ownership guard still applies.
@@ -3854,9 +3862,10 @@ M1 has a temporary compatibility path for unstamped lifecycle commands only.
 Every other `controller_instances` row must be stopped or fenced, and each
 command's `issuedAt` must be strictly before this boot's `startedAt` minus
 five seconds. The same DB/journal idle proof applies. Before admission, the
-source coordinator rows are locked first, then the controller table is locked
-in SHARE mode to repeat the all-other-boots proof. Stamped-only settlement takes
-no controller-table SHARE lock, so it cannot stall another boot's lease renewal.
+source coordinator rows are locked first, then existing controller rows are read
+`FOR SHARE` to repeat the all-other-boots proof, without a table-level lock.
+Stamped-only settlement takes no controller-row locks, so it cannot stall another
+boot's lease renewal.
 Both lock acquisitions use a transaction-local one-second lock timeout, matching
 legacy workspace settlement. Timeout rolls back the transaction, leaves the
 local journal unchanged and refuses with `lifecycle_settlement_lock_timeout`.

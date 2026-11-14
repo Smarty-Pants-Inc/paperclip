@@ -10,7 +10,7 @@ import { isSettledRemoteWarmControlState } from "./remote-warm-session-recovery.
 import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
 import { currentProcessProbe, proveOwnerGone } from "../owner-proof.js";
 import { proveControllerInstance } from "../controller-instance-lease.js";
-import { OWNABLE_KINDS, resolveFenceHolders } from "../recovery/ownership-registry.js";
+import { noControllerOwnedRecordsSql, OWNABLE_KINDS, resolveFenceHolders } from "../recovery/ownership-registry.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const lifecycle = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
@@ -20,21 +20,14 @@ type Input = { db: Db; root: string; bytes: string; identity: Record<string, str
   companyId: string; agentId: string; issueId: string; currentRunId: string };
 
 /** B1's fallback is ONLY for boots the record-driven reconciler cannot reach.
- * Keep the inventory's process/fence-owner tables stable through the documented fence:
- * row locks alone miss inserts and records becoming in-progress. SHARE permits
- * concurrent provers/readers, but excludes ownership INSERT/UPDATE/DELETE. These
- * are all tables from which OWNABLE_KINDS can produce a process/fence owner (including
- * the heartbeat/environment inputs to accepted-result owner classification).
- * No controller-table SHARE lock here: the prover must still renew/fence, and
- * two preflights must never upgrade competing SHARE locks on that table. */
+ * Inventory first, then repeat the process/fence-owner check in the fence UPDATE
+ * itself. At READ COMMITTED this sees ownership committed after inventory but
+ * before that statement's snapshot, without blocking unrelated source writers. */
 async function proveOwnerlessController(db: Db, bootId: string, renewedAt: Date) {
   try {
     return await db.transaction(async transaction => {
       const tx = transaction as unknown as Db;
       await tx.execute(sql`set local lock_timeout = '1s'`);
-      await tx.execute(sql`lock table agents, environment_leases, execution_workspace_runtime_leases,
-        heartbeat_runs, issue_recovery_actions, native_run_finalizations, sandbox_creation_operations,
-        workspace_operations in share mode`);
       for (const kind of OWNABLE_KINDS) {
         if (!kind.listInProgress) continue;
         for (let offset = 0; ; offset += 200) {
@@ -50,7 +43,7 @@ async function proveOwnerlessController(db: Db, bootId: string, renewedAt: Date)
           if (offset + 200 >= 2_000) return "expired" as const;
         }
       }
-      return proveControllerInstance(tx, bootId, renewedAt);
+      return proveControllerInstance(tx, bootId, renewedAt, { ownedRecordRecheck: noControllerOwnedRecordsSql(bootId) });
     });
   } catch (error) {
     for (let cause: unknown = error; cause && typeof cause === "object"; cause = record(cause).cause) {
@@ -123,9 +116,9 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
         // B1 visits only provably ownerless boots. An owned boot must use
         // record-driven reconciliation with its actual owned-write timestamp;
         // renewedAt alone cannot bound that boot's last sign of life.
-        // Fence only in the preflight, before any settlement SHARE lock. A
+        // Fence only in the preflight, before settlement row locks. A
         // transaction recheck refuses a newly arrived unclosed boot instead of
-        // upgrading SHARE locks in two competing settlements.
+        // upgrading row locks in two competing settlements.
         if (!fenceOwnerless || row.epoch >= boot.epoch) { allGone = false; continue; }
         const proof = await proveOwnerlessController(db as Db, row.bootId, row.renewedAt);
         if (proof !== "stopped" && proof !== "fenced") allGone = false;
@@ -162,7 +155,7 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
       await input.db.transaction(async tx => {
         await tx.execute(sql`set local lock_timeout = '1s'`);
         await lockSourceRecoveryCoordinators(tx, binding.companyId, [binding.runId, input.currentRunId]);
-        if (hasLegacyCommands) await tx.execute(sql`lock table controller_instances in share mode`);
+        if (hasLegacyCommands) await tx.select({ bootId: controllerInstances.bootId }).from(controllerInstances).for("share");
         if (readFileSync(path, "utf8") !== input.bytes || !await prove(tx as unknown as Db)) {
           throw new Error("native_lifecycle_settlement_proof_changed");
         }

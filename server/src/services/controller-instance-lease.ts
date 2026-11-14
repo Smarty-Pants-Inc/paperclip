@@ -1,4 +1,4 @@
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql, type SQL } from "drizzle-orm";
 import { controllerInstanceLeaseDb, controllerInstanceLeaseDbWithoutStatementTimeout, controllerInstances, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import {
@@ -252,7 +252,8 @@ export async function stopControllerInstanceLease(db: Db | null = registeredDb):
  * epoch) and its records are gone. A boot that held work exits before this point.
  */
 export async function proveControllerInstance(db: Db, bootId: string, touchedAt: Date | null,
-  options: { readOnly?: boolean } = {}): Promise<ControllerInstanceState | null> {
+  options: { readOnly?: boolean; /** Optional caller-owned recheck in the fence UPDATE's snapshot. */
+    ownedRecordRecheck?: SQL } = {}): Promise<ControllerInstanceState | null> {
   const [row] = await db.select({
     fenced: sql<boolean>`${controllerInstances.fencedAt} is not null`,
     stopped: sql<boolean>`${controllerInstances.stoppedAt} is not null`,
@@ -277,7 +278,7 @@ export async function proveControllerInstance(db: Db, bootId: string, touchedAt:
       sql`greatest(${controllerInstances.leaseExpiresAt}, ${touchedAt.toISOString()}::timestamptz
         + ${`${CONTROLLER_LEASE_TTL_MS} milliseconds`}::interval)
         < now() - ${`${CONTROLLER_LEASE_FENCE_GRACE_MS} milliseconds`}::interval`,
-      sql`${controllerInstances.epoch} < ${epoch}`))
+      sql`${controllerInstances.epoch} < ${epoch}`, options.ownedRecordRecheck))
     .returning({ bootId: controllerInstances.bootId, epoch: controllerInstances.epoch, lastRenewedAt: controllerInstances.renewedAt });
   if (fenced) {
     logger.info({ ...fenced, fencingEpoch: epoch }, "controller instance fenced");
