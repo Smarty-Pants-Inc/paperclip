@@ -321,6 +321,31 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${real}`);
   });
 
+  // testing-lead's seed A on M1.4a (tl-proofs-1242, TES-79, 15:19-15:24Z): an old chat after an environment move and
+  // an idle close. The person's message failed native_session_interrupted "runner_harness_state_mismatch:
+  // backup_without_reusable_lease"; B''s FIRST note said "Sending it again is safe"; Paperclip's own recovery (the
+  // fresh continuation, retryOf the failed run) then failed native_controller_recovery_missing_evidence:
+  // retained_sandbox_binding, and the person's resend failed the same way. RFL: the first note must give the TRUE next
+  // step, never "resend", when recovery cannot fix it by itself.
+  it.each([true, false])("seed A (chat=%s): backup_without_reusable_lease, then the recovery continuation refused retained_sandbox_binding -> ONE note, the true next step, never 'Sending it again is safe'", async chat => {
+    const f = await fixture({ status: "blocked", chat });
+    const message = await f.message("What word did I ask you to remember?");
+    const failed = await f.run({ commentId: message, status: "failed", errorCode: "native_session_interrupted",
+      error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    await f.sweep();
+    const safe = /Sending it again is safe/;
+    expect((await f.history()).filter(note => safe.test(note.body)), "the first note never promises a resend").toHaveLength(0);
+    await f.run({ commentId: message, status: "failed", errorCode: "native_continuation_requires_reconciliation",
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding", retryOfRunId: failed });
+    await f.sweep(); await f.sweep();
+    const history = await f.history();
+    expect(history.filter(note => safe.test(note.body)), "no note ever promises a resend").toHaveLength(0);
+    const notes = await f.visible();
+    expect(notes, "exactly one current note").toHaveLength(1);
+    expect(notes[0]!.body).toBe(chat ? CHAT_HELD : HELD);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+  });
+
   it("conversation clause: an ANSWERED waiting chat is a valid wait (no notice); an UNANSWERED one is not (one notice)", async () => {
     const answered = await fixture({ status: "in_review" });
     await answered.reply(await answered.run({ commentId: await answered.message(), status: "succeeded" }));
