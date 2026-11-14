@@ -133,6 +133,7 @@ import {
   type SandboxOrphanCleanupSpool,
 } from "./sandbox-orphan-cleanup-spool.js";
 import { logger } from "../middleware/logger.js";
+import { assertNativeWarmSessionStopReady, holdNativeWarmSessionStop, NativeWarmSessionStopNotReadyError, nativeWarmSessionStopReady } from "./native-warm-stop-gate.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 // The constant error kind for the durable orphan-cleanup-write-failed log. The
@@ -2599,12 +2600,18 @@ function createSandboxEnvironmentDriver(
 
       let cleanupStatus: "success" | "failed" = "success";
       try {
+        await assertNativeWarmSessionStopReady(db, input.lease);
         await releaseSandboxProviderLease({
           config: parsed.config,
           providerLeaseId: input.lease.providerLeaseId,
           status: input.status,
         });
-      } catch {
+      } catch (error) {
+        // The native warm stop gate refused: keep the box under a stop intent.
+        if (error instanceof NativeWarmSessionStopNotReadyError) {
+          const held = await holdNativeWarmSessionStop(db, input.lease);
+          return held ? toEnvironmentLeaseSnapshot(held) : null;
+        }
         cleanupStatus = "failed";
       }
       if (cleanupStatus === "success") crashPoint("environment.lease_release.after_provider_before_lease");
@@ -2718,6 +2725,7 @@ function createSandboxEnvironmentDriver(
             throw new Error("Workspace export recovery requires verified stop-only cleanup.");
           }
           await assertExportResumeOwnership();
+          await assertNativeWarmSessionStopReady(db, input.lease);
           const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () => pluginWorkerManager.call(pluginId, "environmentStopLease", {
             driverKey: recordedProvider, companyId: input.lease.companyId,
             environmentId: input.lease.environmentId ?? "", issueId: input.lease.issueId,
@@ -2741,6 +2749,7 @@ function createSandboxEnvironmentDriver(
             (input.lease.environmentId !== null && failedCreation.environmentId !== input.lease.environmentId))) {
           throw new Error("Pending creation cleanup ownership does not match the lease");
         }
+        await assertNativeWarmSessionStopReady(db, input.lease);
         const teardown = (metadata: Record<string, unknown>) => pluginWorkerManager.call(
           pluginProvider.resolved.plugin.id,
           "environmentDestroyLease",
@@ -2776,12 +2785,14 @@ function createSandboxEnvironmentDriver(
           throw new Error("Sandbox preservation requires verified built-in stop-only cleanup.");
         }
         await assertExportResumeOwnership();
+        await assertNativeWarmSessionStopReady(db, input.lease);
         const receipt = await provider.stopLease({ config: cleanupConfig, providerLeaseId: input.lease.providerLeaseId });
         if (!acceptedStopOnlyReceipt(input.lease, receipt)) {
           throw new Error("Built-in sandbox stop did not confirm the exact retained allocation.");
         }
         return receipt;
       }
+      await assertNativeWarmSessionStopReady(db, input.lease);
       await destroySandboxProviderLease({
         config: cleanupConfig,
         providerLeaseId: input.lease.providerLeaseId,
@@ -3346,6 +3357,11 @@ function createSandboxEnvironmentDriver(
     if (input.resourceDisposition === "stop_and_retain") {
       throw new Error("Stop-only sandbox cleanup requires a durable stop intent.");
     }
+    // The native warm stop gate refused: keep the box under a stop intent.
+    if (!await nativeWarmSessionStopReady(db, input.lease)) {
+      const held = await holdNativeWarmSessionStop(db, input.lease);
+      return held ? toEnvironmentLeaseSnapshot(held) : null;
+    }
     const metadata = input.lease.metadata ?? {};
     const pluginId = readString(metadata.pluginId);
     const providerKey = readString(metadata.provider);
@@ -3364,6 +3380,7 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
+        await assertNativeWarmSessionStopReady(db, input.lease);
         const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
           pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
             driverKey: providerKey,
@@ -3434,6 +3451,7 @@ function createSandboxEnvironmentDriver(
     let cleanupStatus: "success" | "failed" = "success";
     let termination: ReturnType<typeof remoteTerminationReceipt>;
     const metadata = input.lease.metadata ?? {};
+    let nativeStopHeld = false;
 
     try {
       if (metadata.sandboxProviderPlugin) {
@@ -3452,6 +3470,7 @@ function createSandboxEnvironmentDriver(
             lease: input.lease,
             provider: providerKey,
           });
+          await assertNativeWarmSessionStopReady(db, input.lease);
           const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
             pluginWorkerManager.call(pluginId, "environmentDestroyLease", {
               driverKey: providerKey,
@@ -3477,19 +3496,21 @@ function createSandboxEnvironmentDriver(
         if (parsed.driver !== "sandbox") {
           cleanupStatus = "failed";
         } else {
+          await assertNativeWarmSessionStopReady(db, input.lease);
           await destroySandboxProviderLease({
             config: parsed.config,
             providerLeaseId: input.lease.providerLeaseId,
           });
         }
       }
-    } catch {
+    } catch (error) {
+      nativeStopHeld = error instanceof NativeWarmSessionStopNotReadyError;
       cleanupStatus = "failed";
     }
     // Only a destroy the provider confirmed reaches this gap.
     if (cleanupStatus === "success") crashPoint("environment.teardown.after_destroy_before_lease");
 
-    return await environmentsSvc.releaseLease(
+    const settled = await environmentsSvc.releaseLease(
       input.lease.id,
       cleanupStatus === "success" ? "expired" : "pending_cleanup",
       {
@@ -3500,6 +3521,13 @@ function createSandboxEnvironmentDriver(
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
       },
     );
+    // The native warm stop gate refused: the lease waits in pending_cleanup
+    // with a bounded retry time, and warns once if the wait outlasts its bound.
+    if (nativeStopHeld && settled) {
+      const held = await holdNativeWarmSessionStop(db, settled);
+      return held ? toEnvironmentLeaseSnapshot(held) : settled;
+    }
+    return settled;
   }
 }
 
@@ -3702,6 +3730,7 @@ function createPluginEnvironmentDriver(
     const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease({ ...input, lease });
     const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
     if (!environmentId) throw new Error("Plugin lease cleanup has no saved environment identity");
+    await assertNativeWarmSessionStopReady(db, lease);
     const receipt = await workerManager.call(plugin.id, lease.metadata?.pluginLeaseCleanupMethod === "destroy" ? "environmentDestroyLease" : "environmentReleaseLease", {
       driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
       config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
@@ -3902,6 +3931,7 @@ function createPluginEnvironmentDriver(
       await destroyPluginEnvironmentLease({
         db,
         workerManager,
+        leaseId: input.lease.id,
         companyId: input.lease.companyId,
         environmentId: input.environment.id,
         issueId: input.lease.issueId,
@@ -4426,6 +4456,12 @@ export function environmentRuntimeService(
             preparedStopAttemptId = prepared.metadata?.pendingCleanupAttemptId;
           }
           if (hasStopOnlyCleanup(leaseSnapshot)) {
+            // The stop-and-retain contract waits for the shared native warm
+            // stop gate before it claims and dispatches the stop.
+            if (!await nativeWarmSessionStopReady(db, leaseSnapshot)) {
+              await holdNativeWarmSessionStop(db, leaseSnapshot);
+              continue;
+            }
             const intentKey = stopOnlyCleanupKey(leaseSnapshot);
             const attemptId = randomUUID();
             const controller = { ...await currentControllerProcess(), attemptId };
