@@ -536,18 +536,61 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
       }
 
       if (answeredCards.length && held.state !== "card_answered_no_reply") {
+        // RFL 10:12Z (R2): the card was answered and no continuation reply is
+        // visible. Never edit the posted note in place (it may have been read;
+        // notes are history, org 09:18Z): once the follow-up has ENDED without
+        // a reply (or none started within the no-run grace), post ONE NEW true
+        // note with the next action (chat-aware) and mark this note superseded.
+        const continuationRuns = await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+          agentId: heartbeatRuns.agentId, errorCode: heartbeatRuns.errorCode })
+          .from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, issue.companyId),
+            or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+            inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredCards.map(card => card.id)),
+          )).orderBy(desc(heartbeatRuns.createdAt)).limit(5);
+        if (continuationRuns.some(candidate => LIVE.includes(candidate.status))) continue;
+        const ended = continuationRuns[0] ?? null;
+        if (!ended) {
+          const [answeredCard] = await tx.select({ resolvedAt: issueThreadInteractions.resolvedAt }).from(issueThreadInteractions)
+            .where(and(eq(issueThreadInteractions.companyId, issue.companyId), inArray(issueThreadInteractions.id, answeredCards.map(card => card.id))))
+            .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
+          const answeredAt = answeredCard?.resolvedAt?.getTime() ?? now.getTime();
+          if (answeredAt + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS > now.getTime()) continue;
+        }
         const [run] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.id, held.sourceRunId), eq(heartbeatRuns.companyId, issue.companyId))).limit(1);
         const [agent] = run ? await tx.select({ name: agents.name }).from(agents)
           .where(and(eq(agents.id, run.agentId), eq(agents.companyId, issue.companyId))).limit(1) : [];
-        const agentName = agent?.name?.trim() || "The agent";
-        const body = held.cardName
-          ? `Earlier: ${agentName} answered while the card "${held.cardName}" was pending, but Paperclip kept that reply in the run's activity instead of this chat. The card has been answered; no continuation reply is visible in this chat.`
-          : `Earlier: ${agentName} answered, but Paperclip kept that reply in the run's activity instead of this chat. A question card has been answered; no continuation reply is visible in this chat.`;
-        const nextHeld: HeldReplyMetadata = { ...held, state: "card_answered_no_reply" };
-        const metadata = withHeldReplyMetadata(note.metadata, nextHeld) as never;
-        const presentation = note.presentation ? { ...note.presentation, title: "No continuation reply is visible" } : note.presentation;
-        await tx.update(issueComments).set({ body, presentation, metadata, updatedAt: now })
+        const agentName = agent?.name?.trim() || "the agent";
+        const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
+        const card = held.cardName ? `The card "${held.cardName}"` : "A question card";
+        const outcome = !ended ? `no follow-up run started for ${agentName}.`
+          : ended.status === "succeeded" ? `${agentName}'s follow-up run ended without a reply in this chat.`
+          : `${agentName}'s follow-up run failed before it replied in this chat.`;
+        const reason = typeof objectRecord(note.metadata).authorizationReason === "string"
+          ? objectRecord(note.metadata).authorizationReason as string : null;
+        const fresh = buildStrandedRecoveryEscalationNotice({
+          seed: {
+            title: "No reply after the card was answered",
+            body: `${card} was answered, but ${outcome}`,
+            tone: "warning",
+            nextAction: chat ? `Send your message again; if it fails again, start a new chat with ${agentName}.`
+              : "Send your message again; if it fails again, assign this agent a new task.",
+          },
+          recoveryActionId: null,
+          recoveryOwner: null,
+          recoveryResponsibility: "user",
+          sourceRun: ended ? { id: ended.id, agentId: ended.agentId, status: ended.status, errorCode: ended.errorCode } : null,
+        });
+        const comment = await issueService(tx as unknown as Db).addComment(issue.id, fresh.body, {}, {
+          authorType: "system", presentation: fresh.presentation,
+          metadata: { ...fresh.metadata, ...(reason ? { authorizationReason: reason } : {}) },
+        }, tx);
+        if (!comment?.id) continue;
+        const nextHeld: HeldReplyMetadata = { ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
+          supersededByCommentId: comment.id };
+        const metadata = { ...withHeldReplyMetadata(note.metadata, nextHeld), supersededBy: comment.id } as never;
+        await tx.update(issueComments).set({ metadata, updatedAt: now })
           .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
       } else if (!candidateIds.length) {
         // A generic held note has no card transition to follow. If its own run
