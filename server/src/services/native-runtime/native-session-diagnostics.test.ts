@@ -23,6 +23,20 @@ describe("native session diagnostic ownership", () => {
     expect(f.idle).not.toHaveBeenCalled();
   });
 
+  it.each(["stdout", "stderr"] as const)("preserves %s transport chunks across warm run ownership changes", stream => {
+    const f = fixture(), a = vi.fn(async () => undefined), b = vi.fn(async () => undefined);
+    const first = f.channel.activate(owner, a);
+    f.channel.record("first transport chunk", stream);
+    first.retire();
+    const second = f.channel.activate({ ...owner, runId: "run-b" }, b);
+    f.channel.record("second transport chunk", stream);
+    second.retire();
+    f.channel.record("private idle transport chunk", stream);
+    expect(a).toHaveBeenCalledExactlyOnceWith(stream, "first transport chunk");
+    expect(b).toHaveBeenCalledExactlyOnceWith(stream, "second transport chunk");
+    expect(f.idle).toHaveBeenCalledExactlyOnceWith({ ...owner, runId: "run-b" }, "session_diagnostic");
+  });
+
   it("rebinds the transport trace with its log epoch and clears it on retirement", async () => {
     const f = fixture(), a = vi.fn(async () => undefined), b = vi.fn(async () => undefined);
     const firstTrace = createNativeRunTrace({ runId: "run-a", onEvent: a });

@@ -19511,7 +19511,7 @@ async function createRunnerdBackendWithinSessionClaim(
     // the existing session diagnostic epoch, rebound before run.attach, for
     // both state lines and transport spans; retirement clears both sinks.
     get trace() { return diagnostics.trace; },
-    onLog: async (_stream, chunk) => { diagnostics.record(chunk); },
+    onLog: async (stream, chunk) => { diagnostics.record(chunk, stream); },
     mapCaBundle: sourcePath => {
       if (!remoteBinary) return sourcePath;
       const targetPath = posix.join(posix.dirname(remoteBinary), "runner-ca-bundle.pem");
