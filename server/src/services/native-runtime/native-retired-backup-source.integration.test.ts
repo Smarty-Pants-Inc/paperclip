@@ -205,11 +205,26 @@ describeDb("retired native backup source authority", () => {
     ["a pending workspace export", { idleWarm: "export_pending" as const }],
     ["a cleanup in flight", { idleWarm: "cleanup_in_flight" as const }],
     ["the same restore target", { idleWarm: "same_target" as const }],
-    // The newest matching owner, not a later timestamp on an older row, wins.
-    ["provider work after the tip's matching checkpoint", { tipStamp: "older_matching" as const,
-      providerEventAt: new Date(completedAt.getTime() - 60_000) }],
   ])("keeps a predecessor-stamped warm backup held with %s", async (_label, options) => {
     await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true, ...options })).resolves.toBe(false);
+    const [tip] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    expect(tip!.metadata).toHaveProperty("reusableSandboxLease");
+    expect(tip!.metadata).not.toHaveProperty("reusableSandboxLeaseSuperseded");
+  });
+
+  // Latest-completedAt rule, RFL 23:52Z: the verified predecessor's matching
+  // 05:02:50 checkpoint contains the 05:01:50 provider work after the tip's 05:00:50 checkpoint.
+  it("authorizes a predecessor-stamped warm backup when its latest completedAt contains provider work after the tip's matching checkpoint", async () => {
+    await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true,
+      tipStamp: "older_matching", providerEventAt: new Date(completedAt.getTime() - 60_000) })).resolves.toBe(true);
+  });
+
+  it.each([
+    ["the later predecessor stamp does not match the manifest", { stampSha: `sha256:${"c".repeat(64)}` }],
+    ["the handoff chain is not verified", { handoffFault: "changed_receipt" as const }],
+  ])("keeps the same latest-completedAt warm backup timeline held when %s", async (_label, options) => {
+    await expect(fixture({ handoffs: 11, predecessorStamp: true, idleWarm: "released", stoppedWarm: true,
+      tipStamp: "older_matching", providerEventAt: new Date(completedAt.getTime() - 60_000), ...options })).resolves.toBe(false);
     const [tip] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
     expect(tip!.metadata).toHaveProperty("reusableSandboxLease");
     expect(tip!.metadata).not.toHaveProperty("reusableSandboxLeaseSuperseded");
