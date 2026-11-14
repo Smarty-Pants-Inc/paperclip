@@ -190,6 +190,94 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("pauses polling between attached runs, quarantines stale requests, and resumes with bounded idle backoff", async () => {
+    vi.useFakeTimers();
+    const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    const previousBackoff = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+    process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = "100";
+    process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS = "800";
+    let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | undefined;
+    try {
+      const queueDir = "/workspace/bridge-lifecycle";
+      const directories = sandboxCallbackBridgeDirectories(queueDir);
+      const requests = new Map<string, string>();
+      const responses = new Map<string, string>();
+      let listCalls = 0;
+      const client: SandboxCallbackBridgeQueueClient = {
+        makeDir: async () => {}, makeDirs: async () => {},
+        listJsonFiles: async (dir) => {
+          if (dir !== directories.requestsDir) return [];
+          listCalls++;
+          return [...requests.keys()];
+        },
+        fileSize: async (file) => Buffer.byteLength(requests.get(path.posix.basename(file)) ?? ""),
+        readTextFile: async (file) => {
+          const body = requests.get(path.posix.basename(file));
+          if (body === undefined) throw new Error("request was quarantined");
+          return body;
+        },
+        writeTextFile: async (file, body) => { responses.set(file, body); },
+        writeResponseFile: async (file, body) => { responses.set(file, body); return { wrote: true }; },
+        rename: async () => {}, remove: async (file) => { requests.delete(path.posix.basename(file)); },
+      };
+      const handled: string[] = [];
+      worker = await startSandboxCallbackBridgeWorker({
+        client, queueDir, pollIntervalMs: 100,
+        handleRequest: async (request) => { handled.push(request.id); return { status: 200, body: "ok" }; },
+      });
+      const lifecycle = worker as typeof worker & { pause(): Promise<void>; resume(): Promise<void> };
+      if (typeof lifecycle.pause !== "function") {
+        const stopping = worker.stop({ drainTimeoutMs: 100 });
+        await vi.advanceTimersByTimeAsync(100);
+        await stopping;
+        expect(lifecycle.pause).toBeTypeOf("function");
+      }
+      const requestFile = (id: string) => `${id}.json`;
+      requests.set(requestFile("run-a"), JSON.stringify({ id: "run-a", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handled).toContain("run-a");
+      await lifecycle.pause();
+      const callsAtPause = listCalls;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(listCalls).toBe(callsAtPause);
+
+      requests.set(requestFile("late-a"), JSON.stringify({ id: "late-a", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
+      await lifecycle.resume();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handled).not.toContain("late-a");
+      expect(JSON.stringify([...responses.values()])).toContain("late-a");
+
+      requests.set(requestFile("run-b"), JSON.stringify({ id: "run-b", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handled).toContain("run-b");
+      await vi.advanceTimersByTimeAsync(800);
+      expect(listCalls).toBeLessThan(20);
+      await lifecycle.pause();
+      const callsWhilePaused = listCalls;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(listCalls).toBe(callsWhilePaused);
+      await lifecycle.resume();
+      requests.set(requestFile("fresh-b"), JSON.stringify({ id: "fresh-b", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handled).toContain("fresh-b");
+      await worker.stop();
+      const callsAfterStop = listCalls;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(listCalls).toBe(callsAfterStop);
+    } finally {
+      if (previousInterval === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = previousInterval;
+      if (previousBackoff === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS = previousBackoff;
+      if (worker && typeof (worker as unknown as { pause?: unknown }).pause !== "function") {
+        const stopping = worker.stop({ drainTimeoutMs: 100 });
+        await vi.advanceTimersByTimeAsync(100);
+        await stopping.catch(() => undefined);
+      }
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
   it("round-trips localhost bridge requests over the sandbox queue without forwarding the bridge token", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-runtime-"));
     cleanupDirs.push(rootDir);
