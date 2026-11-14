@@ -28,6 +28,11 @@ mod skill_edit {
         refresh_admission("contract", "prepared");
     }
 
+    #[test]
+    fn skill_edit_failed_idle_close_keeps_refresh_fresh_refusal() {
+        refresh_admission("close_failure", "refresh_fresh");
+    }
+
     fn refresh_admission(blocker: &str, expected: &str) {
         let provider = if blocker == "deferred_terminal" {
             "pi_rpc"
@@ -80,6 +85,21 @@ mod skill_edit {
                 payload["completionContract"] =
                     json!({"revision":"new-contract", "criterionIds":["objective"]})
             }
+            "close_failure" => {
+                state.goal = Some(SessionGoalSnapshot {
+                    objective: "Old work".to_owned(),
+                    status: "active".to_owned(),
+                    token_budget: None,
+                    tokens_used: 0,
+                    elapsed_seconds: 0,
+                    iterations: 0,
+                    last_reason: None,
+                    created_at: None,
+                    updated_at: None,
+                    completed_at: None,
+                    working_now: false,
+                })
+            }
             _ => unreachable!(),
         }
         old.save_state().unwrap();
@@ -88,6 +108,12 @@ mod skill_edit {
         let mut next = CodexCommandExecutor::new(&directory);
         next.pi_launch_profile = old.pi_launch_profile.clone();
         next.event_identity = Some(prepare_contract_identity("run-B"));
+        if blocker == "close_failure" {
+            // Keep the loaded predecessor but make its durable state destination
+            // a regular file, so the existing close receipt cannot be committed.
+            next.state = old.state.clone();
+            next.state_dir = old.state_path();
+        }
         payload["provider"]["instructions"] = json!("Edited skill: M14_ONLY_NEW_SKILL_MARKER");
         let result = next.execute(&crate::durable::Command {
             schema: "paperclip.prp.command.v1".to_owned(),
