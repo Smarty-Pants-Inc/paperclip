@@ -16029,7 +16029,8 @@ const REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT =
   // The same path rules as the stderr log below: never write through a symlink or into a non-file.
   `if test -n "$stale_pids"; then fence_log="$diagnostics_directory/${REMOTE_RUNNER_PROCESS_STDERR_FILE}"; ` +
   'if test -L "$fence_log" || { test -e "$fence_log" && test ! -f "$fence_log"; }; then fence_log=/dev/null; fi; ' +
-  `node -e "${REMOTE_RUNNER_STALE_LINEAGE_STOP_SCRIPT}" "$1" "$state_dir" $stale_pids 2>>"$fence_log" || exit 75; fi; fi; `;
+  `if ! node -e "${REMOTE_RUNNER_STALE_LINEAGE_STOP_SCRIPT}" "$1" "$state_dir" $stale_pids; then ` +
+  'cat -- "$launch_stderr" >> "$fence_log" || true; exit 75; fi; fi; fi; ';
 
 /**
  * Trace-keep: every launch generation keeps its own durable evidence.
