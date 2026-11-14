@@ -288,7 +288,7 @@ const REFUSALS: RefusalCase[] = [
     apply: async () => { await db.update(agents).set({ status: "paused" }).where(eq(agents.id, responderAgentId)); } },
   { name: "agent terminated", reason: "agent_status", details: { status: "terminated" }, cause: /agent has been terminated/i,
     apply: async () => { await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, responderAgentId)); } },
-  { name: "unavailable document target", reason: "target", cause: /linked to a document or another target.*does not support/i,
+  { name: "unavailable document target", reason: "target", details: { targetReason: "unavailable" }, cause: /exact linked document.*current revision is unavailable/i,
     apply: async input => { await setPayload(input, { target: { type: "issue_document", issueId: input.issueId,
       documentId: randomUUID(), key: CANARY, revisionId: randomUUID(), revisionNumber: 1, label: CANARY } }); } },
   { name: "governed tool action", reason: "tool_action", cause: /governed tool action.*independent authorization/i,
