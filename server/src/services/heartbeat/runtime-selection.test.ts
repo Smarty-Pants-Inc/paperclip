@@ -686,6 +686,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(JSON.stringify(answer.prompts)).toContain("Remember the word ALDER-B");
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
     const notes = allNotes.filter(c => !c.metadata?.supersededByCommentId);
+    expect(allNotes).toHaveLength(shape === "proof-arrives" ? 2 : 1);
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toContain("Starting a fresh thread");
     await settleUnrecoverableExecutions(db); await settleUnrecoverableExecutions(db);
@@ -695,6 +696,20 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issue.id)))
       .filter(action => ["active", "escalated"].includes(action.status))).toEqual([]);
   }, 60000);
+
+  it.each(["released", "expired"])("F1b never erases historical stop evidence even when its binding is incomplete (%s)", async status => {
+    const f = await piFixture();
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: f.run.id,
+      issueId: f.issue.id, provider: "boat", providerLeaseId: "historical-receipt", status, cleanupStatus: "success",
+      releasedAt: new Date(), metadata: { pluginId: "fixture-boat", remoteExecutionTermination: {
+        schema: "paperclip.remote-termination.v1", providerLeaseId: "historical-receipt", state: "stopped" } } }).returning();
+    const { prepareHistoricalSandboxStopVerification, prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop }
+      = await import("../sandbox-stop-and-retain.js");
+    expect(await prepareHistoricalSandboxStopVerification(db, lease)).toBeNull();
+    expect(await prepareUnconfirmedSourceSandboxStop(db, lease)).toBeNull();
+    expect(await retryUnconfirmedSourceSandboxStop(db, lease)).toBeNull();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+  });
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
   // These exercise the durable disposition -> mint -> history -> executor answer,

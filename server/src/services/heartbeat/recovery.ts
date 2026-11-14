@@ -31,6 +31,7 @@ import { createHeartbeatAgentStatus } from "./agent-status.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { preserveCancelledNativeWorkspaces, preserveOrphanedNativeWorkspace } from "../native-runtime/native-failed-workspace-recovery.js";
 import { nativeWorkspaceExportPendingForLease, pendingNativeWorkspaceFinalizationCondition } from "../native-runtime/native-workspace-finalization-state.js";
+import { hasNativeWorkspaceExportResume } from "../native-runtime/native-workspace-export-resume.js";
 import { expireAbandonedWorkspaceFileHoldsWhenDue, parkAbandonedWorkspaceFilesLease, recordAbandonedWorkspaceFilesRemoved } from "../remote-workspace-abandoned-files-hold.js";
 import { stopWarmSandboxesPastWindowWhenDue } from "../warm-sandbox-expiry.js";
 import { CHAT_COMPLETION_WAKE_REASON } from "../chat-completion-delivery.js";
@@ -52,7 +53,7 @@ import {
 } from "../legacy-controller-lease.js";
 import { proveOwnerGone } from "../owner-proof.js";
 import { preparingControllerOwnerStamp } from "../native-runtime/native-owner-stamps.js";
-import { remoteTerminationReceipt } from "../remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
@@ -99,7 +100,7 @@ import {
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
 } from "../native-runtime/index.js";
-import { settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
+import { settleStoppedObservedNativeOwner, settleUnstartedNativeSessionResume } from "../native-runtime/native-failed-run-owner-release.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
@@ -1881,12 +1882,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           // Tear the sandbox down from the recorded provider config and the
           // cleanup-authorized secret versions. Preserve any provider receipt;
           // a completed retry must grant the same evidence as initial cleanup.
-          const receipt = await environmentRuntime.retryPendingSandboxTeardown({
-            environment,
-            lease,
-          });
+          // Read the recorded allocation before re-dispatching an unconfirmed
+          // stop. This is the existing cleanup owner, outside admission's
+          // transaction. A fresh exact stopped/destroyed observation settles
+          // through the same attempt-fenced owner; unknown/mismatched answers
+          // grant nothing and the ordinary bounded stop retry still runs.
+          const observation = hasStopOnlyCleanup(lease) && !hasNativeWorkspaceExportResume(lease) && !hasRemoteTerminationReceipt(lease)
+            && environmentRuntime.inspectLeaseResource
+            ? await environmentRuntime.inspectLeaseResource(lease.id).catch(() => undefined) : undefined;
+          const observedReceipt = remoteTerminationReceipt(lease, observation);
+          const receipt = observedReceipt ?? await environmentRuntime.retryPendingSandboxTeardown({ environment, lease });
           const released = hasStopOnlyCleanup(lease)
-            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt })
+            ? await settleStopOnlyCleanup(db, lease, { attemptId: claimed, receipt,
+              ...(observedReceipt ? { receiptSource: "inspection" as const } : {}) })
             : await environmentsSvc.releaseLease(lease.id, "expired", {
             expectedPendingCleanupAttemptId: claimed,
             cleanupStatus: "success",
@@ -2556,6 +2564,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             run.nativePhase === "observed")) &&
         !resumedRunIds.has(run.id) &&
         !locallyTracked;
+      const observedIssueId = run.nativeIssueId ?? run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+      if (observedOwnerUnverified && observedIssueId && !nativeProcessPidAlive && !nativeProcessGroupAlive
+        && await settleStoppedObservedNativeOwner(db, { companyId: run.companyId, issueId: observedIssueId, runId: run.id })) {
+        // The existing owner proved the exact provider stopped; do not rewrite
+        // its lease or manufacture a provider result. Release the stale task
+        // pointer through the ordinary queue owner so saved person wakes run.
+        await releaseIssueExecutionAndPromote(run);
+        await finalizeAgentStatus(run.agentId, "failed", "The earlier provider attempt stopped without a result.", {
+          wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+        });
+        await startNextQueuedRunForAgent(run.agentId);
+        reaped.push(run.id);
+        continue;
+      }
       // Persisted numeric process identifiers prove only that some process is
       // alive, not that Paperclip still owns it. Likewise an observed native
       // coordinator without a live in-process execution has no durable proof

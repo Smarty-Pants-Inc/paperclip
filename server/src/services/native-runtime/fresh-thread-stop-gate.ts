@@ -11,6 +11,7 @@ import { isBuiltinSandboxProvider } from "../sandbox-provider-runtime.js";
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
 import { hostname } from "node:os";
 import { isInstructionRefreshPrepareCode } from "../../vendor/paperclip-runner/index.js";
+import { settleStoppedObservedNativeOwner } from "./native-failed-run-owner-release.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 export const FRESH_THREAD_STOP_UNAVAILABLE_NOTE = "Paperclip cannot confirm that the earlier attempt stopped, so it has not started another thread. Your message and saved work are kept. Retry checks again and starts fresh only after the earlier attempt is confirmed stopped.";
@@ -71,6 +72,7 @@ type ProofReader = Pick<Db, "select" | "selectDistinctOn">;
 type StopGateEffects = {
   notice(body: string): Promise<unknown>;
   requestStop(lease: typeof environmentLeases.$inferSelect): Promise<unknown>;
+  settleObservedOwner(runId: string): Promise<boolean>;
   record(state: "waiting" | "unavailable" | "gone"): Promise<unknown>;
 };
 
@@ -86,6 +88,7 @@ export function readFreshThreadStopProof(db: ProofReader, run: typeof heartbeatR
 export function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string, retryStop = false) {
   return inspectFreshThreadStopProof(tx, run, issueId, {
     notice: body => writeFreshThreadNotice(tx, run, issueId, body),
+    settleObservedOwner: runId => settleStoppedObservedNativeOwner(tx, { companyId: run.companyId, issueId, runId }),
     requestStop: lease => retryStop ? retryUnconfirmedSourceSandboxStop(tx, lease) : prepareUnconfirmedSourceSandboxStop(tx, lease),
     record: state => tx.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
       ${`{${FRESH_THREAD_STOP_STATE_KEY}}`}, ${JSON.stringify({ schema: "paperclip.fresh-thread-stop.v1", state })}::jsonb)` })
@@ -106,7 +109,15 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
   // Legacy rows may bind their issue only through issueId/contextSnapshot.
   // Never lose the contender's recorded local process from the owner proof.
   if (!owners.some(owner => owner.id === run.id)) owners.push(run);
-  // A live earlier turn owns the conversation. Do not even request its stop.
+  // A result-less observed predecessor can outlive its expired claim even
+  // after cleanup recorded the exact provider stop. Only its existing owner
+  // may settle it, rechecking claim, receipts, processes and workspace fences.
+  // Read-only consumers never settle; a live/queued turn still owns the task.
+  for (const owner of owners) {
+    if (owner.id !== run.id && owner.status === "running" && await effects?.settleObservedOwner(owner.id)) {
+      owner.status = "failed";
+    }
+  }
   if (owners.some(owner => owner.id !== run.id && ["running", "queued", "scheduled_retry"].includes(owner.status))) {
     await effects?.record("waiting");
     await effects?.notice(turnWaitingNote(run));
@@ -147,12 +158,10 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
       eq(environmentLeases.provider, lease.provider!), eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
       sql`${environmentLeases.id} <> ${lease.id}`, inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]))).limit(1);
     if (peers.length) { gone = false; unavailable = true; continue; }
-    const termination = lease.metadata?.remoteExecutionTermination as { confirmedAt?: unknown } | undefined;
-    const confirmedAt = typeof termination?.confirmedAt === "string" ? Date.parse(termination.confirmedAt) : NaN;
-    const confirmedRelease = hasRemoteTerminationReceipt(lease) && Number.isFinite(confirmedAt)
-      && confirmedAt >= lease.acquiredAt.getTime() && lease.releasedAt !== null && confirmedAt <= lease.releasedAt.getTime()
-      && lease.metadata?.pendingCleanupInFlight !== true;
-    if (hasConfirmedSandboxStopAndRetain(lease) || confirmedRelease) continue;
+    // Cleanup's allocation-bound release receipt is the authority. Do not
+    // reinterpret its recording timestamp here or re-request a completed stop:
+    // that would erase the very proof this gate is supposed to consume.
+    if (hasConfirmedSandboxStopAndRetain(lease) || hasRemoteTerminationReceipt(lease)) continue;
     gone = false;
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void

@@ -31,6 +31,7 @@ import { persistHeartbeatRunProcessMetadata } from "./run-lifecycle.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { hasNativeLocalProcessStop, PROCESS_START_REQUESTED, releaseSettledNativeRunProcess } from "../native-local-process-stop.js";
 import { legacyControllerBootId } from "../legacy-controller-lease.js";
+import { prepareUnconfirmedSourceSandboxStop } from "../sandbox-stop-and-retain.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 
@@ -620,6 +621,32 @@ describePostgres("heartbeat recovery module ownership", () => {
     },
   );
 
+  it("F1b releases saved chat wakes through the queue owner after an observed allocation stopped", async () => {
+    // A remote PID may collide with this live host's PID. Never probe/signal it.
+    const f = await nativeProcessFixture(process.pid, "remote", "running");
+    await db.update(nativeRunFinalizations).set({ phase: "observed", attempt: 2,
+      leaseOwner: "stranded-owner", leaseExpiresAt: new Date(0) }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.run.companyId, heartbeatRunId: f.run.id,
+      issueId: f.run.issueId, provider: "boat", providerLeaseId: `f1b-${f.run.id}`, status: "released",
+      cleanupStatus: "success", releasedAt: new Date() }).returning();
+    await db.update(environmentLeases).set({ metadata: { remoteExecutionTermination:
+      remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, lease.id));
+    const [before] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    try {
+      expect(await createHeartbeatRecovery(db, f.deps).reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [f.run.id] });
+      expect(await f.current()).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
+      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }));
+      expect(f.deps.executeRun).not.toHaveBeenCalled();
+      expect(f.deps.terminateHeartbeatRunProcess).not.toHaveBeenCalled();
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
+    } finally {
+      await db.delete(activityLog).where(eq(activityLog.runId, f.run.id));
+      await db.delete(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      await f.cleanup();
+    }
+  });
+
   it.each(["unknown", "remote"] as const)("exposes expired observed %s ownership without attributing host liveness", async target => {
     const child = await ownedProcess();
     const f = await nativeProcessFixture(child.pid, "remote", "running");
@@ -1169,6 +1196,55 @@ describePostgres("heartbeat recovery module ownership", () => {
       expect((await environmentService(db).getLeaseById(f.lease.id))!).toMatchObject({ status: "released", cleanupStatus: "success" });
       expect(stop).toHaveBeenCalledOnce(); expect(destroy).not.toHaveBeenCalled();
     } finally { await deleteShutdownSource(f); }
+  });
+
+  it.each(["stopped", "destroyed", "active", "unknown", "wrong_allocation", "read_error"] as const)(
+    "F1b unconfirmed cleanup consumes only an exact fresh provider stop (%s)", async shape => {
+    const run = await seedRun();
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+    const [source] = await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      issueId: run.issueId, provider: "boat", providerLeaseId: `f1b-${run.id}`, status: "pending_cleanup",
+      cleanupStatus: "failed", leasePolicy: "reuse_by_environment", metadata: { driver: "sandbox", pluginId: "fixture-boat",
+        pendingCleanupController: { attemptId: "old-attempt", pid: 123, processStartedAt: "2026-11-14T11:49:42Z" } } }).returning();
+    const prepared = await prepareUnconfirmedSourceSandboxStop(db, source);
+    expect(prepared?.metadata?.pendingCleanupController).toBeUndefined();
+    const inspect = vi.fn(async () => {
+      if (shape === "read_error") throw new Error("provider unavailable");
+      return { providerLeaseId: shape === "wrong_allocation" ? "another-box" : source.providerLeaseId!,
+        state: (shape === "wrong_allocation" ? "stopped" : shape) as "stopped" | "destroyed" | "active" | "unknown" };
+    });
+    const stop = vi.fn(async () => undefined);
+    const runtime = environmentRuntimeService(db, { drivers: [{ driver: "sandbox",
+      resolveCapabilities: async () => classifyEnvironmentCapabilities({}),
+      acquireRunLease: async () => { throw new Error("Unexpected acquire"); }, releaseRunLease: vi.fn(),
+      inspectLeaseResource: inspect, retryPendingSandboxTeardown: stop }] });
+    const deps = callbacks(db); deps.environmentRuntime = runtime;
+    try {
+      const recovery = createHeartbeatRecovery(db, deps);
+      // Concurrent cleanup ticks cannot borrow or overwrite the winning claim.
+      await Promise.all([recovery.sweepPendingCleanupLeases({ backoffMs: 0 }), recovery.sweepPendingCleanupLeases({ backoffMs: 0 })]);
+      const lease = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, source.id)))[0];
+      expect(inspect).toHaveBeenCalledOnce();
+      if (shape === "stopped" || shape === "destroyed") {
+        expect(stop).not.toHaveBeenCalled();
+        expect(lease).toMatchObject({ status: "released", cleanupStatus: "success", metadata: {
+          remoteExecutionTermination: { companyId: run.companyId, runId: run.id, leaseId: source.id,
+            provider: "boat", providerLeaseId: source.providerLeaseId, state: shape } } });
+        expect(hasRemoteTerminationReceipt(lease)).toBe(true);
+        expect(lease.metadata?.sandboxStopAndRetain).toBeUndefined();
+        expect(lease.metadata?.sandboxStopAndRetainReceipt).toBeUndefined();
+        // The existing receipt is final: neither another inspection nor another
+        // sweep may request a stop or rewrite any field of this row.
+        expect(await runtime.inspectLeaseResource(lease.id)).toBeUndefined();
+        await recovery.sweepPendingCleanupLeases({ backoffMs: 0 });
+        expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, source.id)))[0]).toEqual(lease);
+        expect(inspect).toHaveBeenCalledOnce();
+      } else {
+        expect(stop).toHaveBeenCalledOnce();
+        expect(lease).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed" });
+        expect(hasRemoteTerminationReceipt(lease)).toBe(false);
+      }
+    } finally { await db.delete(environmentLeases).where(eq(environmentLeases.id, source.id)); }
   });
 
   it("waits for a claimed ordinary cleanup attempt before converting its shutdown source", async () => {

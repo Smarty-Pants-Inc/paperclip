@@ -25,6 +25,10 @@ const REFUSAL = new RegExp("(?:^|[\\s:])(?:"
   + "native_controller_recovery_missing_evidence:retained_sandbox_binding\\b"
   + "|native_controller_recovery_unsupported:\\S"
   + "|native_session_cleanup_quarantined\\b"
+  // Reserved harness diagnostics are not generic continuation authority.
+  // Only the closed typed classifier above can authorize the fresh boundary;
+  // prose lookalikes and future/unknown suffixes must remain refused.
+  + "|runner_harness_state_mismatch:"
   + "|runner_process_termination_unconfirmed\\b"
   + "|native_runner_warm_attachment_runner_exited\\b"
   + "|runner_state_identity_mismatch: (?:legacy_)?prior_owner_\\w"
