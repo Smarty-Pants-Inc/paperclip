@@ -6290,6 +6290,19 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(anchor("bprime-no-run-notice")!.textContent).toContain(BPRIME_NO_RUN);
     });
 
+    it("hides a superseded no-run notice from the live thread without deleting its history row", () => {
+      const notice = {
+        ...bPrimeNoRunNotice(5),
+        metadata: { ...bPrimeNoRunNotice(5).metadata, supersededBy: "answer-comment" },
+      };
+      const comments = [personMessage("person-message", "Please continue.", 0), notice];
+      paint({ comments, linkedRuns: [], issueStatus: "in_progress" });
+      expect(anchor("bprime-no-run-notice")).toBeNull();
+      expect(comments).toContain(notice);
+      expect(notice.deletedAt).toBeNull();
+      expect(notice.metadata.supersededBy).toBe("answer-comment");
+    });
+
     it("(b) hides the same comment when recoveryResponsibility is 'system' (upstream's filter kept)", () => {
       paint({ comments: [personMessage("person-message", "Please continue.", 0), bPrimeNotice(5, { recoveryResponsibility: "system" })],
         linkedRuns: [failedRun] });
