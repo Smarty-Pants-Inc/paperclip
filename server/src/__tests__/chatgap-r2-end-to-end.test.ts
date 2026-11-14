@@ -81,7 +81,7 @@ suite("chat-gap round-2 production path", () => {
     expect(record).toBeUndefined();
   }
 
-  it.each(["todo", "in_progress", "blocked"] as const)("selector -> fallback -> real queue delivers one unanswered %s chat", async status => {
+  it.each(["todo", "in_progress", "blocked"] as const)("selector -> fallback -> real queue refuses a continuation for unanswered %s chat", async status => {
     const f = await seed(status);
     await finalize(f);
     const heartbeat = heartbeatService(db);
@@ -96,7 +96,7 @@ suite("chat-gap round-2 production path", () => {
     await assertNoContinuation(f);
   }, 60_000);
 
-  it("fallback -> delivery -> real queue admits an unanswered in_review chat once", async () => {
+  it("fallback -> delivery -> real queue refuses a continuation for unanswered in_review chat", async () => {
     const f = await seed("in_review");
     await finalize(f);
     await occupySlot(f);
