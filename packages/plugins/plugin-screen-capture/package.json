@@ -1,0 +1,14 @@
+{
+  "name": "@smarty-pants/plugin-screen-capture",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fail-closed screen.capture policy, atomic message claim and stub recorder",
+  "paperclipPlugin": { "manifest": "./manifest.mjs", "worker": "./worker.mjs" },
+  "scripts": {
+    "build": "node --check worker.mjs && node --check capture.mjs && node --check sql.mjs && node --check manifest.mjs",
+    "test": "bash test/run-postgres-tests.sh"
+  },
+  "dependencies": { "@paperclipai/plugin-sdk": "workspace:*" },
+  "engines": { "node": ">=24.11.0" }
+}
