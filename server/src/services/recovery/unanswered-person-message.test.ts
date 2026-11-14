@@ -705,6 +705,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toBe(WAITING);
     expect(notices[0]!.presentation).toMatchObject({ title: "Your message is waiting to start" });
+    // RFL 20:36Z: the waiting note is written open (systemNoticePresentation).
+    expect(notices[0]!.presentation).toMatchObject({ detailsDefaultOpen: true });
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
     await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
