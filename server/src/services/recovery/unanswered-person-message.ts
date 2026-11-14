@@ -55,11 +55,15 @@ const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
+/** The run that carries the message is queued or scheduled and has not started. */
+export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
+export const UNANSWERED_MESSAGE_WAITING_TEXT =
+  "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 
@@ -436,24 +440,31 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: run?.id ?? null } } : {}) };
   };
 
-  // A turn in progress keeps an unbounded wait (a quiet healthy turn is never
-  // noticed): a run that is running on this task, or any live run (queued,
-  // running, scheduled retry) that carries the message. A running turn that
-  // does not carry it still unbounded: a person's message that arrives during
-  // a long turn waits for that turn to end, when its deferred wake is promoted.
-  // Any other live run (queued or scheduled, not carrying it) is bounded.
+  // Only a turn IN PROGRESS keeps an unbounded wait (a quiet healthy turn is
+  // never noticed): a run that is RUNNING on this task, carrying the message
+  // or not (a person's message that arrives during a long turn waits for that
+  // turn to end, when its deferred wake is promoted). A hung running run is
+  // still caught by Paperclip's silent active-run watchdog
+  // (modules/active-run-watchdog/application/use-cases.ts:332
+  // scanSilentActiveRuns; doc/execution-semantics.md §12). A QUEUED or
+  // scheduled run, carrying the message or not, is bounded: one that is never
+  // claimed (the agent's slots are full, or its claim is refused) must not keep
+  // the person silent. When the run that waits carries the message, the note
+  // says it is waiting to start, not that it failed.
   const live = runs.filter(candidate => LIVE.includes(candidate.status));
   const [otherLive] = live.length ? [] : await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
     contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     inArray(heartbeatRuns.status, LIVE))).limit(1);
   const liveRuns = otherLive ? [...live, otherLive] : live;
-  if (liveRuns.some(candidate => candidate.status === "running" || runCarriesMessage(candidate.contextSnapshot, message.id))) {
+  if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
+  let waitingToStart = false;
   if (liveRuns.length) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
+    waitingToStart = liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id));
   }
 
   // A board-owned hold means nothing moves by itself: queued wakes behind it
@@ -473,7 +484,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   let code: string;
-  if (!run) {
+  if (waitingToStart) {
+    code = UNANSWERED_MESSAGE_WAITING_CODE;
+  } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
@@ -546,21 +559,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (explained) return { kind: "explained" };
 
   const held = HELD_CODES.has(code);
-  const body = code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
+  const waiting = code === UNANSWERED_MESSAGE_WAITING_CODE;
+  const body = waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
-      tone: "warning",
-      nextAction: held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
+      tone: waiting ? "info" : "warning",
+      nextAction: waiting ? "No action is needed; it will start by itself."
+        : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
-    sourceRun: run ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
-    failureCode: run ? undefined : code,
+    sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
+    failureCode: run && !waiting ? undefined : code,
   });
   return { kind: "notice", reason, code, notice };
 }
