@@ -6330,17 +6330,15 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
     const noticeToggle = (id: string) => anchor(id)?.querySelector<HTMLButtonElement>("button[aria-expanded]") ?? null;
     const noticeDetails = (id: string) => anchor(id)?.querySelector('[data-testid="task-chat-system-notice-details"]') ?? null;
     const labelledSuperseded = (id: string) => (noticeToggle(id)?.textContent ?? "").includes("· Superseded");
-    // RFL M1.5 F1: a chat (conversationMode, no expand control, as IssueDetail mounts it) has no other history,
-    // so there a superseded note stays in place as a collapsed "· Superseded" row instead of being dropped.
+    // RFL M1.5 F1, and the ruling of 13:50Z: a note leaves compact history ONLY where an expand control can show it.
+    // These paints have no expand control (a chat as IssueDetail mounts it, or a short task with nothing earlier),
+    // so in both views the superseded note stays in place as a collapsed "· Superseded" row instead of being dropped.
     const expectOffLiveView = (id: string, text: string) => {
-      if (conversationMode) {
-        expect(anchor(id), "a chat keeps the kept note reachable").not.toBeNull();
-        expect(labelledSuperseded(id), "labelled superseded, not current").toBe(true);
-        expect(noticeDetails(id), "collapsed").toBeNull();
-        expect(container.textContent).not.toContain(text);
-      } else {
-        expect(anchor(id)).toBeNull();
-      }
+      expect(container.textContent, "no expand control on screen").not.toMatch(/More messages|More run output/);
+      expect(anchor(id), "with no expand control the kept note stays reachable").not.toBeNull();
+      expect(labelledSuperseded(id), "labelled superseded, not current").toBe(true);
+      expect(noticeDetails(id), "collapsed").toBeNull();
+      expect(container.textContent).not.toContain(text);
     };
 
     it("hides a notice marked only by supersededByInteractionId from live chat and retains its history row", () => {
@@ -6384,14 +6382,11 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
         const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
         const rendered = () => comments.filter(comment => anchor(comment.id) !== null).map(comment => comment.id);
         paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true });
-        if (conversationMode) {
-          // RFL M1.5 F1: in a chat the kept note stays as a collapsed "· Superseded" row; ONE note reads as current.
-          expect(rendered().filter(id => !labelledSuperseded(id)), "live view: exactly ONE held note reads as current").toEqual([current[0]!.id]);
-          expect(labelledSuperseded(superseded.id)).toBe(true);
-          expect(noticeDetails(superseded.id), "collapsed").toBeNull();
-        } else {
-          expect(rendered(), "live view: exactly ONE held note, the current one").toEqual([current[0]!.id]);
-        }
+        // RFL M1.5 F1 and 13:50Z: no expand control here (either view), so the kept note stays as a collapsed
+        // "· Superseded" row; ONE note reads as current.
+        expect(rendered().filter(id => !labelledSuperseded(id)), "live view: exactly ONE held note reads as current").toEqual([current[0]!.id]);
+        expect(labelledSuperseded(superseded.id)).toBe(true);
+        expect(noticeDetails(superseded.id), "collapsed").toBeNull();
         paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: false });
         expect(rendered(), "expanded history: the kept superseded row is reachable").toContain(superseded.id);
         expect(rendered()).toContain(current[0]!.id);
@@ -6442,6 +6437,55 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
         expect(labelledSuperseded(current.id), "the current row is not").toBe(false);
         expect(noticeToggle(superseded.id)!.textContent, "the two rows can be told apart").not.toBe(noticeToggle(current.id)!.textContent);
         expect(noticeDetails(superseded.id), "collapsed").toBeNull();
+      });
+
+      // RFL ruling 13:50Z: a note is dropped from compact history ONLY where an expand control can show it. A short
+      // task (nothing earlier: IssueDetail.tsx:2660 gives historyControl null because hasEarlierMessages and
+      // hasEarlierRuns are false; no deferred or truncated run output, so TaskChatThread renders no "More run output")
+      // has no control, so the note must stay in place, collapsed and labelled.
+      it.skipIf(conversationMode)(`short task, real page props, no expand control (${name}): the superseded note stays reachable as a collapsed '· Superseded' row`, () => {
+        const comments = heldNoteComments(rows);
+        const current = comments.find(comment => isCurrentNotice(comment.metadata))!;
+        const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
+        const onExpandHistory = vi.fn();
+        paint({ comments: comments as never, linkedRuns: [], issueStatus: "blocked", compactHistory: true, onExpandHistory, historyControl: null });
+        expect(Array.from(container.querySelectorAll("button")).map(button => button.textContent ?? "")
+          .filter(text => /More messages|More run output/.test(text)), "no expand control on screen").toEqual([]);
+        expect(anchor(superseded.id), "the kept superseded note is reachable in a short task").not.toBeNull();
+        expect(labelledSuperseded(superseded.id), "it reads as superseded, not current").toBe(true);
+        expect(noticeToggle(superseded.id)!.getAttribute("aria-expanded"), "collapsed").toBe("false");
+        expect(noticeDetails(superseded.id), "details closed until opened").toBeNull();
+        expect(noticeToggle(superseded.id)!.textContent, "no Try again on a superseded row").not.toContain("Try again");
+        expect(anchor(superseded.id)!.textContent, "no Try again on a superseded row").not.toContain("Try again");
+        expect(anchor(current.id)).not.toBeNull();
+        expect(labelledSuperseded(current.id), "the current note carries no Superseded label").toBe(false);
+        expect(comments.filter(comment => anchor(comment.id) !== null && !labelledSuperseded(comment.id)).map(comment => comment.id),
+          "exactly ONE note reads as current").toEqual([current.id]);
+        flushSync(() => noticeToggle(superseded.id)!.click());
+        expect(noticeDetails(superseded.id), "its text is one click away").not.toBeNull();
+        expect(onExpandHistory).not.toHaveBeenCalled();
+      });
+
+      // The other side of the same rule: when the thread's own "More run output" control renders (a run truncated
+      // under compact history, TaskChatThread.tsx historyControl), the note leaves compact history, as before.
+      it.skipIf(conversationMode)(`task with a "More run output" control (${name}): the superseded note leaves compact history until expanded`, () => {
+        const comments = heldNoteComments(rows);
+        const current = comments.find(comment => isCurrentNotice(comment.metadata))!;
+        const superseded = comments.find(comment => !isCurrentNotice(comment.metadata))!;
+        transcriptState.truncatedRunIds.add("long-run");
+        const longRun = { runId: "long-run", agentId: "agent", status: "succeeded", adapterType: "claude_local", runtimeMode: "legacy" as const,
+          createdAt: "2025-01-01T10:00:00Z", startedAt: "2025-01-01T10:00:00Z", logBytes: 100_000 };
+        let expanded = false;
+        const repaint = () => paint({ comments: comments as never, linkedRuns: [longRun] as never, issueStatus: "blocked", compactHistory: !expanded,
+          onExpandHistory: () => { expanded = true; repaint(); }, historyControl: null });
+        repaint();
+        const control = Array.from(container.querySelectorAll("button")).find(button => button.textContent === "More run output");
+        expect(control, "the thread's own expand control renders").toBeDefined();
+        expect(anchor(superseded.id), "off compact history: the control can show it").toBeNull();
+        expect(anchor(current.id)).not.toBeNull();
+        flushSync(() => control!.click());
+        expect(anchor(superseded.id), "reachable after expanding").not.toBeNull();
+        expect(labelledSuperseded(superseded.id)).toBe(true);
       });
     }
 
