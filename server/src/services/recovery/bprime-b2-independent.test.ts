@@ -55,7 +55,7 @@ describe.skipIf(!support.supported)('B2 independent verdict and lifetime',()=>{
   if(end==='held')await f.refusal(160000);else await f.reply(160000);
   await f.sweep(180000);await f.sweep(190000);await save('late-'+end,f);
   const all=await f.history(),kept=all.find(n=>n.id===first.id)!;
-  expect(kept.body).toBe(first.body);expect((kept.metadata as Record<string,unknown>).supersededBy).toBeTruthy();
+  expect(kept.body).toBe(first.body);expect((kept.metadata as unknown as Record<string,unknown>).supersededBy).toBeTruthy();
   expect(await f.current()).toHaveLength(end==='held'?1:0);expect(all.some(n=>SAFE.test(n.body))).toBe(false);
  });
  it('direct retained_sandbox_binding refusal does not defer',async()=>{
