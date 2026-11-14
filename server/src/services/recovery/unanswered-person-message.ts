@@ -2,6 +2,7 @@ import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-o
 import {
   activityLog,
   agentWakeupRequests,
+  agents,
   heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
@@ -65,7 +66,19 @@ export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
 export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
 /** The non-failure marker row of a waiting note (no "Failure code" row). */
 const WAITING_ROW_LABEL = "Waiting code";
-const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL, value: "waiting_to_start" }] }]);
+const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
+/** The agent that answers the conversation is paused (or held) and will not
+ * run until it is resumed. Not a failure: a waiting-kind note. */
+export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused"]);
+/** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
+ * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
+ * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
+ * assertAgentLifecycleAuthority / assertCanManageSubordinateAgent). */
+export function agentPausedText(name: string) {
+  return `${name} is paused. Your message is saved, and it will run when ${name} is resumed. `
+    + `A board user or ${name}'s manager can resume ${name}.`;
+}
 
 export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
@@ -412,13 +425,16 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,
-    waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)` })
+    waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
+    waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
+      jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
+  const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
@@ -487,8 +503,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (liveRuns.some(candidate => candidate.status === "running")) {
     return { kind: "pending", recheckAt: now.getTime() + 30_000 };
   }
+  // The agent is paused (Paperclip's lifecycle: status paused, lifecycle state
+  // paused/pausing, or a lifecycle hold such as "manual"): nothing runs until
+  // it is resumed, so "sending it again" would do nothing. The note says it is
+  // paused and who can resume it; it stays a waiting-kind note, so after the
+  // resume the saved message's own run decides (its answer supersedes it).
+  const [agentRow] = await q.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
+    lifecycleHolds: agents.lifecycleHolds }).from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
+  const agentPaused = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
+    || (agentRow.lifecycleHolds ?? []).length > 0));
+  if (agentPaused) {
+    const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
+    if (due > now.getTime()) return { kind: "pending", recheckAt: due };
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+      return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
+    }
+  }
   let waitingToStart = false;
-  if (liveRuns.length) {
+  if (liveRuns.length && !agentPaused) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
     waitingToStart = liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id));
@@ -500,7 +532,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  if (!boardHold) {
+  if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
@@ -519,12 +551,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
   let code: string;
-  if (waitingToStart) {
+  if (agentPaused) {
+    code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  } else if (waitingToStart) {
     // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
     // carrying run has not started (a dead claim, a stuck queue): failure text.
     const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
     if (startDeadline > now.getTime()) {
-      if (upgrading) return { kind: "pending", recheckAt: startDeadline };
+      if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE) return { kind: "pending", recheckAt: startDeadline };
       code = UNANSWERED_MESSAGE_WAITING_CODE;
     } else {
       code = UNANSWERED_MESSAGE_NO_RUN_CODE;
@@ -598,21 +632,25 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
     sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
     sql`${issueComments.presentation}->>'tone' in ('danger', 'warning')`,
-    sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`)).limit(1);
+    sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`,
+    sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
 
   const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
-  const waiting = code === UNANSWERED_MESSAGE_WAITING_CODE;
-  const body = waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  const pausedName = agentRow?.name?.trim() || "This agent";
+  const waiting = WAITING_KIND_CODES.has(code);
+  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
-      tone: waiting ? "info" : "warning",
-      nextAction: waiting ? "No action is needed; it will start by itself."
+      tone: paused ? "warning" : waiting ? "info" : "warning",
+      nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+        : waiting ? "No action is needed; it will start by itself."
         : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
@@ -622,7 +660,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
     failureCode: waiting ? undefined : run ? undefined : code,
   });
-  if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, UNANSWERED_MESSAGE_WAITING_CODE)] });
+  if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
