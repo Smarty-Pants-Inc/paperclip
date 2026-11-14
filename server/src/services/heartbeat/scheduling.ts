@@ -640,6 +640,57 @@ export function createHeartbeatScheduling(
     }
   }
 
+  async function readIssueMonitorPause(companyId: string, agentId: string) {
+    const [row] = await db.select({ name: agents.name, status: agents.status,
+      pauseReason: agents.pauseReason, holds: agents.lifecycleHolds, companyStatus: companies.status })
+      .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
+      .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
+    return {
+      paused: row?.status === "paused" || row?.companyStatus === "paused",
+      importOnly: row?.companyStatus === "active" && row.status === "paused" && row.pauseReason === "import"
+        && row.holds.every(hold => hold === "import"),
+      name: row?.name ?? null,
+    };
+  }
+
+  async function clearSkippedIssueMonitor(
+    claimed: IssueMonitorDispatchRow,
+    input: Parameters<typeof dispatchClaimedIssueMonitor>[1],
+    policy: ReturnType<typeof normalizeIssueExecutionPolicy>,
+    reason: string,
+    pausedAgentName: string | null,
+  ) {
+    const publications: ActivityPublication[] = [];
+    await db.transaction(async tx => {
+      await notifyIssueReviewState(tx, { companyId: claimed.companyId, issueId: claimed.id });
+      const cleared = await tx.update(issues).set({
+        ...monitorOnlyDispatchPatch(buildIssueMonitorClearedPatch({
+          issue: claimed, policy, clearReason: "dispatch_skipped", clearedAt: input.now,
+        })),
+        updatedAt: new Date(),
+      }).where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
+      // The successful guarded clear owns its note and activity. A competing
+      // dispatcher, replaced schedule, or later tick cannot publish them again.
+      if (cleared.length === 0) return;
+      if (pausedAgentName) {
+        await insertIssueComment(tx, { companyId: claimed.companyId, issueId: claimed.id,
+          authorType: "system",
+          body: `The scheduled check due at ${claimed.monitorNextCheckAt!.toISOString()} was skipped because ${pausedAgentName} was paused; it won't run again unless re-armed.`,
+        });
+      }
+      await logActivity(tx as unknown as Db, {
+        companyId: claimed.companyId, actorType: input.actorType, actorId: input.actorId,
+        agentId: input.agentId, runId: input.runId, action: "issue.monitor_skipped",
+        entityType: "issue", entityId: claimed.id,
+        details: { identifier: claimed.identifier, nextCheckAt: claimed.monitorNextCheckAt!.toISOString(),
+          attemptCount: (claimed.monitorAttemptCount ?? 0) + 1, notes: claimed.monitorNotes ?? null,
+          reason, source: input.activitySource },
+      }, publications);
+    });
+    for (const publication of publications) publishActivity(publication);
+    return { outcome: "skipped" as const, reason };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -708,6 +759,17 @@ export function createHeartbeatScheduling(
             "The previous reviewer run reached provider quota. Resume this execution-review stage now that the quota wait has elapsed.",
         }
       : {};
+
+    const pause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
+    if (pause.importOnly && input.clearOnClientError) {
+      await releaseIssueMonitorWithDiagnostic(claimed, input, {
+        action: "issue.monitor_deferred", reason: "import_paused",
+      });
+      return { outcome: "skipped" as const, reason: "import_paused" };
+    }
+    if (pause.paused && input.clearOnClientError) {
+      return clearSkippedIssueMonitor(claimed, input, policy, "Agent is paused", pause.name);
+    }
 
     if (clearReason) {
       return clearIssueMonitorAndRecover({
@@ -872,42 +934,17 @@ export function createHeartbeatScheduling(
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
         if (input.clearOnClientError) {
-          await db.transaction(async tx => {
-            await notifyIssueReviewState(tx, { companyId: claimed.companyId, issueId: claimed.id });
-            await tx
-            .update(issues)
-            .set({
-              ...monitorOnlyDispatchPatch(buildIssueMonitorClearedPatch({
-                issue: claimed,
-                policy,
-                clearReason: "dispatch_skipped",
-                clearedAt: input.now,
-              })),
-              updatedAt: new Date(),
-            })
-            .where(issueMonitorClaimCondition(claimed));
-          });
-
-          await logActivity(db, {
-            companyId: claimed.companyId,
-            actorType: input.actorType,
-            actorId: input.actorId,
-            agentId: input.agentId,
-            runId: input.runId,
-            action: "issue.monitor_skipped",
-            entityType: "issue",
-            entityId: claimed.id,
-            details: {
-              identifier: claimed.identifier,
-              nextCheckAt: scheduledAtIso,
-              attemptCount: nextAttemptCount,
-              notes: claimed.monitorNotes ?? null,
-              reason: err.message,
-              source: input.activitySource,
-            },
-          });
-
-          return { outcome: "skipped" as const, reason: err.message };
+          // Pause may have arrived after the preflight read but before queue
+          // admission. Preserve import intent on that path as well.
+          const currentPause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
+          if (currentPause.importOnly) {
+            await releaseIssueMonitorWithDiagnostic(claimed, input, {
+              action: "issue.monitor_deferred", reason: "import_paused",
+            });
+            return { outcome: "skipped" as const, reason: "import_paused" };
+          }
+          return clearSkippedIssueMonitor(claimed, input, policy, err.message,
+            currentPause.paused ? currentPause.name : null);
         }
       }
       await releaseIssueMonitorWithDiagnostic(claimed, input, {
@@ -928,6 +965,16 @@ export function createHeartbeatScheduling(
             where monitor_finalization.company_id = monitor_run.company_id
               and monitor_finalization.run_id = monitor_run.id
               and monitor_finalization.phase not in ('committed', 'terminal_failure'))))`;
+  }
+
+  function noImportOnlyPausedMonitorAssignee() {
+    // A retained import schedule is not a runnable deadline. Resume/hold
+    // changes notify the existing delivery queue; do not hot-loop while held.
+    return sql`not exists (select 1 from ${agents} monitor_agent
+      where monitor_agent.id = ${issues.assigneeAgentId}
+        and monitor_agent.company_id = ${issues.companyId}
+        and monitor_agent.status = 'paused' and monitor_agent.pause_reason = 'import'
+        and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) <@ '["import"]'::jsonb)`;
   }
 
   async function triggerIssueMonitor(
@@ -1035,7 +1082,8 @@ export function createHeartbeatScheduling(
       .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
         and(
-          eq(companies.status, "active"),
+          inArray(companies.status, ["active", "paused"]),
+          or(eq(companies.status, "paused"), noImportOnlyPausedMonitorAssignee()),
           noActiveNativeMonitorRun(),
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
@@ -1068,6 +1116,9 @@ export function createHeartbeatScheduling(
           .where(
             and(
               eq(issues.id, due.id),
+              // Recheck import eligibility at the claim, not just the scan.
+              or(sql`exists (select 1 from ${companies} monitor_company where monitor_company.id = ${issues.companyId}
+                and monitor_company.status = 'paused')`, noImportOnlyPausedMonitorAssignee()),
               noActiveNativeMonitorRun(),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
@@ -1126,7 +1177,8 @@ export function createHeartbeatScheduling(
     const [row] = await db.select({ at: sql<string | null>`min(greatest(${issues.monitorNextCheckAt},
       ${issues.monitorWakeRequestedAt} + interval '5 minutes' + interval '1 millisecond'))` })
       .from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(and(eq(companies.status, "active"), noActiveNativeMonitorRun(),
+      .where(and(inArray(companies.status, ["active", "paused"]),
+        or(eq(companies.status, "paused"), noImportOnlyPausedMonitorAssignee()), noActiveNativeMonitorRun(),
         sql`${issues.monitorNextCheckAt} is not null`, isNull(issues.assigneeUserId),
         sql`${issues.assigneeAgentId} is not null`, inArray(issues.status, ["in_progress", "in_review"])));
 

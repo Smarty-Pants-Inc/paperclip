@@ -76,7 +76,13 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
       const code = lifecycle.lifecycleFailureCode(error);
       logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
     },
-    transaction: withAccountingTransaction,
+    // Monitor deadlines omit import-only holds. Every lifecycle transaction
+    // (including a hold-only change while already paused) must wake that owner
+    // before mutation so Resume can rediscover the retained overdue schedule.
+    transaction: (database, companyId, work) => withAccountingTransaction(database, companyId, async (tx, publications) => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+      return work(tx, publications);
+    }),
     deleteDependencies: deleteAgentDependencies,
     policyBlocks,
     setAgentBudget: (db, publications, companyId, agentId, amount, userId, isActive) =>
@@ -103,6 +109,7 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, aut
   if (authorize) effects.transaction = (database, companyId, work) =>
     withAccountingTransaction(database, companyId, async (tx, publications) => {
       await authorize(tx);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
       return work(tx, publications);
     });
   return lifecycle.createAgentLifecycle(db, effects);
@@ -138,6 +145,7 @@ export async function applyAgentBudgetHoldInTransaction(tx: Db, companyId: strin
   publications?: ActivityPublication[]) {
   const [before] = await tx.select({ holds: agents.lifecycleHolds }).from(agents)
     .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
+  await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
   const updated = await applyAgentPolicyHoldsInTransaction(tx, createAgentLifecycleEffects(), companyId, agentId, { budget: blocked });
   // A budget pause is a governance stop: record it, and its release, with the
   // reason, in the transaction that applies it.
