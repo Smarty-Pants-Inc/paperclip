@@ -169,9 +169,15 @@ suite("B' waits for the continuation path (Smarty fork, TEMPORARY)", () => {
     await settleB(f.issueId, 3 * 60_000);
     const resend = await message();
     await settleB(f.issueId, 6 * 60_000);
-    const notices = await systemComments(f.issueId);
-    expect(notices.map(n => n.body).filter(body => SAFE.test(body)), "never 'sending again is safe'").toEqual([]);
-    expect(notices, "one note: the resend's note replaces the first").toHaveLength(1);
+    // org 09:18Z / RFL 09:45Z (M1.4): never a vanishing note. The resend's note supersedes the first;
+    // the first stays (not deleted), marked superseded by it; one CURRENT note.
+    const all = await systemComments(f.issueId);
+    expect(all.map(n => n.body).filter(body => SAFE.test(body)), "never 'sending again is safe'").toEqual([]);
+    expect(all, "the superseded note is kept, not deleted").toHaveLength(2);
+    const notices = all.filter(n => !(n.metadata as Record<string, unknown> | null)?.supersededBy);
+    expect(notices, "one current note: the resend's note supersedes the first").toHaveLength(1);
+    const superseded = all.find(n => n.id !== notices[0]!.id)!;
+    expect((superseded.metadata as Record<string, unknown> | null)?.supersededBy).toBe(notices[0]!.id);
     // org 09:11Z: this fixture is a chat, so the held note names a new chat, not a new task.
     expect(notices[0]!.body).toBe("Coder can't continue this chat from its saved state. Start a new chat with Coder; this one stays readable.");
     expect(notices[0]!.presentation).toMatchObject({ title: "This conversation can't continue" });

@@ -183,11 +183,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand", reason: "issue_commented",
       status: "deferred_issue_execution", payload: { issueId: f.issueId } });
     await f.sweep();
-    notices = await f.visible();
+    // org 09:18Z / RFL 09:45Z (M1.4): the first note is kept (never deleted), marked superseded.
+    const all = await f.visible();
+    expect(all, "the superseded first note is kept").toHaveLength(2);
+    notices = all.filter(notice => !(notice.metadata as Record<string, unknown> | null)?.supersededBy);
     expect(notices).toHaveLength(1);
     expect(notices[0]!.body).toBe(CHAT_HELD);
     expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
     expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${second}`);
+    expect((all.find(notice => notice.id !== notices[0]!.id)!.metadata as Record<string, unknown> | null)?.supersededBy).toBe(notices[0]!.id);
   });
 
   it("SMAA-501 (RFL 20:37Z): a comment coalesced into a remote_cleanup execution wait whose wake FAILED -> exactly one notice, at the failure (no timer)", async () => {
