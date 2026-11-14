@@ -74,6 +74,22 @@ describe.skipIf(!support.supported)("continuation comment carry: never re-presen
       .toMatchObject({ commentContinuation: true, wakeCommentIds: [f.message.id], wakeCommentId: f.message.id });
   });
 
+  // RFL's edge (20:06Z): Paperclip's attribution counts an agent comment with no created_by_run_id by time alone, so it
+  // answers every earlier person comment. A run's own failure path never writes one: failures post SYSTEM notices, and a
+  // run's own replies carry its run id (issues.ts addComment createdByRunId from actor.runId). The only agent comment
+  // the server writes without a run is the onboarding greeting (routes/issues.ts:13845).
+  it("(e) an agent comment with no created_by_run_id, newer than the person's comment, answers it: not carried", async () => {
+    const f = await fixture({ status: "failed" });
+    await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.agentId,
+      createdByRunId: null, body: "Answered outside a run.", createdAt: f.at(30_000) });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+    // An older run-less agent comment does not answer a newer person comment.
+    const g = await fixture({ status: "failed" });
+    await db.insert(issueComments).values({ companyId: g.companyId, issueId: g.issueId, authorType: "agent", authorAgentId: g.agentId,
+      createdByRunId: null, body: "Earlier note.", createdAt: g.at(500) });
+    expect(await readContinuationCommentInput(db, { ...g, runId: g.run.id })).toMatchObject({ wakeCommentIds: [g.message.id] });
+  });
+
   it("(d) a SUCCEEDED parent whose response was never published (publication failed or pending retry, or a yield with no visible reply) still carries the comment", async () => {
     const f = await fixture({ status: "succeeded" });
     expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }))
