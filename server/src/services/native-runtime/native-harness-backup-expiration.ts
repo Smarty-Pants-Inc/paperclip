@@ -21,14 +21,13 @@ import { nativeHarnessStateBase } from "./native-harness-backup-stamp.js";
 import { nativeSessionScopeDigestIsBusy } from "./native-session-executor.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
-import { onNativeHarnessBackupChange, type NativeHarnessBackupExpirationScope } from "../native-harness-backup-expiration-notifications.js";
+import { type NativeHarnessBackupExpirationScope } from "../native-harness-backup-expiration-notifications.js";
 import { deleteRetiredNativeHarnessBackup, durableNativeHarnessStorage, nativeHarnessBackupIsExpirable } from "./native-harness-backup-storage.js";
 import { retireObsoleteNativeHarnessBackup } from "./native-harness-backup-retention.js";
 import type { StorageService } from "../../storage/types.js";
 import { releaseExpiredNativeProviderArtifactRun } from "./native-provider-artifacts.js";
 import { retainNativePiConversationEvidence } from "./native-pi-conversation-evidence.js";
 import { nativeSetupScopeDigest } from "./native-setup-evidence.js";
-import { nativeHarnessBackupErrorFields, noteNativeHarnessBackupStalePendingObserved, reportNativeHarnessBackupStalePending } from "./native-harness-backup-observability.js";
 
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS = 60 * 60 * 1000;
 export const NATIVE_HARNESS_BACKUP_EXPIRATION_STARTUP_DELAY_MS = 2 * 60 * 1000;
@@ -44,8 +43,6 @@ const QUARANTINE_PATTERN =
 const QUARANTINE_CLEANUP_PATTERN = /^[0-9a-f]{64}\.identity_indeterminate\.cleanup\./;
 const EXPIRED_PREFIX = ".expired-";
 const RETIRING_PREFIX = ".retiring-";
-const PENDING_STALE_AFTER_MS = 2 * 60 * 60 * 1000;
-const PENDING_WARNING_INTERVAL_MS = NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
 const LIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"];
 const SETTLED_FINALIZATION_PHASES = ["committed", "terminal_failure"];
 const LIVE_LEASE_STATUSES = ["active", "released", "retained", "pending_cleanup"];
@@ -469,117 +466,6 @@ export function nativeHarnessBackupExpirationService(
     checkpointCursor = null;
   }
 
-  const canReportPending = (signal?: AbortSignal) => !signal?.aborted && (defaults.shouldContinue?.() ?? true);
-
-  const lastWarnedAt = new Map<string, number>();
-  async function warnStalePendingOnce(scopeDigest: string, pendingRoot: string,
-    ageMs: number, hasCurrent: boolean, now: number): Promise<void> {
-    const last = lastWarnedAt.get(pendingRoot) ?? 0;
-    if (now - last < PENDING_WARNING_INTERVAL_MS) return;
-    lastWarnedAt.set(pendingRoot, now);
-    reportNativeHarnessBackupStalePending({ scopeDigest, pendingRoot, ageMs, hasCurrent });
-  }
-
-  async function reportStalePending(backupRoot: string, scopeDigest: string, now: number,
-    canContinue = () => true): Promise<{ next: number | null; complete: boolean }> {
-    // The read-only monitor supplies cancellation. Expiration callers already
-    // own their budget/admission checks; do not consume their predicate here.
-    if (!canContinue()) return { next: null, complete: false };
-    if (!(await isRealDirectory(backupRoot))) return { next: null, complete: canContinue() };
-    const hasCurrent = await isRealDirectory(path.join(backupRoot, "current"));
-    if (!canContinue()) return { next: null, complete: false };
-    let next: number | null = null;
-    for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
-      if (!canContinue()) return { next, complete: false };
-      if (!name.startsWith(".pending-")) continue;
-      const pendingRoot = path.join(backupRoot, name);
-      const stat = await fs.lstat(pendingRoot).catch(missingPath);
-      // Never follow links or recover/delete an incomplete capture. A concurrent
-      // publication can remove this name; only inspect entries still present.
-      if (!canContinue()) return { next, complete: false };
-      if (!stat?.isDirectory() || stat.isSymbolicLink()) continue;
-      const ageMs = now - stat.mtimeMs;
-      const dueAt = ageMs > PENDING_STALE_AFTER_MS ? now + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS
-        : Math.ceil(stat.mtimeMs + PENDING_STALE_AFTER_MS + 1);
-      next = next === null ? dueAt : Math.min(next, dueAt);
-      if (ageMs <= PENDING_STALE_AFTER_MS) continue;
-      noteNativeHarnessBackupStalePendingObserved();
-      await warnStalePendingOnce(scopeDigest, pendingRoot, ageMs, hasCurrent, now);
-    }
-    return { next, complete: canContinue() };
-  }
-
-  async function reportStalePendingBackups(signal?: AbortSignal): Promise<{ next: number | null; complete: boolean }> {
-    const base = path.resolve(defaults.stateBase ?? nativeHarnessStateBase());
-    let after: string | undefined;
-    let next: number | null = null;
-    const report = async (backupRoot: string, scopeDigest: string) => {
-      const result = await reportStalePending(backupRoot, scopeDigest, Date.now(), () => canReportPending(signal));
-      if (result.next !== null) next = next === null ? result.next : Math.min(next, result.next);
-      return result.complete;
-    };
-    while (canReportPending(signal)) {
-      const page = await backupScopes(after, 100);
-      for (const scopeDigest of page.names) {
-        if (!canReportPending(signal)) return { next, complete: false };
-        const scopeRoot = path.join(base, scopeDigest);
-        const hasScope = await isRealDirectory(scopeRoot);
-        if (!canReportPending(signal)) return { next, complete: false };
-        if (!hasScope) continue;
-        if (!(await report(path.join(scopeRoot, "failover-backups"), scopeDigest))) return { next, complete: false };
-        if (!canReportPending(signal)) return { next, complete: false };
-        const continuityRoot = path.join(scopeRoot, "continuity-breaks");
-        const hasContinuity = await isRealDirectory(continuityRoot);
-        if (!canReportPending(signal)) return { next, complete: false };
-        if (!hasContinuity) continue;
-        const archives = (await fs.readdir(continuityRoot).catch(missingPath)) ?? [];
-        if (!canReportPending(signal)) return { next, complete: false };
-        for (const archive of archives) {
-          if (!canReportPending(signal)) return { next, complete: false };
-          const archiveRoot = path.join(continuityRoot, archive);
-          const hasArchive = await isRealDirectory(archiveRoot);
-          if (!canReportPending(signal)) return { next, complete: false };
-          if (hasArchive && !(await report(path.join(archiveRoot, "failover-backups"), scopeDigest))) return { next, complete: false };
-        }
-      }
-      if (!canReportPending(signal)) return { next, complete: false };
-      if (page.complete) return { next, complete: true };
-      after = page.names.at(-1);
-    }
-    return { next, complete: false };
-  }
-
-  function registerStalePendingScan(coordinator: ReturnType<typeof createDeliveryWorkCoordinator>) {
-    let next: number | null = null;
-    let unfinishedDiscovery = false;
-    const worker = coordinator.register(DELIVERY_QUEUES.nativeHarnessBackupStalePending, {
-      retryMs: NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS,
-      pausePassiveMaintenance: true,
-      run: async signal => {
-        if (!canReportPending(signal)) return;
-        unfinishedDiscovery = true;
-        try {
-          const scan = await reportStalePendingBackups(signal);
-          // Only a fully completed pass discharges the startup/discovery obligation.
-          if (scan.complete) unfinishedDiscovery = false;
-          next = scan.complete ? scan.next : Date.now() + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
-        } catch (error) {
-          if (!canReportPending(signal)) return;
-          logger.warn({ reason: "stale_pending_scan_failed", ...nativeHarnessBackupErrorFields(error) },
-            "Native harness stale pending backup scan failed");
-          next = Date.now() + NATIVE_HARNESS_BACKUP_EXPIRATION_INTERVAL_MS;
-        }
-      },
-      hasPending: async () => unfinishedDiscovery || !canReportPending(),
-      nextRunAt: () => next,
-      onStop: () => unsubscribe(),
-    });
-    // Capture creation and publication use the existing local backup-change
-    // surface. Startup reconstructs deadlines from disk; empty roots stay quiet.
-    const unsubscribe = onNativeHarnessBackupChange(db, () => worker.wake());
-    return worker;
-  }
-
   async function settleLeftovers(backupRoot: string) {
     const current = path.join(backupRoot, "current");
     for (const name of (await fs.readdir(backupRoot).catch(missingPath)) ?? []) {
@@ -607,7 +493,6 @@ export function nativeHarnessBackupExpirationService(
     };
     const backupRoot = path.join(root, "failover-backups");
     const current = path.join(backupRoot, "current");
-    await reportStalePending(backupRoot, scopeDigest, options.now);
     if (!options.dryRun) await settleLeftovers(backupRoot);
     if (!(await isRealDirectory(current))) return skip("no_backup");
     if (await fs.lstat(path.join(root, "cleanup-activation.json")).then(() => true, () => false)) {
@@ -1041,9 +926,6 @@ export function nativeHarnessBackupExpirationService(
     if (!SCOPE_PATTERN.test(scopeDigest) || !(await isRealDirectory(root))) return null;
     const backupRoot = path.join(root, "failover-backups");
     if (!(await isRealDirectory(backupRoot))) return null;
-    // Startup discovery visits scopes even when no current backup or identity
-    // survived. Report before those early exits and without scheduling a poll.
-    await reportStalePending(backupRoot, scopeDigest, (defaults.now ?? new Date()).getTime());
     if (!defaults.dryRun) await settleLeftovers(backupRoot);
     const current = path.join(backupRoot, "current");
     const stat = await fs.lstat(current).catch(missingPath);
@@ -1088,5 +970,5 @@ export function nativeHarnessBackupExpirationService(
   }
 
   return { tick, noteEvidence, nextEvidenceAt, tickCheckpoints, registerCheckpointExpiration,
-    reportStalePendingBackups, registerStalePendingScan, reconcileBackup, backupScopes, expireBackup, resolveBackupScope };
+    reconcileBackup, backupScopes, expireBackup, resolveBackupScope };
 }

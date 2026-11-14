@@ -203,7 +203,6 @@ describe("GET /health", () => {
       blocked: 2,
       harnessBackupCaptureSkipped: 0,
       harnessBackupCaptureFailed: 0,
-      harnessBackupStalePendingObserved: 0,
     });
   });
 

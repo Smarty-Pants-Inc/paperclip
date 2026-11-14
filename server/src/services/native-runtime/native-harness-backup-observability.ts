@@ -1,12 +1,10 @@
 import { logger } from "../../middleware/logger.js";
 
-// Process-lifetime observation totals, exposed with nativeRecovery in protected
-// health responses. Repeated sightings of the same pending tree count again;
-// these are not a durable inventory or a count of unique lost transcripts.
+// Process-lifetime capture outcome totals, exposed with nativeRecovery in
+// protected health responses; these reset on server restart.
 const counters = {
   harnessBackupCaptureSkipped: 0,
   harnessBackupCaptureFailed: 0,
-  harnessBackupStalePendingObserved: 0,
 };
 
 export function nativeHarnessBackupCounters(): Readonly<typeof counters> {
@@ -48,20 +46,4 @@ export function reportNativeHarnessBackupCapture(input: {
     outcome: input.outcome, reason: input.reason, ...fields }, input.outcome === "skipped"
     ? "Native harness backup capture skipped"
     : "Native harness backup capture failed");
-}
-
-export function noteNativeHarnessBackupStalePendingObserved(): void {
-  counters.harnessBackupStalePendingObserved++;
-}
-
-export function reportNativeHarnessBackupStalePending(input: {
-  scopeDigest: string;
-  pendingRoot: string;
-  ageMs: number;
-  hasCurrent: boolean;
-}) {
-  logger.warn({ scopeDigest: input.scopeDigest, pendingRoot: input.pendingRoot, ageMs: input.ageMs,
-    hasCurrent: input.hasCurrent, reason: "stale_pending_backup",
-    operatorAction: input.hasCurrent ? "inspect_pending_backup" : "no_current_backup_operator_recovery_required",
-  }, "Native harness backup pending capture is stale; left in place for operator inspection");
 }

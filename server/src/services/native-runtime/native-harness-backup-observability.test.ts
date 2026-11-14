@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../../middleware/logger.js", () => ({ logger: { warn: vi.fn() } }));
 import { logger } from "../../middleware/logger.js";
-import { reportNativeHarnessBackupCapture, reportNativeHarnessBackupStalePending } from "./native-harness-backup-observability.js";
+import { reportNativeHarnessBackupCapture } from "./native-harness-backup-observability.js";
 
 const identity = { scopeDigest: "a".repeat(64), runId: "run", nativeSessionId: "session" };
 const privateText = "DB_PASSWORD db-password-sentinel proxyPassword proxy-password-sentinel transcript-marker-sentinel";
@@ -36,15 +36,10 @@ describe("closed native backup warning fields", () => {
     expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0]).toEqual({ ...identity, outcome: "failed", reason: "capture_failed", errorCode: "unknown" });
   });
 
-  it("closes incomplete reason codes and ignores extra skipped/stale fields", () => {
+  it("closes incomplete reason codes and ignores extra skipped fields", () => {
     reportNativeHarnessBackupCapture({ ...identity, outcome: "skipped", reason: "checkpoint_incomplete",
       incompleteReason: privateText, detail: privateText } as Parameters<typeof reportNativeHarnessBackupCapture>[0]);
     expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0]).toEqual({ ...identity, outcome: "skipped",
       reason: "checkpoint_incomplete", incompleteReason: "unknown" });
-    reportNativeHarnessBackupStalePending({ scopeDigest: identity.scopeDigest, pendingRoot: "/state/.pending-id",
-      ageMs: 8_000_000, hasCurrent: false, err: new Error(privateText) } as Parameters<typeof reportNativeHarnessBackupStalePending>[0]);
-    expect(vi.mocked(logger.warn).mock.calls.at(-1)?.[0]).toEqual({ scopeDigest: identity.scopeDigest,
-      pendingRoot: "/state/.pending-id", ageMs: 8_000_000, hasCurrent: false, reason: "stale_pending_backup",
-      operatorAction: "no_current_backup_operator_recovery_required" });
   });
 });

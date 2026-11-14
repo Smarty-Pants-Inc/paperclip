@@ -98,41 +98,19 @@ constructor's `errorClass`, never their message, stack, stderr, or arbitrary
 provider code. Incomplete skips include a closed `incompleteReason`
 (`unavailable`, `not_suspended`, `provider_unopened`, or `unknown`).
 
-Startup backup discovery and backup maintenance report each real
-`failover-backups/.pending-*` directory whose modification time is more than two
-hours old, including scopes without `current` or readable session identity.
-They do not promote, delete, or modify pending captures and do not follow
-symlinks. The warning includes `scopeDigest`, `pendingRoot`, `ageMs`,
-`hasCurrent`, and reason `stale_pending_backup`. When no current backup exists,
-`operatorAction` is `no_current_backup_operator_recovery_required`; the partial
-capture is left in place for operator inspection, not assumed safe to restore.
-Reporting uses the existing delivery coordinator and shared maintenance scheduler,
-not an independent timer, and never starts a capture. It is registered even when
-`PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED=false`. Startup reconstructs
-pending deadlines from the local filesystem; capture creation and publication
-wake discovery through the existing native-backup change notification. A young
-pending directory is checked just after its two-hour boundary; a stale directory
-is reported hourly while it remains present. With no pending directories and no
-failed discovery to retry, the worker has no deadline and performs no idle scans.
-Drain/warm standby pause discovery; shutdown aborts and awaits the active scan
-and removes its notification subscription. Out-of-process filesystem additions
-are discovered on restart or the next backup-change notification, not by an
-unconditional empty-root poll. Scan failures log only the same closed error
-projection and retry through the shared coordinator.
+Stale .pending-* capture directories are reported by the guardian plugin (M1.5+),
+not by core.
 
 The existing protected `/api/health` response exposes these counters inside
 `nativeRecovery`, alongside the existing native recovery-state counts:
 
 - `harnessBackupCaptureSkipped`
 - `harnessBackupCaptureFailed`
-- `harnessBackupStalePendingObserved`
 
-These three are process-lifetime observation totals and reset on server restart;
-existing recovery-state counts remain database-backed. Each reported pending
-entry increments the last counter, including repeat sightings on later discovery
-or maintenance passes. It is not a unique-directory inventory or a transcript
-loss count. The counters do not contain session identifiers and are absent from
-public/redacted health responses, like the existing native recovery summary.
+These two are process-lifetime observation totals and reset on server restart;
+existing recovery-state counts remain database-backed. The counters do not
+contain session identifiers and are absent from public/redacted health responses,
+like the existing native recovery summary.
 
 An hourly background sweep expires the copy once the session can only resume by
 reopening closed work. It checks at most 200 sessions and expires at most 50 per
