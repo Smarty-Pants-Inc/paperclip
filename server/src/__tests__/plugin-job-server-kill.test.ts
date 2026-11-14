@@ -145,3 +145,45 @@ it.skipIf(!support.supported)("reruns a due job once after its server is killed 
     }
   }
 }, 10 * 60_000);
+
+// Keep reason: the RPC timeout settles the run row, but only the worker process
+// knows whether the handler still runs. A row past its timeout must not let the
+// job start again while that worker is still running it.
+it.skipIf(!support.supported)("does not start a job again while its timed-out execution's worker is still alive", async () => {
+  const database = await startEmbeddedPostgresTestDatabase("plugin-job-timeout-overlap-");
+  const db = createDb(database.connectionString);
+  await mkdir(path.join(serverRoot, "node_modules/.cache"), { recursive: true });
+  const pkg = await mkdtemp(path.join(serverRoot, "node_modules/.cache/plugin-job-timeout-overlap-"));
+  const executionsFile = path.join(pkg, "runs.ndjson");
+  const executions = async (): Promise<Execution[]> => (await readFile(executionsFile, "utf8").catch(() => ""))
+    .split("\n").filter(Boolean).map(line => JSON.parse(line) as Execution);
+  let server: ChildProcess | undefined;
+  try {
+    await cp(fixture, pkg, { recursive: true });
+    await writeFile(path.join(pkg, "sleep-ms"), String(60 * 60_000));
+    const a = await startServer(database.connectionString, path.join(pkg, "server.log"), pkg);
+    server = a.child;
+    const first = await until("first scheduled execution", Date.now() + 90_000,
+      async () => (await executions()).find(entry => entry.event === "start"));
+    await writeFile(path.join(pkg, "sleep-ms"), "0");
+    // The RPC times out at JOB_TIMEOUT_MS; the next minute's occurrence is then due.
+    const next = await until("next execution", Date.parse(first.at) + JOB_TIMEOUT_MS + 60_000 + 15_000,
+      async () => (await executions()).find(entry => entry.event === "start" && entry.runId !== first.runId));
+    const firstEnded = (await executions()).some(entry => entry.event === "end" && entry.runId === first.runId);
+    const firstWorkerAlive = alive(first.pid);
+    const [firstRow] = await db.select().from(pluginJobRuns).where(eq(pluginJobRuns.id, first.runId));
+    console.log("CJOB3_TIMEOUT_OVERLAP", JSON.stringify({ first, next, firstEnded, firstWorkerAlive,
+      firstRow: { status: firstRow.status, error: firstRow.error } }));
+    expect(firstRow.status).toBe("failed");
+    // Either the first execution finished, or its worker was gone, before the next start.
+    expect({ overlapped: !firstEnded && next.pid === first.pid }).toEqual({ overlapped: false });
+    expect(firstWorkerAlive && !firstEnded).toBe(false);
+  } finally {
+    try { await stopServer(server); }
+    finally {
+      await db.$client.end({ timeout: 1 }); await database.cleanup();
+      if (process.env.PLUGIN_JOB_SERVER_KILL_KEEP) console.log("CJOB3_ARTIFACTS", pkg);
+      else await rm(pkg, { recursive: true, force: true });
+    }
+  }
+}, 10 * 60_000);
