@@ -59,13 +59,32 @@ export async function writeFreshThreadNotice(tx: Db, run: typeof heartbeatRuns.$
     sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
 }
 
+type ProofReader = Pick<Db, "select" | "selectDistinctOn">;
+type StopGateEffects = {
+  notice(body: string): Promise<unknown>;
+  requestStop(lease: typeof environmentLeases.$inferSelect): Promise<unknown>;
+};
+
+/** The proof predicate has only read capabilities. Session-boundary consumers
+ * cannot narrate a restart, enqueue cleanup, or alter a lease while reading. */
+export function readFreshThreadStopProof(db: ProofReader, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  return inspectFreshThreadStopProof(db, run, issueId);
+}
+
 /** Strict admission gate for impossible reconciliation. Unlike the generic
  * isolated-workspace fallback, elapsed time can NEVER authorize this boundary.
- * Called under the existing issue -> coordinator -> run -> recovery locks. */
-export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+ * Only this transaction-owning fallback requests stop and writes the notice. */
+export function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  return inspectFreshThreadStopProof(tx, run, issueId, {
+    notice: body => writeFreshThreadNotice(tx, run, issueId, body),
+    requestStop: lease => prepareUnconfirmedSourceSandboxStop(tx, lease),
+  });
+}
+
+async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbeatRuns.$inferSelect,
+  issueId: string, effects?: StopGateEffects) {
   const sessionId = run.nativeSessionId;
   const noticeAuthorizationReason = `fresh_provider_thread_pending:${sessionId ?? run.id}`;
-  const notice = (body: string) => writeFreshThreadNotice(tx, run, issueId, body);
   const owners = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
     eq(heartbeatRuns.agentId, run.agentId),
     or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
@@ -77,7 +96,7 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
   if (!owners.some(owner => owner.id === run.id)) owners.push(run);
   // A live earlier turn owns the conversation. Do not even request its stop.
   if (owners.some(owner => owner.id !== run.id && ["running", "queued", "scheduled_retry"].includes(owner.status))) {
-    await notice(turnWaitingNote(run));
+    await effects?.notice(turnWaitingNote(run));
     return { gone: false as const, reason: "active_provider_turn", noticeAuthorizationReason };
   }
   const turnRefusal = run.resultJson?.nativeFreshContinuationRefusal as { waitForTurn?: unknown } | undefined;
@@ -124,7 +143,7 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void
     // release, 'stopping', expired lease, or successful RPC is NOT evidence.
-    if (!waitingTurn) await prepareUnconfirmedSourceSandboxStop(tx, lease);
+    if (!waitingTurn) await effects?.requestStop(lease);
   }
   // Remote execution has its allocation-bound proof above; process stamps for
   // owners with no remote allocation cannot be skipped just because a local
@@ -156,6 +175,6 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
   }
   // Only the settlement owner can say it is starting fresh: a newer run or a
   // person-owned gate may still make a positive physical proof inapplicable.
-  if (!gone) await notice(waitingTurn ? turnWaitingNote(run) : FRESH_THREAD_STOPPING_NOTE);
+  if (!gone) await effects?.notice(waitingTurn ? turnWaitingNote(run) : FRESH_THREAD_STOPPING_NOTE);
   return { gone, reason: gone ? "previous_execution_gone" : waitingTurn ? "active_provider_turn" : "previous_execution_stop_unconfirmed", noticeAuthorizationReason };
 }

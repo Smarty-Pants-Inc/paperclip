@@ -30,7 +30,7 @@ import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { freshThreadStartedNote, freshThreadStopGate, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
+import { freshThreadStartedNote, freshThreadStopGate, readFreshThreadStopProof, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -404,8 +404,13 @@ async function hasAnswerSinceSettlement(db: Pick<Db, "select">, source: typeof h
  * revalidates physical-stop proof and refuses a settlement answered since it
  * was recorded. Caller holds the task lock, serializing this decision with
  * admission, Stop and chat resets. */
-export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select">,
+export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select" | "selectDistinctOn">,
   run: typeof heartbeatRuns.$inferSelect, issueId: string) {
+  // A turn with a bound identity/input has already crossed admission. Its
+  // running thread is immutable; a late settlement belongs to the NEXT turn.
+  if (run.nativeSessionId || run.runnerProfileJson?.nativeExecutionInput !== undefined
+    || run.runnerProfileJson?.sessionCheckpoint != null || run.runnerProfileJson?.nativeControllerRecovery != null
+    || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null || run.sessionIdAfter !== null) return null;
   const [record] = await db.select({ action: issueRecoveryActions, source: heartbeatRuns })
     .from(issueRecoveryActions).innerJoin(heartbeatRuns, and(
       eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
@@ -451,7 +456,7 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   // Old generic settlements predate the typed strict family. Neither their
   // writer_ended label nor isolation nor the lack of a PID proves a stop.
   // Revalidate the same physical-stop owner for EVERY thread rotation.
-  const stop = await freshThreadStopGate(db as Db, source, issueId);
+  const stop = await readFreshThreadStopProof(db, source, issueId);
   if (!stop.gone) return null;
   return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
     startedNote: await freshThreadStartedNote(db, source),

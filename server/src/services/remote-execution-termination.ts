@@ -83,7 +83,7 @@ export function remoteLeaseCleanupScope(lease: Pick<LeaseIdentity, "provider" | 
     ? JSON.stringify([lease.provider, lease.providerLeaseId]) : undefined;
 }
 
-export async function resolveRemoteTerminationLease(db: Db, lease: Lease): Promise<Lease> {
+export async function resolveRemoteTerminationLease(db: Pick<Db, "select">, lease: Lease): Promise<Lease> {
   if (hasRemoteTerminationReceipt(lease) || lease.status !== "expired" ||
       lease.leasePolicy !== "reuse_by_environment" || !lease.provider || !lease.providerLeaseId) return lease;
   const history = await db.select().from(environmentLeases).where(and(
