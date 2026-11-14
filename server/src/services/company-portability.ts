@@ -11,9 +11,12 @@ import { promises as fs } from "node:fs";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   companies as companiesTable,
+  companySkills as companySkillsTable,
+  authUsers,
+  companyMemberships,
   builtInManagedResources,
   issueRelations,
   principalPermissionGrants,
@@ -4883,10 +4886,12 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
   async function buildPreview(
     input: CompanyPortabilityPreview,
     options?: ImportBehaviorOptions,
+    resolvedSource?: ResolvedSource,
+    readOnlySkillInventory = false,
   ): Promise<ImportPlanInternal> {
     const mode = resolveImportMode(options);
     const requestedInclude = normalizeInclude(input.include);
-    const source = applySelectedFilesToSource(await resolveSource(input.source), input.selectedFiles);
+    const source = applySelectedFilesToSource(resolvedSource ?? await resolveSource(input.source), input.selectedFiles);
     const manifest = source.manifest;
     const include: CompanyPortabilityInclude = {
       company: requestedInclude.company && manifest.company !== null,
@@ -5064,7 +5069,10 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         existingProjectSlugs.add(existing.urlKey);
       }
 
-      const existingSkills = await companySkills.listFull(input.target.companyId);
+      const existingSkills = readOnlySkillInventory
+        ? await db.select({ key: companySkillsTable.key, slug: companySkillsTable.slug })
+          .from(companySkillsTable).where(eq(companySkillsTable.companyId, input.target.companyId))
+        : await companySkills.listFull(input.target.companyId);
       const existingSkillKeys = new Set(existingSkills.map((skill) => skill.key));
       const existingSkillSlugs = new Set(existingSkills.map((skill) => normalizeSkillSlug(skill.slug) ?? skill.slug));
       for (const skill of manifest.skills) {
@@ -5265,12 +5273,117 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     };
   }
 
+  async function resolveImportAttribution(input: CompanyPortabilityPreview) {
+    const resolvedTaskPeople = new Map<string, { createdByUserId: string | null; responsibleUserId: string | null }>();
+    if (input.userCommentAuthorEmail === undefined && input.taskPeople === undefined) {
+      return { source: undefined, userCommentAuthorId: undefined, resolvedTaskPeople, authorship: undefined };
+    }
+    assertInlineSourceComplete(input.source);
+    // Keep the full source for coverage and reuse it after selectedFiles filtering.
+    const source = await resolveSource(input.source);
+    const resolvedUsers = new Map<string, string>();
+    const resolveUserEmail = async (email: string, field: string): Promise<string> => {
+      const normalizedEmail = email.trim().toLowerCase();
+      const cached = resolvedUsers.get(normalizedEmail);
+      if (cached !== undefined) return cached;
+      const users = await db.select({ id: authUsers.id }).from(authUsers)
+        .where(eq(sql`lower(btrim(${authUsers.email}))`, normalizedEmail)).limit(2);
+      if (users.length !== 1) {
+        throw unprocessable(`${field} must match exactly one existing instance user.`);
+      }
+      const userId = users[0]!.id;
+      if (input.target.mode === "existing_company") {
+        const members = await db.select({ id: companyMemberships.id }).from(companyMemberships)
+          .where(and(
+            eq(companyMemberships.companyId, input.target.companyId),
+            eq(companyMemberships.principalId, userId),
+            eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.status, "active"),
+          )).limit(1);
+        if (members.length === 0) {
+          throw unprocessable(`${field} must identify an active user member of the target company.`);
+        }
+      }
+      resolvedUsers.set(normalizedEmail, userId);
+      return userId;
+    };
+    const authorship: NonNullable<CompanyPortabilityPreviewResult["authorship"]> = {};
+    const userCommentAuthorId = input.userCommentAuthorEmail === undefined
+      ? undefined
+      : await resolveUserEmail(input.userCommentAuthorEmail, "userCommentAuthorEmail");
+    if (input.userCommentAuthorEmail !== undefined) {
+      authorship.userCommentAuthorUserId = userCommentAuthorId!;
+      authorship.comments = [];
+      for (const issue of source.manifest.issues) {
+        for (const [commentIndex, comment] of (issue.comments ?? []).entries()) {
+          if (comment.authorType !== "user") continue;
+          const authorUserId = comment.metadata?.sourceChannel ? null : userCommentAuthorId!;
+          authorship.comments.push({
+            issueSlug: issue.slug,
+            issueIdentifier: issue.identifier ?? null,
+            commentIndex,
+            authorType: authorUserId === null ? "system" : "user",
+            authorUserId,
+          });
+        }
+      }
+    }
+    if (input.taskPeople !== undefined) {
+      // Coverage is against the full parsed bundle, not selectedFiles/include.
+      // Identifiers come from .paperclip.yaml tasks[slug].identifier, not slugs.
+      const bundleIdentifiers = new Set<string>();
+      const bundleSlugs = new Set<string>();
+      for (const issue of source.manifest.issues) {
+        if (!issue.identifier || bundleIdentifiers.has(issue.identifier) || bundleSlugs.has(issue.slug)) {
+          throw unprocessable(`taskPeople requires a unique exported issue identifier and slug for task ${issue.slug}.`);
+        }
+        bundleIdentifiers.add(issue.identifier);
+        bundleSlugs.add(issue.slug);
+      }
+      const tableIdentifiers = new Set<string>();
+      for (const row of input.taskPeople) {
+        if (tableIdentifiers.has(row.issueIdentifier)) {
+          throw unprocessable(`taskPeople has duplicate issueIdentifier ${row.issueIdentifier}.`);
+        }
+        if (!bundleIdentifiers.has(row.issueIdentifier)) {
+          throw unprocessable(`taskPeople has extra issueIdentifier ${row.issueIdentifier}.`);
+        }
+        tableIdentifiers.add(row.issueIdentifier);
+      }
+      for (const identifier of bundleIdentifiers) {
+        if (!tableIdentifiers.has(identifier)) {
+          throw unprocessable(`taskPeople is missing issueIdentifier ${identifier}.`);
+        }
+      }
+      const rowsByIdentifier = new Map(input.taskPeople.map(row => [row.issueIdentifier, row]));
+      authorship.taskPeople = [];
+      for (const issue of source.manifest.issues) {
+        const row = rowsByIdentifier.get(issue.identifier!)!;
+        const field = `taskPeople[${JSON.stringify(row.issueIdentifier)}]`;
+        const people = {
+          createdByUserId: row.creatorEmail === null
+            ? null
+            : await resolveUserEmail(row.creatorEmail, `${field}.creatorEmail`),
+          responsibleUserId: row.responsibleEmail === null
+            ? null
+            : await resolveUserEmail(row.responsibleEmail, `${field}.responsibleEmail`),
+        };
+        resolvedTaskPeople.set(issue.slug, people);
+        authorship.taskPeople.push({ issueIdentifier: issue.identifier!, ...people });
+      }
+    }
+    return { source, userCommentAuthorId, resolvedTaskPeople, authorship };
+  }
+
   async function previewImport(
     input: CompanyPortabilityPreview,
     options?: ImportBehaviorOptions,
   ): Promise<CompanyPortabilityPreviewResult> {
-    const plan = await buildPreview(input, options);
-    return plan.preview;
+    const attribution = await resolveImportAttribution(input);
+    const plan = await buildPreview(input, options, attribution.source, attribution.authorship !== undefined);
+    return attribution.authorship === undefined
+      ? plan.preview
+      : { ...plan.preview, authorship: attribution.authorship };
   }
 
   async function importBundle(
@@ -5301,6 +5414,11 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       for (const agent of result.agents) if (agent.action === "created" && agent.id) scheduleAgentLifecycle(db, agent.id);
       return result;
     }
+    const attribution = await resolveImportAttribution(input);
+    const { resolvedTaskPeople } = attribution;
+    const userCommentAuthorId = input.userCommentAuthorEmail === undefined
+      ? actorUserId ?? null
+      : attribution.userCommentAuthorId!;
     // The importing board user brings a CEO's recorded hiring denial with the
     // package; create and configuration writes never take one from input.
     // Like the permissions toggle, the denial also removes an explicit
@@ -5317,7 +5435,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       (manifestAgent.permissionGrants ?? []).filter(grant =>
         !(agent.role === "ceo" && grant.permissionKey === "agents:create" && ceoHiringDenial(manifestAgent.permissions)));
     const mode = resolveImportMode(options);
-    const plan = await buildPreview(input, options);
+    const plan = await buildPreview(input, options, attribution.source);
     if (plan.preview.errors.length > 0) {
       throw unprocessable(`Import preview has errors: ${plan.preview.errors.join("; ")}`);
     }
@@ -6268,12 +6386,15 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             if (comment.authorType === "agent" && comment.authorAgentSlug && !authorAgentId) {
               warnings.push(`Comment on task ${manifestIssue.slug} was imported as a system comment because author agent ${comment.authorAgentSlug} was not imported.`);
             }
-            if (comment.authorType === "user" && !actorUserId) {
+            if (input.userCommentAuthorEmail === undefined && comment.authorType === "user" && !actorUserId) {
               warnings.push(`Comment on task ${manifestIssue.slug} was imported as a system comment because no importing user was available.`);
             }
+            const commentAuthorUserId = input.userCommentAuthorEmail !== undefined && comment.metadata?.sourceChannel
+              ? null
+              : userCommentAuthorId;
             const authorType = authorAgentId
               ? "agent"
-              : comment.authorType === "user" && actorUserId
+              : comment.authorType === "user" && commentAuthorUserId
                 ? "user"
                 : "system";
             const commentId = randomUUID();
@@ -6284,7 +6405,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               body: rewriteEmbeddedAssetUrls(comment.body, embeddedAssetIdMap),
               authorType,
               authorAgentId: authorAgentId ?? null,
-              authorUserId: authorType === "user" ? actorUserId ?? null : null,
+              authorUserId: authorType === "user" ? commentAuthorUserId : null,
               presentation: comment.presentation ?? null,
               metadata: comment.metadata ?? null,
               createdAt: comment.createdAt ?? null,
@@ -6409,6 +6530,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           issueRows.push({
             id: issueId,
             ref: manifestIssue.slug,
+            ...(resolvedTaskPeople.get(manifestIssue.slug) ?? {}),
             projectId: projectId ?? null,
             projectWorkspaceId: projectWorkspaceId ?? null,
             title: manifestIssue.title,

@@ -26,6 +26,9 @@ export interface ImportIssueRow {
   title: string;
   description: string | null;
   assigneeAgentId: string | null;
+  /** Optional verified import attribution; omission preserves legacy defaults. */
+  createdByUserId?: string | null;
+  responsibleUserId?: string | null;
   status: IssueStatus;
   priority: IssuePriority;
   billingCode: string | null;

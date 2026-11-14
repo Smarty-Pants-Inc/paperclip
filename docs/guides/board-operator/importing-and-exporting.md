@@ -210,6 +210,117 @@ The CLI commands use these API endpoints under the hood:
 
 Import apply requests accept `pauseAutomations: true` to create imported agents and routines in a paused state.
 
+### Imported comment authorship
+
+Import preview and apply requests optionally accept `userCommentAuthorEmail` in
+the JSON body, ZIP upload metadata, or chunked-transfer body. Input matching uses
+`trim().toLowerCase()`; stored email matching uses SQL `lower(btrim(email))`
+(surrounding spaces). The email must
+identify exactly one existing instance user in either mode; unknown or ambiguous
+matches are rejected even if only one matching user belongs to the target company.
+For `new_company`, no membership is required because the company does not yet
+exist. Instance users have no active/disabled status; email verification, admin
+roles, and sessions are not eligibility requirements. For `existing_company`, the
+resolved user must also have an active user membership in the target company.
+Failures return an unprocessable error before preview or import-domain writes;
+this option never creates users or memberships or grants access.
+
+**Required operator precondition:** every plain bundled user comment must belong
+to the selected person. Before using this option, run a read-only query against
+the source for this exact bundle's tasks and comments to verify that condition.
+Export identity is lossy: the exporter removes user identities, so Paperclip
+cannot prove original authorship from the bundle; preview's mapping is not evidence
+of original authorship. Do not use this
+single-person option for a bundle containing plain user comments from other people.
+
+With this option, imported user comments are attributed to the selected user,
+except comments with any nonempty `metadata.sourceChannel`: those are imported as system
+comments without a user author. Channel metadata, presentation, and content are
+retained, with the usual embedded-asset URL rewriting. Agent comments keep the
+existing agent-slug mapping, and system comments remain system comments.
+
+Without this option, existing behavior is unchanged: imported user comments,
+including relayed channel comments, are attributed to the importing user, or become
+system comments with the existing warning when no importing user is available.
+This option does not change task or document creators and is not an app setting
+or CLI flag.
+
+### Imported task people
+
+Independently of `userCommentAuthorEmail`, import preview and apply requests
+optionally accept `taskPeople` as a direct array (no version or tasks wrapper).
+**Required operator precheck:** client-side, bind the task table to the exact full
+bundle being submitted and verify every row against read-only source data for that
+bundle. The API checks full-bundle coverage and resolves emails; it cannot prove
+that the supplied people were the original task creators or responsible users.
+
+```json
+{
+  "taskPeople": [
+    {
+      "issueIdentifier": "SRC-123",
+      "creatorEmail": "creator@example.com",
+      "responsibleEmail": null
+    }
+  ]
+}
+```
+
+When present, the array must list every task in the full bundle exactly once,
+even when `include.issues` is false or `selectedFiles` selects only some tasks.
+`issueIdentifier` matches the exported `.paperclip.yaml` task `identifier`, not
+its slug or a newly generated target identifier. Missing source identifiers,
+ambiguous source tasks, missing rows, extra rows, and duplicate rows fail closed.
+Each row requires both email fields; `null` explicitly means nobody, never the
+importing user. Unknown row properties are ignored and cannot supply user or
+agent IDs.
+
+Every non-null email uses the same normalized global-uniqueness and target
+membership checks as `userCommentAuthorEmail`. All coverage and user resolution
+finish before company creation/update or any other import-domain write. Existing
+upload/transfer bookkeeping and source loading are outside this domain boundary.
+For each imported task, the verified users (or explicit nulls) set its creator and
+responsible-user fields. Assignees, conversation users, document creators,
+approvals, and exports are unchanged. Bundled recurring tasks still import as
+routines under the existing routine behavior; their table rows are checked but
+do not change routine attribution.
+
+Without `taskPeople`, task attribution and insert-field shape retain their legacy
+behavior. Either authorship input works alone, or both can be supplied together.
+These are API request options, not app settings or CLI flags.
+
+### Preview attribution mapping
+
+Preview and apply share the same full-bundle coverage and email preflight. Invalid attribution is rejected before preview or import-domain writes.
+With either authorship input present, preview reads the saved skill inventory
+without refreshing it and performs no import-domain writes. Without both inputs,
+preview retains its legacy behavior and adds no `authorship` key. A valid apply
+retains the existing skill-inventory refresh behavior.
+
+Preview keeps the source manifest's original comment authors and metadata intact;
+the optional `authorship` supplement shows the resolved mapping separately:
+
+```json
+{
+  "authorship": {
+    "userCommentAuthorUserId": "selected-user-id",
+    "comments": [
+      { "issueSlug": "onboarding", "issueIdentifier": "SRC-123", "commentIndex": 0, "authorType": "user", "authorUserId": "selected-user-id" },
+      { "issueSlug": "onboarding", "issueIdentifier": "SRC-123", "commentIndex": 2, "authorType": "system", "authorUserId": null }
+    ],
+    "taskPeople": [
+      { "issueIdentifier": "SRC-123", "createdByUserId": "creator-user-id", "responsibleUserId": null }
+    ]
+  }
+}
+```
+
+`comments` and `userCommentAuthorUserId` appear only with the comment option;
+`comments` lists only originally-user comments, using indexes in each original
+comment array (unchanged agent/system comments need no entry). `taskPeople`
+appears only with the task table and uses original source identifiers. Each
+supplement covers the full bundle, independently of selected files.
+
 CEO agents can also use the safe import routes (`/imports/preview` and `/imports/apply`) which enforce non-destructive rules: `replace` is rejected, collisions resolve with `rename` or `skip`, and issues are always created as new.
 
 ## GitHub Sources
