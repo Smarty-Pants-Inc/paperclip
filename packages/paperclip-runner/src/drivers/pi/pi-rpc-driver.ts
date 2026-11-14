@@ -38,7 +38,7 @@ import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
-import { piToolLimitEntry, piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
+import { piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -1552,17 +1552,9 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
     if (!turn) return;
     if (!this.#remember(keys, turn)) return;
-    if (event.type === "entry_appended") {
-      const limit = piToolLimitEntry(event.entry);
-      if (limit && !turn.settled && limit.origin.runId === turn.runId && limit.origin.turnId === turn.turnId
-        && this.#callbacks?.authority.accept(limit.origin)) {
-        // Read only the owned numeric envelope, not arbitrary extension data.
-        // Pi catches hook throws and turns abort() into cancellation; this
-        // supported custom-entry receipt preserves our actual failure cause.
-        turn.toolLimitFailure = { code: "pi_tool_limit_exceeded", message: piToolLimitMessage(limit.toolCount) };
-        return;
-      }
-    }
+    // Custom entries are extension-controlled, including their claimed origin
+    // and count. Only the driver-owned HTTP dispatch latch can set a tool-limit
+    // failure; an entry must never override a successful provider response.
     if (event.type === "tool_execution_start" && !turn.settled) {
       turn.hasToolCalls = true;
       if (typeof event.toolCallId === "string") {

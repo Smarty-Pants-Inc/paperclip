@@ -9,7 +9,6 @@ import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam
 import { piManagedModelRegistration } from "../pi-managed-model.js";
 import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
-import { PI_TOOL_LIMIT_ENTRY, piToolLimitMessage } from "../pi-tool-limit-diagnostics.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -132,7 +131,6 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   let offUnboundParent: (() => void) | undefined;
   let pendingDialogs = 0;
   let registeredProvider: string | undefined;
-  let providerApi: PiBindProvider["api"] | undefined;
   const registeredTools = new Map<string, PiDynamicTool>();
   const pendingTools = new Set<string>();
   const sockets = new Set<Socket>();
@@ -308,7 +306,6 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
           homeDigest = await admitHome(candidate);
           if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
           await registerProvider(request); updateTools(candidate, request.provider.api);
-          providerApi = request.provider.api;
           if (closed || version !== fenceVersion) throw new Error(PI_BIND_ERROR);
           authority.bind(candidate); config = candidate; failed = false;
         } catch { fence(); failed = true; throw new Error(PI_BIND_ERROR); }
@@ -402,23 +399,9 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     running = admitted; admitted = null;
     return { systemPrompt: replacePiHostInstructions(event.systemPrompt, config.instructions, process.env.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY) };
   });
-  // Early check for tools added after inventory. Pi 1.5.2 permits later hooks
-  // to replace this payload; the owned provider broker enforces the final count.
-  // Never trim here or silently lose authority.
-  pi.on("before_provider_request", (event, context) => {
-    const api = context.model?.api ?? providerApi;
-    const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];
-    if (cap === undefined) return;
-    const tools = event.payload?.tools;
-    if (Array.isArray(tools) && tools.length > cap) {
-      // Pi catches before_provider_request throws as extension_error and an
-      // abort alone looks like user cancellation. Publish the owned bounded
-      // cause on its supported custom-entry seam BEFORE revoking/aborting.
-      try { pi.appendEntry?.(PI_TOOL_LIMIT_ENTRY, { origin: running, api, cap, toolCount: tools.length }); }
-      finally { fence(); context.abort(); }
-      throw new Error(piToolLimitMessage(tools.length));
-    }
-  });
+  // Do not abort or publish a tool-limit cause here: later Pi hooks can replace
+  // the payload, and custom entries cannot authenticate their author. Let the
+  // owned HTTP broker measure/refuse the final Chat request and retain its cause.
   pi.on("cache_warming_decision", () => ({ action: "stop" }));
   pi.on("tool_execution_start", event => {
     if (!running || !authority.announce(event.toolCallId, running)) return;

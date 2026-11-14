@@ -637,15 +637,14 @@ describe("resident Pi model binding", () => {
     await expect(f.session.attachRun({ runId: "run-b" })).rejects.toThrow(/receipt/i);
     expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1); expect(await revoked((f.ipc[0] as any).provider)).toBe(true);
   });
-  it.each(["live", "wrong-epoch", "wrong-run", "wrong-turn", "foreign", "wrong-api"])("accepts only a live owned final-request limit receipt: %s", async kind => {
+  it.each(["live", "wrong-epoch", "wrong-run", "wrong-turn", "foreign", "wrong-api"])("does not let an extension entry change native cancellation: %s", async kind => {
     const f = await fixture(); const turn = await f.session.startTurn({ message: { role: "user", text: "one" } });
     const origin = { epoch: kind === "wrong-epoch" ? 2 : 1, runId: kind === "wrong-run" ? "old-run" : "run-a", turnId: kind === "wrong-turn" ? "old-turn" : turn.turnId };
     f.transport.send({ type: "agent_start" });
     f.transport.send({ type: "entry_appended", entry: { type: "custom", customType: kind === "foreign" ? "foreign" : "paperclip.tool-limit.v1", data: { origin, api: kind === "wrong-api" ? "anthropic-messages" : "openai-completions", cap: 128, toolCount: 129, privatePayload: "PRIVATE_PAYLOAD_CANARY" } } });
     f.transport.send({ type: "agent_settled", aborted: true });
-    const expected = kind === "live" ? "turn.failed" : "turn.cancelled";
-    await vi.waitFor(() => expect(f.events.some(event => event.eventType === expected)).toBe(true));
-    if (kind === "live") expect(f.events.at(-1)).toMatchObject({ eventType: "turn.failed", payload: { error: { code: "pi_tool_limit_exceeded", message: expect.stringContaining("129 tools") } } });
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.cancelled")).toBe(true));
+    expect(JSON.stringify(f.events)).not.toContain("pi_tool_limit_exceeded");
     expect(JSON.stringify(f.events)).not.toContain("PRIVATE_PAYLOAD_CANARY");
     expect(f.events.filter(event => ["turn.failed", "turn.cancelled"].includes(event.eventType))).toHaveLength(1);
   });
@@ -766,7 +765,7 @@ real("real Pi 1.5.2 resident binding", () => {
     expect(upstream.requests[1]!.tools).toHaveLength(upstream.requests[0]!.tools.length);
     expect(upstream.requests[1]!.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(d981ToolNames));
   }, 60_000);
-  it("preserves the owned late-tool limit cause as a failed turn before abort, with zero HTTP requests", async () => {
+  it("fails a late-native tool addition through the owned dispatch latch, with zero HTTP requests", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-toolcap-late-")); const workspace = join(root, "workspace"); await mkdir(workspace);
     const agent = join(root, "agent"); await mkdir(join(agent, "extensions"), { recursive: true });
     await writeFile(join(agent, "extensions", "late-tool.ts"), `export default function(pi) {
@@ -788,6 +787,9 @@ real("real Pi 1.5.2 resident binding", () => {
     await session.startTurn({ message: { role: "user", text: "Say hello" } });
     for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); events.push(next.value); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) break; }
     expect(upstream.requests).toHaveLength(0);
+    // No entry can supply this failure anymore; late-native additions reach the
+    // broker, whose private measured latch alone supplies the bounded 129 cause.
+    expect(nativeEvents.filter(event => event.type === "entry_appended" && (event.entry as any)?.customType === "paperclip.tool-limit.v1")).toHaveLength(0);
     expect(events.at(-1)).toMatchObject({ eventType: "turn.failed", payload: { error: { code: "pi_tool_limit_exceeded", message: expect.stringContaining("129 tools") } } });
     expect(events.filter(event => /total tool cap 128 exceeded/.test(JSON.stringify(event.payload)))).toHaveLength(1);
     expect(events.at(-1)!.payload.error).toMatchObject({ message: expect.stringContaining("ask the board") });
