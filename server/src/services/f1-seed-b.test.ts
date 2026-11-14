@@ -92,9 +92,10 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     // the capture omits raw lease metadata, so it is NOT asserted to be its bytes.
     await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "Remember the word ALDER-B. Reply only: noted.", createdAt: new Date(t0 - 600_000) });
     await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "TEST: What word did I ask you to remember? Reply with that word only.", createdAt: new Date(t0 - 60_000) });
-    // TL07 is the persisted instruction-edit refusal on an OPEN task. Idle
-    // must ANSWER, not merely post a waiting note; a genuinely in-flight turn
-    // keeps its owner and one note. Dev-lead owns the runner's prepare change.
+    // TL07 is the server-level refusal from an old Runner on an OPEN task.
+    // Even idle needs positive physical-stop proof: one waiting note now,
+    // then the saved message wakes automatically when that later read arrives.
+    // A genuinely in-flight turn keeps its owner. RFL ruling 23:08Z (B).
     if (tl07) await writeFile(join(root, "AGENTS.md"), "Updated assigned skill: answer the saved word from history.\n");
     const [source] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: sessionId, runtimeMode: "native", status: "failed", nativePhase: "terminal_failure", errorCode: tl07 ? "native_runner_refresh_required" : "native_controller_recovery_missing_evidence:retained_sandbox_binding", resultJson: tl07 ? { nativeFreshContinuationRefusal: { code: "native_runner_refresh_required", prepareRefusalCode: "provider_instructions_changed", waitForTurn: liveTurn } } : null, responsibleUserId: userId, createdAt: new Date(t0 - 60_000), finishedAt: new Date(t0 - 30_000), contextSnapshot: { issueId: issue.id } }).returning();
     await db.insert(nativeRunFinalizations).values({ runId: source.id, companyId: company.id, issueId: issue.id, phase: "terminal_failure", failureCode: source.errorCode, recoveryState: "blocked" });
@@ -149,7 +150,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id))).length;
     for (let n = 0; n < 3; n++) {
       await tick(n);
-      if ((!preconfirmed && !inspectedStop && shape !== "tl07-idle") || shape === "other-lease") {
+      if ((!preconfirmed && !inspectedStop) || shape === "other-lease") {
         expect(await runCount()).toBe(2);
         expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(0);
         expect(await current()).toHaveLength(1);
@@ -183,7 +184,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(await runCount()).toBe(2);
       return;
     }
-    const proofLands = shape === "proof-arrives" || shape === "observed-proof-arrives";
+    const proofLands = shape === "proof-arrives" || shape === "observed-proof-arrives" || shape === "tl07-idle";
     if (proofLands) {
       providerState = "stopped"; await tick(3); expect(inspectLeaseResource).toHaveBeenCalled();
       const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
