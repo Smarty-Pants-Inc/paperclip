@@ -7800,7 +7800,7 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
       if (unanswered) return;
       await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
-        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+        kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
     });

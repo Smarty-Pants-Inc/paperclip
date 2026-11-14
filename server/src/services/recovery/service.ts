@@ -364,7 +364,7 @@ function compactRecoveryPresentation(title: string): IssueCommentPresentation {
       normalizedTitle.length > 160
         ? `${normalizedTitle.slice(0, 159)}…`
         : normalizedTitle,
-    detailsDefaultOpen: false,
+    detailsDefaultOpen: true,
     density: "compact",
   };
 }
