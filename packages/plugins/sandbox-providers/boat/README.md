@@ -99,12 +99,19 @@ restores owner write on an existing target before removing it. The EXIT trap als
 restores owner write on extracted staging data before cleanup, including failure
 paths with read-only nested directories.
 
-Native file sync gives each signed upload/download and its URL request at least
-180 seconds, or `minimumTimeoutMs` when larger, to tolerate sandbox snapshot
-pauses. Timeout, network, HTTP 429 and HTTP 5xx failures get one retry with a fresh
-URL; other HTTP 4xx and invalid URLs do not. Partial local downloads are removed
-before retry. A second failure reports the last safe cause with `(after 1 retry)`.
-Command, archive and cleanup timeouts are unchanged.
+Native file sync bounds each signed PUT/GET attempt by the greater of 180 seconds,
+`minimumTimeoutMs` and the file size at 128 KiB/s (rounded up to whole seconds),
+capped at 840 seconds. Uploads stat the local archive before PUT; downloads keep
+the 180-second floor because this path has no remote archive size (no HEAD is
+added). Each fresh URL requests `ttlSeconds` at least 60 seconds beyond the bound:
+Boat's [upload](https://docs.boat.dev/api/reference/agent/create-upload-url.md) and
+[download](https://docs.boat.dev/api/reference/agent/create-download-url.md)
+`FileUrlRequest` schemas accept 1–3600 seconds (default 900). URL requests still
+use 180 seconds or the larger caller minimum; command, archive and cleanup
+bounds are unchanged. Timeout, network, HTTP 429 and HTTP 5xx failures get one
+retry with a fresh URL; other HTTP 4xx and invalid URLs do not. Partial local
+downloads are removed before retry. A second failure reports the last safe cause
+with `(after 1 retry)`.
 
 Resume verifies the recorded workspace sentinel at the allocation's original
 cwd, even when Core rewrites `remoteCwd` to a prepared shared workspace below it.

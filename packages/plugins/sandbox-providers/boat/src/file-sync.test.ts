@@ -115,6 +115,55 @@ async function clean() {
   for (const directory of [host, remote]) expect((await fs.readdir(directory)).filter(name => name.startsWith(".paperclip-upload") || name.startsWith("paperclip-boat-sync"))).toEqual([]);
 }
 describe("Boat native hybrid file sync", () => {
+  describe("size-aware signed transfer bounds", () => {
+    // Keep: the recorded 39.7 MB runnerd upload exceeds 180 s at production's
+    // measured 0.17 MB/s. Exercise real archives/streams without waiting minutes.
+    it.each([
+      { name: "40 MB upload", bytes: 40_000_000, expected: 306_000 },
+      { name: "tiny upload", bytes: 3, expected: 180_000 },
+      { name: "200 MB upload", bytes: 200_000_000, expected: 840_000 },
+      { name: "larger caller minimum", bytes: 40_000_000, minimum: 600_000, expected: 600_000 },
+      { name: "caller minimum above URL-safe cap", bytes: 3, minimum: 900_000, expected: 840_000 },
+      { name: "40 MB download with unknown archive size", bytes: 40_000_000, outbound: true, expected: 180_000 },
+      { name: "download caller minimum", bytes: 3, outbound: true, minimum: 300_000, expected: 300_000 },
+      { name: "40 MB upload retry", bytes: 40_000_000, retry: true, expected: 306_000 },
+    ])("$name", async ({ bytes, minimum, outbound = false, retry = false, expected }) => {
+      const source = path.join(outbound ? remote : host, "sized-source"), target = path.join(outbound ? host : remote, "sized-target");
+      const sourceFile = await fs.open(source, "w");
+      try { await sourceFile.truncate(bytes); } finally { await sourceFile.close(); }
+      const realTimeout = AbortSignal.timeout.bind(AbortSignal), bounds = new Map<AbortSignal, number>();
+      vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+        const signal = realTimeout(ms); bounds.set(signal, ms); return signal;
+      });
+      const attempts: number[] = [], requests: { bound: number; body: { ttlSeconds: number } }[] = [];
+      vi.stubGlobal("fetch", vi.fn(async (input, init) => {
+        const url = new URL(String(input));
+        expect(init.method).not.toBe("HEAD");
+        if (url.pathname.endsWith(outbound ? "/download-url" : "/upload-url")) {
+          requests.push({ bound: bounds.get(init.signal)!, body: JSON.parse(String(init.body)) });
+        }
+        if (url.hostname === "signed.invalid") {
+          attempts.push(bounds.get(init.signal)!);
+          if (retry && attempts.length === 1) return new Response(null, { status: 503 });
+        }
+        return mockFetch(input, init);
+      }));
+      const result = await (outbound ? plugin.definition.onEnvironmentSyncOut! : plugin.definition.onEnvironmentSyncIn!)({
+        ...params([operation({ sourcePath: source, targetPath: target, kind: "file" })]), minimumTimeoutMs: minimum,
+      });
+      expect((await fs.stat(target)).size).toBe(bytes);
+      expect(result.operations[0].bytesTransferred).toBeGreaterThan(bytes);
+      expect(attempts).toEqual(retry ? [expected, expected] : [expected]);
+      expect(requests).toHaveLength(attempts.length);
+      for (const request of requests) {
+        expect(request.bound).toBe(Math.max(180_000, minimum ?? 0)); // URL request is not the signed byte transfer.
+        expect(request.body.ttlSeconds * 1000).toBeGreaterThanOrEqual(expected + 60_000);
+      }
+      expect(bounds.get(vi.mocked(fetch).mock.calls.at(-1)![1].signal)).toBe(Math.max(60_000, minimum ?? 0));
+      expect(commands).toHaveLength(1); // No extra command to discover download size.
+      await clean();
+    });
+  });
   describe.each([false, true])("freeze-tolerant signed transfers (outbound=%s)", outbound => {
     const direction = outbound ? "download" : "upload";
     async function transfer(minimumTimeoutMs?: number) {

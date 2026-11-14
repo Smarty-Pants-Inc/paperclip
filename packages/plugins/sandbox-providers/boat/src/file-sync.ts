@@ -11,6 +11,10 @@ import { assertBoatActivityAdmission } from "./lease-gates.js";
 import type { PluginEnvironmentSyncInParams, PluginEnvironmentSyncResult, PluginSyncFileMapping, PluginEnvironmentExecuteResult } from "@paperclipai/plugin-sdk";
 
 const exec = promisify(execFile);
+const SIGNED_TRANSFER_MIN_TIMEOUT_MS = 180_000;
+const SIGNED_TRANSFER_MAX_TIMEOUT_MS = 840_000;
+const SIGNED_TRANSFER_MIN_BYTES_PER_SEC = 131_072;
+const SIGNED_TRANSFER_URL_MARGIN_SECONDS = 60;
 export interface SyncTransport {
   request(path: string, init?: RequestInit): Promise<any>;
   run(command: string, timeoutMs: number, cwd?: string): Promise<PluginEnvironmentExecuteResult>;
@@ -107,21 +111,31 @@ function retryableTransferFailure(error: unknown, status?: number): boolean {
   const code = failure.code ?? failure.cause?.code;
   return typeof code === "string" && /^(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EPIPE|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|UND_ERR_(?:CONNECT_TIMEOUT|HEADERS_TIMEOUT|BODY_TIMEOUT|SOCKET))$/.test(code);
 }
-async function signedTransfer(io: SyncTransport, base: string, remote: string, local: string, upload: boolean, timeout: number): Promise<number> {
+async function signedTransfer(io: SyncTransport, base: string, remote: string, local: string, upload: boolean, requestTimeout: number): Promise<number> {
   const direction = upload ? "upload" : "download";
+  // Only signed PUT/GET scale with bytes. This path has no remote archive size;
+  // keep the download floor rather than adding a HEAD or another Boat command.
+  const bytes = upload ? (await fs.stat(local)).size : undefined;
+  const timeout = Math.min(SIGNED_TRANSFER_MAX_TIMEOUT_MS, Math.max(
+    SIGNED_TRANSFER_MIN_TIMEOUT_MS, requestTimeout,
+    bytes === undefined ? 0 : Math.ceil(bytes / SIGNED_TRANSFER_MIN_BYTES_PER_SEC) * 1000,
+  ));
+  // FileUrlRequest accepts ttlSeconds (Boat create-upload-url/download-url docs).
+  // Leave a minute of URL life beyond this attempt's byte-transfer bound.
+  const ttlSeconds = Math.ceil(timeout / 1000) + SIGNED_TRANSFER_URL_MARGIN_SECONDS;
   // Boat publishes an upload only once complete. Retry once, always with a fresh
   // URL (served by the sandbox, which may have paused during snapshot capture).
   for (let attempt = 0; ; attempt++) {
-    const suffix = attempt ? " (after 1 retry)" : "", signal = AbortSignal.timeout(timeout);
+    const suffix = attempt ? " (after 1 retry)" : "", signal = AbortSignal.timeout(requestTimeout);
     let signed;
     try {
       signed = await io.request(`${base}/files/${direction}-url`, {
-        method: "POST", body: JSON.stringify({ path: remote }), signal,
+        method: "POST", body: JSON.stringify({ path: remote, ttlSeconds }), signal,
       });
     } catch (error) {
       const failure = signal.aborted ? signal.reason : error;
       if (attempt === 0 && retryableTransferFailure(failure)) continue;
-      throw new Error(`Boat ${direction}-url request failed: ${transferFailure(failure, timeout)}${suffix}`);
+      throw new Error(`Boat ${direction}-url request failed: ${transferFailure(failure, requestTimeout)}${suffix}`);
     }
     let url: URL;
     try { url = new URL(signed.url); } catch { throw new Error(`Boat file URL response omitted a valid URL${suffix}`); }
@@ -208,7 +222,7 @@ export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound:
   const id = params.lease.providerLeaseId;
   if (!id) throw new Error("Boat sync requires a lease ID");
   const timeout = Math.max(60_000, params.minimumTimeoutMs ?? 0), base = `/sandboxes/${encodeURIComponent(id)}`;
-  const transferTimeout = Math.max(180_000, params.minimumTimeoutMs ?? 0);
+  const transferTimeout = Math.max(SIGNED_TRANSFER_MIN_TIMEOUT_MS, params.minimumTimeoutMs ?? 0);
   // Validate before any side effect, including optional adapter-authored commands.
   for (const op of params.operations) {
     for (const mapping of op.files) {
