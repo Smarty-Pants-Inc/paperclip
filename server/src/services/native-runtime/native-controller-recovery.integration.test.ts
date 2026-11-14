@@ -9,9 +9,9 @@ import { readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agentTaskSessions, agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
+import { agentTaskSessions, agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
 import { DurablePrpControlPlane, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
@@ -26,6 +26,9 @@ import { AgentDirectoryOperationBusyError } from "../agent-directory-working-cop
 import { readNativeControllerRecoveryInventory } from "./native-controller-recovery-inventory.js";
 import { inspectRemoteWarmSessionRecovery } from "./remote-warm-session-recovery.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
+import { canBypassFailedNativePredecessor } from "./native-provider-work-proof.js";
+import { createNativeSessionHandoffLoader } from "./native-session-handoff.js";
+import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
 
 describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable discovery and import", () => {
   let database: Awaited<ReturnType<typeof startRecoveryPostgres>>;
@@ -84,6 +87,134 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     return { scope, native, profile, snapshot, owner,
       supervisor: { schema: "paperclip.native-session-supervisor.v1", ...compatibility, snapshot } };
   }
+
+  // Keep reason: SMA-183 / M1 d981 class. A controller-owned pre-dispatch
+  // receipt is affirmative evidence; HTTP429 or a missing snapshot alone is not.
+  it.each(["opening", "follow-up", "inherited-follow-up"] as const)("continues the same conversation after a positively pre-setup HTTP429 (%s)", async shape => {
+    const prior = await seed();
+    if (shape === "inherited-follow-up") {
+      Object.assign(prior.snapshot, { driverKind: "pi_rpc" });
+      await db.update(heartbeatRuns).set({ runnerProfileJson: prior.profile }).where(eq(heartbeatRuns.id, prior.scope.runId));
+    }
+    await importNativeControllerRecovery(db, { ...prior.scope, expectedConfigDigest: compatibility.configDigest, supervisor: prior.supervisor });
+    const { issueId, normalizedSessionId } = prior.scope;
+    try {
+    const [openingMessage] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
+      body: "Please answer my saved opening request after the setup outage." }).returning();
+    if (shape === "opening") {
+      await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, prior.scope.runId));
+      await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.scope.runId));
+      await db.delete(nativeRunResults).where(eq(nativeRunResults.runId, prior.scope.runId));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, prior.scope.runId));
+    }
+    const failedId = randomUUID();
+    const inherited = shape === "inherited-follow-up";
+    const processIdentity = { processPid: 12345, processGroupId: 12345,
+      processStartedAt: sql`'2026-11-14T08:00:00.000123Z'::timestamptz` };
+    if (inherited) await db.update(heartbeatRuns).set(processIdentity).where(eq(heartbeatRuns.id, prior.scope.runId));
+    await db.insert(heartbeatRuns).values({ id: failedId, companyId, agentId, issueId, nativeIssueId: issueId,
+      ...(inherited ? processIdentity : {}),
+      nativeSessionId: normalizedSessionId, runnerInstanceId: randomUUID(), runtimeMode: "native", status: "failed",
+      errorCode: "setup_failed", error: "Boat HTTP 429 before SETUP", finishedAt: new Date(),
+      createdAt: new Date(Date.now() + 1000),
+      runnerProfileJson: { nativeExecutionInput: { admitted: true }, nativePreparationFencingVersion: 1,
+        ...(inherited ? { inheritedProcessIdentityRunId: prior.scope.runId, sessionCheckpoint: {
+          ...prior.snapshot, identity: { ...prior.snapshot.identity, runId: failedId }, driverKind: "pi_rpc", cursor: null,
+          activeTurnId: null, pendingRuntimeRequests: [], terminalTurns: [], terminal: null, semanticResult: null } } : {}) },
+      resultJson: { failureCause: "provider_http_429", executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        nativePreDispatchFailure: { version: 1, providerWorkStarted: false } } });
+    // Runtime selection may have created an unclaimed coordinator. This run
+    // never entered the executor; no allocation, snapshot or closed-run log.
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: failedId, phase: "observed" });
+    const currentRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: currentRunId, companyId, agentId, issueId, nativeIssueId: issueId,
+      nativeSessionId: normalizedSessionId, runnerInstanceId: randomUUID(), status: "running", runtimeMode: "native",
+      createdAt: new Date(Date.now() + 2000) });
+    expect.soft(await canBypassFailedNativePredecessor(db, { companyId, runId: failedId })).toBe(true);
+    const recovered = await resolveNativeControllerRecovery(db, { companyId, agentId, issueId, normalizedSessionId, currentRunId });
+    expect(recovered.kind).toBe(shape === "opening" ? "no_prior_execution" : "recoverable");
+    if (shape !== "opening") expect(recovered).toMatchObject({ snapshot: { identity: { runId: prior.scope.runId } } });
+    // Run both automatic recovery and a following person turn through the real
+    // executor/control plane. Only the provider boundary is a controlled peer.
+    // Neither turn is allowed to rotate the normalized conversation identity.
+    const runAnswer = async (runId: string, text: string, currentMessage = openingMessage.body) => {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
+      const [prepared] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      const execution = parseNativeExecutionInput({ schema: "paperclip.native-execution-input.v1",
+        binding: { companyId, agentId, issueId, runId, executionWorkspaceId: runId }, provider: { kind: "codex", model: null },
+        task: { identifier: "NCD-429", title: issue.title, description: null, prompt: currentMessage, workMode: "standard" },
+        workspace: { cwd: root, repoUrl: null, repoRef: null, branchName: null },
+        session: { normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+        completionContract: { id: prepared.completionContractId, sha256: prepared.completionContractSha256,
+          schemaVersion: "paperclip.completion-contract.v1", contract: { revision: "1", objective: issue.title,
+            criteria: [{ id: "objective", requirement: "Complete the task objective" }] } }, credentialBindings: [], interactionResponses: [] });
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { ...prepared.runnerProfileJson, nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, runId));
+      await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed" });
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      const getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId, agentId, issueId, before: run.createdAt });
+      expect(await getFreshSessionHandoff()).toContain("saved opening request");
+      const { answered, settled, prompts } = await answerWithNativePeer({ db, execution, runnerInstanceId: native.runnerInstanceId,
+        text, getFreshSessionHandoff });
+      expect(answered).toMatchObject({ exitCode: 0, resultJson: { nativeResult: { summary: text } } });
+      expect(settled).toMatchObject({ nativeSessionId: normalizedSessionId, status: "succeeded", finishedAt: expect.any(Date) });
+      expect(JSON.stringify(prompts)).toContain("saved opening request");
+      expect(JSON.stringify(prompts)).toContain(currentMessage);
+      return settled;
+    };
+    await runAnswer(currentRunId, "Automatic recovery answered the saved opening message.");
+    const [nextMessage] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
+      body: "Now answer the next saved message in this conversation." }).returning();
+    const messageRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: messageRunId, companyId, agentId, issueId, nativeIssueId: issueId,
+      nativeSessionId: normalizedSessionId, runnerInstanceId: randomUUID(), status: "running", runtimeMode: "native",
+      createdAt: new Date(Date.now() + 3000) });
+    expect(await resolveNativeControllerRecovery(db, { companyId, agentId, issueId, normalizedSessionId, currentRunId: messageRunId }))
+      .toMatchObject({ kind: "recoverable", snapshot: { identity: { runId: currentRunId } } });
+    await runAnswer(messageRunId, "The next person message was answered in the same conversation.", nextMessage.body);
+    } finally {
+      // This suite's inventory test deliberately owns exactly two pointers.
+      await db.delete(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issueId));
+    }
+  }, 60_000);
+
+  it.each(["intent", "launched", "allocation", "released-allocation", "provider-event", "source-instance", "checkpoint",
+    "missing-receipt", "claimed", "own-process", "provider-session", "accepted-result", "active-checkpoint"] as const)(
+    "retains a snapshot-less HTTP429 barrier with contradictory or absent proof (%s)", async control => {
+      const f = await seed();
+      await db.delete(nativeRunnerCheckpoints).where(eq(nativeRunnerCheckpoints.runId, f.scope.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null, attempt: control === "claimed" ? 1 : 0,
+        controllerBootId: null, controllerPid: null, leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, f.scope.runId));
+      if (control !== "accepted-result") await db.delete(nativeRunResults).where(eq(nativeRunResults.runId, f.scope.runId));
+      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), runnerProfileJson: { nativeExecutionInput: { admitted: true } },
+        resultJson: control === "missing-receipt" ? {} : { nativePreDispatchFailure: { version: 1, providerWorkStarted: false } } })
+        .where(eq(heartbeatRuns.id, f.scope.runId));
+      if (["intent", "launched", "provider-event", "source-instance"].includes(control)) await db.insert(heartbeatRunEvents).values({ companyId, agentId,
+        runId: f.scope.runId, seq: 1, stream: "system", eventType: control === "intent" ? "native.process_start_requested"
+          : control === "launched" ? "native.process_started" : control === "provider-event" ? "session.started" : "diagnostic",
+        ...(control === "source-instance" ? { sourceInstanceId: "old-runner" } : {}) });
+      if (["allocation", "released-allocation"].includes(control)) await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.scope.runId,
+        issueId: f.scope.issueId, provider: "boat", providerLeaseId: "acquired-box", ...(control === "released-allocation" ? { status: "released" } : {}) });
+      if (control === "own-process") await db.update(heartbeatRuns).set({ processPid: 12345,
+        processGroupId: 12345, processStartedAt: new Date() }).where(eq(heartbeatRuns.id, f.scope.runId));
+      if (control === "provider-session") await db.update(heartbeatRuns).set({ sessionIdAfter: "own-provider-session" }).where(eq(heartbeatRuns.id, f.scope.runId));
+      if (control === "active-checkpoint") await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: { admitted: true },
+        sessionCheckpoint: { ...f.snapshot, cursor: null, activeTurnId: "own-active-turn", pendingRuntimeRequests: [], terminalTurns: [], terminal: null, semanticResult: null } },
+        resultJson: { nativePreDispatchFailure: { version: 1, providerWorkStarted: false }, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+        .where(eq(heartbeatRuns.id, f.scope.runId));
+      if (control === "checkpoint") await db.insert(nativeRunnerCheckpoints).values({ companyId, issueId: f.scope.issueId,
+        runId: f.scope.runId, part: "header", material: {} });
+      const currentRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: currentRunId, companyId, agentId, nativeIssueId: f.scope.issueId,
+        nativeSessionId: f.scope.normalizedSessionId, status: "running", runtimeMode: "native", createdAt: new Date(Date.now() + 1000) });
+      expect(await canBypassFailedNativePredecessor(db, { companyId, runId: f.scope.runId })).toBe(false);
+      // The active-checkpoint control has a bound session snapshot but no
+      // controller metadata; keep that upstream's exact unsupported refusal.
+      expect(await resolveNativeControllerRecovery(db, { ...f.scope, currentRunId })).toEqual(control === "active-checkpoint"
+        ? { kind: "unsupported", reason: "metadata_format" }
+        : { kind: "missing_evidence", reason: "snapshot_binding" });
+    }, 60_000);
 
   it("imports a retained source once, rejects stale input, and resolves it without any local projection", async () => {
     const fixture = await seed();

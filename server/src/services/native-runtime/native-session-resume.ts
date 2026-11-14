@@ -330,7 +330,7 @@ async function isUnstartedInheritedFollowUp(
   )).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId)));
   const recovery = record(evidence?.executionRecovery);
-  if (!evidence || recovery.providerWorkStarted === true || evidence.phase !== "terminal_failure" || evidence.resultId !== null || evidence.leaseOwner !== null ||
+  if (!evidence || recovery.providerWorkStarted === true || !["observed", "terminal_failure"].includes(evidence.phase) || evidence.resultId !== null || evidence.leaseOwner !== null ||
       evidence.controllerCheckpoint || evidence.result || evidence.processStart) return false;
   const bootstrap = noProcess && recovery.kind === "bootstrap" && recovery.providerWorkStarted === false && evidence.controllerPid === null;
   if (!bootstrap && !(piRecovery && (noProcess || evidence.inheritedProcess))) return false;

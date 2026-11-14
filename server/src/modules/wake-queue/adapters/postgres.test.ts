@@ -977,6 +977,66 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     }
   });
 
+  // Keep reason: SMA-183 retry/resend must reach admission, not only the
+  // unanswered-message worker's 'no run' notice. No generic 429 exemption.
+  it.each(["proved", "intent", "allocation", "unproved"] as const)("releases saved input after a positively pre-setup HTTP429, and only that (%s)", async proof => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: randomUUID(),
+      finishedAt: new Date(), errorCode: "setup_failed", runnerProfileJson: { nativeExecutionInput: { admitted: true } },
+      resultJson: { failureCause: "provider_http_429", ...(proof === "unproved" ? {} : {
+        nativePreDispatchFailure: { version: 1, providerWorkStarted: false } }) } }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "terminal_failure" });
+    if (proof === "intent") await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId, seq: 1,
+      stream: "system", eventType: "native.process_start_requested" });
+    if (proof === "allocation") await db.insert(environmentLeases).values({ companyId, issueId, heartbeatRunId: runId,
+      provider: "boat", providerLeaseId: "acquired-allocation" });
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    let reached = false;
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => {
+      reached = true;
+      return { outcome: { kind: "released" }, postCommitEffects: [] };
+    });
+    expect(reached).toBe(proof === "proved");
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(actions).toHaveLength(proof === "proved" ? 0 : 1);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.status).toBe(proof === "proved" ? "in_progress" : "blocked");
+    // Refused cases keep the saved message; successful release delegates its
+    // promotion to the existing queue owner, not a second handwritten path.
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]!.status).toBe("deferred_issue_execution");
+  });
+
+  it.each(["task_retry", "issue_commented"])("promotes a real saved %s after pre-setup HTTP429 instead of only a no-run note", async reason => {
+    const companyId = await seedCompany(), agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId });
+    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, nativeSessionId: randomUUID(),
+      finishedAt: new Date(), errorCode: "setup_failed", runnerProfileJson: { nativeExecutionInput: { admitted: true } },
+      resultJson: { failureCause: "provider_http_429", nativePreDispatchFailure: { version: 1, providerWorkStarted: false } } })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "terminal_failure" });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user",
+      body: "Answer this saved message after the setup outage." }).returning();
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+      payload: { _paperclipWakeContext: { issueId, wakeReason: reason, wakeCommentIds: [comment.id] } } });
+    await db.update(agentWakeupRequests).set({ reason }).where(eq(agentWakeupRequests.id, wakeId));
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} } });
+    expect((await release({ companyId, runId, now: new Date() })).outcome.kind).toBe("promoted");
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    expect(wake).toMatchObject({ status: "queued", runId: expect.any(String) });
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+    expect(successor).toMatchObject({ status: "queued", agentId, contextSnapshot: { issueId, wakeCommentIds: [comment.id] } });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).map(row => row.body)).toEqual([comment.body]);
+    await release({ companyId, runId, now: new Date() });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
+  });
+
   it("does not open a reconciliation incident for a native run whose model the provider rejected", async () => {
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
