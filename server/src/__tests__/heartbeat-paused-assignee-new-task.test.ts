@@ -88,6 +88,38 @@ describePostgres("new task for a manually paused assignee", () => {
     expect(finished.status).toBe("done");
   }, 180_000);
 
+  // Keep: case 8b's real catch. Two recovery owners must explain a parked
+  // assignment once without treating an absent person comment as absent work.
+  it("notices a parked Stop assignment once across racing owners without un-parking", async () => {
+    const f = await seed([]);
+    await db.update(agents).set({ lifecycleState: "pausing",
+      lifecycleOperation: { id: randomUUID(), attempts: 5, stopFailures: 5, retryRequired: true,
+        hostComplete: false, completedPluginIds: [], resumeState: "ready" },
+      lifecycleError: "Automatic stop work is paused. Recheck the stop evidence, then use Retry." })
+      .where(eq(agents.id, f.agentId));
+    const other = heartbeatService(db);
+    await Promise.all([
+      heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+      other.reconcileStrandedAssignedIssues({ companyId: f.companyId }),
+    ]);
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    const [waiting] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(waiting.status).toBe("todo");
+    expect(await runs(f)).toHaveLength(0);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    expect(agent).toMatchObject({ status: "paused", lifecycleState: "pausing",
+      lifecycleOperation: { retryRequired: true, stopFailures: 5 } });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null,
+      body: "Morgan is stopping and can't take this task yet. Automatic stop work is paused. "
+        + "A board user or Morgan's manager must check the outstanding stop or cleanup, then use Retry on the agent. "
+        + "Paperclip will reconsider this task when the agent is ready." });
+    expect(comments[0].metadata?.authorizationReason).toMatch(/^parked_assignment:/);
+    console.log("PARKED_ASSIGNMENT_ONCE", JSON.stringify({ issueId: f.issueId, agentId: f.agentId,
+      issueStatus: waiting.status, lifecycleState: agent.lifecycleState, comments, runCount: 0 }));
+  }, 180_000);
+
   // Keep reason: SMAA-1873. The real pause/resume command removes the hold
   // before Stop settles; the recovery sweep must not escalate that admission wait.
   it("keeps a never-run assignment todo when Resume races an unfinished Pause, then runs once ready", async () => {
