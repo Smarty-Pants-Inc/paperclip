@@ -124,6 +124,9 @@ import {
 } from "@paperclipai/shared";
 import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
+import { logger } from "../../middleware/logger.js";
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
+import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "../transient-lock-contention.js";
 
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 
@@ -1056,8 +1059,15 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     await service.recordRuntimeMcpDeliveryDiagnostic({ ...deliveryDiagnostic, assignmentChanged: true });
     return [];
   }
+  // Retry only after the entire failed transaction has rolled back. Profile,
+  // entries, gateway, binding, audit and token either all commit or all disappear.
+  // External delivery diagnostics stay outside this replayable SQL boundary.
+  const prepared = await retryTransientLockContention(() => input.db.transaction(async tx => {
+  const publications: ActivityPublication[] = [];
+  const db = tx as unknown as Db;
+  const service = createToolGatewayService(db);
   const profileKey = `native:${input.agent.id}:${assignmentDigest}`;
-  let [profile] = await input.db
+  let [profile] = await db
     .select()
     .from(toolProfiles)
     .where(
@@ -1103,7 +1113,9 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     // selector here: truncating or replacing them with connection-wide grants
     // would either lose assigned tools or authorize tools outside this snapshot.
     try {
-      const created = await access.createProfile(input.agent.companyId, {
+      // A concurrent creator can win the immutable profile key. A savepoint
+      // makes that uniqueness race recoverable without poisoning this transaction.
+      const created = await db.transaction(profileTx => toolAccessService(profileTx as unknown as Db).createProfile(input.agent.companyId, {
         profileKey,
         name: `Native ${input.agent.id.slice(0, 8)} ${assignmentDigest.slice(0, 12)}`,
         description: "Immutable Paperclip Runner MCP assignment profile.",
@@ -1115,14 +1127,15 @@ export async function buildPaperclipRuntimeMcpServers(input: {
           assignmentDigest,
         },
         entries,
-      });
-      [profile] = await input.db
+      }));
+      [profile] = await db
         .select()
         .from(toolProfiles)
         .where(eq(toolProfiles.id, created.id))
         .limit(1);
     } catch (error) {
-      [profile] = await input.db
+      if (isTransientLockContention(error)) throw error;
+      [profile] = await db
         .select()
         .from(toolProfiles)
         .where(
@@ -1142,7 +1155,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   }
 
   let [gateway] = (
-    await input.db
+    await db
       .select()
       .from(toolMcpGateways)
       .where(
@@ -1164,7 +1177,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   // The assignment digest includes the agent id, so a reused gateway is this
   // agent's own: bind it here instead of waiting for the assignment to change.
   if (gateway && !gateway.agentId) {
-    await input.db
+    await db
       .update(toolMcpGateways)
       .set({ agentId: input.agent.id, contextScopeType: "agent", contextScopeId: input.agent.id, updatedAt: new Date() })
       .where(
@@ -1174,7 +1187,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
           isNull(toolMcpGateways.agentId),
         ),
       );
-    [gateway] = await input.db
+    [gateway] = await db
       .select()
       .from(toolMcpGateways)
       .where(eq(toolMcpGateways.id, gateway.id))
@@ -1200,14 +1213,16 @@ export async function buildPaperclipRuntimeMcpServers(input: {
           },
         },
         actor: { agentId: input.agent.id },
+        postCommitPublications: publications,
       });
-      [gateway] = await input.db
+      [gateway] = await db
         .select()
         .from(toolMcpGateways)
         .where(eq(toolMcpGateways.id, created.id))
         .limit(1);
     } catch (error) {
-      [gateway] = await input.db
+      if (isTransientLockContention(error)) throw error;
+      [gateway] = await db
         .select()
         .from(toolMcpGateways)
         .where(
@@ -1242,15 +1257,35 @@ export async function buildPaperclipRuntimeMcpServers(input: {
     actor: { agentId: input.agent.id },
   });
 
-  await service.recordRuntimeMcpDeliveryDiagnostic({ ...deliveryDiagnostic, deliveredServerCount: 1 });
-  return [
+  return { publications, servers: [
     {
       name: ASSIGNED_MCP_SERVER_NAME,
       url: `${paperclipApiBaseUrl()}/mcp/gateways/${gateway!.gatewayPublicId}`,
       token: token.token,
       connectionId: `assignment:${assignmentDigest}`,
     },
-  ];
+  ] };
+  }), 20, {
+    jitterMs: attempt => Math.min(15_000, 500 * 2 ** (attempt - 1)),
+    onRetry(error, attempt, delayMs) {
+      // PostgreSQL DETAIL names both waiters; WHERE contains trigger statements
+      // when supplied by the server. Never log driver query parameters/tokens.
+      const conflict: Record<string, string> = {};
+      for (let value = error, depth = 0; value && typeof value === "object" && depth < 4; depth += 1) {
+        const fields = value as Record<string, unknown>;
+        for (const key of ["detail", "where", "internal_query", "table_name", "schema_name", "routine"]) {
+          if (typeof fields[key] === "string") conflict[key] = fields[key];
+        }
+        value = fields.cause;
+      }
+      logger.warn({ companyId: input.agent.companyId, agentId: input.agent.id, runId: input.runId,
+        code: postgresErrorCode(error), attempt, maxAttempts: 20, delayMs, conflict },
+        "Retrying runtime MCP preparation after transaction lock contention");
+    },
+  });
+  for (const publication of prepared.publications) publishActivity(publication);
+  await service.recordRuntimeMcpDeliveryDiagnostic({ ...deliveryDiagnostic, deliveredServerCount: 1 });
+  return prepared.servers;
 }
 
 export function createAdapterRuntimeMcpAccess(
