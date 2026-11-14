@@ -287,7 +287,8 @@ export type PluginRpcErrorCode =
 
 /**
  * Company scope attached by the host to one top-level plugin invocation.
- * Absence of this metadata means the invocation is instance/global scoped.
+ * Absence of this metadata, or a null context scope, means the invocation is
+ * plugin-instance/global scoped and grants no company authority.
  */
 export interface PluginInvocationScope {
   companyId: string;
@@ -301,7 +302,8 @@ export interface PluginInvocationScope {
  */
 export interface PluginInvocationContext {
   id: string;
-  scope: PluginInvocationScope;
+  /** Null identifies a host-issued plugin-instance invocation with no company authority. */
+  scope: PluginInvocationScope | null;
   /**
    * An optional W3C `traceparent` for the active host span. The host mints it
    * per call from the active startup span. The worker treats it as opaque: it

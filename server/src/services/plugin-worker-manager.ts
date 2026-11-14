@@ -575,7 +575,7 @@ interface PendingRequest {
 interface ActiveInvocation {
   startupContextId?: string;
   providerSpanBudget: {remaining:number};
-  scope: PluginInvocationScope;
+  scope: PluginInvocationScope | null;
   timer?: ReturnType<typeof setTimeout>;
   // The host-minted W3C `traceparent` for the active startup span, or undefined
   // when no startup span is active. The span host handler reads it to mint the
@@ -1329,7 +1329,7 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(scope: PluginInvocationScope | null, ttlMs?: number): PluginInvocationContext {
     // Keep the owning operation's parent host-side; workspace/runtime operations
     // use the same per-invocation contract as measured provider startup.
     const activeStep = getActiveStepContext();
@@ -2866,7 +2866,7 @@ export function createPluginWorkerHandle(
       (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
     );
     if (!invocationId) {
-      if (Array.from(activeInvocations.values()).some(entry => entry.scope.agentOrigin)) {
+      if (Array.from(activeInvocations.values()).some(entry => entry.scope?.agentOrigin)) {
         return { invalidInvocationScope: true };
       }
       // No host-issued invocation is being echoed. This is a genuinely
@@ -3694,7 +3694,10 @@ export function createPluginWorkerHandle(
       }
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs, method);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      // Jobs belong to the plugin instance, not an event's company. Give them
+      // their own host-issued id even without company authority, so nested
+      // calls cannot be mistaken for proactive work while notifications live.
+      const invocation = invocationScope || method === "runJob" ? registerInvocation(invocationScope) : null;
       if (invocation && startupContextId) activeInvocations.get(invocation.id)!.startupContextId = startupContextId;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
