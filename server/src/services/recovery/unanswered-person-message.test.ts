@@ -284,13 +284,29 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await flaggedCount(f), "a reset command is not a person message owed a reply").toBe(0);
   });
 
-  it("SMAA-1909: an unanswered message BEFORE '/new' is behind the reset boundary -> no note for it either", async () => {
+  // RFL 13:51Z: no FALSE SILENCE. Only the reset itself and a message reset away from WITHIN its note window go
+  // without; the window is the decision's own deadline (here the run's finish + the 15 s settle), compared with the
+  // /new's created_at. Discovery visits such a task (it cannot mirror every deadline); the decision writes nothing.
+  it("SMAA-1909: an unanswered message reset away WITHIN its note window (the /new 1 s after its run failed) -> no note for it or the reset", async () => {
     const f = await fixture({ status: "in_review" });
     await f.run({ commentId: await f.message("Please continue."), status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
     await f.run({ commentId: await f.message(" /new\n"), status: "succeeded" });
     await f.sweep(); await f.sweep();
     expect(await f.history(), "no note for the reset or the message before it").toHaveLength(0);
-    expect(await flaggedCount(f)).toBe(0);
+  });
+
+  it("SMAA-1909 / RFL 13:51Z: an unanswered message whose note window had ALREADY PASSED before '/new' KEEPS its note, even when the sweep is late", async () => {
+    const f = await fixture({ status: "in_review" });
+    const message = await f.message("Please continue.");
+    await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    // The note was due at the run's finish + 15 s; the person sent /new 60 s later, before any sweep ran.
+    await f.run({ commentId: await f.message("/new", 60_000), status: "succeeded" });
+    expect(await flaggedCount(f), "discovery visits the task").toBeGreaterThan(0);
+    await f.sweep(); await f.sweep();
+    const notes = await f.visible();
+    expect(notes, "exactly one note, for the message, none for the reset").toHaveLength(1);
+    expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
+    expect(await f.history()).toHaveLength(1);
   });
 
   it("SMAA-1909 control: a real message AFTER '/new' that gets no reply DOES get exactly one note", async () => {
