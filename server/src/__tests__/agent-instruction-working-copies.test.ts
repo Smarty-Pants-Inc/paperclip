@@ -887,7 +887,7 @@ describe("registered run instruction copies", () => {
       { id: previousLeaseId, companyId, environmentId, heartbeatRunId: previousRunId, status: "expired", cleanupStatus: "success",
         releasedAt: new Date(), provider: "fixture", providerLeaseId: "stopped-box", leasePolicy: "reuse_by_environment",
         metadata: { remoteCwd: oldRemoteCwd, sandboxStopAndRetainReceipt: stopReceipt } },
-      { id: currentLeaseId, companyId, environmentId, heartbeatRunId: runId, provider: "fixture", providerLeaseId: "new-box",
+      { id: currentLeaseId, companyId, environmentId, heartbeatRunId: runId, status: "active", provider: "fixture", providerLeaseId: "new-box",
         leasePolicy: "reuse_by_environment", metadata: { remoteCwd: currentRemoteCwd } },
     ]);
     await db.insert(agentInstructionWorkingCopies).values({ runId: previousRunId, companyId, agentId, responsibleUserId: userId,
@@ -899,7 +899,7 @@ describe("registered run instruction copies", () => {
       leaseId: currentLeaseId, remoteCwd: currentRemoteCwd, runner: { execute: async () => { throw new Error("mock runner must not execute"); } } };
     const staged = vi.spyOn(executionTargetHelpers, "prepareAdapterExecutionTargetRuntime").mockResolvedValue({
       assetDirs: { instructions: currentExecutionRoot },
-    } as Awaited<ReturnType<typeof executionTargetHelpers.prepareAdapterExecutionTargetRuntime>>);
+    } as unknown as Awaited<ReturnType<typeof executionTargetHelpers.prepareAdapterExecutionTargetRuntime>>);
     const command = vi.spyOn(executionTargetHelpers, "runAdapterExecutionTargetShellCommand").mockResolvedValue({
       exitCode: 0, timedOut: false,
     } as Awaited<ReturnType<typeof executionTargetHelpers.runAdapterExecutionTargetShellCommand>>);
@@ -908,7 +908,9 @@ describe("registered run instruction copies", () => {
       await expect(copies.prepare({ legacy: true, ...target(), runId, cwd: oldRemoteCwd,
         target: currentTarget })).resolves.toMatchObject({ state: "prepared", executionRoot: currentExecutionRoot });
       expect(realpath).not.toHaveBeenCalledWith(oldRemoteCwd);
-      expect(staged).toHaveBeenCalledWith(expect.objectContaining({ target: currentTarget, workspaceRemoteDir: currentExecutionRoot }));
+      expect(staged).toHaveBeenCalledWith(expect.objectContaining({ target: currentTarget,
+        workspaceLocalDir: path.join(path.dirname(root), "file-sync", "runs", runId, "legacy-instructions"),
+        assets: [expect.objectContaining({ key: "instructions", localDir: path.join(path.dirname(root), "file-sync", "runs", runId, "legacy-instructions") })] }));
       expect(command).toHaveBeenCalledWith(runId, currentTarget, expect.any(String), expect.objectContaining({ cwd: currentRemoteCwd }));
     } finally { staged.mockRestore(); command.mockRestore(); realpath.mockRestore(); }
   }, 60_000);

@@ -19,7 +19,7 @@ import {
   type AdapterExecutionTarget,
 } from "@paperclipai/adapter-utils/execution-target";
 import { conflict, notFound } from "../errors.js";
-import { agentInstructionsService, agentInstructionsBundleMode } from "./agent-instructions.js";
+import { agentInstructionsService, agentInstructionsBundleMode, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { agentInstructionRevisionService } from "./agent-instruction-revisions.js";
 import { resolveInstructionActor } from "./agent-instruction-authorization.js";
 import { assertInstructionPathSafe, instructionBytes, instructionPath, materializeInstructionBytes, MAX_INSTRUCTION_BYTES, readInstructionBytes, instructionGitExcludeProgram } from "./agent-instruction-files.js";
@@ -147,8 +147,12 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     const existing = await get(input.companyId, input.runId);
     if (isAgentDirectoryCopy(existing) || (!existing && !input.legacy)) return directories.prepare(input);
     let refreshStoppedCopy = false;
-    const workspace = await fs.realpath(input.cwd);
-    const expectedLocalRoot = path.join(workspace, ".paperclip-runtime", `instruction-edits-${input.runId}`, "instructions");
+    const target = input.target?.kind === "remote" ? input.target : null;
+    const workspace = target ? null : await fs.realpath(input.cwd);
+    const expectedLocalRoot = target
+      ? path.join(path.dirname(resolveManagedInstructionsRoot({ id: input.agentId, companyId: input.companyId, name: "", adapterConfig: {} })),
+          "file-sync", "runs", input.runId, "legacy-instructions")
+      : path.join(workspace!, ".paperclip-runtime", `instruction-edits-${input.runId}`, "instructions");
     if (existing && existing.localRoot !== expectedLocalRoot) throw conflict("The registered instruction copy belongs to a different run workspace");
     const location = input.target?.kind === "remote" ? `remote:${input.target.environmentId ?? ""}` : "local";
     if (existing && (existing.agentId !== input.agentId || existing.location !== location)) {
@@ -201,7 +205,6 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     const entryFile = instructionPath(baseline?.revision.entryFile ?? exported.entryFile);
     const content = instructionBytes(baseline?.content ?? exported.files[entryFile] ?? "");
     const localRoot = existing?.localRoot ?? expectedLocalRoot;
-    const target = input.target?.kind === "remote" ? input.target : null;
     const executionRoot = target
       ? path.posix.join(target.remoteCwd, ".paperclip-runtime", `instruction-edits-${input.runId}`, "instructions")
       : localRoot;
@@ -219,7 +222,9 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     }
     const row = (await get(input.companyId, input.runId))!;
     await assertInstructionPathSafe(localRoot, entryFile);
-    await execFile(process.execPath, ["-e", instructionGitExcludeProgram, workspace], { timeout: 15_000 });
+    // Remote workspaces are excluded on their execution target below. Never
+    // reinterpret a provider path as a server-local path for Git or staging.
+    if (!target) await execFile(process.execPath, ["-e", instructionGitExcludeProgram, workspace!], { timeout: 15_000 });
     await fs.mkdir(localRoot, { recursive: true, mode: 0o700 });
     for (const [name, text] of Object.entries({ ...exported.files, [entryFile]: content.toString("utf8") })) {
       const relative = instructionPath(name);
@@ -233,7 +238,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
     if (target) {
       const staged = await prepareAdapterExecutionTargetRuntime({
         target, runId: input.runId, adapterKey: `instruction-edits-${input.runId}`,
-        workspaceLocalDir: input.cwd, syncWorkspace: false,
+        workspaceLocalDir: localRoot, syncWorkspace: false,
         assets: [{ key: "instructions", localDir: localRoot, followSymlinks: false }],
       });
       if (staged.assetDirs.instructions !== executionRoot) throw new Error("Instruction copy staging path changed");
