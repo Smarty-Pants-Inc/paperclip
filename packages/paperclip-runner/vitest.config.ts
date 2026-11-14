@@ -33,11 +33,9 @@ export default defineConfig({
       ? { maxWorkers: Math.min(4, Math.max(1, Math.floor(availableParallelism() / 2))) }
       : {}),
     sequence: { sequencer: RunnerSequencer },
-    // Preserve the independent judges byte-for-byte. The native judge requires
-    // pinned Pi; both judges require an existing evidence destination.
+    // The native judge requires pinned Pi and an existing evidence destination.
     exclude: [...configDefaults.exclude,
       ...(!process.env.PI_TEST_BINARY || !process.env.TASK_OUT ? ["src/drivers/pi/toolcap-round2-judge.test.ts"] : []),
-      ...(!process.env.TASK_OUT ? ["src/drivers/acpx/judge-legacy-lifetime.test.ts"] : []),
     ],
     include: [
       "src/**/*.test.ts",

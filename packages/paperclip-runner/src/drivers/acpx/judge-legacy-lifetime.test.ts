@@ -49,7 +49,7 @@ it('judge: a legacy managed Chat session recovers on its next fitting turn after
   const first=await host.startTurn({requestId:'over-cap',text:'first turn'}).result;
   const second=await host.startTurn({requestId:'fitting-next-turn',text:'a new next turn'}).result;
   expect(first.status).toBe('failed');
-  await writeFile(join(process.env.TASK_OUT!,'legacy-lifetime-proof.json'),JSON.stringify({statuses,upstreamCounts,sessions,opened,first,second},null,2));
+  if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT,'legacy-lifetime-proof.json'),JSON.stringify({statuses,upstreamCounts,sessions,opened,first,second},null,2));
   expect(opened).toBe(1);expect(sessions).toEqual(['native-1','native-1']);
   expect(statuses).toEqual([400,200]);
   expect(upstreamCounts.at(-1)).toBe(4);
