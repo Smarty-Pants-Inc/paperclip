@@ -86,6 +86,19 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     }, { timeout: 5000 });
   }
 
+  it("reaps a crashed scheduler's stale running row before dispatching the due job", async () => {
+    const row = await due();
+    const orphan = await pluginJobStore(db).createRun({ jobId: row.id, pluginId, trigger: "schedule" });
+    await pluginJobStore(db).markRunning(orphan.id);
+    await db.execute(sql`update plugin_job_runs set created_at = now() - interval '1 hour', started_at = now() - interval '1 hour' where id = ${orphan.id}`);
+
+    await start();
+    await completed();
+    const history = await runs();
+    expect(history.find(run => run.id === orphan.id)).toMatchObject({ status: "failed", error: expect.stringContaining("orphaned_after_restart") });
+    expect(rpc).toHaveBeenCalledOnce();
+  });
+
   it("does not query repeatedly after an empty startup reconciliation", async () => { await start(); await quiet(); });
   it("bounds full refreshes while many job status writes arrive sequentially", async () => {
     await pluginJobStore(db).syncJobDeclarations(pluginId, Array.from({ length: 40 }, (_, i) => ({ jobKey: `manual-${i}`, displayName: `Manual ${i}`, schedule: "" })));
