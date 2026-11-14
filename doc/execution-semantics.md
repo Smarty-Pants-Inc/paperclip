@@ -3751,11 +3751,39 @@ All of these must be true:
   webserver, so when this same server process finished the owner, its live
   PID proves nothing. The owner's exact controller boot identity, with no
   in-process session or startup left for that run, proves it stopped instead.
-- The journal has a delivered terminal, only completed commands, and an
-  answer for each tool input.
+- The journal has a delivered terminal, settled commands, and an answer for
+  each tool input. Server-abandoned lifecycle commands are terminal, not
+  commands to replay; deliveries, tool results and interaction receipts keep
+  their ordinary settlement requirements.
 - No local Runner lifecycle evidence exists for the old owner.
 - Each quarantined root for the scope passes the same journal and local
   Runner evidence checks for the same owner.
+
+Lifecycle commands issued by a native server carry an immutable server-only
+`issuer: { bootId, generation }` in the durable controller journal. Checkpoint
+restore and command-id replay retain the original issuer; PRP sends neither
+this stamp nor the server's abandonment disposition to old runnerd binaries.
+A fenced issuing boot and an idle session can settle its never-released
+lifecycle commands. The DB must have no other in-flight run for this session,
+and the journal must have a terminal with no live turn, pending delivery or
+unanswered tool input. A delivery count greater than zero is not recallable:
+settlement refuses rather than letting a stale drain land in the new turn.
+
+M1 has a temporary compatibility path for unstamped lifecycle commands only.
+Every other `controller_instances` row must be stopped or fenced, and each
+command's `issuedAt` must be strictly before this boot's `startedAt` minus
+five seconds. The same DB/journal idle proof applies. Before admission, the
+source coordinator lock and boot proof are rechecked, and the encrypted DB
+command records are durably marked `ABANDONED` (terminal `rejected` with a
+server-only disposition). Restores cannot requeue them. Each compatibility
+settlement logs `native_legacy_lifecycle_abandoned` with its command count.
+**Delete this unstamped compatibility path at M2.**
+
+Restoring an older DB checkpoint must not resurrect pending commands over a
+newer settled on-disk journal of the exact same authority. Command ordinals
+alone are insufficient: an ACK changes status at the same `controllerSeq`.
+The local journal is retained only when its commands and events dominate the
+checkpoint without conflicting identities, intents or terminal results.
 
 A local per-turn Runner can end the same way: the result was accepted, but its
 `runner.suspend` command did not finish, so its own receipt is still
