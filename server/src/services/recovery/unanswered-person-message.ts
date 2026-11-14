@@ -577,6 +577,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  // RFL 09:16Z (b): a code-only reconciliation hold (an ACTIVE board-owned
+  // native_continuation_requires_reconciliation action) also holds the
+  // conversation: the wake-queue release keeps the issue behind it and leaves
+  // deferred messages unpromoted (run-dispatch postgres.ts:905-994), so a
+  // resend starts nothing. Its notes are the held note, never "safe".
+  const [reconciliationHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board"),
+    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"))).limit(1);
   if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -733,13 +742,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   // The refused run is the one the note names when the refusal decided the code.
   const refused = Boolean(refusedRun) && refusedRun !== run && code === unansweredMessageCode(refusedRun!);
-  const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
+  const heldByHold = Boolean(reconciliationHold);
+  const held = heldByHold || isNativeContinuationRefusal(run) || HELD_CODES.has(code);
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
   const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
   const agentName = agentRow?.name?.trim() || "this agent";
   const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : heldByHold ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE)
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? (chat ? chatNoRunText(agentName) : UNANSWERED_MESSAGE_NO_RUN_TEXT)
       : held ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE) : chat ? chatUnansweredText(agentName) : UNANSWERED_MESSAGE_TEXT;
