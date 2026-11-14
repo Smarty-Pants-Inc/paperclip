@@ -3672,18 +3672,28 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(acquiredAuditCount).toBe(1);
     const probeRuntimeConfigScope = {};
     // A normal launch/turn handoff seeds this runner's probe config and audits
-    // exactly once; the five later observations must not emit five more rows.
+    // exactly once; later idle observations must not emit more rows or reads.
     await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
       command: "true", probeRuntimeConfigScope });
     await flushSecretResolutionWrites();
     const handoffAuditCount = await auditCount();
     expect(handoffAuditCount).toBe(acquiredAuditCount + 1);
-    for (let poll = 0; poll < 5; poll++) {
-      await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
-        command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
-    }
+    // Regression: the old probe cache still SELECTed the environment on every
+    // tick. Count actual query-builder entries while executing real DB-backed
+    // plugin probes, not calls to a stand-in cache.
+    const selects = vi.spyOn(db, "select");
+    let environmentReads: number;
+    try {
+      for (let poll = 0; poll < 40; poll++) {
+        await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+          command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
+      }
+      environmentReads = selects.mock.calls.filter(([fields]) =>
+        fields?.updatedAt === environments.updatedAt && fields?.config === environments.config).length;
+    } finally { selects.mockRestore(); }
     await flushSecretResolutionWrites();
     expect(await auditCount()).toBe(handoffAuditCount);
+    expect(environmentReads, "idle adopted-runner probes must not read environment revisions per tick").toBe(0);
     await secretService(db).rotate(apiSecret.id, { value: "rotated-provider-key" });
     expectedProviderKey = "rotated-provider-key";
     await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
@@ -3691,6 +3701,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await flushSecretResolutionWrites();
     const uncachedHandoffAuditCount = await auditCount();
     expect(uncachedHandoffAuditCount).toBe(handoffAuditCount + 1);
+    // The handle still has its old snapshot: a persisted revision change must
+    // invalidate it anyway. A fresh runner/lease owner must not borrow it either.
     await environmentService(db).update(environment.id, { name: "Revised secure sandbox" });
     await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
       command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
@@ -3700,6 +3712,30 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       command: "true", probeRuntimeConfigScope: {}, readOnlyProbe: true });
     await flushSecretResolutionWrites();
     expect(await auditCount()).toBe(uncachedHandoffAuditCount + 2);
+    // A probe can run after write intent but before an outer commit/rollback.
+    // That old read must be invalidated again on settlement, not cached forever
+    // by a notification fired at a nested savepoint's release.
+    for (const rollback of [false, true]) {
+      const rolledBack = new Error("fixture rollback");
+      const change = db.transaction(async tx => {
+        await environmentService(db).update(environment.id,
+          { name: `Transaction ${rollback}` }, { db: tx });
+        await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+          command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
+        if (rollback) throw rolledBack;
+      });
+      if (rollback) await expect(change).rejects.toBe(rolledBack);
+      else await change;
+      const afterSettlement = vi.spyOn(db, "select");
+      try {
+        for (let probe = 0; probe < 3; probe++) {
+          await runtimeWithPlugin.execute({ environment, lease: acquired.lease,
+            command: "true", probeRuntimeConfigScope, readOnlyProbe: true });
+        }
+        expect(afterSettlement.mock.calls.filter(([fields]) =>
+          fields?.updatedAt === environments.updatedAt && fields?.config === environments.config)).toHaveLength(1);
+      } finally { afterSettlement.mockRestore(); }
+    }
     const executed = await runtimeWithPlugin.execute({
       environment,
       lease: acquired.lease,

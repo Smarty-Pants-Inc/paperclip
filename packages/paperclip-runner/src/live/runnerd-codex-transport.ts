@@ -4126,6 +4126,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   /** The runnerd handle that exited on its own while the session was open. */
   #lostRunnerHandle: RunnerProcessHandle | null = null;
   #adoptedRunnerMonitor: NodeJS.Timeout | null = null;
+  #verifyAdoptedRunner: (() => void) | null = null;
   #adoptedRunnerAuthenticated = false;
   /** Events are delivered only between session start and release, retirement, failure or close. */
   #pumpActive = false;
@@ -6626,7 +6627,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
-      onAuthenticatedDisconnect: () => this.#handle?.requestExitVerification?.(),
+      onAuthenticatedDisconnect: () => this.#requestRunnerExitVerification(),
       // The runner process is up once it authenticates; provider work follows.
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
@@ -7247,7 +7248,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       expectedRunnerVersion: runnerArtifact.version,
       expectedRunnerDigest: runnerArtifact.digest,
       onProtocolIntegrityError: (error) => this.#failTransport(error),
-      onAuthenticatedDisconnect: () => this.#handle?.requestExitVerification?.(),
+      onAuthenticatedDisconnect: () => this.#requestRunnerExitVerification(),
       // The runner process is up once it authenticates; provider work follows.
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
@@ -9199,6 +9200,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     return !(await adoptedRunner.isAlive());
   }
 
+  #requestRunnerExitVerification(): void {
+    this.#handle?.requestExitVerification?.();
+    this.#verifyAdoptedRunner?.();
+  }
+
   #watchAdoptedRunner(
     adoptedRunner: NonNullable<
       CapabilityRunnerdCodexTransportOptions["adoptExistingRunner"]
@@ -9206,13 +9212,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   ): void {
     let checking = false;
     let unverifiedSince: number | null = null;
-    this.#adoptedRunnerMonitor = setInterval(() => {
-      if (checking || this.#closed || (this.#releaseEpisode && !this.#releaseEpisode.claimed)) return;
+    const inactive = () => this.#verifyAdoptedRunner !== verify || this.#adoptedRunnerMonitor === null
+      || this.#closed || this.#failure !== null || (this.#releaseEpisode && !this.#releaseEpisode.claimed);
+    const verify = () => {
+      if (checking || inactive()) return;
       checking = true;
-      void Promise.resolve(adoptedRunner.isAlive())
+      void Promise.resolve().then(() => adoptedRunner.isAlive())
         .then((alive) => {
           unverifiedSince = null;
-          if (alive || this.#closed || (this.#releaseEpisode && !this.#releaseEpisode.claimed)) return;
+          if (alive || inactive()) return;
           this.#evidence.runnerExited = true;
           this.#publish();
           this.#failTransport(
@@ -9226,7 +9234,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           unverifiedSince ??= now;
           if ((this.#core?.activeRunnerConnectionCount() ?? 0) > 0
             && now - unverifiedSince < (this.options.runnerReconnectGraceMs ?? 0)) return;
-          if (!this.#closed && !(this.#releaseEpisode && !this.#releaseEpisode.claimed)) {
+          if (!inactive()) {
             this.#failTransport(
               new Error(
                 "native_adopted_runner_identity_unverifiable: runner liveness could not be revalidated",
@@ -9237,7 +9245,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         .finally(() => {
           checking = false;
         });
-    }, 250);
+    };
+    this.#verifyAdoptedRunner = verify;
+    // Authenticated channel close is the primary trigger, as for fresh handles.
+    // A live owned runner still needs the same 5 s missed-event safety net as
+    // native-session-executor's REMOTE_RUNNER_PROCESS_POLL_MS; no DB revision poll.
+    this.#adoptedRunnerMonitor = setInterval(verify, 5_000);
     this.#adoptedRunnerMonitor.unref?.();
   }
 
