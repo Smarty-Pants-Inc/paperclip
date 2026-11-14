@@ -96,6 +96,35 @@ import type { RunnerIngressEndpoint } from "./runner-connectivity.js";
 
 export type { RuntimeProgressSink } from "./runtime-progress.js";
 
+const SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_ENV = "PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS";
+const DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = 100;
+// The worker watchdog defaults to 20,000ms and its per-iteration request timeout
+// to 10,000ms; 5,000ms leaves 15s watchdog slack and stays below one request timeout.
+const MAX_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = 5_000;
+
+export function resolveSandboxCallbackBridgePollIntervalMs(
+  rawValue = process.env[SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_ENV],
+): number {
+  if (rawValue === undefined) return DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+  if (!/^\d+$/.test(rawValue)) {
+    console.warn(
+      `[paperclip] Invalid ${SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_ENV}=${JSON.stringify(rawValue)}; using ${DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS}ms.`,
+    );
+    return DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+  }
+  const parsed = Number(rawValue);
+  if (!Number.isSafeInteger(parsed)) {
+    console.warn(
+      `[paperclip] Invalid ${SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_ENV}=${JSON.stringify(rawValue)}; using ${DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS}ms.`,
+    );
+    return DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+  }
+  return Math.min(
+    MAX_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS,
+    Math.max(DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS, parsed),
+  );
+}
+
 export function postedIssueCommentLogMarker(
   method: string,
   requestPath: string,
@@ -4973,6 +5002,9 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       timeoutMs: bridgeTimeoutMs,
       shellCommand,
     });
+    // This host-owned worker is not configurable from a sandbox-provider plugin;
+    // read the single operator setting here and use its existing option seam.
+    const pollIntervalMs = resolveSandboxCallbackBridgePollIntervalMs();
     // `startSandboxCallbackBridgeWorker` keeps its awaited queue-directory
     // setup on the active `bridge.paperclip` step, and runs each request under
     // the run parent context (see `runWithRuntimeParent` inside that function).
@@ -4982,6 +5014,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       client,
       queueDir,
       maxBodyBytes,
+      pollIntervalMs,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       // The worker encodes binary bodies only at the queue boundary.
