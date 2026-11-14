@@ -495,7 +495,9 @@ async function recordRetryableFailure(input: {
     const pendingAgentRecovery = current.phase === "terminal_failure"
       && input.coordinator.phase === "terminal_failure"
       && recoveryOwner.kind === "agent" && recoveryOwner.agentId === input.run.agentId;
-    if (current.phase === "committed"
+    const committedWorkspaceRetry = current.phase === "committed" && input.failureScope === "workspace"
+      && current.resultId !== null && current.resultId === input.coordinator.resultId;
+    if ((current.phase === "committed" && !committedWorkspaceRetry)
       || (current.phase === "terminal_failure" && !pendingAgentRecovery)
       || current.leaseOwner !== input.coordinator.leaseOwner) return current;
     const [currentRun] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.run.id)).limit(1);
@@ -620,6 +622,10 @@ async function recordRetryableFailure(input: {
             ? "native_workspace_sync_out_retry_exhausted"
             : "native_finalization_retry_exhausted"
           : input.failureCode;
+    const workspaceCopybackLost = exhausted && input.failureScope === "workspace"
+      && failureCode === "native_workspace_sync_out_retry_exhausted"
+      ? { state: "lost" as const, attempts: workspaceFinalizeAttempt ?? 0 }
+      : null;
     await notifyNativeFinalizationWork(tx, { companyId: input.run.companyId, runId: input.run.id });
     if (phase === "terminal_failure") await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.run.companyId);
     if (phase === "terminal_failure" && failureCode === "native_workspace_sync_out_unsafe_archive") {
@@ -642,6 +648,7 @@ async function recordRetryableFailure(input: {
           ...(workspaceFinalizeAttempt === null
             ? {}
             : { workspaceFinalizeAttempt }),
+          ...(workspaceCopybackLost ? { workspaceCopyback: workspaceCopybackLost } : {}),
           recoveryOwner: supersededByNewerRun
             ? { kind: "none", reason: "newer_native_decision" }
             : exhausted
@@ -665,7 +672,7 @@ async function recordRetryableFailure(input: {
     // keeps the newer run's decision; this result is never applied.
     const projectsTerminalStatus =
       (exhausted || supersededByNewerRun) && input.projectRunStatus;
-    if (projectsTerminalStatus && !supersededByNewerRun && input.failureScope === "workspace") {
+    if (projectsTerminalStatus && !supersededByNewerRun && input.failureScope === "workspace" && !workspaceCopybackLost) {
       await preserveNativeWorkspaceExportLease(tx as unknown as Db, input.run, input.coordinator.resultId);
     }
     if (projectsTerminalStatus) await notifyInstructionCollection(tx, { companyId: input.run.companyId, runId: input.run.id });
@@ -691,6 +698,7 @@ async function recordRetryableFailure(input: {
           // The latest attempt's redacted cause; cleared when it named none.
           failureCause,
           ...(finalizationFailureCount === null ? {} : { finalizationFailureCount }),
+          ...(workspaceCopybackLost ? { workspaceCopyback: workspaceCopybackLost } : {}),
           nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt.toISOString(),
         })}::jsonb`,
         updatedAt: now,
@@ -749,6 +757,11 @@ async function recordRetryableFailure(input: {
           statusVersion: Number(blocked.statusVersion), priorDecisionId: issue.lastStatusDecisionId,
         };
       }
+    }
+    if (workspaceCopybackLost) {
+      await issueService(tx as unknown as Db).addComment(input.coordinator.issueId,
+        "The result is saved. Workspace copy-back was lost after three failed attempts; no additional provider turn was run.",
+        { runId: input.run.id }, { authorType: "system" }, tx);
     }
     if (!supersededByNewerRun) {
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({

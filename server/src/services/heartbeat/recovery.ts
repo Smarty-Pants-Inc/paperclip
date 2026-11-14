@@ -2095,6 +2095,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   }, options?: { skipEnvironmentSettlement?: boolean }) {
     if (!options?.skipEnvironmentSettlement) await settleRecoveredNativeEnvironment(input);
     const settledRun = await getRun(input.runId);
+    if (settledRun && isHeartbeatRunTerminalStatus(settledRun.status)) {
+      await releaseSettledNativeRunProcess(db, input.runId).catch(error => {
+        logger.warn({ err: error, runId: input.runId }, "failed to release settled native runner after workspace finalization");
+      });
+    }
     await releaseRuntimeServicesForRun(input.runId).catch(() => undefined);
     await finalizeAgentStatus(
       input.agentId,
