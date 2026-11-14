@@ -20,6 +20,74 @@ import {
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { hasUnconsumedIssueMonitorPath } from "./issue-graph-liveness.js";
 
+/*
+ * No plugin hook can replace this core policy: run completion enters at run-lifecycle.ts:2155 and the stranded sweep at service.ts:4881.
+ * The seam is this row-locked predicate before block-plus-note; both callers share it via review-path-recovery-escalation.ts:87,112.
+ * It counts only a non-deleted assignee comment backed by chat_publications.state='published' and a non-null provider_message_id.
+ * Its person-message definition matches settlement: author_agent_id IS NULL, excluding system rows without an inbound link (slack-conversation-lifecycle.ts:79-84).
+ * Provider authorization is enforced at issues.ts:14143-14147; settlement's positive publication evidence is slack-conversation-lifecycle.ts:66-77.
+ */
+async function hasPublishedChannelAnswer(
+  db: Pick<Db, "execute">,
+  input: { companyId: string; issueId: string; agentId: string },
+): Promise<boolean> {
+  const [row] = await db.execute<{ answered: boolean }>(sql`select exists (
+    select 1
+    from issue_comments answer
+    join chat_publications publication
+      on publication.company_id = answer.company_id
+      and publication.issue_id = answer.issue_id
+      and publication.comment_id = answer.id
+    join chat_conversations conversation
+      on conversation.company_id = publication.company_id
+      and conversation.id = publication.conversation_id
+      and conversation.endpoint_id = publication.endpoint_id
+      and conversation.issue_id = publication.issue_id
+    where answer.company_id = ${input.companyId}
+      and answer.issue_id = ${input.issueId}
+      and answer.author_agent_id = ${input.agentId}
+      and answer.deleted_at is null
+      and publication.state = 'published'
+      and publication.provider_message_id is not null
+      and exists (
+        select 1 from issue_comments person
+        where person.company_id = answer.company_id and person.issue_id = answer.issue_id
+          and person.deleted_at is null and person.author_agent_id is null
+          and (coalesce(person.author_type, 'user') <> 'system' or exists (
+            select 1 from chat_message_links inbound
+            where inbound.company_id = person.company_id and inbound.comment_id = person.id
+              and inbound.conversation_id = conversation.id and inbound.direction = 'inbound'))
+          and (person.created_at, person.id) < (answer.created_at, answer.id))
+      and not exists (
+        select 1 from issue_comments newer
+        where newer.company_id = answer.company_id and newer.issue_id = answer.issue_id
+          and newer.deleted_at is null and newer.author_agent_id is null
+          and (coalesce(newer.author_type, 'user') <> 'system' or exists (
+            select 1 from chat_message_links inbound
+            where inbound.company_id = newer.company_id and inbound.comment_id = newer.id
+              and inbound.conversation_id = conversation.id and inbound.direction = 'inbound'))
+          and (newer.created_at, newer.id) > (answer.created_at, answer.id))
+  ) as answered`);
+  return row?.answered === true;
+}
+
+/** Run completion and sweep share the same predicate while holding the issue fence. */
+export async function hasPublishedChannelAnswerForReviewDisposition(
+  db: Db,
+  input: { companyId: string; issueId: string; agentId: string },
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const issue = await tx.select({ status: issues.status, originKind: issues.originKind,
+      conversationAgentId: issues.conversationAgentId, assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)))
+      .for("update").then((rows) => rows[0] ?? null);
+    if (!issue || issue.status !== "in_review" || issue.originKind !== "chat_channel"
+      || issue.conversationAgentId !== null || issue.assigneeAgentId !== input.agentId || issue.assigneeUserId) return false;
+    return hasPublishedChannelAnswer(tx, input);
+  });
+}
+
 /** A spent repair wake must leave an operator action, never another automatic wake. */
 export async function escalateExhaustedIssueReviewPathRecovery(
   db: Db,
@@ -40,6 +108,8 @@ export async function escalateExhaustedIssueReviewPathRecovery(
     if (!issue || issue.status !== "in_review" || issue.assigneeAgentId !== run.agentId
       || issue.assigneeUserId || isWaitingConversation(issue)
       || issue.externalConversationState === "waiting") return null;
+    if (issue.originKind === "chat_channel" && issue.conversationAgentId === null
+      && await hasPublishedChannelAnswer(tx, { companyId: run.companyId, issueId, agentId: run.agentId })) return null;
 
     // Startup recovery precedes monitor ticks. Preserve a due or claimed check
     // only while the owner still allows the on-demand wake used by dispatch.

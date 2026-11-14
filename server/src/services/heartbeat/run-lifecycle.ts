@@ -176,7 +176,7 @@ import {
   reviewPathConsumedRefFromRun,
 } from "../recovery/review-path-recovery.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "../successful-run-handoff-state.js";
-import { escalateExhaustedIssueReviewPathRecovery } from "../recovery/review-path-recovery-escalation.js";
+import { escalateExhaustedIssueReviewPathRecovery, hasPublishedChannelAnswerForReviewDisposition } from "../recovery/review-path-recovery-escalation.js";
 import {
   redactCurrentUserText,
   redactCurrentUserValue,
@@ -215,47 +215,6 @@ import type { issueTreeControlService } from "../issue-tree-control.js";
 import { presentStorageFailureMessage } from "../../storage/storage-unavailable.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
-
-async function hasVisibleAssignedAgentReplySinceLatestPersonMessage(
-  db: Db,
-  input: { companyId: string; issueId: string; agentId: string },
-): Promise<boolean> {
-  const latestPersonMessage = await db
-    .select({ id: issueComments.id, createdAt: issueComments.createdAt })
-    .from(issueComments)
-    .where(and(
-      eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-      eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
-    ))
-    .orderBy(desc(issueComments.createdAt), desc(issueComments.id))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  if (!latestPersonMessage) return false;
-
-  const reply = await db
-    .select({ id: issueComments.id })
-    .from(issueComments)
-    .leftJoin(heartbeatRuns, and(
-      eq(heartbeatRuns.id, issueComments.createdByRunId), eq(heartbeatRuns.companyId, issueComments.companyId),
-    ))
-    .where(and(
-      eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
-      eq(issueComments.authorType, "agent"), eq(issueComments.authorAgentId, input.agentId),
-      isNull(issueComments.deletedAt),
-      or(
-        gt(issueComments.createdAt, latestPersonMessage.createdAt),
-        and(eq(issueComments.createdAt, latestPersonMessage.createdAt), gt(issueComments.id, latestPersonMessage.id)),
-      ),
-      or(isNull(heartbeatRuns.id), and(
-        sql`${heartbeatRuns.resultJson}->'presentationDecision'->>'commentAction' is distinct from 'none'`,
-        sql`not coalesce(${heartbeatRuns.resultJson}->'presentationDecision'->'reasonCodes' @> '["yielded_control_plane_wait"]'::jsonb, false)`,
-        sql`not coalesce(${heartbeatRuns.resultJson}->'presentationDecision'->'reasonCodes' @> '["board_response_wait_superseded"]'::jsonb, false)`,
-      )),
-    ))
-    .limit(1)
-    .then((rows) => rows[0] ?? null);
-  return Boolean(reply);
-}
 
 /** Lifecycle owns run writes; the service supplies reporting and admission effects. */
 export interface HeartbeatLifecycleDependencies extends Pick<ReturnType<typeof createHeartbeatRunState>,
@@ -2192,9 +2151,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     if (!issue || issue.status !== "in_review" || !issue.assigneeAgentId)
       return;
 
-    // Skip the review-path disposition (no wake, no block, no note) for an answered chat-channel task with no conversation agent: its review path is the chat itself, and the person already has the answer. Blocking it for a board decision is against Paperclip's intent (RFL 08:25Z, category 4).
     if (issue.originKind === "chat_channel" && issue.conversationAgentId === null &&
-      await hasVisibleAssignedAgentReplySinceLatestPersonMessage(db, {
+      await hasPublishedChannelAnswerForReviewDisposition(db, {
         companyId: issue.companyId, issueId: issue.id, agentId: issue.assigneeAgentId,
       })) return;
 
