@@ -14,7 +14,7 @@ import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gat
 import * as processOwner from "./run-process-owner.js";
 import { freshThreadRefusalCode } from "./native-runtime/runner-reconciliation-refusal.js";
 import { runnerPrepareRefusalCode } from "../vendor/paperclip-runner/index.js";
-import { NativeRunnerRefreshRequiredError } from "../../../packages/paperclip-runner/src/contracts/harness-driver.js";
+import { NativeRunnerRefreshRequiredError } from "@paperclipai/paperclip-runner";
 
 const rflJudgeLogDir = () => { const dir = join(process.env.RFL_JUDGE_LOG_DIR ?? process.env.TASK_OUT ?? tmpdir(), "logs"); mkdirSync(dir, { recursive: true }); return dir; };
 
