@@ -209,7 +209,7 @@ mod reopen_done {
     }
 
     #[cfg(unix)]
-    fn finish_turn(executor: &mut CodexCommandExecutor, turn: u64) {
+    pub(super) fn finish_turn(executor: &mut CodexCommandExecutor, turn: u64) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut observed = Vec::new();
         let mut delivered = false;
