@@ -1,3 +1,4 @@
+import * as executionTargetHelpers from "@paperclipai/adapter-utils/execution-target";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -17,7 +18,7 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, agents, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, agentInstructionWorkingCopies, createDb, withDedicatedDbConnection } from "@paperclipai/db";
+import { activityLog, agents, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, agentInstructionWorkingCopies, environmentLeases, environments, createDb, withDedicatedDbConnection } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentInstructionRevisionService } from "../services/agent-instruction-revisions.js";
 import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
@@ -868,6 +869,49 @@ describe("registered run instruction copies", () => {
     expect(lost).toMatchObject({ state: "unavailable", candidateBase64: null, processStoppedAt: null });
     expect(lost?.errorMessage).not.toContain(copy.localRoot);
   });
+
+  it("prepares a follow-up on the current remote lease after the retained predecessor box is gone", async () => {
+    const environmentId = randomUUID(), previousRunId = randomUUID(), runId = randomUUID();
+    const previousLeaseId = randomUUID(), currentLeaseId = randomUUID();
+    const oldRemoteCwd = path.join(home, "stopped-old-lease-box");
+    const currentRemoteCwd = path.join(home, "current-lease-box");
+    const previousExecutionRoot = path.posix.join(oldRemoteCwd, ".paperclip-runtime", `instruction-edits-${previousRunId}`, "instructions");
+    const currentExecutionRoot = path.posix.join(currentRemoteCwd, ".paperclip-runtime", `instruction-edits-${runId}`, "instructions");
+    const stopReceipt = { schema: "paperclip.sandbox-stop-and-retain-receipt.v1", leaseId: previousLeaseId };
+    await db.insert(environments).values({ id: environmentId, name: `Instruction lease fixture ${environmentId}`, driver: "sandbox" });
+    await db.insert(heartbeatRuns).values([
+      { id: previousRunId, companyId, agentId, invocationSource: "on_demand", status: "succeeded", responsibleUserId: userId },
+      { id: runId, companyId, agentId, invocationSource: "on_demand", status: "running", responsibleUserId: userId },
+    ]);
+    await db.insert(environmentLeases).values([
+      { id: previousLeaseId, companyId, environmentId, heartbeatRunId: previousRunId, status: "expired", cleanupStatus: "success",
+        releasedAt: new Date(), provider: "fixture", providerLeaseId: "stopped-box", leasePolicy: "reuse_by_environment",
+        metadata: { remoteCwd: oldRemoteCwd, sandboxStopAndRetainReceipt: stopReceipt } },
+      { id: currentLeaseId, companyId, environmentId, heartbeatRunId: runId, provider: "fixture", providerLeaseId: "new-box",
+        leasePolicy: "reuse_by_environment", metadata: { remoteCwd: currentRemoteCwd } },
+    ]);
+    await db.insert(agentInstructionWorkingCopies).values({ runId: previousRunId, companyId, agentId, responsibleUserId: userId,
+      entryFile, baseRevisionId: null, baseHash: "previous-baseline", localRoot: path.join(home, "previous-copy"),
+      executionRoot: previousExecutionRoot, location: `remote:${environmentId}`, state: "unchanged",
+      receipt: { sandboxStopAndRetainReceipt: stopReceipt }, processStoppedAt: new Date() });
+
+    const currentTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId,
+      leaseId: currentLeaseId, remoteCwd: currentRemoteCwd, runner: { execute: async () => { throw new Error("mock runner must not execute"); } } };
+    const staged = vi.spyOn(executionTargetHelpers, "prepareAdapterExecutionTargetRuntime").mockResolvedValue({
+      assetDirs: { instructions: currentExecutionRoot },
+    } as Awaited<ReturnType<typeof executionTargetHelpers.prepareAdapterExecutionTargetRuntime>>);
+    const command = vi.spyOn(executionTargetHelpers, "runAdapterExecutionTargetShellCommand").mockResolvedValue({
+      exitCode: 0, timedOut: false,
+    } as Awaited<ReturnType<typeof executionTargetHelpers.runAdapterExecutionTargetShellCommand>>);
+    const realpath = vi.spyOn(fs, "realpath");
+    try {
+      await expect(copies.prepare({ legacy: true, ...target(), runId, cwd: oldRemoteCwd,
+        target: currentTarget })).resolves.toMatchObject({ state: "prepared", executionRoot: currentExecutionRoot });
+      expect(realpath).not.toHaveBeenCalledWith(oldRemoteCwd);
+      expect(staged).toHaveBeenCalledWith(expect.objectContaining({ target: currentTarget, workspaceRemoteDir: currentExecutionRoot }));
+      expect(command).toHaveBeenCalledWith(runId, currentTarget, expect.any(String), expect.objectContaining({ cwd: currentRemoteCwd }));
+    } finally { staged.mockRestore(); command.mockRestore(); realpath.mockRestore(); }
+  }, 60_000);
 
   it("keeps private run copies out of normal Git staging and workspace snapshots", async () => {
     const workspace = path.join(home, `workspace-${randomUUID()}`);
