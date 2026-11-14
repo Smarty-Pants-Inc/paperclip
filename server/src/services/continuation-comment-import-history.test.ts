@@ -162,6 +162,43 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     expect.soft((await notice(issue!)).kind).toBe("noticed");
   });
 
+  // (R7) The company.imported FALLBACK (an import made before the per-task record): which row it reads.
+  async function preRecordImport(userId: string, name: string, slug: string) {
+    const result = await runImport(userId, { mode: "new_company", newCompanyName: name }, slug,
+      [{ body: "Imported question.", authorType: "user", createdAt: past(600) }]);
+    await db.execute(sql`delete from activity_log where company_id = ${result.companyId} and action = 'issue.imported'`);
+    return result;
+  }
+  it("(R7) the fallback reads the company's FIRST company.imported row: a message between two import rows is live", async () => {
+    const userId = await importer();
+    const { companyId, issue } = await preRecordImport(userId, "History R7 first", "r7-first");
+    await db.execute(sql`update activity_log set created_at = ${past(300)}::timestamptz
+      where company_id = ${companyId} and action = 'company.imported'`);
+    await db.insert(activityLog).values({ companyId, actorType: "user", actorId: userId, action: "company.imported",
+      entityType: "company", entityId: companyId, createdAt: new Date(past(60)) });
+    const [old] = await commentsOf(issue.id);
+    const [live] = await db.insert(issueComments).values({ companyId, issueId: issue.id, authorType: "user", authorUserId: userId,
+      body: "Between the two imports.", createdAt: new Date(past(120)) }).returning();
+    const agentId = await makeActionable(issue);
+    expect.soft(await carried(issue, agentId, old!.id), "older than the FIRST import row: history").toEqual({});
+    expect.soft(await carried(issue, agentId, live!.id), "newer than the first row, older than the second: live")
+      .toMatchObject({ wakeCommentIds: [live!.id] });
+    expect.soft((await notice(issue)).kind).toBe("noticed");
+  });
+
+  it("(R7) ANOTHER company's company.imported row does not count for this company's tasks", async () => {
+    const userId = await importer();
+    const a = await preRecordImport(userId, "History R7 A", "r7-a");
+    await db.execute(sql`delete from activity_log where company_id = ${a.companyId} and action = 'company.imported'`);
+    const b = await runImport(userId, { mode: "new_company", newCompanyName: "History R7 B" }, "r7-b", []);
+    const [bRow] = await db.select().from(activityLog).where(and(eq(activityLog.companyId, b.companyId), eq(activityLog.action, "company.imported")));
+    expect(bRow!.createdAt.getTime(), "B's import row is newer than A's message").toBeGreaterThan(Date.parse(past(600)));
+    const [person] = await commentsOf(a.issue.id);
+    const agentId = await makeActionable(a.issue);
+    expect.soft(await carried(a.issue, agentId, person!.id)).toMatchObject({ wakeCommentIds: [person!.id] });
+    expect.soft((await notice(a.issue)).kind).toBe("noticed");
+  });
+
   it.each(["new_company", "existing_company"] as const)("(R6) a %s import writes exactly ONE issue.imported row per created issue, in the import", async mode => {
     const userId = await importer();
     const base = mode === "existing_company" ? await runImport(userId, { mode: "new_company", newCompanyName: "History R6 base" }, "r6-base", []) : null;
