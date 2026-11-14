@@ -1445,6 +1445,103 @@ export async function recoverCommittedNativeReviewResponse(db: Db, input: {
   return materialized !== null;
 }
 
+async function restoreCommittedGovernedResponseAfterWorkspaceRetry(input: {
+  db: Db;
+  run: typeof heartbeatRuns.$inferSelect;
+  coordinator: typeof nativeRunFinalizations.$inferSelect;
+  leaseOwner: string;
+  workspaceFinalizeStatus: "succeeded" | "failed";
+}) {
+  const { run, coordinator } = input;
+  const resultJson = record(run.resultJson);
+  const marker = record(resultJson.externalChatReviewPresentation);
+  if (
+    input.workspaceFinalizeStatus !== "succeeded" ||
+    resultJson.finalizationPhase !== "retryable_failure" ||
+    resultJson.failureCode !== "native_workspace_sync_out_failed" ||
+    !coordinator.decisionId || !coordinator.resultId || !coordinator.assessmentId ||
+    marker.schema !== "paperclip.chat_review_response_presentation.v1" ||
+    marker.runId !== run.id || marker.decisionId !== coordinator.decisionId ||
+    marker.resultId !== coordinator.resultId ||
+    resultJson.finalizationReasonCode !== "governed_response_waiting" ||
+    isNativeRunnerOwnershipHeld(run)
+  ) return null;
+  const decisionId = coordinator.decisionId;
+  const resultId = coordinator.resultId;
+  const assessmentId = coordinator.assessmentId;
+
+  const [operation] = await input.db.select({ status: workspaceOperations.status })
+    .from(workspaceOperations).where(and(
+      eq(workspaceOperations.companyId, run.companyId),
+      eq(workspaceOperations.heartbeatRunId, run.id),
+      eq(workspaceOperations.issueId, coordinator.issueId),
+      eq(workspaceOperations.phase, "workspace_finalize"),
+      eq(workspaceOperations.status, "succeeded"),
+    )).limit(1);
+  if (!operation) return null;
+  const [decision] = await input.db.select({ id: statusDecisions.id })
+    .from(statusDecisions).where(and(
+      eq(statusDecisions.id, decisionId),
+      eq(statusDecisions.companyId, run.companyId),
+      eq(statusDecisions.issueId, coordinator.issueId),
+      eq(statusDecisions.runId, run.id),
+      eq(statusDecisions.assessmentId, assessmentId),
+      eq(statusDecisions.applicationState, "applied"),
+      eq(statusDecisions.reasonCode, "governed_response_waiting"),
+    )).limit(1);
+  if (!decision || !(await hasMaterializedNativeReviewResponse(input.db, {
+    companyId: run.companyId, issueId: coordinator.issueId, runId: run.id,
+    decisionId,
+  }))) return null;
+  const [issue] = await input.db.select({ lastStatusDecisionId: issues.lastStatusDecisionId })
+    .from(issues).where(and(eq(issues.id, coordinator.issueId), eq(issues.companyId, run.companyId))).limit(1);
+  if (issue?.lastStatusDecisionId !== decisionId) return null;
+
+  return input.db.transaction(async (tx) => {
+    const [current] = await tx.select().from(nativeRunFinalizations)
+      .where(and(
+        eq(nativeRunFinalizations.runId, run.id),
+        eq(nativeRunFinalizations.companyId, run.companyId),
+        eq(nativeRunFinalizations.leaseOwner, input.leaseOwner),
+        eq(nativeRunFinalizations.phase, "arbitrating"),
+        eq(nativeRunFinalizations.decisionId, decisionId),
+        eq(nativeRunFinalizations.resultId, resultId),
+      )).for("update").limit(1);
+    if (!current) return null;
+    const [currentRun] = await tx.select({ resultJson: heartbeatRuns.resultJson })
+      .from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+      )).for("update").limit(1);
+    const [currentIssue] = await tx.select({ lastStatusDecisionId: issues.lastStatusDecisionId })
+      .from(issues).where(and(
+        eq(issues.id, coordinator.issueId), eq(issues.companyId, run.companyId),
+      )).for("update").limit(1);
+    const currentResult = record(currentRun?.resultJson);
+    const currentMarker = record(currentResult.externalChatReviewPresentation);
+    if (
+      currentIssue?.lastStatusDecisionId !== decisionId ||
+      currentResult.finalizationPhase !== "retryable_failure" ||
+      currentResult.failureCode !== "native_workspace_sync_out_failed" ||
+      currentMarker.decisionId !== decisionId || currentMarker.resultId !== resultId
+    ) return null;
+    const now = new Date();
+    const [updated] = await tx.update(nativeRunFinalizations).set({
+      phase: "committed", leaseOwner: null, leaseExpiresAt: null,
+      failureCode: null, failureDetail: null, nextAttemptAt: null, updatedAt: now,
+    }).where(eq(nativeRunFinalizations.runId, run.id)).returning();
+    await tx.update(heartbeatRuns).set({
+      nativePhase: "committed", nativePhaseUpdatedAt: now,
+      resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ||
+        '{"finalizationPhase":"committed","failureCode":null,"originalFailureCode":null,"nextAttemptAt":null}'::jsonb`,
+      updatedAt: now,
+    }).where(eq(heartbeatRuns.id, run.id));
+    await notifyNativeFinalizationWork(tx, { companyId: run.companyId, runId: run.id });
+    await notifyExecutionRunWork(tx, { companyId: run.companyId, runId: run.id });
+    await notifyChatRunMilestones(tx, { companyId: run.companyId, issueId: coordinator.issueId });
+    return updated;
+  });
+}
+
 export async function finalizeNativeRun(input: {
   db: Db;
   runId: string;
@@ -1576,6 +1673,22 @@ export async function finalizeNativeRun(input: {
   ]);
   if (!resultRow) throw new Error("native_result_missing");
   if (!contractRow) throw new Error("native_completion_contract_missing");
+  const restoredResponseCommit = await restoreCommittedGovernedResponseAfterWorkspaceRetry({
+    db: input.db, run, coordinator, leaseOwner: claim.leaseOwner!,
+    workspaceFinalizeStatus: input.workspaceFinalizeStatus,
+  });
+  if (restoredResponseCommit) {
+    if (input.projectRunStatus) await projectCommittedRun({ db: input.db, run, coordinator: restoredResponseCommit });
+    if (input.projectRunStatus && !input.skipNativeResponsePresentation) {
+      await repairCommittedNativeChatResponse(input.db, {
+        companyId: run.companyId, issueId: coordinator.issueId, runId: run.id,
+      });
+    }
+    if (!input.skipNativeRecoveryNotices) await resolveCommittedNativeRecoveryNotices(input.db, {
+      companyId: run.companyId, runId: run.id, issueId: coordinator.issueId,
+    });
+    return restoredResponseCommit;
+  }
   const envelope = record(resultRow.resultJson);
   const result = record(envelope.result);
   const terminal = record(envelope.terminal);

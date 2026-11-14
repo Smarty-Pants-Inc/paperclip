@@ -392,7 +392,11 @@ export async function authorizeNativeChatReviewPresentation(
     nativeSha256(input.resultJson.nativeResult) !== marker.semanticSha256 ||
     nativeSha256(record(input.resultJson.nativeResult).summary) !==
       marker.summarySha256 ||
-    input.resultJson.finalizationPhase !== "committed" ||
+    !(
+      input.resultJson.finalizationPhase === "committed" ||
+      (input.resultJson.finalizationPhase === "retryable_failure" &&
+        input.resultJson.failureCode === "native_workspace_sync_out_failed")
+    ) ||
     input.resultJson.finalizationReasonCode !== "governed_response_waiting"
   )
     return false;
