@@ -266,6 +266,18 @@ binding without requiring a handle to the already-exited process. Unknown
 diagnostics, non-idle reconciliation, and other undelivered events remain fenced.
 The existing attachment path retains diagnostics for draining and discards its
 superseded restore notice.
+
+Runner suspension is a separate journal lifecycle (`suspended`), not a provider
+lifecycle. Idle Pi shutdown retains the provider's `session_open` checkpoint,
+completion receipt and saved session, but removes the process handle. If the
+executor itself survives, its one-time restore has already run. A different run's
+prepare therefore explicitly restores this saved Pi session after the existing
+settlement and immutable-profile checks, before attachment checks live work and
+adopts the successor's contract and runtime context. A changed context then
+retires that restored process and the next open relaunches the saved session with
+the new context. Missing-process attachment is not relaxed, restarted executors
+keep their existing restore path, and no saved schema changes.
+
 The stricter empty-event rule for OpenCode launch-profile rebinding is unchanged.
 An existing thread uses the ordinary `run.attach` rebinding path; preparation
 before a thread exists updates the saved binding directly. Same-run contract
