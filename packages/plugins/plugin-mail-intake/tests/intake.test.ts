@@ -59,7 +59,7 @@ afterEach(() => { expect(globalThis.fetch).not.toHaveBeenCalled(); vi.restoreAll
 describe("mail-intake job", () => {
   it("uses the documented schedule, minimal capabilities and secret-ref pickers", () => {
     expect(manifest.jobs).toEqual([expect.objectContaining({ jobKey: "mail-intake", schedule: "*/2 * * * *" })]);
-    expect(manifest.capabilities).toEqual(["jobs.schedule", "http.outbound", "secrets.read-ref", "plugin.state.read", "plugin.state.write"]);
+    expect(manifest.capabilities).toEqual(["jobs.schedule", "http.outbound", "secrets.read-ref", "plugin.state.read", "plugin.state.write", "companies.read"]);
     expect(configSchema.properties.gmailGrantRef.format).toBe("secret-ref");
     expect(configSchema.properties.routineFireSecretRef.format).toBe("secret-ref");
     expect(parseConfig({ ...config, enabled: undefined }).enabled).toBe(false);
@@ -261,12 +261,13 @@ describe("egress trust boundary", () => {
 });
 
 describe("registered job and explicit company binding", () => {
-  async function worker(initial: unknown = []) {
+  async function worker(initial: unknown = [], savedConfig = true) {
     const f = fixture(initial); let job: (() => Promise<void>) | undefined;
     let action: (params: Record<string, unknown>, context: PluginPerformActionContext) => Promise<unknown>;
     const ctx = { ...f.ctx, jobs: { register: vi.fn((_key: string, fn: () => Promise<void>) => { job = fn; }) },
       actions: { register: vi.fn((_key: string, fn: typeof action) => { action = fn; }) },
-      config: { get: vi.fn(async () => ({ ...config })) } };
+      companies: { list: vi.fn(async () => [{ id: company }]) },
+      config: { get: vi.fn(async (): Promise<Record<string, unknown>> => savedConfig ? { ...config } : {}) } };
     const plugin = createMailDefinition();
     await plugin.setup(ctx as unknown as PluginContext);
     const actor = { type: "user" as const, companyId: company, userId: "operator", agentId: null, runId: null };
@@ -311,7 +312,6 @@ describe("registered job and explicit company binding", () => {
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.secrets.resolve).not.toHaveBeenCalled();
     expect(f.ctx.state.set).not.toHaveBeenCalled();
     const restarted = await worker(f.saved());
-    await restarted.plugin.onConfigChanged!({ ...config }, { companyId: company });
     expect(await restarted.plugin.onHealth?.()).toEqual(await f.plugin.onHealth?.());
   });
   it("a tenth delivery failure reaches warning and health with its recorded time, even when disabled", async () => {
@@ -338,12 +338,13 @@ describe("registered job and explicit company binding", () => {
     expect(await f.plugin.onHealth?.()).toMatchObject({ status: "degraded",
       details: { parked: [{ id: "aa", attempts: 10, lastFailureAt: null }] } });
   });
-  it("health is quiet before company binding and redacts corrupt content-bearing state", async () => {
+  it("health reports missing configuration and redacts corrupt content-bearing state", async () => {
     const f = await worker({ ...state(), failures: [
       { id: "aa", internalDate: Date.now(), attempts: 10, nextRetryAt: Date.now(), subject: access },
-    ] });
-    expect(await f.plugin.onHealth?.()).toEqual({ status: "ok" });
-    expect(f.ctx.config.get).not.toHaveBeenCalled(); expect(f.ctx.state.get).not.toHaveBeenCalled();
+    ] }, false);
+    expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: "mail intake is not configured" });
+    expect(f.ctx.state.get).not.toHaveBeenCalled();
+    f.ctx.config.get.mockResolvedValue({ ...config });
     await f.plugin.onConfigChanged!({ ...config }, { companyId: company });
     expect(await f.plugin.onHealth?.()).toEqual({ status: "error", message: SAFE_ERROR });
     expect(f.ctx.http.fetch).not.toHaveBeenCalled(); expect(f.ctx.state.set).not.toHaveBeenCalled();
@@ -375,9 +376,10 @@ describe("registered job and explicit company binding", () => {
     await expect(f.seed({ companyId: company, mailbox: config.mailbox, seenIds: [] })).rejects.toThrow(SAFE_ERROR);
     expect(f.saved()).toBeNull();
   });
-  it("no config is quiet; saved config re-reads only the explicit company and fires", async () => {
-    const f = await worker();
-    await f.tick(); expect(f.ctx.config.get).not.toHaveBeenCalled(); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
+  it("no config fails visibly; saved config re-reads only the explicit company and fires", async () => {
+    const f = await worker([], false);
+    await expect(f.tick()).rejects.toThrow(SAFE_ERROR); expect(f.ctx.http.fetch).not.toHaveBeenCalled();
+    f.ctx.config.get.mockResolvedValue({ ...config });
     await f.plugin.onConfigChanged!(config as unknown as Record<string, unknown>, { companyId: company });
     await f.tick(); expect(f.ctx.config.get).toHaveBeenCalledWith(company); expect(f.fires).toHaveLength(2);
     f.ctx.config.get.mockResolvedValue({ ...config, enabled: false });

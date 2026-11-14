@@ -21,6 +21,31 @@ which returns `{ status, message?, details? }` for the existing health dashboard
 The [SDK contract:250–258](https://github.com/Smarty-Pants-Inc/paperclip/blob/96c12d3a01cc5cbb90e4bd09a3e919d88d25cd23/packages/plugins/sdk/src/define-plugin.ts#L250-L258)
 confirms the host surfaces these diagnostics. No custom status UI or core change.
 
+## Restart recovery (0.1.2)
+
+Startup, each job tick and health reconstruct the single configured company from
+saved host configuration, not a config-change notification or plugin KV row.
+[`PluginCompaniesClient.list()` (SDK types.ts:1180–1193)](../sdk/src/types.ts#L1180-L1193)
+provides company IDs; [`ctx.config.get(companyId)` (430–437)](../sdk/src/types.ts#L430-L437)
+reads each company's saved config. Empty configs are unconfigured; a nonempty
+invalid config or multiple configured companies fails closed. No ID, config or
+credential is copied into instance state. This also recovers pre-0.1.2 installs
+with saved config but **zero plugin_state rows**, without a config re-save.
+
+Discovery requires the documented `companies.read` capability (SDK README:413).
+It is the only added capability; an upgrade may require the host's normal
+capability approval before activation (PLUGIN_SPEC.md:1595). Do not bypass it.
+The job fails if no company resolves; `onHealth()` returns
+`{status:"error", message:"mail intake is not configured"}` instead of healthy.
+Discovery/invalid-config failures use the fixed `could not read mail` message.
+
+The [SDK action context (protocol.ts:442–460)](../sdk/src/protocol.ts#L442-L460)
+names a board principal **`"user"`**, not `"board"`; the host bridge translates
+its BOARD actor to that shape (`server/src/routes/plugins.ts:817–824`). A board
+user needs no agent or run ID. Initialization requires the host context company,
+actor company and injected parameter company to all match the recovered company;
+foreign/global contexts are refused before secret, Gmail or state-write calls.
+
 ## Secret-ref schema / runtime boundary
 
 The manifest declares each ref as `{type:"string", format:"secret-ref"}`.
@@ -39,9 +64,10 @@ secret resolution and preserves the old object-schema failure as a control.
 
 ## Contract
 
-1. Re-read config using the explicitly bound company on each tick. Disabled or
-   never configured means no mail, secret, or state activity. Only one company
-   can be bound to a worker; a different/global company save fails closed.
+1. Discover saved config at startup and on each tick, always with explicit
+   company IDs. Disabled jobs do no mail, secret or state work. Unconfigured
+   jobs fail visibly and health reports not configured. Only one company may
+   have a nonempty config; a different/global company save fails closed.
 2. Read explicitly initialized, company/mailbox-scoped version-2 state: seen
    `{id, internalDate}` records, failures `{id, internalDate, attempts,
    nextRetryAt, lastFailureAt}`, and a monotonic `notBefore` floor (epoch ms).
