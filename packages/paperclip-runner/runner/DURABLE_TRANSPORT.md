@@ -15,38 +15,26 @@ Recovery uses the same entry point. The Runner rejects `--source-reconcile`.
 
 Listener mode accepts TCP connections independently of controller connect ticks,
 including while runnerd is idle or already connected. A blocking accept worker
-sleeps in the kernel when there is no ingress. At most 16 upgrade workers run
-concurrently. If those slots are full, a new arrival **closes the oldest
-unfinished upgrade** and joins its worker before replacing it. Continuously
-replenished silent or partial-HTTP peers therefore cannot reject a controller
-merely by keeping the upgrade cap full. Completed upgrades and live controller
-sockets are never eviction candidates. Silent, partial, and malformed HTTP peers
+sleeps in the kernel when there is no ingress. At most 16 concurrent upgrades
+have a **2-second deadline from accept**, independent of the controller's
+connection/authentication deadline. Silent, partial, and malformed HTTP peers
 are dropped without failing a controller connect attempt or consuming a ticket.
-Only unfinished upgrades retry nonblocking I/O (at most every 5 ms).
+Only these active upgrades retry nonblocking I/O (at most every 5 ms).
 
-Each unauthenticated connection has **one 2.5-second deadline from TCP accept**:
-HTTP upgrade, waiting for a connecting tick, and mutual authentication all spend
-that same budget. HTTP upgrade also retains its shorter 2-second sub-limit.
-The first completed upgrade waits only for the remaining total budget; there is
-no fresh ready grace or authentication budget at handover. The connection closes
-at the total deadline even without another connect tick or incoming peer, or if
-authentication stalls inside a frame. Expiry releases unauthenticated admission;
-dropping an expired handle cannot release a newer controller's slot.
-
-Further arrivals while a completed upgrade is waiting or a controller socket is
-live receive HTTP 503 immediately, rather than joining a FIFO backlog. Dropping
-the controller socket releases admission for the next retry. Once the controller
-proof is validated and the Runner's authentication response is sent within the
-total deadline, its socket is protected: the existing authenticated welcome and
-runtime budgets apply, without an ingress deadline. The execution/reconnect
-lifecycle deadline can shorten any of these budgets.
+The first completed WebSocket upgrade on the configured path is handed to the
+existing connect/authentication path on its next connecting tick. If runnerd is
+not connecting yet, one completed upgrade may wait for **at most 2 seconds**;
+it closes at grace expiry even without another connect tick or incoming peer.
+A controller retry can then claim the free slot. Further arrivals while that
+slot is occupied, while a controller socket is live, or while all upgrade slots
+are occupied receive HTTP 503 and close rather than joining a FIFO backlog.
+Dropping the controller socket releases admission for the next retry.
 
 Path, query and extension checks are unchanged. Warm path rotation invalidates
 pending and completed upgrades for the old path without rebinding the listener.
 Endpoint shutdown wakes accept and cancels/joins outstanding upgrade workers.
-Authentication proofs, PRP, ticket handling, reconnect bookkeeping and dial mode
-are unchanged. Only listener pre-authentication I/O uses the shared admission
-deadline; authenticated welcome retains its existing budget.
+Authentication, PRP, ticket handling, reconnect bookkeeping and dial mode keep
+their existing behavior and budgets.
 
 ## Trust boundary
 

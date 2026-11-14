@@ -12,11 +12,13 @@ use tungstenite::handshake::server::ErrorResponse;
 use tungstenite::handshake::HandshakeError;
 use tungstenite::{accept_hdr_with_config, WebSocket};
 
+/// Independent of the controller's connect/auth budget. Silent and partial
+/// requests occupy one of at most 16 upgrade workers for no more than 2s.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PENDING_HANDSHAKES: usize = 16;
-/// One accept-to-authentication budget: HTTP upgrade, ready wait, and mutual
-/// authentication share this deadline. Authenticated welcome keeps its own budget.
-const UNAUTHENTICATED_TIMEOUT: Duration = Duration::from_millis(2500);
+/// A completed upgrade may precede the next connect tick. Keep only the first
+/// for 2s, then drop it; no idle socket can become an unbounded FIFO backlog.
+const READY_GRACE: Duration = Duration::from_secs(2);
 
 struct ReadySocket {
     socket: WebSocket<TcpStream>,
@@ -27,8 +29,7 @@ struct Admission {
     path: String,
     generation: u64,
     ready: Option<ReadySocket>,
-    active: Option<Instant>,
-    active_deadline: Option<Instant>,
+    active: bool,
     accept_error: Option<String>,
 }
 
@@ -42,25 +43,6 @@ impl Admission {
             self.ready = None;
         }
     }
-}
-
-struct UpgradeControl {
-    stream: Mutex<Option<TcpStream>>,
-    cancelled: AtomicBool,
-    upgrading: AtomicBool,
-}
-
-impl UpgradeControl {
-    fn shutdown(&self) {
-        if let Some(stream) = self.stream.lock().unwrap().as_ref() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-    }
-}
-
-struct PendingUpgrade {
-    control: Arc<UpgradeControl>,
-    worker: thread::JoinHandle<()>,
 }
 
 pub(crate) struct ListenerIngress {
@@ -79,8 +61,7 @@ impl ListenerIngress {
             path,
             generation: 0,
             ready: None,
-            active: None,
-            active_deadline: None,
+            active: false,
             accept_error: None,
         }));
         let stopping = Arc::new(AtomicBool::new(false));
@@ -91,9 +72,7 @@ impl ListenerIngress {
         let worker = thread::Builder::new()
             .name("runner-ingress".into())
             .spawn(move || {
-                // Acceptance order is also eviction order. Completed upgrades
-                // are protected under the same mutex that publishes ready/active.
-                let mut pending: Vec<PendingUpgrade> = Vec::new();
+                let mut pending: Vec<thread::JoinHandle<()>> = Vec::new();
                 loop {
                     let connection = listener.accept();
                     if stop.load(Ordering::Acquire) {
@@ -116,84 +95,40 @@ impl ListenerIngress {
                             break;
                         }
                     };
-                    // Both deadlines start at accept, not worker scheduling.
-                    let accepted = Instant::now();
+                    // The deadline starts at accept, not when a worker is scheduled.
+                    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
                     if stream.set_nonblocking(true).is_err() {
                         continue;
                     }
-                    let mut index = 0;
-                    while index < pending.len() {
-                        if pending[index].worker.is_finished() {
-                            let _ = pending.remove(index).worker.join();
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    let (path, generation, evicted) = {
+                    pending.retain_mut(|worker| !worker.is_finished());
+                    let (path, generation, occupied) = {
                         let mut state = shared.lock().unwrap();
                         state.expire_ready();
-                        if state.active.is_some() || state.ready.is_some() {
-                            reject_busy(&mut stream);
-                            continue;
-                        }
-                        let evicted = if pending.len() >= MAX_PENDING_HANDSHAKES {
-                            let Some(oldest) = pending.iter().position(|pending| {
-                                pending.control.upgrading.load(Ordering::Acquire)
-                            }) else {
-                                reject_busy(&mut stream);
-                                continue;
-                            };
-                            let pending = pending.remove(oldest);
-                            pending.control.cancelled.store(true, Ordering::Release);
-                            pending.control.shutdown();
-                            Some(pending)
-                        } else {
-                            None
-                        };
-                        (state.path.clone(), state.generation, evicted)
+                        (
+                            state.path.clone(),
+                            state.generation,
+                            state.active || state.ready.is_some(),
+                        )
                     };
-                    // Join before replacing: not even a flood can grow the
-                    // worker count beyond 16. Cancellation interrupts I/O and
-                    // the retry loop observes it within its existing 5ms step.
-                    if let Some(evicted) = evicted {
-                        let _ = evicted.worker.join();
-                    }
-                    let Ok(shutdown_stream) = stream.try_clone() else {
+                    if occupied || pending.len() >= MAX_PENDING_HANDSHAKES {
+                        reject_busy(&mut stream);
                         continue;
-                    };
-                    let control = Arc::new(UpgradeControl {
-                        stream: Mutex::new(Some(shutdown_stream)),
-                        cancelled: AtomicBool::new(false),
-                        upgrading: AtomicBool::new(true),
-                    });
-                    let worker_control = control.clone();
+                    }
                     let state = shared.clone();
                     let stop = stop.clone();
                     let wake = wake.clone();
                     if let Ok(worker) = thread::Builder::new()
                         .name("runner-ingress-upgrade".into())
                         .spawn(move || {
-                            upgrade(
-                                stream,
-                                path,
-                                generation,
-                                accepted,
-                                &worker_control,
-                                &state,
-                                &stop,
-                                &wake,
-                            );
-                            // Do not retain an extra TCP handle in the pending
-                            // list after the worker finishes (including errors).
-                            worker_control.stream.lock().unwrap().take();
+                            upgrade(stream, path, generation, deadline, &state, &stop, &wake)
                         })
                     {
-                        pending.push(PendingUpgrade { control, worker });
+                        pending.push(worker);
                     }
                 }
                 // No detached upgrade workers survive endpoint shutdown.
-                for pending in pending {
-                    let _ = pending.worker.join();
+                for worker in pending {
+                    let _ = worker.join();
                 }
             })?;
         Ok(Self {
@@ -228,15 +163,11 @@ impl ListenerIngress {
         let Some(ready) = state.ready.take() else {
             return Ok(None);
         };
-        state.active = Some(ready.expires);
-        state.active_deadline = Some(ready.expires);
+        state.active = true;
         self.changed.notify_all();
         Ok(Some(ListenerSocket {
             socket: ready.socket,
-            id: ready.expires,
-            deadline: Some(ready.expires),
             admission: self.admission.clone(),
-            changed: self.changed.clone(),
         }))
     }
 }
@@ -270,19 +201,12 @@ fn upgrade(
     stream: TcpStream,
     path: String,
     generation: u64,
-    accepted: Instant,
-    control: &UpgradeControl,
+    deadline: Instant,
     admission: &Arc<Mutex<Admission>>,
     stopping: &AtomicBool,
     changed: &Condvar,
 ) {
-    let upgrade_deadline = accepted + HANDSHAKE_TIMEOUT;
-    let deadline = accepted + UNAUTHENTICATED_TIMEOUT;
-    let expired = || {
-        stopping.load(Ordering::Acquire)
-            || control.cancelled.load(Ordering::Acquire)
-            || Instant::now() >= upgrade_deadline
-    };
+    let expired = || stopping.load(Ordering::Acquire) || Instant::now() >= deadline;
     if expired() || stream.set_nonblocking(true).is_err() {
         return;
     }
@@ -300,7 +224,7 @@ fn upgrade(
                 return Err(rejection);
             }
             let state = admission.lock().unwrap();
-            if state.active.is_some() || state.ready.is_some() || state.generation != generation {
+            if state.active || state.ready.is_some() || state.generation != generation {
                 let mut rejection = ErrorResponse::new(None);
                 *rejection.status_mut() = tungstenite::http::StatusCode::SERVICE_UNAVAILABLE;
                 return Err(rejection);
@@ -320,43 +244,20 @@ fn upgrade(
                 }
                 let mut state = admission.lock().unwrap();
                 state.expire_ready();
-                if control.cancelled.load(Ordering::Acquire) {
-                    return;
-                }
-                control.upgrading.store(false, Ordering::Release);
-                if state.active.is_none() && state.ready.is_none() && state.generation == generation
-                {
-                    state.ready = Some(ReadySocket {
-                        socket,
-                        expires: deadline,
-                    });
-                    // One deadline survives ready -> active handover. The
-                    // worker also shuts down stalled authentication I/O (even
-                    // fragmented traffic), without a new timer/thread/poller.
-                    loop {
-                        let owns_ready = state
+                if !state.active && state.ready.is_none() && state.generation == generation {
+                    let expires = Instant::now() + READY_GRACE;
+                    state.ready = Some(ReadySocket { socket, expires });
+                    // The ready socket really closes at grace expiry even if
+                    // runnerd remains idle and no further TCP peer arrives.
+                    while !stopping.load(Ordering::Acquire)
+                        && state
                             .ready
                             .as_ref()
-                            .is_some_and(|ready| ready.expires == deadline);
-                        let owns_active = state.active_deadline == Some(deadline);
-                        if stopping.load(Ordering::Acquire) || (!owns_ready && !owns_active) {
-                            if owns_active {
-                                control.shutdown();
-                                state.active = None;
-                                state.active_deadline = None;
-                            }
-                            break;
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
+                            .is_some_and(|ready| ready.expires == expires)
+                    {
+                        let remaining = expires.saturating_duration_since(Instant::now());
                         if remaining.is_zero() {
-                            if owns_ready {
-                                state.ready = None;
-                            }
-                            if owns_active {
-                                control.shutdown();
-                                state.active = None;
-                                state.active_deadline = None;
-                            }
+                            state.expire_ready();
                             break;
                         }
                         state = changed.wait_timeout(state, remaining).unwrap().0;
@@ -368,7 +269,7 @@ fn upgrade(
                 if admission.lock().unwrap().generation != generation {
                     return;
                 }
-                let remaining = upgrade_deadline.saturating_duration_since(Instant::now());
+                let remaining = deadline.saturating_duration_since(Instant::now());
                 thread::sleep(Duration::from_millis(5).min(remaining));
                 if expired() {
                     return;
@@ -382,33 +283,7 @@ fn upgrade(
 
 pub(super) struct ListenerSocket {
     socket: WebSocket<TcpStream>,
-    id: Instant,
-    deadline: Option<Instant>,
     admission: Arc<Mutex<Admission>>,
-    changed: Arc<Condvar>,
-}
-impl ListenerSocket {
-    pub(super) fn authentication_deadline(&self) -> Option<Instant> {
-        self.deadline
-    }
-
-    /// Only called after validating the controller's proof and sending ours.
-    pub(super) fn authenticated(&mut self) -> Result<(), DurableRunnerError> {
-        let mut state = self.admission.lock().unwrap();
-        if state.active != Some(self.id)
-            || self
-                .deadline
-                .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            return Err(DurableRunnerError::invalid(
-                "listener authentication deadline elapsed",
-            ));
-        }
-        self.deadline = None;
-        state.active_deadline = None;
-        self.changed.notify_all();
-        Ok(())
-    }
 }
 impl Deref for ListenerSocket {
     type Target = WebSocket<TcpStream>;
@@ -424,13 +299,6 @@ impl DerefMut for ListenerSocket {
 impl Drop for ListenerSocket {
     fn drop(&mut self) {
         let _ = self.socket.get_ref().shutdown(std::net::Shutdown::Both);
-        let mut state = self.admission.lock().unwrap();
-        // Expiry may already have closed this unauthenticated socket and
-        // admitted another. A stale handle must not release its successor.
-        if state.active == Some(self.id) {
-            state.active = None;
-            state.active_deadline = None;
-        }
-        self.changed.notify_all();
+        self.admission.lock().unwrap().active = false;
     }
 }
