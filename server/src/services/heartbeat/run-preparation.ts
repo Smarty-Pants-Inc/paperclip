@@ -853,6 +853,8 @@ export interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    /** Internal imported-work recovery: require no prior admission or armed monitor under the issue lock. */
+    initialImport?: true;
     monitorNextCheckAt?: string;
     monitorWakeRequestedAt?: string;
     /** Internal diagnostic only; the callback cannot grant admission. */
