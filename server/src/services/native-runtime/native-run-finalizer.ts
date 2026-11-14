@@ -503,15 +503,19 @@ async function recordRetryableFailure(input: {
     const [currentRun] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.run.id)).limit(1);
     if (!currentRun) throw new Error("native_finalization_run_missing");
     if (input.failureScope === "workspace") {
-      const exported = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(
+      const workspaceOperationsForRun = await tx.select({ status: workspaceOperations.status }).from(workspaceOperations).where(and(
         eq(workspaceOperations.companyId, input.run.companyId),
         eq(workspaceOperations.heartbeatRunId, input.run.id),
         eq(workspaceOperations.phase, "workspace_finalize"),
-        eq(workspaceOperations.status, "succeeded"),
-      )).limit(1);
-      // The live exporter may have acquired ownership since the stale error
-      // was raised, or already durably published a successful copyback.
-      if (exported.length || record(currentRun.runnerProfileJson).nativeWorkspaceFinalizationOwner) return current;
+      ));
+      const exported = workspaceOperationsForRun.some((operation) => operation.status === "succeeded");
+      const failedExport = workspaceOperationsForRun.some((operation) => operation.status === "failed");
+      // A committed result can be reopened only by durable evidence of an
+      // unfinished copy-back. A late error without a failed export operation
+      // must not undo a successful finalization.
+      if (exported || (committedWorkspaceRetry && !failedExport
+        && record(currentRun.resultJson).finalizationPhase === "committed")
+        || record(currentRun.runnerProfileJson).nativeWorkspaceFinalizationOwner) return current;
     }
     input = { ...input, coordinator: current, run: currentRun };
     const issue = await tx
@@ -672,7 +676,7 @@ async function recordRetryableFailure(input: {
     // keeps the newer run's decision; this result is never applied.
     const projectsTerminalStatus =
       (exhausted || supersededByNewerRun) && input.projectRunStatus;
-    if (projectsTerminalStatus && !supersededByNewerRun && input.failureScope === "workspace" && !workspaceCopybackLost) {
+    if (projectsTerminalStatus && !supersededByNewerRun && input.failureScope === "workspace") {
       await preserveNativeWorkspaceExportLease(tx as unknown as Db, input.run, input.coordinator.resultId);
     }
     if (projectsTerminalStatus) await notifyInstructionCollection(tx, { companyId: input.run.companyId, runId: input.run.id });
@@ -759,8 +763,10 @@ async function recordRetryableFailure(input: {
       }
     }
     if (workspaceCopybackLost) {
+      const attempts = workspaceFinalizeAttempt ?? 0;
+      const attemptLabel = attempts === 1 ? "attempt" : "attempts";
       await issueService(tx as unknown as Db).addComment(input.coordinator.issueId,
-        "The result is saved. Workspace copy-back was lost after three failed attempts; no additional provider turn was run.",
+        `The result is saved. Workspace copy-back was lost after ${attempts} failed ${attemptLabel}; the original box was stopped and retained with the files. Retry workspace export from that exact box using the workspace export recovery action; no provider turn is needed.`,
         { runId: input.run.id }, { authorType: "system" }, tx);
     }
     if (!supersededByNewerRun) {
