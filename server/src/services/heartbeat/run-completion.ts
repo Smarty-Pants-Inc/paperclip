@@ -177,6 +177,8 @@ export interface FailHeartbeatRunInput extends RunCompletionInput {
 export interface FailHeartbeatRunSetupInput {
   /** Resume idempotent settlement after a connection failed after the terminal write. */
   resumeSettlement?: boolean;
+  /** A fresh native-eligible run failed before its durable selection committed. */
+  preselectionFailureCode?: "instruction_preparation_failed" | "runtime_selection_failed";
   run: Run;
   runId: string;
   outerErr: unknown;
@@ -1720,6 +1722,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         : null) ??
       recordedResponsibleUserDenialCode ??
       nonRetryablePreflightCode ??
+      (!providerDispatchStarted ? input.preselectionFailureCode : null) ??
       "setup_failed";
     const failureCause = GENERIC_RUN_FAILURE_CODES.has(setupFailureErrorCode) ? thrownFailureCause : null;
     // Bounded kind and reason only: a workspace provider's own text never crosses into Core.
@@ -1927,7 +1930,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: ["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible"].includes(livenessRun.errorCode ?? "") ||
+        suppressImmediateRecovery: ["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible", "instruction_preparation_failed", "runtime_selection_failed"].includes(livenessRun.errorCode ?? "") ||
           storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,

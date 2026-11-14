@@ -94,6 +94,7 @@ export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
 const SHOWN_CODES = new Set([
   "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed",
   "setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible",
+  "instruction_preparation_failed", "runtime_selection_failed",
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
   "native_controller_recovery_metadata_too_large", "native_session_cleanup_quarantined",
@@ -153,7 +154,8 @@ const HELD_CODES = new Set([
   "native_session_supervisor_checkpoint_too_large", "pi_conversation_identity_missing",
 ]);
 
-const PREPARATION_FAILURE_CODES = new Set(["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible"]);
+const PREPARATION_FAILURE_CODES = new Set(["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible",
+  "instruction_preparation_failed", "runtime_selection_failed"]);
 const GENERIC_RUN_CODES = new Set(["adapter_failed", "setup_failed"]);
 const TERMINAL = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 const LIVE = ["queued", "running", "scheduled_retry"];

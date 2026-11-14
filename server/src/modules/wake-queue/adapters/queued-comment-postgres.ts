@@ -1,3 +1,4 @@
+import { runtimeModeReasonForTerminalSql } from "../../../services/runtime-selection-state.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { assertAgentInteraction } from "../../../services/agent-interaction-policy.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
@@ -145,7 +146,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
       await notifyChatRunMilestones(tx, { companyId, issueId });
       const row = await tx
         .update(heartbeatRuns)
-        .set({ status: "cancelled", finishedAt: now, error: reason, errorCode: "queued_comment_discarded", updatedAt: now })
+        .set({ status: "cancelled", runtimeModeReason: runtimeModeReasonForTerminalSql(), finishedAt: now, error: reason, errorCode: "queued_comment_discarded", updatedAt: now })
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
         .returning({ id: heartbeatRuns.id })
         .then((rows) => rows[0] ?? null);

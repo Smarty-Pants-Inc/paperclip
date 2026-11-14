@@ -2425,6 +2425,23 @@ persisted mode incompatible with the agent's adapter fails with
 An unresolved legacy row is the queue's default, not a persisted legacy
 selection: normal native selection still happens through its existing owner.
 
+Native eligibility does not commit a runtime choice. Instruction-copy preparation
+and the selection transaction can still fail before the native stamp commits.
+Those failures use the same fresh settlement owners and bounded preparation retry:
+`instruction_preparation_failed` or `runtime_selection_failed`, respectively;
+a wrapped database disconnect still takes the more specific `setup_connection_lost`
+code. No provider work or native coordinator is claimed for a rolled-back selection.
+
+Before selection, `runtime_mode_reason` records `not_selected_preparing:<phase>`
+at the existing workspace, instruction and selection boundaries (`workspace_prep`,
+`instruction_prep`, `selection_txn`). Terminal writers turn that into
+`not_selected_run_ended_before_selection:<phase>` for failure, cancellation and
+no-op completion; an unclaimed cancellation uses `workspace_prep`. The
+`runtime_mode_resolved_at` timestamp remains NULL. These reasons explain the
+unresolved queue placeholder, never a choice to execute legacy. A committed
+native selection replaces preparation progress with its ordinary eligibility
+reason; existing resolved native and `direct_adapter` choices are unchanged.
+
 A native run can accept its result and then lose its server to a hard kill
 before finalization. Its result stays leased to the controller of the earlier
 boot, which cannot release the lease the way a graceful drain does. Startup

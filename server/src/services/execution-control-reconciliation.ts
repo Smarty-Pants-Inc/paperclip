@@ -1,3 +1,4 @@
+import { runtimeModeReasonForTerminalSql } from "./runtime-selection-state.js";
 import { notifyNativeEnvironmentSettlement } from "./native-environment-settlement-notifications.js";
 import { notifyExternalAgentSettlement } from "../modules/external-agents/index.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
@@ -274,6 +275,7 @@ export async function reconcileAbandonedExecutionControl(
             .update(heartbeatRuns)
             .set({
               status: "failed",
+              runtimeModeReason: runtimeModeReasonForTerminalSql(),
               executionStatusDeliveryId: randomUUID(),
               finishedAt: now,
               ...(coordinator
