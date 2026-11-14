@@ -1319,10 +1319,11 @@ export function transcriptToTaskChatItems(
  */
 export function settledRunChildren(
   parsed: readonly TaskChatItem[],
+  reasoningDisplay: ReasoningDisplay = readReasoningDisplay(),
 ): TaskChatTurnChildItem[] {
   // A finished run's compactions render as thread dividers (see
   // settledCompactionMarkers), not inside its collapsed turn.
-  return buildTurnTimelineRows(parsed, false).filter((item) => !isCompactionDivider(item));
+  return buildTurnTimelineRows(parsed, false, reasoningDisplay).filter((item) => !isCompactionDivider(item));
 }
 
 /**
@@ -2056,9 +2057,22 @@ function subagentsFromDelegation(
   });
 }
 
+export type ReasoningDisplay = "fold" | "inline";
+export const REASONING_DISPLAY_STORAGE_KEY = "paperclip:task-chat:reasoning-display:v1";
+
+export function readReasoningDisplay(): ReasoningDisplay {
+  if (typeof window === "undefined") return "fold";
+  try {
+    return window.localStorage.getItem(REASONING_DISPLAY_STORAGE_KEY) === "inline" ? "inline" : "fold";
+  } catch {
+    return "fold";
+  }
+}
+
 export function buildTurnTimelineRows(
   parsed: readonly TaskChatItem[],
   running: boolean,
+  reasoningDisplay: ReasoningDisplay = readReasoningDisplay(),
 ): TaskChatTurnChildItem[] {
   const rows: TaskChatTurnChildItem[] = [];
   let current: TaskChatActivityPhaseItem | null = null;
@@ -2229,6 +2243,11 @@ export function buildTurnTimelineRows(
       rows.push(resolved
         ? { ...item, resolved: true }
         : stoppedCompaction || stoppedRetry ? { ...item, status: "interrupted" } : item);
+    } else if (item.kind === "thinking" && reasoningDisplay === "inline") {
+      // Inline reasoning is a transcript row in its original chronological
+      // position; tools remain grouped in the existing activity fold.
+      current = null;
+      rows.push(item);
     } else if (
       item.kind === "tool" ||
       item.kind === "usage" ||

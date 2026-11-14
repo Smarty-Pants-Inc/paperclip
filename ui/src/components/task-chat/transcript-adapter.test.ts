@@ -1097,6 +1097,17 @@ describe("buildTurnTimelineRows (DOT-217)", () => {
     patchArtifactRef: null,
   };
 
+  it("keeps reasoning folded by default and places it inline without ungrouping tools", () => {
+    const reasoning: TaskChatItem = { id: "reasoning", kind: "thinking", lines: ["Checking the change"], streaming: true };
+    const input = [tool("tool-before"), reasoning, tool("tool-after")];
+    const folded = buildTurnTimelineRows(input, true, "fold");
+    expect(folded.some((row) => row.kind === "thinking")).toBe(false);
+    expect(folded.filter((row) => row.kind === "activity_phase").flatMap((row) => row.kind === "activity_phase" ? row.items.map((item) => item.id) : [])).toEqual(["tool-before", "reasoning", "tool-after"]);
+    const inline = buildTurnTimelineRows(input, true, "inline");
+    expect(inline.map((row) => row.kind)).toEqual(["activity_phase", "thinking", "activity_phase"]);
+    expect(inline.filter((row) => row.kind === "activity_phase").flatMap((row) => row.kind === "activity_phase" ? row.items.map((item) => item.id) : [])).toEqual(["tool-before", "tool-after"]);
+  });
+
   it("keeps commentary, grouped tools, and latest question receipts in first-seen order", () => {
     const input = [
       commentary("commentary-1", "Inspecting the workspace."),
