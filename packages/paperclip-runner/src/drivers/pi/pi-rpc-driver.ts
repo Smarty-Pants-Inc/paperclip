@@ -38,6 +38,7 @@ import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
+import { piToolLimitEntry, piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -183,8 +184,8 @@ export class PiRpcDriver implements HarnessDriver {
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
     const instructionBoundary = `paperclip-host-${randomUUID()}`;
-    // Bootstrap registers tools without prompting. Only a started Pi can report
-    // the actual active native/extension inventory used for the API budget.
+    // Only a started Pi can report its complete native/add-on inventory. Chat
+    // bootstraps without dynamic tools, then registers ONLY the measured selection.
     let initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
     const agentHome = this.#options.model && usesPiProviderLoopback(this.#options.model, environment)
       ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
@@ -210,6 +211,7 @@ export class PiRpcDriver implements HarnessDriver {
     let resident: PiResidentState | undefined;
     let callbacks: PiHostCallbacks | undefined;
     let bootstrapProvider: PiBindProvider | undefined;
+    let bootstrapToolsDeferred = false;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
@@ -243,7 +245,9 @@ export class PiRpcDriver implements HarnessDriver {
           const toolSocketPath = join(privateDirectory, "tool.sock");
           // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
           await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
-          const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions, tools: context.tools, toolSocketPath };
+          bootstrapToolsDeferred = provider.provider.api === "openai-completions" && context.tools.length > 0;
+          const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions,
+            tools: bootstrapToolsDeferred ? [] : context.tools, toolSocketPath };
           if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
           resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
             binding: { origin, close: provider.close, initial: true }, toolSocketPath };
@@ -312,7 +316,7 @@ export class PiRpcDriver implements HarnessDriver {
         const inventory = await send({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: input.normalizedSessionId });
         const context = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext,
           undefined, { api: bootstrapProvider.api, nativeToolCount: inventory.nativeTools.length });
-        if (context.instructions !== initialContext.instructions || JSON.stringify(context.tools) !== JSON.stringify(initialContext.tools)) {
+        if (bootstrapToolsDeferred || context.instructions !== initialContext.instructions || JSON.stringify(context.tools) !== JSON.stringify(initialContext.tools)) {
           const previous = resident.binding!.origin;
           await send({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...previous });
           const origin = { epoch: resident.epoch + 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
@@ -444,6 +448,7 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   lastErrorMessage?: string;
+  toolLimitFailure?: { code: string; message: string };
   hasToolCalls: boolean;
   /** Low-level agent_end is a continuation boundary, not prompt settlement. */
   agentEnded: boolean;
@@ -1547,6 +1552,17 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
     if (!turn) return;
     if (!this.#remember(keys, turn)) return;
+    if (event.type === "entry_appended") {
+      const limit = piToolLimitEntry(event.entry);
+      if (limit && !turn.settled && limit.origin.runId === turn.runId && limit.origin.turnId === turn.turnId
+        && this.#callbacks?.authority.accept(limit.origin)) {
+        // Read only the owned numeric envelope, not arbitrary extension data.
+        // Pi catches hook throws and turns abort() into cancellation; this
+        // supported custom-entry receipt preserves our actual failure cause.
+        turn.toolLimitFailure = { code: "pi_tool_limit_exceeded", message: piToolLimitMessage(limit.toolCount) };
+        return;
+      }
+    }
     if (event.type === "tool_execution_start" && !turn.settled) {
       turn.hasToolCalls = true;
       if (typeof event.toolCallId === "string") {
@@ -1614,10 +1630,13 @@ export class PiRpcHarnessSession implements HarnessSession {
       // A length receipt is incomplete even with text/mandatory usage. Judge
       // only the final receipt, after Pi has exhausted native recovery.
       const truncated = turn.lastAssistantStopReason === "length";
-      const status = event.aborted === true || turn.cancelRequested ? "cancelled" : turn.failed || truncated || empty ? "failed" : "completed";
-      const error = truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
-        : turn.failed ? { code: "pi_provider_error", message: turn.lastErrorMessage ?? "Pi provider failed without an error message." }
-        : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined;
+      const status = turn.cancelRequested || (event.aborted === true && !turn.toolLimitFailure) ? "cancelled" : turn.toolLimitFailure || turn.failed || truncated || empty ? "failed" : "completed";
+      const providerCause = turn.lastErrorMessage ?? "Pi provider failed without an error message.";
+      const providerMessage = (this.#resident?.context.api ?? this.#initialContext.api) === "anthropic-messages" && /\b413\b|request_too_large|request_body_too_large/i.test(providerCause)
+        ? `${providerCause}\nRequest too large: reduce this agent's tools or ask the board. Paperclip did not trim tools or retry with a smaller catalog.` : providerCause;
+      const error = turn.toolLimitFailure ?? (truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
+        : turn.failed ? { code: "pi_provider_error", message: providerMessage }
+        : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined);
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
       if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled.resolve();
     }

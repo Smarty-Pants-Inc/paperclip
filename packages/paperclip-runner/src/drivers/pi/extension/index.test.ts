@@ -36,7 +36,7 @@ async function fixture(overrides: { initial?: PiBindInitial; hooks?: Parameters<
   const ctx: PiBindContext = { sessionManager: { getSessionId: () => "native-pi-session-not-host-id" }, isIdle: () => idle, hasPendingMessages: () => pending, abort: vi.fn(() => {}), model: { provider: "paperclip", id: "m" }, modelRegistry: { find: (provider, id) => ({ provider, id }) } };
   const pi: PiBindApi = {
     on: (event, handler) => { handlers.set(event, handler); return () => handlers.delete(event); },
-    registerProvider: vi.fn(), unregisterProvider: vi.fn(),
+    registerProvider: vi.fn(), unregisterProvider: vi.fn(), appendEntry: vi.fn(),
     registerTool: tool => { tools.set(tool.name, tool); if (tool.exposure !== "hidden") active = [...new Set([...active, tool.name])]; },
     getActiveTools: () => active, setActiveTools: names => { active = names; },
     setModel: vi.fn(async model => { ctx.model = model; return true; }),
@@ -79,9 +79,23 @@ describe("owned Pi bind extension", () => {
   });
   it.each(["openai-completions", "anthropic-messages", "openai-responses"] as const)("guards the final request only for an API with a documented cap: %s", async api => {
     const f = await fixture(); f.ctx.model!.api = api;
+    await f.emit("input", { source: "rpc" }); await f.emit("before_agent_start", { systemPrompt: "native" });
     const request = () => f.emit("before_provider_request", { payload: { tools: Array.from({ length: 129 }, () => ({})) } });
-    if (api === "openai-completions") { expect(request).toThrow("total tool cap 128"); expect(f.ctx.abort).toHaveBeenCalledTimes(1); }
-    else { expect(request).not.toThrow(); expect(f.ctx.abort).not.toHaveBeenCalled(); }
+    if (api === "openai-completions") {
+      expect(request).toThrow("total tool cap 128"); expect(f.ctx.abort).toHaveBeenCalledTimes(1);
+      expect(f.pi.appendEntry).toHaveBeenCalledExactlyOnceWith("paperclip.tool-limit.v1", { origin: first, api, cap: 128, toolCount: 129 });
+      expect(vi.mocked(f.pi.appendEntry!).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(f.ctx.abort).mock.invocationCallOrder[0]!);
+    } else { expect(request).not.toThrow(); expect(f.ctx.abort).not.toHaveBeenCalled(); expect(f.pi.appendEntry).not.toHaveBeenCalled(); }
+  });
+  it("registers more than 256 Messages tools without a guessed local count ceiling", async () => {
+    const tools = Array.from({ length: 261 }, (_, i) => ({ name: `app_${i}`, description: `Tool ${i}`, inputSchema: { type: "object" } }));
+    const f = await fixture({ initial: { ...initial, tools } });
+    expect(f.tools.size).toBe(261);
+    expect(f.active()).toEqual(["read", ...tools.map(tool => tool.name)]);
+    await sendPiBindRequest(f.socketPath, command("settle", first));
+    await sendPiBindRequest(f.socketPath, { ...bind, provider: { ...bind.provider, api: "anthropic-messages" }, tools: [...tools, { ...tools[0]!, name: "another_tool" }] });
+    expect(f.tools.size).toBe(262);
+    expect(f.active()).toHaveLength(263);
   });
   it("bootstraps immutable first authority without any socket roundtrip or provider registration", async () => {
     const f = await fixture();

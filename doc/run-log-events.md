@@ -294,6 +294,33 @@ does not change selection. Core plus native overflow rejects before prompting.
 No 128-tool cap is inferred for [Anthropic Messages](https://platform.claude.com/docs/en/api/messages/create)
 or other APIs; this does not mean those APIs have no other limits. Provider size
 rejections fail the turn with their cause, not a retry with fewer tools.
+A Messages 413 adds the next step to that single terminal failure note:
+“reduce this agent's tools or ask the board.” The next message can reuse the
+native session and full catalog; no smaller-catalog retry is introduced.
+
+Chat bootstraps without dynamic tools, reads the active native/add-on inventory,
+then registers the measured selection through the existing bind protocol before
+any prompt. Omitted definitions are never registered during bootstrap. Messages
+keeps its complete catalog, including catalogs above 256 tools. The previous
+256-name guard was local, undocumented policy, not a provider or Pi limit
+([original guard, extension/index.ts:192–195](https://github.com/Smarty-Pants-Inc/paperclip/blob/4fa721151ccfe2905b443a6437b245cdfef8b245/packages/paperclip-runner/src/drivers/pi/extension/index.ts#L192-L195),
+introduced by `acb1858ceff255c7e8664a01895cdff15aa077e0`).
+Pi 1.5.2's shipped `docs/extensions.md`, §`pi.registerTool(definition)`
+(lines 1582–1594), documents registration during load and after startup and
+runtime activation with `setActiveTools`; its `dist/core/extensions/loader.js`
+(lines 237–247) stores definitions in a Map without a count guard. The upstream
+[extension API documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md#piregistertooldefinition)
+is the corresponding public reference. Neither this API nor the Messages
+reference above establishes a 256-tool ceiling, so the local guard is removed,
+not replaced by another invented count. Existing private-frame byte bounds remain.
+
+If an add-on pushes the actual serialized Chat request over 128 after inventory,
+the final-request guard refuses it without trimming or HTTP dispatch. Before
+aborting, it publishes only the owned origin and numeric limit/count via Pi's
+supported `appendEntry` → `entry_appended` seam. The driver validates that
+receipt against the live turn and ends it as `turn.failed` with code
+`pi_tool_limit_exceeded`, the count and actionable guidance, not a neutral
+cancellation. Arbitrary extension-error payloads remain excluded.
 
 An overflow emits one `harness.diagnostic` per run, code
 `pi_dynamic_tool_limit`, with `api`, total-request `cap`, `nativeToolCount`,

@@ -2,7 +2,7 @@ import { createServer as httpServer, type Server as HttpServer } from "node:http
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { mkdir, mkdtemp, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
@@ -43,7 +43,13 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, Driver: typeof
   });
   const session = await driver.openSession({ runId: "run-1", normalizedSessionId: "host", workingDirectory: join(root, "workspace") }) as PiRpcHarnessSession;
   cleanups.push(async () => { await session.close().catch(() => {}); for (const socket of sockets) socket.destroy(); await new Promise<void>(r => peer.close(() => r())); });
-  const initial = JSON.parse(readFileSync(launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8")); const events: PrpEvent[] = []; void (async () => { for await (const e of session.events()) events.push(e); })();
+  const initial = JSON.parse(readFileSync(launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+  // Chat's inventory-only bootstrap is deliberately retired before selection
+  // registration. Fake native callbacks must use the admitted bind/begin receipt,
+  // not the now-stale origin from the bootstrap file.
+  const prepared = ipc.findLast(command => command.type === "begin_turn");
+  if (prepared?.type === "begin_turn") Object.assign(initial, { epoch: prepared.epoch, runId: prepared.runId, turnId: prepared.turnId });
+  const events: PrpEvent[] = []; void (async () => { for await (const e of session.events()) events.push(e); })();
   function call(id = "call", change: Partial<PiToolCallRequest> = {}): PiToolCallRequest { return { schema: 1, type: "tool_call", nonce: id, sessionId: "host", origin: { epoch: initial.epoch, runId: initial.runId, turnId: initial.turnId }, toolCallId: id, tool: "context", arguments: {}, ...change }; }
   async function start() { const turn = await session.startTurn({ message: { role: "user", text: "one" } }); transport.send({ type: "agent_start" }); await tick(); return turn; }
   async function announce(request: PiToolCallRequest) { transport.send({ type: "tool_execution_start", toolCallId: request.toolCallId, toolName: request.tool, args: request.arguments }); await tick(); }
@@ -61,9 +67,14 @@ async function packagedDriver(verified = true) {
     ...(verified ? { banner: { js: 'const __paperclipVerifiedEntrypointUrl = require("node:url").pathToFileURL(__filename).href;' }, define: { "import.meta.dirname": "__dirname", "import.meta.url": "__paperclipVerifiedEntrypointUrl" } } : {}),
   });
   await writeFile(join(dist, "package.json"), '{"type":"module"}');
+  // Match tsc's complete relative-import tree, not just the entry file. The
+  // extension imports subagents, diagnostics and tool helpers in installed Pi.
+  const driverDir = fileURLToPath(new URL("./", import.meta.url));
+  const runtimeSources = (await readdir(driverDir, { recursive: true })).filter(path => path.endsWith(".ts") && !path.endsWith(".test.ts")).map(path => join(driverDir, path));
   await Promise.all([
-    build({ entryPoints: [fileURLToPath(new URL("./extension/index.ts", import.meta.url))], outfile: join(dist, "drivers/pi/extension/index.js"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
-    build({ entryPoints: [fileURLToPath(new URL("./pi-bind-protocol.ts", import.meta.url))], outfile: join(dist, "drivers/pi/pi-bind-protocol.js"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
+    build({ entryPoints: runtimeSources, outbase: driverDir, outdir: join(dist, "drivers/pi"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
+    build({ entryPoints: [fileURLToPath(new URL("../../semantic-tools/catalog.ts", import.meta.url))], outfile: join(dist, "semantic-tools/catalog.js"), platform: "node", format: "esm", target: "node24", bundle: true, logLevel: "silent" }),
+    build({ entryPoints: [fileURLToPath(new URL("../../contracts/provider-performance.ts", import.meta.url))], outfile: join(dist, "contracts/provider-performance.js"), platform: "node", format: "esm", target: "node24", bundle: false, logLevel: "silent" }),
     build({ entryPoints: [fileURLToPath(new URL("./extension/subagents/child-bridge.ts", import.meta.url))], outfile: join(dist, "drivers/pi/extension/child-bridge.js"), platform: "node", format: "esm", target: "node24", bundle: true, logLevel: "silent" }),
   ]);
   const path = "dist/drivers/pi/extension/child-bridge.js";
@@ -171,7 +182,7 @@ describe("live host Pi C2 authority", () => {
     if (kind === "missing") request = { ...request, toolCallId: undefined as unknown as string };
     if (kind === "wrongrun") request = { ...request, origin: { ...request.origin, runId: "old" } };
     if (kind === "wrongturn") request = { ...request, origin: { ...request.origin, turnId: "old" } };
-    if (kind === "wrongepoch") request = { ...request, origin: { ...request.origin, epoch: 2 } };
+    if (kind === "wrongepoch") request = { ...request, origin: { ...request.origin, epoch: request.origin.epoch + 1 } };
     if (kind === "wrongsession") request = { ...request, sessionId: "other" };
     if (kind === "tool" || kind === "builtin") request = { ...request, tool: "bash" };
     if (kind === "args") request = { ...request, arguments: { changed: true } };
@@ -186,7 +197,7 @@ describe("live host Pi C2 authority", () => {
     const entered = deferred<void>(); const result = deferred<unknown>(); let signal!: AbortSignal;
     const f = await fixture({ dynamicToolHandler: async call => { if (call.callId === "old") { signal = call.signal!; entered.resolve(); return result.promise; } return { content: [{ type: "text", text: "new" }], details: {} }; } });
     await f.start(); const old = f.call("old"); await f.announce(old); const pending = sendPiToolRequest(f.initial.toolSocketPath, old); const refusal = expect(pending).rejects.toThrow(); await entered.promise;
-    await f.settle(); await f.session.attachRun({ runId: "run-2" }); const second = await f.start(); const origin = { epoch: 2, runId: "run-2", turnId: second.turnId };
+    await f.settle(); await f.session.attachRun({ runId: "run-2" }); const second = await f.start(); const origin = { epoch: f.initial.epoch + 1, runId: "run-2", turnId: second.turnId };
     expect(signal.aborted).toBe(true); result.resolve({ content: [{ type: "text", text: "late" }], details: {} }); await refusal;
     await expect(sendPiToolRequest(f.initial.toolSocketPath, old)).rejects.toThrow(); const current = f.call("new", { origin }); await f.announce(current); await expect(sendPiToolRequest(f.initial.toolSocketPath, current)).resolves.toMatchObject({ content: [{ text: "new" }] });
     expect(f.ipc.find(r => r.type === "bind")).toMatchObject({ toolSocketPath: f.initial.toolSocketPath });
@@ -286,11 +297,12 @@ describe.skipIf(!process.env.PI_TEST_BINARY)("real Pi semantic roundtrip", () =>
     const server: HttpServer = httpServer((req, res) => { let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; }); req.on("end", () => { requests.push(JSON.parse(body)); const first = requests.length === 1; res.writeHead(200, { "content-type": "text/event-stream" }); const chunks = first ? [{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "native-semantic", type: "function", function: { name: "context", arguments: "{}" } }] }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }] : [{ choices: [{ index: 0, delta: { content: "roundtrip complete" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 } }]; for (const chunk of chunks) res.write(`data: ${JSON.stringify({ id: `faux-${requests.length}`, object: "chat.completion.chunk", ...chunk })}\n\n`); res.end("data: [DONE]\n\n"); }); });
     await new Promise<void>(r => server.listen(0, "127.0.0.1", r)); cleanups.push(async () => { server.closeAllConnections(); await new Promise<void>(r => server.close(() => r())); }); const address = server.address(); if (!address || typeof address === "string") throw new Error("bind");
     const session = await new Driver({ bindRequest: async (path, command, options) => { privateCommands.push(command.type); return sendPiBindRequest(path, command, options); }, command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools: [tool], dynamicToolHandler: async call => { ++effects; captured = { ...call, signal: undefined }; return { contentItems: [{ type: "inputText", text: "HOST_SEMANTIC_OK" }], success: true }; }, environment: { PI_OFFLINE: "1", PI_CODING_AGENT_DIR: join(root, "agent"), PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: "local-faux-only" }, transportFactory: options => { initial = JSON.parse(readFileSync(options.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8")); native = new PiRpcTransport(options); const stream = native.events.bind(native); native.events = () => ({ async *[Symbol.asyncIterator]() { for await (const event of stream()) { nativeRecords.push(structuredClone(event)); yield event; } } }); return native; }, shutdownTimeoutMs: 1000 }).openSession({ runId: "real-run", normalizedSessionId: "real-host", workingDirectory: join(root, "workspace") }) as PiRpcHarnessSession;
-    cleanups.push(() => session.close()); const events: PrpEvent[] = []; const iterator = session.events()[Symbol.asyncIterator](); await session.startTurn({ message: { role: "user", text: "call context" } });
+    cleanups.push(() => session.close()); const events: PrpEvent[] = []; const iterator = session.events()[Symbol.asyncIterator](); const turn = await session.startTurn({ message: { role: "user", text: "call context" } });
     for (;;) { const next = await iterator.next(); if (next.done) throw new Error("early close"); events.push(next.value); if (next.value.eventType === "turn.failed") throw new Error(JSON.stringify(next.value)); if (next.value.eventType === "turn.completed") break; }
-    expect(privateCommands.filter(type => type === "bind" || type === "begin_turn")).toEqual([]);
+    expect(initial.tools).toEqual([]);
+    expect(privateCommands.filter(type => type === "bind" || type === "begin_turn")).toEqual(["bind", "begin_turn"]);
     expect((await native.request("prompt", { message: "unsolicited idle prompt" })).data).toMatchObject({ disposition: "handled" }); expect(requests).toHaveLength(2);
-    expect(effects).toBe(1); expect(JSON.stringify(requests[1])).toContain("HOST_SEMANTIC_OK"); expect(captured).toMatchObject({ runId: "real-run", turnId: initial.turnId, callId: "native-semantic" });
+    expect(effects).toBe(1); expect(JSON.stringify(requests[1])).toContain("HOST_SEMANTIC_OK"); expect(captured).toMatchObject({ runId: "real-run", turnId: turn.turnId, callId: "native-semantic" });
     await expect(sendPiToolRequest(initial.toolSocketPath, { schema: 1, type: "tool_call", nonce: "replay", sessionId: "real-host", origin: { epoch: 1, runId: "real-run", turnId: initial.turnId }, toolCallId: "native-semantic", tool: "context", arguments: {} })).rejects.toThrow(); expect(await session.parkReady()).toEqual({ ready: true, reasons: [] });
     const snapshot = await session.snapshot(); await writeFile(join(root, "proof.json"), JSON.stringify({ requests, events, captured, snapshot, pid: native.pid, privateCommands }, null, 2)); expect(await readFile(snapshot.sessionFile, "utf8")).toContain("HOST_SEMANTIC_OK"); console.log(`LIVE_C2_PROOF ${join(root, "proof.json")}`); await session.close(); expect(session.processExited()).toBe(true); await writeFile(join(root, "native-records.jsonl"), nativeRecords.map(event => JSON.stringify(event)).join("\n") + "\n");
   }, 30000);
