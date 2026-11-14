@@ -2,11 +2,27 @@ import { spawn } from "node:child_process";
 import { lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, REMOTE_RUNNER_PROCESS_STDERR_FILE, REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES,
   REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES,
 } from "./native-session-executor.js";
+
+/** The shared process log is a copy the detached copier appends about once a second; wait for it. */
+async function eventually(read: () => Promise<string>, check: (text: string) => void, timeout = 5_000) {
+  await vi.waitFor(async () => check(await read()), { timeout, interval: 50 });
+}
+
+/** The copier/trimmer for runnerd `pid`, found by its own argv, as the stale-state fence finds it. */
+async function copierPids(pid: number) {
+  const found: number[] = [];
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry)) continue;
+    const argv = await readFile(`/proc/${entry}/cmdline`, "utf8").then(text => text.split("\0"), () => []);
+    if (argv[3] === "paperclip-runner-stderr-trim" && argv[4] === String(pid)) found.push(Number(entry));
+  }
+  return found;
+}
 
 /** Runs the launch writer as the remote launcher does, with a Node child standing in for runnerd. */
 async function launch(root: string, childSource: string, script = REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT,
@@ -30,12 +46,12 @@ describe("remote runnerd stderr evidence", () => {
       // Nothing reaches the launcher's own stderr; the reason stays in the sandbox file.
       expect(result.stderr).toBe("");
       const file = join(root, "diagnostics", REMOTE_RUNNER_PROCESS_STDERR_FILE);
-      expect(await readFile(file, "utf8")).toBe("paperclip-runnerd: lease expired\n");
+      await eventually(() => readFile(file, "utf8"), text => expect(text).toBe("paperclip-runnerd: lease expired\n"));
       expect((await stat(file)).mode & 0o077).toBe(0);
       expect((await readFile(join(root, "state", "identity"), "utf8")).split("\n")[1]).toBe(String(result.pid));
       // A second launch appends: the earlier exit reason survives the relaunch.
       await launch(root, 'process.stderr.write("second\\n")');
-      expect(await readFile(file, "utf8")).toBe("paperclip-runnerd: lease expired\nsecond\n");
+      await eventually(() => readFile(file, "utf8"), text => expect(text).toBe("paperclip-runnerd: lease expired\nsecond\n"));
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -48,10 +64,13 @@ describe("remote runnerd stderr evidence", () => {
       await writeFile(file, "o".repeat(REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES + 1));
       await launch(root, 'process.stderr.write("fresh\\n")');
       expect((await stat(`${file}.1`)).size).toBe(REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES + 1);
-      // The trimmer checks every 15 s in production; check it quickly here.
-      const fast = REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT.replace("sleep 15", "sleep 0.2");
-      expect(fast).not.toBe(REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT);
+      await eventually(() => readFile(file, "utf8"), text => expect(text).toBe("fresh\n"));
+      // The copier passes every second and trims every 15 passes in production; check it quickly here.
+      const fast = REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT.replace('"$passes" -ge 15', '"$passes" -ge 1').replace("sleep 1; done", "sleep 0.2; done");
+      expect(fast).not.toContain('"$passes" -ge 15');
+      expect(fast).not.toContain("sleep 1; done");
       await launch(root, `process.stderr.write("z".repeat(${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES + 4096}) + "\\nend\\n"); setTimeout(() => {}, 1500)`, fast);
+      await eventually(() => readFile(file, "utf8"), text => expect(text.endsWith("end\n")).toBe(true));
       const size = (await stat(file)).size;
       // Past the 8 MiB backstop the trimmer keeps the last 1 MiB, the most recent lines included.
       expect(size).toBeLessThanOrEqual(REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES + 4096);
@@ -81,11 +100,14 @@ describe("remote runnerd stderr evidence", () => {
     const root = await mkdtemp(join(tmpdir(), "runner-launch-generations-"));
     try {
       await mkdir(join(root, "state"));
+      const directory = join(root, "diagnostics");
       for (const generation of [1, 2, 3]) {
         await launch(root, `process.stderr.write("GENERATION_${generation}\\n" + "x".repeat(${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES + 64}) + "\\n")`,
           REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, join(root, "state", "identity"), `nonce-${generation}`);
+        await eventually(() => readFile(join(directory, REMOTE_RUNNER_PROCESS_STDERR_FILE), "utf8"),
+          text => expect(text.startsWith(`GENERATION_${generation}\n`)
+            && text.length === `GENERATION_${generation}\n`.length + REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES + 65).toBe(true));
       }
-      const directory = join(root, "diagnostics");
       const names = await readdir(directory);
       const all = (await Promise.all(names.map(name => readFile(join(directory, name), "utf8")))).join("");
       for (const generation of [1, 2, 3]) expect(all).toContain(`GENERATION_${generation}\n`);
@@ -96,6 +118,89 @@ describe("remote runnerd stderr evidence", () => {
       for (const name of names) expect((await stat(join(directory, name))).mode & 0o077).toBe(0);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  // review-fleet-2 (m1a2tee): an earlier short generation's stderr sat only in the
+  // shared log, and a later noisy generation's live trimmer cut it to its last
+  // 1 MiB, erasing that trace and the noisy generation's start. Each generation's
+  // own file must keep its whole stream. Unmodified production script and interval.
+  it("keeps every generation's whole stderr in its own file when the live trimmer cuts the shared log", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-launch-shared-trim-"));
+    try {
+      await mkdir(join(root, "state"));
+      const directory = join(root, "diagnostics");
+      const log = join(directory, REMOTE_RUNNER_PROCESS_STDERR_FILE);
+      const marker = "PRIOR_GENERATION_TRACE_MUST_SURVIVE\n";
+      const first = await launch(root, `process.stderr.write(${JSON.stringify(marker)})`, REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT,
+        join(root, "state", "identity"), "nonce-1");
+      expect(first.code).toBe(0);
+      await eventually(() => readFile(log, "utf8"), text => expect(text).toBe(marker));
+      const payloadSource = `"NOISY_SECOND_GENERATION\\n" + "x".repeat(${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES + 4096}) + "\\nEND_SECOND\\n"`;
+      const payload = `NOISY_SECOND_GENERATION\n${"x".repeat(REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES + 4096)}\nEND_SECOND\n`;
+      // runnerd stays up, as a live one does, until its own trimmer has cut the shared log (30 s cap).
+      const second = await launch(root, `const fs = require("node:fs"); let data = Buffer.from(${payloadSource});
+        while (data.length) data = data.subarray(fs.writeSync(2, data));
+        const started = Date.now(); let grown = false;
+        const check = () => { let size = 0; try { size = fs.statSync(${JSON.stringify(log)}).size } catch {}
+          if (size > ${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES}) grown = true;
+          if ((grown && size <= ${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES}) || Date.now() - started > 30000) process.exit(0); setTimeout(check, 200); };
+        check();`, REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, join(root, "state", "identity"), "nonce-2");
+      expect(second.code).toBe(0);
+      const names = (await readdir(directory)).sort();
+      const launchFile = (nonce: string) => names.find(name => name.startsWith(`runnerd.launch-stderr.${nonce}.`))!;
+      expect(names).toEqual([launchFile("nonce-1"), launchFile("nonce-2"), REMOTE_RUNNER_PROCESS_STDERR_FILE].sort());
+      // Both generations are whole in their own files.
+      expect(await readFile(join(directory, launchFile("nonce-1")), "utf8")).toBe(marker);
+      expect(await readFile(join(directory, launchFile("nonce-2")), "utf8")).toBe(payload);
+      // The shared log is still upstream's bounded copy: trimmed live to its last 1 MiB, newest bytes kept.
+      const shared = await readFile(log, "utf8");
+      expect(shared.length).toBeLessThanOrEqual(REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES);
+      expect(shared.endsWith("\nEND_SECOND\n")).toBe(true);
+      expect(shared).not.toContain(marker);
+      for (const name of names) expect((await stat(join(directory, name))).mode & 0o777).toBe(0o600);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  // The copy into the shared log runs beside runnerd, never in its write path:
+  // a stopped or killed copier must not block runnerd, fail its writes, or change its exit status.
+  it.each(["SIGSTOP", "SIGKILL"] as const)("never blocks runnerd or changes its exit status when the copier gets %s", async (signal) => {
+    const root = await mkdtemp(join(tmpdir(), "runner-launch-copier-"));
+    let stopped: number[] = [];
+    try {
+      await mkdir(join(root, "state"));
+      const directory = join(root, "diagnostics");
+      const ready = join(root, "ready");
+      const go = join(root, "go");
+      const payload = `START\n${"y".repeat(4 * 1_048_576)}\nEND\n`;
+      const exited = launch(root, `const fs = require("node:fs");
+        fs.writeFileSync(${JSON.stringify(ready)}, String(process.pid));
+        const wait = () => { if (!fs.existsSync(${JSON.stringify(go)})) return setTimeout(wait, 20);
+          let data = Buffer.from("START\\n" + "y".repeat(${4 * 1_048_576}) + "\\nEND\\n"); while (data.length) data = data.subarray(fs.writeSync(2, data));
+          process.exit(7); };
+        wait();`);
+      let pid = 0;
+      await vi.waitFor(async () => { pid = Number(await readFile(ready, "utf8")); expect(pid).toBeGreaterThan(0); }, { timeout: 5_000 });
+      await vi.waitFor(async () => { stopped = await copierPids(pid); expect(stopped).toHaveLength(1); }, { timeout: 5_000 });
+      process.kill(stopped[0], signal);
+      await writeFile(go, "");
+      const result = await Promise.race([exited, new Promise<"blocked">(resolve => setTimeout(() => resolve("blocked"), 10_000))]);
+      expect(result).not.toBe("blocked");
+      expect((result as Awaited<typeof exited>).code).toBe(7);
+      expect((await readFile(join(root, "state", "identity"), "utf8")).split("\n")[1]).toBe(String(pid));
+      const names = await readdir(directory);
+      const own = names.find(name => name.startsWith("runnerd.launch-stderr.nonce."))!;
+      expect(await readFile(join(directory, own), "utf8")).toBe(payload);
+      expect((await stat(join(directory, own))).mode & 0o777).toBe(0o600);
+      if (signal === "SIGSTOP") {
+        // Resumed, the copier sees runnerd gone and copies everything it wrote before exiting.
+        process.kill(stopped[0], "SIGCONT");
+        await eventually(() => readFile(join(directory, REMOTE_RUNNER_PROCESS_STDERR_FILE), "utf8"), text => expect(text).toBe(payload), 10_000);
+        await vi.waitFor(async () => expect(await copierPids(pid)).toEqual([]), { timeout: 5_000 });
+      }
+    } finally {
+      for (const copier of stopped) { try { process.kill(copier, "SIGKILL"); } catch {} }
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it("never writes through a symlink at the stderr path", async () => {
     const root = await mkdtemp(join(tmpdir(), "runner-launch-symlink-"));

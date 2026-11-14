@@ -15793,17 +15793,36 @@ export const REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES = 8_388_608;
 const REMOTE_RUNNER_PROCESS_STDERR_KEEP_BYTES = 1_048_576;
 
 /**
- * The disk backstop for a running runnerd's stderr file ($1 pid, $2 file). It
- * runs detached from runnerd (double fork) with its own argv and ends with
- * runnerd. Rewriting the kept tail can drop a line runnerd appends between the
- * copy and the rewrite, so it acts only past 8 MiB, which ordinary stderr
- * volume never reaches. runnerd's own exit reason is not on this stream: it
- * writes that to `runnerd.stderr.log` itself, which no trimmer touches.
+ * The bounded copy and disk backstop for a running runnerd's stderr ($1 pid,
+ * $2 the shared process log, $3 this generation's launch-stderr file). It runs
+ * detached from runnerd (double fork) with its own argv and ends with runnerd.
+ *
+ * runnerd writes its stderr straight to its own launch-stderr file (C8's
+ * per-generation file), which nothing trims or deletes. Every second this loop
+ * appends the bytes that file gained to the shared log, so the shared log stays
+ * the recovery-readable copy. runnerd itself never writes to a pipe or to the
+ * shared log: a slow or killed copier cannot block it, fail its writes, or
+ * change its exit status, and a trim can only shorten the copy. After runnerd
+ * exits, one last pass copies whatever it wrote before exiting.
+ *
+ * Every 15 passes, past 8 MiB, it keeps the shared log's last 1 MiB. This loop
+ * is the shared log's only writer while runnerd runs, so the rewrite no longer
+ * races runnerd's own appends. runnerd's own exit reason is not on this
+ * stream: it writes that to `runnerd.stderr.log` itself, which no trimmer
+ * touches.
+ *
+ * The script is embedded in a single-quoted shell word, so it must not contain
+ * a single quote.
  */
 const REMOTE_RUNNER_PROCESS_STDERR_TRIM_SCRIPT =
-  `pid=$1; log=$2; while kill -0 "$pid" 2>/dev/null; do sleep 15; size=$(wc -c 2>/dev/null < "$log" | tr -d " "); ` +
+  'pid=$1; log=$2; source=$3; copied=0; passes=0; while :; do alive=0; kill -0 "$pid" 2>/dev/null && alive=1; ' +
+  'size=$(wc -c 2>/dev/null < "$source" | tr -d " "); ' +
+  'if test "${size:-0}" -gt "$copied" && test ! -L "$log" && { test ! -e "$log" || test -f "$log"; }; then ' +
+  'tail -c +$((copied + 1)) -- "$source" | head -c $((size - copied)) >> "$log"; copied=$size; fi; ' +
+  'test "$alive" = 1 || exit 0; passes=$((passes + 1)); if test "$passes" -ge 15; then passes=0; ' +
+  'size=$(wc -c 2>/dev/null < "$log" | tr -d " "); ' +
   `if test "\${size:-0}" -gt ${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES} && test -f "$log" && test ! -L "$log"; then ` +
-  `tail -c ${REMOTE_RUNNER_PROCESS_STDERR_KEEP_BYTES} -- "$log" > "$log.trim" && cat -- "$log.trim" > "$log"; rm -f -- "$log.trim"; fi; done`;
+  `tail -c ${REMOTE_RUNNER_PROCESS_STDERR_KEEP_BYTES} -- "$log" > "$log.trim" && cat -- "$log.trim" > "$log"; rm -f -- "$log.trim"; fi; fi; sleep 1; done`;
 
 /**
  * Two runnerd processes must never share one durable state directory. A Runner
@@ -15906,20 +15925,22 @@ const REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT =
  *   launch that fails before `exec` (for example the identity-marker write)
  *   leaves no evidence at all. The launch nonce + child PID names a private
  *   file; noclobber refuses reuse or a planted symlink.
- * - Process: runnerd's own stderr goes to the bounded, recovery-readable
- *   `runnerd.process-stderr.log` below; rotation retires, never deletes, an
- *   earlier generation's file.
+ * - Process: `exec "$@"` keeps that same file as runnerd's stderr, so the
+ *   generation's file holds its whole stream, as in C8. Nothing trims it. The
+ *   copier above also appends it to the bounded, recovery-readable
+ *   `runnerd.process-stderr.log`. Only that shared copy is rotated and trimmed,
+ *   and rotation retires, never deletes, an earlier generation's file.
  * Nothing deletes diagnostics from an earlier generation.
  */
 export const REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT =
   'set -eu; identity_path=$1; identity_nonce=$2; runner_instance_id=$3; diagnostics_directory=$4; shift 4; umask 077; ' +
   'test ! -L "$diagnostics_directory"; if test -e "$diagnostics_directory"; then test -d "$diagnostics_directory"; else mkdir -p -- "$diagnostics_directory"; fi; chmod 0700 "$diagnostics_directory"; ' +
-  'set -C; exec 2> "$diagnostics_directory/runnerd.launch-stderr.${identity_nonce}.$$.log"; set +C; ' +
+  'launch_stderr="$diagnostics_directory/runnerd.launch-stderr.${identity_nonce}.$$.log"; set -C; exec 2> "$launch_stderr"; set +C; ' +
   REMOTE_RUNNER_STALE_STATE_FENCE_SCRIPT +
   'started_at=$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"); pid=$$; process_fingerprint=""; if ' +
   REMOTE_RUNNER_PROCESS_FINGERPRINT_SCRIPT +
   '; then :; else process_fingerprint=""; fi; ' +
-  // Bounded stderr evidence: rotate an oversized file, then trim it in place while runnerd runs.
+  // Bounded stderr copy: rotate an oversized shared file, then copy and trim it while runnerd runs.
   // Rotation first retires an existing `.1` under this launch's own name, so no generation is lost.
   // A symlink or non-file at the path keeps the old /dev/null behavior.
   `stderr_log="$diagnostics_directory/${REMOTE_RUNNER_PROCESS_STDERR_FILE}"; ` +
@@ -15928,8 +15949,8 @@ export const REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT =
   `if test "\${stderr_size:-0}" -gt ${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES}; then ` +
   'if test -f "$stderr_log.1" && test ! -L "$stderr_log.1"; then mv -f -- "$stderr_log.1" "$diagnostics_directory/runnerd.process-stderr.retired.${identity_nonce}.$$.log"; fi; ' +
   'mv -f -- "$stderr_log" "$stderr_log.1"; fi; ' +
-  `( ( exec sh -c '${REMOTE_RUNNER_PROCESS_STDERR_TRIM_SCRIPT}' paperclip-runner-stderr-trim "$pid" "$stderr_log" </dev/null >/dev/null 2>&1 ) & ); fi; ` +
-  'identity_tmp="${identity_path}.tmp.$$"; printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$identity_nonce" "$$" "$started_at" "$runner_instance_id" "$process_fingerprint" > "$identity_tmp"; chmod 0600 "$identity_tmp"; mv -f -- "$identity_tmp" "$identity_path"; exec "$@" 2>>"$stderr_log"';
+  `( ( exec sh -c '${REMOTE_RUNNER_PROCESS_STDERR_TRIM_SCRIPT}' paperclip-runner-stderr-trim "$pid" "$stderr_log" "$launch_stderr" </dev/null >/dev/null 2>&1 ) & ); fi; ` +
+  'identity_tmp="${identity_path}.tmp.$$"; printf "%s\\n%s\\n%s\\n%s\\n%s\\n" "$identity_nonce" "$$" "$started_at" "$runner_instance_id" "$process_fingerprint" > "$identity_tmp"; chmod 0600 "$identity_tmp"; mv -f -- "$identity_tmp" "$identity_path"; exec "$@"';
 
 const REMOTE_RUNNER_FAILED_IDENTITY_CLEANUP_SCRIPT =
   'set -eu; identity_path=$1; expected_nonce=$2; expected_runner_id=$3; marker_wait=0; while { test ! -f "$identity_path" || test -L "$identity_path"; } && test "$marker_wait" -lt 50; do marker_wait=$((marker_wait + 1)); sleep 0.1; done; test -f "$identity_path" && test ! -L "$identity_path" || exit 3; { IFS= read -r nonce; IFS= read -r pid; IFS= read -r started_at; IFS= read -r runner_id; } < "$identity_path"; test "$nonce" = "$expected_nonce" && test "$runner_id" = "$expected_runner_id" && test -n "$started_at" || exit 4; case "$pid" in ""|*[!0-9]*) exit 4 ;; esac; test "$pid" -gt 0 || exit 4; if kill -0 "$pid" 2>/dev/null; then if test -r "/proc/$pid/cmdline"; then command_line=$(tr "\\000" "\\n" < "/proc/$pid/cmdline"); printf "%s\\n" "$command_line" | grep -Fqx -- "--runner-id" || exit 4; printf "%s\\n" "$command_line" | grep -Fqx -- "$expected_runner_id" || exit 4; fi; signal_target=$pid; if command -v ps >/dev/null 2>&1; then session_id=$(ps -o sid= -p "$pid" 2>/dev/null | tr -d " ") || true; if test "$session_id" = "$pid"; then signal_target="-$pid"; fi; fi; kill -TERM -- "$signal_target" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; term_wait=0; while kill -0 "$pid" 2>/dev/null && test "$term_wait" -lt 50; do term_wait=$((term_wait + 1)); sleep 0.1; done; if kill -0 "$pid" 2>/dev/null; then kill -KILL -- "$signal_target" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; kill_wait=0; while kill -0 "$pid" 2>/dev/null && test "$kill_wait" -lt 50; do kill_wait=$((kill_wait + 1)); sleep 0.1; done; fi; kill -0 "$pid" 2>/dev/null && exit 5; fi; test -f "$identity_path" && test ! -L "$identity_path" || exit 4; { IFS= read -r final_nonce; IFS= read -r final_pid; IFS= read -r final_started_at; IFS= read -r final_runner_id; } < "$identity_path"; test "$final_nonce" = "$nonce" && test "$final_pid" = "$pid" && test "$final_started_at" = "$started_at" && test "$final_runner_id" = "$runner_id" || exit 4; rm -f -- "$identity_path"';
