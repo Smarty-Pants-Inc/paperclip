@@ -8,7 +8,7 @@
  * echo, which is the core legibility win.
  */
 import type { Agent } from "@paperclipai/shared";
-import type { IssueChatComment } from "@/lib/issue-chat-messages";
+import { supersededCommentIds, type IssueChatComment } from "@/lib/issue-chat-messages";
 import { resolveCommentAttribution } from "@/lib/comment-attribution";
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 import type { CompanyUserProfile } from "@/lib/company-members";
@@ -70,8 +70,10 @@ export function commentsToTaskChatItems(
   ctx: TaskChatAdapterContext = {},
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
+  const hiddenIds = supersededCommentIds(comments);
   for (const comment of comments) {
     if (comment.deletedAt) continue;
+    if (hiddenIds.has(comment.id)) continue;
     if (comment.conversationSessionGeneration != null) {
       items.push({ id: comment.id, kind: "marker", variant: "session_start", label: "New session",
         detail: "Earlier messages and files are still available.", createdAtIso: new Date(comment.createdAt).toISOString() });
