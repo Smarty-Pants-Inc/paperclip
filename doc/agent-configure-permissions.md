@@ -73,6 +73,10 @@ Activating a shared connection/profile or changing shared instructions still
 checks all affected consumers; a hire-only draft can still be activated. Shared
 catalog review is not an assignment and uses the shared editor path. Non-preserving
 agent finishes also check the shared consumers before changing profile actions.
+Remote-MCP reconnects with saved access use this same writer for agent finishes,
+not the board/internal reconnect shortcut. A recipient-only agent finish leaves
+shared reconnect configuration unchanged; connection activation and instruction
+edits still require authority over the affected consumers.
 
 Agent install PUTs never clean up a shared app profile's legacy connection-wide
 include, even for an unchanged install list. Board and trusted internal writes

@@ -203,20 +203,100 @@ describe("tool grants to a manager's current reporting subtree", () => {
     expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id))).toEqual(before);
   }, 60_000);
 
-  it("repair: a preserving finish can still activate a hire-only draft connection", async () => {
+  it.each([false, true])("repair: a preserving finish can still activate a hire-only draft connection (remote reconnect: %s)", async remoteReconnect => {
     const f = await finishFixture();
     await db.delete(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id));
     await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.connection.id));
     await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
     await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: f.profile.id, targetType: "agent", targetId: f.report });
     await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: f.connection.id, targetType: "agent", targetId: f.report });
-    await db.update(toolConnections).set({ status: "draft", enabled: false }).where(eq(toolConnections.id, f.connection.id));
+    const config = remoteReconnect ? { sourceTemplateKey: "zapier", connectionMethodKey: "generated-url", mcpPreserveAccess: true } : {};
+    await db.update(toolConnections).set({ status: "draft", enabled: false, config, transportConfig: config }).where(eq(toolConnections.id, f.connection.id));
     const response = await f.finish([f.report]);
     expect(response.status, response.text).toBe(200);
     expect(response.body.connection).toMatchObject({ status: "active", enabled: true });
     const effective = await request(f.board).get(`/api/companies/${f.companyId}/tools/profiles/effective/agents/${f.report}`);
     expect(effective.status, effective.text).toBe(200);
     expect(effective.body.allowedToolNames).toContain("read_mailbox");
+  }, 60_000);
+
+  it.each([false, true])("repair: remote reconnect grants only the hire access without rewriting shared state (ask first: %s)", async askFirst => {
+    const f = await finishFixture();
+    const config = { sourceTemplateKey: "zapier", connectionMethodKey: "generated-url", mcpPreserveAccess: true };
+    await db.update(toolConnections).set({ config, transportConfig: config, agentInstructions: { enabled: true, text: "Board-owned instructions" } })
+      .where(eq(toolConnections.id, f.connection.id));
+    await db.delete(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: f.profile.id,
+      selectorType: "catalog_entry", effect: "exclude", catalogEntryId: f.entry.id });
+    const snapshot = async () => ({
+      connections: await db.select().from(toolConnections).where(eq(toolConnections.id, f.connection.id)),
+      applications: await db.select().from(toolApplications).where(eq(toolApplications.id, f.connection.applicationId)),
+      profiles: await db.select().from(toolProfiles).where(eq(toolProfiles.id, f.profile.id)),
+      entries: await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id)).orderBy(toolProfileEntries.id),
+      bindings: await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.companyId, f.companyId)).orderBy(toolProfileBindings.id),
+      installs: await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.connection.id)).orderBy(toolConnectionInstalls.id),
+      policies: await db.select().from(toolPolicies).where(eq(toolPolicies.companyId, f.companyId)).orderBy(toolPolicies.id),
+      catalog: await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.connectionId, f.connection.id)).orderBy(toolCatalogEntries.id),
+    });
+    const before = await snapshot();
+    const finish = () => request(f.api).post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .set("Authorization", `Bearer ${f.token}`).send({ access: { agentIds: [f.report] }, preserveExistingAccess: true,
+        enabledCatalogEntryIds: [f.entry.id], askFirstCatalogEntryIds: askFirst ? [f.entry.id] : [] });
+    const response = await finish();
+    expect(response.status, response.text).toBe(200);
+    const after = await snapshot();
+    expect(after).toMatchObject({ connections: before.connections, applications: before.applications,
+      profiles: before.profiles, entries: before.entries, catalog: before.catalog });
+    expect(after.bindings.filter(binding => binding.targetId !== f.report)).toEqual(before.bindings);
+    expect(after.installs.filter(install => install.targetId !== f.report)).toEqual(before.installs);
+    expect(after.bindings.filter(binding => binding.profileId === f.profile.id && binding.targetId === f.report)).toHaveLength(1);
+    expect(after.installs.filter(install => install.targetId === f.report)).toHaveLength(1);
+    if (askFirst) expect(after.policies).toEqual([expect.objectContaining({ enabled: true, policyType: "require_approval",
+      conditions: { actor: { agentId: f.report } } })]);
+    else expect(after.policies).toEqual(before.policies);
+    for (const [agentId, allowed] of [[f.report, true], [f.ids.other, false]] as const) {
+      const effective = await request(f.board).get(`/api/companies/${f.companyId}/tools/profiles/effective/agents/${agentId}`);
+      expect(effective.status, effective.text).toBe(200);
+      expect(effective.body.allowedToolNames.includes("read_mailbox")).toBe(allowed);
+    }
+    const replay = await finish();
+    expect(replay.status, replay.text).toBe(200);
+    expect(await snapshot()).toEqual(after);
+  }, 60_000);
+
+  it("repair: remote reconnect cannot activate a disabled shared profile", async () => {
+    const f = await finishFixture();
+    const config = { sourceTemplateKey: "zapier", connectionMethodKey: "generated-url", mcpPreserveAccess: true };
+    await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, f.connection.id));
+    await db.update(toolProfiles).set({ status: "disabled" }).where(eq(toolProfiles.id, f.profile.id));
+    const before = await db.select().from(toolConnections).where(eq(toolConnections.id, f.connection.id));
+    const response = await f.finish([f.report]);
+    expect(response.status, response.text).toBe(403);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.id, f.connection.id))).toEqual(before);
+    expect((await db.select().from(toolProfiles).where(eq(toolProfiles.id, f.profile.id)))[0].status).toBe("disabled");
+    expect(await f.bindings()).not.toContain(`agent:${f.report}`);
+    expect(await f.installed()).not.toContain(f.report);
+  }, 60_000);
+
+  it("repair: board remote reconnect keeps its saved-access shortcut", async () => {
+    const f = await finishFixture();
+    const config = { sourceTemplateKey: "zapier", connectionMethodKey: "generated-url", mcpPreserveAccess: true };
+    await db.update(toolConnections).set({ status: "draft", enabled: false, config, transportConfig: config }).where(eq(toolConnections.id, f.connection.id));
+    const entries = await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id));
+    const bindings = await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id));
+    const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.connection.id));
+    const response = await request(f.board).post(`/api/companies/${f.companyId}/tools/apps/${f.connection.id}/finish`)
+      .send({ access: { agentIds: [f.report] }, preserveExistingAccess: true, enabledCatalogEntryIds: [],
+        agentInstructions: { enabled: true, text: "Board reconnect instructions" } });
+    expect(response.status, response.text).toBe(200);
+    expect(response.body.connection).toMatchObject({ status: "active", enabled: true,
+      agentInstructions: { enabled: true, text: "Board reconnect instructions" } });
+    const [saved] = await db.select().from(toolConnections).where(eq(toolConnections.id, f.connection.id));
+    expect(saved.config).toEqual({ sourceTemplateKey: "zapier", connectionMethodKey: "generated-url" });
+    expect(saved.transportConfig).toEqual(saved.config);
+    expect(await db.select().from(toolProfileEntries).where(eq(toolProfileEntries.profileId, f.profile.id))).toEqual(entries);
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, f.profile.id))).toEqual(bindings);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.connection.id))).toEqual(installs);
   }, 60_000);
 
   it.each([false, true])("finish preserves root/company access while enabling its own hire (already installed: %s)", async alreadyInstalled => {

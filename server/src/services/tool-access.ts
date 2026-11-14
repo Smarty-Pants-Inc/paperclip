@@ -3164,7 +3164,12 @@ export function toolAccessService(
     await assertConnectorConnectionSetupEnabled(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
-    if (connection.config.mcpPreserveAccess === true && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
+    // Reconnect's shortcut writes shared connection state, not just recipient
+    // bindings. Agent finishes must use the normal writer below, which checks
+    // shared consumers before activation/instruction edits and confines new
+    // capabilities to the authorized recipients.
+    const agentFinish = actor?.managementContext?.actor.type === "agent" || actor?.actorType === "agent";
+    if (!agentFinish && connection.config.mcpPreserveAccess === true && isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey)) {
       const [profile] = await db.select().from(toolProfiles).where(and(
         eq(toolProfiles.companyId, companyId), eq(toolProfiles.profileKey, `app:${connection.id}`),
       )).limit(1);
