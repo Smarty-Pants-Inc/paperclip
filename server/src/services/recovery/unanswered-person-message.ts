@@ -22,7 +22,7 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
-import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { conversationResetSql, currentNoticeSql } from "../issue-comment-current.js";
@@ -83,10 +83,14 @@ export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
  * native finalization is a retryable_failure with the next attempt scheduled,
  * heartbeat.ts:3862-3895): past T0, ONE progress note, never a failure. */
 export const UNANSWERED_MESSAGE_STILL_TRYING_CODE = "still_trying";
+/** RFL (A) on seed A: Paperclip's own recovery has not given its verdict by T0. */
+export const UNANSWERED_MESSAGE_RETRYING_CODE = "retrying_automatically";
+export const UNANSWERED_MESSAGE_RETRYING_TEXT = "Your message wasn't answered yet; Paperclip is retrying automatically.";
 export function stillTryingText(name: string) {
   return `${name} is still trying to reach its workspace; your message is kept.`;
 }
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_STILL_TRYING_CODE]);
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_STILL_TRYING_CODE,
+  UNANSWERED_MESSAGE_RETRYING_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -842,6 +846,32 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 }
 
 /**
+ * RFL (A) on seed A: true while Paperclip's OWN recovery, the fresh-continuation
+ * fallback (fresh-continuation-fallback.ts), will act on this ended run and has
+ * not given its verdict yet, by Paperclip's existing classifications only: a
+ * fallback source code (BACKLOG_CONTINUATION_SOURCE_CODES, within its max age),
+ * not a refusal (isNativeContinuationRefusal), not person-owned
+ * (isPersonOwnedFailureCode), its chain not exhausted (freshContinuationChain,
+ * FRESH_CONTINUATIONS_PER_CHAIN), and no fresh-continuation record for it yet.
+ * The caller also requires no board-owned hold and no native same-run retry.
+ */
+async function recoveryVerdictPending(q: Db, issue: DecisionIssue, run: { id: string; status: string; errorCode: string | null;
+  error: string | null; finishedAt: Date | null }, now: Date): Promise<boolean> {
+  // Imported at use: fresh-continuation-fallback.ts imports modules that import this one.
+  const fallback = await import("../fresh-continuation-fallback.js");
+  if (!["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) || !run.finishedAt) return false;
+  if (!run.errorCode || !(fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[]).includes(run.errorCode)) return false;
+  if (run.finishedAt.getTime() + fallback.BACKLOG_CONTINUATION_MAX_AGE_MS <= now.getTime()) return false;
+  if (isNativeContinuationRefusal(run) || fallback.isPersonOwnedFailureCode(run.errorCode)) return false;
+  const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id });
+  if (chain.attempts >= fallback.FRESH_CONTINUATIONS_PER_CHAIN) return false;
+  const [record] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+    sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}' = ${run.id}`)).limit(1);
+  return !record;
+}
+
+/**
  * The decision for one person message at `now`. Reads only. With `asOf`, `now`
  * is a past instant (a reset's created_at) and the run and wake evidence is
  * read AS OF then from durable timestamps (RFL m15b B1): a run or wake created
@@ -1162,7 +1192,23 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
           ...(t0 === null ? { recordDeferral: { runId: run.id, agentId: run.agentId, messageId: message.id } } : {}) };
       }
     }
+    // RFL (A) on seed A: Paperclip's own recovery will act on this run and has
+    // not decided. Its verdict is the true next step: wait for it within T0
+    // (no note). Past T0, say ONLY that it retries, never "safe to resend";
+    // the verdict's note (held) or the answer then supersedes that note.
+    let retrying = false;
+    // A saved state refused for missing evidence does not wait (SMA-183): its
+    // note says so at once.
+    if (!stillTrying && !boardHold && !heldReplyRun && !refusedRun && run.status !== "succeeded"
+      && (!coordinator || !(NATIVE_PENDING_PHASES.includes(coordinator.phase) || coordinator.phase === "retryable_failure"))
+      && await recoveryVerdictPending(q, issue, run, now)) {
+      if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_RETRYING_CODE) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+      retrying = true;
+    }
     code = stillTrying ? UNANSWERED_MESSAGE_STILL_TRYING_CODE
+      : retrying ? UNANSWERED_MESSAGE_RETRYING_CODE
       : heldReplyRun ? UNANSWERED_MESSAGE_HELD_REPLY_CODE
       : refusedRun && run.status !== "succeeded" ? unansweredMessageCode(refusedRun)
       : run.status === "succeeded" ? UNANSWERED_MESSAGE_NO_REPLY_CODE : unansweredMessageCode(run);
@@ -1235,6 +1281,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
   const chat = Boolean(issue.conversationAgentId && issue.conversationUserId);
   const agentName = agentRow?.name?.trim() || "this agent";
   const stillTryingNote = code === UNANSWERED_MESSAGE_STILL_TRYING_CODE;
+  const retryingNote = code === UNANSWERED_MESSAGE_RETRYING_CODE;
   const heldReply = heldReplyRun && run ? {
     version: 1 as const, sourceRunId: run.id,
     // A sole prior question card is retained only as a continuation link; it
@@ -1249,6 +1296,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
   const heldName = agentRow?.name?.trim() || "The agent";
   const body = heldReply ? heldReplyBody(heldName, heldReply.cardName, heldReply.relatedCardName ?? null, Boolean(heldReplyCard))
     : paused ? agentPausedText(pausedName) : stillTryingNote ? stillTryingText(pausedName)
+    : retryingNote ? UNANSWERED_MESSAGE_RETRYING_TEXT
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : heldByHold ? (chat ? chatHeldText(agentName) : HELD_PREDECESSOR_NOTICE)
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
@@ -1258,12 +1306,14 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
     seed: {
       title: heldReply ? "The reply is held in run activity" : paused ? `${pausedName} is paused`
         : stillTryingNote ? `${pausedName} is still trying`
+        : retryingNote ? "Retrying automatically"
         : waiting ? "Your message is waiting to start" : held ? HELD_NOTE_TITLE : "Your message wasn't answered",
       body,
       tone: heldReply || waiting ? "info" : paused ? "warning" : "warning",
       nextAction: heldReply ? "Open the source run to read the held reply."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : stillTryingNote ? "No action is needed; your message is kept while it tries."
+        : retryingNote ? "No action is needed; Paperclip is retrying automatically."
         : waiting ? "No action is needed; it will start by itself."
         : held ? (chat ? `Start a new chat with ${agentName}.` : "Assign this agent a new task to continue.")
         : chat ? `Send the message again; if it fails again, start a new chat with ${agentName}.`
