@@ -66,7 +66,7 @@ export async function writePiSessionHistoryLossNotice(db: Db,
   // Changing state appends history; never rewrite what a person already read.
   // The issue lock makes replay idempotent and the supersession atomic.
   const next = await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
-    kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
+    kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
   }, metadata: { version: 1, authorizationReason,
     sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Fresh conversation" }] }] } }, tx);
   if (existing) await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
