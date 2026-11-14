@@ -7,6 +7,7 @@ import {
   activityLog,
   agents,
   assets,
+  authUsers,
   companyMemberships,
   companies,
   completionContracts,
@@ -35,11 +36,17 @@ vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => ({
 import { executePaperclipNativeSession } from "./native-session-executor.js";
 import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
-import { NATIVE_ADDRESSED_INTERACTION_FAILED, NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE } from "./native-addressed-interaction-failure.js";
+import {
+  appendNativeAddressedInteractionFailureNotice,
+  NATIVE_ADDRESSED_INTERACTION_FAILED,
+  NATIVE_ADDRESSED_INTERACTION_PENDING_FAILURE_MESSAGE,
+} from "./native-addressed-interaction-failure.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 
 const companyId = randomUUID();
 const ownerAgentId = randomUUID();
 const responderAgentId = randomUUID();
+const humanUserId = randomUUID();
 
 type Fixture = {
   issueId: string;
@@ -71,6 +78,13 @@ beforeAll(async () => {
   await db.insert(companyMemberships).values([ownerAgentId, responderAgentId].map(principalId => ({
     companyId, principalType: "agent", principalId, membershipRole: "member", status: "active",
   })));
+  await db.insert(authUsers).values({
+    id: humanUserId, name: "Human resolver", email: `${humanUserId}@example.test`,
+    createdAt: new Date(), updatedAt: new Date(),
+  });
+  await db.insert(companyMemberships).values({
+    companyId, principalType: "user", principalId: humanUserId, membershipRole: "owner", status: "active",
+  });
 }, 120_000);
 
 afterAll(async () => {
@@ -83,7 +97,18 @@ afterAll(async () => {
   }
 });
 
-async function fixture(role: "addressed" | "assignee", withAttachment = false): Promise<Fixture> {
+async function fixture(role: "addressed" | "assignee", withAttachment = false, options: {
+  issueStatus?: "in_progress" | "in_review";
+  target?: {
+    type: "issue_document";
+    issueId?: string;
+    documentId: string;
+    key: string;
+    revisionId: string;
+    revisionNumber: number;
+    label?: string;
+  };
+} = {}): Promise<Fixture> {
   const issueId = randomUUID();
   const runId = randomUUID();
   const ownerRunId = randomUUID();
@@ -95,7 +120,7 @@ async function fixture(role: "addressed" | "assignee", withAttachment = false): 
     id: issueId,
     companyId,
     title: addressed ? "Respond to an addressed confirmation" : "Continue the assigned task",
-    status: "in_progress",
+    status: options.issueStatus ?? "in_progress",
     workMode: "standard",
     assigneeAgentId: addressed ? ownerAgentId : responderAgentId,
     createdByAgentId: ownerAgentId,
@@ -124,7 +149,11 @@ async function fixture(role: "addressed" | "assignee", withAttachment = false): 
       requestedResolverPolicy: "not_creator",
       effectiveResolverPolicy: "not_creator",
       resolverPolicyProvenance: "explicit",
-      payload: { version: 1, prompt: "Confirm the requested response." },
+      payload: {
+        version: 1,
+        prompt: "Confirm the requested response.",
+        ...(options.target ? { target: { ...options.target, issueId: options.target.issueId ?? issueId } } : {}),
+      },
     }).returning();
     interactionId = interaction.id;
     Object.assign(contextSnapshot, {
@@ -256,6 +285,20 @@ async function executeFailure(input: Fixture, options: {
   expect(callbacks.prepareWakeAttachmentPrompt).toEqual(expect.any(Function));
 }
 
+async function executeWithoutProvider(input: Fixture) {
+  provider.execute.mockReset();
+  await executePaperclipNativeSession({
+    db,
+    execution: input.execution,
+    runContextSnapshot: input.runContextSnapshot,
+    runnerInstanceId: input.runnerInstanceId,
+    runnerEnvironment: {},
+    useRunnerd: true,
+    prepareAttachmentPrompt: async () => "",
+  });
+  expect(provider.execute).not.toHaveBeenCalled();
+}
+
 async function settled(input: Fixture) {
   const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
   const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, input.runId));
@@ -306,6 +349,145 @@ describe("native addressed failure lifecycle through the executor and PostgreSQL
     ));
     expect(audits).toHaveLength(1);
     await expectHeldOwnerUnchanged(input);
+  }, 120_000);
+
+  it("terminalizes an unavailable issue-document refusal on an in-review addressed card once per card", async () => {
+    const input = await fixture("addressed", false, {
+      issueStatus: "in_review",
+      target: {
+        type: "issue_document",
+        documentId: randomUUID(),
+        key: "status-brief",
+        revisionId: randomUUID(),
+        revisionNumber: 2,
+        label: "Status brief",
+      },
+    });
+    const [cardBefore] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+    expect(input.issueBefore).toMatchObject({ status: "in_review", createdByAgentId: ownerAgentId, assigneeAgentId: ownerAgentId });
+    expect(input.ownerRunBefore).toMatchObject({ status: "running", agentId: ownerAgentId });
+    expect(input.runContextSnapshot).toMatchObject({ sourceRunId: input.ownerRunId, interactionId: input.interactionId });
+    expect(cardBefore).toMatchObject({
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: ownerAgentId,
+      addresseeAgentId: responderAgentId,
+      sourceRunId: input.ownerRunId,
+      payload: { target: { type: "issue_document", issueId: input.issueId, key: "status-brief" } },
+    });
+    expect(input.execution.binding.agentId).toBe(responderAgentId);
+    await expectHeldOwnerUnchanged(input);
+
+    await executeWithoutProvider(input);
+
+    const { run, coordinator } = await settled(input);
+    expect(coordinator).toMatchObject({
+      phase: "terminal_failure",
+      failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+      nextAttemptAt: null,
+      leaseOwner: null,
+      recoveryState: null,
+    });
+    expect(run).toMatchObject({ status: "failed", nativePhase: "terminal_failure", errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED });
+    const [pendingCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+    expect(pendingCard).toMatchObject({ status: "pending" });
+    await expectHeldOwnerUnchanged(input);
+
+    const cardFailureKey = `native-addressed-failure:${input.interactionId}`;
+    const readFailureNotice = () => db.select().from(issueComments).where(and(
+      eq(issueComments.companyId, companyId), eq(issueComments.issueId, input.issueId),
+      eq(issueComments.authorType, "system"), eq(issueComments.clientRequestId, cardFailureKey),
+    ));
+    const notices = await readFailureNotice();
+    expect(notices).toHaveLength(1);
+    const [notice] = notices;
+    expect(notice.body).toMatch(/KP/i);
+    expect(notice.body).toMatch(/document/i);
+    expect(notice.body).toMatch(/unavailable|not available|missing|stale|no longer current|cannot be found|could not be found|does not exist|does not support|not supported/i);
+    expect(notice.body).toMatch(/answer/i);
+    expect(notice.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
+    const metadataRows = ((notice.metadata as { sections?: Array<{ rows?: Array<Record<string, unknown>> }> } | null)?.sections ?? [])
+      .flatMap(section => section.rows ?? []);
+    expect(metadataRows).toEqual(expect.arrayContaining([
+      { type: "agent_link", label: "Recovery owner", agentId: ownerAgentId, name: "KA" },
+      expect.objectContaining({ type: "key_value", label: "Next action", value: expect.stringMatching(/answer/i) }),
+    ]));
+
+    const secondRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId: responderAgentId,
+      scopeKind: "issue",
+      issueId: input.issueId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "failed",
+      runtimeMode: "native",
+      nativePhase: "terminal_failure",
+      nativeIssueId: input.issueId,
+      errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+      contextSnapshot: input.runContextSnapshot,
+      finishedAt: new Date(),
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId: secondRunId,
+      companyId,
+      issueId: input.issueId,
+      phase: "terminal_failure",
+      failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+      nextAttemptAt: null,
+    });
+    await expect(appendNativeAddressedInteractionFailureNotice(db, {
+      companyId, issueId: input.issueId, agentId: responderAgentId, runId: secondRunId,
+    }, input.interactionId!)).resolves.toBeNull();
+    expect(await readFailureNotice()).toHaveLength(1);
+  }, 120_000);
+
+  it("reports a paused addressed responder and leaves the pending card human-resolvable", async () => {
+    const input = await fixture("addressed");
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, responderAgentId));
+    try {
+      await executeWithoutProvider(input);
+
+      const { run, coordinator } = await settled(input);
+      expect(coordinator).toMatchObject({
+        phase: "terminal_failure",
+        failureCode: NATIVE_ADDRESSED_INTERACTION_FAILED,
+        nextAttemptAt: null,
+        leaseOwner: null,
+        recoveryState: null,
+      });
+      expect(run).toMatchObject({ status: "failed", nativePhase: "terminal_failure", errorCode: NATIVE_ADDRESSED_INTERACTION_FAILED });
+      const [pendingCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+      expect(pendingCard).toMatchObject({ status: "pending", addresseeAgentId: responderAgentId, createdByAgentId: ownerAgentId });
+      await expectHeldOwnerUnchanged(input);
+
+      const [notice] = await db.select().from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.issueId, input.issueId),
+        eq(issueComments.authorType, "system"),
+        eq(issueComments.clientRequestId, `native-addressed-failure:${input.interactionId}`),
+      ));
+      expect(notice.body).toMatch(/KP/i);
+      expect(notice.body).toMatch(/paused/i);
+      expect(notice.body).toMatch(/resume/i);
+      expect(notice.presentation).toMatchObject({ kind: "system_notice", tone: "danger" });
+      const metadataRows = ((notice.metadata as { sections?: Array<{ rows?: Array<Record<string, unknown>> }> } | null)?.sections ?? [])
+        .flatMap(section => section.rows ?? []);
+      expect(metadataRows).toEqual(expect.arrayContaining([
+        { type: "agent_link", label: "Recovery owner", agentId: ownerAgentId, name: "KA" },
+        expect.objectContaining({ type: "key_value", label: "Next action", value: expect.stringMatching(/resume/i) }),
+      ]));
+
+      const resolved = await issueThreadInteractionService(db).acceptInteraction({
+        id: input.issueId, companyId, projectId: null, goalId: null, status: input.issueBefore.status,
+      }, input.interactionId!, {}, { userId: humanUserId });
+      expect(resolved.interaction).toMatchObject({ status: "accepted", resolvedByUserId: humanUserId });
+      const [humanResolvedCard] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, input.interactionId!));
+      expect(humanResolvedCard).toMatchObject({ status: "accepted", resolvedByUserId: humanUserId });
+    } finally {
+      await db.update(agents).set({ status: "active" }).where(eq(agents.id, responderAgentId));
+    }
   }, 120_000);
 
   it("settles an F2 opaque-download cancellation through the executor without publishing a pending notice", async () => {
