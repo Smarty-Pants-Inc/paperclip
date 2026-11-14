@@ -38,6 +38,7 @@ import { REVIEWED_CHAT_BINDING_NOT_READY, ReviewedChatBindingNotReadyError, revi
 import { reportRunFailure } from "../run-failure-report.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { isConversation, settleConversationTurn } from "../agent-conversations.js";
+import { continuationInputAnsweredByOtherRun } from "../continuation-comment-input.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -841,8 +842,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         await settleAgent();
         return;
       }
-      const skipRunIssueComment =
-        parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
+      const skipRunIssueComment = parseObject(livenessRun.contextSnapshot).skipIssueComment === true;
       let resolvedPresentationDecision: RunPresentationDecision | null =
         null;
       try {
@@ -899,6 +899,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         });
         let presentationDecision: RunPresentationDecision =
           resolved.decision;
+        const duplicateContinuationAnswer = issueId && presentationDecision.commentAction === "create"
+          ? await continuationInputAnsweredByOtherRun(db, { companyId: livenessRun.companyId, issueId,
+            runId: livenessRun.id, createdAt: livenessRun.createdAt, contextSnapshot: livenessRun.contextSnapshot }) : false;
+        if (duplicateContinuationAnswer) presentationDecision = {
+          ...presentationDecision, commentAction: "none",
+          reasonCodes: [...presentationDecision.reasonCodes, "continuation_input_answered_by_other_run"],
+        };
 
         if (
           issueId &&

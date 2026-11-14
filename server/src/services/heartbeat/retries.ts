@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
 import { AGENT_DIRECTORY_BUSY_ERROR_CODE, AGENT_DIRECTORY_BUSY_MAX_DEFERRALS, AGENT_DIRECTORY_BUSY_RETRY_REASON, AGENT_DIRECTORY_BUSY_RETRY_WAKE_REASON, agentDirectoryBusyRetryDelayMs, type AgentDirectoryPreparationDeferral } from "./agent-directory-busy.js";
@@ -804,9 +805,11 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const shouldQuarantineWorkspaceForRetry =
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
+    const commentIssueId = issueId ?? readNonEmptyString(contextSnapshot.issueId);
     const retryContextSnapshot: Record<string, unknown> = withRecoveryContext(
       {
         ...contextSnapshot,
+        ...(commentIssueId ? await readContinuationCommentInput(db, { companyId: run.companyId, issueId: commentIssueId, runId: run.id }) : {}),
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt, now),
         retryOfRunId: run.id,
         ...(opts?.preserveWakeContext
@@ -1223,6 +1226,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               {
                 ...(issueId ? { issueId } : {}),
                 retryOfRunId: run.id,
+                _paperclipWakeContext: retryContextSnapshot.commentContinuation === true ? {
+                  wakeCommentId: retryContextSnapshot.wakeCommentId, wakeCommentIds: retryContextSnapshot.wakeCommentIds,
+                } : undefined,
                 ...interactionContinuationPayload,
                 retryReason,
                 ...(transientRecovery

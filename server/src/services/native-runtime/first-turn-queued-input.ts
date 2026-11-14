@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, heartbeatRunEvents, heartbeatRuns, issueAttachments, issueComments, issues } from "@paperclipai/db";
 import type { SourceTrustMetadata } from "@paperclipai/shared";
 
+import { pendingContinuationCommentInput } from "../continuation-comment-input.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
@@ -206,8 +207,16 @@ export async function claimFirstTurnQueuedInput(
     const joining = !issue || issue.conversationAgentId || issue.executionRunId !== run.id
       ? [] : wakes.filter(wake => deferredWakeJoinsFirstTurn(wake, run));
     const commentIds = [...new Set(joining.flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)))];
-    const taken = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
+    const queued = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
       commentIds, excludeDelivered: true });
+    // A failed parent may have accepted the message without ever answering it.
+    // Re-deliver only its still-pending input, not every previously delivered wake.
+    const carried = issue?.executionRunId === run.id && !issue.conversationAgentId && record(run.contextSnapshot).commentContinuation === true
+      ? await pendingContinuationCommentInput(tx as unknown as Db, { ...binding, contextSnapshot: run.contextSnapshot }) : {};
+    const retryMessages = await readQueuedMessages(tx as unknown as Db, { ...binding, responsibleUserId: run.responsibleUserId,
+      commentIds: stringIds(carried.wakeCommentIds), excludeDelivered: false });
+    const taken = [...new Map([...retryMessages, ...queued].map(message => [message.id, message])).values()]
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id));
     // Render before sealing: once the receipt commits, nothing can fail
     // between it and the turn input that the receipt describes.
     const text = await render(taken);
@@ -215,8 +224,11 @@ export async function claimFirstTurnQueuedInput(
     const sealed: FirstTurnQueuedInputReceipt = {
       schema: FIRST_TURN_QUEUED_INPUT_SCHEMA,
       runId: run.id,
-      wakeupRequestIds: joining.filter(wake => queuedCommentIdsFromWakePayload(wake.payload)
-        .some(id => taken.some(message => message.id === id))).map(wake => wake.id),
+      wakeupRequestIds: [...new Set([
+        ...(retryMessages.length ? stringIds(carried.queuedCommentSourceWakeIds) : []),
+        ...joining.filter(wake => queuedCommentIdsFromWakePayload(wake.payload)
+          .some(id => taken.some(message => message.id === id))).map(wake => wake.id),
+      ])],
       commentIds: taken.map(message => message.id),
       claimedAt: new Date().toISOString(),
     };

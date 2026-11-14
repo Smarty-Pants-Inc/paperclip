@@ -3,7 +3,7 @@ import { and, eq, sql as sqlTag } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agents, agentTaskSessions, agentWakeupRequests, approvals, companies, createDb, heartbeatRuns, issueApprovals,
-  issueRecoveryActions, issueRelations, issues, issueThreadInteractions, nativeRunFinalizations,
+  issueComments, issueRecoveryActions, issueRelations, issues, issueThreadInteractions, nativeRunFinalizations,
 } from "@paperclipai/db";
 import { recoveryService } from "../services/recovery/service.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -76,11 +76,14 @@ describePostgres("assigned-work invariant sweep", () => {
   it("a deploy-interrupted in_progress task with nothing pending gets exactly one continuation; the stranded sweep leaves it", async () => {
     const f = await seedCompany();
     const issueId = await f.issue();
+    const [followup] = await db.insert(issueComments).values({ companyId: f.companyId, issueId, authorType: "user",
+      authorUserId: "local-board", body: "Continue with COBALT, not the first reply." }).returning();
     // The staging run: a person's Retry, stopped by a deploy's shutdown during
     // setup, certified as no provider work, its hold already resolved.
     await f.run(issueId, { resultJson: { stopReason: "interrupted", workspaceRestoreFailure: "restore_failed",
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
-      contextSnapshot: { issueId, taskId: issueId, explicitUserContinuation: { previousRunId: randomUUID() } } });
+      contextSnapshot: { issueId, taskId: issueId, wakeCommentId: followup.id,
+        explicitUserContinuation: { previousRunId: randomUUID() } } });
     const queue = wakeQueue();
     // Production wiring: the bounded retry scheduler declines (not_scheduled).
     const recovery = recoveryService(db, { enqueueWakeup: queue.enqueueWakeup, scheduleRecoveryRetry: async () => null });
@@ -94,6 +97,9 @@ describePostgres("assigned-work invariant sweep", () => {
     // What staging shows for this shape: a Retry button that only the system can act on.
     expect(check).toMatchObject({ outcome: "repaired", verdict: { kind: "violation", reason: "retry_offered" } });
     expect(queue.calls).toEqual([{ agentId: f.agentId, issueId, source: "issue.assigned_work_invariant" }]);
+    expect(queue.enqueueWakeup.mock.calls[0][1]?.contextSnapshot).toMatchObject({
+      commentContinuation: true, wakeCommentId: followup.id, wakeCommentIds: [followup.id],
+    });
     const [activity] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, issueId),
       eq(activityLog.action, ASSIGNED_WORK_CONTINUED_ACTION)));
     expect(activity.details).toMatchObject({ message: expect.stringContaining("Continued automatically") });
