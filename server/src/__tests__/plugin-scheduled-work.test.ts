@@ -74,6 +74,15 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(reads).not.toHaveBeenCalled(); expect(writes).not.toHaveBeenCalled(); expect(executes).not.toHaveBeenCalled();
     reads.mockRestore(); writes.mockRestore(); executes.mockRestore();
   }
+  // Past the startup notification batch, to the next real wake.
+  async function nextRealWake() {
+    await vi.waitFor(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(idleWorkSnapshot().active).toBe(0);
+      expect(coordinator!.nextWakeAt()! - Date.now()).toBeGreaterThan(60_000);
+    }, { timeout: 5000 });
+    return coordinator!.nextWakeAt()! - Date.now();
+  }
   async function due(key = "hourly") {
     const row = await job(key);
     await pluginJobStore(db).updateRunTimestamps(row.id, new Date(0), new Date(Date.now() - 1000));
@@ -91,12 +100,39 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const orphan = await pluginJobStore(db).createRun({ jobId: row.id, pluginId, trigger: "schedule" });
     await pluginJobStore(db).markRunning(orphan.id);
     await db.execute(sql`update plugin_job_runs set created_at = now() - interval '1 hour', started_at = now() - interval '1 hour' where id = ${orphan.id}`);
+    // Another server's run inside its worker timeout may still be live.
+    const replicaJob = await due("live-replica");
+    const liveReplica = await pluginJobStore(db).createRun({ jobId: replicaJob.id, pluginId, trigger: "schedule" });
+    await pluginJobStore(db).markRunning(liveReplica.id);
 
     await start();
-    await completed();
+    await completed(2);
     const history = await runs();
     expect(history.find(run => run.id === orphan.id)).toMatchObject({ status: "failed", error: expect.stringContaining("orphaned_after_restart") });
+    expect(history.find(run => run.id === liveReplica.id)?.status).toBe("running");
     expect(rpc).toHaveBeenCalledOnce();
+    // It wakes to recover the replica's run only once that run is orphaned.
+    const wakeIn = await nextRealWake();
+    expect(wakeIn).toBeGreaterThan(5 * 60_000);
+    expect(wakeIn).toBeLessThanOrEqual(5 * 60_000 + 30_000);
+  });
+
+  it("never reaps or reruns its own running row past the worker timeout while its worker is alive", async () => {
+    await due();
+    let finish!: () => void;
+    rpc.mockImplementation(() => new Promise(resolve => { finish = () => resolve({}); }));
+    await start();
+    await vi.waitFor(async () => { await vi.advanceTimersByTimeAsync(100); expect(rpc).toHaveBeenCalledOnce(); }, { timeout: 5000 });
+    const [own] = await runs();
+    await db.execute(sql`update plugin_job_runs set created_at = now() - interval '1 hour', started_at = now() - interval '1 hour' where id = ${own.id}`);
+    await scheduler!.tick();
+    await vi.advanceTimersByTimeAsync(60_000);
+    await scheduler!.tick();
+    expect((await runs()).map(run => [run.id, run.status])).toEqual([[own.id, "running"]]);
+    expect(rpc).toHaveBeenCalledOnce();
+    finish();
+    await completed();
+    expect((await runs()).map(run => [run.id, run.status])).toEqual([[own.id, "succeeded"]]);
   });
 
   it("does not query repeatedly after an empty startup reconciliation", async () => { await start(); await quiet(); });
@@ -392,7 +428,17 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   });
   it("does not replay an unresolved run left by another process", async () => {
     const row = await due(); await pluginJobStore(db).createRun({ jobId: row.id, pluginId, trigger: "schedule" });
-    await start(); await quiet(); expect(rpc).not.toHaveBeenCalled();
+    await start();
+    // Its owner may be live until the worker timeout passes. One wake then
+    // recovers it if orphaned; until then no SQL and no replay.
+    const wakeIn = await nextRealWake();
+    expect(wakeIn).toBeGreaterThan(5 * 60_000);
+    expect(wakeIn).toBeLessThanOrEqual(5 * 60_000 + 30_000);
+    const reads = vi.spyOn(db, "select"), writes = vi.spyOn(db, "transaction"), executes = vi.spyOn(db, "execute");
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(reads).not.toHaveBeenCalled(); expect(writes).not.toHaveBeenCalled(); expect(executes).not.toHaveBeenCalled();
+    reads.mockRestore(); writes.mockRestore(); executes.mockRestore();
+    expect(rpc).not.toHaveBeenCalled();
     const [run] = await runs(); await pluginJobStore(db).completeRun(run.id, { status: "cancelled" }); await completed();
   });
   it("fills released capacity from completion without a poll", async () => {

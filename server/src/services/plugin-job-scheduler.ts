@@ -61,6 +61,10 @@ export function createPluginJobScheduler(options: PluginJobSchedulerOptions): Pl
   let lastTickAt: Date | null = null;
   let ticking: Promise<void> | undefined;
   const canRun = () => running && options.isBackgroundWorkEnabled?.() !== false;
+  // Milliseconds until an outstanding run is orphaned, by database time: the
+  // run row's creation (a database default) precedes its worker call.
+  const orphanInMs = sql<number>`(ceil(extract(epoch from ${pluginJobRuns.createdAt}
+    + ${jobTimeoutMs + tickIntervalMs} * interval '1 millisecond' - now()) * 1000))::float8`.mapWith(Number);
 
   function track<T>(promise: Promise<T>): Promise<T> {
     const tracked = trackIdleWork(promise);
@@ -148,13 +152,31 @@ export function createPluginJobScheduler(options: PluginJobSchedulerOptions): Pl
     const jobs = await db.select().from(pluginJobs).where(eq(pluginJobs.status, "active"));
     const runnable = jobs.filter(job => !unregistered.has(job.pluginId) && workerManager.isRunning(job.pluginId)
       && !activeJobs.has(job.id) && !pendingSettlements.has(job.id) && job.schedule && !validateCron(job.schedule));
-    const outstanding = runnable.length === 0 ? [] : await db.select({ jobId: pluginJobRuns.jobId })
+    const outstanding = runnable.length === 0 ? [] : await db.select({ id: pluginJobRuns.id, jobId: pluginJobRuns.jobId, orphanInMs })
       .from(pluginJobRuns).where(and(inArray(pluginJobRuns.jobId, runnable.map(job => job.id)),
         inArray(pluginJobRuns.status, ["pending", "queued", "running"])));
-    const blocked = new Set(outstanding.map(run => run.jobId));
+    // Runnable jobs are not active here, so this process owns none of these
+    // runs. A live owner settles its run when the RPC times out; a killed
+    // server's workers exit with it (they lose stdin). A run still outstanding
+    // one scheduler interval after the timeout has no live owner: fail it so
+    // the job's owed occurrence runs again.
+    const orphaned = outstanding.filter(run => run.orphanInMs <= 0);
+    const reaped = orphaned.length === 0 ? [] : await db.update(pluginJobRuns).set({
+      status: "failed", finishedAt: sql`now()`,
+      error: "orphaned_after_restart: run outlived its worker timeout without settlement",
+    }).where(and(inArray(pluginJobRuns.jobId, orphaned.map(run => run.jobId)),
+      inArray(pluginJobRuns.status, ["pending", "queued", "running"]), sql`${orphanInMs} <= 0`))
+      .returning({ id: pluginJobRuns.id, jobId: pluginJobRuns.jobId });
+    if (reaped.length) log.warn({ runs: reaped }, "failed plugin job runs orphaned by a stopped server");
+    const reapedIds = new Set(reaped.map(run => run.id));
+    const blocked = new Set(outstanding.filter(run => !reapedIds.has(run.id)).map(run => run.jobId));
     const now = new Date();
     const dispatches: Promise<unknown>[] = [];
     next = null;
+    // Wake when the next unowned run becomes orphaned, instead of polling.
+    for (const run of outstanding) {
+      if (!reapedIds.has(run.id) && run.orphanInMs > 0) next = Math.min(next ?? Infinity, now.getTime() + run.orphanInMs);
+    }
     for (const job of runnable) {
       if (!canRun() || signal?.aborted) break;
       if (blocked.has(job.id) || activeJobs.has(job.id) || pendingSettlements.has(job.id)) continue;
