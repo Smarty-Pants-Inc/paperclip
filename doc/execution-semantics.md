@@ -2537,11 +2537,30 @@ For an operational investigation of such a row:
 
 Legacy lifecycle-command settlement's temporary M1 B1 guard also visits
 **ownerless** controller rows that the record-driven reconciler cannot reach.
-Before opening its settlement transaction, it calls the same documented
-`proveControllerInstance` primitive for every noncurrent, unclosed row with an
-epoch older than the serving boot. The timestamp is the row's persisted
-`renewed_at` (`renewedAt` in the schema), its last lease write, not a command's
-age or a fabricated owned-record timestamp. The primitive still requires
+Before opening its settlement transaction, it considers noncurrent, unclosed
+rows with an epoch older than the serving boot. For each candidate, a separate
+preflight transaction enumerates the same `OWNABLE_KINDS.listInProgress` inventory
+as ownership reconciliation, including its `resolveFenceHolders` lookup. A process
+owner or fence naming that boot refuses
+the fallback, even when its record is old: use the documented owned-record path and
+its actual last-write timestamp instead. An incomplete inventory also refuses.
+
+The inventory read and existing `proveControllerInstance` fence run under SHARE
+locks on every inventory table that can yield a process or fence owner:
+`agents`, `environment_leases`, `execution_workspace_runtime_leases`,
+`heartbeat_runs`, `issue_recovery_actions`,
+`native_run_finalizations`, `sandbox_creation_operations`, and
+`workspace_operations`. This includes classification inputs, and prevents both
+updates and newly inserted ownership records from slipping between the read and
+fence. Concurrent readers/preflights remain compatible; the preflight waits at
+most one second for a busy ownership-source lock, then refuses. Maintain this
+lock set when the registry gains a new process/fence-owner source. No controller-table
+SHARE lock is taken in this preflight.
+
+Only after proving ownerlessness does it call the documented primitive. The
+timestamp is the row's persisted `renewed_at` (`renewedAt` in the schema), its
+last lease write, not a command's age or a fabricated owned-record timestamp.
+The primitive still requires
 `max(lease_expires_at, renewed_at + 90 seconds) + 30 seconds` to have elapsed
 and a registered serving lease with a newer epoch. Only `stopped` or `fenced`
 discharges B1; `live`, `grace`, `expired` and absent proof still refuse. The

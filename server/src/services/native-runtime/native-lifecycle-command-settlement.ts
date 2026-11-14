@@ -10,6 +10,7 @@ import { isSettledRemoteWarmControlState } from "./remote-warm-session-recovery.
 import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
 import { currentProcessProbe, proveOwnerGone } from "../owner-proof.js";
 import { proveControllerInstance } from "../controller-instance-lease.js";
+import { OWNABLE_KINDS, resolveFenceHolders } from "../recovery/ownership-registry.js";
 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const lifecycle = new Set(["runner.drain", "runner.suspend", "runner.shutdown"]);
@@ -17,6 +18,47 @@ export const NATIVE_LEGACY_LIFECYCLE_SKEW_MS = 5_000;
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type Input = { db: Db; root: string; bytes: string; identity: Record<string, string>;
   companyId: string; agentId: string; issueId: string; currentRunId: string };
+
+/** B1's fallback is ONLY for boots the record-driven reconciler cannot reach.
+ * Keep the inventory's process/fence-owner tables stable through the documented fence:
+ * row locks alone miss inserts and records becoming in-progress. SHARE permits
+ * concurrent provers/readers, but excludes ownership INSERT/UPDATE/DELETE. These
+ * are all tables from which OWNABLE_KINDS can produce a process/fence owner (including
+ * the heartbeat/environment inputs to accepted-result owner classification).
+ * No controller-table SHARE lock here: the prover must still renew/fence, and
+ * two preflights must never upgrade competing SHARE locks on that table. */
+async function proveOwnerlessController(db: Db, bootId: string, renewedAt: Date) {
+  try {
+    return await db.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      await tx.execute(sql`set local lock_timeout = '1s'`);
+      await tx.execute(sql`lock table agents, environment_leases, execution_workspace_runtime_leases,
+        heartbeat_runs, issue_recovery_actions, native_run_finalizations, sandbox_creation_operations,
+        workspace_operations in share mode`);
+      for (const kind of OWNABLE_KINDS) {
+        if (!kind.listInProgress) continue;
+        for (let offset = 0; ; offset += 200) {
+          const listed = await kind.listInProgress(tx, 200, offset);
+          await resolveFenceHolders(tx, listed.records);
+          if (listed.records.some(({ owner }) => owner.kind === "process" ? owner.stamp.bootId === bootId
+            : owner.kind === "fence" && (owner.stamp.fenceToken === bootId || owner.fence.currentFenceToken === bootId))) {
+            return "expired" as const;
+          }
+          if (!listed.truncated) break;
+          // The report uses the same per-kind cap. An incomplete inventory
+          // cannot prove ownerlessness; never silently treat it as empty.
+          if (offset + 200 >= 2_000) return "expired" as const;
+        }
+      }
+      return proveControllerInstance(tx, bootId, renewedAt);
+    });
+  } catch (error) {
+    for (let cause: unknown = error; cause && typeof cause === "object"; cause = record(cause).cause) {
+      if (record(cause).code === "55P03") return "expired" as const;
+    }
+    throw error;
+  }
+}
 
 /** A plan grants no admission. The caller must first prove the terminal owner,
  * released lease, stopped controller, local lifecycle and every quarantine.
@@ -78,15 +120,14 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
       let allGone = true;
       for (const row of boots) {
         if (row.bootId === current.bootId || row.stoppedAt || row.fencedAt) continue;
-        // B1 also visits ownerless boots that record-driven reconciliation
-        // cannot reach. renewedAt is this row's persisted last lease write;
-        // never substitute command age or lease expiry for it. The documented
-        // prover retains max(lease expiry, renewedAt + TTL) + fence grace.
+        // B1 visits only provably ownerless boots. An owned boot must use
+        // record-driven reconciliation with its actual owned-write timestamp;
+        // renewedAt alone cannot bound that boot's last sign of life.
         // Fence only in the preflight, before any settlement SHARE lock. A
         // transaction recheck refuses a newly arrived unclosed boot instead of
         // upgrading SHARE locks in two competing settlements.
         if (!fenceOwnerless || row.epoch >= boot.epoch) { allGone = false; continue; }
-        const proof = await proveControllerInstance(db as Db, row.bootId, row.renewedAt);
+        const proof = await proveOwnerlessController(db as Db, row.bootId, row.renewedAt);
         if (proof !== "stopped" && proof !== "fenced") allGone = false;
       }
       if (!allGone) return false;
