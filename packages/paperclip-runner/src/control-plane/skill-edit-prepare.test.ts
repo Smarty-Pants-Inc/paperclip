@@ -28,8 +28,10 @@ type Session = {
 // run.prepare boundary and actual provider subprocess turns, not a mocked
 // prepare result. The scripted provider is NOT live-model or deployment proof.
 it.each([
-  ["codex", "open"], ["codex", "done"], ["pi_rpc", "open"], ["pi_rpc", "done"],
-] as const)("refreshes an edited skill on %s after an %s conversation through real run.prepare", async (provider, disposition) => {
+  ["codex", "open", null], ["codex", "done", null], ["pi_rpc", "open", null], ["pi_rpc", "done", null],
+  ["codex", "open", "active_turn"], ["codex", "done", "descendant"],
+  ["codex", "open", "goal"], ["codex", "done", "contract"],
+] as const)("refreshes an edited skill on %s after an %s conversation (%s) through real run.prepare", async (provider, disposition, blocker) => {
   const root = await mkdtemp(join(tmpdir(), "skill-edit-prepare-"));
   const runnerDigest = sha(await readFile(binary));
   const skillRoot = join(root, "assigned-skill");
@@ -166,6 +168,20 @@ it.each([
     expect(before.activeProviderTurnId).toBeNull();
     expect(before.piDeferredTerminal ?? null).toBeNull();
     if (disposition === "done") expect(before.activeProviderResultDisposition).toBe("done");
+    // Retain real serialized provider state and vary only the durable admission
+    // fence. A separate runner process must decide at prepare, before restoring
+    // the old provider or changing its configuration.
+    if (blocker === "active_turn") {
+      before.activeProviderTurnId = "unsettled-old-turn";
+      before.lifecycle = "turn_active";
+      before.completedTurnAuthoritative = false;
+      before.completedProviderTurnId = null;
+      before.completedTurnProcessGeneration = null;
+    } else if (blocker === "descendant") before.descendantThreadIds = ["old-child-thread"];
+    else if (blocker === "goal") before.goal = { objective: "Old work", status: "active", tokenBudget: null,
+      tokensUsed: 0, elapsedSeconds: 0, iterations: 0, lastReason: null, createdAt: null,
+      updatedAt: null, completedAt: null, workingNow: false };
+    if (blocker) await writeFile(checkpoint, JSON.stringify(before), { mode: 0o600 });
 
     // Edit the on-disk fixture skill and model its new admitted version plus
     // the next run's instruction working-copy framing. The production composer
@@ -181,10 +197,16 @@ it.each([
     const nextPayload = { ...payload, provider: { ...descriptor, instructions: nextInstructions,
       ...(provider === "pi_rpc" ? { runtimeContext: edited } : {}) } };
     expect(nextPayload.provider.instructions).not.toBe(payload.provider.instructions);
+    if (blocker === "contract") nextPayload.completionContract = { revision: "revision-2", criterionIds: ["criterion-1"] };
     const next = await start("run-B", checkpoint);
     const prepared = await next.command("run.prepare", nextPayload);
-    console.log(`SKILL_EDIT_PRP provider=${provider} predecessor=${disposition} config_diff=[instructions] includeSkillInstructions_unchanged=true tools_unchanged=true completionContract_unchanged=true status=${prepared.status} result=${JSON.stringify(prepared.result)}`);
+    console.log(`SKILL_EDIT_PRP provider=${provider} predecessor=${disposition} config_diff=[instructions] includeSkillInstructions_unchanged=true tools_unchanged=true completionContract_unchanged=${blocker !== "contract"} status=${prepared.status} result=${JSON.stringify(prepared.result)}`);
     expect(prepared).toMatchObject({ status: "completed" });
+    if (blocker) {
+      expect(prepared.result?.result).toMatchObject({ status: blocker === "goal" || blocker === "contract" ? "refresh_fresh" : "refresh_wait" });
+      expect(JSON.parse(await readFile(join(next.stateDirectory, "codex-provider-state.json"), "utf8"))).toEqual(before);
+      return;
+    }
     await next.completed("session.open");
     const adopted = JSON.parse(await readFile(join(next.stateDirectory, "codex-provider-state.json"), "utf8"));
     expect(adopted.runIdentity.runId).toBe("run-B");
