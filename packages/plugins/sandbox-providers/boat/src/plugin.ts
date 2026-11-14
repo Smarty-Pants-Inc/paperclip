@@ -288,8 +288,10 @@ async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseI
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
     const sandbox = result.sandbox ?? result;
     assertSandboxId(sandbox, id);
-    const stop = sandbox.stop ?? result.stop ?? result.operation ?? operation;
-    if (["archived", "stopped"].includes(sandbox.state) || stop?.status === "completed") {
+    const seen = sandbox.stop ?? result.stop ?? result.operation;
+    const stop = seen ?? operation;
+    // A completed stop counts only when GET confirms the id returned by POST /stop.
+    if (["archived", "stopped"].includes(sandbox.state) || (stopId !== undefined && seen?.id === stopId && seen?.status === "completed")) {
       idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" };
     }
     // A missing id on 202 is not failure: observe the sandbox until its stop
