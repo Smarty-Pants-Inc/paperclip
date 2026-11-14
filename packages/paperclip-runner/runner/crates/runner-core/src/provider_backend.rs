@@ -3521,6 +3521,13 @@ impl CodexCommandExecutor {
             if rebind_run && state.thread_id.is_some() {
                 let refresh_pi_process =
                     config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context;
+                if config.provider == "pi_rpc" && state.lifecycle == "session_open" {
+                    // Idle suspend can stop Pi without restarting this executor.
+                    // restore_once is then already checked, so explicitly resume
+                    // the saved session before attachment's live-work fences.
+                    // Keep this after new-run settlement and profile admission.
+                    self.restore_provider_if_needed()?;
+                }
                 // Reuse attachment's tool/accounting reset and live-provider
                 // contract update; changing only the saved binding is not enough.
                 let mut attachment_payload = payload.clone();
