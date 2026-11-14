@@ -548,6 +548,9 @@
   --artifact-play-scrim: rgba(0, 0, 0, 0.55);
   --artifact-hover-ease: 300ms cubic-bezier(0.3, 0, 0.1, 1);
   --tc-interaction-card-max-h: 50dvh;
+  /* On a phone the docked card scrolls inside itself so the composer and Send stay on screen.
+     The mobile chat shell redeclares it against its visible-viewport height (keyboard aware). */
+  --tc-interaction-card-max-h-mobile: calc(var(--mobile-chat-viewport-height, 100dvh) * 0.45);
   /* About 3.5 queued rows, and less on short windows so the conversation stays visible. */
   --tc-queued-list-max-h: min(calc(var(--spacing) * 40), 28dvh);
   --shadow-task-composer: 0 2px 8px -2px color-mix(in oklab, var(--foreground) 7%, transparent),
@@ -979,6 +982,7 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   height: var(--mobile-chat-viewport-height);
   min-height: 0;
   overflow: hidden;
+  --tc-interaction-card-max-h-mobile: calc(var(--mobile-chat-viewport-height, 100dvh) * 0.45);
 }
 
 .paperclip-app-shell:is([data-mobile="true"], [data-keyboard-open="true"]):has([data-task-chat-shell]) :is(.app-main-row, .app-content-row),
