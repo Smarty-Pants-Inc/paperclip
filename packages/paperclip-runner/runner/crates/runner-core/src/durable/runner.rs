@@ -4585,7 +4585,10 @@ mod tests {
         current.ca_bundle_path = Some(PathBuf::from("/fixture/trusted-ca.pem"));
         current.runner_digest = format!("sha256:{}", "a".repeat(64));
         let original_url = current.connect_url.clone();
-        let mut endpoint = RunnerTransportEndpoint::from_listener(listener, path.clone());
+        let mut endpoint = RunnerTransportEndpoint::Listen {
+            listener,
+            path: path.clone(),
+        };
         let store = DurableStateStore::new(&directory).unwrap();
         let (mut state, _) = store.load_or_create(&current).unwrap();
         for run in 2..=3 {
