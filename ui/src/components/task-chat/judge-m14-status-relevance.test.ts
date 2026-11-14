@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import type { IssueChatComment } from "@/lib/issue-chat-messages";
 import { taskChatStatusRelevance, isSupersededNotice } from "./status-relevance";
@@ -6,8 +7,8 @@ import { taskChatStatusRelevance, isSupersededNotice } from "./status-relevance"
 // This is the projection called by TaskChatThread.tsx:934, not a browser/render claim.
 describe("M14 current held notice projection",()=>{
  it("counts only the current note from actual retained B-prime PostgreSQL rows",()=>{
-  if(!process.env.JUDGE_NOTICE_RECEIPT) throw new Error("JUDGE_NOTICE_RECEIPT must name the retained evidence file");
-  const rows=JSON.parse(readFileSync(process.env.JUDGE_NOTICE_RECEIPT,"utf8")) as IssueChatComment[];
+  const receipt=process.env.JUDGE_NOTICE_RECEIPT ?? fileURLToPath(new URL("./judge-m14-status-relevance.ui-notice-rows.json", import.meta.url));
+  const rows=JSON.parse(readFileSync(receipt,"utf8")) as IssueChatComment[];
   expect(rows).toHaveLength(2);
   const current=rows.filter(n=>!(n.metadata as Record<string,unknown>|null)?.supersededBy);
   expect(current).toHaveLength(1);
