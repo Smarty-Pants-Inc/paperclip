@@ -3,6 +3,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { environmentLeases, type Db } from "@paperclipai/db";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
 import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
+import { nativeWarmSessionStopReadySql } from "./native-warm-stop-gate.js";
 
 /**
  * Warm sandbox expiry.
@@ -64,6 +65,8 @@ export function warmWindowEndsAtSql() {
  * run on the task that is starting now (it may be resuming this sandbox before
  * its lease is written), or an operation already in progress on the lease.
  * Superseded and replaced leases belong to the retained-orphan settle.
+ * A native warm session is a candidate only once the shared native warm stop
+ * gate holds (`native-warm-stop-gate.ts`): the window ending is never proof.
  * Plugin Runner task leases (`driver: "plugin"`) are excluded: their cleanup
  * releases through the plugin rather than the verified stop-only contract, so
  * it cannot promise to keep the task's files.
@@ -81,6 +84,7 @@ export function warmSandboxExpiryCandidateCondition() {
       'portableTaskSuccessor', 'reusableLeaseSuccessor', 'reusableSandboxLeaseSuperseded',
       ${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}])`,
     sql`coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`,
+    nativeWarmSessionStopReadySql(),
     sql`coalesce(${environmentLeases.metadata}#>>'{legacyShutdownWorkspaceSettlement,state}', '') <> 'pending'`,
     sql`not exists (select 1 from heartbeat_runs run where run.id = ${environmentLeases.heartbeatRunId}
       and run.status not in ('succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted'))`,

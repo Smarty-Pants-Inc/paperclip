@@ -1632,6 +1632,17 @@ sandbox up: the warm owner is released and the next run on the task prepares its
 instructions fresh. A follow-up whose predecessor's warm instruction copy cannot be
 handed off retires that owner and prepares fresh instead of failing.
 
+The margin is not proof. A reusable sandbox of the native runner keeps a native
+warm session, and no server path stops, releases or destroys it (warm-window
+expiry, retained-orphan and source-change stops, explicit stop-and-retain, run
+finalization release, reusable destroy, the pending-cleanup sweep, remote
+workspace close) until its lease row has a checkpoint stamp for that exact
+sandbox covering the last finished turn on it, and a close receipt for the same
+sandbox, run, session and checkpoint no older than the stamp. A refused stop
+keeps the sandbox under a stop intent in `pending_cleanup` with a retry time; if
+it still waits after 30 minutes, it is warned about once. Sandboxes without a
+native warm session are not affected.
+
 A remote runner also keeps working while its controller is offline, and the host
 reattaches it within the remote runner reconnect grace (7 minutes). Daytona counts
 only SDK and lifecycle calls as activity, so with no controller its idle auto-stop

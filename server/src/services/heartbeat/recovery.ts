@@ -109,6 +109,7 @@ import {
 import { performance } from "node:perf_hooks";
 import { buildProcessLossDiagnostic } from "../process-loss-diagnostics.js";
 import { logActivity, persistActivity } from "../activity-log.js";
+import { holdNativeWarmSessionStop, nativeWarmSessionStopReady } from "../native-warm-stop-gate.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { releaseRuntimeServicesForRun } from "../workspace-runtime.js";
@@ -1795,6 +1796,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         : null;
       const lease = await environmentsSvc.getLeaseById(row.id);
       if (!lease) continue;
+      // Every stop, release and destroy of a native warm session waits for the
+      // shared native warm stop gate (native-warm-stop-gate.ts). A refused
+      // lease keeps its box, gets a bounded retry time and, past the bound, one
+      // warning; it consumes no finite cleanup attempt.
+      if (!await nativeWarmSessionStopReady(db, lease)) {
+        await holdNativeWarmSessionStop(db, lease);
+        continue;
+      }
 
       // An orphan ephemeral lease keeps its provider, its provider lease id, and
       // its sandbox config in the lease row. A failed acquire records it, and its

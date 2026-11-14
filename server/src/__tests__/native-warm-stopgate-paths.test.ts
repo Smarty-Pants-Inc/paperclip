@@ -41,7 +41,8 @@ async function fixture(input: { status?: "active" | "retained" | "released" | "p
   const lease = await environmentService(db).acquireLease({ companyId, environmentId, executionWorkspaceId, issueId,
     heartbeatRunId: runId, leasePolicy: "reuse_by_environment", provider: "fake", providerLeaseId,
     metadata: { agentId, driver: "sandbox", provider: "fake", image: "ubuntu:24.04", reuseLease: true,
-      ...(input.idleAgoMs !== undefined ? { [WARM_SANDBOX_IDLE_TIMEOUT_KEY]: 5 * MINUTE } : {}),
+      // A native warm session's lease records its warm window at acquisition.
+      [WARM_SANDBOX_IDLE_TIMEOUT_KEY]: 5 * MINUTE,
       reusableSandboxLease: { adapterType: "paperclip_runner" } } });
   const status = input.status ?? "active";
   if (status !== "active") {
@@ -94,7 +95,7 @@ suite("one native warm checkpoint gate across every sandbox stop path", () => {
   }
 
   it("(1) warm-window expiry durably waits, then stops only after checkpoint and close receipt", async () => {
-    const f = await fixture({ status: "retained", runStatus: "succeeded", idleAgoMs: 6 * MINUTE });
+    const f = await fixture({ status: "retained", runStatus: "succeeded", idleAgoMs: 8 * MINUTE });
     const calls = providerSpies();
     await stopWarmSandboxesPastWindow(db);
     expect(await savedLease(f.leaseId)).toMatchObject({ status: "pending_cleanup" });

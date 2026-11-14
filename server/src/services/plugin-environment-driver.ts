@@ -1,4 +1,5 @@
 import { agents, plugins, type Db } from "@paperclipai/db";
+import { assertNativeWarmSessionStopReady } from "./native-warm-stop-gate.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { conflict } from "../errors.js";
 import type {
@@ -605,6 +606,8 @@ export async function resumePluginEnvironmentLease(input: {
 export async function destroyPluginEnvironmentLease(input: {
   db: Db;
   workerManager: PluginWorkerManager;
+  /** The lease row whose provider allocation is destroyed (native warm stop gate). */
+  leaseId: string;
   companyId: string;
   environmentId: string;
   issueId?: string | null;
@@ -613,6 +616,7 @@ export async function destroyPluginEnvironmentLease(input: {
   leaseMetadata?: Record<string, unknown>;
 }): Promise<void> {
   const { plugin } = await resolvePluginEnvironmentDriver(input);
+  await assertNativeWarmSessionStopReady(input.db, { id: input.leaseId, companyId: input.companyId });
   await input.workerManager.call(plugin.id, "environmentDestroyLease", {
     driverKey: input.config.driverKey,
     companyId: input.companyId,

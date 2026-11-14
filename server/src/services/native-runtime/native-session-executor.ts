@@ -346,7 +346,8 @@ import {
   type NativeRunSpanScope,
   type NativeRunTrace,
 } from "./native-run-trace.js";
-import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { createNativeHarnessBackupStamp, readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
+import { WARM_NATIVE_SESSION_CLOSE_KEY, WARM_NATIVE_SESSION_CLOSE_SCHEMA } from "../native-warm-stop-gate.js";
 import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
@@ -1118,6 +1119,40 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   db?: Db;
 }): Promise<WarmNativeSessionCloseResult> {
   return closeIdleWarmNativeSessions(input);
+}
+
+/**
+ * After the idle close of a warm native session confirmed, record the close
+ * receipt the native warm stop gate (`native-warm-stop-gate.ts`) requires on
+ * the exact retained lease of this run: bound to its provider lease, run, and
+ * the checkpoint stamp (session and manifest) on the row at close time.
+ * `closedAt` is this server's wall clock at confirmation. A failed or lost
+ * write records nothing, so the gate keeps the box (fails closed).
+ */
+async function recordWarmNativeSessionCloseReceipt(entry: WarmNativeSession): Promise<boolean> {
+  const db = entry.sandboxLeaseDb;
+  if (!db || typeof db.transaction !== "function" || !entry.providerLeaseId) return false;
+  try {
+    const [lease] = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.heartbeatRunId, entry.runId),
+      eq(environmentLeases.providerLeaseId, entry.providerLeaseId), eq(environmentLeases.status, "retained"),
+    )).limit(1);
+    const stamp = lease?.providerLeaseId ? readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId) : null;
+    if (!lease || !stamp) return false;
+    const receipt = { schema: WARM_NATIVE_SESSION_CLOSE_SCHEMA, state: "closed", closedAt: new Date().toISOString(),
+      providerLeaseId: lease.providerLeaseId, runId: entry.runId, normalizedSessionId: stamp.normalizedSessionId,
+      manifestSha256: stamp.manifestSha256, checkpointCompletedAt: stamp.completedAt };
+    const updated = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ [WARM_NATIVE_SESSION_CLOSE_KEY]: receipt })}::jsonb`,
+      updatedAt: new Date(),
+    }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "retained"),
+      sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`))
+      .returning({ id: environmentLeases.id }), { companyId: lease.companyId, runId: entry.runId });
+    return updated.length === 1;
+  } catch (error) {
+    logger.warn({ err: error, runId: entry.runId, providerLeaseId: entry.providerLeaseId }, "could not record the warm native session close receipt");
+    return false;
+  }
 }
 
 async function warmSandboxGivenUpByHost(entry: WarmNativeSession): Promise<boolean> {
@@ -9105,7 +9140,10 @@ function armWarmNativeSessionIdleTimer(
     const released = current.released === true;
     if (!released) current.closeOnReleaseReason = "warm native session idle timeout";
     const closing = (released ? detachReleasedWarmNativeSession(current) : closeWarmNativeSession(current, current.closeOnReleaseReason!))
-      .then(() => { forgetWarmNativeSession(sessionId, current); })
+      .then(async () => {
+        if (!released) await recordWarmNativeSessionCloseReceipt(current);
+        forgetWarmNativeSession(sessionId, current);
+      })
       .catch(error => {
         if (released) current.closeOnReleaseReason = "released Runner local detach is unconfirmed";
         if (!released && error instanceof AgentDirectoryOperationBusyError) {
