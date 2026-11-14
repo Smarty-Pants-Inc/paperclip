@@ -6520,6 +6520,8 @@ rl.on("line", (line) => {
     { label: "MCP text", data: { content: [{ type: "text", text: "plain text" }] } },
     { label: "MCP image", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png" }] } },
     { label: "transport collision", data: { transport: "paperclip_plugin", content: [{ type: "text", text: "plain text" }] } },
+    { label: "image existing references", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", reference: "legacy-ref", sha256: "legacy-sha", sizeBytes: 123 }] } },
+    { label: "image nested attachment", data: { content: [{ type: "image", data: "cGl4ZWxz", mimeType: "image/png", attachment: { type: "image", data: "cGl4ZWxz", mimeType: "image/png" } }] } },
   ])("preserves pre-image HTTP bytes for legacy $label data.content", async ({ data }) => {
     const company = await createCompany(db);
     const agent = await createAgent(db, company.id);
