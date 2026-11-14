@@ -1,8 +1,8 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type ChangeEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Camera, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
+import { Camera, KeyRound, LoaderCircle, Save, Trash2, UserRoundPen } from "lucide-react";
 import type { AuthSession, CurrentUserProfile, UpdateCurrentUserProfile } from "@paperclipai/shared";
-import { authApi } from "@/api/auth";
+import { AuthApiError, authApi } from "@/api/auth";
 import { useAccountBoundMutation } from "@/hooks/useAccountBoundMutation";
 import { assetsApi } from "@/api/assets";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
@@ -16,6 +16,152 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { describeError } from "@/api/errors";
+
+// Better Auth's defaults; server/src/auth/better-auth.ts does not override
+// `emailAndPassword.minPasswordLength` / `maxPasswordLength`.
+const MIN_PASSWORD_LENGTH = 8;
+const MAX_PASSWORD_LENGTH = 128;
+
+function changePasswordProblem(current: string, next: string, confirm: string): string | null {
+  if (!current) return "Enter your current password.";
+  if (next.length < MIN_PASSWORD_LENGTH) return `Use at least ${MIN_PASSWORD_LENGTH} characters.`;
+  if (next.length > MAX_PASSWORD_LENGTH) return `Use at most ${MAX_PASSWORD_LENGTH} characters.`;
+  if (next === current) return "Choose a new password that differs from your current one.";
+  if (next !== confirm) return "The new passwords don't match.";
+  return null;
+}
+
+function changePasswordErrorCopy(error: unknown): string {
+  if (error instanceof AuthApiError) {
+    if (error.code === "INVALID_PASSWORD") return "Your current password is wrong.";
+    if (error.code === "PASSWORD_TOO_SHORT") return `Use at least ${MIN_PASSWORD_LENGTH} characters.`;
+    if (error.code === "PASSWORD_TOO_LONG") return `Use at most ${MAX_PASSWORD_LENGTH} characters.`;
+    if (error.code === "CREDENTIAL_ACCOUNT_NOT_FOUND") return "This account signs in without a password, so there is none to change.";
+  }
+  return describeError(error).body;
+}
+
+/**
+ * Change password through Better Auth's documented endpoint with
+ * `revokeOtherSessions: true`: other devices are signed out and this browser
+ * keeps a fresh session.
+ */
+function ChangePasswordSection() {
+  const queryClient = useQueryClient();
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [problem, setProblem] = useState<string | null>(null);
+  const [changed, setChanged] = useState(false);
+
+  const changePasswordMutation = useAccountBoundMutation({
+    mutationFn: (input: { currentPassword: string; newPassword: string }) =>
+      authApi.changePassword({ ...input, revokeOtherSessions: true }),
+    onSuccess: () => {
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+      setProblem(null);
+      setChanged(true);
+      // Better Auth replaced this browser's session; re-read it.
+      void queryClient.invalidateQueries({ queryKey: queryKeys.auth.session });
+    },
+    onError: (error) => {
+      setChanged(false);
+      setProblem(changePasswordErrorCopy(error));
+    },
+  });
+
+  function edit(setter: (value: string) => void) {
+    return (event: ChangeEvent<HTMLInputElement>) => {
+      setter(event.target.value);
+      setChanged(false);
+      setProblem(null);
+    };
+  }
+
+  return (
+    <section className="space-y-4" aria-labelledby="change-password-heading">
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <KeyRound className="h-5 w-5 text-muted-foreground" />
+          <h2 id="change-password-heading" className="text-base font-semibold">Change password</h2>
+        </div>
+        <p className="max-w-2xl text-sm text-muted-foreground">
+          Changing your password signs you out on every other device. You stay signed in here.
+        </p>
+      </div>
+
+      <form
+        className="grid max-w-2xl gap-4"
+        noValidate
+        onSubmit={(event) => {
+          event.preventDefault();
+          const found = changePasswordProblem(currentPassword, newPassword, confirmPassword);
+          setChanged(false);
+          setProblem(found);
+          if (found) return;
+          changePasswordMutation.mutate({ currentPassword, newPassword });
+        }}
+      >
+        <div className="space-y-2">
+          <Label htmlFor="current-password">Current password</Label>
+          <Input
+            id="current-password"
+            type="password"
+            autoComplete="current-password"
+            value={currentPassword}
+            onChange={edit(setCurrentPassword)}
+          />
+        </div>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div className="space-y-2">
+            <Label htmlFor="new-password">New password</Label>
+            <Input
+              id="new-password"
+              type="password"
+              autoComplete="new-password"
+              value={newPassword}
+              onChange={edit(setNewPassword)}
+              aria-describedby="new-password-hint"
+            />
+            <p id="new-password-hint" className="text-xs text-muted-foreground">
+              At least {MIN_PASSWORD_LENGTH} characters.
+            </p>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="confirm-new-password">Confirm new password</Label>
+            <Input
+              id="confirm-new-password"
+              type="password"
+              autoComplete="new-password"
+              value={confirmPassword}
+              onChange={edit(setConfirmPassword)}
+            />
+          </div>
+        </div>
+
+        {problem ? (
+          <div role="alert" className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+            {problem}
+          </div>
+        ) : null}
+        {changed ? (
+          <div role="status" className="rounded-md border border-border bg-muted/40 px-3 py-2 text-sm text-foreground">
+            Password changed. Other devices were signed out.
+          </div>
+        ) : null}
+
+        <div className="flex justify-end">
+          <Button type="submit" disabled={changePasswordMutation.isPending}>
+            {changePasswordMutation.isPending ? <LoaderCircle className="size-4 animate-spin" /> : <KeyRound className="size-4" />}
+            {changePasswordMutation.isPending ? "Changing password..." : "Change password"}
+          </Button>
+        </div>
+      </form>
+    </section>
+  );
+}
 
 function deriveInitials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -285,6 +431,8 @@ export function ProfileSettings() {
             </Button>
           </div>
         </form>
+
+        <ChangePasswordSection />
 
         <InboxAgentPolicyControl companyId={selectedCompanyId} />
       </section>
