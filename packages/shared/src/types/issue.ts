@@ -1264,6 +1264,8 @@ export interface IssueCommentMetadata {
   authorizationReason?: string | null;
   /** The comment that superseded this kept note (never deleted): history, not a current notice. */
   supersededBy?: string;
+  /** The card (issue thread interaction) that superseded this kept note: history, not a current notice. */
+  supersededByInteractionId?: string;
   /** Display snapshot only. Retry authority comes from the current recovery action. */
   recovery?: {
     kind: "disposition_repair_escalated";

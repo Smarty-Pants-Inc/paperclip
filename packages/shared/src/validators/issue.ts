@@ -1184,6 +1184,8 @@ export const issueCommentMetadataSchema = z
       .optional(),
     /** B' never-delete (org 09:18Z): the comment that superseded this kept note; it is history, not current. */
     supersededBy: z.string().guid().optional(),
+    /** The card (issue thread interaction) that superseded this kept note, e.g. on its accept; history, not current. */
+    supersededByInteractionId: z.string().guid().optional(),
     recovery: z.object({
       kind: z.literal("disposition_repair_escalated"),
       actionId: z.string().guid(),
