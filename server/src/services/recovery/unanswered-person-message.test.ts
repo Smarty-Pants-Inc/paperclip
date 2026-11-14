@@ -19,6 +19,8 @@ import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
 
@@ -105,6 +107,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const codeOf = (comment: { metadata: unknown }) => {
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
+  };
+  const heldReplyOf = (comment: { metadata: unknown }) => {
+    const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
+    const value = sections.flatMap(section => section.rows).find(row => row.label === "Held reply record")?.value;
+    return value ? JSON.parse(value) as Record<string, unknown> : null;
   };
 
   it("SMAA-143 msg 1: native_session_interrupted (backup_without_reusable_lease) with its retries exhausted -> exactly one notice, code in metadata only", async () => {
@@ -1091,4 +1098,114 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(notices).toHaveLength(1);
       expect(notices[0]!.body).toBe(NO_REPLY);
     });
+
+  const heldResult = {
+    nativeResult: { summary: "The answer to the person's request." },
+    presentationDecision: { chosenSource: "none", commentAction: "none", reasonCodes: ["yielded_control_plane_wait"], activityDisposition: "collapse" },
+    finalizationReasonCode: "board_response_wait_superseded",
+  };
+  const questionPayload = (prompt: string) => ({ version: 1, questions: [{ id: "format", prompt, selectionMode: "single",
+    options: [{ id: "a", label: "A" }, { id: "b", label: "B" }] }] });
+
+  it("D8 RED: task-mode held reply with an empty-title question uses the first question prompt, never the no-reply/safe text", async () => {
+    // Lab shape: a manual task, not Agent Chat (conversationAgentId is null), in review.
+    const f = await fixture({ status: "in_review", chat: false });
+    const message = await f.message("Please continue the earlier answer.");
+    const seed = await f.run({ status: "succeeded", wakeReason: "heartbeat_timer" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: seed, createdByAgentId: f.agentId, addresseeUserId: f.userId,
+      title: null, summary: null, payload: questionPayload("Bullets or a paragraph?") as never, createdAt: f.at() }).returning();
+    const held = await f.run({ commentId: message, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ resultJson: heldResult }).where(eq(heartbeatRuns.id, held));
+    await f.sweep();
+    const [note] = await f.visible();
+    expect(note).toBeDefined();
+    expect(note!.body).toContain(`card "Bullets or a paragraph?"`);
+    expect(note!.body).not.toMatch(/without a reply|wasn't answered|sending it again is safe/i);
+    expect(heldReplyOf(note!)).toMatchObject({ cardId: card!.id });
+  });
+
+  it("D8 RED: task-mode held reply with no active card gets a true generic held note, not no-reply/safe text", async () => {
+    const f = await fixture({ status: "in_review", chat: false });
+    const message = await f.message("Please continue the earlier answer.");
+    const held = await f.run({ commentId: message, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ resultJson: heldResult }).where(eq(heartbeatRuns.id, held));
+    await f.sweep();
+    const [note] = await f.visible();
+    expect(note).toBeDefined();
+    expect(note!.body).toMatch(/answered.*run's activity/i);
+    expect(note!.body).not.toMatch(/without a reply|wasn't answered|sending it again is safe/i);
+  });
+
+  it("D8 RED: real question-response-delivery context publishes a later reply and marks the one held note superseded, never deletes it", async () => {
+    const f = await fixture({ status: "in_review", chat: false });
+    const first = await f.message("Write me a summary.");
+    const seed = await f.run({ commentId: first, status: "succeeded" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: seed, createdByAgentId: f.agentId, addresseeUserId: f.userId,
+      payload: questionPayload("Bullets or a paragraph?") as never, createdAt: f.at() }).returning();
+    const message = await f.message("What was the word?");
+    const held = await f.run({ commentId: message, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ resultJson: heldResult }).where(eq(heartbeatRuns.id, held));
+    await f.sweep();
+    const [initialNote] = await f.visible();
+    expect(initialNote).toBeDefined();
+
+    await issueThreadInteractionService(db).answerQuestions(
+      { id: f.issueId, companyId: f.companyId, status: "in_review" }, card!.id,
+      { answers: [{ questionId: "format", optionIds: ["a"] }] }, { userId: f.userId });
+    let continuation: { runId: string; contextSnapshot: unknown } | null = null;
+    const delivery = questionResponseDeliveryService(db, { heartbeat: {
+      wakeup: async (agentId: string, options: { contextSnapshot?: Record<string, unknown> }) => {
+        const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId, status: "running",
+          runtimeMode: "native", nativeIssueId: f.issueId, contextSnapshot: options?.contextSnapshot, createdAt: f.at() }).returning();
+        continuation = { runId: run!.id, contextSnapshot: options?.contextSnapshot };
+        return { id: run!.id, driverKind: "native" } as never;
+      },
+      cancelRun: async () => null,
+    } as never });
+    await delivery.deliver(card!.id);
+    expect(continuation).not.toBeNull();
+    expect((continuation!.contextSnapshot as Record<string, unknown>).interactionId).toBe(card!.id);
+    expect((continuation!.contextSnapshot as Record<string, unknown>).wakeCommentId).toBe(first);
+    expect(continuation!.runId).not.toBe(held);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, continuation!.runId));
+    await f.reply(continuation!.runId);
+    await f.sweep();
+
+    const [note] = await db.select().from(issueComments).where(eq(issueComments.id, initialNote!.id));
+    expect(note).toBeDefined();
+    expect(note!.deletedAt).toBeNull();
+    expect(heldReplyOf(note!)).toMatchObject({ superseded: true, cardId: card!.id });
+    expect(await f.visible()).toHaveLength(1);
+  });
+
+  it("D8: a card answered before the continuation fails leaves one updated true note with no standing continuation promise", async () => {
+    const f = await fixture({ status: "in_review", chat: false });
+    const first = await f.message("Write me a summary.");
+    const seed = await f.run({ commentId: first, status: "succeeded" });
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "pending", sourceRunId: seed, createdByAgentId: f.agentId, addresseeUserId: f.userId,
+      payload: questionPayload("Bullets or a paragraph?") as never, createdAt: f.at() }).returning();
+    const message = await f.message("What was the word?");
+    const held = await f.run({ commentId: message, status: "succeeded" });
+    await db.update(heartbeatRuns).set({ resultJson: heldResult }).where(eq(heartbeatRuns.id, held));
+    await f.sweep();
+    const [initialNote] = await f.visible();
+    await issueThreadInteractionService(db).answerQuestions(
+      { id: f.issueId, companyId: f.companyId, status: "in_review" }, card!.id,
+      { answers: [{ questionId: "format", optionIds: ["a"] }] }, { userId: f.userId });
+    const [failedContinuation] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId,
+      status: "failed", errorCode: "adapter_failed", error: "provider_process_exited: boom", runtimeMode: "native", nativeIssueId: f.issueId,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, interactionId: card!.id, interactionKind: "ask_user_questions",
+        interactionStatus: "answered", mutation: "interaction", sourceCommentId: first, wakeCommentId: first, wakeCommentIds: [first],
+        wakeReason: "issue_commented", source: "issue.interaction.respond" }, createdAt: f.at(), finishedAt: f.at() }).returning();
+    await f.sweep();
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.id).toBe(initialNote!.id);
+    expect(notes[0]!.body).toMatch(/card has been answered/i);
+    expect(notes[0]!.body).not.toMatch(/will continue from there|answer the card/i);
+    expect(failedContinuation).toBeDefined();
+  });
 });
