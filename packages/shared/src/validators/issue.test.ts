@@ -63,6 +63,20 @@ describe("issue validators", () => {
     expect(issueCommentMetadataSchema.safeParse({ ...metadata, attachmentPreparation: { attachmentId: "bad-id" } }).success).toBe(false);
   });
 
+  // B' never-delete (org 09:18Z; RFL supnotice F1 11:20Z, 11:43Z): a kept note's supersession marker survives the
+  // comments read projection (issues.ts parses metadata with .nullable().catch(null)): by a comment or by a card.
+  it.each(["supersededBy", "supersededByInteractionId"])("keeps the optional %s marker through the read projection and rejects malformed markers", key => {
+    const metadata = { version: 1, sections: [{ rows: [{ type: "text", text: "Details" }] }] };
+    const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
+    const read = (value: unknown) => issueCommentMetadataSchema.nullable().catch(null).parse(value) as Record<string, unknown> | null;
+    expect(read({ ...metadata, [key]: id }), "a marked note keeps its metadata").toEqual({ ...metadata, [key]: id });
+    expect(read({ ...metadata, supersededBy: id, supersededByInteractionId: id })?.[key]).toBe(id);
+    expect(read(metadata)?.[key]).toBeUndefined();
+    for (const bad of ["", "not-an-id", 42, null]) {
+      expect(issueCommentMetadataSchema.safeParse({ ...metadata, [key]: bad }).success, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
   it("uses the same bounded unique upload ID contract for comment and update requests", () => {
     const id = "9af8228f-0be7-45ae-a104-6fbe0af6f1d3";
     expect(
