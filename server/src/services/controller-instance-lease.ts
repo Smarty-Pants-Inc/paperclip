@@ -252,7 +252,7 @@ export async function stopControllerInstanceLease(db: Db | null = registeredDb):
  * epoch) and its records are gone. A boot that held work exits before this point.
  */
 export async function proveControllerInstance(db: Db, bootId: string, touchedAt: Date | null,
-  options: { readOnly?: boolean; /** Optional caller-owned recheck in the fence UPDATE's snapshot. */
+  options: { readOnly?: boolean; /** Rechecked after UPDATE under its row lock; a failed check rolls the fence back. */
     ownedRecordRecheck?: SQL } = {}): Promise<ControllerInstanceState | null> {
   const [row] = await db.select({
     fenced: sql<boolean>`${controllerInstances.fencedAt} is not null`,
@@ -273,13 +273,30 @@ export async function proveControllerInstance(db: Db, bootId: string, touchedAt:
   // Only a boot that holds a lease row of its own may fence, and only an older epoch.
   const epoch = await ownEpoch();
   if (epoch === null) return "expired";
-  const [fenced] = await db.update(controllerInstances).set({ fencedAt: sql`now()`, fencedByEpoch: epoch })
+  const ownedRecordRecheck = options.ownedRecordRecheck;
+  const fence = (writer: Pick<Db, "update">) => writer.update(controllerInstances).set({ fencedAt: sql`now()`, fencedByEpoch: epoch })
     .where(and(eq(controllerInstances.bootId, bootId), isNull(controllerInstances.fencedAt), isNull(controllerInstances.stoppedAt),
       sql`greatest(${controllerInstances.leaseExpiresAt}, ${touchedAt.toISOString()}::timestamptz
         + ${`${CONTROLLER_LEASE_TTL_MS} milliseconds`}::interval)
         < now() - ${`${CONTROLLER_LEASE_FENCE_GRACE_MS} milliseconds`}::interval`,
-      sql`${controllerInstances.epoch} < ${epoch}`, options.ownedRecordRecheck))
+      sql`${controllerInstances.epoch} < ${epoch}`, ownedRecordRecheck))
     .returning({ bootId: controllerInstances.bootId, epoch: controllerInstances.epoch, lastRenewedAt: controllerInstances.renewedAt });
+  const recheckFailed = new Error("controller_instance_owned_record_recheck_failed");
+  let rows: Awaited<ReturnType<typeof fence>>;
+  try {
+    rows = ownedRecordRecheck ? await db.transaction(async tx => {
+      const updated = await fence(tx);
+      if (updated.length) {
+        const [rechecked] = await tx.execute(sql`select ${ownedRecordRecheck} as ownerless`);
+        if (rechecked?.ownerless !== true) throw recheckFailed;
+      }
+      return updated;
+    }) : await fence(db);
+  } catch (error) {
+    if (error === recheckFailed) return "expired";
+    throw error;
+  }
+  const [fenced] = rows;
   if (fenced) {
     logger.info({ ...fenced, fencingEpoch: epoch }, "controller instance fenced");
     return "fenced";

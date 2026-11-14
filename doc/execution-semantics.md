@@ -2516,6 +2516,8 @@ owner or fence naming that boot refuses
 the fallback, even when its record is old: use the documented owned-record path and
 its actual last-write timestamp instead. An incomplete inventory also refuses.
 
+Before inventory or controller mutation, the preflight takes `FOR SHARE` on the
+source and current coordinator rows, ordered by run id, as settlement does.
 The inventory takes no table-level locks. After the inventory proves ownerlessness,
 B1 supplies `noControllerOwnedRecordsSql(bootId)` as the existing
 `proveControllerInstance` primitive's optional `ownedRecordRecheck` predicate.
@@ -2527,12 +2529,20 @@ the registry's in-progress filters and process/token classification, including
 accepted-result remote ownership and resolved coordinator fence holders. Maintain
 this SQL counterpart beside the registry when a boot-owning kind changes.
 
-At READ COMMITTED, an ownership INSERT or UPDATE committed after inventory but
-before the fence UPDATE's statement snapshot prevents the fence. The fallback
-does not block unrelated writers, and does not claim to serialize ownership writes
-committed after that snapshot. `SET LOCAL lock_timeout = '1s'` bounds the remaining
-controller-row UPDATE wait; a timeout refuses. The optional recheck changes no
-other prover caller's default behavior.
+At READ COMMITTED, the UPDATE's ownership subquery keeps its original statement
+snapshot even if the UPDATE waits for a controller-row lock. PostgreSQL's target
+row recheck does not refresh that subquery. The optional recheck therefore runs
+the UPDATE in a transaction (a savepoint inside B1's preflight), then repeats the
+same ownership predicate in a new statement while holding the controller-row
+lock. If ownership committed during the wait, the fresh statement sees it and
+rolls back the fence before returning `expired`; no successful fence is logged.
+The caller refuses settlement, leaving the owned-record path and its actual
+last-write grace intact. Errors also roll back and propagate.
+
+The fallback does not block unrelated source writers and does not claim a global
+predicate lock over future ownership writes. `SET LOCAL lock_timeout = '1s'`
+bounds coordinator and controller-row waits; a timeout refuses. Callers without
+`ownedRecordRecheck` retain their existing record-driven UPDATE behavior.
 
 Only after proving ownerlessness does it call the documented primitive. The
 timestamp is the row's persisted `renewed_at` (`renewedAt` in the schema), its

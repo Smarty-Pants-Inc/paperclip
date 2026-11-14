@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, ne, sql } from "drizzle-orm";
 import { controllerInstances, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { abandonNativeRunnerCheckpointCommands, loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
@@ -20,14 +20,17 @@ type Input = { db: Db; root: string; bytes: string; identity: Record<string, str
   companyId: string; agentId: string; issueId: string; currentRunId: string };
 
 /** B1's fallback is ONLY for boots the record-driven reconciler cannot reach.
- * Inventory first, then repeat the process/fence-owner check in the fence UPDATE
- * itself. At READ COMMITTED this sees ownership committed after inventory but
- * before that statement's snapshot, without blocking unrelated source writers. */
-async function proveOwnerlessController(db: Db, bootId: string, renewedAt: Date) {
+ * The prover repeats the inventory predicate after UPDATE under its controller
+ * row lock, rolling back if a concurrent owner committed during the row wait. */
+async function proveOwnerlessController(db: Db, bootId: string, renewedAt: Date,
+  source: { companyId: string; runIds: readonly string[] }) {
   try {
     return await db.transaction(async transaction => {
       const tx = transaction as unknown as Db;
       await tx.execute(sql`set local lock_timeout = '1s'`);
+      await transaction.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, source.companyId), inArray(nativeRunFinalizations.runId, [...new Set(source.runIds)]),
+      )).orderBy(asc(nativeRunFinalizations.runId)).for("share");
       for (const kind of OWNABLE_KINDS) {
         if (!kind.listInProgress) continue;
         for (let offset = 0; ; offset += 200) {
@@ -120,7 +123,8 @@ export async function planNativeLifecycleSettlement(input: Input): Promise<{
         // transaction recheck refuses a newly arrived unclosed boot instead of
         // upgrading row locks in two competing settlements.
         if (!fenceOwnerless || row.epoch >= boot.epoch) { allGone = false; continue; }
-        const proof = await proveOwnerlessController(db as Db, row.bootId, row.renewedAt);
+        const proof = await proveOwnerlessController(db as Db, row.bootId, row.renewedAt,
+          { companyId: binding.companyId, runIds: [binding.runId, input.currentRunId] });
         if (proof !== "stopped" && proof !== "fenced") allGone = false;
       }
       if (!allGone) return false;
