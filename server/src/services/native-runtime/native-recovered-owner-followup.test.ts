@@ -8,9 +8,10 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations,
+  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations, issueThreadInteractions, issueQuestionResponseDeliveries, issueComments,
 } from "@paperclipai/db";
-import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, type NativeSession, type NativeSessionBackend, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { materializeNativeInteractionResponses } from "./native-interaction-bridge.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -20,6 +21,8 @@ import { createNativeControllerRecovery, resolveNativeControllerRecovery } from 
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { readProcessStartedAt } from "../hot-restart.js";
+import { issueThreadInteractionService } from "../issue-thread-interactions.js";
+import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -42,7 +45,7 @@ vi.mock("./current-wake-comments.js", async importOriginal => ({
   resolveCurrentWakeCommentsBinding: async () => null,
   assertCurrentWakeCommentsRead: async () => undefined,
 }));
-import { buildNativeHarnessBackupManifest, createRunnerdBackend, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
+import { buildNativeHarnessBackupManifest, createRunnerdBackend, executePaperclipNativeSession, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
   scopedRunnerdStateRoot } from "./native-session-executor.js";
 
 // Durable-root admission is the boundary under test. Reaching the run's tool
@@ -100,12 +103,12 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     | "failed-turn-start" | "rejected-turn-start" | "indeterminate-turn-start" | "unknown-outcome-turn-start"
     | "unsuperseded-unknown-outcome-turn-start" | "failed-suspend" | "pending-attach" | "pending-tool-result" = "settled",
     options: { controller?: { bootId: string; pid: number; processStartedAt: Date }; provider?: "codex" | "acpx" | "opencode" | "pi_rpc";
-      lifecycle?: "warm"; governedWait?: boolean; interruptedLifecycle?: boolean; activeAfterTerminal?: boolean;
+      lifecycle?: "warm"; governedWait?: boolean; connectionWait?: boolean; interruptedLifecycle?: boolean; activeAfterTerminal?: boolean;
       lifecycleIssuedAt?: string; stamped?: boolean; deliveryCount?: number } = {}) {
     const issueId = randomUUID(), workspaceId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Continue after recovery", assigneeAgentId: agentId, status: "in_progress" });
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
-      nativeIssueId: issueId, contextSnapshot: { issueId } }).returning();
+      nativeIssueId: issueId, contextSnapshot: { issueId }, ...(options.connectionWait ? { responsibleUserId: "board-person" } : {}) }).returning();
     const native = await prepareNativeHeartbeatRun({ db, run: row, issue: issueFields(issueId), environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
     const executionFor = (currentRunId: string) => buildNativeExecutionInput({
@@ -137,6 +140,16 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       controllerBootId: owner.bootId, controllerGeneration: 1, controllerPid: priorController.pid,
       controllerProcessStartedAt: priorController.processStartedAt, leaseOwner: owner.leaseOwner,
       leaseExpiresAt: new Date(Date.now() + 60_000) });
+    const questionKey = options.connectionWait ? `connection-intent:${runId}:board-person:github` : `parked-question:${runId}`;
+    const governedInteraction = options.connectionWait ? await issueThreadInteractionService(db).createConnectionIntent({ id: issueId, companyId }, {
+      sourceRunId: runId, addresseeUserId: "board-person", idempotencyKey: questionKey,
+      payload: { version: 1, serviceSlug: "github", serviceName: "GitHub", requestingAgentId: agentId,
+        requestingAgentName: "Recovery agent", phase: "requested" },
+    }) : options.governedWait ? await issueThreadInteractionService(db).create({ id: issueId, companyId }, {
+      kind: "ask_user_questions", idempotencyKey: questionKey, sourceRunId: runId, continuationPolicy: "wake_assignee",
+      payload: { version: 1, title: "Choose a color", questions: [{ id: "color", prompt: "Which color?", selectionMode: "single",
+        required: true, options: [{ id: "green", label: "Green" }] }] },
+    }, { agentId, runId }) : null;
     const scratch = await mkdtemp(join(tmpdir(), "native-recovered-owner-controller-"));
     const controller = new DurablePrpControlPlane({ stateDirectory: scratch, identity,
       expectedRunnerVersion: "recovered-owner-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
@@ -179,7 +192,10 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       const toolInput = control === "unanswered-tool" || control === "pending-tool-result";
       if (control === "pending-tool-result") controller.queueCommand("semantic_tool.result", { sourceEventId: "unanswered-tool-input" });
       const event = (sourceSeq: number, sourceEventId: string, eventType: string) => ({ sourceSeq, sourceEventId, eventType,
-        priority: 0 as const, envelope: { ...identity }, deliveryCount: 1, logicalEffectCount: 1 });
+        priority: 0 as const, envelope: { ...identity, payload: { ...identity, payload: { semantic_tool: {
+          schema: "paperclip.prp.semantic_tool.v1", operationId: options.connectionWait ? "connections_request" : options.governedWait ? "request_human_input" : "non_parked_tool",
+          callId: sourceEventId, input: options.connectionWait ? { service: "github" } : { interactionKind: "questions", idempotencyKey: questionKey },
+        } } } }, deliveryCount: 1, logicalEffectCount: 1 });
       controller.store.state.committedEvents.push(
         ...(toolInput ? [event(1, "unanswered-tool-input", "semantic_tool.input")] : []),
         ...(options.interruptedLifecycle ? [event(1, "interrupted-turn", "turn.interrupted")] : []),
@@ -200,8 +216,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId,
       completionContractId: prepared.completionContractId!, serverFingerprint: "fixture", schemaStatus: "accepted",
       // A turn parked on a request_human_input question commits this governed-wait result.
-      resultJson: options.governedWait ? { continuation: { kind: "response_wake", idempotencyKey: "interaction-response:question" },
-        artifacts: [{ kind: "issue_thread_interaction", ref: `interaction:${randomUUID()}` }] } : {},
+      resultJson: governedInteraction ? { result: { continuation: { kind: "response_wake", idempotencyKey: `interaction-response:${governedInteraction.id}` },
+        artifacts: [{ kind: "issue_thread_interaction", ref: `interaction:${governedInteraction.id}` }] } } : {},
       canonicalSha256: "fixture" }).returning();
     await db.update(nativeRunFinalizations).set({ phase: "committed", resultId: result.id, leaseOwner: null, leaseExpiresAt: null })
       .where(eq(nativeRunFinalizations.runId, runId));
@@ -212,7 +228,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         { configDigest: `sha256:${"b".repeat(64)}`, processConfigDigest: null },
         { runId, runnerInstanceId: native.runnerInstanceId, normalizedSessionId: native.normalizedSessionId }),
     } }).where(eq(heartbeatRuns.id, runId));
-    return { issueId, runId, native, identity, executionFor, priorController };
+    return { issueId, runId, native, identity, executionFor, priorController, governedInteraction };
   }
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
@@ -1179,6 +1195,14 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("native_legacy_lifecycle_abandoned");
   }, 60_000);
 
+  it("SMA-122 stamped negative: stopped is not fenced and must never fall back to the legacy predicate", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true, stamped: true });
+    await db.update(controllerInstances).set({ fencedAt: null, stoppedAt: new Date() })
+      .where(eq(controllerInstances.bootId, prior.priorController.bootId));
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)"));
+  }, 60_000);
+
   it("SMA-122 B1 negative: a second unfenced controller keeps legacy lifecycle pending", async () => {
     const other = randomUUID();
     await db.insert(controllerInstances).values({ bootId: other, processSpace: "other-live-controller", pid: process.pid,
@@ -1214,6 +1238,19 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(proof).toMatchObject({ finished: false, refused: "journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)" });
       expect(await followUp.start()).toBe("native_controller_recovery_missing_evidence:newer_progress_barrier");
     } finally { await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, active!.id)); }
+  }, 60_000);
+
+  it("SMA-122 B3 negative: the current startup reservation cannot hide already-dispatched provider work", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "opencode", lifecycle: "warm", interruptedLifecycle: true });
+    const followUp = await admitFollowUp(prior);
+    const root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+    await restoreNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }, root);
+    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: followUp.runId, seq: 100,
+      eventType: "turn.started", stream: "system", level: "info", message: "current turn already dispatched", payload: {} });
+    expect(await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+        sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never,
+    })).toMatchObject({ finished: false, refused: "journal_commands_unsettled(runner.drain.pending,runner.suspend.pending)" });
   }, 60_000);
 
   it("SMA-122 B4 negative: never abandons a stale drain already released to runnerd", async () => {
@@ -1318,6 +1355,163 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         status, releasedAt: status === "retained" ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
     }
     expect(await followUp.start()).toBe(outcome);
+  }, 60_000);
+
+  it("retires the exact parked question after the standing same-box exit-45 generation-loss proof", async () => {
+    const prior = await seedRecoveredPriorRun("unanswered-tool", { provider: "opencode", lifecycle: "warm", governedWait: true });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp);
+    expect(await followUp.start("resumed")).toBe(ADMITTED);
+    const [card] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, prior.governedInteraction!.id));
+    expect(card.status).toBe("pending");
+    expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
+  }, 60_000);
+
+  it.each(["live", "timeout", "throws"] as const)("a parked question never treats a %s generation probe as gone", async mode => {
+    const prior = await seedRecoveredPriorRun("unanswered-tool", { provider: "opencode", lifecycle: "warm", governedWait: true });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp, "live");
+    const execute = followUp.remoteExecute.getMockImplementation()!;
+    followUp.remoteExecute.mockImplementation(async request => {
+      if (JSON.stringify(request).includes("paperclip-runner-generation-check")) {
+        if (mode === "throws") throw new Error("no answer from box");
+        return { exitCode: mode === "timeout" ? 45 : 0, timedOut: mode === "timeout", stdout: "", stderr: "" };
+      }
+      return execute(request);
+    });
+    const root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+    await restoreNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }, root);
+    expect(await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: followUp.providerLeaseId } } as never,
+    })).toMatchObject({ finished: false, generationLost: false, refused: "restarted_sandbox_runner_generation_not_lost" });
+  }, 60_000);
+
+  it.each(["pending-tool-result", "pending-attach"] as const)("a parked input never settles a %s on the same box", async control => {
+    const prior = await seedRecoveredPriorRun(control, { provider: "opencode", lifecycle: "warm", governedWait: true });
+    const followUp = await admitFollowUp(prior);
+    await recordPriorLeaseOnSameSandbox(prior, followUp);
+    const root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+    await restoreNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }, root);
+    expect(await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+        sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: followUp.providerLeaseId } } as never,
+    })).toMatchObject({ finished: false, generationLost: true,
+      refused: `journal_commands_unsettled(${control === "pending-tool-result" ? "semantic_tool.result" : "run.attach"}.pending)` });
+  }, 60_000);
+
+  it.each([
+    { restarted: true, inputKind: "card" }, { restarted: false, inputKind: "card" },
+    { restarted: true, inputKind: "message" }, { restarted: false, inputKind: "message" },
+    { restarted: false, inputKind: "plain-control" },
+    { restarted: true, inputKind: "connection-message" },
+  ] as const)("the person's $inputKind survives and the controlled next-generation agent acts (restart=$restarted)", async ({ restarted, inputKind }) => {
+    const prior = await seedRecoveredPriorRun(inputKind === "plain-control" ? "settled" : "unanswered-tool",
+      { provider: "opencode", lifecycle: "warm", governedWait: inputKind !== "plain-control", connectionWait: inputKind === "connection-message" });
+    const followUp = await admitFollowUp(prior);
+    if (restarted) {
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      expect(await followUp.start("resumed")).toBe(ADMITTED);
+    }
+    const card = prior.governedInteraction;
+    const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    if (inputKind === "card") {
+      await issueThreadInteractionService(db).answerQuestions({ id: prior.issueId, companyId, status: "in_progress" }, card!.id,
+        { answers: [{ questionId: "color", optionIds: ["green"] }] }, { userId: "board-person" });
+      const wakeup = vi.fn(async (_agentId: string, _options: unknown) => currentRun);
+      await questionResponseDeliveryService(db, { heartbeat: { wakeup, cancelRun: async () => null } as never }).deliver(card!.id);
+      expect(wakeup).toHaveBeenCalledOnce();
+      expect(wakeup.mock.calls[0]![1]).toMatchObject({ payload: { interactionId: card!.id, interactionStatus: "answered" } });
+    } else {
+      await db.insert(issueComments).values({ companyId, issueId: prior.issueId, authorUserId: "board-person", body: "Please paint blue." });
+    }
+    const responses = await materializeNativeInteractionResponses({ db, companyId, agentId, issueId: prior.issueId,
+      runId: followUp.runId, interactionIds: inputKind === "card" ? [card!.id] : [] });
+    expect(responses).toHaveLength(inputKind === "card" ? 1 : 0);
+    const execution = { ...prior.executionFor(followUp.runId), interactionResponses: responses };
+    execution.session.lifecyclePolicy = { mode: "per_turn", idleTimeoutMs: null };
+    // Real production delivery/materialization/runtime; only the provider is a
+    // controlled test agent. The action artifact must be derived from the
+    // submitted answer, not from a mocked admission or an expected call count.
+    const action = join(stateDirectory, `agent-action-${restarted}-${inputKind}.txt`);
+    const color = inputKind === "card" ? "green" : "blue";
+    let began!: () => void;
+    const started = new Promise<void>(resolve => { began = resolve; });
+    const identity = { companyId, agentId, issueId: prior.issueId, runId: followUp.runId, sessionId: prior.native.normalizedSessionId };
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const result = { schema: "paperclip.run_result.v1" as const, reportedWorkDisposition: "done" as const,
+      summary: `Painted ${color} from the person's ${inputKind}.`, completionClaim: {
+        contractRevision: execution.completionContract.contract.revision, objectiveSatisfied: true,
+        criteria: execution.completionContract.contract.criteria.map(criterion => ({ criterionId: criterion.id, status: "satisfied" as const, evidenceRefs: [action] })), remainingWork: [] },
+      evidence: [{ ref: action }], verification: [], attentionRequests: [], artifacts: [] };
+    const terminal = { schema: "paperclip.prp.terminal.v1" as const, turnTerminalState: "completed" as const,
+      runTerminalState: "succeeded" as const, reportedWorkDisposition: "done" as const };
+    const session: NativeSession = { identity: () => identity, capabilities: async () => capabilities,
+      startTurn: async request => {
+        const submitted = JSON.parse(request.message.text);
+        if (inputKind === "card") {
+          const response = submitted.interactionResponses?.find((value: { interactionId: string }) => value.interactionId === card!.id);
+          expect(JSON.stringify(response)).toContain("green");
+          await writeFile(action, `paint:${response.response.result.answers[0].optionIds[0]}`);
+        } else {
+          const { PaperclipRunnerToolAuthority: RealToolAuthority } = await vi.importActual<typeof import("./paperclip-runner-tool-authority.js")>("./paperclip-runner-tool-authority.js");
+          const authority = new RealToolAuthority(db, { ...identity, normalizedSessionId: identity.sessionId });
+          try {
+            const history = await authority.execute({ tool: "get_task_history", callId: "read-person-message", arguments: { limit: 10 } }) as { comments: { body: string }[] };
+            const message = history.comments.at(-1)!.body;
+            expect(message).toBe("Please paint blue.");
+            await writeFile(action, `paint:${/paint (\w+)/.exec(message)![1]}`);
+          } finally { authority.close(); }
+        }
+        began(); return { turnId: "answered-turn" };
+      },
+      async *events() { await started; yield { schema: "paperclip.prp.event.v1", sourceInstanceId: followUp.native.runnerInstanceId,
+        sourceEventId: "answer-agent:1", sourceSeq: 1, sourceKind: "runner", runId: followUp.runId,
+        normalizedSessionId: prior.native.normalizedSessionId, turnId: "answered-turn", eventType: "turn.completed",
+        schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: { status: "completed" } }; },
+      result: async () => ({ result, terminal, turnId: "answered-turn" }),
+      snapshot: async () => ({ backendKind: "mock", sessionId: identity.sessionId, identity, activeTurnId: null,
+        pendingRuntimeRequests: [], cursor: "1", semanticResult: result }), close: async () => {},
+    };
+    const backend: NativeSessionBackend = { descriptor: async () => ({ kind: "mock", name: "card-answer-agent", version: "1", capabilities,
+      runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }), openSession: async () => session };
+    toolDefinitions.mockResolvedValue([]);
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...currentRun.runnerProfileJson, sessionCheckpoint: null, nativeExecutionInput: execution } })
+      .where(eq(heartbeatRuns.id, followUp.runId));
+    await executePaperclipNativeSession({ db, execution, backend, runnerInstanceId: followUp.native.runnerInstanceId });
+    expect(await readFile(action, "utf8")).toBe(`paint:${color}`);
+    if (card) {
+      const [saved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id));
+      expect(saved.status).toBe(inputKind === "card" ? "answered" : "pending");
+      const deliveries = await db.select().from(issueQuestionResponseDeliveries).where(eq(issueQuestionResponseDeliveries.interactionId, card.id));
+      if (inputKind === "card") expect(deliveries[0]!.status).toBe("fallback_queued");
+      else expect(deliveries).toHaveLength(0);
+    }
+    const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, followUp.runId));
+    expect((accepted.resultJson.result as { summary: string }).summary).toContain(`Painted ${color}`);
+  }, 60_000);
+
+  it.each(["duplicate", "unrelated"] as const)("does not exempt a %s unanswered input just because one question is parked", async kind => {
+    const prior = await seedRecoveredPriorRun("unanswered-tool", { provider: "opencode", governedWait: true });
+    const followUp = await admitFollowUp(prior);
+    const root = scopedRunnerdStateRoot(prior.executionFor(followUp.runId));
+    await restoreNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }, root);
+    const path = join(root, "control-plane", "control-plane-state.json");
+    const state = JSON.parse(await readFile(path, "utf8"));
+    state.committedEvents.at(-1).sourceSeq = 3;
+    const extra = structuredClone(state.committedEvents[0]);
+    extra.sourceEventId = "another-unanswered-input"; extra.sourceSeq = 2;
+    if (kind === "unrelated") extra.envelope.payload.payload.semantic_tool.operationId = "non_parked_tool";
+    state.committedEvents.splice(1, 0, extra);
+    state.ackedSourceSeq = 3;
+    await writeFile(path, JSON.stringify(state));
+    await db.insert(environments).values({ id: followUp.environmentId, name: `parked-${followUp.environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: `old-${prior.runId}`, status: "expired", releasedAt: new Date() });
+    expect(await inspectFinishedPerTurnRunnerdOwner({ db, root, identity: prior.identity, execution: prior.executionFor(followUp.runId),
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
+        sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never,
+    })).toMatchObject({ finished: false, refused: "journal_tool_input_unanswered" });
   }, 60_000);
 
   // Staging PAP-4196 (run.attach) and PAP-3443 (semantic_tool.result): the
