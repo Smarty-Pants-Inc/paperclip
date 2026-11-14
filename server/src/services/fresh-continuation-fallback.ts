@@ -26,6 +26,7 @@ import { notifyRoutineExecutionStatus } from "./routine-execution-status-notific
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -47,15 +48,17 @@ import { readSystemRecovery } from "./system-recovery-state.js";
  *   side effect.
  *
  * Eligibility is by classification, not by an allowlist: every failure is
- * eligible except the causes a person must resolve (`PERSON_OWNED_FAILURE_CODES`
- * and the task-level waits in `personOwnedTaskWait`). A failure code added
- * later falls back without a change here.
+ * eligible except a permanent conversation refusal or a cause a person must
+ * resolve (`PERSON_OWNED_FAILURE_CODES` and `personOwnedTaskWait`). A failure
+ * code added later falls back without a change here.
  *
  * Idempotent per source run: the task row lock serializes callers on every
  * server, and the recorded `freshContinuation.sourceRunId` (or any newer run of
  * the task) makes later calls a no-op. Bounded per task, not per failure: at
  * most `FRESH_CONTINUATIONS_PER_HOUR` continuations in a rolling hour, then it
  * backs off and is checked again; it never charges the task's failure budget.
+ * Independently, each source-run chain gets at most two fresh continuations,
+ * counted from durable recovery records without a time window.
  */
 
 export const FRESH_CONTINUATION_SCHEMA = "paperclip.fresh-continuation.v1" as const;
@@ -68,6 +71,7 @@ export const FRESH_CONTINUATION_CHECK_KEY = "freshContinuationCheck" as const;
 // Literal values (an import would be undefined under the heartbeat module's
 // import cycle); a test pins them to SERVER_RESTART_RETRY_MAX_ATTEMPTS/_WINDOW_MS.
 export const FRESH_CONTINUATIONS_PER_HOUR = 6;
+export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;
 /** Consecutive pending checks (about 12 minutes) before the fallback stops waiting. */
@@ -160,6 +164,38 @@ const object = (value: unknown): Record<string, unknown> =>
 function holdRunId(evidence: Record<string, unknown>): string | null {
   const value = evidence.runId ?? evidence.sourceRunId;
   return typeof value === "string" ? value : null;
+}
+
+/**
+ * Count the existing durable records, not a rolling window or a process-local
+ * counter. Following run lineage also counts records written before chain
+ * markers existed. UNION deduplicates even cyclic legacy lineage; every hop
+ * and every action is scoped to this company and task.
+ */
+export async function freshContinuationChain(db: Db, input: { companyId: string; issueId: string; runId: string }) {
+  const uuid = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+  const [chain] = await db.execute<{ rootRunId: string; attempts: number }>(sql`
+    with recursive source_chain as (
+      select id, coalesce(retry_of_run_id::text, nullif(context_snapshot->>'previousRunId', ''),
+        nullif(context_snapshot->>'retryOfRunId', '')) as parent_id
+      from heartbeat_runs where company_id = ${input.companyId} and id = ${input.runId}
+        and (issue_id = ${input.issueId} or native_issue_id = ${input.issueId} or context_snapshot->>'issueId' = ${input.issueId})
+      union
+      select parent.id, coalesce(parent.retry_of_run_id::text, nullif(parent.context_snapshot->>'previousRunId', ''),
+        nullif(parent.context_snapshot->>'retryOfRunId', ''))
+      from heartbeat_runs parent join source_chain child
+        on parent.id = case when child.parent_id ~ ${uuid} then child.parent_id::uuid end
+      where parent.company_id = ${input.companyId}
+        and (parent.issue_id = ${input.issueId} or parent.native_issue_id = ${input.issueId}
+          or parent.context_snapshot->>'issueId' = ${input.issueId})
+    )
+    select coalesce((select id::text from source_chain ancestor
+      order by (parent_id is null or not exists (select 1 from source_chain parent where parent.id::text = ancestor.parent_id)) desc,
+        id limit 1), ${input.runId}) as "rootRunId",
+      (select count(*)::int from issue_recovery_actions action
+        where action.company_id = ${input.companyId} and action.source_issue_id = ${input.issueId}
+          and action.evidence#>>'{freshContinuation,sourceRunId}' in (select id::text from source_chain)) as attempts`);
+  return chain!;
 }
 
 /** Task-level waits that belong to a person. Read under the task lock. */
@@ -436,6 +472,13 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
+  // A refusal cannot be made continuable by repeatedly creating new run IDs.
+  // Use the same classification as the execution blocker and projection.
+  if (isNativeContinuationRefusal(run)) return { kind: "not_applicable", reason: "native_continuation_refused" };
+  const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
+  if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
+    return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
+
   // The holds this decision owns: reconciliation holds that still block the
   // task. Workspace restore/repair holds stay with workspace recovery, and
   // resolved history is never rewritten.
@@ -634,6 +677,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
         ? `The previous writer of run ${run.id} is not proven stopped, so the continuation starts in a new isolated workspace; no unverified files are applied.`
         : `The continuation of run ${run.id} starts from the task's last saved workspace; no unverified files are applied.` };
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
+    chainRootRunId: chain.rootRunId, chainAttempt: chain.attempts + 1,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };

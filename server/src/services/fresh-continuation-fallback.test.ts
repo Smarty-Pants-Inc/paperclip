@@ -29,6 +29,7 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { createSystemRecovery } from "./system-recovery-state.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
+import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -217,6 +218,133 @@ suite("fresh-continuation fallback", () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_new_failure_added_next_week" });
     await settleUnrecoverableExecutions(db);
     await expectOneFreshSuccessor(f);
+  }, 60_000);
+
+  /** Reproduce a delivered fallback failing at preparation, without starting a provider. */
+  async function refuseContinuation(run: typeof heartbeatRuns.$inferSelect, error: string) {
+    const finishedAt = new Date();
+    const [task] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null,
+      blockedTransitionAt: finishedAt }).where(eq(issues.id, run.issueId!)).returning();
+    await db.update(heartbeatRuns).set({ status: "failed", runtimeMode: "native", nativeIssueId: task!.id, nativePhase: "terminal_failure",
+      errorCode: "native_continuation_requires_reconciliation", error, finishedAt }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(nativeRunFinalizations).values({ runId: run.id, companyId, issueId: task!.id,
+      phase: "terminal_failure", recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" });
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: task!.id, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation",
+      fingerprint: `native-continuation:${run.id}`, nextAction: "The previous conversation cannot continue.",
+      evidence: { runId: run.id, nativeFailureBlock: { runId: run.id, statusVersion: Number(task!.statusVersion) } } });
+  }
+
+  it.each([
+    "native_controller_recovery_unsupported:metadata_format",
+    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled",
+  ])("never re-fires the real fallback after a terminal continuation refusal: %s", async error => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    const next = await expectOneFreshSuccessor(f);
+    await refuseContinuation(next, error);
+    await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+      body: NATIVE_CONTINUATION_REFUSED_ACTION });
+    const before = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    // Exercise the actual sweep and delivery, repeatedly, not a classifier mock.
+    for (let pass = 0; pass < 3; pass++) {
+      await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver();
+    }
+    expect(await successors(next.id)).toHaveLength(0);
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(before.length);
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).map(note => note.body))
+      .toEqual([NATIVE_CONTINUATION_REFUSED_ACTION]);
+  }, 60_000);
+
+  it("durably stops a transient fallback chain at two attempts, including legacy records outside the hourly window", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    const first = await expectOneFreshSuccessor(f);
+    // Existing production records predate the chain markers. Neither an upgrade
+    // nor waiting out the hourly budget may reset their attempts.
+    await db.execute(sql`update issue_recovery_actions set evidence = jsonb_set(evidence,
+      '{freshContinuation}', ((evidence->'freshContinuation') - 'chainRootRunId' - 'chainAttempt')
+      || jsonb_build_object('recordedAt', (now() - interval '2 hours')::text))
+      where source_issue_id = ${f.issueId} and evidence ? 'freshContinuation'`);
+    await refuseContinuation(first, "temporary_runner_transport_unavailable");
+    // The durable context is also lineage when an older release omitted the FK.
+    await db.update(heartbeatRuns).set({ retryOfRunId: null }).where(eq(heartbeatRuns.id, first.id));
+    await settleUnrecoverableExecutions(db); await deliver();
+    const second = (await successors(first.id))[0]!;
+    expect(second).toBeDefined();
+    await refuseContinuation(second, "temporary_runner_transport_unavailable");
+    // New DB handle: no in-memory attempt counter can make this test pass.
+    const restarted = createDb(temporary!.connectionString);
+    try {
+      for (let pass = 0; pass < 3; pass++) {
+        await settleUnrecoverableExecutions(restarted); await continueHeldExecutions(restarted);
+        await deliverReconciledExecutions(restarted, heartbeatService(restarted).wakeup);
+      }
+    } finally { await restarted.$client.end(); }
+    expect(await successors(second.id)).toHaveLength(0);
+    const records = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.sourceIssueId, f.issueId),
+      sql`${issueRecoveryActions.evidence}->'freshContinuation' is not null`));
+    expect(records).toHaveLength(2);
+    expect(records.find(record => (record.evidence.freshContinuation as { sourceRunId: string }).sourceRunId === first.id)!.evidence)
+      .toMatchObject({ freshContinuation: { chainRootRunId: f.runId, chainAttempt: 2 } });
+    // A separate user-started source run on this issue is not the old chain.
+    const independentId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: independentId, companyId, agentId, issueId: f.issueId,
+      status: "failed", errorCode: "temporary_runner_transport_unavailable", startedAt: new Date(), finishedAt: new Date(),
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented" } });
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    expect(await ensureFreshContinuation(db, { companyId, runId: independentId, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "continued" });
+  }, 60_000);
+
+  it("invalidates an older pending terminal fallback before it can occupy an agent slot", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    // Shape left by the previous release: pending before the permanent refusal
+    // was understood by the fallback. Do not create a new note or a queued run.
+    await db.update(heartbeatRuns).set({ error: "native_controller_recovery_unsupported:metadata_format" })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await deliver();
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0]!.evidence)
+      .toMatchObject({ continuationDelivery: "invalidated", continuationStopReason: "native_continuation_refused" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+  }, 60_000);
+
+  it("invalidates an older pending third attempt using durable lineage, even without chain markers", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    const first = await expectOneFreshSuccessor(f);
+    await refuseContinuation(first, "temporary_runner_transport_unavailable");
+    await settleUnrecoverableExecutions(db); await deliver();
+    const second = (await successors(first.id))[0]!;
+    await refuseContinuation(second, "temporary_runner_transport_unavailable");
+    const [record] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
+    const { id: _id, ...template } = record!;
+    const fresh: Record<string, unknown> = { ...(record!.evidence.freshContinuation as Record<string, unknown>), sourceRunId: second.id,
+      recordedAt: new Date().toISOString() };
+    delete fresh.chainRootRunId; delete fresh.chainAttempt;
+    const [pending] = await db.insert(issueRecoveryActions).values({ ...template, fingerprint: `old-fallback:${second.id}`,
+      evidence: { ...record!.evidence, runId: second.id, continuationDelivery: "pending", freshContinuation: fresh,
+        executionReconciliation: { ...(record!.evidence.executionReconciliation as Record<string, unknown>), runId: second.id } },
+    }).returning();
+    await deliver();
+    expect(await successors(second.id)).toHaveLength(0);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, pending!.id)))[0]!.evidence)
+      .toMatchObject({ continuationDelivery: "invalidated", continuationStopReason: "fresh_continuation_chain_exhausted" });
+  }, 60_000);
+
+  it("leaves a successful delivered continuation unchanged", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await settleUnrecoverableExecutions(db);
+    const next = await expectOneFreshSuccessor(f);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.id));
+    expect(await ensureFreshContinuation(db, { companyId, runId: next.id, trigger: "recovery_refused" }))
+      .toMatchObject({ kind: "not_applicable", reason: "run_not_unfinished" });
+    await settleUnrecoverableExecutions(db); await deliver();
+    expect(await successors(next.id)).toHaveLength(0);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0]!.evidence)
+      .toMatchObject({ continuationDelivery: "delivered", continuationRunId: next.id });
   }, 60_000);
 
   it("creates one successor when two servers call it at once", async () => {

@@ -1652,6 +1652,24 @@ A task whose run was interrupted and whose fresh continuation is recorded reads 
 
 The exact replay can also be refused after the click is accepted. This happens when chat source authorization was deferred by a busy identity or endpoint lock, or when it later fails, so the chat retry action settles `failed` with no admitted run. The task Retry receipt is then not failed. If it is a person's Retry, its source run is still the latest run, its chat wake has no run, and no saved or unadmitted chat input remains, the same receipt drops its chat action and becomes the board continuation described above, recorded as `issue.retry_continued_from_saved_work`. Saved chat input whose source comment was written no later than the failed run's stop boundary (the user's recorded Stop request, otherwise `finishedAt`, the same boundary admission uses) does not block this: admission holds such input as `message_predates_stop`, so it can never start alone. The continuation adopts it (the input receipt is coalesced into the Retry receipt) and the task continues from saved work. Saved input that arrived after the stop keeps its own admission path, and the Retry still settles as failed. When the latest run is an admission that the recovery hold cancelled before dispatch (`execution_reconciliation_required`), the saved work that counts is the recovered work of the run whose recovery action held it. The deferred-receipt worker dispatches it with every normal gate. Retry that Paperclip requests by itself still settles as failed. When a failed run's saved work is recovered, the task's execution blocker offers Retry (also on a connected task) and says "Saved work recovered. Retry continues from it." A stopped (cancelled) run keeps "Send a message to continue."
 
+### Automatic fresh-continuation limits
+
+A permanent native conversation refusal (including an unreadable controller
+metadata format or indeterminate prior-owner terminal state) never starts an
+automatic fresh continuation. Recovery uses the same refusal classification as
+the execution blocker; the existing conversation notice remains the only note.
+Transient failures may create at most two fresh continuations per task and
+source-run chain. The task lock serializes recording, and the existing recovery
+actions retain `freshContinuation.chainRootRunId` and `chainAttempt`. The bound
+counts durable records along `retryOfRunId` / previous-run context, including
+records from before these markers existed, with company and task scope on every
+hop. It does not reset on restart or when the separate six-per-hour rolling
+budget expires. An independent source run starts a new chain. Pending fallback
+records from older releases are invalidated before delivery if their source is
+permanently refused or they exceed the chain bound; invalidation starts no run
+and posts no additional note. A successful continuation is unchanged. No schema
+migration or plugin setting is needed.
+
 ### Saved chat Retry preparation
 
 Task Retry can meet a busy chat identity or endpoint lock before its source is authorized.
