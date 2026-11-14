@@ -55,6 +55,7 @@ import {
 } from "@/components/task-chat/TaskChatTurnStatusIsland";
 import { commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
 import {
+  isSupersededNotice,
   taskChatStatusRelevance,
   withoutHistoricalRunStatus,
 } from "@/components/task-chat/status-relevance";
@@ -932,6 +933,11 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (imageReceipts.has(comment.id)) return [];
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment)) return [];
+        // Superseded: off the live view, kept collapsed in expanded history.
+        if (isSupersededNotice(comment)) {
+          if (props.compactHistory) return [];
+          return [comment.presentation ? { ...comment, presentation: { ...comment.presentation, detailsDefaultOpen: false } } : comment];
+        }
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
         if (comment.body !== LEGACY_WITHHELD_RUN_COMMENT || !comment.runId)
           return [comment];
@@ -945,7 +951,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const summary = acceptedSemanticResultSummary(resultJson);
         return [summary ? { ...comment, body: summary } : comment];
       }),
-    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts],
+    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts, props.compactHistory],
   );
 
   const commentItems = useMemo(
