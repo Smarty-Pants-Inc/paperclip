@@ -709,33 +709,26 @@ export async function settleUnansweredPersonMessage(
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
-      || fenced.upgradeCommentId !== decision.upgradeCommentId
       || fenced.supersedeCommentId !== decision.supersedeCommentId) return null;
-    let comment: { id: string } | null | undefined;
-    if (fenced.upgradeCommentId) {
-      // The SAME note (same key) becomes the failure text: still one note.
-      const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
-        .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
-          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
-      comment = updated;
-    } else {
-      comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
-        authorType: "system",
-        presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
-      }, tx);
-    }
+    // Never edit a note in place (org 09:18Z; RFL line1 A1): every state is a
+    // NEW note. The message's standing waiting-kind note (waiting, paused,
+    // still trying) is kept byte-identical and marked superseded by it below.
+    const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
+      authorType: "system",
+      presentation: fenced.notice.presentation,
+      metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason },
+    }, tx);
     // One CURRENT held note per conversation (SMA-183; RFL np2 F2/F3): a
-    // held-conversation note for the person's latest message, inserted OR
-    // upgraded in place from its waiting note, supersedes B''s earlier HELD
-    // notes only, never progress, waiting or other history. They are kept
-    // (never deleted, org 09:18Z) and marked metadata.supersededBy; their keys
-    // still mark their messages noticed.
+    // held-conversation note for the person's latest message supersedes B''s
+    // earlier HELD notes only, never progress, waiting or other history. They
+    // are kept (never deleted, org 09:18Z) and marked metadata.supersededBy;
+    // their keys still mark their messages noticed. A chain A->B->C is kept as
+    // is (RFL 11:16Z): every reader skips ALL superseded notes.
     if (comment?.id && fenced.supersedeCommentId) {
       await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
         || jsonb_build_object('supersededBy', ${comment.id}::text), updated_at = ${now.toISOString()}::timestamptz
-        where id = ${fenced.supersedeCommentId} and company_id = ${issue.companyId} and deleted_at is null`);
+        where id = ${fenced.supersedeCommentId} and company_id = ${issue.companyId} and deleted_at is null
+          and not coalesce(metadata ? 'supersededBy', false)`);
     }
     if (comment?.id && fenced.replacesEarlier) {
       const messageId = fenced.reason.slice(UNANSWERED_MESSAGE_REASON_PREFIX.length);
@@ -764,11 +757,9 @@ type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" 
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
-      /** Set when this replaces the message's standing waiting note. */
-      upgradeCommentId?: string;
       /** A held-conversation note: it replaces B''s live note for an earlier message. */
       replacesEarlier?: boolean;
-      /** The message's progress note that this note supersedes (kept, marked supersededBy). */
+      /** The message's standing waiting-kind note this NEW note supersedes (kept, marked supersededBy). */
       supersedeCommentId?: string };
 
 /** The run event that records, once and durably, when this step first deferred
@@ -896,10 +887,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     lifecycleHolds: agents.lifecycleHolds }).from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   const agentPaused = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
     || (agentRow.lifecycleHolds ?? []).length > 0));
+  // RFL 09:16Z (b): a code-only reconciliation hold (an ACTIVE board-owned
+  // native_continuation_requires_reconciliation action) also holds the
+  // conversation: the wake-queue release keeps the issue behind it and leaves
+  // deferred messages unpromoted (run-dispatch postgres.ts:905-994), so a
+  // resend starts nothing, and neither does a resume (RFL line1 A4). Its notes
+  // are the held note, never "safe" and never "it will run when resumed".
+  const [reconciliationHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board"),
+    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"))).limit(1);
   if (agentPaused) {
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE) {
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE && !reconciliationHold) {
       return { kind: "pending", recheckAt: now.getTime() + 5 * 60_000 };
     }
   }
@@ -916,15 +917,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  // RFL 09:16Z (b): a code-only reconciliation hold (an ACTIVE board-owned
-  // native_continuation_requires_reconciliation action) also holds the
-  // conversation: the wake-queue release keeps the issue behind it and leaves
-  // deferred messages unpromoted (run-dispatch postgres.ts:905-994), so a
-  // resend starts nothing. Its notes are the held note, never "safe".
-  const [reconciliationHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board"),
-    eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation"))).limit(1);
   if (!boardHold && !agentPaused) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
@@ -982,12 +974,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   let code: string;
   let stillTrying = false;
-  if (agentPaused && !heldReplyRun) {
+  if (agentPaused && !heldReplyRun && !reconciliationHold) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
-  } else if (waitingToStart && reconciliationHold && !heldReplyRun) {
-    // RFL np2 F1: a durable reconciliation hold keeps the queued message from
-    // being admitted (run-dispatch postgres.ts:905-994). Held beats waiting:
-    // the held note, never "it will start by itself".
+  } else if ((waitingToStart || agentPaused) && reconciliationHold && !heldReplyRun) {
+    // RFL np2 F1, line1 A4: a durable reconciliation hold keeps the queued
+    // message from being admitted (run-dispatch postgres.ts:905-994), paused
+    // or not. Held beats waiting and paused: the held note, never "it will
+    // start by itself" or "it will run when <agent> is resumed".
     code = UNANSWERED_MESSAGE_RECONCILIATION_HOLD_CODE;
   } else if (waitingToStart && !heldReplyRun) {
     // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
@@ -1179,12 +1172,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   if (heldReply) notice.metadata = withHeldReplyMetadata(notice.metadata, heldReply) as never;
-  // RFL 09:45Z: the progress note is never rewritten or deleted; the next
-  // state is a new note, and the progress note is marked superseded by it.
-  const supersedes = upgrading && standingWaitingCode === UNANSWERED_MESSAGE_STILL_TRYING_CODE && !stillTryingNote;
+  // RFL 09:45Z, line1 A1: a standing note is never rewritten or deleted; the
+  // next state is a new note, and the standing note is marked superseded by it.
   return { kind: "notice", reason, code, notice,
-    ...(upgrading && !supersedes ? { upgradeCommentId: upgrading } : {}),
-    ...(supersedes ? { supersedeCommentId: upgrading } : {}),
+    ...(upgrading ? { supersedeCommentId: upgrading } : {}),
     ...(held && !paused && !waiting ? { replacesEarlier: true } : {}) };
 }
 
