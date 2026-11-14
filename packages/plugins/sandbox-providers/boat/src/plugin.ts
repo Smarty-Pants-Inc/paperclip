@@ -67,9 +67,42 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const headers = new Headers(init.headers);
     headers.set("Authorization", `Bearer ${config.apiKey}`);
     if (init.body !== undefined) headers.set("Content-Type", "application/json");
-    category = "network_error";
-    const response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: init.signal ?? AbortSignal.timeout(30_000) });
-    httpStatus = response.status;
+    const requestBody = init.body;
+    const isStreamBody = requestBody !== null && typeof requestBody === "object" &&
+      (typeof (requestBody as { getReader?: unknown }).getReader === "function" || typeof (requestBody as { pipe?: unknown }).pipe === "function");
+    let waitedMs = 0;
+    let response: Response;
+    const signal = init.signal ?? AbortSignal.timeout(30_000);
+    for (let attempt = 0; ; attempt++) {
+      category = "network_error";
+      httpStatus = null;
+      response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal });
+      httpStatus = response.status;
+      if (response.status !== 429 || attempt >= 2 || isStreamBody) {
+        if (response.status === 429 && (attempt >= 2 || isStreamBody)) {
+          category = "http_error";
+          // Do not parse or retain provider diagnostics.
+          await response.body?.cancel();
+          throw new Error(category);
+        }
+        break;
+      }
+      // A 429 is a definite refusal. Drop its body without inspecting provider text.
+      category = "http_error";
+      await response.body?.cancel();
+      let retryAfterMs = 2_000;
+      const retryAfter = response.headers.get("Retry-After");
+      if (retryAfter !== null) {
+        const seconds = /^\s*(\d+(?:\.\d+)?)\s*$/.exec(retryAfter);
+        const parsedDate = seconds ? NaN : Date.parse(retryAfter);
+        if (seconds) retryAfterMs = Number(seconds[1]) * 1_000;
+        else if (Number.isFinite(parsedDate)) retryAfterMs = Math.max(0, parsedDate - Date.now());
+      }
+      const waitMs = Math.min(15_000, Math.max(0, retryAfterMs), 30_000 - waitedMs);
+      if (waitMs <= 0) throw new Error(category);
+      waitedMs += waitMs;
+      await delay(waitMs, undefined, { signal });
+    }
     responseOptions.onHeaders?.(response.headers);
     if (allowMissing && response.status === 404) {
       if (!responseOptions.strictMissing) { await response.body?.cancel(); return null; }

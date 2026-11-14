@@ -3,7 +3,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 const manifest: PaperclipPluginManifestV1 = {
   id: "paperclip.boat-sandbox-provider",
   apiVersion: 1,
-  version: "0.1.15-runner-envfile-snapid-retain-routea",
+  version: "0.1.16-retry429",
   displayName: "Boat Sandbox Provider",
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",

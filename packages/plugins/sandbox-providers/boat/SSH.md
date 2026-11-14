@@ -1,6 +1,6 @@
 # Route A: S9 resident guardian over SSH
 
-Version `0.1.15-runner-envfile-snapid-retain-routea`. Vendored SDK/shared originate
+Version `0.1.16-retry429`. Vendored SDK/shared originate
 from Paperclip `cl/img1b` **ae66270620cb7eeaae2a13fc0aef22e3656d44ad**; the SDK adds
 only the optional liveness observation fields described in [README.md](README.md).
 Existing plugin ID `paperclip.boat-sandbox-provider`, provider key `boat`.
