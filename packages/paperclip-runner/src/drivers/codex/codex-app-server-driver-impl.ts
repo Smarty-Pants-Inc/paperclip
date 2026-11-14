@@ -20,7 +20,7 @@ import type {
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
 import { NativeSessionProtocolIntegrityError, isNativeProviderRecoveryDeadlineError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
-import { HarnessReconciliationError, isRunnerResumeStateUnavailable, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerRecoveryFailureClass } from "../../contracts/harness-driver.js";
+import { HarnessReconciliationError, runnerRefreshWaitForTurn, isRunnerResumeStateUnavailable, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerReconciliationFailureClass, runnerPrepareRefusalCode } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -843,7 +843,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       // resume it here. With nothing in flight, the runtime's recovery policy
       // decides, as for a moved workspace root. An in-flight session keeps the
       // unclassified failure.
-      const classified = runnerRecoveryFailureClass(error);
+      const classified = runnerReconciliationFailureClass(error);
       const resumeStateUnavailable = !classified && isRunnerResumeStateUnavailable(error)
         && !persistedSessionInFlight(snapshot);
       const failureClass = classified ?? (resumeStateUnavailable ? PROVIDER_STATE_INCOMPATIBLE : undefined);
@@ -851,6 +851,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         recovered: false,
         reason: redactCodexDiagnostic(String(error)),
         ...(failureClass ? { failureClass } : {}),
+        ...(runnerRefreshWaitForTurn(error) ? { refreshWaitForTurn: true as const } : {}),
+        ...(runnerPrepareRefusalCode(error) ? { prepareRefusalCode: runnerPrepareRefusalCode(error) } : {}),
         ...(resumeStateUnavailable ? { resumeStateUnavailable: true as const } : {}),
         ...(transport.runnerExitConfirmed?.() === true ? { runnerExitConfirmed: true as const } : {}),
       };

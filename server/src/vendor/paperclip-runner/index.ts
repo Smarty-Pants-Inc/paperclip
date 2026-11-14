@@ -159,6 +159,7 @@ export const createRunnerdCodexTransport: (
 // Runner-owned normalized refusal boundary; core must not parse provider prose.
 export const runnerRecoveryFailureClass = runner.runnerRecoveryFailureClass;
 export const runnerPrepareRefusalCode = runner.runnerPrepareRefusalCode;
+export const runnerReconciliationFailureClass = runner.runnerReconciliationFailureClass;
 export const PROVIDER_LAUNCH_PROFILE_MISMATCH = runner.PROVIDER_LAUNCH_PROFILE_MISMATCH;
 
 export const defaultCapabilityRunnerdBinary =

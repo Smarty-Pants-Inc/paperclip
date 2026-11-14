@@ -1100,6 +1100,60 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     });
   });
 
+  it.each([
+    "native_controller_recovery_missing_evidence:snapshot_binding",
+    "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable", "native_runner_refresh_required",
+  ])("persists structured fresh-thread refusal without generic Retry (%s)", async code => {
+    for (const phase of ["execute", "setup"]) {
+      const f = await fixture({ runtimeMode: "native" }, `FR${randomUUID().slice(0, 6)}`);
+      const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Structured refusal", assigneeAgentId: f.run.agentId }).returning();
+      await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, issueId: issue.id }).where(eq(heartbeatRuns.id, f.run.id));
+      f.run.nativeIssueId = issue.id;
+      f.run.issueId = issue.id;
+      await db.insert(nativeRunFinalizations).values({ companyId: f.run.companyId, issueId: issue.id,
+        runId: f.run.id, phase: "observed", attempt: 0 });
+      const error = Object.assign(new Error("Opaque Runner/controller refusal; not provider prose"), { code, waitForTurn: true });
+      if (phase === "execute") await f.completion.failRun(f.failure(error));
+      else await f.completion.failRunSetup(f.setup(error));
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: code,
+        resultJson: { nativeFreshContinuationRefusal: { code, waitForTurn: true } } });
+      expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)))[0])
+        .toMatchObject({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null, leaseOwner: null });
+      expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
+      expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
+      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }),
+        expect.objectContaining({ suppressImmediateRecovery: true }));
+    }
+  });
+
+  it.each(["provider_active_turn", "provider_live_descendants", "provider_active_goal", "provider_config_changed",
+    "provider_contract_changed_same_run", "provider_launch_profile_mismatch", "provider_pending_tool_calls",
+    "provider_reconciliation_required", "provider_session_closed", undefined, "future_unknown"])(
+    "persists the precise prepare code through the server completion boundary (%s)", async refusalCode => {
+    for (const phase of ["execute", "setup"]) {
+      const f = await fixture({ runtimeMode: "native" }, `WC${randomUUID().slice(0, 6)}`);
+      const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Wire refusal", assigneeAgentId: f.run.agentId }).returning();
+      await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, issueId: issue.id }).where(eq(heartbeatRuns.id, f.run.id));
+      f.run.nativeIssueId = issue.id;
+      f.run.issueId = issue.id;
+      await db.insert(nativeRunFinalizations).values({ companyId: f.run.companyId, issueId: issue.id,
+        runId: f.run.id, phase: "observed", attempt: 0 });
+      const error = Object.assign(new Error("opaque transport"), { runnerCommandResult: {
+        commandType: "run.prepare", status: "failed", result: { code: "command_execution_failed", refusalCode,
+          message: "Pi run.prepare launch does not match the runner-owned qualified profile" } } });
+      if (phase === "execute") await f.completion.failRun(f.failure(error));
+      else await f.completion.failRunSetup(f.setup(error));
+      const code = refusalCode === "provider_launch_profile_mismatch" ? "native_runner_launch_profile_mismatch" : "native_runner_refresh_required";
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: code,
+        resultJson: { nativeFreshContinuationRefusal: { code,
+          prepareRefusalCode: !refusalCode || refusalCode === "future_unknown" ? "provider_prepare_refused" : refusalCode } } });
+      expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
+      expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
+    }
+  });
+
   it("persists a project denial without provider work or an automatic retry", async () => {
     const f = await fixture();
     const projectId = randomUUID();
