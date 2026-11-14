@@ -56,15 +56,14 @@ export async function masterPid(e:SshEndpoint){const r=await exec("ssh",["-O","c
 export async function sdk(f:Awaited<ReturnType<typeof fixture>>){
  vi.resetModules();const{default:plugin}=await import("../plugin.js"),{default:manifest}=await import("../manifest.js");
  const {BoatSshCarrier:WorkerCarrier}=await import("../ssh-carrier.js");const warm=vi.spyOn(WorkerCarrier.prototype,"prewarm");
- const ctl={failRetire:false,retireCalls:0,stopCalls:0,destroyCalls:0};
+ const ctl={failRetire:false,retireCalls:0,stopCalls:0,stopPending:false,destroyCalls:0};
  const response=(x:unknown)=>new Response(JSON.stringify(x));
  vi.stubGlobal("fetch",async(url:any,init?:RequestInit)=>{
   if(String(url).startsWith("https://routea-upload.test/"))return f.uploadFetch(url,init!);
   const u=new URL(String(url)),path=u.pathname.replace("/api/v1","")+u.search;
   if(path===`/sandboxes/${scope.providerLeaseId}`&&init?.method==="DELETE"){ctl.destroyCalls++;throw Error("sandbox DELETE forbidden");}
-  if(path==="/sandboxes"||path===`/sandboxes/${scope.providerLeaseId}`||path.endsWith("/resume"))return response({sandbox:{id:scope.providerLeaseId,state:"ready"}});
-  if(path.endsWith("/stops/stop"))return response({stop:{status:"completed"}});
-  if(path.endsWith("/stop")){ctl.stopCalls++;return response({operation:{id:"stop"}});}
+  if(path==="/sandboxes"||path===`/sandboxes/${scope.providerLeaseId}`||path.endsWith("/resume")){if(path.endsWith("/resume"))ctl.stopPending=false;const stopped=ctl.stopPending;ctl.stopPending=false;return response({sandbox:{id:scope.providerLeaseId,state:stopped ? "archived" : "ready",...(stopped ? {stop:{id:"stop",status:"completed"}} : {})}});}
+  if(path.endsWith("/stop")){ctl.stopCalls++;ctl.stopPending=true;return response({operation:{id:"stop"}});}
   if(path.endsWith("/commands")){const b=JSON.parse(String(init?.body));if(b.command.includes("-retire.mjs")){ctl.retireCalls++;if(ctl.failRetire)return response({exitCode:1,timedOut:false,stdout:"",stderr:""});}return response(await f.api.run(b.command,b.timeoutSeconds*1000));}
   return response(await f.api.request(path,init));
  });

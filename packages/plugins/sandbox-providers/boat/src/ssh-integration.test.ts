@@ -99,12 +99,12 @@ it('unconfirmed retirement remains retryable; no replacement key is issued',asyn
  const f=await fixture();let fail=false;const carrier=new BoatSshCarrier(()=>({...f.api,run:async(c,t)=>fail&&c.includes('-retire.mjs')?{exitCode:1,timedOut:false,stdout:'',stderr:''}:f.api.run(c,t)}));cleanups.push(()=>carrier.close());await carrier.prepare(f.lease);fail=true;await expect(carrier.retire(f.lease)).rejects.toMatchObject({code:'BOAT_SSH_RETIRE_FAILED'});await expect(carrier.prepare(f.lease)).rejects.toMatchObject({code:'BOAT_SSH_RETIRE_PENDING'});fail=false;await carrier.retire(f.lease);expect(await readFile(f.keys,'utf8')).toBe('# operator-owned sentinel\n');
 },30000);
 it('real SDK all four hooks carry S9 and release/resume re-preflights the same allocation',async()=>{
- const f=await fixture();const{default:plugin}=await import('./plugin.js'),{default:manifest}=await import('./manifest.js');const response=(x:unknown)=>new Response(JSON.stringify(x));
+ const f=await fixture();const{default:plugin}=await import('./plugin.js'),{default:manifest}=await import('./manifest.js');const response=(x:unknown)=>new Response(JSON.stringify(x));let stopCalls=0,stopPending=false;
  vi.stubGlobal('fetch',async(url:any,init?:RequestInit)=>{
   if(String(url).startsWith('https://routea-upload.test/'))return f.uploadFetch(url,init!);
   const u=new URL(String(url)),path=u.pathname.replace('/api/v1','')+u.search;
-  if(path==='/sandboxes'||path===`/sandboxes/${scope.providerLeaseId}`||path.endsWith('/resume'))return response({sandbox:{id:scope.providerLeaseId,state:'ready'}});
-  if(path.endsWith('/stops/stop'))return response({stop:{status:'completed'}});if(path.endsWith('/stop'))return response({operation:{id:'stop'}});
+  if(path==='/sandboxes'||path===`/sandboxes/${scope.providerLeaseId}`||path.endsWith('/resume')){if(path.endsWith('/resume'))stopPending=false;const stopped=stopPending;stopPending=false;return response({sandbox:{id:scope.providerLeaseId,state:stopped ? 'archived' : 'ready',...(stopped ? {stop:{id:'stop',status:'completed'}} : {})}});}
+  if(path.endsWith('/stop')){stopCalls++;stopPending=true;return response({operation:{id:'stop'}});}
   if(path.endsWith('/commands')){const b=JSON.parse(String(init?.body));return response(await f.api.run(b.command,b.timeoutSeconds*1000));}return response(await f.api.request(path,init));
  });
  const input=new PassThrough(),output=new PassThrough(),lines=createInterface({input:output}),host=startWorkerRpcHost({plugin,stdin:input,stdout:output,rpcTimeoutMs:10000});let seq=0;
