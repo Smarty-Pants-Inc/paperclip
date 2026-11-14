@@ -3935,6 +3935,9 @@ export function secretService(db: Db | DbTransaction) {
     },
 
     list: async (companyId: string) => {
+      // Administrative reads must see the access events used by upstream's
+      // Last-used projection. Runtime credential reads remain non-blocking.
+      if (!(db instanceof PgTransaction)) await flushSecretResolutionWrites(db as Db);
       const [secrets, referenceCounts] = await Promise.all([
         db
           .select()

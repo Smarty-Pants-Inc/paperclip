@@ -70,7 +70,7 @@ suite("warm secret resolution (real PostgreSQL lock boundary)", () => {
     }
   });
 
-  it("does not await audit INSERTs, then flushes all 20 events with only one debounced UPDATE", async () => {
+  it("does not await audit INSERTs, then flushes all 20 events without writing the secret row", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Audit batch", issuePrefix: `A${companyId.slice(0, 6)}` });
     const service = secretService(db);
@@ -104,13 +104,14 @@ suite("warm secret resolution (real PostgreSQL lock boundary)", () => {
     const recorded = await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.secretId, secret.id));
     expect(recorded).toHaveLength(20);
     expect(new Set(recorded.map(row => row.id)).size).toBe(20);
-    expect(updates.mock.calls.filter(([table]) => table === companySecrets)).toHaveLength(1);
+    expect(updates.mock.calls.filter(([table]) => table === companySecrets)).toHaveLength(0);
     await service.resolveSecretValue(companyId, secret.id, "latest");
     await flushSecretResolutionWrites(db);
-    expect(updates.mock.calls.filter(([table]) => table === companySecrets)).toHaveLength(1);
+    expect(updates.mock.calls.filter(([table]) => table === companySecrets)).toHaveLength(0);
     const [metadata] = await db.select().from(companySecrets).where(eq(companySecrets.id, secret.id));
-    expect(metadata.updatedAt).toEqual(secret.updatedAt);
-    await recordEvidence({ auditEvents: recorded.length, debouncedUpdates: 1, updatedAtUnchanged: true });
+    expect(metadata).toEqual(secret);
+    expect((await service.list(companyId)).find(row => row.id === secret.id)?.lastResolvedAt).toBeInstanceOf(Date);
+    await recordEvidence({ auditEvents: recorded.length, secretRowUpdates: 0, secretRowUnchanged: true });
     updates.mockRestore();
   });
 
