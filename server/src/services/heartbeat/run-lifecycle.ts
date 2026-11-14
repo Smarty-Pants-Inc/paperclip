@@ -1,4 +1,5 @@
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
+import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { notifyStrandedAgentStatus } from "../live-run-recovery-notifications.js";
@@ -2343,7 +2344,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     runId: string,
     meta: { pid: number; processGroupId: number | null; startedAt: string; targetKind: "local" | "remote" },
   ) {
-    return retryTransientRunWrite(() => persistHeartbeatRunProcessMetadata(db, runId, meta));
+    const persisted = await retryTransientRunWrite(() => persistHeartbeatRunProcessMetadata(db, runId, meta));
+    settleReattachRun(runId, "reached");
+    return persisted;
   }
 
   async function clearDetachedRunWarning(runId: string) {
