@@ -57,7 +57,8 @@ describe.skipIf(!support.supported)("d981 shape: unrestored saved files, Retry n
       status: "queued", payload: { issueId } });
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
-      .filter(comment => comment.metadata?.recoveryResponsibility !== "system");
+      .filter(comment => comment.metadata?.recoveryResponsibility !== "system")
+      .filter(comment => !(comment.metadata as Record<string, unknown> | null)?.supersededBy); // RFL 10:14Z: CURRENT notes
     return { companyId, agentId, issueId, messageId: message!.id, runId: run!.id, visible };
   }
 

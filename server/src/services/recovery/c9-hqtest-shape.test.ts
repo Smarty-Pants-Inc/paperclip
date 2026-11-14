@@ -50,7 +50,8 @@ describe.skipIf(!support.supported)("hq-test warm1/warm2 shape", () => {
       nextAction: "Inspect the original provider failure and explicitly resolve the ambiguous session state; do not open a replacement provider session" });
     const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
-      .filter(comment => comment.metadata?.recoveryResponsibility !== "system");
+      .filter(comment => comment.metadata?.recoveryResponsibility !== "system")
+      .filter(comment => !(comment.metadata as Record<string, unknown> | null)?.supersededBy); // RFL 10:14Z: CURRENT notes
     return { companyId, agentId, issueId, messageId: message!.id, runId: run!.id, visible };
   }
 

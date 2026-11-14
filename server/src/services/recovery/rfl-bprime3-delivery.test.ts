@@ -31,8 +31,9 @@ describe.skipIf(!support.supported)("RFL Bprime3 delivered first-turn messages",
         source: "issue.comment", wakeCommentId: messageId, wakeCommentIds: [messageId] } } }).returning();
     const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId,
       skipRelatedRecovery: true, skipExternalConversationSettlement: true });
-    const notices = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
-      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt)));
+    const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
+      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy) // RFL 10:14Z: CURRENT notes (never-delete part 1);
     return { companyId, agentId, issueId, messageId, messageAt, userId, wakeId: wake!.id, sweep, notices };
   }
 

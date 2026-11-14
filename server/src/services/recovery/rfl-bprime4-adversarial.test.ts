@@ -42,7 +42,8 @@ describe.skipIf(!support.supported)("RFL Bprime4 message attribution", () => {
       skipRelatedRecovery: true, skipExternalConversationSettlement: true });
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
       eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
-      .filter(row => row.metadata?.recoveryResponsibility !== "system");
+      .filter(row => row.metadata?.recoveryResponsibility !== "system")
+      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy) // RFL 10:14Z: CURRENT notes (never-delete part 1);
     return { companyId, agentId, issueId, userId, base, message, run, reply, card, sweep, notices };
   }
 

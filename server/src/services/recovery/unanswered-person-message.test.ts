@@ -97,11 +97,16 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         eq(issueComments.authorType, "system"), gt(issueComments.createdAt, new Date(clock))));
       for (const row of fresh) await db.update(issueComments).set({ createdAt: at() }).where(eq(issueComments.id, row.id));
     };
-    // What the v2 chat panel shows: system comments not classified "system".
-    const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+    // RFL 10:14Z (never-delete part 1): notes are never deleted; a superseded note is history.
+    // history(): every kept B' row the v2 chat panel would list (not classified "system").
+    // visible(): the notes the person CURRENTLY sees: history minus superseded (metadata.supersededBy),
+    // which the chat hides as historical (app-lead #20594).
+    const history = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
       .filter(comment => (comment.metadata as Record<string, unknown> | null)?.recoveryResponsibility !== "system");
-    return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, at };
+    const visible = async () => (await history())
+      .filter(comment => !(comment.metadata as Record<string, unknown> | null)?.supersededBy);
+    return { companyId, agentId, issueId, userId, message, run, reply, boardHold, sweep, visible, history, at };
   }
 
   const codeOf = (comment: { metadata: unknown }) => {
@@ -191,7 +196,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       status: "deferred_issue_execution", payload: { issueId: f.issueId } });
     await f.sweep();
     // org 09:18Z / RFL 09:45Z (M1.4): the first note is kept (never deleted), marked superseded.
-    const all = await f.visible();
+    const all = await f.history();
     expect(all, "the superseded first note is kept").toHaveLength(2);
     notices = all.filter(notice => !(notice.metadata as Record<string, unknown> | null)?.supersededBy);
     expect(notices).toHaveLength(1);
@@ -661,7 +666,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await settleAt(f, 17 * 60_000);
     // One note per STATE (RFL 09:35Z), and never a vanishing note (org 09:18Z, RFL 09:45Z): the
     // failure note is a new note; the progress note stays, visible as history, marked superseded.
-    notices = await f.visible();
+    notices = await f.history();
     expect(notices, "one note per state: the progress note (history) and ONE failure note").toHaveLength(2);
     const failure = notices.find(notice => notice.id !== progress.id)!;
     expect(failure.body).not.toMatch(/sending it again is safe/i);
@@ -674,7 +679,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(kept!.body).toBe(progress.body);
     expect((kept!.metadata as Record<string, unknown> | null)?.supersededBy, "marked superseded by the failure note").toBe(failure.id);
     await settleAt(f, 18 * 60_000);
-    expect(await f.visible(), "no further note").toHaveLength(2);
+    expect(await f.history(), "no further note").toHaveLength(2);
   });
 
   it("M1.1 (5) control: the retry starts a run carrying the message within the bound, which answers -> no notice", async () => {
@@ -921,6 +926,28 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       });
     }
   }
+
+  // RFL 10:14Z (never-delete part 1): an answer supersedes the note by MARKING it, never deleting it.
+  it("never-delete: the agent's answer supersedes the note: the row is kept (deleted_at NULL, body unchanged), marked supersededBy = the answer, and no longer current", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    await f.sweep();
+    const [note] = await f.visible();
+    expect(note).toBeDefined();
+    const answering = await f.run({ commentId, status: "succeeded", retryOfRunId: failed });
+    await f.reply(answering);
+    await f.sweep();
+    expect(await f.visible(), "the answered note is no longer current").toHaveLength(0);
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, note!.id));
+    expect(kept, "the note row still exists").toBeDefined();
+    expect(kept!.deletedAt, "never deleted").toBeNull();
+    expect(kept!.body).toBe(note!.body);
+    const [answer] = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "agent")));
+    expect((kept!.metadata as Record<string, unknown> | null)?.supersededBy, "marked superseded by the answer").toBe(answer!.id);
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+  });
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
@@ -1204,7 +1231,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // RFL 10:12Z (R2 of D8): no edit in place (a person may already have read it; notes are history,
     // org 09:18Z). ONE NEW true note says the card was answered but the follow-up run failed, with the next
     // action (chat-aware); the earlier held note is kept unchanged and marked superseded by it.
-    const notes = await f.visible();
+    const notes = await f.history();
     expect(notes, "the earlier held note is kept, and one new note").toHaveLength(2);
     const kept = notes.find(note => note.id === initialNote!.id)!;
     expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
@@ -1219,7 +1246,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(nextActionOf(current[0]!)).toBe("Send your message again; if it fails again, assign this agent a new task.");
     expect(failedContinuation).toBeDefined();
     await f.sweep();
-    expect(await f.visible(), "no further note").toHaveLength(2);
+    expect(await f.history(), "no further note").toHaveLength(2);
   });
   it("D8 (chat): a card answered before the continuation fails gets ONE NEW true note with the chat-aware action (RFL 10:12Z R2)", async () => {
     const f = await fixture({ status: "in_review", chat: true });
@@ -1245,7 +1272,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     // RFL 10:12Z (R2 of D8): no edit in place (a person may already have read it; notes are history,
     // org 09:18Z). ONE NEW true note says the card was answered but the follow-up run failed, with the next
     // action (chat-aware); the earlier held note is kept unchanged and marked superseded by it.
-    const notes = await f.visible();
+    const notes = await f.history();
     expect(notes, "the earlier held note is kept, and one new note").toHaveLength(2);
     const kept = notes.find(note => note.id === initialNote!.id)!;
     expect(kept.body, "the earlier note's body is unchanged").toBe(initialNote!.body);
@@ -1260,6 +1287,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(nextActionOf(current[0]!)).toBe("Send your message again; if it fails again, start a new chat with Managed Pi.");
     expect(failedContinuation).toBeDefined();
     await f.sweep();
-    expect(await f.visible(), "no further note").toHaveLength(2);
+    expect(await f.history(), "no further note").toHaveLength(2);
   });
 });

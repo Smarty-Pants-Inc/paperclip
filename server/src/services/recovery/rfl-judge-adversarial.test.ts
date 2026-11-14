@@ -32,7 +32,8 @@ describe.skipIf(!support.supported)("RFL independent unanswered-message safety",
       contextSnapshot: { issueId, wakeCommentId: messageId, wakeReason: "issue_commented" }, errorCode: "adapter_failed",
       error: "runner_state_identity_mismatch: prior_owner_active", createdAt: new Date(old + 1_000), finishedAt: new Date(old + 2_000) });
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
-      .filter(row => row.metadata?.recoveryResponsibility !== "system");
+      .filter(row => row.metadata?.recoveryResponsibility !== "system")
+      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy); // RFL 10:14Z: CURRENT notes (never-delete part 1)
     // Match the production worker's flags, including skipping the unrelated
     // company-wide active-action reconciliation.
     const sweep = () => heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId, skipRelatedRecovery: true, skipExternalConversationSettlement: true });

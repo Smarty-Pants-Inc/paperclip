@@ -42,7 +42,8 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     };
     const notices = async () => (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
       eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt))))
-      .filter(row => row.metadata?.recoveryResponsibility !== "system");
+      .filter(row => row.metadata?.recoveryResponsibility !== "system")
+      .filter(row => !(row.metadata as Record<string, unknown> | null)?.supersededBy) // RFL 10:14Z: CURRENT notes (never-delete part 1);
     const flags = async () => ({
       discovered: (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId), unansweredPersonMessageCondition(issues.id, issues.companyId)))).length > 0,
       batched: (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, issueId), unansweredPersonMessageCommentCondition()))).length > 0,
@@ -102,6 +103,11 @@ describe.skipIf(!support.supported)("RFL Bprime5 independent attribution and bou
     expect(await f.flags()).toEqual({ discovered: true, batched: true }); // notice needs retiring
     expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     expect(await f.notices()).toHaveLength(0);
+    // RFL 10:14Z (never-delete part 1): the superseded note row still EXISTS, deleted_at NULL, body unchanged.
+    const [kept] = await db.select().from(issueComments).where(eq(issueComments.id, notice!.id));
+    expect(kept, "the superseded note row still exists").toBeDefined();
+    expect(kept!.deletedAt, "the superseded note is never deleted").toBeNull();
+    expect(kept!.body).toBe(notice!.body);
     expect(await f.flags()).toEqual({ discovered: false, batched: false });
   });
 
