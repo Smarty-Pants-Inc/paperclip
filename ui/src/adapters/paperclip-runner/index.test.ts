@@ -252,6 +252,14 @@ describe("paperclip runner transcript projection", () => {
     expect(modelRoute).toEqual([expect.objectContaining({ kind: "provider_activity", family: "model_identity", summary: "Claude Sonnet" })]);
   });
 
+  it("shows the Pi connection omission count as a person-visible run activity system line", () => {
+    const message = "Pi total tool cap 128 (7 active native/extension tools): omitted 30 connection tools: GitHub (github-id): 6; Google Workspace (google-id): 24. All 61 Paperclip core tools retained.";
+    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({ type: "paperclip.prp.event", event: {
+      eventType: "harness.diagnostic", payload: { code: "pi_dynamic_tool_limit", message, omittedToolCount: 30 },
+    } }), "2026-11-14T10:00:00.000Z");
+    expect(entries).toEqual([{ kind: "system", ts: "2026-11-14T10:00:00.000Z", text: `Runner: ${message}` }]);
+  });
+
   it("projects workspace changes and verified file references as bounded structured entries", () => {
     const parse = paperclipRunnerUIAdapter.createStdoutParser!().parseLine;
     const event = (eventType: string, payload: Record<string, unknown>) => parse(JSON.stringify({

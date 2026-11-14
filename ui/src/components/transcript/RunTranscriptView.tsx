@@ -1681,7 +1681,12 @@ function TranscriptSystemGroup({
   block: Extract<TranscriptBlock, { type: "system_group" }>;
   density: TranscriptDensity;
 }) {
-  const [open, setOpen] = useState(false);
+  const hasToolCapNotice = block.lines.some((line) => line.text.startsWith("Runner: Pi total tool cap "));
+  const [open, setOpen] = useState(hasToolCapNotice);
+  useEffect(() => {
+    // A limit notice can arrive after this group first rendered collapsed.
+    if (hasToolCapNotice) setOpen(true);
+  }, [hasToolCapNotice]);
   return (
     <div className="rounded-xl border border-blue-500/20 bg-blue-500/[0.04] p-2 text-blue-700 dark:text-blue-300">
       <div

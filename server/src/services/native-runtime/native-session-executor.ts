@@ -17326,6 +17326,7 @@ async function createRunnerdBackendWithinSessionClaim(
         gatewayPublicId: assignedGatewayPublicId!,
         bearerToken: assignedMcpToken,
         workMode: input.execution.task.workMode,
+        ...(input.execution.provider.kind === "pi_rpc" ? { provenanceBinding: { db: input.db, companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId } } : {}),
         ...(input.execution.provider.kind === "opencode" ? { delivery: "on_demand" as const } : {}),
       }))
       : undefined),
@@ -17348,6 +17349,7 @@ async function createRunnerdBackendWithinSessionClaim(
     ...(nativeReview ? { nativeReview } : {}),
     connectorAssignments,
     assignedMcpTools,
+    toolProvenance: input.execution.provider.kind === "pi_rpc",
     companyId: input.execution.binding.companyId,
     issueId: input.execution.binding.issueId,
     runId: input.execution.binding.runId,

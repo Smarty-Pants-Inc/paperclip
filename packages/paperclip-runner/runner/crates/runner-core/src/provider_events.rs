@@ -1239,6 +1239,35 @@ pub fn normalize_codex_notification_in(
                 }),
             );
         }
+        // The Pi facade uses the existing warning channel, but this host-owned
+        // omission must remain a structured run diagnostic, not just prose.
+        "warning"
+            if params.get("category").and_then(Value::as_str) == Some("pi_dynamic_tool_limit") =>
+        {
+            let delivery = &params["toolDelivery"];
+            let connections: Vec<Value> = delivery["omittedConnections"].as_array().into_iter().flatten().take(256)
+                .map(|connection| json!({
+                    "connectionId": bounded_text(string(connection.get("connectionId")), 256),
+                    "connectionName": bounded_text(string(connection.get("connectionName")), 256),
+                    "omittedToolCount": connection["omittedToolCount"].as_u64(),
+                })).collect();
+            push(
+                &mut events,
+                "harness.diagnostic",
+                EventPriority::P0,
+                json!({
+                    "code": "pi_dynamic_tool_limit",
+                    "message": bounded_text(string(params.get("message")), MAX_TEXT_CHARS),
+                    "api": bounded_text(string(delivery.get("api")), 80),
+                    "cap": delivery["cap"].as_u64(),
+                    "nativeToolCount": delivery["nativeToolCount"].as_u64(),
+                    "coreToolCount": delivery["coreToolCount"].as_u64(),
+                    "deliveredToolCount": delivery["deliveredToolCount"].as_u64(),
+                    "omittedToolCount": delivery["omittedToolCount"].as_u64(),
+                    "omittedConnections": connections,
+                }),
+            );
+        }
         "warning"
             if params.get("classification").and_then(Value::as_str)
                 == Some("unrelated_information") =>
@@ -2840,6 +2869,36 @@ mod tests {
             None
         )
         .is_empty());
+    }
+
+    #[test]
+    fn pi_tool_cap_warning_retains_connection_counts_in_the_actual_run_diagnostic() {
+        let normalized = normalize_codex_notification(
+            "warning",
+            &json!({
+                "category": "pi_dynamic_tool_limit", "message": "Pi total tool cap 128: GitHub: 6; Google Workspace: 24",
+                "toolDelivery": { "api": "openai-completions", "cap": 128, "nativeToolCount": 7,
+                    "coreToolCount": 61, "deliveredToolCount": 121, "omittedToolCount": 30,
+                    "omittedConnections": [{"connectionId": "github-id", "connectionName": "GitHub", "omittedToolCount": 6},
+                        {"connectionId": "google-id", "connectionName": "Google Workspace", "omittedToolCount": 24}],
+                    "private": "must-not-cross" },
+            }),
+        );
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].event_type, "harness.diagnostic");
+        assert_eq!(normalized[0].payload["code"], "pi_dynamic_tool_limit");
+        assert_eq!(normalized[0].payload["cap"], 128);
+        assert_eq!(normalized[0].payload["nativeToolCount"], 7);
+        assert_eq!(normalized[0].payload["omittedToolCount"], 30);
+        assert_eq!(
+            normalized[0].payload["omittedConnections"][1]["connectionName"],
+            "Google Workspace"
+        );
+        assert_eq!(
+            normalized[0].payload["omittedConnections"][1]["omittedToolCount"],
+            24
+        );
+        assert!(!normalized[0].payload.to_string().contains("must-not-cross"));
     }
 
     #[test]

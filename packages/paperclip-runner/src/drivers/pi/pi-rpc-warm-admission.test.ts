@@ -115,7 +115,7 @@ async function fixture() {
             if (Buffer.byteLength(buffer) > 1024 * 1024) { socket.destroy(); return; }
             if (!buffer.endsWith("\n")) return;
             const request = JSON.parse(buffer) as PiBindCommand;
-            ipc.push(request); native.order.push(`ipc:${request.type}`);
+            if (request.type !== "tool_inventory") { ipc.push(request); native.order.push(`ipc:${request.type}`); }
             if (request.type === "bind") {
               expect(validateBindRequest(request)).toBe(true);
               expect(request.sessionId).toBe(initial.sessionId);
@@ -130,6 +130,8 @@ async function fixture() {
               socket.end(`${JSON.stringify({ schema: 1, type: "bind", nonce: request.nonce, sessionId: request.sessionId,
                 epoch: fault === "stale-bind" ? request.epoch - 1 : request.epoch, runId: request.runId,
                 provider: request.provider.name, model: request.model, thinkingLevel: request.thinkingLevel, ...bindContent(request) })}\n`);
+            } else if (request.type === "tool_inventory") {
+              socket.end(`${JSON.stringify({ ...request, nativeTools: [] })}\n`);
             } else if (request.type === "stop_children") {
               socket.end(`${JSON.stringify({ ...request, settled: [], uncertain: [] })}\n`);
             } else if (request.type === "park_ready") {

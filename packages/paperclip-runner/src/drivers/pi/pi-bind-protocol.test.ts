@@ -3,8 +3,9 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../semantic-tools/catalog.js";
 import {
-  RunAuthority, bindContent, dispatchPiToolCall, guardCallback, sendPiBindRequest, sendPiToolRequest,
+  RunAuthority, bindContent, dispatchPiToolCall, guardCallback, normalizePiDynamicTools, sendPiBindRequest, sendPiToolRequest,
   validateBindReceipt, validateBindRequest, validatePiToolCallRequest,
   type BindRequest, type Origin, type PiToolCallRequest,
 } from "./pi-bind-protocol.js";
@@ -41,6 +42,40 @@ async function peer(reply: (request: Record<string, unknown>) => string | null) 
 function receipt() {
   return { schema: 1, type: "bind", nonce: binding.nonce, sessionId: "session", epoch: 2, runId: "run-2", provider: "paperclip", model: "paperclip/m", thinkingLevel: "low", ...bindContent(binding) };
 }
+
+// Recorded catch: d981 lost core actions because the entire catalog was sliced
+// alphabetically. Keep selection independent of labels and unrelated providers.
+describe("Pi per-API total tool budget", () => {
+  const tool = (name: string) => ({ name, description: name, inputSchema: { type: "object", properties: {} } });
+  it("derives protected semantic actions from the live catalog, not a copied list", () => {
+    const semantic = CAPABILITY_SEMANTIC_TOOL_CATALOG.map(entry => entry.operationId);
+    const values = [...Array.from({ length: 129 }, (_, index) => tool(`app_${index}`)), ...semantic.map(tool)];
+    const result = normalizePiDynamicTools(values, "openai-completions", 7);
+    expect(result.tools).toHaveLength(121);
+    expect(result.tools.slice(0, semantic.length).map(tool => tool.name)).toEqual(semantic);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics[0]).toMatchObject({ nativeToolCount: 7, coreToolCount: semantic.length });
+  });
+  it("uses applicable install date, immutable connectionId ties and missing-provenance-last; labels cannot change survivors", () => {
+    const core = Array.from({ length: 124 }, (_, index) => ({ ...tool(`core_${index}`), paperclipToolSource: { kind: "core" } }));
+    const connection = (id: string, label: string, installedAt?: string) => ({ ...tool(`app_${id}`), paperclipToolSource: { kind: "connection", connectionId: id, connectionName: label, installedAt } });
+    const connections = [connection("missing", "A missing install"), connection("bb", "B label", "2026-01-02"), connection("zz", "Z oldest", "2026-01-01"), connection("aa", "A label", "2026-01-02")];
+    const selected = normalizePiDynamicTools([...connections, ...core], "openai-completions", 1);
+    expect(selected.tools.slice(-3).map(tool => tool.name)).toEqual(["app_zz", "app_aa", "app_bb"]);
+    expect(selected.diagnostics[0]).toMatchObject({ omittedToolCount: 1, omittedConnections: [{ connectionId: "missing", connectionName: "A missing install", omittedToolCount: 1 }] });
+    const renamed = connections.map(entry => ({ ...entry, paperclipToolSource: { ...entry.paperclipToolSource, connectionName: `RENAMED ${entry.paperclipToolSource.connectionId}` } })).reverse();
+    expect(normalizePiDynamicTools([...renamed, ...core], "openai-completions", 1).tools).toEqual(selected.tools);
+    expect(selected.tools.every(tool => !Object.hasOwn(tool, "paperclipToolSource"))).toBe(true);
+  });
+  it("validates measured inventory receipts, including nonce and duplicate names", () => {
+    const request = { schema: 1 as const, type: "tool_inventory" as const, nonce: "inventory-nonce", sessionId: "session" };
+    const receipt = { ...request, nativeTools: ["bash", "read", "subagent"] };
+    expect(validateBindReceipt(receipt, request)).toBe(true);
+    expect(validateBindReceipt({ ...receipt, nativeTools: Array.from({ length: 257 }, (_, index) => `native_${index}`) }, request)).toBe(true);
+    expect(validateBindReceipt({ ...receipt, nonce: "old-nonce" }, request)).toBe(false);
+    expect(validateBindReceipt({ ...receipt, nativeTools: ["bash", "bash"] }, request)).toBe(false);
+  });
+});
 
 describe("resident Pi authority", () => {
   it("requires the originating run AND a turn-local announcement; freezes captured identity", () => {

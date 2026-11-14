@@ -46,7 +46,8 @@ async function fixture(primary: unknown, user: unknown, originalPiDir = false, m
     environment: { HOME: home, ...(managedPiDir ? { PI_CODING_AGENT_DIR: agent } : {}), PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
     transportFactory: () => transport as unknown as PiRpcTransport,
     bindRequest: async <C extends PiBindCommand>(_path: string, request: C) => {
-      if (request.type !== "stop_children") throw new Error("source fixture only supports Stop");
+      if (request.type === "tool_inventory") return { ...request, nativeTools: [] } as unknown as PiBindResponse<C>;
+      if (request.type !== "stop_children") throw new Error("source fixture only supports inventory and Stop");
       return { schema: 1, type: "stop_children", nonce: request.nonce, sessionId: request.sessionId, settled: [], uncertain: [] } as unknown as PiBindResponse<C>;
     },
   }).openSession({ runId: "source-run", normalizedSessionId: "source-session", workingDirectory: root }) as PiRpcHarnessSession;

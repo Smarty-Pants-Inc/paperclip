@@ -88,6 +88,7 @@ async function fixture(options: { capture?: boolean; semanticTool?: string } = {
       bindRequest: (async (_path: string, command: PiBindCommand) => command.type === "bind"
         ? { schema: 1, type: "bind", nonce: command.nonce, sessionId: command.sessionId, epoch: command.epoch, runId: command.runId,
           provider: command.provider.name, model: command.model, thinkingLevel: command.thinkingLevel, ...bindContent(command) }
+        : command.type === "tool_inventory" ? { ...command, nativeTools: [] }
         : command.type === "stop_children" ? { ...command, settled: [], uncertain: [] } : { ...command, ack: true }) as never,
     } : {}),
     transportFactory: launch => {

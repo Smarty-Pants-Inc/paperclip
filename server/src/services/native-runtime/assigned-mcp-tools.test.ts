@@ -5,7 +5,7 @@ import type { Db } from "@paperclipai/db";
 import { ToolGatewayHttpError, type ToolGatewayDescriptor, type ToolGatewayService } from "../tool-gateway.js";
 import {
   ASSIGNED_SCHEMA_ADMISSION_CACHE_ENTRIES, ASSIGNED_SCHEMA_LISTING_BUDGET_BYTES, assignedSchemaAdmissionCacheSize,
-  createAssignedMcpTools, getAssignedMcpGateway, registerAssignedMcpGateway,
+  assignedToolName, createAssignedMcpTools, getAssignedMcpGateway, registerAssignedMcpGateway,
 } from "./assigned-mcp-tools.js";
 import { admitToolInputSchema } from "../../vendor/paperclip-runner/index.js";
 import { startOpenCodeMcpBridge } from "../../vendor/paperclip-runner/testing.js";
@@ -38,6 +38,24 @@ function fixture(tools: ToolGatewayDescriptor[]) {
 describe("assigned MCP runner tools", () => {
   const searchName = "paperclip_search_assigned_tools";
   const callName = "paperclip_call_assigned_tool";
+
+  it("snapshots the earliest applicable connection install and label as host-only Pi provenance", async () => {
+    const rows = [
+      { connectionId: "github", connectionName: "Z renamed GitHub", createdAt: new Date("2026-01-03") },
+      { connectionId: "github", connectionName: "Z renamed GitHub", createdAt: new Date("2026-01-01") },
+      { connectionId: "google", connectionName: "A Google", createdAt: new Date("2026-01-02") },
+    ];
+    const db = { select: () => ({ from: () => ({ innerJoin: () => ({ where: async () => rows }) }) }) } as unknown as Db;
+    const github = { ...descriptor("github:read_pr"), connectionId: "github" };
+    const google = { ...descriptor("google:read_doc"), connectionId: "google" };
+    const f = fixture([github, google]);
+    const assigned = await createAssignedMcpTools({ ...f, provenanceBinding: { db, companyId: "company", agentId: "agent" } });
+    rows[1]!.createdAt = new Date("2026-01-04"); // Later edits cannot reorder a pinned catalog.
+    expect(assigned.provenance(assignedToolName(github.name))).toEqual({ connectionId: "github", connectionName: "Z renamed GitHub", installedAt: "2026-01-01T00:00:00.000Z" });
+    expect(assigned.provenance(assignedToolName(google.name))).toMatchObject({ connectionId: "google", installedAt: "2026-01-02T00:00:00.000Z" });
+    expect(assigned.definitions().every(tool => !Object.hasOwn(tool, "paperclipToolSource"))).toBe(true);
+    expect(assigned.provenance("request_human_input")).toBeUndefined();
+  });
 
   it.each(["", " \t\n"])("discovers and calls assigned tools through MCP with a blank schema reference %j", async schemaTool => {
     const github = descriptor("github_bot:read_pull_request");

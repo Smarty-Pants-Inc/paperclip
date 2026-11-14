@@ -1,10 +1,26 @@
 import { createHash } from "node:crypto";
 import { connect } from "node:net";
+import { CAPABILITY_SEMANTIC_TOOL_CATALOG } from "../../semantic-tools/catalog.js";
 
 /** Private IPC only: never put these records on Pi stdin/stdout or in its journal. */
 export const PI_BIND_MAX_FRAME_BYTES = 1024 * 1024;
 export const PI_BIND_TIMEOUT_MS = 5000;
 export const PI_BIND_ERROR = "Pi private request rejected";
+/** OpenAI Chat Completions `tools`: "A maximum of 128 functions are supported."
+ * https://platform.openai.com/docs/api-reference/chat/create#chat-create-tools
+ * piManagedProviderApi maps gateway `chat` to openai-completions. This is the
+ * TOTAL request-tool budget: subtract the measured active native/extension count.
+ * Do not apply it to Messages/Responses. No universal 128-tool top-level cap
+ * is documented for Messages at https://platform.claude.com/docs/en/api/messages/create
+ * (checked 2026-11-14). The inline-tools beta's separate 10,000/4MB bounds are
+ * not a 128 top-level cap. This does not claim Messages requests are unlimited.
+ * On overflow, connection tools follow the earliest applicable company/agent
+ * install's createdAt, then immutable connectionId, then original tool name.
+ * Missing install provenance sorts last; renaming a connection never reorders it.
+ */
+export const PI_DYNAMIC_TOOL_LIMIT_BY_API: Readonly<Partial<Record<PiBindProvider["api"], number>>> = Object.freeze({ "openai-completions": 128 });
+const PI_CORE_TOOL_NAMES = new Set(CAPABILITY_SEMANTIC_TOOL_CATALOG.map(tool => tool.operationId as string));
+export interface PiToolDiagnostic { code: string; message: string; [key: string]: unknown }
 export type PiThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export interface Origin { readonly epoch: number; readonly runId: string; readonly turnId: string }
 export interface PiDynamicTool { name: string; description: string; inputSchema: Record<string, unknown> }
@@ -110,9 +126,11 @@ export interface BindRequest extends Envelope, PiBindingConfig {
 }
 export interface TurnRequest extends Envelope, Origin { type: "begin_turn" | "settle" }
 export interface AnnounceRequest extends Envelope { type: "announce"; toolCallId: string; origin: Origin }
+export interface ToolInventoryRequest extends Envelope { type: "tool_inventory" }
+export interface ToolInventoryReceipt extends Envelope { type: "tool_inventory"; nativeTools: string[] }
 export interface ParkReadyRequest extends Envelope { type: "park_ready" }
 export interface StopChildrenRequest extends Envelope { type: "stop_children" }
-export type PiBindCommand = BindRequest | TurnRequest | AnnounceRequest | ParkReadyRequest | StopChildrenRequest;
+export type PiBindCommand = BindRequest | TurnRequest | AnnounceRequest | ToolInventoryRequest | ParkReadyRequest | StopChildrenRequest;
 export interface BindReceipt extends Envelope {
   type: "bind"; epoch: number; runId: string; provider: string; model: string; thinkingLevel: PiThinkingLevel;
   instructionHash: string; instructionLength: number; toolRevision: string; homeDigest?: string;
@@ -123,9 +141,9 @@ export interface ParkReadyResult { ready: boolean; reasons: string[] }
 export interface StopChildrenResult { settled: string[]; uncertain: string[] }
 export interface ParkReadyReceipt extends Envelope, ParkReadyResult { type: "park_ready" }
 export interface StopChildrenReceipt extends Envelope, StopChildrenResult { type: "stop_children" }
-export type PiBindReceipt = BindReceipt | TurnReceipt | AnnounceReceipt | ParkReadyReceipt | StopChildrenReceipt;
+export type PiBindReceipt = BindReceipt | TurnReceipt | AnnounceReceipt | ToolInventoryReceipt | ParkReadyReceipt | StopChildrenReceipt;
 export type PiBindResponse<C extends PiBindCommand> = C extends BindRequest ? BindReceipt
-  : C extends AnnounceRequest ? AnnounceReceipt : C extends ParkReadyRequest ? ParkReadyReceipt
+  : C extends AnnounceRequest ? AnnounceReceipt : C extends ToolInventoryRequest ? ToolInventoryReceipt : C extends ParkReadyRequest ? ParkReadyReceipt
   : C extends StopChildrenRequest ? StopChildrenReceipt : TurnReceipt;
 export interface PiToolResult {
   content: Array<{ type: "text"; text: string }>;
@@ -164,16 +182,13 @@ function validDynamicTool(value: unknown): value is PiDynamicTool {
  * Reserve the alias namespace so native names cannot impersonate generated names.
  * The reverse map stays host-private; Pi and its receipts use only normalized tools.
  */
-export function normalizePiDynamicTools(values: readonly unknown[]): {
-  tools: PiDynamicTool[]; toolNames: Record<string, string>; diagnostics: Array<{ code: string; message: string }>;
+export function normalizePiDynamicTools(values: readonly unknown[], api?: PiBindProvider["api"], nativeToolCount = 0): {
+  tools: PiDynamicTool[]; toolNames: Record<string, string>; diagnostics: PiToolDiagnostic[]; catalog: Readonly<Record<string, unknown>>[];
 } {
-  const tools: PiDynamicTool[] = [], toolNames: Record<string, string> = Object.create(null);
-  const diagnostics: Array<{ code: string; message: string }> = [];
+  const toolNames: Record<string, string> = Object.create(null);
+  const diagnostics: PiToolDiagnostic[] = [];
+  const entries: Array<{ tool: PiDynamicTool; originalName: string; core: boolean; connectionId: string; connectionName: string; installedAt: number }> = [];
   for (const [index, value] of values.entries()) {
-    if (tools.length === 128) {
-      diagnostics.push({ code: "pi_dynamic_tool_limit", message: `Pi kept 128 dynamic tools; omitted ${values.length - index} remaining definitions.` });
-      break;
-    }
     try {
       if (!object(value) || typeof value.name !== "string" || !value.name.trim() || !object(value.inputSchema)) throw new Error();
       const originalName = value.name;
@@ -190,19 +205,57 @@ export function normalizePiDynamicTools(values: readonly unknown[]): {
       const inputSchema: unknown = JSON.parse(JSON.stringify({ ...value.inputSchema, type: value.inputSchema.type ?? "object" }));
       const tool = { name, description, inputSchema };
       if (!validDynamicTool(tool)) throw new Error();
-      tools.push(tool); toolNames[name] = originalName;
+      const source = object(value.paperclipToolSource) ? value.paperclipToolSource : {};
+      // Only the controller supplies provenance, never the tool's JSON schema.
+      // The live catalog protects semantic actions even for older controllers;
+      // the authority marks its additional bridge/finish/attachment tools core.
+      const core = PI_CORE_TOOL_NAMES.has(originalName) || source.kind === "core";
+      const connectionId = typeof source.connectionId === "string" && text(source.connectionId, 256) ? source.connectionId : "unattributed";
+      const connectionName = typeof source.connectionName === "string" && text(source.connectionName, 256) ? source.connectionName : connectionId;
+      const installedAt = typeof source.installedAt === "string" ? Date.parse(source.installedAt) : NaN;
+      entries.push({ tool, originalName, core, connectionId, connectionName, installedAt: Number.isFinite(installedAt) ? installedAt : Infinity });
+      toolNames[name] = originalName;
     } catch {
       // Never echo arbitrary schema/description data in a diagnostic.
       diagnostics.push({ code: "pi_dynamic_tool_dropped", message: `Pi dropped unusable dynamic tool definition ${index + 1}.` });
     }
   }
-  return { tools, toolNames, diagnostics };
+  const catalog = entries.map(entry => ({ ...entry.tool, name: entry.originalName, paperclipToolSource: entry.core ? { kind: "core" }
+    : { kind: "connection", connectionId: entry.connectionId, connectionName: entry.connectionName,
+      ...(Number.isFinite(entry.installedAt) ? { installedAt: new Date(entry.installedAt).toISOString() } : {}) } }));
+  const core = entries.filter(entry => entry.core);
+  const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];
+  if (!Number.isSafeInteger(nativeToolCount) || nativeToolCount < 0) throw new Error("Pi native tool inventory rejected");
+  const dynamicCap = cap === undefined ? undefined : cap - nativeToolCount;
+  if (dynamicCap !== undefined && core.length > dynamicCap) {
+    throw new Error(`pi_core_tool_limit: Pi cannot deliver ${core.length} Paperclip core tools plus ${nativeToolCount} active native/extension tools: ${api} total tool cap ${cap}. No prompt was sent.`);
+  }
+  let connections = entries.filter(entry => !entry.core);
+  if (dynamicCap !== undefined && entries.length > dynamicCap) {
+    const compare = (a: string, b: string) => a < b ? -1 : a > b ? 1 : 0;
+    connections.sort((a, b) => (a.installedAt < b.installedAt ? -1 : a.installedAt > b.installedAt ? 1 : 0)
+      || compare(a.connectionId, b.connectionId) || compare(a.originalName, b.originalName));
+    const omitted = connections.slice(dynamicCap - core.length);
+    connections = connections.slice(0, dynamicCap - core.length);
+    const groups = new Map<string, { connectionId: string; connectionName: string; omittedToolCount: number }>();
+    for (const entry of omitted) {
+      const group = groups.get(entry.connectionId) ?? { connectionId: entry.connectionId, connectionName: entry.connectionName, omittedToolCount: 0 };
+      group.omittedToolCount++; groups.set(entry.connectionId, group);
+      delete toolNames[entry.tool.name];
+    }
+    const omittedConnections = [...groups.values()];
+    diagnostics.push({ code: "pi_dynamic_tool_limit", cap, api, nativeToolCount, coreToolCount: core.length, deliveredToolCount: core.length + connections.length, omittedToolCount: omitted.length, omittedConnections,
+      message: `Pi total tool cap ${cap} (${nativeToolCount} active native/extension tools): omitted ${omitted.length} connection tools: ${omittedConnections.map(group => `${group.connectionName} (${group.connectionId}): ${group.omittedToolCount}`).join("; ")}. All ${core.length} Paperclip core tools retained.` });
+  }
+  // A catalog that fits (or an API with no documented cap) is unchanged.
+  const selected = dynamicCap !== undefined && entries.length > dynamicCap ? [...core, ...connections] : entries;
+  return { tools: selected.map(entry => entry.tool), toolNames, diagnostics, catalog };
 }
-export function validateBindingConfig(value: unknown): value is PiBindingConfig {
+export function validateBindingConfig(value: unknown, api?: PiBindProvider["api"]): value is PiBindingConfig {
   if (!object(value) || !integer(value.epoch, 1) || !text(value.runId, 256) || !text(value.model, 512)
     || !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value.thinkingLevel as string)
     || typeof value.instructions !== "string" || Buffer.byteLength(value.instructions) > 256 * 1024
-    || !Array.isArray(value.tools) || value.tools.length > 128
+    || !Array.isArray(value.tools) || (api !== undefined && PI_DYNAMIC_TOOL_LIMIT_BY_API[api] !== undefined && value.tools.length > PI_DYNAMIC_TOOL_LIMIT_BY_API[api]!)
     || (value.homeDigest !== undefined && !isDigest(value.homeDigest))
     || (value.toolSocketPath !== undefined && !validSocketPath(value.toolSocketPath))) return false;
   const names = new Set<string>();
@@ -238,7 +291,7 @@ function validProvider(value: unknown, model: string): value is PiBindProvider {
   return model.startsWith(`${value.name}/`) && ids.has(model.slice(value.name.length + 1));
 }
 export function validateBindRequest(value: unknown): value is BindRequest {
-  return envelope(value) && value.type === "bind" && validateBindingConfig(value) && integer(value.expectedPriorEpoch)
+  return envelope(value) && value.type === "bind" && object(value.provider) && validateBindingConfig(value, value.provider.api as PiBindProvider["api"]) && integer(value.expectedPriorEpoch)
     && value.epoch === value.expectedPriorEpoch + 1 && validProvider(value.provider, value.model);
 }
 export function validatePiBindCommand(value: unknown): value is PiBindCommand {
@@ -247,7 +300,7 @@ export function validatePiBindCommand(value: unknown): value is PiBindCommand {
     case "bind": return validateBindRequest(value);
     case "begin_turn": case "settle": return validateOrigin(value);
     case "announce": return validateOrigin(value.origin) && text(value.toolCallId, 1024);
-    case "park_ready": case "stop_children": return true;
+    case "tool_inventory": case "park_ready": case "stop_children": return true;
     default: return false;
   }
 }
@@ -268,6 +321,9 @@ export function validateBindReceipt(value: unknown, request: PiBindCommand): val
     }
     case "begin_turn": case "settle": return value.ack === true && validateOrigin(value) && sameOrigin(value, request);
     case "announce": return value.ack === true && value.toolCallId === request.toolCallId && validateOrigin(value.origin) && sameOrigin(value.origin, request.origin);
+    // The existing IPC frame bound limits memory; do not invent a native-tool
+    // count limit for APIs whose per-request tool count is not documented.
+    case "tool_inventory": return Array.isArray(value.nativeTools) && value.nativeTools.every(name => text(name, 128)) && new Set(value.nativeTools).size === value.nativeTools.length;
     case "park_ready": return typeof value.ready === "boolean" && stringList(value.reasons) && (!value.ready || value.reasons.length === 0);
     case "stop_children": return stringList(value.settled) && stringList(value.uncertain);
   }

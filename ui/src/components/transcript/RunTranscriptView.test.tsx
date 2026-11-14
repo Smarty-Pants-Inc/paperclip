@@ -6,9 +6,33 @@ import { parseAcpxStdoutLine } from "@paperclipai/adapter-utils/acpx-engine/ui";
 import { buildTranscript, type RunLogChunk, type TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { ThemeProvider } from "../../context/ThemeContext";
+import { paperclipRunnerUIAdapter } from "../../adapters/paperclip-runner";
 import { RunTranscriptView, keyTranscriptBlocks, normalizeTranscript } from "./RunTranscriptView";
 
 describe("RunTranscriptView", () => {
+  it.each(["compact", "comfortable"] as const)("opens tool-cap system notices without a click in %s mode", (density) => {
+    const message = "Pi total tool cap 128 (7 active native/extension tools): omitted 30 connection tools: GitHub (github-id): 6; Google Workspace (google-id): 24. All 61 Paperclip core tools retained.";
+    const entries = paperclipRunnerUIAdapter.parseStdoutLine(JSON.stringify({
+      type: "paperclip.prp.event",
+      event: { eventType: "harness.diagnostic", payload: { code: "pi_dynamic_tool_limit", message, omittedToolCount: 30 } },
+    }), "2026-11-14T10:00:00.000Z");
+    const html = renderToStaticMarkup(<RunTranscriptView density={density} entries={[
+      { kind: "system", ts: "2026-11-14T09:59:59.000Z", text: "Session attached" },
+      ...entries,
+    ]} />);
+    expect(html).toContain("2 system");
+    expect(html).toContain(`Runner: ${message}`);
+    expect(html).toContain("Session attached");
+  });
+
+  it("keeps ordinary system-message groups collapsed", () => {
+    const html = renderToStaticMarkup(<RunTranscriptView entries={[
+      { kind: "system", ts: "2026-11-14T10:00:00.000Z", text: "Session attached" },
+    ]} />);
+    expect(html).toContain("1 system");
+    expect(html).not.toContain("Session attached");
+  });
+
   it("renders provider activity semantically without dumping the payload", () => {
     const html = renderToStaticMarkup(<RunTranscriptView entries={[{ kind: "provider_activity", ts: "2026-08-21T12:00:00.000Z", family: "plan", eventType: "plan.updated", status: "completed", title: "Plan", summary: "Plan completed", payload: { steps: [{ stepId: "s1", body: "Validate schemas", status: "completed" }], hiddenSecret: "must-not-render" } }]} />);
     expect(html).toContain("Plan");

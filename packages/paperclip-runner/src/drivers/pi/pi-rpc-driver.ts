@@ -7,7 +7,7 @@ import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-conte
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createPiProviderBinding, directPiProviderConfiguration, piManagedProviderApi, usesPiProviderLoopback } from "../acpx/pi-provider-loopback.js";
-import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
+import { PI_BIND_MAX_FRAME_BYTES, RunAuthority, normalizePiDynamicTools, sendPiBindRequest, validateBindReceipt, validateBindRequest, validateBindingConfig, validateOrigin, validatePiToolResult, type Origin, type PiBindCommand, type PiBindResponse, type PiBindProvider, type PiDynamicTool, type PiToolCallRequest, type PiToolResult } from "./pi-bind-protocol.js";
 import { startPiCallbackServer } from "./pi-rpc-callback-server.js";
 import { writePrivateFile } from "../private-file.js";
 import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } from "./pi-models-merge.js";
@@ -183,7 +183,9 @@ export class PiRpcDriver implements HarnessDriver {
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
     const instructionBoundary = `paperclip-host-${randomUUID()}`;
-    const initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
+    // Bootstrap registers tools without prompting. Only a started Pi can report
+    // the actual active native/extension inventory used for the API budget.
+    let initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
     const agentHome = this.#options.model && usesPiProviderLoopback(this.#options.model, environment)
       ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
       : piCompanySkillsAgentHome(environment);
@@ -207,6 +209,7 @@ export class PiRpcDriver implements HarnessDriver {
     let closeProvider: (() => Promise<void>) | undefined;
     let resident: PiResidentState | undefined;
     let callbacks: PiHostCallbacks | undefined;
+    let bootstrapProvider: PiBindProvider | undefined;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
       await mkdir(agentHome, { recursive: true, mode: 0o700 });
       environment.PI_CODING_AGENT_DIR = agentHome;
@@ -227,6 +230,7 @@ export class PiRpcDriver implements HarnessDriver {
         // capability and prepares exactly one preallocated host turn, without IPC.
         const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
         closeProvider = provider.close;
+        bootstrapProvider = provider.provider;
         let privateDirectory: string | undefined;
         try {
           privateDirectory = await realpath(await mkdtemp(join(tmpdir(), "pcpi-")));
@@ -234,7 +238,7 @@ export class PiRpcDriver implements HarnessDriver {
           const socketPath = join(privateDirectory, "bind.sock");
           if (Buffer.byteLength(socketPath) > 103 || Buffer.byteLength(join(privateDirectory, "tool.sock")) > 103) throw new Error("Pi private socket path exceeds Unix limit");
           const origin = { epoch: 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
-          const context = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
+          const context = initialContext;
           callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
           const toolSocketPath = join(privateDirectory, "tool.sock");
           // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
@@ -297,7 +301,34 @@ export class PiRpcDriver implements HarnessDriver {
         const live = ready;
         if (live.sessionId !== recovery.snapshot.driverSessionId || live.sessionFile !== sessionFile) throw piSessionFileInvalid();
       }
-      const identity = await admitPiRpcSession(port, config, input.signal);
+      let identity = await admitPiRpcSession(port, config, input.signal);
+      if (resident && bootstrapProvider) {
+        const send = async <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => {
+          const timeoutMs = this.#options.startupTimeoutMs ?? 5000;
+          const receipt = await withAbort(withTimeout((this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out"), input.signal);
+          if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
+          return receipt;
+        };
+        const inventory = await send({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: input.normalizedSessionId });
+        const context = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext,
+          undefined, { api: bootstrapProvider.api, nativeToolCount: inventory.nativeTools.length });
+        if (context.instructions !== initialContext.instructions || JSON.stringify(context.tools) !== JSON.stringify(initialContext.tools)) {
+          const previous = resident.binding!.origin;
+          await send({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...previous });
+          const origin = { epoch: resident.epoch + 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
+          const request = { schema: 1 as const, type: "bind" as const, nonce: randomUUID(), sessionId: input.normalizedSessionId,
+            expectedPriorEpoch: resident.epoch, epoch: origin.epoch, runId: input.runId, provider: bootstrapProvider,
+            model: config.model, thinkingLevel: config.piRpcThinkingLevel!, instructions: context.instructions, tools: context.tools,
+            ...(resident.toolSocketPath ? { toolSocketPath: resident.toolSocketPath } : {}) };
+          await send(request);
+          resident.epoch = origin.epoch;
+          resident.binding = { origin, close: resident.binding!.close, initial: true };
+          await send({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...origin });
+          identity = await admitPiRpcSession(port, config, input.signal);
+          await writePrivateFile(instructionFile, piHostInstructionSegment(context.instructions, instructionBoundary));
+        }
+        resident.context = initialContext = context;
+      }
       if (recovery && identity.providerSessionId !== recovery.snapshot.driverSessionId) throw piSessionFileInvalid();
       // Discovery is separate from inference. Keep catalog/auth contents private;
       // the receipt exposes only qualified version, provider names and auth shape.
@@ -353,7 +384,10 @@ interface PiRunContext {
   instructions: string;
   tools: PiDynamicTool[];
   toolNames: Record<string, string>;
-  diagnostics: Array<{ code: string; message: string }>;
+  diagnostics: Array<{ code: string; message: string; [key: string]: unknown }>;
+  catalog: readonly Readonly<Record<string, unknown>>[];
+  api?: PiBindProvider["api"];
+  nativeToolCount: number;
 }
 interface PiResidentState {
   modelConfiguration: PiManagedModel;
@@ -500,6 +534,7 @@ export class PiRpcHarnessSession implements HarnessSession {
   readonly #piMetadata: Record<string, unknown>;
   #identity: PiNativeAdmittedIdentity;
   #thinkingLoweringReported = false;
+  readonly #toolLimitReportedRuns = new Set<string>();
   #initialContext: PiRunContext;
   readonly #agentHome: string;
   readonly #instructionFile: string;
@@ -559,7 +594,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#abortTimeoutMs = Number.isFinite(state.abortTimeoutMs) ? Math.max(1, Math.min(30_000, state.abortTimeoutMs!)) : 5000;
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
-    for (const diagnostic of state.initialContext.diagnostics) this.#emit("harness.diagnostic", diagnostic);
+    this.#reportToolDiagnostics(state.initialContext);
     void this.#pump();
   }
 
@@ -598,9 +633,11 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
       if (this.#resident) {
         const previous = this.#resident.context;
+        const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal);
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
           input.dynamicTools,
-          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
+          input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous,
+          { api: previous.api, nativeToolCount: inventory.nativeTools.length });
         // The proxy sends attach before every turn, including the bootstrap and
         // same-run post-claim admission. Do not consume INITIAL or rotate twice.
         if (this.#resident.binding) {
@@ -621,7 +658,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         this.#initialContext = context;
       }
       this.#runId = input.runId;
-      for (const diagnostic of (this.#resident?.context ?? this.#initialContext).diagnostics) this.#emit("harness.diagnostic", diagnostic);
+      this.#reportToolDiagnostics(this.#resident?.context ?? this.#initialContext);
     }), { runId: input.runId }, true);
   }
 
@@ -699,8 +736,20 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#interrupting) await this.#measure("runner.pi.interrupt_wait", () => this.#interrupting!, { runId });
   }
 
+  #reportToolDiagnostics(context: PiRunContext): void {
+    for (const diagnostic of context.diagnostics) {
+      if (diagnostic.code === "pi_dynamic_tool_limit") {
+        if (this.#toolLimitReportedRuns.has(this.#runId)) continue;
+        this.#toolLimitReportedRuns.add(this.#runId);
+      }
+      this.#emit("harness.diagnostic", diagnostic);
+    }
+  }
+
   #effectiveContext(): Record<string, unknown> {
-    return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata };
+    const context = this.#resident?.context ?? this.#initialContext;
+    return { model: this.#identity.model, piRpcThinkingLevel: this.#identity.piRpcThinkingLevel, piMetadata: this.#piMetadata,
+      toolDelivery: { api: context.api, nativeToolCount: context.nativeToolCount, dynamicToolCount: context.tools.length, totalToolCount: context.nativeToolCount + context.tools.length } };
   }
 
   #recordAdmission(identity: PiNativeAdmittedIdentity): void {
@@ -1752,18 +1801,21 @@ function sameJson(a: unknown, b: unknown): boolean {
   try { return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b)); } catch { return false; }
 }
 
-function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[] | undefined, runtimeContext: unknown, previous?: PiRunContext): PiRunContext {
+function bindingContext(baseInstructions: string, tools: readonly Readonly<Record<string, unknown>>[] | readonly PiDynamicTool[] | undefined, runtimeContext: unknown, previous?: PiRunContext,
+  delivery: { api?: PiBindProvider["api"]; nativeToolCount: number } = { api: previous?.api, nativeToolCount: previous?.nativeToolCount ?? 0 }): PiRunContext {
   if (typeof baseInstructions !== "string" || (tools !== undefined && !Array.isArray(tools))) throw new Error("Pi binding context rejected");
   // Freeze serializable context NOW. Never hash one object then look it up again
   // from a mutable caller when the request is eventually admitted.
   const contextJson = runtimeContext === undefined ? undefined : JSON.stringify(runtimeContext);
   if (runtimeContext !== undefined && contextJson === undefined) throw new Error("Pi runtime context is not serializable");
   const frozenContext: unknown = contextJson === undefined ? undefined : JSON.parse(contextJson);
-  const normalized = tools === undefined && previous
-    ? { tools: previous.tools, toolNames: previous.toolNames, diagnostics: previous.diagnostics }
-    : normalizePiDynamicTools(tools ?? []);
-  return { baseInstructions, runtimeContext: frozenContext,
-    instructions: contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`, ...normalized };
+  const normalized = tools === undefined && previous && previous.api === delivery.api && previous.nativeToolCount === delivery.nativeToolCount
+    ? { tools: previous.tools, toolNames: previous.toolNames, diagnostics: previous.diagnostics, catalog: previous.catalog }
+    : normalizePiDynamicTools(tools ?? previous?.catalog ?? [], delivery.api, delivery.nativeToolCount);
+  const limitNote = normalized.diagnostics.find(diagnostic => diagnostic.code === "pi_dynamic_tool_limit");
+  const instructions = contextJson === undefined ? baseInstructions : `${baseInstructions}\n\n<runtime_context>\n${contextJson}\n</runtime_context>`;
+  return { baseInstructions, runtimeContext: frozenContext, api: delivery.api, nativeToolCount: delivery.nativeToolCount,
+    instructions: limitNote ? `${instructions}\n\n<tool_delivery_notice>\n${limitNote.message} Do not claim these omitted tools were delivered; permissions are unchanged.\n</tool_delivery_notice>` : instructions, ...normalized };
 }
 
 async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPath" | "directory">): Promise<void> {
