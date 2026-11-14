@@ -34,6 +34,7 @@ import { CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE 
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { PENDING_CONTINUATION_BOUND_MS } from "../recovery-continuation-pacing.js";
+import { ISSUE_REVIEW_PATH_LOST_WAKE_REASON } from "./review-path-recovery.js";
 import { attributeBlock, BLOCK_ATTRIBUTION_WINDOW_MS, blockedStatusDetailsSql } from "../interruption-block-release.js";
 import { ASSIGNED_WORK_CONTINUED_ACTION, taskAutomaticAttempts } from "./task-automatic-attempts.js";
 import { STRANDED_CONTINUATION_MAX_AGE_MS, STRANDED_KIND, strandedHoldContinuesAutomatically, type StrandedHoldRun } from "./stranded-hold-continuation.js";
@@ -76,7 +77,7 @@ type IssueRow = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" |
   | "projectId" | "statusVersion" | "executionState" | "identifier" | "createdAt" | "blockedOwnerNotifiedAt" | "conversationState">;
 
 type RunRow = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status" | "agentId" | "runtimeMode" | "errorCode" | "finishedAt"
-  | "scheduledRetryAt" | "controllerBootId" | "controllerLeaseExpiresAt" | "controllerProcess" | "resultJson"> & { issueId: string };
+  | "scheduledRetryAt" | "controllerBootId" | "controllerLeaseExpiresAt" | "controllerProcess" | "resultJson" | "contextSnapshot"> & { issueId: string };
 
 export type AssignedWorkDeps = {
   enqueueWakeup: (agentId: string, opts: {
@@ -178,6 +179,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       scheduledRetryAt: heartbeatRuns.scheduledRetryAt, controllerBootId: heartbeatRuns.controllerBootId,
       controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt, controllerProcess: heartbeatRuns.controllerProcess,
       resultJson: sql<Record<string, unknown> | null>`jsonb_build_object('cancelledByActorType', ${heartbeatRuns.resultJson}->'cancelledByActorType')`,
+      contextSnapshot: heartbeatRuns.contextSnapshot,
     };
     const agentIds = [...new Set(issueRows.flatMap(issue => issue.assigneeAgentId ? [issue.assigneeAgentId] : []))];
     const blockedRows = issueRows.filter(issue => issue.status === "blocked");
@@ -186,7 +188,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const notSupersededByUserContinuation = interactionNotSupersededSql(issueThreadInteractions.companyId,
       sql`${issueThreadInteractions.issueId}::text`, issueThreadInteractions.createdAt);
 
-    const [activeRuns, latestRuns, wakes, chatWakes, nativePending, handoffs, goals, interactions, approvalRows,
+    const [activeRuns, latestRuns, wakes, reviewPathRecoveryRuns, reviewPathRecoveryWakes, chatWakes, nativePending, handoffs, goals, interactions, approvalRows,
       blockerRows, resolvedBlockerRows, childRows, actionMap, agentRows, companyRows, onboardingRows, blockActivity, interruptions,
       inReviewPersonMessages] = await Promise.all([
       database.select(runColumns).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
@@ -199,7 +201,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             r.finished_at as "finishedAt", r.scheduled_retry_at as "scheduledRetryAt",
             r.controller_boot_id as "controllerBootId", r.controller_lease_expires_at as "controllerLeaseExpiresAt",
             r.controller_process as "controllerProcess",
-            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType') as "resultJson"
+            jsonb_build_object('cancelledByActorType', r.result_json->'cancelledByActorType') as "resultJson",
+            r.context_snapshot as "contextSnapshot"
           from heartbeat_runs r
           where r.company_id = ${companyId} and (r.context_snapshot->>'issueId') = requested.id
           order by r.created_at desc limit 1
@@ -216,6 +219,21 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
                 > ${at.toISOString()}::timestamptz - ${`${DEFERRED_WAKE_PENDING_BOUND_MS} milliseconds`}::interval)))`,
           sql`${agentWakeupRequests.payload}->>'issueId' = any(${idParam})`))
         .groupBy(sql`${agentWakeupRequests.payload}->>'issueId'`),
+      database.selectDistinct({ issueId: sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'` })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = any(${idParam})`,
+          sql`(trim(coalesce(${heartbeatRuns.contextSnapshot}->>'wakeReason', '')) = ${ISSUE_REVIEW_PATH_LOST_WAKE_REASON}
+            or ${heartbeatRuns.contextSnapshot}->>'reviewPathRecoveryAttempt' = '1')`)),
+      database.selectDistinct({ issueId: sql<string>`${agentWakeupRequests.payload}->>'issueId'` })
+        .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+          sql`${agentWakeupRequests.idempotencyKey} like ${`${ISSUE_REVIEW_PATH_LOST_WAKE_REASON}:%`}`,
+          sql`${agentWakeupRequests.payload}->>'issueId' = any(${idParam})`,
+          sql`(${agentWakeupRequests.status} = 'queued'
+            or (${agentWakeupRequests.status} = 'deferred_issue_execution'
+              and ${agentWakeupRequests.createdAt} > ${at.toISOString()}::timestamptz - ${`${DEFERRED_WAKE_PENDING_BOUND_MS} milliseconds`}::interval)
+            or (${agentWakeupRequests.status} = 'claimed' and (${agentWakeupRequests.runId} is not null
+              or coalesce(${agentWakeupRequests.claimedAt}, ${agentWakeupRequests.createdAt})
+                > ${at.toISOString()}::timestamptz - ${`${DEFERRED_WAKE_PENDING_BOUND_MS} milliseconds`}::interval)))`)),
       database.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, companyId), inArray(issues.id, ids),
         unadmittedChatWakeupCondition(issues.id, issues.companyId))),
       database.select({ issueId: nativeRunFinalizations.issueId, runId: nativeRunFinalizations.runId,
@@ -340,6 +358,10 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const onboardingIds = new Set(onboardingRows.map(row => row.id));
     const inReviewPersonMessageIds = new Set((inReviewPersonMessages as Array<{ issueId: string }>).map(row => row.issueId));
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
+    const reviewPathRecoveryOwnerIds = new Set([
+      ...rowsOf<{ issueId: string }>(reviewPathRecoveryRuns).map(row => row.issueId),
+      ...rowsOf<{ issueId: string }>(reviewPathRecoveryWakes).map(row => row.issueId),
+    ]);
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
     const conversationReplyRuns = await conversationReplyRunsForLastMessages(database, {
@@ -401,6 +423,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             || (latest.status === "cancelled" && ["user", "board"].includes(String(json(latest.resultJson).cancelledByActorType)))),
         } : null,
         pendingWakes: (wakeCounts.get(issue.id) ?? 0) + (chatWakeIds.has(issue.id) ? 1 : 0),
+        reviewPathRecoveryOwner: reviewPathRecoveryOwnerIds.has(issue.id),
         nativeRecoveryPending: nativeIds.has(issue.id),
         pendingHandoff: handoffIds.has(issue.id),
         // Only a goal that is running and still wanted running starts turns by
@@ -535,6 +558,17 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
             or (w.status = 'deferred_issue_execution' and w.created_at > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)
             or (w.status = 'claimed' and (w.run_id is not null
               or coalesce(w.claimed_at, w.created_at) > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)))))`,
+        sql`not exists (select 1 from heartbeat_runs review_run where review_run.company_id = ${issues.companyId}
+          and review_run.context_snapshot->>'issueId' = ${issues.id}::text
+          and (trim(coalesce(review_run.context_snapshot->>'wakeReason', '')) = ${ISSUE_REVIEW_PATH_LOST_WAKE_REASON}
+            or review_run.context_snapshot->>'reviewPathRecoveryAttempt' = '1'))`,
+        sql`not exists (select 1 from agent_wakeup_requests review_wake where review_wake.company_id = ${issues.companyId}
+          and review_wake.payload->>'issueId' = ${issues.id}::text
+          and review_wake.idempotency_key like ${`${ISSUE_REVIEW_PATH_LOST_WAKE_REASON}:%`}
+          and (review_wake.status = 'queued'
+            or (review_wake.status = 'deferred_issue_execution' and review_wake.created_at > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)
+            or (review_wake.status = 'claimed' and (review_wake.run_id is not null
+              or coalesce(review_wake.claimed_at, review_wake.created_at) > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz))))`,
         sql`not exists (select 1 from issue_thread_interactions t where t.company_id = ${issues.companyId}
           and t.issue_id = ${issues.id} and t.status = 'pending'
           and ${interactionNotSupersededSql(sql`t.company_id`, sql`t.issue_id::text`, sql`t.created_at`)})`,

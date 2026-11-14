@@ -27,6 +27,7 @@ export const PENDING_INTENTS = [
   "pending_handoff",
   "session_goal",
   "system_recovery_working",
+  "review_path_recovery",
 ] as const;
 export type PendingIntent = (typeof PENDING_INTENTS)[number];
 
@@ -148,6 +149,8 @@ export type AssignedWorkFacts = {
     operatorStopped: boolean;
   } | null;
   pendingWakes: number;
+  /** The existing review-path recovery owner has an outstanding wake or run. */
+  reviewPathRecoveryOwner?: boolean;
   nativeRecoveryPending: boolean;
   pendingHandoff: boolean;
   sessionGoal: "active" | "paused" | null;
@@ -240,6 +243,7 @@ export function evaluateAssignedWork(facts: AssignedWorkFacts, now: Date = new D
 }
 
 function pendingIntent(facts: AssignedWorkFacts, now: Date): PendingIntent | null {
+  if (facts.issue.status === "in_review" && facts.reviewPathRecoveryOwner) return "review_path_recovery";
   if (facts.pendingWakes > 0) return "queued_wake";
   if (facts.activeRuns.some(run => run.status === "scheduled_retry")) return "scheduled_retry";
   if (facts.nativeRecoveryPending) return "native_recovery";
