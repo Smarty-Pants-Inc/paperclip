@@ -255,16 +255,30 @@ Completion contracts belong to runs, not to the reusable Codex provider session
 or its native facades. The provider snapshot records the run identity that owns
 its current binding. A `run.prepare` for a different known run may adopt its own
 contract only over settled state: no active or ambiguous turn, startup attempt,
-receipt-limit interruption, pending tool call, undelivered event, continuing goal,
-deferred terminal, descendant work, or live provider request. An existing thread
-uses the ordinary `run.attach` rebinding path; preparation before a thread exists
-updates the saved binding directly. Same-run contract changes and provider-profile
-changes still refuse without replacing the saved state.
+receipt-limit interruption, pending tool call, substantive undelivered event,
+continuing goal, deferred terminal, descendant work, or live provider request.
+Restore's `session.resumed` and startup ownership/retirement diagnostics describe
+admission history, not active work; they do not block this attachment. Unknown
+diagnostics and other undelivered events remain fenced. The existing attachment
+path retains diagnostics for draining and discards its superseded restore notice.
+The stricter empty-event rule for OpenCode launch-profile rebinding is unchanged.
+An existing thread uses the ordinary `run.attach` rebinding path; preparation
+before a thread exists updates the saved binding directly. Same-run contract
+changes and provider-profile changes still refuse without replacing saved state.
+Pi's run-scoped runtime context (including updated company skills) may refresh at
+this same boundary; a changed context retires the predecessor process before the
+next turn opens the retained conversation with its new contract and context.
 
-Older snapshots without a recorded run owner retain the strict contract equality
-check. An unchanged successful preparation records the current owner; an explicit
-`run.attach` records its target owner. A changed contract alone is never evidence
-that an ownerless snapshot belongs to another run.
+C8 snapshots have no recorded run owner. After the public `run.prepare` command
+restores that state under the authenticated current runner authority, it may
+establish ownership through the same settled `run.attach` path, without replaying
+the old task. This is attachment admission, not an inference from changed or equal
+contracts and not a claim that an unknown remote owner is dead. All live-work,
+startup, tool, goal, descendant, and immutable profile guards still apply. The
+private preparation helper alone cannot migrate a changed ownerless contract;
+it retains strict equality unless invoked through this restored command path.
+Once attachment records the current owner, same-run contract changes refuse,
+and repeat preparation is stable.
 
 A Codex `run.attach` that would change the durable provider profile or a
 protected launch argument fails with the closed classification

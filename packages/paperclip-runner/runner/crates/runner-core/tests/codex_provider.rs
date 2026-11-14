@@ -26,6 +26,8 @@ mod human_input_validation;
 #[path = "support/codex_tail_drain.rs"]
 mod tail_drain;
 
+include!("support/cross_run_judge.rs");
+
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 static RECEIPT_LIMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 

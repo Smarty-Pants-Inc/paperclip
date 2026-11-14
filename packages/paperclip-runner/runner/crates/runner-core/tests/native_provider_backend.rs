@@ -1,4 +1,6 @@
 use std::fs;
+
+include!("support/pi_reopened_issue.rs");
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
