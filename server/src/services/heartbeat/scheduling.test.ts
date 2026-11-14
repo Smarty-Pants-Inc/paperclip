@@ -13,7 +13,6 @@ import { heartbeatService } from "../heartbeat.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { companyService } from "../companies.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../agent-lifecycle.js";
-import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { issueService } from "../issues.js";
 import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -815,24 +814,15 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       await quiet();
     });
 
-    // M1.5 explicitly distinguishes company/manual pause from the import
-    // safety hold: a due check is skipped visibly, not replayed on Resume.
-    it("clears a check due while the company is paused and does not replay it on committed resume", async () => {
+    it("disarms while the company is paused and reactivates on its committed resume", async () => {
       const f = await fixture();
       await companyService(db).update(f.company.id, { status: "paused" });
       await start(f); await quiet();
-      expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: null, monitorAttemptCount: 0 });
-      expect(parseIssueExecutionState((await readIssue(f.issue.id)).executionState)?.monitor)
-        .toMatchObject({ status: "cleared", clearReason: "dispatch_skipped" });
-      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-      expect(comments.map(c => c.body)).toEqual([
-        `The scheduled check due at ${dueAt.toISOString()} was skipped because Scheduled agent was paused; it won't run again unless re-armed.`,
-      ]);
       expect(coordinator!.nextWakeAt()).toBeNull();
       await companyService(db).update(f.company.id, { status: "active" });
+      await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
+      expect(f.deps.enqueueWakeup).toHaveBeenCalledOnce();
       await quiet();
-      expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
-      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(1);
     });
 
     it.each(["resume", "manual"] as const)("stays SQL-quiet on an overdue import hold until lifecycle %s changes eligibility", async action => {
@@ -846,8 +836,17 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
         expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
         expect(f.deps.enqueueWakeup).not.toHaveBeenCalled();
         expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
-        if (action === "resume") await createAgentLifecycle(db).resumeAgent(f.agent.id);
-        else await createAgentLifecycle(db).pauseAgent(f.agent.id, "manual");
+        if (action === "resume") {
+          await createAgentLifecycle(db).resumeAgent(f.agent.id);
+          // The committed Resume still projects paused until its driver finishes.
+          // It must not look like a new manual pause to the monitor coordinator.
+          expect((await db.select().from(agents).where(eq(agents.id, f.agent.id)))[0])
+            .toMatchObject({ status: "paused", lifecycleState: "resuming", lifecycleHolds: [] });
+          expect(await f.scheduler.nextIssueMonitorAt()).toBeNull();
+          expect(await f.scheduler.tickIssueMonitors(new Date())).toEqual({ checked: 0, triggered: 0, skipped: 0 });
+          expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorAttemptCount: 0 });
+          expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+        } else await createAgentLifecycle(db).pauseAgent(f.agent.id, "manual");
         await worker.process(f.agent.id);
         await advance(31_000);
         await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());

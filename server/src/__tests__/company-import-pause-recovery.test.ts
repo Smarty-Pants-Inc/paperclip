@@ -270,7 +270,7 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
     } finally { await worker.stop(); await heartbeat.drainActiveRunExecutions(); await peer.drainActiveRunExecutions(); }
   });
 
-  it.each(["manual", "company", "import+manual", "import+company"] as const)("a due monitor cleared by %s pause posts one visible note per clear, not a resume run", async pause => {
+  it.each(["manual", "company", "import+manual", "import+company"] as const)("a due monitor obeys the upstream company-retain / manual-clear contract for %s pause", async pause => {
     const f = await imported(true);
     const app = monitorApp();
     const due = new Date(Date.now() + 60_000);
@@ -298,7 +298,45 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       // Company pause gates admission at commit, before the asynchronous agent
       // projection; cover that window as well as import+company's paused agent.
       if (!pause.endsWith("company")) expect(paused!.status).toBe("paused");
-      else expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]!.status).toBe("paused");
+      else {
+        expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]!.status).toBe("paused");
+        for (let pass = 0; pass < 2; pass++) {
+          await Promise.all([heartbeat.tickIssueMonitors(new Date(due.getTime() + 1 + pass)), peer.tickIssueMonitors(new Date(due.getTime() + 1 + pass))]);
+          const [waiting] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+          expect(waiting).toMatchObject({ monitorNextCheckAt: due, monitorWakeRequestedAt: null,
+            monitorAttemptCount: 0, monitorLastTriggeredAt: null, monitorNotes: "Paused scheduled check" });
+          expect(parseIssueExecutionState(waiting!.executionState)?.monitor?.status).toBe("scheduled");
+        }
+        expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
+        expect(await notes(f.issue.id)).toHaveLength(0);
+        expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issue.id), eq(activityLog.action, "issue.monitor_skipped")))).toHaveLength(0);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+        await companyService(db).update(f.companyId, { status: "active" });
+        if (pause === "import+company") {
+          // Removing only the company hold must not remove the import hold.
+          await heartbeat.tickIssueMonitors(new Date(due.getTime() + 3));
+          expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
+          expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0]!.monitorNextCheckAt).toEqual(due);
+        }
+        await createAgentLifecycle(db).resumeAgent(f.agentId);
+        await worker.process(f.agentId);
+        expect(await heartbeat.nextIssueMonitorAt()).toBe(due.getTime());
+        await Promise.all([heartbeat.tickIssueMonitors(new Date(due.getTime() + 4)), peer.tickIssueMonitors(new Date(due.getTime() + 4))]);
+        await heartbeat.tickIssueMonitors(new Date(due.getTime() + 5));
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+        const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId));
+        const [settled] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+        console.log(JSON.stringify({ check: "company-monitor-retained-resumed", pause, runs: runs.length,
+          wakes: wakes.length, notes: (await notes(f.issue.id)).length }));
+        expect(runs).toHaveLength(1);
+        expect(wakes).toHaveLength(1);
+        expect(runs[0]).toMatchObject({ status: "queued", contextSnapshot: { wakeReason: "issue_monitor_due", issueId: f.issue.id } });
+        expect(settled).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null, monitorAttemptCount: 1 });
+        expect(await notes(f.issue.id)).toHaveLength(0);
+        expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issue.id), eq(activityLog.action, "issue.monitor_skipped")))).toHaveLength(0);
+        return;
+      }
       const expectedNote = (at: Date) => `The scheduled check due at ${at.toISOString()} was skipped because Import Coder was paused; it won't run again unless re-armed.`;
       for (const at of pause === "manual" ? [due, new Date(due.getTime() + 60_000)] : [due]) {
         if (at !== due) await arm(at);
@@ -316,7 +354,6 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       expect(visible).toHaveLength(expectedCount);
       expect(skips).toHaveLength(expectedCount);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
-      if (pause.endsWith("company")) await companyService(db).update(f.companyId, { status: "active" });
       await createAgentLifecycle(db).resumeAgent(f.agentId);
       await worker.process(f.agentId);
       await heartbeat.tickIssueMonitors(new Date(due.getTime() + 120_000));
