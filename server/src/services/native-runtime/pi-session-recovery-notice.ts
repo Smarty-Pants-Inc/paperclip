@@ -4,6 +4,9 @@ import { agentTaskSessions, heartbeatRuns, issueComments, issues, nativeRunFinal
 import type { NativeExecutionInput, PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
 import { issueService } from "../issues.js";
+import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
+import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { readPiConversation } from "./pi-conversation-record.js";
 
 const record = (value: unknown): Record<string, unknown> => value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
@@ -54,13 +57,27 @@ function invalidPiSessionRecovery(event: Pick<PrpEvent, "eventType" | "payload" 
 export async function writePiSessionHistoryLossNotice(db: Db,
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
     companyId: string; issueId: string; runId: string; agentId: string;
-    authorizationReason: string; body: string;
+    authorizationReason: string; body: string; replaceExisting?: boolean;
   }): Promise<boolean> {
   const { companyId, issueId, runId, agentId, authorizationReason, body } = input;
-  const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [existing] = await tx.select({ id: issueComments.id, body: issueComments.body }).from(issueComments).where(and(
     eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
-  if (existing) return false;
+  if (existing) {
+    if (input.replaceExisting && existing.body !== body) {
+      const updatedAt = new Date();
+      await tx.update(issueComments).set({ body, updatedAt }).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.id, existing.id)));
+      await tx.update(issues).set({ updatedAt }).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
+      // Same transaction-scoped invalidations as the shared comment writer.
+      // Rechecking an unchanged waiting note must not generate more work.
+      await notifyStatusCardIssueChange(tx, companyId);
+      await notifyIssueRecovery(tx, { companyId, issueId });
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `company:${companyId}`);
+    }
+    return false;
+  }
   await issueService(db).addComment(issueId, body, {}, { authorType: "system", presentation: {
     kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false,
   }, metadata: { version: 1, authorizationReason,

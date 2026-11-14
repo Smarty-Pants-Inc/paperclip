@@ -34,8 +34,11 @@ import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
 import { environmentService } from "../environments.js";
-import { materializePiSessionRecoveryNotice } from "../native-runtime/pi-session-recovery-notice.js";
-import { ensureFreshContinuation } from "../fresh-continuation-fallback.js";
+import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "../native-runtime/pi-session-recovery-notice.js";
+import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
+import { issueRecoveryActions } from "@paperclipai/db";
+import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { projectTaskInterruption } from "../task-interruption-presentation.js";
 import { canBypassFailedNativePredecessor } from "../native-runtime/native-provider-work-proof.js";
 import { heartbeatRunEvents } from "@paperclipai/db";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
@@ -408,6 +411,150 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect((await notices()).filter(comment => comment.authorType === "system")).toHaveLength(1);
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   });
+
+  it("updates only the system-owned fresh-thread notice, never a person's matching metadata", async () => {
+    const f = await piFixture();
+    const authorizationReason = `fresh_provider_thread_pending:${randomUUID()}`;
+    const [person] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+      authorType: "user", authorUserId: "local-board", body: "Keep my saved request unchanged.",
+      metadata: { version: 1, authorizationReason, sections: [] } }).returning();
+    await db.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, f.issue.id)).for("update");
+      await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)).for("update");
+      const input = { companyId: f.agent.companyId, issueId: f.issue.id, runId: f.run.id, agentId: f.agent.id,
+        authorizationReason, replaceExisting: true };
+      await writePiSessionHistoryLossNotice(db, tx, { ...input, body: "Stopping the earlier attempt before starting fresh." });
+      await writePiSessionHistoryLossNotice(db, tx, { ...input, body: "Starting a fresh thread from saved history." });
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    expect(comments.find(comment => comment.id === person.id)?.body).toBe(person.body);
+    expect(comments.filter(comment => comment.authorType === "system"))
+      .toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
+    expect(comments.filter(comment => comment.authorType === "system")).toHaveLength(1);
+  });
+
+  // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
+  // These exercise the durable disposition -> mint -> history -> executor answer,
+  // not a stand-in success from a classifier or a note-only recovery.
+  it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
+    "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed"] as const)(
+    "designed end answers from history with one note and no Retry (%s)", async shape => {
+    const scenario = shape.replace(/^codex-/, "");
+    const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
+    f.input.workspace.executionWorkspace.cwd = instructionRoot;
+    const first = await selectHeartbeatRuntime(db, f.input);
+    if (!first.selected || !first.nativeExecution) throw new Error("Expected first selection");
+    const oldId = first.nativeExecution.session.normalizedSessionId!;
+    const [message] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+      authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
+    await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
+      seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
+    const error = scenario === "metadata-format" || scenario.startsWith("already-stranded")
+      ? "native_controller_recovery_unsupported:metadata_format"
+      : scenario === "idle-descendants" || scenario === "active-turn" ? "native_runner_refresh_required"
+      : "native_controller_recovery_missing_evidence:snapshot_binding";
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), errorCode: error, error,
+      resultJson: { failureCause: "provider_http_429" } }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, controllerBootId: randomUUID(),
+      leaseOwner: null, leaseExpiresAt: null, recoveryState: "blocked", failureCode: error }).where(eq(nativeRunFinalizations.runId, f.run.id));
+    expect((await read(f.run.id)).resultJson?.nativePreDispatchFailure).toBeUndefined();
+    expect((await read(f.run.id)).runnerProfileJson?.sessionCheckpoint).toBeUndefined();
+    let leaseRunId = f.run.id;
+    if (scenario.startsWith("already-stranded")) {
+      const [stranded] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, nativeIssueId: f.issue.id,
+        nativeSessionId: oldId, runtimeMode: "native", status: "failed", errorCode: "runner_remote_state_unavailable",
+        error: "native_session_recovery_failed: runner_remote_state_unavailable", finishedAt: new Date(),
+        createdAt: new Date(f.run.createdAt.getTime() - 1000) }).returning();
+      // The follow-up failed reading metadata before acquiring any new lease;
+      // only the original stranded attempt can supply physical-stop proof.
+      leaseRunId = stranded.id;
+    }
+    const [lease] = await db.insert(environmentLeases).values({ companyId: f.agent.companyId, heartbeatRunId: leaseRunId,
+      issueId: f.issue.id, provider: "boat", providerLeaseId: "bx_33zmdkqu", status: "expired", cleanupStatus: "success",
+      acquiredAt: new Date("2026-11-14T08:15:56.610Z"), releasedAt: new Date(), metadata: { pluginId: "fixture-boat" } }).returning();
+    const confirmStop = async () => {
+      const confirmedAt = new Date().toISOString();
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success",
+        metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+          companyId: lease.companyId, runId: leaseRunId, leaseId: lease.id, provider: lease.provider,
+          providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, lease.id));
+    };
+    const waiting = scenario === "unconfirmed-stop" || scenario === "active-turn" || scenario === "already-stranded-unconfirmed";
+    if (!waiting) await confirmStop();
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
+      kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board",
+      returnOwnerAgentId: f.agent.id, fingerprint: `d10-designed-end:${f.run.id}`, nextAction: "System recovery pending",
+      evidence: { runId: f.run.id } }).returning();
+    let activeRunId: string | undefined;
+    if (scenario === "active-turn") {
+      const [active] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+        nativeIssueId: f.issue.id, nativeSessionId: oldId, runtimeMode: "native", status: "running",
+        createdAt: new Date(f.run.createdAt.getTime() - 500) }).returning();
+      activeRunId = active.id;
+    }
+    if (waiting) {
+      await settleUnrecoverableExecutions(db);
+      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
+      // Elapsed time is never a stop predicate, even beyond the old fallback bound.
+      expect(await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+        trigger: "held_recovery", now: new Date(Date.now() + 3600_000) })).toMatchObject({ kind: "exact_recovery_pending" });
+      const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+      expect(notes).toHaveLength(1);
+      expect(notes[0].body).toContain(scenario === "active-turn" ? "your skill change takes effect after the current step" : "stopping the earlier attempt before starting fresh");
+      if (activeRunId) await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
+      await confirmStop();
+    }
+    let heldCommentId: string | undefined;
+    if (scenario === "held-notice") {
+      const [held] = await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
+        authorType: "system", body: "The earlier attempt is still being checked.",
+        metadata: { version: 1, authorizationReason: `native_prior_owner_held:${oldId}`, sections: [] } }).returning();
+      heldCommentId = held.id;
+      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
+    }
+    // The existing disposition owner runs again when cleanup/turn completion
+    // signals it. No Retry, new message, or time advance supplies authority.
+    await settleUnrecoverableExecutions(db);
+    const records = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
+    expect(records).toHaveLength(1);
+    const action = records[0];
+    const projected = projectTaskInterruption(f.issue, { run: await read(f.run.id), action, paused: false, approval: false });
+    expect(projected).toMatchObject({ state: "working", canRetry: false, nextRetryAt: null });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
+      status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000), contextSnapshot: { issueId: f.issue.id,
+        previousRunId: f.run.id, recoveryActionId: action.id, forceFreshSession: true,
+        ...(action.evidence.freshContinuation && (action.evidence.freshContinuation as Record<string, unknown>).isolation === "fresh_isolated_workspace"
+          ? { freshContinuationIsolation: action.id } : {}) } }).returning();
+    f.input.run = run;
+    f.input.session.persistedNativeExecutionInput = null;
+    f.input.session.persistedRunnerProfile = {};
+    f.input.task.context = run.contextSnapshot!;
+    f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+      agentId: f.agent.id, issueId: f.issue.id, before: run.createdAt });
+    const selected = await selectHeartbeatRuntime(db, f.input);
+    if (!selected.selected || !selected.nativeExecution) throw new Error("Expected fresh selection");
+    expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(oldId);
+    // Replay while this immutable run still owns admission, not after its
+    // answer has committed and correctly surrendered execution authority.
+    f.input.run = await read(run.id);
+    f.input.session.persistedNativeExecutionInput = selected.nativeExecution;
+    f.input.session.persistedRunnerProfile = f.input.run.runnerProfileJson ?? {};
+    expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: selected.nativeExecution });
+    await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, f.issue.id));
+    const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+      runnerInstanceId: selected.nativeRunnerInstanceId!, text: `Answered ${shape} from saved history.`,
+      getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    expect(answered.settled.status).toBe("succeeded");
+    expect(JSON.stringify(answered.prompts)).toContain(message.body);
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toContain("fresh thread in this conversation");
+    if (heldCommentId) {
+      expect(notes[0].id).toBe(heldCommentId);
+      expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
+    }
+    expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
+  }, 60_000);
 
   it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {
     const f = await piFixture();

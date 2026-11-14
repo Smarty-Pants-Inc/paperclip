@@ -82,6 +82,12 @@ impl DurableRunnerError {
         error
     }
 
+    pub fn refresh_required(message: impl Into<String>) -> Self {
+        let mut error = Self::invalid(message);
+        error.3 = Some("provider_refresh_required");
+        error
+    }
+
     pub fn with_provider_failure(mut self, value: Option<serde_json::Value>) -> Self {
         self.1 = crate::provider_failure::validated_provider_failure(value);
         self

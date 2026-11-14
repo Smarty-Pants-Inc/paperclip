@@ -522,12 +522,23 @@ export const PROVIDER_LAUNCH_PROFILE_MISMATCH = "provider_launch_profile_mismatc
 /** The saved session still owns a side-effecting call without a recorded
  * result. Replacing the session could repeat or lose that external action. */
 export const PROVIDER_SIDE_EFFECT_PENDING = "provider_side_effect_pending";
+export const PROVIDER_REFRESH_REQUIRED = "provider_refresh_required";
+
+/** A prepare admission decision, not permission to open/attach the old thread. */
+export class NativeRunnerRefreshRequiredError extends Error {
+  readonly code = "native_runner_refresh_required";
+  constructor(readonly waitForTurn: boolean) {
+    super("native_runner_refresh_required");
+    this.name = "NativeRunnerRefreshRequiredError";
+  }
+}
 
 export type RunnerRecoveryFailureClass =
   | typeof PROVIDER_STATE_INCOMPATIBLE
   | typeof PROVIDER_ATTACH_REFUSED
   | typeof PROVIDER_LAUNCH_PROFILE_MISMATCH
-  | typeof PROVIDER_SIDE_EFFECT_PENDING;
+  | typeof PROVIDER_SIDE_EFFECT_PENDING
+  | typeof PROVIDER_REFRESH_REQUIRED;
 
 const RUNNER_RECOVERY_FAILURE_CLASSES: ReadonlySet<string> = new Set([
   PROVIDER_STATE_INCOMPATIBLE,
@@ -575,6 +586,12 @@ export function isRunnerResumeStateUnavailable(error: unknown, depth = 0): boole
   return isRunnerResumeStateUnavailable((error as { cause?: unknown }).cause, depth + 1);
 }
 
+export function runnerRefreshWaitForTurn(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== "object" || depth > 5) return false;
+  if (error instanceof NativeRunnerRefreshRequiredError) return error.waitForTurn;
+  return runnerRefreshWaitForTurn((error as { cause?: unknown }).cause, depth + 1);
+}
+
 export interface HarnessSessionRecoveryResult {
   recovered: boolean;
   session?: HarnessSession;
@@ -586,6 +603,7 @@ export interface HarnessSessionRecoveryResult {
    * the checkpoint had no turn or runtime request in flight. */
   resumeStateUnavailable?: true;
   runnerExitConfirmed?: true;
+  refreshWaitForTurn?: true;
 }
 
 /** Reads the Runner-owned closed refusal class. New receipts carry a structured
@@ -598,6 +616,7 @@ export function runnerRecoveryFailureClass(
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   if (error instanceof NativeRunnerSourceReconciliationRequiredError) return PROVIDER_SIDE_EFFECT_PENDING;
   if (error instanceof NativeRunnerLaunchProfileMismatchError) return PROVIDER_LAUNCH_PROFILE_MISMATCH;
+  if (error instanceof NativeRunnerRefreshRequiredError) return PROVIDER_REFRESH_REQUIRED;
   const value = error as Record<string, unknown>;
   const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
     ? v as Record<string, unknown> : {};
@@ -614,6 +633,8 @@ export function runnerRecoveryFailureClass(
     }
   }
   const detail = record(receipt.result);
+  if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
+    && detail.code === "command_execution_failed" && detail.refusalCode === PROVIDER_REFRESH_REQUIRED) return PROVIDER_REFRESH_REQUIRED;
   if (["run.attach", "run.prepare"].includes(String(receipt.commandType)) && receipt.status === "failed"
     && detail.code === "command_execution_failed"
     && (detail.refusalCode === PROVIDER_LAUNCH_PROFILE_MISMATCH

@@ -20,7 +20,7 @@ import type {
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
 import { NativeSessionProtocolIntegrityError, isNativeProviderRecoveryDeadlineError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
-import { HarnessReconciliationError, isRunnerResumeStateUnavailable, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerRecoveryFailureClass } from "../../contracts/harness-driver.js";
+import { HarnessReconciliationError, runnerRefreshWaitForTurn, isRunnerResumeStateUnavailable, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerRecoveryFailureClass } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -851,6 +851,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         recovered: false,
         reason: redactCodexDiagnostic(String(error)),
         ...(failureClass ? { failureClass } : {}),
+        ...(runnerRefreshWaitForTurn(error) ? { refreshWaitForTurn: true as const } : {}),
         ...(resumeStateUnavailable ? { resumeStateUnavailable: true as const } : {}),
         ...(transport.runnerExitConfirmed?.() === true ? { runnerExitConfirmed: true as const } : {}),
       };

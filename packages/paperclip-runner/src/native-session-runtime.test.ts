@@ -28,7 +28,7 @@ import {
   NativeSessionProtocolIntegrityError,
   nativeRestartContinuationInFlight, nativeRestartInterruptedTurnId,
 } from "./contracts/native-session-backend.js";
-import { PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
+import { NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -6709,6 +6709,29 @@ describe("executeNativeSession recovery", () => {
       }).catch((error: unknown) => error);
       expect(failure, providerRecoveryPolicy).toBeInstanceOf(NativeProviderStateIncompatibleError);
       expect((failure as Error).message).toBe("native_session_recovery_failed: saved launch profile changed");
+      expect(openRun).not.toHaveBeenCalled();
+      expect(openSession).not.toHaveBeenCalled();
+      expect(openReplacementSession).not.toHaveBeenCalled();
+    }
+  });
+
+  it.each([false, true])("preserves refresh turn waiting without runtime-owned replacement (waitForTurn=%s)", async waitForTurn => {
+    for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
+      const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: "earlier-driver", identity,
+        providerSessionId: "earlier-provider", providerRecoveryPolicy, cursor: "0", activeTurnId: null,
+        pendingRuntimeRequests: [], lineage: [] };
+      const openRun = vi.fn(), openSession = vi.fn(), openReplacementSession = vi.fn();
+      const backend: NativeSessionBackend = { descriptor: async () => ({ kind: "mock", name: "refresh", version: "1",
+        capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }),
+        openSession, openReplacementSession, recoverSession: async () => ({ recovered: false,
+          failureClass: PROVIDER_REFRESH_REQUIRED, reason: "opaque authenticated refusal", ...(waitForTurn ? { refreshWaitForTurn: true as const } : {}) }) };
+      const port: ControlPlanePort = { openRun, appendEvent: vi.fn(), completeRun: vi.fn(),
+        loadSessionCheckpoint: async () => structuredClone(checkpoint),
+        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }) };
+      const failure = await executeNativeSession({ input, backend, controlPlane: port,
+        runnerInstanceId: "runner-refresh", controlPlaneInstanceId: "control-refresh" }).catch((error: unknown) => error);
+      expect(failure, providerRecoveryPolicy).toBeInstanceOf(NativeRunnerRefreshRequiredError);
+      expect(failure).toMatchObject({ code: "native_runner_refresh_required", waitForTurn });
       expect(openRun).not.toHaveBeenCalled();
       expect(openSession).not.toHaveBeenCalled();
       expect(openReplacementSession).not.toHaveBeenCalled();

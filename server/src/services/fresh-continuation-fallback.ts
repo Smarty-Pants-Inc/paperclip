@@ -26,6 +26,8 @@ import { notifyRoutineExecutionStatus } from "./routine-execution-status-notific
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
+import { FRESH_THREAD_STARTED_NOTE, freshThreadStopGate, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
 
 /**
  * Fresh-continuation fallback: exact resumption of an unfinished run is an
@@ -34,8 +36,8 @@ import { readSystemRecovery } from "./system-recovery-state.js";
  * When a run ended without finishing its work and nothing exact follows it
  * (no resumed session, no replacement, no scheduled retry, no saved input),
  * `ensureFreshContinuation` starts the task again in a fresh session from its
- * last verified saved workspace and its conversation. It needs no person and
- * no proof that the old executor stopped:
+ * last verified saved workspace and its conversation. The generic isolated
+ * fallback needs no person and no proof that the old executor stopped:
  *
  * - The old run keeps its own fencing. Its remote workspace epoch is abandoned
  *   when it still owns it, so its writer can never publish again and the next
@@ -45,6 +47,12 @@ import { readSystemRecovery } from "./system-recovery-state.js";
  * - The opening context of the continuation names the cut-off run and every
  *   action whose outcome is unknown, so the agent checks before repeating a
  *   side effect.
+ *
+ * EXCEPTION: the closed impossible-reconciliation refusal family uses
+ * `freshThreadStopGate` before any generic wait bound or isolation decision.
+ * Its old execution must be positively proven gone; no elapsed time or
+ * workspace fencing grants that authority. One history notice is updated
+ * from stopping/waiting-for-turn to fresh-thread admission.
  *
  * Eligibility is by classification, not by an allowlist: every failure is
  * eligible except the causes a person must resolve (`PERSON_OWNED_FAILURE_CODES`
@@ -393,7 +401,8 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   const settlement = object(action.evidence.freshContinuationSettlement);
   const reconciliation = object(action.evidence.executionReconciliation);
   const context = object(run.contextSnapshot);
-  if (fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
+  if ((isFreshThreadRefusal(source) && fresh.previousExecutionGone !== true)
+    || fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
     || fresh.sourceRunId !== source.id || settlement.sourceRunId !== source.id
     || settlement.actorType !== "system" || settlement.actorId !== FRESH_CONTINUATION_ACTOR
     || settlement.decision !== "continue_in_fresh_run" || settlement.replay !== "none"
@@ -409,7 +418,8 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
     || (context.recoveryActionId != null && context.recoveryActionId !== action.id)
     || (action.evidence.continuationRunId != null && action.evidence.continuationRunId !== run.id)
     || !["pending", "not_requested", "delivered"].includes(String(action.evidence.continuationDelivery))) return null;
-  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId };
+  return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
+    ...(typeof fresh.noticeAuthorizationReason === "string" ? { noticeAuthorizationReason: fresh.noticeAuthorizationReason } : {}) };
 }
 
 /**
@@ -479,8 +489,35 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     eq(issueRecoveryActions.sourceIssueId, issue.id),
     or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`, sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`)))
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
+  // A physical-stop gate must not promise an automatic restart after a
+  // person's Stop, pause, approval, or reassignment decision. Keep these
+  // task-level gates ahead of both the waiting note and stop requests.
+  if (isFreshThreadRefusal(run)) {
+    const cancellation = readRunCancellation(run.resultJson);
+    if ((cancellation && ["user", "agent"].includes(cancellation.initiator.type))
+      || object(run.resultJson).operatorInterrupted === true
+      || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run))
+      return { kind: "person_owned", reason: "stopped_on_request" };
+    if (issue.status === "in_review") return { kind: "person_owned", reason: "in_review" };
+    if (holds.some(hold => blocksExecution(hold) && isHumanGate(hold) && !hold.evidence.executionReconciliation)
+      || holds.some(hold => hold.ownerUserId || hold.evidence.ownerGoneAttestation || hold.evidence.explicitUserContinuation))
+      return { kind: "person_owned", reason: "operator_decision_recorded" };
+    const taskWait = await personOwnedTaskWait(tx, { companyId, issue, run });
+    if (taskWait) return { kind: "person_owned", reason: taskWait };
+  }
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
   if (prior) {
+    // Upgrade an older isolated-only settlement before allowing this stronger
+    // refusal family to leave its provider thread. Isolation is not stop proof.
+    if (isFreshThreadRefusal(run) && object(prior.evidence.freshContinuation).previousExecutionGone !== true) {
+      const gate = await freshThreadStopGate(tx, run, issue.id);
+      if (!gate.gone) return { kind: "exact_recovery_pending", reason: gate.reason,
+        retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
+      await tx.update(issueRecoveryActions).set({ evidence: { ...prior.evidence,
+        freshContinuation: { ...object(prior.evidence.freshContinuation), previousExecutionGone: true,
+          noticeAuthorizationReason: gate.noticeAuthorizationReason } } }).where(eq(issueRecoveryActions.id, prior.id));
+      await writeFreshThreadNotice(tx, run, issue.id, FRESH_THREAD_STARTED_NOTE);
+    }
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
@@ -488,6 +525,12 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // task. Workspace restore/repair holds stay with workspace recovery, and
   // resolved history is never rewritten.
   const ownedHolds = holds.filter(isOwnedReconciliationHold);
+
+  // This closed refusal family has stronger admission than the generic
+  // isolated fallback. No timeout or abandoned epoch can waive physical stop.
+  const strictBoundary = isFreshThreadRefusal(run) ? await freshThreadStopGate(tx, run, issue.id) : null;
+  if (strictBoundary && !strictBoundary.gone) return { kind: "exact_recovery_pending",
+    reason: strictBoundary.reason, retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
 
   const [refused] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
@@ -505,7 +548,9 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (!personAsked && decision?.recent !== true) return { kind: "person_owned", reason: "retry_needed" };
   }
 
-  // Every wait is bounded in time: about 10 minutes from the first pending
+  // Generic exact-recovery waits are bounded. The strict physical-stop gate
+  // above is deliberately NOT bounded: no timer can authorize that boundary.
+  // About 10 minutes from the first pending
   // check, or 15 while the exact-recovery owner shows progress (a new run
   // event, output or lease renewal since the last check). Then the fallback
   // stops waiting and continues in isolation (writes revoked, new root).
@@ -684,6 +729,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
+    ...(strictBoundary ? { previousExecutionGone: true, noticeAuthorizationReason: strictBoundary.noticeAuthorizationReason } : {}),
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
   const reconciliation = { ...decision, actorId: FRESH_CONTINUATION_ACTOR, recordedAt: now.toISOString() };
   // Who, what, why and when. A fresh run is not a replay: the interrupted turn
@@ -770,6 +816,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
+  if (strictBoundary) await writeFreshThreadNotice(tx, run, issue.id, FRESH_THREAD_STARTED_NOTE);
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Unfinished run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };
@@ -830,7 +877,21 @@ export async function recordFreshContinuationCheck(db: Db, input: { companyId: s
 /** Not yet checked, or due for another check. */
 export function freshContinuationCheckDue(now: Date) {
   return sql`(${issueRecoveryActions.evidence}->${FRESH_CONTINUATION_CHECK_KEY} is null
-    or coalesce((${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,nextCheckAt}')::bigint, 9223372036854775807) <= ${now.getTime()})`;
+    or coalesce((${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,nextCheckAt}')::bigint, 9223372036854775807) <= ${now.getTime()}
+    or (${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,reason}' in ('active_provider_turn', 'previous_execution_stop_unconfirmed')
+      and exists (select 1 from heartbeat_runs source where source.company_id = ${issueRecoveryActions.companyId}
+        and source.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
+        and (exists (select 1 from environment_leases lease where lease.company_id = source.company_id
+          and (lease.heartbeat_run_id = source.id or exists (select 1 from heartbeat_runs lease_owner
+            where lease_owner.id = lease.heartbeat_run_id and lease_owner.company_id = source.company_id
+              and lease_owner.agent_id = source.agent_id and lease_owner.native_issue_id = source.native_issue_id
+              and lease_owner.native_session_id = source.native_session_id and lease_owner.created_at <= source.created_at))
+          and lease.cleanup_status = 'success'
+          and lease.metadata#>>'{remoteExecutionTermination,state}' in ('stopped', 'destroyed'))
+          or (${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,reason}' = 'active_provider_turn'
+            and not exists (select 1 from heartbeat_runs owner where owner.company_id = source.company_id
+              and owner.native_issue_id = source.native_issue_id and owner.native_session_id = source.native_session_id
+              and owner.id <> source.id and owner.status in ('running', 'queued', 'scheduled_retry')))))))`;
 }
 
 /**
@@ -863,6 +924,7 @@ export function heldExecutionsAwaitingFreshContinuation(db: Db, now: Date, limit
  */
 export const BACKLOG_CONTINUATION_MAX_AGE_MS = 24 * 60 * 60_000;
 export const BACKLOG_CONTINUATION_SOURCE_CODES = [
+  ...FRESH_THREAD_REFUSAL_CODES,
   "native_restart_recovery_blocked", "native_continuation_requires_reconciliation", "native_session_interrupted",
   "native_runner_process_exited", "server_shutdown_interrupted", "process_lost", "controller_lease_lost",
   "execution_finalization_deadline_exceeded", "local_runtime_api_listener_unavailable",

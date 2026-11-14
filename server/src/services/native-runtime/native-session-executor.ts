@@ -1,3 +1,4 @@
+import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
@@ -7624,7 +7625,7 @@ async function restorePerTurnRunnerdController(input: {
     } else {
       if (recovered.kind === "waiting_for_owner") throw new NativeControllerRecoveryWaitingError(recovered.deadline);
       if (recovered.kind !== "unsupported" && recovered.kind !== "no_prior_execution") {
-        throw new Error(`native_controller_recovery_${recovered.kind}:${"reason" in recovered ? recovered.reason : "prior_reference"}`);
+        throw nativeReconciliationError(`native_controller_recovery_${recovered.kind}:${"reason" in recovered ? recovered.reason : "prior_reference"}`);
       }
       const restored = await restoreNativeRunnerCheckpoint(input.db,
         { companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId, runId: reference.runId },
@@ -7980,7 +7981,7 @@ async function restoreNativeControllerProjections(db: Db, execution: NativeExecu
   if (recovered.kind === "waiting_for_owner") {
     throw new NativeControllerRecoveryWaitingError(recovered.deadline);
   }
-  if (recovered.kind !== "recoverable") throw new Error(`native_controller_recovery_${recovered.kind}:${recovered.reason}`, { cause: recovered.cause });
+  if (recovered.kind !== "recoverable") throw nativeReconciliationError(`native_controller_recovery_${recovered.kind}:${recovered.reason}`, { cause: recovered.cause });
   recovered.checkpoint.restoreSessionDirectory(root);
   if (execution.session.lifecyclePolicy.mode === "warm") {
     persistWarmNativeCheckpoint(execution, recovered.metadata.configDigest, recovered.snapshot,
@@ -9138,6 +9139,7 @@ export function nativeSessionFailureDisposition(
   const permanentFailure =
     // A same-run retry would meet the same unretired owner on the same sandbox;
     // the next run starts on a fresh one instead.
+    isFreshThreadRefusal({ errorCode: sourceFailureCode }) ||
     sourceFailureCode === NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE ||
     sourceFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
     sourceFailureCode === "runner_task_admission_rejected" ||
@@ -9382,7 +9384,10 @@ export function nativeSessionFailureSourceCode(
   | "local_runtime_api_listener_unavailable"
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
-  | "native_session_interrupted" {
+  | "native_session_interrupted"
+  | FreshThreadRefusalCode {
+  const freshRefusal = freshThreadRefusalCode(error);
+  if (freshRefusal) return freshRefusal;
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
@@ -15816,9 +15821,9 @@ export async function readRemoteRunnerState(input: {
         deadline: input.recoveryDeadline, readOnly: true, stall: input.stall,
       });
   if (result.exitCode !== 0 || result.timedOut) {
-    const error = new Error(
+    const error = Object.assign(new Error(
       `runner_remote_state_unavailable: exit=${result.exitCode} timedOut=${result.timedOut}${result.stderr.trim() ? ` ${redactSensitiveText(result.stderr).trim().slice(-512)}` : ""}`,
-    );
+    ), { code: "runner_remote_state_unavailable" });
     throw input.recoveryDeadline === undefined ? error : attachRemoteRunnerRecoveryDiagnostic(error,
       { stage: "runner_state", reason: result.timedOut ? "probe_timeout" : "state_read_failed" });
   }

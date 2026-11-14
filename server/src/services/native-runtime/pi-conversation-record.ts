@@ -164,7 +164,8 @@ export async function selectPiConversation(db: Db, input: {
     if (freshBoundary) {
       const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
       await writePiSessionHistoryLossNotice(db, tx, { ...input,
-        authorizationReason: `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
+        authorizationReason: freshBoundary.noticeAuthorizationReason ?? `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
+        replaceExisting: true,
         body: "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed." });
     }
     if (legacyUnverified) {
@@ -177,6 +178,46 @@ export async function selectPiConversation(db: Db, input: {
         body: "My earlier conversation could not be restored (it predates conversation records). Starting a new one." });
     }
     return record;
+  });
+}
+
+/** Non-Pi providers consume the SAME durable fresh-continuation settlement.
+ * This is not generic config/skill freshness and cannot bypass a checkpoint.
+ * Persist the new normalized id under the existing admission locks so replay
+ * never mints another thread, even before task-session publication. */
+export async function selectFreshContinuationThread(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; runId: string;
+}): Promise<string | null> {
+  return db.transaction(async tx => {
+    const [issue] = await tx.select().from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("no key update");
+    const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.id, input.runId))).for("update");
+    if (!issue || !run || run.status !== "running" || run.resultJson?.startupCancellation
+      || (run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId) !== issue.id
+      || (issue.conversationAgentId && (issue.conversationAgentId !== input.agentId
+        || run.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration))) return null;
+    if (run.nativeSessionId) return run.nativeSessionId;
+    if (run.runnerProfileJson?.nativeExecutionInput || run.runnerProfileJson?.sessionCheckpoint
+      || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null) return null;
+    const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
+    const fresh = await readFreshContinuationSessionBoundary(tx, run, issue.id);
+    if (!fresh?.noticeAuthorizationReason) return null;
+    const scope = and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId),
+      eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issue.id));
+    const [session] = await tx.select().from(agentTaskSessions).where(scope).for("update");
+    const previous = session?.sessionParamsJson?.sessionId;
+    if (previous && previous !== fresh.sourceSessionId) return null;
+    const id = randomUUID();
+    if (session) await tx.update(agentTaskSessions).set({ sessionParamsJson: { ...session.sessionParamsJson, sessionId: id },
+      updatedAt: new Date() }).where(eq(agentTaskSessions.id, session.id));
+    else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
+      adapterType: "paperclip_runner", taskKey: issue.id, sessionParamsJson: { sessionId: id } });
+    await tx.update(heartbeatRuns).set({ nativeSessionId: id }).where(eq(heartbeatRuns.id, run.id));
+    const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
+    const { FRESH_THREAD_STARTED_NOTE } = await import("./fresh-thread-stop-gate.js");
+    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason: fresh.noticeAuthorizationReason,
+      body: FRESH_THREAD_STARTED_NOTE, replaceExisting: true });
+    return id;
   });
 }
 

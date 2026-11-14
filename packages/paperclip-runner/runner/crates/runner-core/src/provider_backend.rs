@@ -2204,6 +2204,10 @@ pub struct CodexCommandExecutor {
     startup_command: Option<ProviderStartupCommand>,
     startup_evidence_error: Option<DurableRunnerError>,
     recovery_pending_effects: Option<usize>,
+    // A contender has no authority to restore, poll or stop its predecessor.
+    // Derived again from the saved identities after restart; never persisted
+    // into the predecessor's provider state.
+    refresh_admission: Option<&'static str>,
     unsaved_frame_state: std::cell::Cell<bool>,
     unsaved_trace_interpretations: Vec<NormalizationTrace>,
     #[cfg(test)]
@@ -2225,6 +2229,7 @@ impl CodexCommandExecutor {
             startup_command: None,
             startup_evidence_error: None,
             recovery_pending_effects: None,
+            refresh_admission: None,
             unsaved_frame_state: std::cell::Cell::new(false),
             unsaved_trace_interpretations: Vec::new(),
             #[cfg(test)]
@@ -2243,6 +2248,51 @@ impl CodexCommandExecutor {
 
     pub(crate) fn observe_recovery_state(&mut self, state: &crate::durable::DurableState) {
         self.recovery_pending_effects = Some(state.recovery_pending_effects());
+    }
+
+    fn cold_predecessor_pending(&mut self) -> Result<bool, DurableRunnerError> {
+        if self.provider.is_some() || self.restore_checked {
+            return Ok(false);
+        }
+        // Unopened polling must not restore an unreadable checkpoint. Prepare
+        // still performs the normal strict read before any provider admission.
+        if self.state.is_none() && self.load_state_without_provider().is_err() { return Ok(false); }
+        Ok(self.state.as_ref().is_some_and(|state| {
+            state.run_identity.as_ref().zip(self.event_identity.as_ref())
+                .is_some_and(|(saved, next)| saved.run_id != next.run_id)
+        }))
+    }
+
+    /// Read-only admission, before restore can reconcile or relaunch old work.
+    /// A prepare receipt is NOT an attachment or permission to open a session.
+    /// The controller must wait for the old turn, prove its execution ended,
+    /// then use the existing fresh-history owner rather than mutate this state.
+    fn skill_refresh_admission(&mut self, payload: &Value) -> Result<Option<CommandExecution>, DurableRunnerError> {
+        if !self.cold_predecessor_pending()? { return Ok(None); }
+        let state = self.state.as_ref().expect("loaded predecessor");
+        let Some(provider) = payload.get("provider") else { return Ok(None); };
+        let mut next: CodexProviderConfig = serde_json::from_value(provider.clone())
+            .map_err(|error| DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}")))?;
+        if next.provider != "codex" { next.include_skill_instructions = None; }
+        next.validate().map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        if !matches!(next.provider.as_str(), "codex" | "pi_rpc") || state.thread_id.is_none()
+            || next.instructions == state.config.instructions { return Ok(None); }
+        next.instructions = state.config.instructions.clone();
+        // Immutable profile changes keep the ordinary strict refusal.
+        if next != state.config { return Ok(None); }
+        // This is a refusal, not a tool grant. Do not reconcile the old tool
+        // bridge; normal admitted preparation still validates its full set.
+        let active = state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
+            || state.ambiguous_turn_start_pending || state.startup_attempt.is_some()
+            || state.tool_bridge.pending_calls().next().is_some();
+        let descendants = !state.descendant_thread_ids.is_empty();
+        let goal = state.goal.as_ref().is_some_and(|goal| goal.status == "active" || goal.working_now);
+        let changed_contract = state.completion_contract != completion_contract(payload)?;
+        if !active && !descendants && !goal && !changed_contract { return Ok(None); }
+        let status = if active || descendants { "refresh_wait" } else { "refresh_fresh" };
+        self.refresh_admission = Some(status);
+        Ok(Some(CommandExecution::result(json!({ "status": status,
+            "refusalCode": "provider_refresh_required", "waitForTurn": active }))))
     }
 
     fn bind_opencode_launch_profile(
@@ -6468,6 +6518,7 @@ impl CodexCommandExecutor {
 
 impl CommandExecutor for CodexCommandExecutor {
     fn host_park_ready(&mut self) -> Result<bool, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(false); }
         self.save_before_provider_writes(false)?;
         let Some(state) = self.state.as_ref() else {
             return Ok(false);
@@ -6549,6 +6600,16 @@ impl CommandExecutor for CodexCommandExecutor {
             command_type: command.command_type.clone(),
         });
         let outcome = (|| {
+            if command.command_type == "run.prepare" {
+                if let Some(admission) = self.skill_refresh_admission(&command.payload)? { return Ok(admission); }
+            }
+            if self.refresh_admission.is_some() {
+                return match command.command_type.as_str() {
+                    "runner.drain" | "runner.suspend" | "runner.shutdown" | "session.close" =>
+                        Ok(CommandExecution::result(json!({"status": "completed"}))),
+                    _ => Err(DurableRunnerError::refresh_required("prepare did not admit a provider session")),
+                };
+            }
             self.save_before_provider_writes(false)?;
             self.restore()?;
             self.maintain_deferred_pi_terminal()?;
@@ -6632,11 +6693,13 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
         self.poll_provider()?;
         self.retained_events()
     }
 
     fn poll_disconnected_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
         self.maintain_deferred_pi_terminal()?;
         // Only an already-admitted local Codex process can supply passive
         // output. Recovery, facades and cleanup retain their connected path.
@@ -6653,6 +6716,7 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
         if let Some(error) = &self.startup_evidence_error {
             return Err(error.clone());
         }
@@ -6669,6 +6733,7 @@ impl CommandExecutor for CodexCommandExecutor {
     fn maintain_disconnected_provider(
         &mut self,
     ) -> Result<Option<std::time::Instant>, DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(None); }
         if let Some(deadline) = self.maintain_deferred_pi_terminal()? {
             let remaining = deadline.saturating_sub(current_unix_ms()?);
             return std::time::Instant::now()
@@ -6723,6 +6788,7 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(()); }
         self.maintain_deferred_pi_terminal()?;
         if self.state.as_ref().is_some_and(|state| {
             state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
@@ -6756,6 +6822,7 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(()); }
         // Terminal-result recovery can invoke shutdown on a fresh executor.
         // Loading the durable provider identity here ensures that cleanup is
         // attempted against the persisted session instead of reporting a
