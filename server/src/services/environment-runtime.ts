@@ -46,7 +46,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { currentControllerProcess } from "./controller-process-identity.js";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns } from "@paperclipai/db";
+import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRunEvents, heartbeatRuns } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentLease,
@@ -1684,8 +1684,7 @@ function createSandboxEnvironmentDriver(
     if (!nativeSessionId) return null;
     const finished = await db.select({
       id: heartbeatRuns.id, status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
-      nativePhase: heartbeatRuns.nativePhase, lastOutputSeq: heartbeatRuns.lastOutputSeq,
-      stdoutExcerpt: heartbeatRuns.stdoutExcerpt, stderrExcerpt: heartbeatRuns.stderrExcerpt,
+      nativePhase: heartbeatRuns.nativePhase,
     }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.nativeSessionId, nativeSessionId),
       sql`${heartbeatRuns.finishedAt} is not null`,
@@ -1693,6 +1692,15 @@ function createSandboxEnvironmentDriver(
     const latestSucceeded = [...finished].reverse().find(run => run.status === "succeeded");
     if (!latestSucceeded) return null;
     const laterRuns = finished.slice(finished.indexOf(latestSucceeded) + 1);
+    const turnStartedEventRunIds = new Set(laterRuns.length ? (await db.select({ runId: heartbeatRunEvents.runId })
+      .from(heartbeatRunEvents).where(and(
+        eq(heartbeatRunEvents.companyId, input.companyId),
+        inArray(heartbeatRunEvents.runId, laterRuns.map(run => run.id)),
+        inArray(heartbeatRunEvents.eventType, [
+          "turn.started", "turn.submitted", "turn.accepted", "item.started", "item.completed", "item.delta",
+          "tool.execution.started", "run.result.proposed", "run.result.accepted",
+        ]),
+      ))).map(event => event.runId) : []);
     const preTurnRecoveryErrors = new Set([
       "native_session_interrupted", "runner_remote_state_unavailable",
       "native_continuation_requires_reconciliation",
@@ -1702,14 +1710,13 @@ function createSandboxEnvironmentDriver(
       const recoveryError = run.errorCode !== null && (
         preTurnRecoveryErrors.has(run.errorCode) || run.errorCode.startsWith("native_controller_recovery_")
       );
-      const hasTurnOutput = run.lastOutputSeq > 0 || run.stdoutExcerpt !== null || run.stderrExcerpt !== null;
-      // The listed errors are emitted while recovering/attaching to a session,
-      // before dispatching a new turn. Output/result evidence always wins.
-      const turnStarted = new Set([
+      // Output can contain only recovery diagnostics. Durable provider-work events
+      // distinguish a genuine turn from a failure that happened during attachment.
+      const turnStarted = turnStartedEventRunIds.has(run.id) || new Set([
         "turn", "turn_running", "running", "provider_running", "awaiting_input", "result_accepted",
         "arbitrating", "finalizing", "workspace_finalizing", "committed",
       ]).has(run.nativePhase ?? "");
-      return recoveryError && !hasTurnOutput && !turnStarted;
+      return recoveryError && !turnStarted;
     });
     return everyLaterRunFailedBeforeTurn ? latestSucceeded.id : null;
   }

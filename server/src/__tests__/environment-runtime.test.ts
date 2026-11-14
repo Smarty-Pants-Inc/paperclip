@@ -1050,10 +1050,21 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, original.lease.id));
     if (scenario === "pre-turn-failures" || scenario === "turn-started-after-owner") {
       const recoveryFailureId = randomUUID();
+      const recoveryFinishedAt = new Date();
       await db.insert(heartbeatRuns).values({ id: recoveryFailureId, companyId: seeded.companyId, agentId: seeded.agentId,
         status: "failed", nativeSessionId: sessionId,
         nativePhase: scenario === "pre-turn-failures" ? "retryable_failure" : "turn_running",
-        errorCode: "runner_remote_state_unavailable", lastOutputSeq: 0, finishedAt: new Date(), createdAt: new Date(), updatedAt: new Date() });
+        errorCode: "runner_remote_state_unavailable", lastOutputSeq: scenario === "pre-turn-failures" ? 5 : 0,
+        stderrExcerpt: scenario === "pre-turn-failures" ? "runner remote state unavailable" : null,
+        finishedAt: recoveryFinishedAt, createdAt: recoveryFinishedAt, updatedAt: recoveryFinishedAt });
+      await db.insert(heartbeatRunEvents).values([
+        { companyId: seeded.companyId, agentId: seeded.agentId, runId: recoveryFailureId, seq: 1, eventType: "lifecycle" },
+        { companyId: seeded.companyId, agentId: seeded.agentId, runId: recoveryFailureId, seq: 2, eventType: "error" },
+        { companyId: seeded.companyId, agentId: seeded.agentId, runId: recoveryFailureId, seq: 3, eventType: "run.performance.span" },
+        ...(scenario === "turn-started-after-owner" ? [
+          { companyId: seeded.companyId, agentId: seeded.agentId, runId: recoveryFailureId, seq: 4, eventType: "turn.started" },
+        ] : []),
+      ]);
     } else if (scenario === "newer-success-owner") {
       await db.insert(heartbeatRuns).values({ id: randomUUID(), companyId: seeded.companyId, agentId: seeded.agentId,
         status: "succeeded", nativeSessionId: sessionId, finishedAt: new Date(Date.now() + 1_000), createdAt: new Date(), updatedAt: new Date() });
