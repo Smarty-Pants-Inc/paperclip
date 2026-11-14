@@ -111,6 +111,22 @@ describe.skipIf(!support.supported)("F1 actual SEED-B released row at follow-up 
     expect(call).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["missing", "wrong-lease", "wrong-run", "wrong-allocation", "wrong-schema"])("historical verification still owns genuinely unconfirmed proof: %s", async shape => {
+    const f = await seed();
+    const metadata = { ...f.lease.metadata };
+    if (shape === "missing") delete metadata.remoteExecutionTermination;
+    else metadata.remoteExecutionTermination = { ...(metadata.remoteExecutionTermination as Record<string, unknown>),
+      ...(shape === "wrong-lease" ? { leaseId: randomUUID() } : {}),
+      ...(shape === "wrong-run" ? { runId: randomUUID() } : {}),
+      ...(shape === "wrong-allocation" ? { providerLeaseId: "bx-another" } : {}),
+      ...(shape === "wrong-schema" ? { schema: "unrecognized" } : {}),
+    };
+    await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, ids.lease));
+    const before = await row();
+    expect(hasRemoteTerminationReceipt(before)).toBe(false);
+    expect(await prepareHistoricalSandboxStopVerification(db, before)).toMatchObject({ status: "pending_cleanup", failureReason: "sandbox_stop_pending" });
+  });
+
   it.each(["released", "expired"])("historical verification must not re-prepare a %s complete bound receipt", async status => {
     const f = await seed();
     await db.update(environmentLeases).set({ status }).where(eq(environmentLeases.id, ids.lease));
