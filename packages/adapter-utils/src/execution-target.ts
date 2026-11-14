@@ -431,7 +431,7 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
   /** Pause file-queue polling at a native-run detach boundary. */
   pause?(): Promise<void>;
   /** Quarantine paused queue entries before polling under a new run. */
-  resume?(): Promise<void>;
+  resume?(generation?: string): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -4471,6 +4471,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   runtimeSpan?: RuntimeSpanRunner;
   /** Start file polling paused until a native run binding is attached. */
   startPaused?: boolean;
+  /** Read the broker's current generation when HTTP/2 HEADERS are accepted. */
+  getRunGeneration?: () => string | undefined;
   // The injected recorder for the fixed duplex observability surface. The factory
   // binds it to a provider-scoped telemetry facade, which records the channel-open
   // span, the request span, the guarded counters, and the transport event. The
@@ -4502,6 +4504,29 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       : path.posix.join(target.remoteCwd, ".paperclip-runtime", input.adapterKey);
   const bridgeRuntimeDir = path.posix.join(runtimeRootDir, "paperclip-bridge");
   const queueDir = path.posix.join(bridgeRuntimeDir, "queue");
+  const runStatePath = path.posix.join(queueDir, "run-state.json");
+  let runStateWriteFailureLogged = false;
+  const writeHttp2RunState = async (state: string): Promise<void> => {
+    try {
+      const command = [
+        `mkdir -p ${shellQuote(queueDir)}`,
+        `printf %s ${shellQuote(state)} > ${shellQuote(runStatePath)}`,
+      ].join(" && ");
+      const result = await runSandboxBridgeControlCommand(runner, {
+        command: shellCommand,
+        args: shellCommandArgs(command),
+        cwd: target.remoteCwd,
+        env: { PAPERCLIP_SANDBOX_EXEC_CHANNEL: "bridge" },
+        timeoutMs: 5_000,
+      });
+      if (result.timedOut || result.exitCode !== 0) throw new Error("run-state write failed");
+    } catch (error) {
+      if (!runStateWriteFailureLogged) {
+        runStateWriteFailureLogged = true;
+        void Promise.resolve().then(() => onLog("stderr", `[paperclip] Sandbox HTTP/2 bridge could not update run state: ${error instanceof Error ? error.message : String(error)}\n`)).catch(() => undefined);
+      }
+    }
+  };
   const assetRemoteDir = path.posix.join(bridgeRuntimeDir, "server");
   const bridgeToken = createSandboxCallbackBridgeToken();
   const configuredAttachmentBytes = Number(process.env.PAPERCLIP_ATTACHMENT_MAX_BYTES);
@@ -4576,7 +4601,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       /** Host-issued run generation stamped when the gateway accepted the request. */
       bridgeGeneration?: string;
       /** Internal marker for requests delivered through the file-queue worker. */
-      bridgeTransport?: "queue_v1";
+      bridgeTransport?: "queue_v1" | "http2_v1";
       /** Legacy text envelopes remain strings; binary uploads are raw bytes. */
       body?: string | Buffer;
     },
@@ -4776,6 +4801,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         PAPERCLIP_BRIDGE_HOST: "127.0.0.1",
         PAPERCLIP_BRIDGE_PORT: String(assignedPort),
         PAPERCLIP_BRIDGE_NONCE: nonce,
+        PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
         PAPERCLIP_BRIDGE_MAX_BODY_BYTES: String(maxBodyBytes),
       };
       const command = buildDuplexGatewayLaunchArgv({
@@ -4783,6 +4809,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
         remoteEntrypoint: assetSync.remoteEntrypoint,
         env: gatewayEnv,
       });
+      await writeHttp2RunState("paused");
       openStage = "channel_open";
       channel = await openDuplexChannel({ command });
     } catch (error) {
@@ -4897,6 +4924,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
                   query: request.query,
                   headers: request.headers,
                   body: request.body,
+                  bridgeGeneration: request.headers["x-paperclip-bridge-generation"],
+                  bridgeTransport: "http2_v1",
                 },
                 request.signal,
                 { suppressDebugLog: true, reservation: request.reservation },
@@ -4911,6 +4940,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
 
           const http2Server = createHttp2BridgeServer({
             bridgeToken,
+            captureGeneration: input.getRunGeneration,
             forwardRequest: http2ForwardRequest,
             routes: HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST,
             // The same resolved limit the launch environment hands the
@@ -4984,9 +5014,14 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
               PAPERCLIP_API_URL: sandboxOrigin,
               PAPERCLIP_API_KEY: bridgeToken,
               PAPERCLIP_API_BRIDGE_MODE: SANDBOX_CALLBACK_BRIDGE_HTTP2_MODE,
+              PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
             },
             runLogTail: duplexRunLogTail,
             readRunDisposition: (): DuplexBrokerRunDisposition => dispositionLatch.disposition,
+            pause: async () => { await writeHttp2RunState("paused"); },
+            resume: async (generation?: string) => {
+              await writeHttp2RunState(generation ? `attached:${generation}` : "attached");
+            },
             // Atomically read the latch and mark the orderly completion for the
             // ACP success-eligible terminal, so no await separates the read from
             // the mark and a teardown loss cannot slip in between.

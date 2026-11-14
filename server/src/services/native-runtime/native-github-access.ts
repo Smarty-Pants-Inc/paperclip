@@ -66,15 +66,15 @@ export async function createNativeGitHubAccess(input: {
       return;
     }
     const bridgedRequest = typeof req.headers["x-paperclip-run-id"] === "string";
-    const queuedBridgeRequest = req.headers["x-paperclip-bridge-transport"] === "queue_v1";
-    if (queuedBridgeRequest && typeof requestGeneration !== "string") {
+    const queueTransport = req.headers["x-paperclip-bridge-transport"] === "queue_v1";
+    if ((bridgedRequest || queueTransport) && typeof requestGeneration !== "string") {
       reply(403, { error: "GitHub bridge request has no run generation" });
       return;
     }
     try {
       await bodyComplete;
       if (stopped || active !== binding || activeGeneration !== capturedGeneration ||
-          ((queuedBridgeRequest || bridgedRequest) && typeof requestGeneration === "string" && requestGeneration !== capturedGeneration)) {
+          ((bridgedRequest || queueTransport) && requestGeneration !== capturedGeneration)) {
         reply(403, { error: "GitHub bridge request belongs to an inactive run generation" });
         return;
       }
@@ -128,6 +128,7 @@ export async function createNativeGitHubAccess(input: {
         hostApiUrl: url,
         enableSandboxDuplexBridge: duplexRequested,
         startPaused: true,
+        getRunGeneration: () => activeGeneration ?? undefined,
         duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
         onLog: input.onLog,
       });
