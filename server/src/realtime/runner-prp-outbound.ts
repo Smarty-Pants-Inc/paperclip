@@ -544,21 +544,24 @@ export function connectRunnerPrpIngress(input: {
           && connectAttempts < minimumAttempts && Date.now() >= recoveryDeadline;
         let retryDeadline = floorRetry ? Date.now() + HANDSHAKE_TIMEOUT_MS : recoveryDeadline;
         if (Date.now() < retryDeadline) {
-          const base = Math.max(RECONNECT_DELAYS_MS[
+          const base = RECONNECT_DELAYS_MS[
             Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
-          ]!, transportFailure && recoveryDeadline - Date.now() > MIN_ROUTE_REACQUIRE_DELAY_MS
-            ? MIN_ROUTE_REACQUIRE_DELAY_MS : 0);
+          ]!;
           attempt += 1;
           // No catch-up sleeps after a stalled dial; the floor permits at most
           // two extra dials. Inside a short cold budget retain the old 250/500ms
           // cadence instead of spending the entire budget on the added spacing.
-          if (!floorRetry) await delay(
-            Math.min(
-              Math.max(1, Math.round(base * (0.75 + random() * 0.5))),
-              Math.max(1, retryDeadline - Date.now()),
-            ),
-            abort.signal,
-          );
+          if (!floorRetry) {
+            const jitter = 0.75 + random() * 0.5;
+            const routeDelay = Math.max(1, Math.round(Math.max(base, MIN_ROUTE_REACQUIRE_DELAY_MS) * jitter));
+            const retryDelay = transportFailure && routeDelay < retryDeadline - Date.now()
+              ? routeDelay
+              : Math.max(1, Math.round(base * jitter));
+            await delay(
+              Math.min(retryDelay, Math.max(1, retryDeadline - Date.now())),
+              abort.signal,
+            );
+          }
           if (abort.signal.aborted) return;
           // Expiry can become known while the backoff timer is pending.
           if (input.authority.connectionLeaseFailure) leaseFailureCode = "runner_connection_lease_expired";
