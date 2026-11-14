@@ -171,7 +171,12 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(settledLease.status).toBe(endedWithoutReceipt ? before.status : "released");
       expect(hasRemoteTerminationReceipt(settledLease)).toBe(true);
       expect(settledLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
-      if (endedWithoutReceipt) expect(settledLease.releasedAt).toEqual(before.releasedAt);
+      if (endedWithoutReceipt) {
+        // The new physical observation is now, not the historical idle close;
+        // never backdate its receipt to that old timestamp.
+        expect(settledLease.releasedAt!.getTime()).toBeGreaterThanOrEqual(before.releasedAt!.getTime());
+        expect((settledLease.metadata?.remoteExecutionTermination as { confirmedAt: string }).confirmedAt).toBe(settledLease.releasedAt!.toISOString());
+      }
       expect(await current()).toHaveLength(1);
     }
     if (!["idle-release", "receipt-window-end", "observed-owner", "observed-proof-arrives", "proof-arrives", "tl07-idle"].includes(shape) && !inspectedStop) {

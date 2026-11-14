@@ -191,7 +191,7 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
     // A proof reader must never invalidate an ended allocation's bound receipt,
     // including older idle/warm releases without a retain-dispatch receipt.
-    || (["released", "expired"].includes(lease.status) && hasBoundRemoteStopReceipt(lease))
+    || ["released", "expired"].includes(lease.status)
     || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed") return null;
   return prepareStopAndRetain(db, lease, lease.status);
 }
@@ -200,7 +200,7 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
  * It never changes allocation identity, resumes a provider, or clears proof.
  * In-flight cleanup and workspace-export recovery keep their own budgets. */
 export async function retryUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
-  if (["released", "expired"].includes(lease.status) && hasBoundRemoteStopReceipt(lease)) return null;
+  if (["released", "expired"].includes(lease.status)) return null;
   if (!hasStopOnlyCleanup(lease)) return prepareUnconfirmedSourceSandboxStop(db, lease);
   if (hasNativeWorkspaceExportResume(lease) || !readStopOnlyCleanup(lease)
     || lease.status !== "pending_cleanup" || lease.metadata?.pendingCleanupInFlight === true) return null;
@@ -244,8 +244,33 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
 export async function settleStopOnlyCleanup(db: Db, lease: Lease, options: { attemptId: string; receipt?: unknown; receiptSource?: "provider_inspection" }) {
   if (hasNativeWorkspaceExportResume(lease)) return settleNativeWorkspaceExportResume(db, lease, options);
   const intent = readStopOnlyCleanup(lease);
-  if (!intent) return null;
   const receipt = remoteTerminationReceipt(lease, options.receipt), stopped = receipt?.state === "stopped";
+  // Ordinary warm release can end without a receipt (old providers return
+  // void). A new exact-resource observation supplies proof, not a new stop
+  // intent. Never reopen that ended row as pending_cleanup, even transiently.
+  if (!intent && options.receiptSource === "provider_inspection"
+    && ["released", "expired"].includes(lease.status) && receipt
+    && !hasBoundRemoteStopReceipt(lease) && lease.metadata?.pendingCleanupInFlight !== true) {
+    const now = new Date();
+    const [updated] = await writeEnvironmentCleanup(db, async tx => {
+      await notifyRetainedNativeSessionCleanup(tx, { companyId: lease.companyId, runId: lease.heartbeatRunId! });
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.workspaceRecovery);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.nativeRunProjection,
+        JSON.stringify({ companyId: lease.companyId, runId: lease.heartbeatRunId }));
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+      return tx.update(environmentLeases).set({ cleanupStatus: "success", releasedAt: now, updatedAt: now,
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: receipt })}::jsonb`,
+      }).where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, lease.companyId),
+        eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!), eq(environmentLeases.provider, lease.provider!),
+        eq(environmentLeases.providerLeaseId, lease.providerLeaseId!), eq(environmentLeases.status, lease.status),
+        sql`${environmentLeases.metadata} is not distinct from ${lease.metadata === null ? null : JSON.stringify(lease.metadata)}::jsonb`,
+        sql`not exists (select 1 from environment_leases peer where peer.id <> ${lease.id}
+          and peer.provider = ${lease.provider} and peer.provider_lease_id = ${lease.providerLeaseId}
+          and peer.status in ('active', 'retained', 'pending_cleanup'))`)).returning();
+    }, { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
+    return updated ?? null;
+  }
+  if (!intent) return null;
   // The provider confirmed the sandbox is gone: the stop settles with that
   // receipt, and nothing claims its files were retained.
   const gone = receipt?.state === "destroyed";

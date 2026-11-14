@@ -1,7 +1,7 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
-import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
-import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
+import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, settleStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
@@ -78,6 +78,37 @@ type StopGateEffects = {
  * cannot narrate a restart, enqueue cleanup, or alter a lease while reading. */
 export function readFreshThreadStopProof(db: ProofReader, run: typeof heartbeatRuns.$inferSelect, issueId: string) {
   return inspectFreshThreadStopProof(db, run, issueId);
+}
+
+/** Read-only provider fallback for the existing disposition pass. Network I/O
+ * finishes before any task/coordinator/run locks. Only ended owners qualify;
+ * a current turn and another allocation holder retain their authority. The
+ * stop receipt owner rechecks the complete lease snapshot when persisting it. */
+export async function inspectFreshThreadStopResources(db: Db, run: typeof heartbeatRuns.$inferSelect,
+  issueId: string, inspectLeaseResource: (leaseId: string) => Promise<unknown>) {
+  const owners = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
+    eq(heartbeatRuns.agentId, run.agentId),
+    or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+    run.nativeSessionId ? eq(heartbeatRuns.nativeSessionId, run.nativeSessionId) : undefined,
+    sql`${heartbeatRuns.createdAt} <= (select created_at from ${heartbeatRuns} where id = ${run.id})`));
+  if (owners.some(owner => ["running", "queued", "scheduled_retry"].includes(owner.status))) return;
+  const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+    inArray(environmentLeases.heartbeatRunId, owners.map(owner => owner.id).concat(run.id))));
+  for (const lease of leases) {
+    if (!lease.provider || lease.provider === "local" || !lease.providerLeaseId
+      || lease.metadata?.remoteExecutionTermination != null || readStopOnlyCleanup(lease)
+      || lease.metadata?.pendingCleanupInFlight === true) continue;
+    const [peer] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
+      eq(environmentLeases.provider, lease.provider), eq(environmentLeases.providerLeaseId, lease.providerLeaseId),
+      sql`${environmentLeases.id} <> ${lease.id}`, inArray(environmentLeases.status, [...SANDBOX_ALLOCATION_HOLDER_STATUSES]))).limit(1);
+    if (peer) continue;
+    const observation = await inspectLeaseResource(lease.id).catch(() => undefined);
+    if (!remoteTerminationReceipt(lease, observation)) continue;
+    const prepared = ["released", "expired"].includes(lease.status) ? lease : await prepareUnconfirmedSourceSandboxStop(db, lease);
+    if (prepared) await settleStopOnlyCleanup(db, prepared, { attemptId: String(prepared.metadata?.pendingCleanupAttemptId),
+      receipt: observation, receiptSource: "provider_inspection" });
+  }
 }
 
 /** Strict admission gate for impossible reconciliation. Unlike the generic
@@ -158,7 +189,7 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     gone = false;
     // Even an inadmissible ended receipt is immutable evidence, not permission
     // to erase it and launch a new stop request.
-    if (["released", "expired"].includes(lease.status) && hasBoundRemoteStopReceipt(lease)) { unavailable = true; continue; }
+    if (["released", "expired"].includes(lease.status)) { unavailable = true; continue; }
     // Persist the existing stop-only intent; cleanup's plugin release contract
     // supplies the independently bound stopped/destroyed receipt. A void
     // release, 'stopping', expired lease, or successful RPC is NOT evidence.
