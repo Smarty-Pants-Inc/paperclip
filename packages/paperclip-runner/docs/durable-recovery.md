@@ -78,6 +78,13 @@ new runner will actually be spawned. Adoption does not read the retired
 controller's provider-pack executables, sidecar or proxy files. Fresh launches
 still require the existing artifact digests and provider-pack authority.
 
+Adopted-process supervision uses authenticated channel close as a hint to verify
+that exact process, not as proof of death. Like the fresh-process monitor, it
+coalesces hints received during an outstanding probe into one follow-up probe
+after settlement, without concurrent verifiers. Detach, retirement, and terminal
+failure fence off that follow-up. The existing five-second fallback covers lost
+hints; it is a scheduling cadence, not a bound on slow remote proof completion.
+
 The component regression starts the production runner and OpenCode proxy against
 a scripted harness, removes the controller's launch files, then recovers the
 same process and provider session and completes another turn. This exercises the
