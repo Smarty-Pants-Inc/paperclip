@@ -101,6 +101,42 @@ suite("warm sandbox expiry", () => {
     expect((await row(leaseId)).metadata?.sandboxStopAndRetain).toBeUndefined();
   });
 
+  it("stale stamp (older than the last turn) does not open the gate", async () => {
+    const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
+    const lease = await row(leaseId);
+    const finishedAt = new Date();
+    await db.update(heartbeatRuns).set({ finishedAt }).where(eq(heartbeatRuns.id, lease.heartbeatRunId!));
+    await db.update(environmentLeases).set({ metadata: { ...lease.metadata,
+      reusableSandboxLease: { adapterType: "paperclip_runner" },
+      nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: "native-session",
+        runnerInstanceId: "runner", sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: lease.providerLeaseId!,
+        authorizedProviderLeaseId: lease.providerLeaseId!, manifestSha256: `sha256:${"b".repeat(64)}`,
+        completedAt: new Date(finishedAt.getTime() - 1).toISOString() },
+      warmNativeSessionClose: { state: "closed", closedAt: finishedAt.toISOString() },
+    } }).where(eq(environmentLeases.id, leaseId));
+
+    expect(await stopWarmSandboxesPastWindow(db)).toEqual({ stopping: 0 });
+    expect((await row(leaseId)).status).toBe("retained");
+  });
+
+  it("close failure -> no stop, one counted warning", async () => {
+    const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
+    const lease = await row(leaseId);
+    await db.update(environmentLeases).set({ metadata: { ...lease.metadata,
+      reusableSandboxLease: { adapterType: "paperclip_runner" },
+      nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: "native-session",
+        runnerInstanceId: "runner", sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: lease.providerLeaseId!,
+        authorizedProviderLeaseId: lease.providerLeaseId!, manifestSha256: `sha256:${"b".repeat(64)}`,
+        completedAt: new Date().toISOString() },
+      warmNativeSessionClose: { state: "failed", attempts: 3, warningCount: 1, failure: "durable recovery runner timed out" },
+    } }).where(eq(environmentLeases.id, leaseId));
+
+    expect(await stopWarmSandboxesPastWindow(db)).toEqual({ stopping: 0 });
+    const retained = await row(leaseId);
+    expect(retained.status).toBe("retained");
+    expect(retained.metadata?.warmNativeSessionClose).toMatchObject({ state: "failed", attempts: 3, warningCount: 1 });
+  });
+
   it("stops a sandbox once its warm window has passed and keeps it for the next turn", async () => {
     const leaseId = await warmRetained({ releasedAgoMs: 6 * MINUTE, windowMs: 5 * MINUTE });
 
