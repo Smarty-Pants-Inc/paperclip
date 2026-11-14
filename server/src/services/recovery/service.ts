@@ -2216,8 +2216,8 @@ export function recoveryService(
     const initialDispatch = issue.status === "in_progress"
       ? "assigned_in_progress_liveness_dispatch" : "assigned_todo_liveness_dispatch";
     return deps.enqueueWakeup(agentId, {
-      ...(issue.status === "in_progress" ? {
-        issueStateGuard: { statuses: ["in_progress"], assigneeAgentId: agentId, initialImport: true },
+      ...(issue.status === "in_progress" || issue.originKind === "company_import" ? {
+        issueStateGuard: { statuses: [issue.status], assigneeAgentId: agentId, initialImport: true },
       } : {}),
       source: "assignment",
       triggerDetail: "system",

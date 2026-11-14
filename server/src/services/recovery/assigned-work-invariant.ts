@@ -116,6 +116,8 @@ export const CONTINUATION_MAX_BACKOFF_MS = 15 * 60_000;
 export type AssignedWorkFacts = {
   issue: {
     status: string;
+    /** Existing task provenance; source blocks have no local block activity. */
+    originKind?: string | null;
     assigneeAgentId: string | null;
     assigneeUserId: string | null;
     hidden: boolean;
@@ -295,6 +297,9 @@ function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | nul
   if (issue.isConversation) return "conversation";
   if (issue.awaitingFirstMessage) return "awaiting_first_message";
   if (issue.status === "blocked") {
+    // A carried source block is an intentional wait, not an unknown local
+    // failure to repair. Once local execution exists, its normal owner applies.
+    if (issue.originKind === "company_import" && !facts.latestRun) return "assignee_declared_block";
     if (facts.blockedBy === "user") return "user_stop";
     const owner = issue.unblockOwner;
     const declaredForSomeoneElse = owner !== null
