@@ -23,10 +23,12 @@ for the core fix; local commits are not an upstream PR or release qualification.
 
 Timeouts, refusals and HTTP 5xx reacquire the route before another handshake.
 The ordinary jittered base spacing is 1/1/1/2/5 seconds (actual jitter factor
-0.75–1.25). When the extra 1-second base would consume the remaining budget,
-retain the original 250/500ms cold-start cadence instead. This preserves the
-existing real-TLS test: a route available at 200ms must be usable within its
-750ms startup budget. Refresh never resets the original episode deadline.
+0.75–1.25). Compute the actual rounded, jittered spacing first, using one
+random sample. When that spacing would consume the remaining budget, retain
+the original 250/500ms cold-start cadence with the same sample instead. This
+preserves the existing real-TLS test (a route available at 200ms within a 750ms
+budget) and the high-jitter regression (the same route within a 1,100ms budget
+at random sample 0.9). Refresh never resets the original episode deadline.
 
 Actual socket construction, not elapsed time or a synthetic retry counter,
 counts toward the minimum. Normal 60-second startup and seven-minute recovery
