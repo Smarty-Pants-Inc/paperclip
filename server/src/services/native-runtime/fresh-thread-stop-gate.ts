@@ -33,8 +33,12 @@ export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof
 }
 
 function turnWaitingNote(run: typeof heartbeatRuns.$inferSelect): string {
-  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined;
+  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
   const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
+  // The same Runner-owned rule as the final note: only a typed instruction refresh says a skill change is pending.
+  if (code === "native_runner_refresh_required" && refusal?.prepareRefusalCode != null
+    && isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))
+    return `your skill change takes effect after the current step finishes. ${FRESH_THREAD_TURN_NOTE}`;
   const reason = code === "runner_remote_state_unavailable" ? "The earlier environment is unavailable."
     : code === "native_controller_recovery_missing_evidence:snapshot_binding"
       || code === "native_controller_recovery_unsupported:metadata_format" ? "The saved thread cannot be restored."
