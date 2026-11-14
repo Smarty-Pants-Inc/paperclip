@@ -435,7 +435,8 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
           if ((expiresAt && (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now())) ||
               (deadline !== null && (!Number.isFinite(deadline) || !expiresAt || expiresAt.getTime() > deadline)))
             throw new Error("Plugin replacement task expiry is not bounded");
-          await attachSandboxCreation(db, String(fresh.metadata!.creationOperationId), { companyId: input.companyId, environmentId: environment!.id, heartbeatRunId: lease.heartbeatRunId }, async tx => {
+          await attachSandboxCreation(db, String(fresh.metadata!.creationOperationId), { companyId: input.companyId, environmentId: environment!.id,
+            heartbeatRunId: lease.heartbeatRunId, issueId: lease.issueId, executionWorkspaceId: lease.executionWorkspaceId, leaseId: lease.id }, async tx => {
             context?.assertOpen();
             const [updated] = await tx.update(environmentLeases).set({providerLeaseId:fresh.providerLeaseId,expiresAt,
             metadata:{...replacementMetadata,creationOperationId:fresh.metadata!.creationOperationId},

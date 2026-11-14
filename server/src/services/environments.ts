@@ -1,3 +1,4 @@
+import { lockEnvironmentLeaseAcquisitionParents, lockEnvironmentLeaseAcquisitionSource } from "./environment-lease-acquisition-locks.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
@@ -67,17 +68,34 @@ import {
  * all use this one list, or a delete can orphan a sandbox. */
 export const KEPT_SANDBOX_LEASE_POLICIES = ["reuse_by_environment", "retain_on_failure"] as const;
 
-export async function attachSandboxCreation(db: Db, id: string, scope: { companyId: string; environmentId: string; heartbeatRunId?: string | null },
-  attach: (tx: Db) => Promise<EnvironmentLease>): Promise<EnvironmentLease> {
+export async function attachSandboxCreation(db: Db, id: string, scope: {
+  companyId: string; environmentId: string; heartbeatRunId?: string | null;
+  issueId?: string | null; executionWorkspaceId?: string | null; leaseId?: string | null;
+}, attach: (tx: Db) => Promise<EnvironmentLease>): Promise<EnvironmentLease> {
   return db.transaction(async tx => {
+    const [binding] = await tx.select({ issueId: sandboxCreationOperations.issueId,
+      executionWorkspaceId: sandboxCreationOperations.executionWorkspaceId }).from(sandboxCreationOperations)
+      .where(and(eq(sandboxCreationOperations.id, id), eq(sandboxCreationOperations.companyId, scope.companyId),
+        eq(sandboxCreationOperations.originalEnvironmentId, scope.environmentId)));
+    if (binding && ((scope.issueId !== undefined && scope.issueId !== binding.issueId) ||
+        (scope.executionWorkspaceId !== undefined && scope.executionWorkspaceId !== binding.executionWorkspaceId))) {
+      throw conflict("Sandbox creation ownership changed during acquisition.");
+    }
+    const previous = await lockEnvironmentLeaseAcquisitionParents(tx as unknown as Db, {
+      ...scope, assertCompanyBinding: true,
+      issueId: scope.issueId ?? binding?.issueId, executionWorkspaceId: scope.executionWorkspaceId ?? binding?.executionWorkspaceId,
+    });
     await assertEnvironmentCompanyBinding(tx as unknown as Db, scope.environmentId, scope.companyId);
     const [operation] = await tx.select().from(sandboxCreationOperations)
       .where(and(eq(sandboxCreationOperations.id, id), eq(sandboxCreationOperations.companyId, scope.companyId),
-        eq(sandboxCreationOperations.originalEnvironmentId, scope.environmentId))).for("update");
+        eq(sandboxCreationOperations.originalEnvironmentId, scope.environmentId))).for("no key update");
+    if (operation && (!binding || operation.issueId !== binding.issueId || operation.executionWorkspaceId !== binding.executionWorkspaceId)) {
+      throw conflict("Sandbox creation ownership changed during acquisition.");
+    }
     if (scope.heartbeatRunId) {
       const [run] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, scope.heartbeatRunId), eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.status, "running"),
-      )).for("update");
+      )).for("no key update");
       if (!run || operation?.runId !== scope.heartbeatRunId) throw new Error("Sandbox creation run authority changed");
     }
     if (operation?.state === "attached" && operation.leaseId) {
@@ -85,6 +103,7 @@ export async function attachSandboxCreation(db: Db, id: string, scope: { company
       if (existing?.status === "active") return existing;
     }
     if (!operation || operation.state !== "pending") throw new Error("Sandbox creation ownership has already transferred");
+    await lockEnvironmentLeaseAcquisitionSource(tx as unknown as Db, previous);
     const lease = await attach(tx as unknown as Db);
     await notifyEnvironmentCleanup(tx, { companyId: scope.companyId, runId: operation.runId });
     await tx.update(sandboxCreationOperations).set({ state: "attached", leaseId: lease.id, updatedAt: new Date() })
@@ -95,7 +114,7 @@ export async function attachSandboxCreation(db: Db, id: string, scope: { company
 
 export async function assertEnvironmentCompanyBinding(db: Db, environmentId: string, companyId: string): Promise<void> {
   const [environment] = await db.select({ id: environments.id }).from(environments)
-    .where(eq(environments.id, environmentId)).for("update");
+    .where(eq(environments.id, environmentId)).for("no key update");
   if (!environment) throw new Error("Sandbox creation environment no longer exists");
   const bindings = await db.select({ companyId: builtInManagedResources.companyId }).from(builtInManagedResources)
     .where(and(eq(builtInManagedResources.resourceKind, "environment"), eq(builtInManagedResources.resourceId, environmentId)));
@@ -1558,7 +1577,9 @@ export function environmentService(db: Db) {
     }): Promise<EnvironmentLease> => {
       if (input.creationOperationId) {
         const { creationOperationId, ...leaseInput } = input;
-        return attachSandboxCreation(db, creationOperationId, { companyId: input.companyId, environmentId: input.environmentId, heartbeatRunId: input.heartbeatRunId },
+        return attachSandboxCreation(db, creationOperationId, { companyId: input.companyId, environmentId: input.environmentId,
+          heartbeatRunId: input.heartbeatRunId, issueId: input.issueId, executionWorkspaceId: input.executionWorkspaceId,
+          leaseId: input.replacesReusableLeaseId ?? input.reusesReusableLeaseId },
           tx => environmentService(tx).acquireLease({ ...leaseInput, assertCompanyBinding: true }));
       }
       const now = new Date();
@@ -1609,6 +1630,10 @@ export function environmentService(db: Db) {
         input.replacesReusableLeaseId ||
         input.reusesReusableLeaseId
           ? await db.transaction(async (tx) => {
+              const previous = await lockEnvironmentLeaseAcquisitionParents(tx as unknown as Db, {
+                ...input, leaseId: input.replacesReusableLeaseId ?? input.reusesReusableLeaseId,
+              });
+              await lockEnvironmentLeaseAcquisitionSource(tx as unknown as Db, previous);
               if (input.heartbeatRunId) await notifyNativeEnvironmentSettlement(tx, {
                 companyId: input.companyId, runId: input.heartbeatRunId,
               });
@@ -1670,7 +1695,7 @@ export function environmentService(db: Db) {
               }
               if (input.reusesReusableLeaseId) {
                 const [previous] = await tx.select().from(environmentLeases)
-                  .where(and(eq(environmentLeases.id, input.reusesReusableLeaseId), eq(environmentLeases.companyId, input.companyId))).for("update");
+                  .where(and(eq(environmentLeases.id, input.reusesReusableLeaseId), eq(environmentLeases.companyId, input.companyId))).for("no key update");
                 const reacquired = await tx
                   .update(environmentLeases)
                   .set({
@@ -1730,6 +1755,7 @@ export function environmentService(db: Db) {
                 .then((rows) => rows[0] ?? null);
             })
           : await db.transaction(async tx => {
+              await lockEnvironmentLeaseAcquisitionParents(tx as unknown as Db, input);
               if (input.heartbeatRunId) await notifyNativeEnvironmentSettlement(tx, {
                 companyId: input.companyId, runId: input.heartbeatRunId,
               });

@@ -1169,6 +1169,43 @@ blocks concurrent task or run updates. It allows audit inserts to retain their
 foreign-key `KEY SHARE` locks without waiting on identity acquisition. The audit
 foreign keys and their deletion behavior remain enforced.
 
+## Environment lease acquisition row locks
+
+Lease acquisition fences non-key state, not parent identities. `N` below means
+`FOR NO KEY UPDATE`, `K` means `FOR KEY SHARE`, `S` means `FOR SHARE`, and `U`
+means `FOR UPDATE`. N conflicts with other state writers but is compatible with
+an insert's implicit FK K. S is **not** compatible with N.
+
+| Owning path / row set | Strength | Order and source |
+| --- | --- | --- |
+| Acquisition company | K | First; `environment-lease-acquisition-locks.ts` |
+| Old and new task parents, then runs, then workspaces | N | Complete predecessor/successor union; each table in ascending ID order, scoped to the company; same helper |
+| Acquisition environment | K without binding assertion; N with assertion | After I/R/W, at its final strength; binding assertion does not change an environment key |
+| Discovered source lease | N | After parents; `lockEnvironmentLeaseAcquisitionSource` rechecks company/E/I/R/W and aborts a stale decision before writes |
+| Sandbox creation operation | N | After acquisition parents; `attachSandboxCreation` rechecks discovered task/workspace attribution, run authority and operation state |
+| Existing orphan recorder / actual environment deletion | Existing U | `insertPendingCleanupLease` retains its deletion-race/null-reference fallback and existing fence; `delete` really deletes E. Acquisition adds no U fence here |
+| Existing remote workspace owner | C(K), I(U), R(U), W(U) | `reserveRemoteWorkspace` and parent-first preparation/publication remain unchanged; acquisition N follows the same I/R/W order and serializes behind these U owners |
+
+Acquisition does not modify or delete the keys of C/I/R/W/E/L/O. Its new parent
+fences and changed binding/source/operation fences therefore do not require U.
+The orphan recorder's pre-existing E(U) is not a claim that U is minimal for an
+existence check; it is unchanged in this bounded fix. The important cross-E
+case has no common environment mutex: orphan FK K on W and then I can complete
+while acquisition holds I/R/W(N). Preservation's repeated lease UPDATE can
+recheck E(K) while acquisition owns E(N), without forming the environment-first
+cycle. The database foreign keys and deletion actions remain unchanged.
+
+Source discovery is deliberately unlocked. After locking the complete old/new
+parent set and source lease, a changed source aborts the whole transaction with
+409. A caller must repeat the ownership **decision** from fresh state, not
+continue a partially applied handoff. No automatic deadlock retry is added.
+Attachment uses the same helper before its nested acquisition, preserving the
+operation's ownership/state gate and the transactional handoff receipt.
+
+These rules cover the demonstrated acquisition/preservation/orphan families.
+They are not a whole-server total order; other owners and the admission order
+below retain their documented scope and exceptions.
+
 ## Remote workspace row locks
 
 The runtime workspace service takes company `KEY SHARE`, current task `UPDATE`,
