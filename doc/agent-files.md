@@ -283,8 +283,32 @@ its failed-save receipt. Recovery can later clean an unavailable remote copy
 after destruction of its exact lease and executes no remote command. An
 unavailable local copy can still contain uncollected edits; this cleanup path
 preserves those bytes even if local stop proof arrives later.
-Deferred cleanup retries after a
-delay so one blocked copy does not prevent other copies from being cleaned.
+Deferred directory cleanup reserves a durable exponential retry before I/O in
+both stopped-collection and post-save cleanup recovery: 30 seconds, one minute,
+two minutes, and so on, capped at one hour. After 12 unsuccessful attempts it
+records `receipt.cleanupTerminal` with state `abandoned`, reason
+`retry_exhausted`, the last reason and attempt count, and clears `next_attempt_at`.
+The cleanup count is independent of the three collection/save attempts. Local
+warm-copy stop observations leave adoption authority unchanged; this retry
+budget applies to remote recovery and cleanup with recorded local stop proof.
+
+An exact registered lease that has been released, expired or failed, or whose
+environment reference has been removed, cannot service remote cleanup. Recovery
+retires that obligation with reason `source_gone` instead of repeatedly checking
+it. A newly released or stopped lease gets one 30-second grace period for its final
+destruction receipt; reinspection never extends this grace period. Exact
+confirmed destruction still uses the existing locked local-cleanup path and
+records a settled `source_gone` receipt. Otherwise abandonment removes no files
+and grants no process-stop, destruction or successful-save proof. A missing,
+foreign or ambiguously bound lease is uncertainty, not evidence of source loss;
+its retries remain bounded by the same attempt budget.
+
+Terminal cleanup receipts are excluded from both workers' SQL predicates and
+partial indexes. Settlement preserves the evidence row, save state, original
+save error and any captured candidate bytes. Abandoned receipts preserve the
+baseline and source binding as well; they are not successful cleanup receipts.
+Restart reconstructs only outstanding obligations, so retained terminal rows
+schedule no further checks.
 If releasing a run's instruction copy fails, the run records a cleanup warning
 and leaves the durable copy for the recovery sweep. Cleanup does not replace the
 provider's result, discard usage accounting, or prevent environment lease release.
@@ -305,9 +329,10 @@ without independently recorded stop proof; terminal run status or the old run's
 alias is not enough to collect that root. Recovery leaves it preserved until the
 required proof is available. Exact destruction of the current owner's remote
 allocation permits an explicit unavailable/no-save outcome and owned local
-cleanup. A stopped-but-retained allocation instead stays pending with its files
-preserved. The current remote execute API may restart a stopped sandbox even
-when it bypasses a persistent session, so recovery cannot use it for retrieval
+cleanup. A stopped-but-retained allocation instead keeps its failed or pending
+save outcome and its files preserved, even after automatic cleanup retries
+retire. The current remote execute API may restart a stopped sandbox even when
+it bypasses a persistent session, so recovery cannot use it for retrieval
 or deletion. Safe retrieval from a stopped allocation remains a transport gap;
 live owner retirement still collects before the environment stops. No save is
 claimed for the pending case, and stale prior-run leases cannot authorize cleanup.
