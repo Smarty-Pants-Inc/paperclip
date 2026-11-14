@@ -1134,6 +1134,33 @@ authorization decision retry separately, so a disconnect in the decision does no
 replay the completed lookup. Both steps only read. Missing issues, denied
 decisions, and other errors keep their usual behavior.
 
+## Runtime MCP preparation lock retries
+
+Runtime MCP preparation uses the existing `retryTransientLockContention`
+callback helper around a complete SQL transaction, not around an individual
+statement. Its immutable native profile and entries, named gateway and binding,
+gateway audit, and run token commit together. A failed attempt rolls them all
+back before the next attempt. Profile-key and gateway-slug races still reuse
+existing rows after validating their provenance. Profile creation uses a
+savepoint so a uniqueness conflict does not leave the outer transaction aborted.
+
+Only PostgreSQL `40P01`, `40001`, and `55P03` are retried, for at most 20 attempts.
+Each retry waits `100 * attempt` milliseconds plus uniform random jitter whose
+ceiling doubles from 500 ms to a 15-second cap. Each retry logs its failed attempt,
+SQLSTATE, company/agent/run, delay, and PostgreSQL conflict DETAIL and statement
+context when available, without logging driver parameters or bearer tokens.
+Exhaustion propagates the original error. This bounds attempts and backoff, not
+SQL lock-wait time; sustained contention can still delay or fail preparation.
+
+Delivery diagnostics remain outside the replayed transaction. Named-gateway
+audit publications are collected per attempt using the existing activity
+publication mechanism; only the committed attempt publishes. Rolled-back
+attempts cannot emit phantom gateway creation events. Callers that do not own
+an outer transaction retain immediate publication. Connection-loss errors and
+unknown commit outcomes are never replayed by this policy. This is preparation
+recovery, not a change to permission locks, connector triggers, or the general
+named-gateway API's retry policy.
+
 ## Tool profile reads
 
 Tool profile list, detail, and new-tool review queries select only the catalog

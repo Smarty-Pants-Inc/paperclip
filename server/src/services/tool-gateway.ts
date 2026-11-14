@@ -2090,6 +2090,7 @@ export function createToolGatewayService(
     actorId?: string;
     action: string;
     details: Record<string, unknown>;
+    postCommitPublications?: ActivityPublication[];
   }) {
     const dedicatedAuditAction =
       input.action === "tool_gateway.discovery"
@@ -2230,7 +2231,7 @@ export function createToolGatewayService(
         runId: input.runId,
         ...input.details,
       },
-    });
+    }, input.postCommitPublications);
   }
 
   async function writeSessionAuthFailure(
@@ -10619,6 +10620,8 @@ export function createToolGatewayService(
       body: CreateToolMcpGateway;
       actor?: { agentId?: string | null; userId?: string | null };
       managementContext?: ConnectionManagementContext;
+      /** Collect publications when the caller owns the outer transaction. */
+      postCommitPublications?: ActivityPublication[];
     }): Promise<ToolMcpGatewayWithTokens> {
       await input.managementContext?.reauthorize();
       await assertGatewayContext({
@@ -10718,6 +10721,7 @@ export function createToolGatewayService(
             : "system",
         actorId: input.actor?.agentId ?? input.actor?.userId ?? gateway.id,
         action: "tool_gateway.session_created",
+        postCommitPublications: input.postCommitPublications,
         details: {
           decision: "allow",
           reasonCode: "named_gateway_created",
@@ -10728,7 +10732,7 @@ export function createToolGatewayService(
       });
       if (input.managementContext) await logActivity(db, { companyId: input.companyId, ...input.managementContext.audit,
         action: "tool_gateway.created", entityType: "tool_mcp_gateway", entityId: gateway.id,
-        details: { profileId: gateway.profileId } });
+        details: { profileId: gateway.profileId } }, input.postCommitPublications);
       return getGatewayWithTokens(input.companyId, gateway.id);
     },
 
