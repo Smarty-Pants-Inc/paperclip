@@ -1876,3 +1876,19 @@ describe("AI recovery presentation", () => {
     expect(messages[0]?.metadata.custom).toMatchObject({ kind: "interaction" });
   });
 });
+
+describe("superseded waiting notes", () => {
+  it("keeps a superseded note when its successor is not in the list being built", () => {
+    const notice = { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false } as const;
+    const old = createComment({
+      id: "11111111-1111-4111-8111-111111111111",
+      authorType: "system",
+      authorUserId: null,
+      body: "I'm stopping the earlier attempt before starting fresh.",
+      presentation: notice,
+      metadata: { version: 1, sections: [], supersededByCommentId: "22222222-2222-4222-8222-222222222222" },
+    });
+    const messages = buildIssueChatMessages({ comments: [old], interactions: [], timelineEvents: [], linkedRuns: [], liveRuns: [] });
+    expect(messages.map((message) => message.id)).toEqual([old.id]);
+  });
+});

@@ -336,3 +336,19 @@ describe("commentsToTaskChatItems", () => {
     expect(item.metadata).toBeUndefined();
   });
 });
+
+describe("superseded waiting notes on the task chat page", () => {
+  const notice = (id: string, supersededByCommentId?: string) => ({
+    id, authorType: "system", authorUserId: null, authorAgentId: null, body: `note ${id}`, createdAt: "2026-11-14T18:40:38Z",
+    presentation: { kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: false },
+    metadata: { version: 1, sections: [], ...(supersededByCommentId ? { supersededByCommentId } : {}) },
+  } as unknown as IssueChatComment);
+
+  it("shows only the current note when its successor is present", () => {
+    expect(commentsToTaskChatItems([notice("old", "new"), notice("new")]).map(item => item.id)).toEqual(["new"]);
+  });
+
+  it("keeps the old note when its successor is not in the list", () => {
+    expect(commentsToTaskChatItems([notice("old", "new")]).map(item => item.id)).toEqual(["old"]);
+  });
+});
