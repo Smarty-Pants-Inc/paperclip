@@ -319,6 +319,10 @@ any event handlers on the same worker. A job can use its capability-gated
 retained. This invocation does not inherit an event's company. A company-scoped
 host call, such as `ctx.config.get(companyId)`, must explicitly reference one of
 the plugin's configured companies, using the same allowlist as proactive calls.
+The host re-reads the plugin's stored company configuration for each explicit
+company reference in a job or proactive host RPC. Config saves and removals made
+through another server process therefore apply without restarting the worker;
+if that read fails, the call is denied rather than using cached authority.
 Unconfigured companies and wildcard company access remain denied. Calls without
 invocation IDs keep the existing proactive-call checks; unknown or retired
 invocation IDs remain denied.
