@@ -20,6 +20,8 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
+import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -431,19 +433,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
-  const run = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
   // reply. A card from an earlier turn or one the board addressed to someone
   // else, and any approval, can hold the task but do not answer the message.
-  if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
+  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
   }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
-  // and its carrying run) the first time this step defers to such an attempt,
+  // and its carrying run, messageRun; a refused successor below never
+  // restarts it) the first time this step defers to such an attempt,
   // and the wait ends at T0 + PENDING_WAIT_BOUND_MS. An attempt that never
   // starts (a re-wake that is never claimed, a finalization stuck in a pending
   // phase, a retry with no next attempt, a missing-comment retry that never
@@ -455,13 +458,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
         eq(activityLog.action, PENDING_WAIT_ACTION), sql`${activityLog.details}->>'messageId' = ${message.id}`,
-        sql`coalesce(${activityLog.details}->>'runId', '') = ${run?.id ?? ""}`));
+        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`));
       waitT0 = wait?.at ? new Date(wait.at).getTime() : null;
     }
     const bound = (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
     if (bound <= now.getTime()) return null;
     return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
-      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: run?.id ?? null } } : {}) };
+      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
   };
 
   // Only a turn IN PROGRESS keeps an unbounded wait (a quiet healthy turn is
@@ -506,6 +509,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (wait) return wait;
     }
   }
+
+  // A refused fresh continuation that descends from the message's run is the
+  // run the person's message ended on: its refusal is the explanation
+  // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
+  const latest = runs[0];
+  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+    && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
+      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
   let code: string;
   if (waitingToStart) {
@@ -590,7 +601,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`)).limit(1);
   if (explained) return { kind: "explained" };
 
-  const held = HELD_CODES.has(code);
+  const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
   const waiting = code === UNANSWERED_MESSAGE_WAITING_CODE;
   const body = waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT

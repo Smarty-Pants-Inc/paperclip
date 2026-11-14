@@ -1664,11 +1664,22 @@ actions retain `freshContinuation.chainRootRunId` and `chainAttempt`. The bound
 counts durable records along `retryOfRunId` / previous-run context, including
 records from before these markers existed, with company and task scope on every
 hop. It does not reset on restart or when the separate six-per-hour rolling
-budget expires. An independent source run starts a new chain. Pending fallback
-records from older releases are invalidated before delivery if their source is
-permanently refused or they exceed the chain bound; invalidation starts no run
-and posts no additional note. A successful continuation is unchanged. No schema
-migration or plugin setting is needed.
+budget expires. A genuinely admitted new person turn starts a new chain even
+when it retains `previousRunId` or `retryOfRunId` as execution provenance. The
+lineage stops at the admission owner's explicit-user authorization or a
+user-owned wake carrying that person's comment, not an arbitrary wake reason
+or a copied continuation marker. Automatic retries of that turn remain in its
+chain. Pending fallback records from older releases are invalidated before
+delivery if their source is permanently refused or they exceed the chain bound;
+invalidation starts no run
+and posts no additional note. If a fresh continuation fails in preparation with
+a permanent refusal before carrying the message, the existing unanswered-message
+notice owner follows its automatic lineage and uses that terminal run's
+classification and Run evidence. It produces the existing new-task guidance,
+not the earlier source's resend guidance, under the same per-message dedupe and
+issue fence; there is no second notice writer. Unrelated runs and later person
+turns do not supply another message's failure. A successful continuation is
+unchanged. No schema migration or plugin setting is needed.
 
 ### Saved chat Retry preparation
 
