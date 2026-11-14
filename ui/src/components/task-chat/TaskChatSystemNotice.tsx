@@ -2,6 +2,7 @@ import { useWorkspaceBaseRefRecovery, useWorkspaceRetry } from "@/components/Wor
 import { WorkspaceBaseRefRecoveryNotice } from "@/components/WorkspaceBaseRefRecoveryNotice";
 import { DispositionRecoveryNotice, useDispositionRecoverySnapshot } from "@/components/DispositionRecoveryNotice";
 import { useId, useState } from "react";
+import { isSupersededNotice } from "@paperclipai/shared";
 import {
   ChevronDown,
   CircleCheck,
@@ -78,7 +79,10 @@ export function TaskChatSystemNotice({
   const showBody = !isStructuredWorkspaceReadyNotice;
   const ToneIcon = TONE_ICON[tone];
   const relative = item.createdAtIso ? timeAgo(item.createdAtIso) : undefined;
+  // Kept as history, not current: labelled like Classic's "· Superseded" row.
+  const superseded = isSupersededNotice(item.metadata);
   const showTryAgain =
+    !superseded &&
     Boolean(onTryAgainNoLiveExecutionPath) &&
     isNoLiveExecutionPathNotice(item);
   const handleTryAgain = () => {
@@ -117,6 +121,7 @@ export function TaskChatSystemNotice({
         >
           <ToneIcon className={cn("h-3.5 w-3.5 shrink-0", TONE_ICON_CLASS[tone])} aria-hidden />
           <span className="truncate font-medium">{title}</span>
+          {superseded ? <span className="shrink-0">· Superseded</span> : null}
           {detail ? <span className="hidden truncate sm:inline">· {detail}</span> : null}
           {relative ? <span className="shrink-0 text-muted-foreground">· {relative}</span> : null}
           <ChevronDown

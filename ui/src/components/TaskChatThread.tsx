@@ -933,10 +933,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment)) return [];
         // Superseded: off the live view, kept collapsed in expanded history.
+        // A chat with no expand control is its own history (IssueDetail never
+        // expands a conversation), so there it stays in place, collapsed and
+        // labelled "Superseded" as in Classic.
         if (comment.conversationSessionGeneration == null
           && (comment.authorType === "system" || comment.presentation?.kind === "system_notice")
           && isSupersededNotice(comment.metadata)) {
-          if (props.compactHistory) return [];
+          if (props.compactHistory && (!conversationMode || props.onExpandHistory || props.historyControl)) return [];
           return [comment.presentation ? { ...comment, presentation: { ...comment.presentation, detailsDefaultOpen: false } } : comment];
         }
         if (isRedundantAiRecoveryNotice(comment, interactions)) return [];
@@ -952,7 +955,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         const summary = acceptedSemanticResultSummary(resultJson);
         return [summary ? { ...comment, body: summary } : comment];
       }),
-    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts, props.compactHistory],
+    [comments, interactions, linkedRunMetaById, statusRelevance, imageReceipts, props.compactHistory, conversationMode, props.onExpandHistory, props.historyControl],
   );
 
   const commentItems = useMemo(
