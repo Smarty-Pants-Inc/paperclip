@@ -166,6 +166,8 @@ type Input = {
    * task in the same transaction, and that wake is the continuation.
    */
   delivery?: "record" | "caller_owns";
+  /** A validated deliberate Retry may re-arm the existing stop-only owner. */
+  retryStop?: boolean;
 };
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -573,7 +575,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     // Upgrade an older isolated-only settlement before allowing this stronger
     // refusal family to leave its provider thread. Isolation is not stop proof.
     if (isFreshThreadRefusal(run) && object(prior.evidence.freshContinuation).previousExecutionGone !== true) {
-      const gate = await freshThreadStopGate(tx, run, issue.id);
+      const gate = await freshThreadStopGate(tx, run, issue.id, input.retryStop);
       if (!gate.gone) return { kind: "exact_recovery_pending", reason: gate.reason,
         retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
       await tx.update(issueRecoveryActions).set({ evidence: { ...prior.evidence,
@@ -600,7 +602,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
 
   // This closed refusal family has stronger admission than the generic
   // isolated fallback. No timeout or abandoned epoch can waive physical stop.
-  const strictBoundary = isFreshThreadRefusal(run) ? await freshThreadStopGate(tx, run, issue.id) : null;
+  const strictBoundary = isFreshThreadRefusal(run) ? await freshThreadStopGate(tx, run, issue.id, input.retryStop) : null;
   if (strictBoundary && !strictBoundary.gone) return { kind: "exact_recovery_pending",
     reason: strictBoundary.reason, retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
 

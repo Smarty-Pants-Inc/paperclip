@@ -1,4 +1,4 @@
-import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
+import { isFreshThreadRefusal, freshThreadStopNeedsRetry } from "./native-runtime/runner-reconciliation-refusal.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
@@ -260,7 +260,11 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
     ...(userAction === "choose_model" && run.rejectedModel ? { rejectedModel: run.rejectedModel } : {}) };
   // Impossible reconciliation is system-owned until actual stop proof lands.
   // A timer, Retry, or generic 'Trying again' countdown is not its escape hatch.
-  if (isFreshThreadRefusal(run)) return { ...base, state: "working", canRetry: false, nextRetryAt: null };
+  if (isFreshThreadRefusal(run)) return freshThreadStopNeedsRetry(run)
+    ? { ...base, state: "failed", canRetry: true, nextRetryAt: null,
+      retryWait: { reason: "previous_execution_stop_unconfirmed",
+        message: "Paperclip cannot confirm that the earlier attempt stopped. Your message and saved work are kept. Retry checks again before starting fresh." } }
+    : { ...base, state: "working", canRetry: false, nextRetryAt: null };
   // The previous controller cannot confirm its own stop. Name the one board
   // action instead of showing the fenced run as working (RC-47).
   if (input.ownerStopRequired) return { ...base, responsibility: "user", state: "waiting_for_user", userAction: "confirm_owner_stop" };
@@ -498,6 +502,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
         'timeoutFired', coalesce(${heartbeatRuns.resultJson}->'timeoutFired' = 'true'::jsonb, false),
         'projectAccessDenied', ${heartbeatRuns.resultJson}->'projectAccessDenied',
+        'nativeFreshContinuationStop', jsonb_build_object(
+          'schema', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeFreshContinuationStop'->'schema'`, 64)},
+          'state', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeFreshContinuationStop'->'state'`, 32)}),
         'cancelledByActorType', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByActorType'`, 32)},
         'cancelledByUserId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByUserId'`, 160)},
         'queuedCommentInterruptQueueId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'queuedCommentInterruptQueueId'`, 160)},

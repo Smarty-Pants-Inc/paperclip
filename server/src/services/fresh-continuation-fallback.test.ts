@@ -194,6 +194,104 @@ suite("fresh-continuation fallback", () => {
     await expectOneFreshSuccessor(f);
   });
 
+  it.each(["missing_allocation", "foreign_launch", "process_read_failed"])("RFL round5 F2-end truthful end and working Retry (%s)", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const [lease] = shape === "missing_allocation" ? await db.insert(environmentLeases).values({ companyId,
+      heartbeatRunId: f.runId, issueId: f.issueId, provider: "boat", providerLeaseId: null,
+      status: "released", metadata: { pluginId: "fixture-boat" } }).returning() : [];
+    if (shape === "foreign_launch") await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "native.process_start_requested", stream: "system", level: "info", message: "Remote launch requested",
+      payload: { targetKind: "remote", hostname: "earlier-controller" } });
+    const root = await mkdtemp(join(tmpdir(), "d10-end-process-read-"));
+    await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    try {
+      if (shape === "process_read_failed") vi.stubEnv("PATH", root);
+      for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
+        expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
+          .toMatchObject({ kind: "exact_recovery_pending" });
+        const task = await issue(f.issueId);
+        expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
+          assigneeAgentId: task.assigneeAgentId, projectId: task.projectId }))
+          .toMatchObject({ state: "failed", canRetry: true, retryWait: { reason: "previous_execution_stop_unconfirmed" } });
+      }
+      const currentNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+        .filter(note => !note.metadata?.supersededByCommentId);
+      expect(currentNotes).toHaveLength(1);
+      expect(currentNotes[0].body).toMatch(/cannot confirm.*stopped/i);
+      expect(currentNotes[0].body).toContain("Retry");
+      expect(currentNotes[0].body).not.toMatch(/I'm stopping|will start automatically/i);
+      const click = () => requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
+        observedRunId: f.runId, idempotencyKey: randomUUID() });
+      expect(await click()).toMatchObject({ accepted: true, stale: false });
+      expect(await successors(f.runId)).toHaveLength(0);
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
+        .not.toHaveProperty("freshContinuation");
+      // Repair evidence, not a timeout or click, grants fresh-thread authority.
+      vi.unstubAllEnvs();
+      if (lease || shape === "foreign_launch") {
+        const [bound] = lease ? await db.update(environmentLeases).set({ providerLeaseId: `repaired-${randomUUID()}` })
+          .where(eq(environmentLeases.id, lease.id)).returning() : await db.insert(environmentLeases).values({ companyId,
+            heartbeatRunId: f.runId, issueId: f.issueId, provider: "boat", providerLeaseId: `found-${randomUUID()}`,
+            status: "released", metadata: { pluginId: "fixture-boat" } }).returning();
+        const now = new Date();
+        await db.update(environmentLeases).set({ status: "released", releasedAt: now, cleanupStatus: "success",
+          metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+            companyId, runId: f.runId, leaseId: bound.id, provider: "boat", providerLeaseId: bound.providerLeaseId,
+            state: "destroyed", confirmedAt: now.toISOString() } } }).where(eq(environmentLeases.id, bound.id));
+      }
+      const key = randomUUID();
+      const repairedClick = () => requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
+        observedRunId: f.runId, idempotencyKey: key });
+      expect(await repairedClick()).toMatchObject({ accepted: true });
+      expect(await repairedClick()).toMatchObject({ accepted: true });
+      await expectOneFreshSuccessor(f);
+      const receipts = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+        eq(agentWakeupRequests.reason, "task_retry")));
+      expect(receipts.every(receipt => receipt.status === "coalesced")).toBe(true);
+    } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("RFL round5 F2-end Retry re-arms the existing stop owner, never admits without its receipt", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
+      provider: "boat", providerLeaseId: `retry-stop-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending" });
+    const [pending] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    const metadata = { ...pending.metadata, pendingCleanupRetryAttempts: 5, pendingCleanupRetryCapWarned: true,
+      pendingCleanupRetryAfterMs: Date.now() + 3600_000 };
+    await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, lease.id));
+    await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
+    const task = await issue(f.issueId);
+    expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
+      assigneeAgentId: task.assigneeAgentId, projectId: task.projectId })).toMatchObject({ state: "failed", canRetry: true });
+    const retryInput = { db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
+      observedRunId: f.runId, idempotencyKey: randomUUID() };
+    // An automatic restart hook cannot renew a deliberately exhausted budget.
+    expect(await requestTaskRetry({ ...retryInput, initiatedBy: "restart_recovery" })).toMatchObject({ accepted: true });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0].metadata)
+      .toMatchObject({ pendingCleanupRetryAttempts: 5 });
+    expect(await requestTaskRetry({ ...retryInput, idempotencyKey: randomUUID() })).toMatchObject({ accepted: true });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0])
+      .toMatchObject({ providerLeaseId: lease.providerLeaseId, status: "pending_cleanup", metadata: {
+        sandboxStopAndRetain: metadata.sandboxStopAndRetain, pendingCleanupAttemptId: metadata.pendingCleanupAttemptId,
+        pendingCleanupRetryAttempts: 0, pendingCleanupRetryAfterMs: 0, pendingCleanupRetryCapWarned: false } });
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
+      .not.toHaveProperty("freshContinuation");
+  });
+
+  it("RFL round5 F2-end Retry refuses a principal without task access before touching cleanup", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
+      provider: "boat", providerLeaseId: `no-access-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
+    await expect(requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: randomUUID(),
+      observedRunId: f.runId, idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 403 });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    expect(await successors(f.runId)).toHaveLength(0);
+  });
+
   it("RFL F2 an unbound local owner with a recorded live process is not an empty owner set", async () => {
     const f = await unfinishedRun({ runtime: "legacy", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.runId));

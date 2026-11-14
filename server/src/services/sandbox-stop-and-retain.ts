@@ -193,6 +193,22 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
   return prepareStopAndRetain(db, lease, lease.status);
 }
 
+/** A deliberate user Retry re-arms only the existing, validated stop owner.
+ * It never changes allocation identity, resumes a provider, or clears proof.
+ * In-flight cleanup and workspace-export recovery keep their own budgets. */
+export async function retryUnconfirmedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
+  if (!hasStopOnlyCleanup(lease)) return prepareUnconfirmedSourceSandboxStop(db, lease);
+  if (hasNativeWorkspaceExportResume(lease) || !readStopOnlyCleanup(lease)
+    || lease.status !== "pending_cleanup" || lease.metadata?.pendingCleanupInFlight === true) return null;
+  const [updated] = await writeEnvironmentCleanup(db, tx => tx.update(environmentLeases).set({ updatedAt: new Date(),
+    metadata: sql`${environmentLeases.metadata} || '{"pendingCleanupRetryAfterMs":0,"pendingCleanupRetryAttempts":0,"pendingCleanupRetryCapWarned":false}'::jsonb`,
+  }).where(and(eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
+    eq(environmentLeases.status, "pending_cleanup"),
+    sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`)).returning(),
+  { companyId: lease.companyId, runId: lease.heartbeatRunId ?? undefined });
+  return updated ?? null;
+}
+
 async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, recovery: Record<string, unknown> = {},
   retention?: { leasePolicy: string; metadata: Record<string, unknown> }) {
   const requestId = randomUUID(), now = new Date();
