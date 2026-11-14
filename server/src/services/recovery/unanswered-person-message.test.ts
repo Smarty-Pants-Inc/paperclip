@@ -615,6 +615,40 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  // RFL 03:16Z (E3.04): only a RUNNING turn is unbounded. A queued run that
+  // carries the message but is never claimed gets one "waiting to start" note.
+  const WAITING = "Your message is waiting for the agent to be free; it will start by itself.";
+  it("E3.04: a carrying run queued behind a full agent -> one 'waiting' note at the bound; it starts later -> no second note; its answer supersedes it", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const queued = await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    let notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!.body).toBe(WAITING);
+    expect(notices[0]!.presentation).toMatchObject({ title: "Your message is waiting to start" });
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
+    notices = await f.visible();
+    expect(notices).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await f.reply(queued);
+    await settleAt(f, AFTER_WAKE_BOUND_MS + 120_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
+  it("E3.04 control: a RUNNING run carrying the message is never bounded (a quiet healthy turn) -> no note at +30 min", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message(), status: "running" });
+    await f.sweep();
+    await settleAt(f, AFTER_WAKE_BOUND_MS);
+    await settleAt(f, 30 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+  });
+
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
     for (let round = 0; round < 4; round++) {
       const f = await fixture();
