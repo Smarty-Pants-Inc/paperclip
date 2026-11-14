@@ -4,7 +4,6 @@ import type { ActivityPublication } from "../../types/activity-publication.js";
 import { persistActivity } from "../activity-log.js";
 import { canActorReadIssuePrivacy } from "../authorization.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
-import { isIssueReviewVerdictInteraction } from "../issue-review-policy.js";
 import { getSameIssueDocumentConfirmationTargetRefusal } from "../issue-thread-interactions.js";
 import { agentLinkRow, keyValueRow, type NoticeMetadataRow } from "../recovery/notice-format.js";
 import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
@@ -60,7 +59,6 @@ async function readOrdinaryAddressedFailureIdentity(db: Db, binding: NativeAddre
     if (payload.target != null && await getSameIssueDocumentConfirmationTargetRefusal(db, {
       companyId: binding.companyId, issueId: binding.issueId, target: payload.target,
     })) return null;
-    if (row.issue.status === "in_review" && await isIssueReviewVerdictInteraction(db, { issue: row.issue, interaction })) return null;
   }
   return { interactionId, state: interaction.status };
 }
