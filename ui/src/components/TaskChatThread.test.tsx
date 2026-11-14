@@ -6327,3 +6327,129 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
     });
   });
 });
+
+// SMA-43 duplicate reply (prod c1dea0db). Shape-only fixture of Paul's chat:
+// ids, timestamps, authorType, runId, the empty system comment deleted after
+// the reply, a runs-list row whose resultJson is {} and the transcript a
+// recovery-finalized native run yields. All text is placeholder text.
+describe("TaskChatThread recovered native reply (SMA-43 shape)", () => {
+  const RUN = "d4260467-6bea-443f-b558-91f992393a1d";
+  const RESET_RUN = "015c76d0-0000-4000-8000-000000000000";
+  const AGENT = "d981429b-94e4-4adf-869b-210e36e4980b";
+  const USER = "kHrMNh1PLKqOjE3iAT3dMZOXPWAineZH";
+  const TURN = "pi-turn-b4a2c76c-bd3d-4ee8-8bab-362c945e0c19";
+  const MESSAGE_ITEM = `${TURN}:pi-message:8:block:0`;
+  const TOOL_ITEM = `${TURN}:pi-tool:f38926805e0a7f0e555982fd3547999343b813b7adf210be4cb25b44e4358e7c`;
+  const REPLY = "REPLY TEXT A: placeholder for the agent's one final reply.";
+  const base = { companyId: "0af93a21-e013-4cc9-9093-63100f753c40", issueId: "e17b7052-a47b-423a-9173-67494a21acdc",
+    presentation: null, metadata: null, deletedAt: null };
+  const newComment = { ...base, id: "d4ff16b7-7b72-4fc8-a070-d2d07cfe2daa", authorType: "user" as const,
+    authorUserId: USER, authorAgentId: null, createdByRunId: null, runId: null, body: "/new",
+    conversationSessionGeneration: 1,
+    createdAt: new Date("2026-11-14T03:51:34.455Z"), updatedAt: new Date("2026-11-14T03:51:34.455Z") };
+  const emptySystem = { ...base, id: "5fdff54e-46a4-43d4-88d4-8e372bab902d", authorType: "system" as const,
+    authorUserId: null, authorAgentId: null, createdByRunId: null, runId: null, body: "",
+    createdAt: new Date("2026-11-14T03:51:49.961Z"), updatedAt: new Date("2026-11-14T03:51:49.961Z") };
+  const hi = { ...base, id: "cda17ec2-8e43-4703-bf7c-88d10e7cbc68", authorType: "user" as const,
+    authorUserId: USER, authorAgentId: null, createdByRunId: null, runId: null, body: "USER TEXT B",
+    createdAt: new Date("2026-11-14T03:54:08.628Z"), updatedAt: new Date("2026-11-14T03:54:08.628Z") };
+  // IssueDetail projects an agent comment's createdByRunId onto runId.
+  const reply = { ...base, id: "ca0b0812-6cb6-453c-b948-7e373d044f13", authorType: "agent" as const,
+    authorUserId: null, authorAgentId: AGENT, onBehalfOfUserId: USER, createdByRunId: RUN, runId: RUN, body: REPLY,
+    metadata: { version: 1 as const, authorizationReason: "internal_agent_write",
+      sections: [{ title: "Authorization", rows: [{ type: "key_value" as const, label: "Reason", value: "internal_agent_write" }] }] },
+    createdAt: new Date("2026-11-14T03:55:38.348Z"), updatedAt: new Date("2026-11-14T03:55:38.348Z") };
+  const runFields = { agentId: AGENT, agentName: "Paul's Smarty", adapterType: "paperclip_runner", runtimeMode: "native" as const };
+  const resetRun = { ...runFields, runId: RESET_RUN, status: "succeeded", createdAt: "2026-11-14T03:51:34.500Z",
+    startedAt: "2026-11-14T03:51:35.000Z", finishedAt: "2026-11-14T03:51:38.000Z", resultJson: { conversationReset: true } };
+  const liveRun = { ...runFields, id: RUN, status: "running" as const, invocationSource: "on_demand" as const,
+    triggerDetail: "manual", createdAt: "2026-11-14T03:54:08.661Z", startedAt: "2026-11-14T03:54:08.726Z", finishedAt: null };
+  // GET /api/issues/:id/runs projects resultJson to a whitelist that omits
+  // presentationDecision, so this recovered run reads as {}.
+  const settledRow = { ...runFields, runId: RUN, status: "succeeded", createdAt: liveRun.createdAt,
+    startedAt: liveRun.startedAt, finishedAt: "2026-11-14T03:55:37.639Z", resultJson: {} };
+  const prp = (seq: number, sourceSeq: number, eventType: string, at: string, payload: Record<string, unknown>,
+    extra: Record<string, unknown> = {}) => ({
+    id: 676000 + seq, companyId: base.companyId, runId: RUN, agentId: AGENT, seq, eventType, stream: "system",
+    level: "info", color: null, message: null, createdAt: new Date(at),
+    payload: { prpEvent: { schema: "paperclip.prp.event.v1", sourceEventId: `dd79b8b3:${RUN}:${sourceSeq}`, sourceSeq,
+      sourceInstanceId: "dd79b8b3", sourceKind: "runner", runId: RUN, turnId: TURN,
+      normalizedSessionId: "6d4ee6cb-7a72-4718-a7f3-0baaccc81ee5", eventType, schemaVersion: 1, priority: 1,
+      emittedAt: at, ...extra, payload } },
+  }) as Parameters<typeof nativeRunEventsToTranscript>[0][number];
+  const liveEvents = [
+    prp(185, 20, "item.started", "2026-11-14T03:54:47.601Z", { kind: "tool_use", text: "", channel: "unknown",
+      item: { id: TOOL_ITEM, text: null, type: "tool_use", status: "running", channel: "detail" } }, { itemId: TOOL_ITEM }),
+    prp(195, 26, "item.completed", "2026-11-14T03:54:47.620Z", { kind: "tool_use", text: "", channel: "unknown",
+      item: { id: TOOL_ITEM, text: null, type: "tool_use", status: "completed", channel: "detail" } }, { itemId: TOOL_ITEM }),
+    prp(291, 110, "item.started", "2026-11-14T03:55:33.701Z", { kind: "agentMessage", text: "", channel: "progress",
+      providerPhase: "commentary", item: { id: MESSAGE_ITEM, text: "", type: "agentMessage", phase: "commentary",
+        status: "running", channel: "progress" } }, { itemId: MESSAGE_ITEM }),
+    prp(292, 111, "item.delta", "2026-11-14T03:55:34.258Z", { kind: "agentMessage", text: REPLY, channel: "progress",
+      providerMethod: "item/agentMessage/delta", update: { kind: "agentMessage", text: REPLY, delta: REPLY,
+        itemId: MESSAGE_ITEM, turnId: TURN, channel: "progress", provider: "pi_rpc", providerMethod: "item/agentMessage/delta" } },
+    { itemId: MESSAGE_ITEM }),
+    prp(294, 112, "item.completed", "2026-11-14T03:55:34.268Z", { kind: "agentMessage", text: REPLY, channel: "final",
+      providerPhase: "final_answer", item: { id: MESSAGE_ITEM, text: REPLY, type: "agentMessage", phase: "final_answer",
+        status: "completed", channel: "final" } }, { itemId: MESSAGE_ITEM }),
+    prp(298, 115, "turn.completed", "2026-11-14T03:55:34.280Z", { error: null, status: "completed" }),
+  ];
+  const settledEvents = [
+    ...liveEvents,
+    prp(303, 2, "run.terminal", "2026-11-14T03:55:34.309Z", { schema: "paperclip.prp.terminal.v1",
+      runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "done" },
+    { sourceKind: "control_plane", priority: 0 }),
+  ];
+  const replyCopies = () => container.textContent?.split(REPLY).length! - 1;
+  const steps = (variant: { terminalHydrated: boolean }) => {
+    const props = { issueId: base.issueId, issueStatus: "in_progress", onAdd: async () => {} };
+    nativeTranscriptState.terminalHydratedRunIds = variant.terminalHydrated ? undefined : new Set();
+    const counts: Record<string, number> = {};
+    // 1. The run streams its final answer live.
+    nativeTranscriptState.transcriptByRun.set(RUN, nativeRunEventsToTranscript(liveEvents));
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi]} linkedRuns={[resetRun]}
+      activeRun={liveRun} liveRuns={[liveRun]} />);
+    counts.live = replyCopies();
+    // 2. The run is finalized (03:55:37.6Z); recovery has not posted the reply yet.
+    nativeTranscriptState.transcriptByRun.set(RUN, nativeRunEventsToTranscript(settledEvents));
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi]} linkedRuns={[resetRun, settledRow]}
+      activeRun={null} liveRuns={[]} />);
+    counts.settledNoComment = replyCopies();
+    // 3. Recovery posts the reply comment (03:55:38.3Z).
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi, reply]} linkedRuns={[resetRun, settledRow]}
+      activeRun={null} liveRuns={[]} />);
+    counts.withComment = replyCopies();
+    // 4. The empty system comment is deleted (03:56:07.7Z).
+    const deleted = { ...emptySystem, deletedAt: new Date("2026-11-14T03:56:07.713Z") };
+    render(<TaskChatThread {...props} comments={[newComment, deleted, hi, reply]} linkedRuns={[resetRun, settledRow]}
+      activeRun={null} liveRuns={[]} />);
+    counts.systemDeleted = replyCopies();
+    return counts;
+  };
+
+  it.each([true, false])("renders the recovered reply exactly once at every step (terminal hydrated=%s)", (terminalHydrated) => {
+    expect(steps({ terminalHydrated })).toEqual({ live: 1, settledNoComment: 1, withComment: 1, systemDeleted: 1 });
+  });
+  // Two copies: the settled turn renders its final answer from the transcript,
+  // then the reply comment lands without run provenance (no runId and no
+  // createdByRunId), so nothing ties it to the turn that already shows it.
+  it("lets a settled turn's reply comment own the answer when it arrives without run provenance", () => {
+    nativeTranscriptState.transcriptByRun.set(RUN, nativeRunEventsToTranscript(liveEvents));
+    const props = { issueId: base.issueId, issueStatus: "in_progress", onAdd: async () => {}, conversationMode: true };
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi]} linkedRuns={[resetRun]}
+      activeRun={liveRun} liveRuns={[liveRun]} />);
+    expect(replyCopies()).toBe(1);
+    nativeTranscriptState.transcriptByRun.set(RUN, nativeRunEventsToTranscript(settledEvents));
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi]} linkedRuns={[resetRun, settledRow]}
+      activeRun={null} liveRuns={[]} />);
+    act(() => {});
+    expect(replyCopies()).toBe(1);
+    const unlinked = { ...reply, runId: undefined, createdByRunId: undefined };
+    render(<TaskChatThread {...props} comments={[newComment, emptySystem, hi, unlinked]} linkedRuns={[resetRun, settledRow]}
+      activeRun={null} liveRuns={[]} />);
+    act(() => {});
+    expect(replyCopies()).toBe(1);
+    expect(container.querySelectorAll('[data-testid="task-chat-agent-bubble"]')).toHaveLength(1);
+    expect(container.querySelector(`#comment-${reply.id}`)).not.toBeNull();
+  });
+});
