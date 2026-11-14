@@ -2258,9 +2258,14 @@ impl CodexCommandExecutor {
         }
         // Unopened polling must not restore an unreadable checkpoint. Prepare
         // still performs the normal strict read before any provider admission.
-        if self.state.is_none() && self.load_state_without_provider().is_err() { return Ok(false); }
+        if self.state.is_none() && self.load_state_without_provider().is_err() {
+            return Ok(false);
+        }
         Ok(self.state.as_ref().is_some_and(|state| {
-            state.run_identity.as_ref().zip(self.event_identity.as_ref())
+            state
+                .run_identity
+                .as_ref()
+                .zip(self.event_identity.as_ref())
                 .is_some_and(|(saved, next)| saved.run_id != next.run_id)
         }))
     }
@@ -2269,33 +2274,67 @@ impl CodexCommandExecutor {
     /// A prepare receipt is NOT an attachment or permission to open a session.
     /// The controller must wait for the old turn, prove its execution ended,
     /// then use the existing fresh-history owner rather than mutate this state.
-    fn skill_refresh_admission(&mut self, payload: &Value) -> Result<Option<CommandExecution>, DurableRunnerError> {
-        if !self.cold_predecessor_pending()? { return Ok(None); }
+    fn skill_refresh_admission(
+        &mut self,
+        payload: &Value,
+    ) -> Result<Option<CommandExecution>, DurableRunnerError> {
+        if !self.cold_predecessor_pending()? {
+            return Ok(None);
+        }
         let state = self.state.as_ref().expect("loaded predecessor");
-        let Some(provider) = payload.get("provider") else { return Ok(None); };
-        let mut next: CodexProviderConfig = serde_json::from_value(provider.clone())
-            .map_err(|error| DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}")))?;
-        if next.provider != "codex" { next.include_skill_instructions = None; }
-        next.validate().map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
-        if !matches!(next.provider.as_str(), "codex" | "pi_rpc") || state.thread_id.is_none()
-            || next.instructions == state.config.instructions { return Ok(None); }
+        let Some(provider) = payload.get("provider") else {
+            return Ok(None);
+        };
+        let mut next: CodexProviderConfig =
+            serde_json::from_value(provider.clone()).map_err(|error| {
+                DurableRunnerError::invalid(format!("run.prepare provider is invalid: {error}"))
+            })?;
+        if next.provider != "codex" {
+            next.include_skill_instructions = None;
+        }
+        next.validate()
+            .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        if !matches!(next.provider.as_str(), "codex" | "pi_rpc")
+            || state.thread_id.is_none()
+            || next.instructions == state.config.instructions
+        {
+            return Ok(None);
+        }
         next.instructions = state.config.instructions.clone();
         // Immutable profile changes keep the ordinary strict refusal.
-        if next != state.config { return Ok(None); }
+        if next != state.config {
+            return Ok(None);
+        }
         // This is a refusal, not a tool grant. Do not reconcile the old tool
         // bridge; normal admitted preparation still validates its full set.
-        let active = state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
-            || state.ambiguous_turn_start_pending || state.startup_attempt.is_some()
+        let active = state.active_provider_turn_id.is_some()
+            || state.pi_deferred_terminal.is_some()
+            || state.ambiguous_turn_start_pending
+            || state.startup_attempt.is_some()
             || state.tool_bridge.pending_calls().next().is_some();
         let descendants = !state.descendant_thread_ids.is_empty();
-        let goal = state.goal.as_ref().is_some_and(|goal| goal.status == "active" || goal.working_now);
+        let goal = state
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status == "active" || goal.working_now);
         let changed_contract = state.completion_contract != completion_contract(payload)?;
-        if !active && !descendants && !goal && !changed_contract { return Ok(None); }
-        let status = if active || descendants { "refresh_wait" } else { "refresh_fresh" };
-        let prepare_refusal_code = if active { "provider_active_turn"
-            } else if descendants { "provider_live_descendants"
-            } else if goal { "provider_active_goal"
-            } else { "provider_contract_changed" };
+        if !active && !descendants && !goal && !changed_contract {
+            return Ok(None);
+        }
+        let status = if active || descendants {
+            "refresh_wait"
+        } else {
+            "refresh_fresh"
+        };
+        let prepare_refusal_code = if active {
+            "provider_active_turn"
+        } else if descendants {
+            "provider_live_descendants"
+        } else if goal {
+            "provider_active_goal"
+        } else {
+            "provider_contract_changed"
+        };
         self.refresh_admission = Some(status);
         Ok(Some(CommandExecution::result(json!({ "status": status,
             "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
@@ -2801,12 +2840,21 @@ impl CodexCommandExecutor {
         // Capture before restore_provider_if_needed can settle the old turn.
         // This field labels errors only; it never participates in admission.
         self.prepare_input_refusal_code = if state.active_provider_turn_id.is_some()
-            || state.pi_deferred_terminal.is_some() || state.ambiguous_turn_start_pending {
+            || state.pi_deferred_terminal.is_some()
+            || state.ambiguous_turn_start_pending
+        {
             Some("provider_active_turn")
-        } else if !state.descendant_thread_ids.is_empty() { Some("provider_live_descendants")
-        } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) {
+        } else if !state.descendant_thread_ids.is_empty() {
+            Some("provider_live_descendants")
+        } else if state
+            .goal
+            .as_ref()
+            .is_some_and(|g| g.status == "active" || g.working_now)
+        {
             Some("provider_active_goal")
-        } else { None };
+        } else {
+            None
+        };
         let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
         if state.pi_launch_profile_digest != expected_pi_profile_digest {
             return Err(DurableRunnerError::launch_profile_mismatch(
@@ -3562,15 +3610,29 @@ impl CodexCommandExecutor {
             {
                 // Additive diagnostics only: retain the exact refusal predicate
                 // and priority above. No restore/replacement decision changes.
-                let code = if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
-                    || state.ambiguous_turn_start_pending || state.startup_attempt.is_some()
-                    || self.provider.as_ref().is_some_and(|p| !p.run_attachment_live_work().is_empty()) {
+                let code = if state.active_provider_turn_id.is_some()
+                    || state.pi_deferred_terminal.is_some()
+                    || state.ambiguous_turn_start_pending
+                    || state.startup_attempt.is_some()
+                    || self
+                        .provider
+                        .as_ref()
+                        .is_some_and(|p| !p.run_attachment_live_work().is_empty())
+                {
                     "provider_active_turn"
                 } else if !state.descendant_thread_ids.is_empty()
-                    || self.provider.as_ref().is_some_and(|p| p.has_known_descendants()) {
+                    || self
+                        .provider
+                        .as_ref()
+                        .is_some_and(|p| p.has_known_descendants())
+                {
                     "provider_live_descendants"
-                } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now)
-                    || self.provider.as_ref().is_some_and(|p| p.has_active_goal()) {
+                } else if state
+                    .goal
+                    .as_ref()
+                    .is_some_and(|g| g.status == "active" || g.working_now)
+                    || self.provider.as_ref().is_some_and(|p| p.has_active_goal())
+                {
                     "provider_active_goal"
                 } else if state.tool_bridge.pending_calls().next().is_some() {
                     "provider_pending_tool_calls"
@@ -3580,10 +3642,13 @@ impl CodexCommandExecutor {
                     "provider_config_changed"
                 } else if state.completion_contract != completion_contract {
                     "provider_contract_changed_same_run"
-                } else { "provider_prepare_refused" };
+                } else {
+                    "provider_prepare_refused"
+                };
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
-                ).with_refusal_code(code));
+                )
+                .with_refusal_code(code));
             }
             if state.pi_launch_profile_digest != pi_launch_profile_digest {
                 return Err(DurableRunnerError::launch_profile_mismatch(
@@ -3603,7 +3668,8 @@ impl CodexCommandExecutor {
             if state.lifecycle == "closed" {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider session is already closed",
-                ).with_refusal_code("provider_session_closed"));
+                )
+                .with_refusal_code("provider_session_closed"));
             }
             if rebind_run && state.thread_id.is_some() {
                 let refresh_pi_process =
@@ -3694,7 +3760,9 @@ impl CodexCommandExecutor {
                     .as_ref()
                     .is_some_and(|provider| !provider.run_attachment_live_work().is_empty())
             {
-                let code = if state.active_provider_turn_id.is_some() || state.ambiguous_turn_start_pending {
+                let code = if state.active_provider_turn_id.is_some()
+                    || state.ambiguous_turn_start_pending
+                {
                     "provider_active_turn"
                 } else if state.tool_bridge.pending_calls().next().is_some() {
                     "provider_pending_tool_calls"
@@ -3702,10 +3770,13 @@ impl CodexCommandExecutor {
                     "provider_active_goal"
                 } else if state.lifecycle == "reconciliation_required" {
                     "provider_reconciliation_required"
-                } else { "provider_prepare_refused" };
+                } else {
+                    "provider_prepare_refused"
+                };
                 return Err(DurableRunnerError::invalid(
                     "run.prepare Pi context refresh requires a settled provider session",
-                ).with_refusal_code(code));
+                )
+                .with_refusal_code(code));
             }
             if let Some(provider) = self.provider.as_mut() {
                 let (accounting, drained) =
@@ -4017,20 +4088,33 @@ impl CodexCommandExecutor {
             blockers.push("durable_active_goal");
         }
         if !blockers.is_empty() {
-            let code = if next_state.active_provider_turn_id.is_some() || next_state.ambiguous_turn_start_pending {
+            let code = if next_state.active_provider_turn_id.is_some()
+                || next_state.ambiguous_turn_start_pending
+            {
                 "provider_active_turn"
             } else if !next_state.descendant_thread_ids.is_empty()
-                || self.provider.as_ref().is_some_and(|p| p.has_known_descendants()) {
+                || self
+                    .provider
+                    .as_ref()
+                    .is_some_and(|p| p.has_known_descendants())
+            {
                 "provider_live_descendants"
-            } else if goal_continues_after_turn(&next_state, goal_active) { "provider_active_goal"
-            } else if blockers.contains(&"durable_pending_tool_calls") { "provider_pending_tool_calls"
-            } else if next_state.lifecycle == "closed" { "provider_session_closed"
-            } else if next_state.lifecycle == "reconciliation_required" { "provider_reconciliation_required"
-            } else { "provider_prepare_refused" };
+            } else if goal_continues_after_turn(&next_state, goal_active) {
+                "provider_active_goal"
+            } else if blockers.contains(&"durable_pending_tool_calls") {
+                "provider_pending_tool_calls"
+            } else if next_state.lifecycle == "closed" {
+                "provider_session_closed"
+            } else if next_state.lifecycle == "reconciliation_required" {
+                "provider_reconciliation_required"
+            } else {
+                "provider_prepare_refused"
+            };
             let error = DurableRunnerError::invalid(format!(
                 "run.attach requires a settled Codex provider session: {}",
                 blockers.join(", ")
-            )).with_refusal_code(code);
+            ))
+            .with_refusal_code(code);
             // A pending tool call is a side effect without a recorded result.
             // The controller must not replace this session to get past it.
             return Err(if blockers.contains(&"durable_pending_tool_calls") {
@@ -6575,7 +6659,9 @@ impl CodexCommandExecutor {
 
 impl CommandExecutor for CodexCommandExecutor {
     fn host_park_ready(&mut self) -> Result<bool, DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(false); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(false);
+        }
         self.save_before_provider_writes(false)?;
         let Some(state) = self.state.as_ref() else {
             return Ok(false);
@@ -6655,11 +6741,22 @@ impl CommandExecutor for CodexCommandExecutor {
         // contract. Preserve its input blocker for the additive refusal channel;
         // do not change restore, admission, or the replacement decision.
         self.prepare_input_refusal_code = self.state.as_ref().and_then(|state| {
-            if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
-                || state.ambiguous_turn_start_pending { Some("provider_active_turn")
-            } else if !state.descendant_thread_ids.is_empty() { Some("provider_live_descendants")
-            } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) { Some("provider_active_goal")
-            } else { None }
+            if state.active_provider_turn_id.is_some()
+                || state.pi_deferred_terminal.is_some()
+                || state.ambiguous_turn_start_pending
+            {
+                Some("provider_active_turn")
+            } else if !state.descendant_thread_ids.is_empty() {
+                Some("provider_live_descendants")
+            } else if state
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.status == "active" || g.working_now)
+            {
+                Some("provider_active_goal")
+            } else {
+                None
+            }
         });
         self.startup_command = Some(ProviderStartupCommand {
             command_id: command.command_id.clone(),
@@ -6668,13 +6765,18 @@ impl CommandExecutor for CodexCommandExecutor {
         });
         let outcome = (|| {
             if command.command_type == "run.prepare" {
-                if let Some(admission) = self.skill_refresh_admission(&command.payload)? { return Ok(admission); }
+                if let Some(admission) = self.skill_refresh_admission(&command.payload)? {
+                    return Ok(admission);
+                }
             }
             if self.refresh_admission.is_some() {
                 return match command.command_type.as_str() {
-                    "runner.drain" | "runner.suspend" | "runner.shutdown" | "session.close" =>
-                        Ok(CommandExecution::result(json!({"status": "completed"}))),
-                    _ => Err(DurableRunnerError::refresh_required("prepare did not admit a provider session")),
+                    "runner.drain" | "runner.suspend" | "runner.shutdown" | "session.close" => {
+                        Ok(CommandExecution::result(json!({"status": "completed"})))
+                    }
+                    _ => Err(DurableRunnerError::refresh_required(
+                        "prepare did not admit a provider session",
+                    )),
                 };
             }
             self.save_before_provider_writes(false)?;
@@ -6752,26 +6854,51 @@ impl CommandExecutor for CodexCommandExecutor {
         })();
         self.startup_command = None;
         outcome.map_err(|error: DurableRunnerError| {
-            if !matches!(command.command_type.as_str(), "run.prepare" | "run.attach") { return error; }
+            if !matches!(command.command_type.as_str(), "run.prepare" | "run.attach") {
+                return error;
+            }
             if let Some(blocker) = self.prepare_input_refusal_code {
-                if matches!(error.refusal_code(), None | Some("provider_prepare_refused")
-                    | Some("provider_config_changed") | Some("provider_contract_changed_same_run")) {
+                if matches!(
+                    error.refusal_code(),
+                    None | Some("provider_prepare_refused")
+                        | Some("provider_config_changed")
+                        | Some("provider_contract_changed_same_run")
+                ) {
                     return error.with_refusal_code(blocker);
                 }
             }
-            if error.refusal_code().is_some() { return error; }
+            if error.refusal_code().is_some() {
+                return error;
+            }
             // Restore may refuse before prepare reaches its own fences. Carry
             // the durable blocker without changing restore, its error, or any
             // classification/replacement decision.
-            let code = self.state.as_ref().map(|state| {
-                if state.active_provider_turn_id.is_some() || state.pi_deferred_terminal.is_some()
-                    || state.ambiguous_turn_start_pending { "provider_active_turn"
-                } else if !state.descendant_thread_ids.is_empty() { "provider_live_descendants"
-                } else if state.goal.as_ref().is_some_and(|g| g.status == "active" || g.working_now) { "provider_active_goal"
-                } else if state.tool_bridge.pending_calls().next().is_some() { "provider_pending_tool_calls"
-                } else if state.lifecycle == "reconciliation_required" { "provider_reconciliation_required"
-                } else { "provider_prepare_refused" }
-            }).unwrap_or("provider_prepare_refused");
+            let code = self
+                .state
+                .as_ref()
+                .map(|state| {
+                    if state.active_provider_turn_id.is_some()
+                        || state.pi_deferred_terminal.is_some()
+                        || state.ambiguous_turn_start_pending
+                    {
+                        "provider_active_turn"
+                    } else if !state.descendant_thread_ids.is_empty() {
+                        "provider_live_descendants"
+                    } else if state
+                        .goal
+                        .as_ref()
+                        .is_some_and(|g| g.status == "active" || g.working_now)
+                    {
+                        "provider_active_goal"
+                    } else if state.tool_bridge.pending_calls().next().is_some() {
+                        "provider_pending_tool_calls"
+                    } else if state.lifecycle == "reconciliation_required" {
+                        "provider_reconciliation_required"
+                    } else {
+                        "provider_prepare_refused"
+                    }
+                })
+                .unwrap_or("provider_prepare_refused");
             error.with_refusal_code(code)
         })
     }
@@ -6782,13 +6909,17 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn poll_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
         self.poll_provider()?;
         self.retained_events()
     }
 
     fn poll_disconnected_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
         self.maintain_deferred_pi_terminal()?;
         // Only an already-admitted local Codex process can supply passive
         // output. Recovery, facades and cleanup retain their connected path.
@@ -6805,7 +6936,9 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn retained_events(&mut self) -> Result<Vec<PolledEvent>, DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(Vec::new()); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(Vec::new());
+        }
         if let Some(error) = &self.startup_evidence_error {
             return Err(error.clone());
         }
@@ -6822,7 +6955,9 @@ impl CommandExecutor for CodexCommandExecutor {
     fn maintain_disconnected_provider(
         &mut self,
     ) -> Result<Option<std::time::Instant>, DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(None); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(None);
+        }
         if let Some(deadline) = self.maintain_deferred_pi_terminal()? {
             let remaining = deadline.saturating_sub(current_unix_ms()?);
             return std::time::Instant::now()
@@ -6877,7 +7012,9 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn maintain_backpressured_provider(&mut self) -> Result<(), DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(()); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(());
+        }
         self.maintain_deferred_pi_terminal()?;
         if self.state.as_ref().is_some_and(|state| {
             state.receipt_limit_interrupt_pending && state.active_provider_turn_id.is_some()
@@ -6911,7 +7048,9 @@ impl CommandExecutor for CodexCommandExecutor {
     }
 
     fn shutdown(&mut self) -> Result<(), DurableRunnerError> {
-        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? { return Ok(()); }
+        if self.refresh_admission.is_some() || self.cold_predecessor_pending()? {
+            return Ok(());
+        }
         // Terminal-result recovery can invoke shutdown on a fresh executor.
         // Loading the durable provider identity here ensures that cleanup is
         // attempted against the persisted session instead of reporting a
@@ -8759,16 +8898,46 @@ done
             let (directory, mut executor, mut payload) = prepared_skill_checkpoint("codex", true);
             let state = executor.state.as_mut().unwrap();
             state.run_identity = Some(prepare_contract_identity("run-A"));
-            executor.event_identity = Some(prepare_contract_identity(if shape == "contract" { "run-A" } else { "run-B" }));
+            executor.event_identity = Some(prepare_contract_identity(if shape == "contract" {
+                "run-A"
+            } else {
+                "run-B"
+            }));
             match shape {
-                "active_turn" => { state.active_provider_turn_id = Some("old-turn".to_owned()); state.lifecycle = "turn_active".to_owned(); }
-                "descendant" => { state.descendant_thread_ids.insert("child".to_owned()); }
-                "goal" => { state.goal = Some(SessionGoalSnapshot { objective: "old".to_owned(), status: "active".to_owned(), token_budget: None, tokens_used: 0, elapsed_seconds: 0, iterations: 0, last_reason: None, created_at: None, updated_at: None, completed_at: None, working_now: false }); }
-                "config" => { payload["provider"]["model"] = json!("new-model"); }
-                "contract" => { payload["completionContract"] = json!({"revision":"new", "criterionIds":["objective"]}); }
+                "active_turn" => {
+                    state.active_provider_turn_id = Some("old-turn".to_owned());
+                    state.lifecycle = "turn_active".to_owned();
+                }
+                "descendant" => {
+                    state.descendant_thread_ids.insert("child".to_owned());
+                }
+                "goal" => {
+                    state.goal = Some(SessionGoalSnapshot {
+                        objective: "old".to_owned(),
+                        status: "active".to_owned(),
+                        token_budget: None,
+                        tokens_used: 0,
+                        elapsed_seconds: 0,
+                        iterations: 0,
+                        last_reason: None,
+                        created_at: None,
+                        updated_at: None,
+                        completed_at: None,
+                        working_now: false,
+                    });
+                }
+                "config" => {
+                    payload["provider"]["model"] = json!("new-model");
+                }
+                "contract" => {
+                    payload["completionContract"] =
+                        json!({"revision":"new", "criterionIds":["objective"]});
+                }
                 _ => unreachable!(),
             }
-            if shape != "contract" { payload["provider"]["instructions"] = json!("edited skill"); }
+            if shape != "contract" {
+                payload["provider"]["instructions"] = json!("edited skill");
+            }
             executor.save_state().unwrap();
             let bytes = fs::read(executor.state_path()).unwrap();
             for _ in 0..2 {
@@ -8784,15 +8953,25 @@ done
     #[test]
     fn prepare_launch_drift_is_a_structured_refusal_without_rewriting_history() {
         let (directory, mut executor, payload) = prepared_skill_checkpoint("pi_rpc", true);
-        executor.state.as_mut().unwrap().pi_launch_profile_digest = Some("previous-profile".to_owned());
+        executor.state.as_mut().unwrap().pi_launch_profile_digest =
+            Some("previous-profile".to_owned());
         executor.save_state().unwrap();
         let saved = fs::read(executor.state_path()).unwrap();
         for _ in 0..2 {
             let error = executor.prepare(&payload).unwrap_err();
-            assert_eq!(error.refusal_code(), Some("provider_launch_profile_mismatch"));
-            assert_eq!(error.to_string(), "Pi runner launch profile changed across the durable run");
+            assert_eq!(
+                error.refusal_code(),
+                Some("provider_launch_profile_mismatch")
+            );
+            assert_eq!(
+                error.to_string(),
+                "Pi runner launch profile changed across the durable run"
+            );
             assert_eq!(fs::read(executor.state_path()).unwrap(), saved);
-            assert!(executor.provider.is_none(), "a refusal cannot start a provider");
+            assert!(
+                executor.provider.is_none(),
+                "a refusal cannot start a provider"
+            );
         }
         fs::remove_dir_all(directory).unwrap();
     }

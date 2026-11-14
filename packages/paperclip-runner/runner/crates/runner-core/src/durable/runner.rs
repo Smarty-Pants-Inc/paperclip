@@ -3751,28 +3751,44 @@ mod tests {
 
     #[test]
     fn launch_refusal_code_survives_command_commit_restart_and_replay() {
-        struct RefusingExecutor { calls: usize }
+        struct RefusingExecutor {
+            calls: usize,
+        }
         impl CommandExecutor for RefusingExecutor {
             fn execute(&mut self, _: &Command) -> Result<CommandExecution, DurableRunnerError> {
                 self.calls += 1;
-                Err(DurableRunnerError::launch_profile_mismatch("opaque diagnostic")
-                    .with_classification(super::super::PROVIDER_STATE_INCOMPATIBLE))
+                Err(
+                    DurableRunnerError::launch_profile_mismatch("opaque diagnostic")
+                        .with_classification(super::super::PROVIDER_STATE_INCOMPATIBLE),
+                )
             }
         }
-        let directory = std::env::temp_dir().join(format!("paperclip-launch-refusal-{}", uuid::Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("paperclip-launch-refusal-{}", uuid::Uuid::new_v4()));
         let config = config(directory.clone());
         let store = DurableStateStore::new(&directory).unwrap();
         let (mut state, _) = store.load_or_create(&config).unwrap();
         let prepare = command("run.prepare");
         let mut executor = RefusingExecutor { calls: 0 };
-        let (failed, _) = process_command(&mut state, &store, &config, &mut executor, &prepare).unwrap();
+        let (failed, _) =
+            process_command(&mut state, &store, &config, &mut executor, &prepare).unwrap();
         assert_eq!(failed.status, "failed");
-        assert_eq!(failed.result["refusalCode"], "provider_launch_profile_mismatch");
-        assert_eq!(failed.result["classification"], "provider_state_incompatible");
+        assert_eq!(
+            failed.result["refusalCode"],
+            "provider_launch_profile_mismatch"
+        );
+        assert_eq!(
+            failed.result["classification"],
+            "provider_state_incompatible"
+        );
         let (mut restored, _) = store.load_or_create(&config).unwrap();
-        let (replayed, _) = process_command(&mut restored, &store, &config, &mut executor, &prepare).unwrap();
+        let (replayed, _) =
+            process_command(&mut restored, &store, &config, &mut executor, &prepare).unwrap();
         assert_eq!(replayed, failed);
-        assert_eq!(executor.calls, 1, "restart replay cannot retry the refused command");
+        assert_eq!(
+            executor.calls, 1,
+            "restart replay cannot retry the refused command"
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 
