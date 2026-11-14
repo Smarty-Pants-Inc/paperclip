@@ -2,6 +2,7 @@ import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
+import { settleReattachRun } from "../heartbeat/run-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -13225,6 +13226,7 @@ async function executePaperclipNativeSessionAttempt(
               );
             },
             onSession: async (session) => {
+              if (session) settleReattachRun(input.execution.binding.runId, "reached");
               input.bindAttachmentSession?.(session);
               if (session) {
                 runnerdBackend?.bindDiagnosticSession?.(session);
