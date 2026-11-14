@@ -14,6 +14,7 @@ import {
   completionContracts,
   nativeRunFinalizations,
   nativeRunResults,
+  environmentLeases,
 } from "@paperclipai/db";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -101,6 +102,36 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
   };
+
+  // Keep: recorded D10 F0 catch. The read-only gate decision must not
+  // register transaction work or abort the ordinary conversations behind it.
+  it("RFL round4 F0 sweeps a gate-held conversation with five ordinary unanswered ones without throwing", async () => {
+    const held = await fixture();
+    const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
+    await db.insert(environmentLeases).values({ companyId: held.companyId, issueId: held.issueId,
+      heartbeatRunId: heldRunId, provider: "boat", providerLeaseId: `gate-held-${randomUUID()}`, status: "retained" });
+    const { ensureFreshContinuation } = await import("../fresh-continuation-fallback.js");
+    expect(await ensureFreshContinuation(db, { companyId: held.companyId, runId: heldRunId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    const ordinary = [];
+    for (let i = 0; i < 5; i++) {
+      const f = await fixture();
+      await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
+      ordinary.push(f);
+    }
+    for (let pass = 0; pass < 3; pass++) {
+      await expect(heartbeatService(db).reconcileStrandedAssignedIssues()).resolves.toBeDefined();
+      for (const f of ordinary) {
+        const notices = await f.visible();
+        expect(notices).toHaveLength(1);
+        expect(notices[0]!.body).toBe(NOT_ANSWERED);
+      }
+      const heldNotices = await held.visible();
+      expect(heldNotices).toHaveLength(1);
+      expect(heldNotices[0]!.body).toContain("stopping the earlier attempt before starting fresh");
+    }
+  });
 
   it("SMAA-143 msg 1: native_session_interrupted (backup_without_reusable_lease) with its retries exhausted -> exactly one notice, code in metadata only", async () => {
     const f = await fixture({ status: "blocked" });

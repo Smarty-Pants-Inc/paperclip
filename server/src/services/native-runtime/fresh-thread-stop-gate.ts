@@ -1,15 +1,28 @@
-import { and, eq, inArray, isNull, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
-import { proveRunProcessGone } from "../run-process-owner.js";
+import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
 import { writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
+import { currentProcessSpaceHash } from "../controller-process-identity.js";
+import { hostname } from "node:os";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 export const FRESH_THREAD_STOPPING_NOTE = "I'm stopping the earlier attempt before starting fresh. Your message is saved; the fresh thread will read this conversation's history.";
 export const FRESH_THREAD_TURN_NOTE = "Your message is saved; the current step must finish before starting a fresh thread from this conversation's history.";
+
+/** Only the typed instruction/skill refresh may claim the change took effect.
+ * Environment loss and launch mismatch retain the generic truthful notice. */
+export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
+  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined;
+  const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
+  if (code !== "native_runner_refresh_required") return FRESH_THREAD_STARTED_NOTE;
+  const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
+    eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
+  return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
+}
 
 function turnWaitingNote(run: typeof heartbeatRuns.$inferSelect): string {
   const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown } | undefined;
@@ -54,8 +67,10 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
   const noticeAuthorizationReason = `fresh_provider_thread_pending:${sessionId ?? run.id}`;
   const notice = (body: string) => writeFreshThreadNotice(tx, run, issueId, body);
   const owners = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
-    eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.nativeIssueId, issueId),
-    sessionId ? eq(heartbeatRuns.nativeSessionId, sessionId) : eq(heartbeatRuns.id, run.id),
+    eq(heartbeatRuns.agentId, run.agentId),
+    or(eq(heartbeatRuns.nativeIssueId, issueId), eq(heartbeatRuns.issueId, issueId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+    sessionId ? eq(heartbeatRuns.nativeSessionId, sessionId) : undefined,
     sql`${heartbeatRuns.createdAt} <= (select created_at from ${heartbeatRuns} where id = ${run.id})`));
   // Legacy rows may bind their issue only through issueId/contextSnapshot.
   // Never lose the contender's recorded local process from the owner proof.
@@ -70,9 +85,9 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
     && owner.finishedAt && run.finishedAt && owner.finishedAt > run.finishedAt);
   const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
     inArray(environmentLeases.heartbeatRunId, owners.map(owner => owner.id).concat(run.id))));
-  // No remote allocation and no recorded process is a positive empty owner
-  // set, not an unfulfillable request for a provider stop receipt. Recorded
-  // local children still require the shared exact process proof below.
+  // Missing rows are not proof. Allocations require bound provider receipts;
+  // local owners require either exact process proof or a positive process-
+  // table read below, including launches whose PID was never persisted.
   let gone = true;
   const checked = new Set<string>();
   for (const original of leases) {
@@ -114,13 +129,30 @@ export async function freshThreadStopGate(tx: Db, run: typeof heartbeatRuns.$inf
   // Remote execution has its allocation-bound proof above; process stamps for
   // owners with no remote allocation cannot be skipped just because a local
   // lease row exists (or belongs to an earlier stranded attempt).
+  const unidentifiedLocalOwners: string[] = [];
   for (const owner of owners) {
     const hasRemoteAllocation = leases.some(lease => lease.heartbeatRunId === owner.id
       && lease.provider && lease.provider !== "local" && lease.providerLeaseId);
-    if (!hasRemoteAllocation && (owner.processPid !== null || owner.processGroupId !== null)) {
+    if (hasRemoteAllocation) continue;
+    if (owner.processPid !== null || owner.processGroupId !== null) {
       const proof = await proveRunProcessGone(owner, owner.id);
       if (proof?.verdict !== "gone") gone = false;
+    } else {
+      unidentifiedLocalOwners.push(owner.id);
     }
+  }
+  if (unidentifiedLocalOwners.length) {
+    const launches = await tx.selectDistinctOn([heartbeatRunEvents.runId], { payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId),
+        inArray(heartbeatRunEvents.runId, unidentifiedLocalOwners), isNull(heartbeatRunEvents.sourceEventId),
+        inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded"])))
+      .orderBy(heartbeatRunEvents.runId, desc(heartbeatRunEvents.seq));
+    // A local OS read cannot establish absence on another host/allocation.
+    const foreignOwner = owners.some(owner => unidentifiedLocalOwners.includes(owner.id)
+      && owner.processHostHash && owner.processHostHash !== currentProcessSpaceHash())
+      || launches.some(event => event.payload?.targetKind === "remote"
+        || (event.payload?.hostname && event.payload.hostname !== hostname()));
+    if (foreignOwner || !await noLocalRunnerProcessesForRuns(unidentifiedLocalOwners)) gone = false;
   }
   // Only the settlement owner can say it is starting fresh: a newer run or a
   // person-owned gate may still make a positive physical proof inapplicable.

@@ -605,6 +605,17 @@ export interface HarnessSessionRecoveryResult {
   runnerExitConfirmed?: true;
   refreshWaitForTurn?: true;
   prepareRefusalCode?: RunnerPrepareRefusalCode;
+  /** Server-authored remote read refusal; diagnostics are not authority. */
+  recoveryRefusalCode?: "runner_remote_state_unavailable";
+}
+
+/** Keep the remote-state refusal across driver recovery without interpreting
+ * serialized errors or unknown future codes as a deterministic refusal. */
+export function runnerRecoveryRefusalCode(error: unknown, depth = 0): HarnessSessionRecoveryResult["recoveryRefusalCode"] {
+  if (!error || typeof error !== "object" || depth > 5) return undefined;
+  const failure = error as { code?: unknown; cause?: unknown };
+  return failure.code === "runner_remote_state_unavailable" ? failure.code
+    : runnerRecoveryRefusalCode(failure.cause, depth + 1);
 }
 
 /** The additive prepare/attach channel. Unknown and old no-code receipts map

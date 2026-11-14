@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { once } from "node:events";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -197,6 +201,87 @@ suite("fresh-continuation fallback", () => {
       .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
     expect(await successors(f.runId)).toHaveLength(0);
   });
+
+  // Keep: executor exclusion/data safety, RFL's refused-predecessor catch.
+  it.each([true, false])("RFL round4 F6 proves the earlier owner's process, not the dead contender (nativeIssueId=%s)", async nativeIssue => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const sessionId = randomUUID();
+    const dead = spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" });
+    expect(dead.status).toBe(0);
+    const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, processPid: Number(dead.stdout.trim()) })
+      .where(eq(heartbeatRuns.id, f.runId)).returning();
+    await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId,
+      nativeIssueId: nativeIssue ? f.issueId : null, nativeSessionId: sessionId,
+      runtimeMode: "native", status: "failed", processPid: process.pid,
+      createdAt: new Date(source.createdAt.getTime() - 1000), finishedAt: source.finishedAt });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    expect(await successors(f.runId)).toHaveLength(0);
+  });
+
+  it.each(["refused", "earlier"])("RFL round4 F2-positive absent process and lease rows with a live %s runner still wait", async which => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    let ownerId = f.runId;
+    if (which === "earlier") {
+      const sessionId = randomUUID(); ownerId = randomUUID();
+      const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId })
+        .where(eq(heartbeatRuns.id, f.runId)).returning();
+      await db.insert(heartbeatRuns).values({ id: ownerId, companyId, agentId, nativeSessionId: sessionId,
+        runtimeMode: "native", status: "failed", contextSnapshot: { issueId: f.issueId },
+        createdAt: new Date(source.createdAt.getTime() - 1000), finishedAt: source.finishedAt });
+    }
+    const child = spawn(process.execPath, ["-e", "process.stdout.write('ready\\n'); setInterval(() => {}, 1000)", "--", "--run-id", ownerId],
+      { stdio: ["ignore", "pipe", "pipe"] });
+    try {
+      await once(child.stdout!, "data");
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      expect(await successors(f.runId)).toHaveLength(0);
+    } finally {
+      const exited = once(child, "exit"); child.kill(); await exited;
+    }
+    // The same positive process-table read now proves no local owner exists.
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+  });
+
+  it("RFL round4 F2-positive a failed process-table read is not an empty owner set", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const root = await mkdtemp(join(tmpdir(), "d10-process-table-failure-"));
+    await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    try {
+      vi.stubEnv("PATH", root);
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      expect(await successors(f.runId)).toHaveLength(0);
+    } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
+  });
+
+  it.each(["remote", "other-host"])("RFL round4 F2-positive a missing row cannot turn a %s launch into local proof", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
+      seq: 1, eventType: "native.process_start_requested", stream: "system", level: "info",
+      message: "Prior launch requested", payload: { targetKind: shape === "remote" ? "remote" : "local", hostname: "another-host" } });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+    expect(await successors(f.runId)).toHaveLength(0);
+  });
+
+  it.each(["native_runner_refresh_required", "runner_remote_state_unavailable", "native_runner_launch_profile_mismatch"])(
+    "RFL round4 F9 final wording distinguishes skill refresh from generic refusal (%s)", async code => {
+      const f = await unfinishedRun({ runtime: "native", errorCode: code });
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "continued" });
+      const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(notes).toHaveLength(1);
+      if (code === "native_runner_refresh_required") {
+        expect(notes[0].body).toContain("your skill change is in effect; Coder restarted its working thread");
+        expect(notes[0].body).not.toContain("could not be safely restored");
+      } else {
+        expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+        expect(notes[0].body).not.toMatch(/skill change/);
+      }
+    });
 
   it("RFL F3 appends changed notes, supersedes without rewriting another owner's note, and is idempotent", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });

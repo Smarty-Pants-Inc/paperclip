@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import type { heartbeatRuns } from "@paperclipai/db";
 import { proveOwnerGone, type LocalOwnerStamp, type OwnerProof, type ProcessProbe } from "./owner-proof.js";
 import { runProcessOwnerStamp } from "./native-runtime/native-owner-stamps.js";
@@ -31,4 +32,20 @@ export async function proveRunProcessGone(run: RunProcessIdentity, scope: string
   probe?: ProcessProbe): Promise<OwnerProof | null> {
   const stamp = lostProcessOwnerStamp(run, scope);
   return stamp ? proveOwnerGone(stamp, probe) : null;
+}
+
+/** Positive, same-host process-table read for the spawn/persist crash window.
+ * Runner argv AND inherited run attribution are checked: an adapter child need
+ * not be runnerd and may have no persisted PID yet. No diagnostics escape this
+ * proof (the listing includes environments). A failed/unsupported read is not
+ * an empty owner set. Remote/foreign-host launches need their own proof.
+ */
+export async function noLocalRunnerProcessesForRuns(runIds: readonly string[]): Promise<boolean> {
+  if (process.platform !== "linux") return false;
+  const listing = await new Promise<string | null>(resolve => {
+    execFile("ps", ["-axeww", "-o", "command="], { encoding: "utf8", timeout: 5_000, maxBuffer: 64 * 1024 * 1024 },
+      (error, stdout) => resolve(error ? null : stdout));
+  });
+  return listing !== null && !listing.split("\n").some(line => runIds.some(id =>
+    line.includes(`--run-id ${id}`) || line.includes(`PAPERCLIP_RUN_ID=${id}`)));
 }

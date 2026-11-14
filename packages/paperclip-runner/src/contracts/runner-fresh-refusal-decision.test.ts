@@ -1,8 +1,19 @@
 import { expect, it } from "vitest";
 import { NativeRunnerLaunchProfileMismatchError, NativeRunnerRefreshRequiredError, RUNNER_PREPARE_REFUSAL_CODES,
-  runnerPrepareRefusalCode, runnerReconciliationFailureClass, runnerRefreshWaitForTurn } from "./harness-driver.js";
+  runnerPrepareRefusalCode, runnerReconciliationFailureClass, runnerRefreshWaitForTurn, runnerRecoveryRefusalCode } from "./harness-driver.js";
 
 // Keep: the C3 trust-boundary policy opts into typed codes, not legacy prose.
+it("RFL round4 row5 reads only the structured remote-state code, including bounded causes", () => {
+  const source = Object.assign(new Error("opaque"), { code: "runner_remote_state_unavailable" });
+  expect(runnerRecoveryRefusalCode(source)).toBe("runner_remote_state_unavailable");
+  expect(runnerRecoveryRefusalCode(new Error("wrapper", { cause: source }))).toBe("runner_remote_state_unavailable");
+  for (const error of [new Error("runner_remote_state_unavailable"), { code: "unknown_future_code" },
+    { code: ["runner_remote_state_unavailable"] }, { reason: { code: "runner_remote_state_unavailable" } }]) {
+    expect(runnerRecoveryRefusalCode(error)).toBeUndefined();
+  }
+  const cyclic: { cause?: unknown } = {}; cyclic.cause = cyclic;
+  expect(runnerRecoveryRefusalCode(cyclic)).toBeUndefined();
+});
 it.each(RUNNER_PREPARE_REFUSAL_CODES)("C3 decides from the specific prepare code %s", refusalCode => {
   const error = { runnerCommandResult: { commandType: "run.prepare", status: "failed",
     result: { code: "command_execution_failed", refusalCode, message: "opaque", classification: "provider_state_incompatible" } } };

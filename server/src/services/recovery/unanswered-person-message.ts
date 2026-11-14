@@ -341,6 +341,9 @@ export async function settleUnansweredPersonMessage(
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
   if (decision.kind === "pending") {
+    if (decision.requestExecutionDisposition) await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
+    });
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
         agentId: decision.recordDeferral.agentId, eventType: NATIVE_REPAIR_DEFERRAL_EVENT, stream: "system", level: "info",
@@ -387,7 +390,7 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
-  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
+  | { kind: "pending"; recheckAt: number; requestExecutionDisposition?: true; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       /** Set when this replaces the message's standing waiting note. */
@@ -472,8 +475,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Impossible reconciliation has its own one-note, proven-stop owner. A
   // generic 'send again' notice must never race or time out that ownership.
   if (run && isFreshThreadRefusal(run)) {
-    await notifyDeliveryWork(q, DELIVERY_QUEUES.executionDisposition);
-    return { kind: "pending", recheckAt: now.getTime() + 60_000 };
+    // This predicate also runs with a plain read handle. Its caller owns the
+    // transaction needed to register delivery work; never signal here.
+    return { kind: "pending", recheckAt: now.getTime() + 60_000, requestExecutionDisposition: true };
   }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
