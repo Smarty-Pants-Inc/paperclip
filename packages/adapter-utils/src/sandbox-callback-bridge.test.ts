@@ -1845,6 +1845,92 @@ describe("sandbox callback bridge", () => {
     }));
   });
 
+  it("keeps the default host poll cadence at 100 ms", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-poll-"));
+    cleanupDirs.push(rootDir);
+    const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    vi.useFakeTimers();
+    let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | undefined;
+    try {
+      const listJsonFiles = vi.fn(async () => [] as string[]);
+      worker = await startSandboxCallbackBridgeWorker({
+        client: {
+          makeDir: async () => {}, makeDirs: async () => {}, listJsonFiles,
+          readTextFile: async () => "", writeTextFile: async () => {},
+          rename: async () => {}, remove: async () => {},
+        },
+        queueDir: path.join(rootDir, "queue"),
+        handleRequest: async () => ({ status: 200 }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listJsonFiles).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(99);
+      expect(listJsonFiles).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(listJsonFiles).toHaveBeenCalledTimes(2);
+    } finally {
+      if (worker) {
+        const stopped = worker.stop();
+        await vi.advanceTimersByTimeAsync(2_000);
+        await stopped;
+      }
+      vi.useRealTimers();
+      if (previousInterval === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = previousInterval;
+    }
+  });
+
+  it("uses the configured host interval for idle polling and still picks up requests within one interval", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-configured-poll-"));
+    cleanupDirs.push(rootDir);
+    const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = "1000";
+    vi.useFakeTimers();
+    let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | undefined;
+    try {
+      let requestReady = false;
+      let requestHandled = false;
+      const listJsonFiles = vi.fn(async () => requestReady ? ["request-1.json"] : []);
+      worker = await startSandboxCallbackBridgeWorker({
+        client: {
+          makeDir: async () => {}, makeDirs: async () => {}, listJsonFiles,
+          readTextFile: async () => JSON.stringify({
+            id: "request-1", method: "GET", path: "/api/agents/me", query: "", headers: {}, body: "",
+          }),
+          writeTextFile: async () => {}, rename: async () => {},
+          remove: async () => { requestReady = false; },
+        },
+        queueDir: path.join(rootDir, "queue"),
+        authorizeRequest: async () => null,
+        handleRequest: async () => { requestHandled = true; return { status: 200, body: "ok" }; },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listJsonFiles).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(listJsonFiles).toHaveBeenCalledTimes(1);
+      requestReady = true;
+      await vi.advanceTimersByTimeAsync(1);
+      expect(requestHandled).toBe(true);
+      // One immediate relist drains the now-removed request, then idle polling
+      // resumes at the configured interval.
+      expect(listJsonFiles).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(listJsonFiles).toHaveBeenCalledTimes(3);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(listJsonFiles).toHaveBeenCalledTimes(4);
+    } finally {
+      if (worker) {
+        const stopped = worker.stop();
+        await vi.advanceTimersByTimeAsync(2_000);
+        await stopped;
+      }
+      vi.useRealTimers();
+      if (previousInterval === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = previousInterval;
+    }
+  });
+
   it("creates the bridge queue directories in one directory-creation exec", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-makedirs-"));
     cleanupDirs.push(rootDir);

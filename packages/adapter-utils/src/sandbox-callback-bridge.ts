@@ -861,7 +861,16 @@ export async function startSandboxCallbackBridgeWorker(input: {
   // behavior.
   runtimeSpan?: RuntimeSpanRunner;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
-  const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
+  // This is the HOST-side worker interval. Keep it distinct from
+  // PAPERCLIP_BRIDGE_POLL_INTERVAL_MS, which configures the sandbox gateway's
+  // own queue polling and has separate semantics.
+  const configuredPollIntervalMs = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+  const pollIntervalMs = normalizeTimeoutMs(
+    input.pollIntervalMs === undefined
+      ? configuredPollIntervalMs === undefined ? undefined : Number(configuredPollIntervalMs)
+      : input.pollIntervalMs,
+    DEFAULT_BRIDGE_POLL_INTERVAL_MS,
+  );
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
   const abortedHandlerGraceMs = normalizeTimeoutMs(
