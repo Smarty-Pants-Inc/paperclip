@@ -270,6 +270,17 @@ export function resolveHeartbeatRuntimeMode(input: {
   };
 }
 
+/** The unresolved legacy row is only a queue default, not a legacy selection.
+ * Reject incompatible immutable selections before spending time preparing a workspace. */
+export function assertClaimedRuntimeAdapterCompatible(run: { runtimeMode: string | null; runtimeModeResolvedAt: Date | null }, adapterType: string | null): void {
+  if ((run.runtimeMode === "native" && adapterType !== "paperclip_runner") ||
+      (run.runtimeMode === "legacy" && !!run.runtimeModeResolvedAt && adapterType === "paperclip_runner") ||
+      (run.runtimeMode !== "legacy" && run.runtimeMode !== "native")) {
+    throw new NativeRunnerSelectionError("runtime_mode_adapter_incompatible",
+      "The claimed runtime mode cannot execute with this adapter; start a new run with a compatible selection.");
+  }
+}
+
 /**
  * Production heartbeat selection seam. A resolved run keeps its persisted
  * mode across configuration changes; only a fresh unresolved run consults the

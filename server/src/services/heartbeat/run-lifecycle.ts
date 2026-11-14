@@ -1209,7 +1209,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     failureReport?: RunFailureReportOptions,
-    options?: { setupFailure: true },
+    options?: { setupFailure: true; controllerBootId?: string | null; preparationOnly?: boolean },
   ) {
     return setRunStatusFromLive(runId, status, ["running"], patch, failureReport, undefined, options);
   }
@@ -1228,6 +1228,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     cancellationCondition?: ReturnType<typeof nativeRetryCancellationCommitCondition>,
     options?: {
       setupFailure?: true;
+      controllerBootId?: string | null;
+      preparationOnly?: boolean;
       /**
        * Write only while no native executor lease on the run is live. Locks the
        * coordinator row first, the order the owner takes back a lapsed lease in
@@ -1300,7 +1302,12 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             patch,
             fromStatuses,
             reconcileIfNeeded: true,
-            writeConditions: [nativeRunnerOwnershipNotHeldCondition(), ...(cancellationCondition ? [cancellationCondition] : [])],
+            writeConditions: [nativeRunnerOwnershipNotHeldCondition(),
+              ...(options && "controllerBootId" in options ? [options.controllerBootId === null
+                ? isNull(heartbeatRuns.controllerBootId) : eq(heartbeatRuns.controllerBootId, options.controllerBootId!)] : []),
+              ...(options?.preparationOnly ? [eq(heartbeatRuns.executionStage, "preparing"),
+                isNull(heartbeatRuns.processPid), isNull(heartbeatRuns.processGroupId), isNull(heartbeatRuns.processStartedAt)] : []),
+              ...(cancellationCondition ? [cancellationCondition] : [])],
           })
         : writer
             .update(heartbeatRuns)

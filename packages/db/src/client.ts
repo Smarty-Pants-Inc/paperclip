@@ -271,7 +271,8 @@ export function postgresJsOptions(options: DatabaseClientOptions): Record<string
 // A long advisory-lock transaction must not borrow the normal pool that its
 // work needs for progress writes. Keep connection configuration private to the
 // originating Db lifetime; callers receive neither URLs nor credentials.
-const dedicatedDbFactories = new WeakMap<object, () => Db>();
+type DedicatedDbOptions = Pick<DatabaseClientOptions, "connectTimeoutSeconds" | "statementTimeoutMs" | "maxConnections" | "applicationName">;
+const dedicatedDbFactories = new WeakMap<object, (options?: DedicatedDbOptions) => Db>();
 const ownedDatabaseListenerFactories = new WeakMap<object, () => Db>();
 
 export interface OwnedDatabaseListener {
@@ -289,10 +290,11 @@ export function createOwnedDatabaseListener(db: Db): OwnedDatabaseListener {
   };
 }
 
-export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>): Promise<T> {
+export async function withDedicatedDbConnection<T>(db: Db, action: (dedicated: Db) => Promise<T>,
+  options?: DedicatedDbOptions): Promise<T> {
   const factory = dedicatedDbFactories.get(db);
   if (!factory) throw new Error("dedicated_connection_requires_create_db");
-  const dedicated = factory();
+  const dedicated = factory(options);
   try { return await action(dedicated); }
   finally { await dedicated.$client.end({ timeout: 1 }); }
 }
@@ -431,8 +433,8 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // that know the complete operation is idempotent.
   const db = installDatabaseWorkSignals(drizzleWithLazyTransactionQueries(sql, schema), owner);
   installDatabaseResponseCapture(db, schema);
-  dedicatedDbFactories.set(db, () => createDbClient(url, {
-    ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",
+  dedicatedDbFactories.set(db, options => createDbClient(url, {
+    ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock", ...options,
   }, db));
   ownedDatabaseListenerFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: 1,

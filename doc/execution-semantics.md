@@ -2384,12 +2384,37 @@ On startup and on the periodic recovery loop, Paperclip performs the following r
 4. scan silent active runs only for source-aware terminal folding and legacy cleanup; API reads classify ordinary output silence for the board UI
 
 The orphan reap normally waits until a `running` run has been unchanged for five
-minutes. A legacy run whose controller lease belongs to an earlier server boot
-and has expired, which was still preparing (before adapter dispatch), and which
-has no recorded process is recovered when that lease expires instead. The
-expired lease proves that the earlier owner is gone, and no provider work
-started. A live lease, a lease of the current boot, a dispatched adapter, or a
-recorded process keeps the five-minute guard.
+minutes. Preparation uses the existing controller lease instead of a wall-clock
+setup deadline: the owning executor renews the 60-second lease every 10 seconds,
+including cleanup-gate and workspace-readiness waits. A healthy 50-second (or
+longer) setup is not a lost run. When no local executor is tracked and a legacy
+run's lease has expired while it is still `preparing`, with no recorded provider
+process, the existing sweep can recover it without the five-minute age guard.
+This also covers an abandoned executor from the current boot. A foreign process
+proven alive gets 30 seconds after lease expiry to settle preparation itself;
+renewal/revocation and the committed stage fence prevent concurrent dispatch.
+Dispatched adapters and recorded provider processes retain their existing safety
+checks. A provably gone controller can still be recovered immediately.
+
+When preparation actually fails before dispatch, completion runs on a fresh
+pool rather than the failed request connection. It makes at most three logged
+settlement attempts, with 2-second connection/statement timeouts and a 1-second
+pause between attempts. A retry after a committed failure resumes the remaining
+wakeup, claim, note, agent-status and environment-lease settlement. Wrapped driver
+codes (`ECONNRESET`, `57P01`, `08006` and driver connection-closed codes) become
+`setup_connection_lost`; an unprovable foreign preparation owner becomes
+`setup_owner_lost`. Both use the existing bounded preparation-retry owner. That
+owner can atomically transfer the failed run's issue claim to a durable
+`scheduled_retry` successor; a failed predecessor never keeps the claim. The
+existing unanswered-message owner posts one idempotent, pre-dispatch explanation
+for the carrying message, including its fresh-continuation lineage. A proven-live
+foreign controller is only logged, never failed by another executor.
+
+Immediately after claim, before workspace preparation or cleanup-gate work, a
+persisted mode incompatible with the agent's adapter fails with
+`runtime_mode_adapter_incompatible`, without an automatic configuration retry.
+An unresolved legacy row is the queue's default, not a persisted legacy
+selection: normal native selection still happens through its existing owner.
 
 A native run can accept its result and then lose its server to a hard kill
 before finalization. Its result stays leased to the controller of the earlier

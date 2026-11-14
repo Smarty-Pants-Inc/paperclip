@@ -2608,7 +2608,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // charge the failure budget. Recover it only once the owner is gone, or
       // when it has not settled the run within the grace.
       if (!legacyLease && legacyControllerProof?.verdict === "alive" && run.controllerLeaseExpiresAt) {
-        const ownerSettlesBy = run.controllerLeaseExpiresAt.getTime() + LEGACY_LIVE_OWNER_SETTLE_GRACE_MS;
+        const ownerSettlesBy = run.controllerLeaseExpiresAt.getTime() +
+          (run.executionStage === "preparing" && !run.processPid && !run.processGroupId ? 30_000 : LEGACY_LIVE_OWNER_SETTLE_GRACE_MS);
         if (now.getTime() < ownerSettlesBy) {
           scope.onDeferredDeadline?.(Math.min(ownerSettlesBy, Date.now() + 30_000));
           continue;
@@ -2618,16 +2619,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // A legacy controller proves it is alive only by renewing its lease, and
       // the check above found no live lease (a missing expiry also lands here;
       // revocation below then refuses the row). When the lease belongs to a
-      // previous boot, setup never reached adapter dispatch, and no process
+      // boot (including this boot) with no locally tracked executor, setup
+      // never reached adapter dispatch, and no process
       // was recorded, the owner is gone and no provider work can be running:
       // recover now instead of waiting for the age threshold. A dispatched
       // adapter (for example a remote HTTP request) keeps the age guard. The
       // stage is rechecked from the state committed with the revocation below.
-      const priorBootSetupExpired =
+      const expiredPreparation =
         run.runtimeMode === "legacy" &&
         run.executionStage === "preparing" &&
         !!run.controllerBootId &&
-        run.controllerBootId !== legacyControllerBootId &&
         !run.processPid &&
         !run.processGroupId;
       const currentAdapterTracksLocalChild =
@@ -2651,7 +2652,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const legacyProcessProof = !nativeRun && (checksPersistedChildLiveness || run.processPid != null || run.processGroupId != null)
         ? await proveRunProcessGone(run, "legacy_run_process") : null;
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0 && !priorBootSetupExpired && !legacyControllerGone && legacyProcessProof?.verdict !== "gone") {
+      if (staleThresholdMs > 0 && !expiredPreparation && !legacyControllerGone && legacyProcessProof?.verdict !== "gone") {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) {
           scope.onDeferredDeadline?.(refTime + staleThresholdMs);
@@ -2715,7 +2716,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         readNonEmptyString(runContext.wakeReason) === "issue_monitor_due" &&
         monitorNextCheckAt !== undefined &&
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
-      const reclaimPortablePreparation = priorBootSetupExpired && adapterType === "paperclip_runner" && run.scopeKind === "issue" && run.issueId
+      const reclaimPortablePreparation = expiredPreparation && adapterType === "paperclip_runner" && run.scopeKind === "issue" && run.issueId
         ? portableTaskPreparationLeaseId(db, run) : undefined;
       const revokedState = await revokeExpiredLegacyControllerWithState(db, run, reclaimPortablePreparation);
       if (!revokedState) continue;
@@ -2739,7 +2740,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // The earlier snapshot may predate a final renewal that admitted the
       // adapter. Revocation leaves a fresh foreign lease, so a later pass
       // applies the age guard to that dispatched run.
-      if (priorBootSetupExpired && !legacyControllerGone && staleThresholdMs > 0 && (revokedState.executionStage !== "preparing"
+      if (expiredPreparation && !legacyControllerGone && staleThresholdMs > 0 && (revokedState.executionStage !== "preparing"
         || revokedState.processPid || revokedState.processGroupId)) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         scope.onDeferredDeadline?.(Math.max(refTime + staleThresholdMs, Date.now() + 60_000));

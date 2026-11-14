@@ -1,3 +1,6 @@
+import { setTimeout as delay } from "node:timers/promises";
+import { closeCheckpointDb, closeLivenessDb, withDedicatedDbConnection } from "@paperclipai/db";
+import { settleUnansweredPersonMessagesForTask } from "../recovery/unanswered-person-message.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
@@ -172,6 +175,8 @@ export interface FailHeartbeatRunInput extends RunCompletionInput {
 }
 
 export interface FailHeartbeatRunSetupInput {
+  /** Resume idempotent settlement after a connection failed after the terminal write. */
+  resumeSettlement?: boolean;
   run: Run;
   runId: string;
   outerErr: unknown;
@@ -182,6 +187,34 @@ export interface FailHeartbeatRunSetupInput {
   nativeDispatchMayHaveStarted?: boolean;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "redact">;
   readFailureReportSecrets: () => string[];
+}
+
+/** Only driver codes, including wrapped query causes; never infer database loss from error prose. */
+export function preparationConnectionLost(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 6; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if (["ECONNRESET", "57P01", "08006", "CONNECTION_CLOSED", "CONNECTION_ENDED", "CONNECTION_DESTROYED"].includes(String((cause as { code?: unknown }).code))) return true;
+  }
+  return false;
+}
+
+/** Rebuild completion's existing owners on a new connection, not the failed request/transaction.
+ * No preparation deadline: only failed, pre-dispatch settlement is retried. */
+export async function settlePreparationFailureWithFreshConnection(db: Db, input: FailHeartbeatRunSetupInput,
+  settle: (fresh: Db, input: FailHeartbeatRunSetupInput) => Promise<void>): Promise<void> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    logger.warn({ runId: input.runId, attempt, maxAttempts: 3 }, "settling failed preparation on a fresh database connection");
+    try {
+      await withDedicatedDbConnection(db, async fresh => {
+        try { await settle(fresh, { ...input, resumeSettlement: true }); }
+        finally { await Promise.all([closeCheckpointDb(fresh, 0), closeLivenessDb(fresh, 0)]); }
+      }, { connectTimeoutSeconds: 2, statementTimeoutMs: 2_000, maxConnections: 4, applicationName: "paperclip-setup-settlement" });
+      return;
+    } catch (error) {
+      logger.error({ runId: input.runId, attempt, connectionLost: preparationConnectionLost(error) }, "fresh preparation settlement attempt failed");
+      if (attempt === 3) throw error;
+      await delay(1_000);
+    }
+  }
 }
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
@@ -1663,7 +1696,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ? outerErr : null;
     const runnerRevisionMismatch = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && isRunnerRevisionMismatch(outerErr);
+    const namedPreparationCode = !providerDispatchStarted && ["setup_owner_lost", "runtime_mode_adapter_incompatible"].includes(String((outerErr as { code?: unknown })?.code))
+      ? String((outerErr as { code: string }).code) : null;
     const setupFailureErrorCode =
+      (!providerDispatchStarted && preparationConnectionLost(outerErr) ? "setup_connection_lost" : null) ??
+      namedPreparationCode ??
       (controllerLeaseLost ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
@@ -1773,7 +1810,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }, { error: outerErr, phase: "setup", secretValues: readFailureReportSecrets(),
       // The Sentry report waits for the bounded retry decision below.
       ...(reviewedChatBindingNotReady ? { reviewedChatRetry: "pending" as const } : {}),
-    }, { setupFailure: true }).catch(() => ({ run: null, updated: false as const }));
+    }, { setupFailure: true,
+      ...(!providerDispatchStarted && run.runtimeMode === "legacy" ? { controllerBootId: run.controllerBootId } : {}),
+      ...(setupFailureErrorCode === "setup_owner_lost" ? { preparationOnly: true } : {}),
+    });
     let reviewedChatRetryScheduled = false;
     if (!setupFailureWrite.updated) {
       logger.info(
@@ -1784,14 +1824,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         },
         "skipping late setup failure finalization because the run already left running state",
       );
-    } else {
-      await setWakeupStatus(run.wakeupRequestId, "failed", {
-        finishedAt: new Date(),
-        error: message,
-      }).catch(() => undefined);
     }
-    const failedRun = await getRun(runId).catch(() => null);
-    if (setupFailureWrite.updated && failedRun) {
+    const failedRun = await getRun(runId);
+    const ownsSetupFailure = setupFailureWrite.updated || (input.resumeSettlement && failedRun?.status === "failed"
+      && failedRun.errorCode === setupFailureErrorCode && failedRun.controllerBootId === run.controllerBootId);
+    if (ownsSetupFailure && failedRun) {
+      await setWakeupStatus(run.wakeupRequestId, "failed", {
+        finishedAt: new Date(), error: message,
+      }).catch(error => { if (input.resumeSettlement) throw error; });
       // Emit a run-log event so the failure is visible in the run timeline,
       // consistent with what the inner catch block does for adapter failures.
       await appendRunEvent(failedRun, {
@@ -1887,7 +1927,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: ["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible"].includes(livenessRun.errorCode ?? "") ||
+          storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||
@@ -1899,7 +1940,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           { err: releaseError, runId },
           "failed to release issue execution after heartbeat setup failure",
         );
+        if (input.resumeSettlement) throw releaseError;
       });
+      if (input.resumeSettlement && setupFailureIssueId) {
+        await settleUnansweredPersonMessagesForTask(db, { companyId: run.companyId, issueId: setupFailureIssueId });
+      }
       await handleIssueReviewPathDisposition(livenessRun).catch(
         (reviewPathError) => {
           logger.error(
@@ -1916,10 +1961,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       void reportRunFailure(db, reviewedChatReportRun, { error: outerErr, phase: "setup", secretValues: readFailureReportSecrets(),
         reviewedChatRetry: reviewedChatRetryScheduled ? "scheduled" : "not_scheduled" });
     }
-    // Ensure the agent is not left stuck in "running" if the setup-failure
-    // path owned the terminal transition. If another path already finalized
-    // the run, keep that terminal outcome authoritative.
-    if (setupFailureWrite.updated) {
+    // Retry the full settlement, including wakeup and agent status, if a
+    // connection died after our terminal write. Another owner's outcome wins.
+    if (ownsSetupFailure) {
       await finalizeAgentStatus(run.agentId, "failed", message, {
         wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
         // Low-trust admission failures are task/principal preconditions,

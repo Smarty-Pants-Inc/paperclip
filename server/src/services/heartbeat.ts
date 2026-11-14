@@ -67,7 +67,7 @@ import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorks
 import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { prepareAndSelectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
-import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
+import { createHeartbeatRunCompletion, settlePreparationFailureWithFreshConnection, type FailHeartbeatRunSetupInput } from "./heartbeat/run-completion.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 export {
   MAX_TURN_CONTINUATION_WAKE_REASON,
@@ -309,6 +309,7 @@ import {
 
 import {
   legacyControllerBootId,
+  proveLegacyController,
   watchLegacyControllerLease,
 } from "./legacy-controller-lease.js";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
@@ -406,6 +407,7 @@ import {
   resolveHeartbeatNativeRuntimeMode,
 } from "./native-runtime/index.js";
 
+import { assertClaimedRuntimeAdapterCompatible } from "./native-runtime/runtime-mode.js";
 import { nativeChatWorkspaceCwd } from "./native-runtime/native-chat-workspace.js";
 import {
   configuredEnvironmentProjection,
@@ -873,9 +875,17 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
-export function heartbeatService(
+export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
+  return createHeartbeatService(db, options);
+}
+
+// Completion owners can be rebound to a fresh pool without swapping the Db of
+// concurrent executions or exposing a second public failure/notice owner.
+function createHeartbeatService(
   db: Db,
-  options: HeartbeatServiceOptions = {},
+  options: HeartbeatServiceOptions,
+  captureSetupFailure?: (settle: (input: FailHeartbeatRunSetupInput) => Promise<void>) => void,
+  preparationPostCommitEffects?: WakeQueuePostCommitEffect[],
 ) {
   const { finalizeAgentStatus } = createHeartbeatAgentStatus(db);
   const {
@@ -1572,8 +1582,12 @@ export function heartbeatService(
     const run = await getRun(runId);
     if (run && run.companyId === companyId) await resumeRemoteStopComments(run);
   };
-  registerHeldPreparationResumer(resumeSettledRun);
-  registerCompletedTurnCleanupResumer(resumeSettledRun);
+  if (!captureSetupFailure) {
+    // A short-lived settlement pool must never replace the server's process-
+    // lifetime recovery callbacks with closures over a connection it closes.
+    registerHeldPreparationResumer(resumeSettledRun);
+    registerCompletedTurnCleanupResumer(resumeSettledRun);
+  }
 
   function cancelRunInternal(...args: Parameters<typeof runControl.cancelRunInternal>) {
     return runControl.cancelRunInternal(...args);
@@ -1600,6 +1614,12 @@ export function heartbeatService(
   // module: publish + dispatch a promoted or recovery run, log a reopened
   // issue's activity entry.
   async function applyWakeQueuePostCommitEffects(effects: WakeQueuePostCommitEffect[]) {
+    if (preparationPostCommitEffects) {
+      // Persist/release on the fresh pool, but dispatch only through the live
+      // server owner after that pool has closed. Never launch on a temporary Db.
+      preparationPostCommitEffects.push(...effects);
+      return;
+    }
     for (const effect of effects) {
       if (effect.kind === "conversation_retry_requested") {
         const [source] = await db.select().from(heartbeatRuns).where(and(
@@ -1931,6 +1951,35 @@ export function heartbeatService(
     failedProcessRunCancellations,
   });
 
+  captureSetupFailure?.(async input => {
+    // Trace metadata is optional; it must never prevent terminal settlement.
+    await traceStore.finalize(input.runId, input.run.companyId).catch(() => {
+      logger.warn({ runId: input.runId }, "provider trace finalization deferred during failed preparation settlement");
+    });
+    await runCompletion.failRunSetup(input);
+    const current = await getRun(input.runId);
+    if (current?.status === "running" && current.controllerBootId === input.run.controllerBootId) {
+      throw new Error("preparation_failure_not_persisted");
+    }
+    if (current?.status === "failed" && current.controllerBootId === input.run.controllerBootId) {
+      // The ordinary finally block still owns in-memory/file cleanup. Its DB
+      // owners must also run here: a dead request pool cannot strand leases.
+      await releaseEnvironmentLeasesForRun({ runId: current.id, companyId: current.companyId,
+        agentId: current.agentId, status: current.status, failureReason: current.error ?? undefined,
+        providerResourceDisposition: providerResourceDispositionForTerminalRun(undefined, current.status, current.errorCode) });
+      await releaseRuntimeServicesForRun(current.id);
+    }
+  });
+  const settleFailedPreparation = async (input: FailHeartbeatRunSetupInput) => {
+    const effects: WakeQueuePostCommitEffect[] = [];
+    await settlePreparationFailureWithFreshConnection(db, input, async (fresh, retryInput) => {
+      let settle!: (input: FailHeartbeatRunSetupInput) => Promise<void>;
+      createHeartbeatService(fresh, options, owner => { settle = owner; }, effects);
+      await settle(retryInput);
+    });
+    await applyWakeQueuePostCommitEffects(effects);
+  };
+
   async function executeRun(
     runId: string,
     runOptions: {
@@ -2074,18 +2123,17 @@ export function heartbeatService(
         run = cleared;
       }
     }
-    // A failed session close (this run's own, or a finished predecessor's) may
-    // still hold this process's cleanup gate for the task. When its runner and
-    // providers are proven stopped, retire it so admission is not refused.
-    const cleanupGateIssueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
-    if (cleanupGateIssueId) {
-      const { retireStoppedSessionCleanupGates } = await import("./native-runtime/native-session-executor.js");
-      await retireStoppedSessionCleanupGates(db, { companyId: run.companyId, issueId: cleanupGateIssueId,
-        ...(run.runtimeMode === "native" ? { run } : {}) });
+    if (run.runtimeMode === "legacy" && run.controllerBootId && run.controllerBootId !== legacyControllerBootId) {
+      const proof = await proveLegacyController(run);
+      logger.warn({ runId: run.id, ownerBootId: run.controllerBootId, ownerProcess: run.controllerProcess,
+        ourBootId: legacyControllerBootId, ownerVerdict: proof?.verdict ?? "unprovable" }, "run preparation belongs to a foreign controller");
+      if (proof?.verdict !== "alive") {
+        await settleFailedPreparation({ run, runId, outerErr: Object.assign(new Error("Preparation owner could not be verified before dispatch"), { code: "setup_owner_lost" }),
+          signal: new AbortController().signal, providerDispatchStarted: false, nativeDispatchMayHaveStarted: false,
+          identityRedactor: { redact: value => value }, readFailureReportSecrets: () => [] });
+      }
+      return;
     }
-
-    if (run.runtimeMode === "legacy" && run.controllerBootId &&
-        run.controllerBootId !== legacyControllerBootId) return;
     activeRunExecutions.add(run.id);
     const timePreparation = createHeartbeatPreparationTiming(run.id);
     const executionControl = createAdapterExecutionControl();
@@ -2203,6 +2251,15 @@ export function heartbeatService(
         return;
       }
       let agent = loadedAgent;
+      assertClaimedRuntimeAdapterCompatible(run, agent.adapterType);
+      // Renew from claim through cleanup-gate waits too; all preparation errors
+      // belong to the same failure owner, including a failed gate query.
+      const cleanupGateIssueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
+      if (cleanupGateIssueId) {
+        const { retireStoppedSessionCleanupGates } = await import("./native-runtime/native-session-executor.js");
+        await retireStoppedSessionCleanupGates(db, { companyId: run.companyId, issueId: cleanupGateIssueId,
+          ...(run.runtimeMode === "native" ? { run } : {}) });
+      }
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -4056,9 +4113,14 @@ export function heartbeatService(
           },
         );
       } else if (!(await leaveToNextController(outerErr))) {
-        await preserveNativeWorkspaceOnFailure();
+        // Losing the preparation connection must not lose the original failure
+        // while reading optional workspace-preservation evidence on that pool.
+        await preserveNativeWorkspaceOnFailure().catch(() => {
+          logger.warn({ runId: run.id }, "workspace preservation evidence deferred after preparation failure");
+        });
         if (!nativeOwnershipHeld && !nativeStartupCleanupScheduled && !nativeStartupCleanupError) {
-          await runCompletion.failRunSetup({
+          await (!legacyAdapterEntered && !nativeDispatchStarted && !nativeDispatchMayHaveStarted()
+            ? settleFailedPreparation : runCompletion.failRunSetup)({
             run, runId, outerErr, signal: executionControl.controller.signal,
             providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted,
             nativeDispatchMayHaveStarted: nativeDispatchMayHaveStarted(),

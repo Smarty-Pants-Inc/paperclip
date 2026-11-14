@@ -159,7 +159,7 @@ export function isTransientWorkspacePreparationCode(code: string | null | undefi
     || code === REMOTE_WORKSPACE_RESTORE_FAILED_CODE || code === PLUGIN_WORKER_UNAVAILABLE_CODE
     || code === RUNNER_REVISION_MISMATCH_CODE || code === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE
     || code === REPOSITORY_CATALOG_UNAVAILABLE_CODE || code === REVIEWED_CHAT_BINDING_NOT_READY
-    || code === STORAGE_UNAVAILABLE_CODE;
+    || code === STORAGE_UNAVAILABLE_CODE || code === "setup_connection_lost" || code === "setup_owner_lost";
 }
 
 /**
@@ -432,6 +432,7 @@ function isRetryableInteractionContinuationInfrastructureFailure(
   if (
     run.errorCode === WORKSPACE_VALIDATION_FAILURE_CODE ||
     run.errorCode === "process_lost" ||
+    run.errorCode === "setup_connection_lost" || run.errorCode === "setup_owner_lost" ||
     run.errorCode === CONTROLLER_LEASE_LOST_FAILURE_CODE ||
     run.errorCode === PLUGIN_WORKER_UNAVAILABLE_CODE ||
     run.errorCode === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE ||

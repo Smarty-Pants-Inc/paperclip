@@ -93,6 +93,7 @@ export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
 // code token; anything not listed is unclassified_failure, never raw text.
 const SHOWN_CODES = new Set([
   "adapter_failed", "cancelled", "timeout", "timed_out", "interrupted", "process_lost", "setup_failed",
+  "setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible",
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
   "native_controller_recovery_metadata_too_large", "native_session_cleanup_quarantined",
@@ -138,6 +139,7 @@ const SHOWN_CODES = new Set([
 
 // Refusals a new message meets the same way: the held text, not "send it again".
 const HELD_CODES = new Set([
+  "runtime_mode_adapter_incompatible",
   "runner_state_identity_mismatch", "native_controller_recovery_missing_evidence",
   "native_controller_recovery_dependency_unavailable", "native_controller_recovery_unsupported",
   "native_session_cleanup_quarantined", "runner_process_termination_unconfirmed",
@@ -151,6 +153,7 @@ const HELD_CODES = new Set([
   "native_session_supervisor_checkpoint_too_large", "pi_conversation_identity_missing",
 ]);
 
+const PREPARATION_FAILURE_CODES = new Set(["setup_connection_lost", "setup_owner_lost", "runtime_mode_adapter_incompatible"]);
 const GENERIC_RUN_CODES = new Set(["adapter_failed", "setup_failed"]);
 const TERMINAL = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 const LIVE = ["queued", "running", "scheduled_retry"];
@@ -442,6 +445,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
+    preparationRecovery: sql<Record<string, unknown> | null>`${heartbeatRuns.resultJson}->'executionRecovery'`,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
@@ -457,6 +461,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // else, and any approval, can hold the task but do not answer the message.
   if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
+  }
+
+  // A positively pre-dispatch failure is immediately explainable, even if
+  // its bounded retry is scheduled. Follow the existing message lineage; an
+  // unrelated routine's setup failure cannot explain this person's message.
+  let preparationFailure: typeof messageRun = null;
+  if (messageRun) {
+    for (const candidate of runs) {
+      if (candidate.status !== "failed" || !PREPARATION_FAILURE_CODES.has(candidate.errorCode ?? "") ||
+          candidate.preparationRecovery?.kind !== "bootstrap" || candidate.preparationRecovery.providerWorkStarted !== false) continue;
+      if (runCarriesMessage(candidate.contextSnapshot, message.id) || await freshContinuationDescendsFrom(q, {
+        companyId: issue.companyId, issueId: issue.id, runId: candidate.id, ancestorRunId: messageRun.id })) {
+        preparationFailure = candidate; break;
+      }
+    }
   }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
@@ -520,7 +539,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
   let waitingToStart = false;
-  if (liveRuns.length && !agentPaused) {
+  if (liveRuns.length && !agentPaused && !preparationFailure) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
     waitingToStart = liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id));
@@ -532,7 +551,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  if (!boardHold && !agentPaused) {
+  if (!boardHold && !agentPaused && !preparationFailure) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
@@ -546,9 +565,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // run the person's message ended on: its refusal is the explanation
   // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
   const latest = runs[0];
-  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+  const run = preparationFailure ?? (messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
+      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun);
 
   let code: string;
   if (agentPaused) {
@@ -579,8 +598,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
-    if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (run.issueCommentStatus === "retry_queued") {
+    if (!preparationFailure && due > now.getTime()) return { kind: "pending", recheckAt: due };
+    if (!preparationFailure && run.issueCommentStatus === "retry_queued") {
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
     }
@@ -640,7 +659,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  const body = preparationFailure ? code === "runtime_mode_adapter_incompatible"
+    ? "Task setup stopped because this runtime mode and adapter cannot execute together. No agent work started."
+    : "Task setup ended before agent work began. Your message has not been answered."
+    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
@@ -649,7 +671,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
-      nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+      nextAction: preparationFailure ? code === "runtime_mode_adapter_incompatible"
+        ? "Choose a compatible runtime and adapter, then retry."
+        : "Retry if another attempt does not answer your message."
+        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
