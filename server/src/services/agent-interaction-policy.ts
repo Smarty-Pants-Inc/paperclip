@@ -1,7 +1,7 @@
 import { agents, issues, type Db } from "@paperclipai/db";
 import { extractAgentMentionIds, isUuidLike, type AgentInteractionPermissionKey } from "@paperclipai/shared";
-import { and, eq, inArray, or } from "drizzle-orm";
-import { forbidden, notFound } from "../errors.js";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { conflict, forbidden, notFound } from "../errors.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -20,6 +20,8 @@ export interface AgentInteractionInput {
   texts?: readonly string[];
   lock?: boolean | "update";
   lockAgentIds?: readonly string[];
+  /** The mutation will run the company's connector invalidation trigger. */
+  lockCompanyRuntimeAgents?: boolean;
   delivery?: boolean;
 }
 
@@ -37,6 +39,7 @@ export interface AgentInteractionDenial {
 export async function agentInteractionDenial(
   db: Db | DbTransaction,
   input: AgentInteractionInput,
+  plannedAgentIds?: readonly string[],
 ): Promise<AgentInteractionDenial | null> {
   const origin = currentPluginInteractionOrigin();
   const actorCompanyId = input.actorCompanyId ?? input.companyId;
@@ -57,10 +60,29 @@ export async function agentInteractionDenial(
   const agentIds = [...new Set([
     actorAgentId, input.targetAgentId, owner(issue), owner(parent), ...mentions, ...(input.lockAgentIds ?? []).filter(isUuidLike),
   ].filter((id): id is string => Boolean(id)))].sort();
+  if (plannedAgentIds && agentIds.some(id => !plannedAgentIds.includes(id))) {
+    // A later task changed owner after batch discovery. Do not acquire a new
+    // lower-ID policy lock behind the earlier batch's SHARE locks.
+    throw conflict("Task interaction ownership changed during the operation.");
+  }
+  // Configure mutations can synchronously invalidate every active agent. The
+  // configure fence must take that same N set in one ID-ordered query, together
+  // with explicit inactive targets, rather than first locking a higher actor.
+  // Ordinary policy readers retain S and their exact interaction scope.
+  // This does not reorder a caller's preheld lifecycle S fence: the preserved
+  // gateway-preheld-run-reader regression blocks deploying this candidate.
+  const configureWrite = input.operation === "configure" && input.lock === "update" && input.lockCompanyRuntimeAgents;
+  if (configureWrite) {
+    await db.select({ id: agents.id }).from(agents).where(or(
+      and(eq(agents.companyId, input.companyId), or(inArray(agents.id, agentIds),
+        sql`${agents.status} NOT IN ('pending_approval', 'terminated')`)),
+      and(eq(agents.companyId, actorCompanyId), eq(agents.id, actorAgentId)),
+    )).orderBy(agents.id).for("no key update");
+  }
   const agentQuery = db.select({ id: agents.id, companyId: agents.companyId, permissions: agents.permissions }).from(agents)
-    .where(or(and(eq(agents.companyId, input.companyId), inArray(agents.id, agentIds)),
+    .where(or(and(eq(agents.companyId, input.companyId), inArray(agents.id, plannedAgentIds ?? agentIds)),
       and(eq(agents.companyId, actorCompanyId), eq(agents.id, actorAgentId)))).orderBy(agents.id);
-  const rows = await (input.lock ? agentQuery.for(input.lock === "update" ? "no key update" : "share") : agentQuery);
+  const rows = await (input.lock && !configureWrite ? agentQuery.for(input.lock === "update" ? "no key update" : "share") : agentQuery);
   const byId = new Map(rows.map(row => [row.id, row.permissions]));
   if (!rows.some(row => row.id === actorAgentId && row.companyId === actorCompanyId)
     || (input.targetAgentId && !rows.some(row => row.id === input.targetAgentId && row.companyId === input.companyId))) {
@@ -132,7 +154,55 @@ export async function agentInteractionDenial(
   return null;
 }
 
-export async function assertAgentInteraction(db: Db | DbTransaction, input: AgentInteractionInput): Promise<void> {
-  const denial = await agentInteractionDenial(db, input);
+function assertAllowed(denial: AgentInteractionDenial | null): void {
   if (denial) throw forbidden(`Agent interaction is disabled by ${denial.permission}. A human permission manager can change this setting.`, denial);
+}
+
+export async function assertAgentInteraction(db: Db | DbTransaction, input: AgentInteractionInput): Promise<void> {
+  assertAllowed(await agentInteractionDenial(db, input));
+}
+
+/** Plan a batched reader's full policy set before its first SHARE lock. Task
+ * rows still get the existing per-operation fence; each is revalidated before
+ * using the discovered owner. No company-wide policy read sweep is introduced.
+ */
+export async function assertAgentInteractions(db: Db | DbTransaction, inputs: readonly AgentInteractionInput[]): Promise<void> {
+  const origin = currentPluginInteractionOrigin();
+  const planned = new Set<string>();
+  const scopes = new Map<string, Set<string>>();
+  const taskScopes = new Map<string, Set<string>>();
+  const add = (companyId: string, id: string) => {
+    planned.add(id);
+    const ids = scopes.get(companyId) ?? new Set<string>(); ids.add(id); scopes.set(companyId, ids);
+  };
+  for (const input of inputs) {
+    if (input.lock !== true) throw new Error("Batched interactions require SHARE policy fences");
+    const actorCompanyId = input.actorCompanyId ?? input.companyId;
+    if (origin && origin.companyId !== actorCompanyId) throw notFound("Company resource not found");
+    const actorAgentId = origin?.agentId ?? input.actorAgentId;
+    if (!actorAgentId) continue;
+    const taskIds = taskScopes.get(input.companyId) ?? new Set<string>();
+    for (const id of [input.issueId, input.parentIssueId]) if (id) taskIds.add(id);
+    if (taskIds.size) taskScopes.set(input.companyId, taskIds);
+    add(actorCompanyId, actorAgentId);
+    for (const id of [input.targetAgentId,
+      ...(input.texts ?? []).flatMap(extractAgentMentionIds).filter(isUuidLike), ...(input.lockAgentIds ?? []).filter(isUuidLike)]) {
+      if (id) add(input.companyId, id);
+    }
+  }
+  const tasks = taskScopes.size ? await db.select({ companyId: issues.companyId,
+    assigneeAgentId: issues.assigneeAgentId, conversationAgentId: issues.conversationAgentId }).from(issues).where(or(
+    ...[...taskScopes].map(([companyId, ids]) => and(eq(issues.companyId, companyId), inArray(issues.id, [...ids]))),
+  )) : [];
+  for (const task of tasks) {
+    const ownerId = task.conversationAgentId ?? task.assigneeAgentId;
+    if (ownerId) add(task.companyId, ownerId);
+  }
+  const plannedAgentIds = [...planned].sort();
+  if (plannedAgentIds.length) await db.select({ id: agents.id }).from(agents).where(or(
+    ...[...scopes].map(([companyId, ids]) => and(eq(agents.companyId, companyId), inArray(agents.id, [...ids]))),
+  )).orderBy(agents.id).for("share");
+  for (const input of inputs) {
+    assertAllowed(await agentInteractionDenial(db, input, plannedAgentIds));
+  }
 }

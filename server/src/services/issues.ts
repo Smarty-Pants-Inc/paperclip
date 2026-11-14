@@ -1,5 +1,5 @@
 import { recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "./public-mcp/upload-cleanup.js";
-import { assertAgentInteraction } from "./agent-interaction-policy.js";
+import { assertAgentInteraction, assertAgentInteractions } from "./agent-interaction-policy.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import type { IssueDisplayStatus } from "@paperclipai/shared";
 import { issueDisplayStatusSql } from "./issue-display-status.js";
@@ -10607,27 +10607,32 @@ export function issueService(db: Db) {
       const persist = async (tx: DbTransaction) => {
         await tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)).for("no key update");
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`issue-privacy-tree:${companyId}`}, 0))`);
-        await assertAgentInteraction(tx as unknown as Db, {
-          companyId, actorAgentId: issueData.createdByAgentId,
-          operation: "assign", targetAgentId: issueData.assigneeAgentId,
-          assigneeUserId: issueData.assigneeUserId, parentIssueId: requestedParentId,
-          texts: [resolvedTitle, issueData.description ?? "", initialPlan ?? ""], lock: true,
-        });
         const parentResolution = confirmPlacement(
           await resolveNewTaskParent(tx, companyId, requestedParentId, parentDepthPolicy),
           expectedParentId,
         );
-        if (expectedParentId !== undefined && parentResolution.effectiveParentId !== expectedParentId) {
+        // The requested parent and flattened ancestor are one interaction set,
+        // not independently sorted policy reads in the same transaction.
+        await assertAgentInteractions(tx, [
+          { companyId, actorAgentId: issueData.createdByAgentId,
+            operation: "assign", targetAgentId: issueData.assigneeAgentId,
+            assigneeUserId: issueData.assigneeUserId, parentIssueId: requestedParentId,
+            texts: [resolvedTitle, issueData.description ?? "", initialPlan ?? ""], lock: true },
+          ...(parentResolution.effectiveParentId && parentResolution.effectiveParentId !== requestedParentId
+            ? [{ companyId, actorAgentId: issueData.createdByAgentId, operation: "edit" as const,
+              issueId: parentResolution.effectiveParentId, lock: true as const }] : []),
+        ]);
+        const recheckedParent = confirmPlacement(
+          await resolveNewTaskParent(tx, companyId, requestedParentId, parentDepthPolicy), expectedParentId,
+        );
+        if (recheckedParent.effectiveParentId !== parentResolution.effectiveParentId ||
+            (expectedParentId !== undefined && parentResolution.effectiveParentId !== expectedParentId)) {
           throw conflict("The task tree changed while this task was checked. Read the tasks again and retry.", {
             code: "issue_parent_placement_changed",
           });
         }
         parentAdjustment = parentResolution.adjustment;
         issueData.parentId = parentResolution.effectiveParentId;
-        if (issueData.parentId && issueData.parentId !== requestedParentId) {
-          await assertAgentInteraction(tx, { companyId, actorAgentId: issueData.createdByAgentId,
-            operation: "edit", issueId: issueData.parentId, lock: true });
-        }
         await assertParentInCompany(tx, companyId, issueData.parentId);
         await assertExecutionTaskParent(tx as unknown as Db, companyId, issueData.parentId);
         if (issueData.conversationAgentId && issueData.conversationUserId) {
@@ -11477,8 +11482,8 @@ export function issueService(db: Db) {
       const censorUsernameInLogs = (await instanceSettings.getGeneral())
         .censorUsernameInLogs;
       await db.transaction(async (tx) => {
-        for (const row of rows) await assertAgentInteraction(tx, { companyId: row.companyId, actorAgentId, actorCompanyId: actorCompanyId ?? undefined,
-          operation: "mention", issueId: row.issueId, texts: [row.body], lock: true });
+        await assertAgentInteractions(tx, rows.map(row => ({ companyId: row.companyId, actorAgentId,
+          actorCompanyId: actorCompanyId ?? undefined, operation: "mention", issueId: row.issueId, texts: [row.body], lock: true })));
         for (const companyId of new Set(rows.map(row => row.companyId))) await notifyStatusCardIssueChange(tx, companyId);
         const commentRows = rows.map((row) => {
           const createdAt = row.createdAt ? new Date(row.createdAt) : null;

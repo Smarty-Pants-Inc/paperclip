@@ -1185,6 +1185,8 @@ an insert's implicit FK K. S is **not** compatible with N.
 | Sandbox creation operation | N | After acquisition parents; `attachSandboxCreation` rechecks discovered task/workspace attribution, run authority and operation state |
 | Existing orphan recorder / actual environment deletion | Existing U | `insertPendingCleanupLease` retains its deletion-race/null-reference fallback and existing fence; `delete` really deletes E. Acquisition adds no U fence here |
 | Existing remote workspace owner | C(K), I(U), R(U), W(U) | `reserveRemoteWorkspace` and parent-first preparation/publication remain unchanged; acquisition N follows the same I/R/W order and serializes behind these U owners |
+| Standalone named-gateway configure candidate | N | `assertAgentToolAssignmentInteractions`: active company agents plus explicit actor/old/new targets in one ascending-ID set, before connector trigger writes; inactive non-target agents are not swept |
+| Task creation / comment-import batch policy candidate | S | `assertAgentInteractions`: discover exact owners, targets and mentions for the complete batch, lock their union in ascending ID order before per-operation task fences, revalidate before using each owner |
 
 Acquisition does not modify or delete the keys of C/I/R/W/E/L/O. Its new parent
 fences and changed binding/source/operation fences therefore do not require U.
@@ -1205,6 +1207,24 @@ operation's ownership/state gate and the transactional handoff receipt.
 These rules cover the demonstrated acquisition/preservation/orphan families.
 They are not a whole-server total order; other owners and the admission order
 below retain their documented scope and exceptions.
+
+### Gateway candidate: known blocking outer-transaction exception
+
+The gateway candidate is **not accepted for deployment**. S conflicts with N;
+retaining permission protection is not sufficient to establish an order. An
+outer native tool transaction already takes `lockAgentForRunWrite(actor)` in S
+before invoking an issue mutation. With a higher-ID actor, the gateway candidate
+can hold a lower-ID active agent in N while waiting for the actor's S. A later
+comment mentioning that lower agent then waits for S, producing a real 40P01.
+`gateway-preheld-run-reader-lock-order.test.ts` preserves this counterexample;
+it passes on M1 and fails on this candidate. Sorting the nested policy query
+cannot repair the outer actor lock. The create/import batch change removes their
+separate later-reader inversions but does not solve this outer authority case.
+
+Do not infer whole-transaction gateway safety from the supplied standalone
+schedules or 20-way preparation timings. A replacement must plan the complete
+reader set before the outer lifecycle fence, or prove a different shared
+mechanism, without weakening authorization to K or masking failure with retries.
 
 ## Remote workspace row locks
 

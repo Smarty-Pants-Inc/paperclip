@@ -10636,7 +10636,7 @@ export function createToolGatewayService(
       const gateway = await db.transaction(async tx => {
         await assertAgentToolAssignmentInteractions(tx as unknown as Db,
           input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : input.actor?.agentId,
-          input.companyId, input.body.agentId ? [input.body.agentId] : []);
+          input.companyId, input.body.agentId ? [input.body.agentId] : [], true, true);
         const [gateway] = await tx
           .insert(toolMcpGateways)
           .values({
@@ -10758,7 +10758,7 @@ export function createToolGatewayService(
           );
         const targets = [...new Set([existing.agentId, input.body.agentId].filter((id): id is string => Boolean(id)))];
         await assertAgentToolAssignmentInteractions(tx as unknown as Db,
-          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : null, input.companyId, targets);
+          input.managementContext?.actor.type === "agent" ? input.managementContext.actor.agentId : null, input.companyId, targets, true, true);
         await assertGatewayContext({
           companyId: input.companyId,
           profileId: input.body.profileId ?? existing.profileId,

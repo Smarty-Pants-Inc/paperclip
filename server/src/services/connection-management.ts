@@ -61,11 +61,13 @@ export async function assertAgentConnectionInstallAccess(db: Db, actor: Authoriz
 }
 
 export async function assertAgentToolAssignmentInteractions(db: Db, actorAgentId: string | null | undefined,
-  companyId: string, agentIds: readonly string[], lock = typeof (db as unknown as { nestedIndex?: number }).nestedIndex === "number") {
+  companyId: string, agentIds: readonly string[], lock = typeof (db as unknown as { nestedIndex?: number }).nestedIndex === "number",
+  lockCompanyRuntimeAgents = false) {
   const targets = [...new Set(agentIds)].sort();
   for (const [index, targetAgentId] of targets.entries()) {
     await assertAgentInteraction(db, { companyId, actorAgentId, operation: "configure", targetAgentId,
-      lock: index === 0 && lock ? "update" : false, lockAgentIds: index === 0 ? targets : undefined });
+      lock: index === 0 && lock ? "update" : false, lockAgentIds: index === 0 ? targets : undefined,
+      lockCompanyRuntimeAgents: index === 0 && lock && lockCompanyRuntimeAgents });
   }
 }
 
