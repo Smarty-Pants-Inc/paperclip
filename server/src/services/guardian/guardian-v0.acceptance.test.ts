@@ -1,26 +1,37 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   agents, authUsers, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
-  activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db,
+  activityLog, agentApiKeys, agentWakeupRequests, boardApiKeys, heartbeatRunEvents, heartbeatRuns,
+  issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, type Db,
 } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { GUARDIAN_PLUGIN_ID, startRealPluginLoader } from "../../__tests__/helpers/plugin-real-loader.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../heartbeat-policy.js";
+import { filterZombieCoalesceTarget, heartbeatService } from "../heartbeat.js";
+import { createWakeQueue } from "../../modules/wake-queue/index.js";
+import { createHeartbeatRunPreparation, mergeCoalescedContextSnapshot } from "../heartbeat/run-preparation.js";
+import { createHeartbeatRunState } from "../heartbeat/run-state.js";
+import { shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake } from "../heartbeat/queue.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { currentControllerProcessStamp } from "../controller-process-identity.js";
 
-// Keep reason: real loader/RPC/DB trust boundary plus RFL R6-STRAND's persisted
-// parked-task failure. These are ordinary failing tests, NOT it.fails/expected failures.
-// SQL builds stuck states; the person posts and reads through the real board API.
-// No provider is called: original fixtures disable wake-on-demand; case 8b
-// keeps the runtime defaults and uses only a local /bin/true process adapter.
+// Keep: real loader/RPC/DB trust boundary and durable input safety (RFL F2/F3).
+// Ordinary failing tests, never it.fails. The API admits person messages; real
+// heartbeat admission/claim/drain paths hit scoped PostgreSQL fault triggers.
+// No provider is called: execution uses only the local /bin/true process adapter.
+// Non-timing fixtures age persisted rows, NOT the clock. Case 1 alone measures
+// real minute-cron delivery. The old locked 8u is explicitly outside v0.
 describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — real server + Postgres (%s)", mode => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
   let runtime: Awaited<ReturnType<typeof startRealPluginLoader>>;
   let pluginId: string;
+  let core: ReturnType<typeof heartbeatService>;
+  const optedIn = new Set<string>();
   let parkedFixture: Fixture;
   let releaseParkedSeed = () => {};
   let parkedSeedLock: Promise<void> | undefined;
@@ -30,30 +41,29 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     db = createDb(database.connectionString, { maxConnections: 6 });
     await db.insert(authUsers).values({ id: "local-board", name: "Guardian judge", email: "guardian-judge@example.test",
       createdAt: new Date(), updatedAt: new Date() });
-    // Persist the same RFL seed before boot; do not fence the production worker.
-    parkedFixture = await seed(false);
-    const lifecycle = createAgentLifecycle(db);
-    await lifecycle.pauseAgent(parkedFixture.agent.id);
-    await lifecycle.resumeAgent(parkedFixture.agent.id);
-    const [pausing] = await db.select().from(agents).where(eq(agents.id, parkedFixture.agent.id));
-    const parkedOperation = { ...pausing.lifecycleOperation!, retryRequired: true, stopFailures: 5 };
-    await db.update(agents).set({ lifecycleOperation: parkedOperation,
-      lifecycleError: "Automatic stop work is paused after 5 incomplete attempts. Recheck the stop evidence, then use Retry." })
-      .where(eq(agents.id, parkedFixture.agent.id));
-    const old = new Date(Date.now() - 86_400_000);
-    await db.update(issues).set({ createdAt: old, updatedAt: old }).where(eq(issues.id, parkedFixture.issue.id));
-    const initial = await snapshot(parkedFixture, "seed-before-boot", 0);
-    expect(initial.agent).toMatchObject({ status: "paused", lifecycleState: "pausing", lifecycleHolds: [],
-      lifecycleOperation: { retryRequired: true, stopFailures: 5 },
-      lifecycleError: "Automatic stop work is paused after 5 incomplete attempts. Recheck the stop evidence, then use Retry." });
-    expect(initial.task).toMatchObject({ status: "todo", assigneeAgentId: parkedFixture.agent.id });
-    expect(initial.runs).toHaveLength(0);
-    expect(initial.comments).toHaveLength(0);
-    expect(initial.recoveryActions).toHaveLength(0);
+    core = heartbeatService(db);
     if (mode === "locked") {
-      // case 8u (unit, LOCKED: hides the lifecycle worker)
-      // Separate database/runtime: this lock cannot block case 8's real worker.
-      // Normal MVCC reads, including plugin RPC, still see the committed seed.
+      // Retained only for skipped 8u; no obsolete no-person seed in v0.
+      parkedFixture = await seed(false);
+      const lifecycle = createAgentLifecycle(db);
+      await lifecycle.pauseAgent(parkedFixture.agent.id);
+      await lifecycle.resumeAgent(parkedFixture.agent.id);
+      const [pausing] = await db.select().from(agents).where(eq(agents.id, parkedFixture.agent.id));
+      const parkedOperation = { ...pausing.lifecycleOperation!, retryRequired: true, stopFailures: 5 };
+      await db.update(agents).set({ lifecycleOperation: parkedOperation,
+        lifecycleError: "Automatic stop work is paused after 5 incomplete attempts. Recheck the stop evidence, then use Retry." })
+        .where(eq(agents.id, parkedFixture.agent.id));
+      const old = new Date(Date.now() - 86_400_000);
+      await db.update(issues).set({ createdAt: old, updatedAt: old }).where(eq(issues.id, parkedFixture.issue.id));
+      const initial = await snapshot(parkedFixture, "seed-before-boot", 0);
+      expect(initial.agent).toMatchObject({ status: "paused", lifecycleState: "pausing", lifecycleHolds: [],
+        lifecycleOperation: { retryRequired: true, stopFailures: 5 },
+        lifecycleError: "Automatic stop work is paused after 5 incomplete attempts. Recheck the stop evidence, then use Retry." });
+      expect(initial.task).toMatchObject({ status: "todo", assigneeAgentId: parkedFixture.agent.id });
+      expect(initial.runs).toHaveLength(0);
+      expect(initial.comments).toHaveLength(0);
+      expect(initial.recoveryActions).toHaveLength(0);
+      // 8u only: normal MVCC/plugin reads still see the committed seed.
       const gate = new Promise<void>(resolve => { releaseParkedSeed = resolve; });
       let locked!: () => void;
       let lockFailed!: (error: unknown) => void;
@@ -81,16 +91,22 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  async function seed(personComment = true) {
+  afterEach(async () => {
+    // Old intentionally unanswered fixtures must not take part in later jobs.
+    for (const companyId of optedIn) await runtime.setCompanyConfig(pluginId, companyId, { enabled: false });
+    optedIn.clear();
+  });
+
+  async function seed(personComment = true, backdate = true) {
     const suffix = randomUUID().slice(0, 8);
     const [company] = await db.insert(companies).values({ name: `Guardian judge ${suffix}`, issuePrefix: `G${suffix}`,
       defaultResponsibleUserId: "local-board" }).returning();
     await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: "local-board",
       status: "active", membershipRole: "operator" });
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Guardian assignee", role: "engineer",
-      adapterType: "process", adapterConfig: {}, status: "idle", lifecycleState: "ready",
+      adapterType: "process", adapterConfig: { command: "/bin/true" }, status: "idle", lifecycleState: "ready",
       runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false, intervalSec: 0 } } }).returning();
-    const old = new Date(Date.now() - 180_000);
+    const old = new Date(Date.now() - (backdate ? 180_000 : 0));
     const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Please review this task", status: "todo",
       assigneeAgentId: agent.id, responsibleUserId: "local-board", createdAt: old, updatedAt: old }).returning();
     let request: typeof issueComments.$inferSelect | undefined;
@@ -99,8 +115,12 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
         body: "Please review this and tell me the result.",
       });
       expect(posted.authorType).toBe("user");
-      [request] = await db.update(issueComments).set({ createdAt: old, updatedAt: old })
-        .where(eq(issueComments.id, posted.id)).returning();
+      if (backdate) {
+        [request] = await db.update(issueComments).set({ createdAt: old, updatedAt: old })
+          .where(eq(issueComments.id, posted.id)).returning();
+      } else {
+        [request] = await db.select().from(issueComments).where(eq(issueComments.id, posted.id));
+      }
       expect(request.authorUserId).toBe("local-board");
     }
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).toHaveLength(0);
@@ -126,13 +146,14 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   }
 
   async function seedRun(f: Fixture, status: "queued" | "running" | "failed" | "succeeded") {
-    const createdAt = new Date(f.old.getTime() + 1_000);
+    const createdAt = new Date(f.old.getTime() + (f.request ? 1_000 : -1_000));
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id, status,
-      runtimeMode: "native", nativeIssueId: f.issue.id, invocationSource: "assignment", triggerDetail: "system",
+      runtimeMode: "native", nativeIssueId: f.issue.id, issueId: f.issue.id, scopeKind: "issue",
+      responsibleUserId: "local-board", invocationSource: "assignment", triggerDetail: "system",
       createdAt, updatedAt: createdAt, startedAt: status === "queued" ? null : createdAt,
       finishedAt: ["failed", "succeeded"].includes(status) ? new Date(f.old.getTime() + 5_000) : null,
       error: status === "failed" ? "Judge-seeded run failure" : null,
-      contextSnapshot: { issueId: f.issue.id, wakeCommentIds: [f.request!.id] },
+      contextSnapshot: { issueId: f.issue.id, wakeCommentIds: f.request ? [f.request.id] : [] },
     }).returning();
     return run;
   }
@@ -140,7 +161,10 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   async function sweep(f: Fixture, count = 1) {
     // Opt in only AFTER every input is persisted: startup reconciliation must
     // not observe a half-seeded running/answered control and post a false note.
-    await runtime.setCompanyConfig(pluginId, f.company.id, { enabled: true });
+    if (!optedIn.has(f.company.id)) {
+      optedIn.add(f.company.id);
+      await runtime.setCompanyConfig(pluginId, f.company.id, { enabled: true });
+    }
     for (let i = 0; i < count; i++) await runtime.runJob(pluginId);
   }
 
@@ -164,8 +188,132 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     return note;
   }
 
+  async function readRun(id: string) {
+    return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0];
+  }
+
+  async function readWake(id: string) {
+    return (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, id)))[0];
+  }
+
+  async function enableCoreWake(f: Fixture) {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true,
+      intervalSec: 0, maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agent.id));
+  }
+
+  async function postFollowup(f: Fixture) {
+    const posted = await runtime.api<{ id: string; authorType: string }>(`/issues/${f.issue.id}/comments`,
+      { body: "M2: please review this saved follow-up and answer it." });
+    expect(posted.authorType).toBe("user");
+    [f.request] = await db.update(issueComments).set({ createdAt: f.old, updatedAt: f.old })
+      .where(eq(issueComments.id, posted.id)).returning();
+    // The comment route owns admission; wait for its persisted receipt, never
+    // substitute a test-inserted wake. This observes asynchronous route effects.
+    const wakes = await runtime.waitFor("person-message wake admission", () => db.select().from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, f.agent.id)), rows => rows.some(row => row.payload?.commentId === posted.id));
+    const wake = wakes.find(row => row.payload?.commentId === posted.id)!;
+    await db.update(agentWakeupRequests).set({ createdAt: f.old, updatedAt: f.old }).where(eq(agentWakeupRequests.id, wake.id));
+    return wake;
+  }
+
+  async function deferredFollowup() {
+    const f = await seed(false);
+    const old = new Date(f.old.getTime() - 60_000);
+    const stamp = currentControllerProcessStamp();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", runtimeMode: "native", nativeIssueId: f.issue.id,
+      status: "running", invocationSource: "assignment", responsibleUserId: "local-board",
+      createdAt: old, updatedAt: old, startedAt: old, controllerBootId: stamp.bootId, controllerProcess: stamp,
+      controllerLeaseExpiresAt: new Date(Date.now() + 600_000),
+      contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id } }).returning();
+    await db.insert(nativeRunFinalizations).values({ runId: source.id, companyId: f.company.id, issueId: f.issue.id, phase: "observed" });
+    await db.update(issues).set({ status: "in_progress", executionRunId: source.id, checkoutRunId: source.id,
+      executionAgentNameKey: f.agent.name, executionLockedAt: old }).where(eq(issues.id, f.issue.id));
+    await enableCoreWake(f);
+    const wake = await postFollowup(f);
+    expect(await readWake(wake.id), "real core admission deferred M2 behind the owner").toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(source.createdAt.getTime()).toBeLessThan(f.request!.createdAt.getTime());
+    expect((await readRun(source.id)).contextSnapshot?.wakeCommentIds ?? []).not.toContain(f.request!.id);
+    console.log("GUARDIAN_DEFERRED_ADMISSION", JSON.stringify({ source, request: f.request, wake: await readWake(wake.id) }));
+    return { f, source, wake };
+  }
+
+  async function queuedAtCapacity() {
+    const f = await seed(false);
+    const [holder] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      status: "running", invocationSource: "assignment", responsibleUserId: "local-board",
+      startedAt: new Date(), contextSnapshot: {} }).returning();
+    await enableCoreWake(f);
+    const wake = await postFollowup(f);
+    const rows = await runtime.waitFor("queued person-message run", () => db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, f.agent.id)), rows => rows.some(row => row.id !== holder.id && row.status === "queued"));
+    const queued = rows.find(row => row.id !== holder.id)!;
+    expect(queued.contextSnapshot?.wakeCommentIds).toContain(f.request!.id);
+    expect(await core.resumeQueuedRunsForAgent(f.company.id, f.agent.id), "real dispatcher refuses at full concurrency").toEqual([]);
+    expect(await readRun(queued.id)).toMatchObject({ status: "queued", startedAt: null });
+    console.log("GUARDIAN_CAPACITY_REFUSAL", JSON.stringify({ holder, queued: await readRun(queued.id), wake: await readWake(wake.id) }));
+    return { f, holder, queued, wake };
+  }
+
+  // Same wake-queue release path as g3-core-progress.patch. Production resolver,
+  // session and routine readers, no fake queue or plugin. Escalation is not part
+  // of this suppressed-recovery release; reaching it is a fixture error.
+  function deferredDrain() {
+    const prep = createHeartbeatRunPreparation(db), state = createHeartbeatRunState(db);
+    return createWakeQueue(db, {
+      resolveResponsibleUserId: input => prep.resolveResponsibleUserIdForRunSeed({ ...input,
+        issueContext: input.issue, source: input.source as "automation",
+        triggerDetail: input.triggerDetail as "system",
+        routineEnvContext: input.routineEnvContext as Awaited<ReturnType<typeof prep.getRoutineEnvForExecutionIssue>> }),
+      getRoutineEnv: input => prep.getRoutineEnvForExecutionIssue(input.companyId, input.issue),
+      resolveSessionBeforeForWakeup: async input => {
+        const agent = await state.getAgent(input.agentId);
+        return agent?.companyId === input.companyId ? state.resolveSessionBeforeForWakeup(agent, input.taskKey) : null;
+      },
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget, mergeCoalescedContextSnapshot,
+        shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: {
+        escalateStrandedAssignedIssue: async () => { throw new Error("Unexpected C35 escalation"); },
+        escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("Unexpected C35 escalation"); },
+      },
+    });
+  }
+
+  async function failRunWrite(f: Fixture, kind: "C35" | "E3.05") {
+    const name = `guardian_fault_${randomUUID().replaceAll("-", "")}`;
+    const transition = kind === "C35" ? "TG_OP = 'INSERT' AND NEW.status = 'queued'"
+      : "TG_OP = 'UPDATE' AND OLD.status = 'queued' AND NEW.status = 'running'";
+    // A sequence survives transaction rollback, proving that the REAL path hit
+    // the injected persistence exception (not merely that the row stayed put).
+    await db.execute(sql.raw(`CREATE SEQUENCE ${name}_hits`));
+    await db.execute(sql.raw(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.company_id = '${f.company.id}'::uuid AND ${transition} THEN
+        PERFORM nextval('${name}_hits'); RAISE EXCEPTION '${kind} guardian injected persistence failure';
+      END IF; RETURN NEW; END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER ${name} BEFORE INSERT OR UPDATE ON heartbeat_runs FOR EACH ROW EXECUTE FUNCTION ${name}()`));
+    return {
+      hits: async () => {
+        const [row] = await db.execute<{ last_value: string; is_called: boolean }>(sql.raw(`SELECT last_value, is_called FROM ${name}_hits`));
+        return row.is_called ? Number(row.last_value) : 0;
+      },
+      close: async () => {
+        await db.execute(sql.raw(`DROP TRIGGER ${name} ON heartbeat_runs`));
+        await db.execute(sql.raw(`DROP FUNCTION ${name}()`));
+        await db.execute(sql.raw(`DROP SEQUENCE ${name}_hits`));
+      },
+    };
+  }
+
+  async function agentHeaders(f: Fixture) {
+    // Disposable in-database test identity only; no host/production credentials.
+    const token = `guardian-test-${randomUUID()}`;
+    await db.insert(agentApiKeys).values({ companyId: f.company.id, agentId: f.agent.id, name: "Guardian API fixture",
+      keyHash: createHash("sha256").update(token).digest("hex"), responsibleUserId: "local-board" });
+    return { authorization: `Bearer ${token}` };
+  }
+
   if (mode === "locked") {
-    it("case 8u (unit, LOCKED: hides the lifecycle worker)", async () => {
+    it.skip("case 8u / older locked shape, LATER (RFL)", async () => {
       // Retain the original locked Stop/Retry assertions, not production proof.
       const f = parkedFixture;
       expect(await runtime.comments(f.issue.id)).toHaveLength(0);
@@ -188,11 +336,28 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     return;
   }
 
-  it("1 / I1: nothing took the person's message", async () => {
-    const f = await seed();
-    await sweep(f);
-    await oneNote(f, "hasn't been picked up", "1 / nothing took it");
-  });
+  it("1 / I1 timing: real cron posts at 60–150 seconds, no manual trigger", async () => {
+    const f = await seed(true, false);
+    // Minute cron drives delivery; bounded API reads only observe it.
+    optedIn.add(f.company.id);
+    await runtime.setCompanyConfig(pluginId, f.company.id, { enabled: true });
+    const start = f.request!.createdAt.getTime();
+    const deadline = start + 150_000;
+    let seen = await runtime.comments(f.issue.id);
+    while (!seen.some(row => row.authorType === "system") && Date.now() < deadline) {
+      await delay(Math.min(500, Math.max(0, deadline - Date.now())));
+      seen = await runtime.comments(f.issue.id);
+    }
+    const jobs = (await runtime.jobRuns(pluginId)).filter(run => new Date(run.createdAt).getTime() >= start);
+    console.log("GUARDIAN_CRON_TIMING", JSON.stringify({ requestId: f.request!.id, messageAt: f.request!.createdAt,
+      observedAt: new Date(), jobs, comments: seen }));
+    expect(jobs.some(run => run.trigger === "schedule" && run.status === "succeeded"), "real scheduled job completed").toBe(true);
+    const note = await oneNote(f, "hasn't been picked up", "1 / real cron");
+    const elapsedMs = new Date(note.createdAt).getTime() - start;
+    console.log("GUARDIAN_CRON_ELAPSED", JSON.stringify({ elapsedMs, requestId: f.request!.id, noteId: note.id }));
+    expect(elapsedMs).toBeGreaterThanOrEqual(60_000);
+    expect(elapsedMs).toBeLessThanOrEqual(150_000);
+  }, 165_000);
 
   it("2 / I1: queued run never started", async () => {
     const f = await seed();
@@ -211,11 +376,17 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
   it("4 / I1: succeeded TASK run left no answer — one neutral note", async () => {
     const f = await seed();
     expect(f.issue.conversationAgentId).toBeNull();
-    await seedRun(f, "succeeded");
-    await sweep(f);
-    // Shared v0 spec and G3 use two neutral phrasings; neither is a retry prompt.
-    const note = await oneNote(f, /read[\s\S]*(nothing to add|finished without a reply)/i, "4 / succeeded task");
-    expect(note.body).not.toMatch(/sending it again|use retry/i);
+    const run = await seedRun(f, "succeeded");
+    const before = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+    await sweep(f, 2);
+    const note = await oneNote(f, "read this and finished without a reply", "4 / succeeded task");
+    expect(note.body).toContain(f.agent.name);
+    expect(note.body).toContain(`/agents/${f.agent.id}/runs/${run.id}`);
+    expect(note.body).not.toMatch(/nothing to add|sending it again|use retry/i);
+    await runtime.runJob(pluginId);
+    const after = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+    expect(after.map(row => row.id).sort(), "successful TASK must never be rerun").toEqual(before.map(row => row.id).sort());
+    expect(await notes(f, "4 / no rerun after note")).toHaveLength(1);
   });
 
   it("5 / I3: running run took it — zero notes after three jobs", async () => {
@@ -251,36 +422,300 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     expect(final[0].body).toContain(`conversation-guardian:note:${f.request!.id}`);
   });
 
-  it("8 / R6-STRAND F1 / REQUEST-SCOPE: UNLOCKED worker clears Stop; no-comment todo still needs a pickup note", async () => {
-    const f = parkedFixture;
-    // The real lifecycle delivery worker owns progress. This read-only 10s
-    // sampling is bounded to three minutes; no forced core sweep or retry.
-    const started = Date.now();
-    for (let tick = 0; tick <= 18; tick++) {
-      await delay(Math.max(0, started + tick * 10_000 - Date.now()));
-      await snapshot(f, "worker-observation", Date.now() - started);
+  it("C35 / real drain rolls back: one note, original wake remains deferred", async () => {
+    const { f, source, wake } = await deferredFollowup();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(f.old.getTime() + 5_000) })
+      .where(eq(heartbeatRuns.id, source.id));
+    await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, source.id));
+    const fault = await failRunWrite(f, "C35");
+    try {
+      const drain = deferredDrain();
+      await expect(drain.releaseIssueExecution({ companyId: f.company.id, runId: source.id, now: new Date(),
+        suppressImmediateRecovery: true })).rejects.toThrow();
+      expect(await fault.hits(), "release must reach the injected persistence failure").toBeGreaterThan(0);
+      expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
+      expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].executionRunId).toBe(source.id);
+      await sweep(f, 2);
+      // Check preservation before the intentionally RED ABSENT oracle.
+      expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))).toHaveLength(1);
+      console.log("GUARDIAN_C35_ROLLBACK", JSON.stringify({ hits: await fault.hits(), wake: await readWake(wake.id) }));
+      await oneNote(f, /hasn't been picked up|waiting/, "C35 / rollback");
+    } finally { await fault.close(); }
+  });
+
+  it("E3.01 / stalled execution lock: deferred message receives one note", async () => {
+    const { f, source, wake } = await deferredFollowup();
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.id))).toHaveLength(0);
+    expect(Date.now() - source.updatedAt.getTime()).toBeGreaterThan(60_000);
+    await sweep(f, 2);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+    expect(issue.executionRunId).toBe(source.id);
+    expect(await readRun(source.id)).toMatchObject({ status: "running", updatedAt: source.updatedAt });
+    expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await oneNote(f, /hasn't been picked up|waiting/, "E3.01 / stalled lock");
+  });
+
+  it("E3.01 / I3 control: event-emitting live lock-holder gets no note across three jobs", async () => {
+    const { f, source, wake } = await deferredFollowup();
+    for (let i = 0; i < 3; i++) {
+      await appendHeartbeatRunEvent(db, { companyId: f.company.id, agentId: f.agent.id, runId: source.id,
+        eventType: "stdout", stream: "stdout", level: "info", message: `Still working on the task, progress ${i}` });
+      await sweep(f);
+      expect.soft(await notes(f, `E3.01 / live lock job ${i + 1}`)).toHaveLength(0);
     }
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, source.id))).toHaveLength(3);
+    expect(await readRun(source.id)).toMatchObject({ status: "running" });
+    expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].executionRunId).toBe(source.id);
+  });
+
+  it("E3.04 / real concurrency refusal: waiting note, same queued run starts when slot frees", async () => {
+    const { f, holder, queued, wake } = await queuedAtCapacity();
     await sweep(f);
-    const after = await snapshot(f, "after-guardian-job", Date.now() - started);
-    const rows = await notes(f, "8 / UNLOCKED ready but no pickup");
-    // Observed on ba8b96aa: the real worker consumes pausing despite
-    // retryRequired. No explicit Retry, core sweep, or driver mock is used.
-    // This is NOT proof of a durable parked-Stop state. Wake-on-demand remains
-    // disabled, as in the original seed, so readiness alone produces no run.
-    expect(after.agent).toMatchObject({ status: "idle", lifecycleState: "ready", lifecycleHolds: [],
-      lifecycleError: null, pauseReason: null });
-    expect(after.agent.lifecycleOperation).not.toHaveProperty("retryRequired");
-    expect(after.agent.lifecycleOperation).not.toHaveProperty("stopFailures");
-    expect(after.task).toMatchObject({ status: "todo", assigneeAgentId: f.agent.id, assigneeUserId: null });
-    expect(after.runs).toHaveLength(0);
-    expect(after.recoveryActions).toHaveLength(0);
-    expect(rows, "8 / UNLOCKED: exactly one persisted system pickup note").toHaveLength(1);
-    expect(rows[0].authorAgentId).toBeNull();
-    expect(rows[0].authorUserId).toBeNull();
-    expect(rows[0].body).toContain("conversation-guardian:");
-    expect(rows[0].body).toContain("hasn't been picked up");
-    expect(rows[0].body).not.toMatch(/\bstop\b|\bretry\b/i);
-  }, 180_000 + EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+    // Continue the free-slot control even in ABSENT, retaining both receipts.
+    const first = await notes(f, "E3.04 / refused at capacity");
+    expect.soft(first).toHaveLength(1);
+    if (first[0]) expect.soft(first[0].body).toContain("waiting to start");
+    expect(await readRun(queued.id)).toMatchObject({ status: "queued", startedAt: null });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holder.id));
+    await core.resumeQueuedRunsForAgent(f.company.id, f.agent.id);
+    const started = await runtime.waitFor("same queued run starts", () => readRun(queued.id), run => run.startedAt !== null);
+    // Observe local /bin/true completion before teardown, not just claim time.
+    // Ordinary core missing-comment continuation is not a guardian rerun.
+    const settled = await runtime.waitFor("local process execution settles", () => db.select().from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, f.agent.id)), rows => rows.every(run => !["running", "queued"].includes(run.status)));
+    for (const run of settled) await core.waitForRunExecutionDrain(run.id, { timeoutMs: 30_000 });
+    await sweep(f, 2);
+    expect(started.id).toBe(queued.id);
+    expect(settled.filter(run => run.wakeupRequestId === wake.id).map(run => run.id)).toEqual([queued.id]);
+    const final = await notes(f, "E3.04 / same run started");
+    expect(final.map(note => note.id)).toEqual(first.map(note => note.id));
+    console.log("GUARDIAN_E304_STARTED", JSON.stringify({ queuedRunId: queued.id, startedAt: started.startedAt,
+      run: await readRun(queued.id), notes: final }));
+  }, 60_000);
+
+  it("E3.05 / real claim throws: queued row survives and gets one note", async () => {
+    const { f, holder, queued } = await queuedAtCapacity();
+    const fault = await failRunWrite(f, "E3.05");
+    try {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, holder.id));
+      await expect(core.resumeQueuedRunsForAgent(f.company.id, f.agent.id)).rejects.toThrow();
+      expect(await fault.hits(), "claim must reach the injected exception").toBeGreaterThan(0);
+      expect(await readRun(queued.id)).toMatchObject({ status: "queued", startedAt: null, finishedAt: null });
+      await sweep(f, 2);
+      expect(await readRun(queued.id)).toMatchObject({ status: "queued", startedAt: null, finishedAt: null });
+      console.log("GUARDIAN_E305_CLAIM", JSON.stringify({ hits: await fault.hits(), run: await readRun(queued.id) }));
+      await oneNote(f, "waiting to start", "E3.05 / claim exception");
+    } finally { await fault.close(); }
+  });
+
+  it("E3.09 / running follow-up: no note in three jobs, one after unanswered end + 60s", async () => {
+    const { f, source, wake } = await deferredFollowup();
+    for (let i = 0; i < 3; i++) {
+      await sweep(f);
+      expect.soft(await notes(f, `E3.09 / running job ${i + 1}`)).toHaveLength(0);
+    }
+    // Persist the missed-finalizer outcome; do not invent a successor or mutate
+    // the run's input to pretend it carried a comment that arrived later.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), updatedAt: new Date() })
+      .where(eq(heartbeatRuns.id, source.id));
+    await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, source.id));
+    await runtime.runJob(pluginId);
+    expect.soft(await notes(f, "E3.09 / before terminal + 60s")).toHaveLength(0);
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 61_000) }).where(eq(heartbeatRuns.id, source.id));
+    await runtime.runJob(pluginId);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))).toHaveLength(1);
+    expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    await oneNote(f, /hasn't been picked up|finished without a reply/, "E3.09 / unanswered end");
+  });
+
+  it("E3.09 / I3 control: running turn answers follow-up through API, no note", async () => {
+    const { f, source } = await deferredFollowup();
+    const headers = { ...await agentHeaders(f), "x-paperclip-run-id": source.id };
+    const answer = await runtime.api<{ id: string; authorType: string; authorAgentId: string }>(`/issues/${f.issue.id}/comments`,
+      { body: "Reviewed your follow-up: the requested result is complete." }, "POST", headers);
+    expect(answer).toMatchObject({ authorType: "agent", authorAgentId: f.agent.id });
+    const ended = new Date(Date.now() - 61_000);
+    await db.update(issueComments).set({ createdAt: new Date(ended.getTime() - 1_000) }).where(eq(issueComments.id, answer.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended })
+      .where(eq(heartbeatRuns.id, source.id));
+    await sweep(f, 3);
+    expect(await notes(f, "E3.09 / answered by already-running turn")).toHaveLength(0);
+    expect(await runtime.comments(f.issue.id)).toHaveLength(2);
+  });
+
+  it("I3 / agent creates an interaction card through API: no note", async () => {
+    const f = await seed();
+    const source = await seedRun(f, "running");
+    const headers = { ...await agentHeaders(f), "x-paperclip-run-id": source.id };
+    const card = await runtime.api<{ id: string; createdByAgentId: string }>(`/issues/${f.issue.id}/interactions`, {
+      kind: "ask_user_questions", resolverPolicy: "human_only",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Which result should I deliver?",
+        selectionMode: "single", options: [{ id: "full", label: "Full review" }, { id: "summary", label: "Summary" }] }] },
+    }, "POST", headers);
+    expect(card.createdByAgentId).toBe(f.agent.id);
+    // Age the completed sequence coherently: request < card < terminal < due.
+    const ended = new Date(Date.now() - 61_000);
+    await db.update(issueThreadInteractions).set({ createdAt: new Date(ended.getTime() - 1_000) })
+      .where(eq(issueThreadInteractions.id, card.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: ended }).where(eq(heartbeatRuns.id, source.id));
+    const [saved] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id));
+    expect(saved.createdAt.getTime()).toBeGreaterThan(f.request!.createdAt.getTime());
+    expect(await runtime.comments(f.issue.id), "card is the only answer; no agent comment masks a card bug").toHaveLength(1);
+    await sweep(f, 3);
+    console.log("GUARDIAN_CARD", JSON.stringify(saved));
+    expect(await notes(f, "I3 / answered with card")).toHaveLength(0);
+  });
+
+  it.each(["agent", "board-key agent", "system"] as const)("person-only / %s comment gets no note", async kind => {
+    const f = await seed(false);
+    let posted: { id: string; authorType: string | null };
+    if (kind === "agent") {
+      const source = await seedRun(f, "running");
+      posted = await runtime.api(`/issues/${f.issue.id}/comments`, { body: "Agent-authored progress, not a person request." },
+        "POST", { ...await agentHeaders(f), "x-paperclip-run-id": source.id });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(f.old.getTime() + 5_000) })
+        .where(eq(heartbeatRuns.id, source.id));
+    } else if (kind === "board-key agent") {
+      // Host forbids authorType=agent for a board key (HTTP 422). Preserve its
+      // real API-authored user-id provenance, then seed the closest persisted
+      // agent shape. This is NOT proof the host can detect a disguised caller.
+      const token = `guardian-board-fixture-${randomUUID()}`;
+      await db.insert(boardApiKeys).values({ userId: "local-board", name: "Guardian board fixture",
+        keyHash: createHash("sha256").update(token).digest("hex") });
+      posted = await runtime.api(`/issues/${f.issue.id}/comments`, { body: "Agent progress via board key." },
+        "POST", { authorization: `Bearer ${token}` });
+      expect(posted.authorType).toBe("user");
+      [posted] = await db.update(issueComments).set({ authorType: "agent", authorAgentId: f.agent.id })
+        .where(eq(issueComments.id, posted.id)).returning();
+    } else {
+      [posted] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+        authorType: "system", body: "System progress, not a person request." }).returning();
+    }
+    expect(posted.authorType).toBe(kind === "system" ? "system" : "agent");
+    await db.update(issueComments).set({ createdAt: f.old, updatedAt: f.old }).where(eq(issueComments.id, posted.id));
+    await sweep(f, 3);
+    const comments = await runtime.comments(f.issue.id);
+    console.log("GUARDIAN_PERSON_ONLY", JSON.stringify({ kind, comments }));
+    expect(comments.map(row => row.id)).toEqual([posted.id]);
+    expect(comments.some(row => row.body.includes("conversation-guardian:"))).toBe(false);
+  });
+
+  it.each([true, false])("B′ / same comment = %s: suppress only the exact person-message notice", async same => {
+    const f = await seed();
+    let otherId = f.request!.id;
+    if (!same) {
+      // Real second person comment on the SAME issue; B′ covers that one only.
+      const other = await runtime.api<{ id: string }>(`/issues/${f.issue.id}/comments`, { body: "A different request, already covered by B-prime." });
+      otherId = other.id;
+      await db.update(issueComments).set({ createdAt: f.old }).where(eq(issueComments.id, otherId));
+    }
+    const [bprime] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+      authorType: "system", body: "Core: your message is waiting; check the agent.",
+      metadata: { version: 1, sections: [], authorizationReason: `unanswered_message:${otherId}` } }).returning();
+    await sweep(f, 3);
+    const comments = await runtime.comments(f.issue.id);
+    const guardian = comments.filter(row => row.body.includes("conversation-guardian:"));
+    console.log("GUARDIAN_BPRIME", JSON.stringify({ same, requestId: f.request!.id, bprime, comments }));
+    expect(guardian).toHaveLength(same ? 0 : 1);
+    if (!same) {
+      expect(guardian[0].authorType).toBe("system");
+      expect(guardian[0].body).toContain(`conversation-guardian:note:${f.request!.id}`);
+      expect(guardian[0].body).not.toContain(`conversation-guardian:note:${otherId}`);
+    }
+  });
+
+  it("I4 / racing triggers through real host: exactly one note", async () => {
+    const f = await seed(true, false);
+    await sweep(f, 0);
+    // Config reload reconciles at startup. Arm a fresh request first so that
+    // startup cannot post before the two racing jobs under test.
+    f.old = new Date(Date.now() - 180_000);
+    await db.update(issueComments).set({ createdAt: f.old }).where(eq(issueComments.id, f.request!.id));
+    expect(await notes(f, "I4 / before racing triggers")).toHaveLength(0);
+    const results = await Promise.all([0, 1].map(async () => {
+      try { return { run: await runtime.runJob(pluginId) }; }
+      catch (error) { return { error: String(error) }; }
+    }));
+    console.log("GUARDIAN_RACING_JOBS", JSON.stringify(results));
+    // Host may reject the second trigger at its single-job admission guard.
+    // That is not proof of overlapping plugin workers; keep the receipt explicit.
+    expect(results.some(result => result.run?.status === "succeeded")).toBe(true);
+    for (const result of results) if (result.error) expect(result.error).toMatch(/already running|no longer available/);
+    await oneNote(f, "hasn't been picked up", "I4 / concurrent triggers");
+  });
+
+  it("I4 / mid-post worker restart: blocked real comment insert reconciles to at most one note", async () => {
+    const f = await seed(true, false);
+    await sweep(f, 0);
+    f.old = new Date(Date.now() - 180_000);
+    await db.update(issueComments).set({ createdAt: f.old }).where(eq(issueComments.id, f.request!.id));
+    expect(await notes(f, "I4 / before mid-post trigger")).toHaveLength(0);
+    if (!process.env.GUARDIAN_PLUGIN_PATH) {
+      // The inert ABSENT worker cannot enter a post window. Still run the same
+      // one-note delivery oracle; do not call a missing fault hit a behavior RED.
+      await sweep(f);
+      await runtime.restartWorker(pluginId);
+      await runtime.runJob(pluginId);
+      console.log("GUARDIAN_MIDPOST_WINDOW", "ABSENT: no post to interrupt");
+      await oneNote(f, "hasn't been picked up", "I4 / absent mid-post control");
+      return;
+    }
+    const name = `guardian_post_${randomUUID().replaceAll("-", "")}`;
+    const lockClass = 194235, lockId = 1;
+    let release = () => {};
+    let acquired!: () => void;
+    let failed!: (error: unknown) => void;
+    const ready = new Promise<void>((resolve, reject) => { acquired = resolve; failed = reject; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    await db.execute(sql.raw(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.issue_id = '${f.issue.id}'::uuid AND NEW.body LIKE '%conversation-guardian:note:%' THEN
+        PERFORM pg_advisory_xact_lock(${lockClass}, ${lockId});
+      END IF; RETURN NEW; END $$`));
+    await db.execute(sql.raw(`CREATE TRIGGER ${name} BEFORE INSERT ON issue_comments FOR EACH ROW EXECUTE FUNCTION ${name}()`));
+    const holding = db.transaction(async tx => {
+      await tx.execute(sql`SELECT pg_advisory_xact_lock(${lockClass}, ${lockId})`);
+      acquired();
+      await gate;
+    });
+    void holding.catch(failed);
+    try {
+      await ready;
+      await sweep(f, 0);
+      const before = await runtime.dashboard(pluginId);
+      const receipt = await runtime.triggerJob(pluginId);
+      const blocked = await runtime.waitFor("real comment insert blocked before commit", () => db.execute<{ pid: number }>(sql`
+        SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = ${lockClass}::oid
+          AND objid = ${lockId}::oid AND NOT granted`), rows => rows.length > 0);
+      const running = (await runtime.jobRuns(pluginId)).find(run => run.id === receipt.runId);
+      expect(running?.status).toBe("running");
+      expect((await runtime.comments(f.issue.id)).filter(row => row.authorType === "system")).toHaveLength(0);
+      console.log("GUARDIAN_MIDPOST_WINDOW", JSON.stringify({ blocked, running, worker: before.worker }));
+      // Disable while the host comment RPC is blocked, not after a clean post.
+      await runtime.api(`/plugins/${pluginId}/disable`, {});
+      const stopped = await runtime.dashboard(pluginId);
+      expect(stopped.worker?.status).not.toBe("running");
+      release();
+      await holding;
+      await runtime.waitFor("old host insert settles", () => db.execute<{ pid: number }>(sql`
+        SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND classid = ${lockClass}::oid
+          AND objid = ${lockId}::oid AND NOT granted`), rows => rows.length === 0);
+      await runtime.api(`/plugins/${pluginId}/enable`, {});
+      const after = await runtime.waitFor("new worker after mid-post stop", () => runtime.dashboard(pluginId),
+        value => value.worker?.status === "running" && !!value.worker.pid && value.worker.pid !== before.worker?.pid);
+      await runtime.runJob(pluginId);
+      await runtime.runJob(pluginId);
+      console.log("GUARDIAN_MIDPOST_RECONCILED", JSON.stringify({ before, stopped, after,
+        interruptedJob: await runtime.waitForJob(pluginId, receipt.runId), comments: await runtime.comments(f.issue.id) }));
+      expect(await notes(f, "I4 / reconciled mid-post"), "no duplicate across the forced post/stop window").toHaveLength(1);
+    } finally {
+      release();
+      await holding;
+      await db.execute(sql.raw(`DROP TRIGGER ${name} ON issue_comments`));
+      await db.execute(sql.raw(`DROP FUNCTION ${name}()`));
+    }
+  }, 120_000);
 
   it("case 8b / default agent: UNLOCKED Stop clears and task starts; no guardian note needed after 180s", async () => {
     const suffix = randomUUID().slice(0, 8);
@@ -330,6 +765,8 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
       lifecycleOperation: { retryRequired: true, stopFailures: 5 } });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).toHaveLength(0);
 
+    optedIn.add(company.id);
+    await runtime.setCompanyConfig(pluginId, company.id, { enabled: true });
     // A person assigns a new todo through the board API, while the Stop seed
     // is live. Do not insert the task in SQL, backdate it, or suppress its wake.
     const createdIssue = await runtime.api<{ id: string }>(`/companies/${company.id}/issues`, {
@@ -340,10 +777,11 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
     const f: Fixture = { company, agent, issue, request: undefined, old: issue.createdAt };
     const started = Date.now();
     const samples: Awaited<ReturnType<typeof snapshot>>[] = [];
-    // Assignment/lifecycle events own progress. Read-only observation is bounded
-    // to 180s with 10s samples; no guardian job or other intervention during it.
+    // Assignment/lifecycle events own pickup. Guardian is enabled throughout;
+    // exercise it during pickup and after the 180s observation, not just ABSENT.
     for (let tick = 0; tick <= 18; tick++) {
       await delay(Math.max(0, started + tick * 10_000 - Date.now()));
+      if (tick === 0 || tick === 9 || tick === 18) await runtime.runJob(pluginId);
       samples.push(await snapshot(f, "case8b-worker-observation", Date.now() - started));
     }
     const after = samples.at(-1)!;
