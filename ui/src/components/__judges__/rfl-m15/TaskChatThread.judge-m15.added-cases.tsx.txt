@@ -12,8 +12,18 @@
       const titleCount = (container.textContent ?? "").split("This conversation can't continue").length - 1;
       judgeFs.writeFileSync(`${process.env.JUDGE_UI_RECEIPT_DIR}/live-conversationMode-${conversationMode}.html`, container.innerHTML);
       judgeReceipt("live", { rendered, current: current.map(r => r.id), superseded: superseded.map(r => r.id), heldTitleOccurrences: titleCount });
+      // PROPOSED AMENDMENT (needs an RFL ruling): in a chat the page props for "live" and "history" are identical
+      // (compactHistory true, no expand control), so the live contract there is: exactly ONE note reads as current;
+      // the superseded one is a collapsed "· Superseded" row (RFL M1.5 F1 fix). The task view is unchanged.
+      if (conversationMode) {
+        const labelled = (id: string) => (anchor(id)?.querySelector("button[aria-expanded]")?.textContent ?? "").includes("· Superseded");
+        expect(rendered.filter(id => !labelled(id))).toEqual([current[0]!.id]);
+        expect(superseded.every(r => labelled(r.id) && anchor(r.id)!.querySelector('[data-testid="task-chat-system-notice-details"]') === null)).toBe(true);
+        expect((container.textContent ?? "").split("· Superseded").length - 1).toBe(superseded.length);
+      } else {
       expect(rendered).toEqual([current[0]!.id]);
       expect(titleCount).toBe(1);
+      }
     });
 
     // IssueDetail.tsx:2657-2660 passes compactHistory = !historyExpanded, and for a conversation onExpandHistory = undefined and
