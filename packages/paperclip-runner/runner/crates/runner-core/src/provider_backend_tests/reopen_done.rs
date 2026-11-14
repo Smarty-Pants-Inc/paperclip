@@ -47,7 +47,7 @@ mod reopen_done {
         for blocker in [
             "same_run_contract",
             "same_run_instructions",
-            "no_thread_instructions",
+            "same_run_no_thread_instructions",
             "model",
             "command",
             "args",
@@ -81,16 +81,16 @@ mod reopen_done {
             payload["provider"]["runtimeContext"] =
                 json!({"skills":[{"name":"new-company-skill"}]});
             match blocker {
-                "same_run_instructions" => {
+                "same_run_instructions" | "same_run_no_thread_instructions" => {
                     payload["completionContract"] = serde_json::to_value(
                         executor.state.as_ref().unwrap().completion_contract.clone(),
                     )
                     .unwrap();
                     payload["provider"]["instructions"] = json!("Changed run instructions");
-                }
-                "no_thread_instructions" => {
-                    executor.state.as_mut().unwrap().thread_id = None;
-                    payload["provider"]["instructions"] = json!("Changed run instructions");
+                    if blocker == "same_run_no_thread_instructions" {
+                        // No thread permits a new run, not a same-run mutation.
+                        executor.state.as_mut().unwrap().thread_id = None;
+                    }
                 }
                 "model" => payload["provider"]["model"] = json!("other/model"),
                 "command" => payload["provider"]["command"] = json!("/bin/false"),
