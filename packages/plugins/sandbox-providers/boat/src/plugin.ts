@@ -25,6 +25,8 @@ import type {
 type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
 const API = "https://boat.dev/api/v1";
 const idleActivity = new BoatIdleActivity();
+const BOAT_CALL_BUDGET_MS = 30_000;
+const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
 function parse(raw: Record<string, unknown>): Config {
   return {
@@ -70,37 +72,53 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const requestBody = init.body;
     const isStreamBody = requestBody !== null && typeof requestBody === "object" &&
       (typeof (requestBody as { getReader?: unknown }).getReader === "function" || typeof (requestBody as { pipe?: unknown }).pipe === "function");
-    let waitedMs = 0;
     let response: Response;
-    const signal = init.signal ?? AbortSignal.timeout(30_000);
-    for (let attempt = 0; ; attempt++) {
+    const deadline = Date.now() + BOAT_CALL_BUDGET_MS;
+    const signal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
+    const method = (init.method ?? "GET").toUpperCase();
+    const retryable429Routes: { method: string; pattern: RegExp }[] = [
+      // POST /sandboxes (create): docs/llms-full.txt lines 9864, 9889-9890, 2174.
+      { method: "POST", pattern: /^\/sandboxes$/ },
+      // POST /sandboxes/{sandboxId}/fork: docs/llms-full.txt lines 13240, 9889-9890.
+      { method: "POST", pattern: /^\/sandboxes\/[^/?]+\/fork$/ },
+      // POST /sandboxes/{sandboxId}/resume: docs/llms-full.txt lines 9889-9890 (resume is a start).
+      { method: "POST", pattern: /^\/sandboxes\/[^/?]+\/resume$/ },
+    ];
+    // Not allowlisted: POST commands can execute (docs lines 1415-1416, 2115-2127); upload-url (1397-1398) and PUT files (1559-1560) lack a 429 no-execution guarantee.
+    const retryableStart = retryable429Routes.some(route => route.method === method && route.pattern.test(path));
+    for (let attempt = 1; ; attempt++) {
       category = "network_error";
       httpStatus = null;
       response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal });
       httpStatus = response.status;
-      if (response.status !== 429 || attempt >= 2 || isStreamBody) {
-        if (response.status === 429 && (attempt >= 2 || isStreamBody)) {
-          category = "http_error";
-          // Do not parse or retain provider diagnostics.
-          await response.body?.cancel();
-          throw new Error(category);
-        }
-        break;
-      }
-      // A 429 is a definite refusal. Drop its body without inspecting provider text.
+      if (response.status !== 429) break;
       category = "http_error";
-      await response.body?.cancel();
-      let retryAfterMs = 2_000;
       const retryAfter = response.headers.get("Retry-After");
+      const retryAfterText = retryAfter ?? "<missing>";
+      let retryAfterMs = 2_000;
       if (retryAfter !== null) {
         const seconds = /^\s*(\d+(?:\.\d+)?)\s*$/.exec(retryAfter);
         const parsedDate = seconds ? NaN : Date.parse(retryAfter);
         if (seconds) retryAfterMs = Number(seconds[1]) * 1_000;
         else if (Number.isFinite(parsedDate)) retryAfterMs = Math.max(0, parsedDate - Date.now());
       }
-      const waitMs = Math.min(15_000, Math.max(0, retryAfterMs), 30_000 - waitedMs);
-      if (waitMs <= 0) throw new Error(category);
-      waitedMs += waitMs;
+      let errorCode: unknown;
+      const body = await response.clone().json().catch(() => null);
+      if (body && typeof body === "object") {
+        const code = (body as any).code ?? (body as any).error?.code;
+        if (typeof code === "string") errorCode = code;
+      }
+      const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
+      duplexLogger?.warn("Boat API 429", {
+        method, route, attempt: `${attempt}/${BOAT_MAX_ATTEMPTS}`, retryAfter: retryAfterText,
+        rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
+        ...(errorCode ? { code: errorCode } : {}),
+      });
+      await response.body?.cancel();
+      if (!retryableStart || isStreamBody || attempt >= BOAT_MAX_ATTEMPTS || !["rate_limited", "limit_reached", "member_limit_reached"].includes(String(errorCode))) throw new Error(category);
+      const remainingMs = deadline - Date.now();
+      if (retryAfterMs > remainingMs || remainingMs <= 0) throw new Error(category);
+      const waitMs = Math.min(remainingMs, retryAfterMs + Math.random() * retryAfterMs * 0.2);
       await delay(waitMs, undefined, { signal });
     }
     responseOptions.onHeaders?.(response.headers);
