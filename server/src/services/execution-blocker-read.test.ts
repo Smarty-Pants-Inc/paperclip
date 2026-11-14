@@ -1,11 +1,12 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
 import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
+import { FRESH_THREAD_STOPPING_NOTE, freshThreadStopGate } from "./native-runtime/fresh-thread-stop-gate.js";
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -221,11 +222,43 @@ describe.skipIf(!support.supported)("execution blocker PostgreSQL read projectio
     expect((await getExecutionBlocker(db, f.companyId, f.issueId))!.nextAction).toBe("Recovering saved work…");
   });
 
-  // Runs saved before the held notice existed: the run's own refusal code.
+  // D10 class 2: before positive stop proof, the current notice is the only action.
   it.each([
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
     { errorCode: "adapter_failed", error: "native_controller_recovery_unsupported:metadata_format" },
+  ])("D10 offers only its waiting notice before stop proof ($errorCode, $error)", async patch => {
+    const sessionId = randomUUID();
+    const f = await recoveredRefusal({ ...patch, nativeSessionId: sessionId });
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.run.id));
+    await db.update(issueRecoveryActions).set({ nextAction: FRESH_THREAD_STOPPING_NOTE,
+      evidence: { runId: f.run.id } }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.run.id, issueId: f.issueId,
+      provider: "boat", providerLeaseId: `d10-waiting-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } });
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(blocker).toMatchObject({ runId: f.run.id, canRetry: false, canContinue: false });
+    expect(blocker!.nextAction).not.toMatch(/send a message to continue/i);
+    expect(blocker!.nextAction).toBe(FRESH_THREAD_STOPPING_NOTE);
+  });
+
+  // After the gate's positive stop proof, a committed successor is the designed end.
+  it.each([
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
+    { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
+    { errorCode: "adapter_failed", error: "native_controller_recovery_unsupported:metadata_format" },
+  ])("D10 is unblocked after positive stop proof ($errorCode, $error)", async patch => {
+    const sessionId = randomUUID();
+    const f = await recoveredRefusal({ ...patch, nativeSessionId: sessionId });
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.run.id));
+    const run = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0]!;
+    const proof = await freshThreadStopGate(db, run, f.issueId);
+    expect(proof.gone).toBe(true);
+    await committedSuccess(f, sessionId);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  // Runs saved before the held notice existed: the run's own refusal code.
+  it.each([
     { errorCode: "native_session_cleanup_quarantined", error: "Fixture failure" },
     { errorCode: "adapter_failed", error: "runner_process_termination_unconfirmed" },
     { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=true" },
