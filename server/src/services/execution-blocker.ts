@@ -7,6 +7,7 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
+import { freshThreadStopNeedsRetry, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -460,7 +461,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const canRetry = Boolean(!heldConversationNotice && !deadlineNotice && (!restoreHold || recoveredFailure) && run &&
     conversation?.assigneeAgentId === run.agentId &&
 
-    !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
+    !["done", "cancelled"].includes(conversation.status) &&
+    (isFreshThreadRefusal(run) ? freshThreadStopNeedsRetry(run) : await canRetryStoppedRun(db, run)));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
     // Earlier releases saved operator-facing text for the cleanup gate. Show

@@ -29,6 +29,8 @@ import { rearmExhaustedNativeFinalization } from "./native-runtime/exhausted-fin
 import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
 import { selectTaskRetryInput } from "./chat-channels/task-retry-input.js";
+import { continueFreshInTransaction } from "./fresh-continuation-fallback.js";
+import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 
 export async function taskRetryMutationAllowed(db: Db, input: {
   companyId: string; issueId: string; actorId: string; actorSource: TaskRetryIntent["actorSource"];
@@ -319,6 +321,30 @@ function admitTaskRetry(input: TaskRetryRequest) {
     if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
         latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
+    }
+    // This closed refusal family cannot use generic Retry's isolation lane.
+    // Re-run the canonical physical-stop gate under the issue lock. A click
+    // authorizes a proof/cleanup recheck, NEVER another executor. The existing
+    // continuation delivery owner alone dispatches after positive evidence.
+    if (isFreshThreadRefusal(latest) && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)) {
+      if (!await taskRetryMutationAllowed(db, { companyId: issue.companyId, issueId: issue.id,
+        actorId: input.actorId, actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session") }))
+        throw forbidden("You cannot retry this task.");
+      const result = await continueFreshInTransaction(db, { companyId: issue.companyId, runId: latest.id,
+        trigger: "continuation_wake", retryStop: !input.initiatedBy });
+      if (["person_owned", "not_applicable", "dependency_wait", "successor_exists"].includes(result.kind))
+        return { requestId: null, accepted: false, stale: false, observedRunId: latest.id, chatActionId: undefined };
+      const id = randomUUID();
+      const intent: TaskRetryIntent = { schema: "paperclip.task-retry.v1", generationId: id, sourceRunId: latest.id,
+        actorId: input.actorId, actorSource: taskRetryIntentSchema.shape.actorSource.parse(input.actorSource ?? "session"), strategy: "continue" };
+      await tx.insert(agentWakeupRequests).values({ id, companyId: issue.companyId, agentId: issue.assigneeAgentId,
+        source: "on_demand", triggerDetail: "manual", reason: "task_retry", idempotencyKey: key,
+        requestedByActorType: "user", requestedByActorId: input.actorId, status: "coalesced", finishedAt: new Date(),
+        payload: { issueId: issue.id, taskRetry: intent, freshThreadStopRetry: result } });
+      await persistActivity(db, { companyId: issue.companyId, ...automaticRetryActor(input), action: "issue.retry_requested",
+        entityType: "issue", entityId: issue.id, runId: latest.id,
+        details: { requestId: id, sourceRunId: latest.id, freshThreadStopRetry: result } });
+      return { requestId: id, accepted: true, stale: false, observedRunId: latest.id, chatActionId: undefined };
     }
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))

@@ -40,6 +40,8 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
+import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
+import { freshThreadStopGate, readFreshThreadStopProof, FRESH_THREAD_STOP_UNAVAILABLE_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -520,6 +522,15 @@ export async function admitExplicitNativeContinuation(input: {
         !(cancelledStartup && authorizedAt > run.finishedAt!)) return null;
     if (retry && run.status === "cancelled" && !canContinueCancelledRun(run) && !cancelledStartup)
       return blocked("cancelled_by_operator", "Inspect the stopped run and send a new message to continue.");
+    // New input is not an escape hatch from the closed strict family. Prove
+    // all earlier owners, not only this failed contender, before any generic
+    // failed-preparation/isolated-workspace exemption can admit a new thread.
+    if (isFreshThreadRefusal(run)) {
+      const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, run.id)));
+      if (!source) return blocked("source_missing", "The previous attempt could not be identified. Your message is saved.");
+      const proof = input.dryRun ? await readFreshThreadStopProof(db, source, issueId) : await freshThreadStopGate(db, source, issueId);
+      if (!proof.gone) return blocked("previous_execution_stop_unconfirmed", FRESH_THREAD_STOP_UNAVAILABLE_NOTE);
+    }
     if (cancelledStartup) cancelledStartupIds.add(run.id);
     if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return refused("previous_execution_unverified", PREVIOUS_EXECUTION_UNVERIFIED);
     // A provider failure can finish the normal result/assessment commit path.
