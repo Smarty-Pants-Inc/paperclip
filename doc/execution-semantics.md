@@ -1683,8 +1683,14 @@ a permanent refusal before carrying the message, the existing unanswered-message
 notice owner follows its automatic lineage and uses that terminal run's
 classification and Run evidence. It produces the existing new-task guidance,
 not the earlier source's resend guidance, under the same per-message dedupe and
-issue fence; there is no second notice writer. Unrelated runs and later person
-turns do not supply another message's failure. A successful continuation is
+issue fence; there is no second notice writer. A recorded continuation with
+`continuationDelivery: "pending"` is still an attempt waiting to answer, even
+before it has a run or wake row. The notice owner defers while that durable
+record is pending. A later terminal descendant makes an existing canonical
+per-message notice discoverable again. The same owner updates its body,
+presentation and Run evidence in place, preserving the comment ID and creation
+time, rather than posting another note. Unrelated runs and later person turns
+do not supply another message's failure. A successful continuation is
 unchanged. No schema migration or plugin setting is needed.
 
 ### Saved chat Retry preparation

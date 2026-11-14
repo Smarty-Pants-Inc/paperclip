@@ -19,6 +19,9 @@ import { conversationTurnAnswered } from "../native-runtime/native-governance.js
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
+import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -168,6 +171,12 @@ function answeredSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
             or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
             or coalesce(r.context_snapshot->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? b.id::text))))`;
 }
+function noticeHasLaterDispositionSql(n: { companyId: SQL; issueId: SQL; updatedAt: SQL }): SQL {
+  return sql`exists (select 1 from ${heartbeatRuns} later
+    where later.company_id = ${n.companyId} and later.native_issue_id = ${n.issueId}
+      and later.status in ('failed', 'cancelled', 'timed_out', 'interrupted')
+      and coalesce(later.finished_at, later.updated_at) > ${n.updatedAt})`;
+}
 const rawMessage = (alias: string) => ({ id: sql.raw(`${alias}.id`), companyId: sql.raw(`${alias}.company_id`),
   issueId: sql.raw(`${alias}.issue_id`), createdAt: sql.raw(`${alias}.created_at`) });
 
@@ -194,8 +203,8 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
 /**
  * SQL: this issue row has a person's message within the lookback that no agent
  * answered and that has no notice yet, or an unanswered-message notice that a
- * later agent comment answered. The stranded sweep visits such tasks in every
- * open status, including blocked.
+ * later agent comment answered or a later terminal run may correct. The
+ * stranded sweep visits such tasks in every open status, including blocked.
  */
 export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
   const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
@@ -211,13 +220,15 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and (${answeredSql(rawMessage("m"))} or ${noticeHasLaterDispositionSql({
+        companyId: sql`n.company_id`, issueId: sql`n.issue_id`, updatedAt: sql`n.updated_at`,
+      })})))`;
 }
 
 /**
  * SQL over issue_comments rows (the outer table): a person's message within the
  * lookback that no agent answered and that has no notice yet, or a live
- * unanswered-message notice whose message an agent has since answered. The
+ * unanswered-message notice answered or followed by a terminal run. The
  * recovery worker runs ONE batched query with it per page of visited tasks.
  */
 export function unansweredPersonMessageCommentCondition(): SQL {
@@ -235,7 +246,10 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})))`;
+          and (${answeredSql(rawMessage("m"))} or ${noticeHasLaterDispositionSql({
+            companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`,
+            updatedAt: sql`${issueComments.updatedAt}`,
+          })}))))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -330,6 +344,18 @@ export async function settleUnansweredPersonMessage(
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
     const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason) return null;
+    if (fenced.existingCommentId) {
+      await notifyStatusCardIssueChange(tx, issue.companyId);
+      await notifyIssueRecovery(tx, { companyId: issue.companyId, issueId: issue.id });
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.dotEvents, `company:${issue.companyId}`);
+      const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body,
+        presentation: fenced.notice.presentation,
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now,
+      }).where(and(eq(issueComments.id, fenced.existingCommentId), eq(issueComments.companyId, issue.companyId),
+        eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+        sql`${reasonOf(issueComments.metadata)} = ${fenced.reason}`)).returning({ id: issueComments.id });
+      return updated?.id ?? null;
+    }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
       authorType: "system",
       presentation: fenced.notice.presentation,
@@ -344,7 +370,8 @@ type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: 
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string } }
-  | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
+  | { kind: "notice"; reason: string; code: string; existingCommentId?: string;
+    notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
@@ -370,10 +397,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+  const [noticed] = await q.select({ id: issueComments.id, metadata: issueComments.metadata,
+    deletedAt: issueComments.deletedAt }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
-    sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
-  if (noticed) return { kind: "noticed_before" };
+    eq(issueComments.authorType, "system"), sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+
+  const [pendingContinuation] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+    .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, issueRecoveryActions.companyId),
+      sql`${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}#>>'{freshContinuation,sourceRunId}'`))
+    .where(and(eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+      eq(issueRecoveryActions.status, "resolved"), eq(heartbeatRuns.agentId, agentId),
+      or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+      sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,schema}' = 'paperclip.fresh-continuation.v1'`,
+      sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`)).limit(1);
+  if (pendingContinuation) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
 
   // Something will still answer it by itself: a live or scheduled run.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
@@ -421,6 +459,11 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
+
+  const terminalSuccessor = run && messageRun && run.id !== messageRun.id && isNativeContinuationRefusal(run);
+  if (noticed && (noticed.deletedAt || !terminalSuccessor || noticed.metadata?.sourceRunId === run.id)) {
+    return { kind: "noticed_before" };
+  }
 
   let code: string;
   if (!run) {
@@ -480,14 +523,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
 
   // Already explained: the executor's held notice for this conversation, or a
   // person-facing recovery notice posted after the message.
-  if (await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return { kind: "explained" };
+  if (!noticed && await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return { kind: "explained" };
   const [explained] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
     sql`${issueComments.presentation}->>'kind' = 'system_notice'`,
     sql`${issueComments.presentation}->>'tone' in ('danger', 'warning')`,
+    sql`coalesce(${reasonOf(issueComments.metadata)}, '') <> ${reason}`,
     sql`coalesce(${issueComments.metadata}->>'recoveryResponsibility', 'user') <> 'system'`)).limit(1);
-  if (explained) return { kind: "explained" };
+  if (explained && !noticed) return { kind: "explained" };
 
   const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
   const body = code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
@@ -506,7 +550,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sourceRun: run ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
     failureCode: run ? undefined : code,
   });
-  return { kind: "notice", reason, code, notice };
+  return { kind: "notice", reason, code, notice, ...(noticed ? { existingCommentId: noticed.id } : {}) };
 }
 
 
