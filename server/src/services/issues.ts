@@ -11432,6 +11432,8 @@ export function issueService(db: Db) {
             executionWorkspaceSettings,
             goalId,
             responsibleUserId: null,
+            ...(row.createdByUserId !== undefined ? { createdByUserId: row.createdByUserId } : {}),
+            ...(row.responsibleUserId !== undefined ? { responsibleUserId: row.responsibleUserId } : {}),
             requestDepth: clampIssueRequestDepth(undefined),
             // Imported timestamps describe source history, not a local run.
             // Preserve that provenance so resume can admit carried-over work.

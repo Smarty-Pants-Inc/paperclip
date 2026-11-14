@@ -313,6 +313,12 @@ export const companyPortabilityExportSchema = z.object({
 export type CompanyPortabilityExport = z.infer<typeof companyPortabilityExportSchema>;
 
 export const companyPortabilityPreviewSchema = z.object({
+  userCommentAuthorEmail: z.string().trim().email().optional(),
+  taskPeople: z.array(z.object({
+    issueIdentifier: z.string().min(1),
+    creatorEmail: z.string().trim().email().nullable(),
+    responsibleEmail: z.string().trim().email().nullable(),
+  })).optional(),
   source: portabilitySourceSchema,
   include: portabilityIncludeSchema.optional(),
   target: portabilityTargetSchema,

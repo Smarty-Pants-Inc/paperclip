@@ -337,6 +337,12 @@ export type CompanyPortabilityAgentSelection = "all" | string[];
 export type CompanyPortabilityCollisionStrategy = "rename" | "skip" | "replace";
 
 export interface CompanyPortabilityPreviewRequest {
+  userCommentAuthorEmail?: string;
+  taskPeople?: {
+    issueIdentifier: string;
+    creatorEmail: string | null;
+    responsibleEmail: string | null;
+  }[];
   source: CompanyPortabilitySource;
   include?: Partial<CompanyPortabilityInclude>;
   target: CompanyPortabilityImportTarget;
@@ -370,6 +376,21 @@ export interface CompanyPortabilityPreviewIssuePlan {
 }
 
 export interface CompanyPortabilityPreviewResult {
+  authorship?: {
+    userCommentAuthorUserId?: string;
+    comments?: Array<{
+      issueSlug: string;
+      issueIdentifier: string | null;
+      commentIndex: number;
+      authorType: "user" | "system";
+      authorUserId: string | null;
+    }>;
+    taskPeople?: Array<{
+      issueIdentifier: string;
+      createdByUserId: string | null;
+      responsibleUserId: string | null;
+    }>;
+  };
   include: CompanyPortabilityInclude;
   targetCompanyId: string | null;
   targetCompanyName: string | null;
