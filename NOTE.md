@@ -53,6 +53,59 @@ The test intentionally synthesizes legacy missing-confirmedAt because the raw
 incident metadata is absent. TL07 writes an instruction edit and starts at its
 persisted typed refusal; it does not claim to reproduce the runner prepare RPC.
 
+## Repair in the existing owners
+
+- Stop gate accepts the existing bound legacy release receipt without requiring
+  an absent confirmedAt. Explicitly malformed/out-of-window timestamps still
+  refuse. Released/expired bound receipts are immutable in both gate and source
+  stop preparation/Retry, even when a stronger proof predicate refuses them.
+- Physical inspection precedes exact recovery in the orphan inventory. The
+  existing native failed-owner settlement retires only an expired, result-less,
+  untracked observed remote owner with independent bound stop proof; it fences
+  the old generation, preserves failed workspace obligations, settles its wake,
+  and signals existing disposition/replacement owners. No fabricated result.
+- No-receipt inspection uses the existing inspectLeaseResource, outside all
+  task/gate transactions. Exact stopped/destroyed observations pass through the
+  existing lease CAS and attempt-fenced stop receipt owner. An inspection does
+  NOT fabricate an environmentStopLease/stop-and-retain dispatch receipt.
+  Provider live/stopping/unknown and another allocation holder remain waits.
+  Cloud cleanup absence is deliberately not used for continuation authority.
+- The held-source query no longer hides an earlier live turn before its strict
+  gate can post the one current waiting note. It still cannot admit that turn.
+  Existing immutable-note supersession and wake/delivery owners are retained.
+- pendingCleanupController explanation: prepareStopAndRetain merged a new
+  intent and inFlight=false over old metadata without removing the former
+  claim's controller stamp. Thus 11:49:42 can survive into a newly prepared
+  intent; that is not evidence that an old process was actually dispatched.
+  The existing cleanup claim already re-stamps currentControllerProcess and a
+  fresh attempt ID. Preparation now removes the obsolete controller stamp.
+  Exact provenance of the incident's stamp remains unavailable with its absent
+  raw metadata; this explanation is the reproduced source mechanism, not an
+  invented live process observation.
+
+## Qualification checkpoint
+
+The final frozen ten-case replay on d7f7090b (`base-seed-final-v5.json`) is
+4 passed / 6 failed. The repaired source (`head-seed-v5.json`) is 9 passed /
+1 failed: all receipt/stranded-owner/proof-arrival/peer controls qualify; idle
+TL07 remains RED (dev-lead owns the runner prepare change, not fixed here).
+The running-turn TL07 control waits with one note. Initial eight targeted suites
+(`head-focused-v1.json`) are 702 passed / 2 failed; both failures demand the old
+"I'm stopping" wording for a malformed timestamp receipt. The repair refuses
+and preserves that receipt, truthfully reporting stop unavailable instead of
+promising an RPC forbidden by this brief. Tests are kept unchanged and RED.
+Typecheck has exactly the same three unchanged person-judge errors as base.
+
+Proof limits: controlled provider peers prove real DB admission, saved-history
+handoff, native event/result/finalization, one current note, hold resolution and
+unblocking. The saved word is checked in the provider prompt; the peer response
+is deterministic, NOT a model-memory or live Boat proof. The queued continuation
+is admitted by real delivery without a resend; the peer takes over its launcher
+boundary and mirrors dispatch's running projection. TL07 starts at its typed
+persisted refusal after writing an instruction edit, not the actual prepare RPC.
+Full live acceptance and the exact SEED-B failed subpredicate still need lead
+input/deployment; these qualifications must accompany any status claim.
+
 ## Prior provenance
 
 # Pi warm reattach: step one, not a PRP shortcut
