@@ -4,6 +4,7 @@ import {
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations,
   plugins, pluginCompanySettings, type Db,
 } from "@paperclipai/db";
+import type { PluginStatus } from "@paperclipai/shared";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -58,7 +59,7 @@ describe.skipIf(!support.supported)("R4-a delta independent judge", () => {
   async function plugin(status = "ready") {
     const id = randomUUID();
     const pluginKey = `judge.plugin.${id}`;
-    const [p] = await db.insert(plugins).values({ id, pluginKey, packageName: pluginKey, version: "1.0.0", status,
+    const [p] = await db.insert(plugins).values({ id, pluginKey, packageName: pluginKey, version: "1.0.0", status: status as PluginStatus,
       manifestJson: { id: pluginKey, apiVersion: 1, version: "1.0.0", displayName: "Judge fixture", description: "Fixture", author: "Judge", categories: ["automation"], capabilities: ["issues.wakeup"], entrypoints: { worker: "./worker.js" } } }).returning();
     return p;
   }
