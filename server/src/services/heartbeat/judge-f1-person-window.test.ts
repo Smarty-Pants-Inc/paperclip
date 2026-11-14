@@ -38,6 +38,7 @@ import type { Db } from "@paperclipai/db";
 import { activityLog, agents, applyPendingMigrations, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environments, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, nativeRunnerCheckpoints } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { classifyEnvironmentCapabilities, environmentRuntimeService } from "../environment-runtime.js";
 import { environmentService } from "../environments.js";
@@ -230,6 +231,59 @@ if (!support.supported) console.warn(`Skipping recovery module database tests: $
 describePostgres("heartbeat recovery module ownership", () => {
   let db: Db;
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let caseCleanup: { run: Run; hb?: ReturnType<typeof heartbeatService>; coordinator?: ReturnType<typeof createDeliveryWorkCoordinator>; passes?: Set<Promise<unknown>>; bodyFinished?: boolean; finish?: () => void } | undefined;
+  afterEach(async () => {
+    const owned = caseCleanup;
+    if (!owned) return;
+    const finished = owned.hb && !owned.bodyFinished
+      ? new Promise<void>(resolve => { owned.finish = resolve; }) : undefined;
+    // Stop this case's workers before fencing its rows. afterEach also runs
+    // when Vitest times out an async body that has not reached its finally.
+    const stopping = owned.coordinator?.stop();
+    const receipts: unknown[] = [];
+    for (const stage of ["fence", "settled"]) {
+      // The agent was minted by seedRun for this case; this includes any
+      // successor admitted indirectly while its original body was waiting.
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, owned.run.agentId));
+      for (const run of runs) {
+        adapterExecutionControls.get(run.id)?.controller.abort(new Error("RFL per-case teardown"));
+        await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "operator_interrupted",
+          error: "RFL per-case teardown", finishedAt: new Date(), controllerLeaseExpiresAt: new Date(0),
+          resultJson: { ...run.resultJson, cancelledByActorType: "board" } }).where(eq(heartbeatRuns.id, run.id));
+        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", recoveryState: "blocked",
+          failureCode: "cancelled", nextAttemptAt: null, leaseOwner: null, leaseExpiresAt: null,
+          controlDeadlineAt: null }).where(eq(nativeRunFinalizations.runId, run.id));
+        await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" })
+          .where(eq(environmentLeases.heartbeatRunId, run.id));
+      }
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, owned.run.agentId));
+      for (const wake of wakes) await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, wake.id));
+      receipts.push({ stage, runIds: runs.map(run => run.id), wakeIds: wakes.map(wake => wake.id),
+        activeAdapterRunIds: runs.filter(run => adapterExecutionControls.has(run.id)).map(run => run.id),
+        pendingPasses: owned.passes?.size ?? 0 });
+      if (stage === "fence" && owned.hb) {
+        // Release only the already-due frozen connection callback in teardown,
+        // after cancelling the case. Never advance the measured person window.
+        if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
+        vi.useRealTimers();
+        await stopping;
+        await owned.hb.drainActiveRunExecutions();
+        await Promise.allSettled([...(owned.passes ?? [])]);
+        // A timed-out body must reach its own finally before the next case
+        // installs another fake clock or restores this file's recovery mocks.
+        await finished;
+      }
+    }
+    await appendFile(`${process.env.TASK_OUT}/case-teardown.jsonl`, JSON.stringify({
+      issueId: owned.run.issueId, agentId: owned.run.agentId, receipts,
+      heartbeatDrained: Boolean(owned.hb), bodyFinallyReached: Boolean(owned.bodyFinished),
+      runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, owned.run.agentId)),
+      retries: await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.issueId, owned.run.issueId!)),
+      leases: await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, owned.run.issueId!)),
+    }) + "\n");
+    caseCleanup = undefined;
+  });
   beforeAll(async () => {
     if (externalUrl) await applyPendingMigrations(externalUrl);
     else database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-module-");
@@ -247,6 +301,7 @@ describePostgres("heartbeat recovery module ownership", () => {
 
   it.each(["unlaunched", "dispatched", "reassigned", "ambiguous"] as const)("claims the same expired portable preparation only with its original task lock (%s)", async state => {
     const run = await seedRun(), deps = callbacks(db);
+    caseCleanup = { run };
     const environmentId = randomUUID(), leaseId = randomUUID();
     const oldBootId = randomUUID();
     await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
@@ -663,6 +718,7 @@ describePostgres("heartbeat recovery module ownership", () => {
     const hb = heartbeatService(db, { runtimeEnv: { PAPERCLIP_NATIVE_RUNTIME_ENABLED: "true" } });
     const passes = new Set<Promise<unknown>>(), errors: unknown[] = [];
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true, onError: error => errors.push(error) });
+    caseCleanup = { run: f.run, hb, coordinator, passes };
     const register = coordinator.register.bind(coordinator);
     coordinator.register = (queue, task) => register(queue, { ...task, run: signal => { const pass = Promise.resolve(task.run(signal)); passes.add(pass); void pass.then(() => passes.delete(pass), () => passes.delete(pass)); return pass; } });
     // Same clock-advance helper as server/src/__tests__/live-recovery-work.test.ts.
@@ -730,7 +786,12 @@ describePostgres("heartbeat recovery module ownership", () => {
       const final = await sample("final-assertions");
       expect(errors).toEqual([]);
       expect(final.comments.filter(c=>c.authorType!=="user"), "one saved message must receive an explanatory note or answer without another send").not.toEqual([]);
-    } finally { await coordinator.stop(); await hb.drainActiveRunExecutions(); vi.useRealTimers(); await child.stop(); }
+    } finally {
+      try { await coordinator.stop(); await hb.drainActiveRunExecutions(); vi.useRealTimers(); await child.stop(); }
+      finally {
+        if (caseCleanup) { caseCleanup.bodyFinished = true; caseCleanup.finish?.(); }
+      }
+    }
   }, 120000);
 
   it.each(["unknown", "remote"] as const)("R52 observed positive close still holds %s ownership", async target => {
