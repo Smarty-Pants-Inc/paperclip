@@ -8359,7 +8359,7 @@ function leaseDb(
       };
     },
   });
-  const select = () => ({
+  const select = (fields?: Record<string, unknown>) => ({
     from: (table: unknown) => {
       const rows =
         table === nativeRunFinalizations
@@ -8401,9 +8401,13 @@ function leaseDb(
               : table === heartbeatRunEvents
                 ? priorAccountingEvents.map((event, seq) => ({ seq, eventType: event.eventType, sourceSeq: event.sourceSeq, payload: { prpEvent: event } }))
                 : [];
+      const resultRows = table === environmentLeases && fields?.lease
+        ? environmentLeaseRows.map(lease => ({ lease, environment: { driver: "sandbox" } }))
+        : rows;
       const query = {
-        then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+        then: Promise.resolve(resultRows).then.bind(Promise.resolve(resultRows)),
         leftJoin: () => query,
+        innerJoin: () => query,
         where: () => query,
         orderBy: () => query,
         for: () => query,
@@ -16636,6 +16640,17 @@ describe("native process ownership", () => {
 
 });
 
+async function currentRecoveryCoordinator(leaseOwner: string, controllerGeneration = 2) {
+  const { currentNativeControllerIdentity } = await import("./native-restart-recovery.js");
+  const controller = await currentNativeControllerIdentity();
+  return { leaseOwner, controllerBootId: controller.bootId, controllerPid: controller.pid, controllerGeneration, attempt: 1 };
+}
+
+const provenGonePredecessorRuntime = {
+  execute: vi.fn(),
+  readPredecessorSandboxRecord: vi.fn(async () => ({ kind: "gone" as const })),
+};
+
 describe("runnerd provider runtime wiring", () => {
   it("keeps remote warm turns open while retaining verified close semantics", async () => {
     const current = scopedNativeExecution("remote-warm-settlement");
@@ -16707,19 +16722,19 @@ describe("runnerd provider runtime wiring", () => {
       failureReason: proof === "retired replacement predecessor" ? "resume_failed" : null,
       metadata: { remoteCwd: "/previous-box",
         ...(proof === "kept replacement successor" ? { reusableSandboxKeptAfterReplacement: {
-          replacementLeaseId: "replacement-environment-lease" } } : {}),
+          runId: current.binding.runId, replacementLeaseId: "replacement-environment-lease" } } : {}),
         sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "previous-box" } },
     };
     const acquisition = { outcome: "replacement" as const, providerLeaseId: "replacement-box",
       ...(proof === "direct provider lease predecessor"
         ? { previousProviderLeaseId: "previous-box" }
-        : { reason: "resume_failed" as const }) };
+        : { reason: "resume_failed" as const, ...(proof === "retired replacement predecessor" ? { previousProviderLeaseId: "previous-box" } : {}) }) };
     const acquiredLease = {
       ...previousLease, id: "replacement-environment-lease", status: "active", providerLeaseId: "replacement-box",
       releasedAt: null, cleanupStatus: null, failureReason: null,
       metadata: { remoteCwd: "/replacement-box", sandboxLeaseAcquisition: acquisition },
     };
-    const db = leaseDb(current, {}, {}, [], {}, "running", [], [acquiredLease, previousLease] as never);
+    const db = leaseDb(current, await currentRecoveryCoordinator("restart-controller"), {}, [], {}, "running", [], [acquiredLease, previousLease] as never);
     const dispatch = vi.fn(async (_options: unknown) => ({ result: { summary: "verified" },
       terminal: { runTerminalState: "succeeded" as const }, turnId: "fresh-turn",
       normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "fresh-provider-session",
@@ -16735,6 +16750,7 @@ describe("runnerd provider runtime wiring", () => {
       await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: "replacement-controller",
         leaseOwner: "restart-controller", useRunnerd: true, backend: { kind: "cold-restore-test" } as never,
         conversationMode, restartRecovery, runnerIngressAuthorized: true,
+        predecessorEnvironmentRuntime: provenGonePredecessorRuntime,
         runnerExecutionTarget: target as never });
       expect(dispatch).toHaveBeenCalledTimes(1);
       expect(dispatch.mock.calls[0]![0]).toMatchObject({ resumeInterruptedTurn: false,
@@ -16742,6 +16758,210 @@ describe("runnerd provider runtime wiring", () => {
     } finally {
       state.execute.mockReset();
     }
+  });
+
+  it.each([true, false])("JUDGE replacement uses actual restore boundary and must not blank a conversation (backup=%s)", async hasBackup => {
+    const current = scopedNativeExecution(`judge-restore-${hasBackup}`);
+    const remoteCwd = join(isolatedStateDirectory, `judge-restore-remote-${hasBackup}`);
+    const runnerInstanceId = "judge-restore-controller";
+    const acquisition = { outcome: "replacement" as const, providerLeaseId: "new-box", previousProviderLeaseId: "old-box" };
+    const acquired = { id: "new-lease", companyId: current.binding.companyId, environmentId: "environment",
+      executionWorkspaceId: current.binding.executionWorkspaceId, issueId: current.binding.issueId,
+      heartbeatRunId: current.binding.runId, status: "active", provider: "daytona", providerLeaseId: "new-box",
+      metadata: { remoteCwd, sandboxLeaseAcquisition: acquisition } };
+    const predecessor = { ...acquired, id: "old-lease", providerLeaseId: "old-box", status: "active",
+      metadata: { remoteCwd: "/old-box", sandboxLeaseAcquisition: { outcome: "created" } } };
+    const db = leaseDb(current, await currentRecoveryCoordinator("restart-controller"), {}, [], {}, "running", [], [acquired, predecessor]);
+    const earlierTurn = "Earlier user turn: remember the harbor code ORCHID-741.\nEarlier assistant turn: I will remember ORCHID-741.\n";
+    const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+      if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+        packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }) };
+      if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
+      if (command.command === "sh") {
+        try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+        catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+      }
+      return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+    });
+    const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+      for (const operation of operations) for (const file of operation.files) {
+        expect(file.targetPath.startsWith(`${remoteCwd}/`)).toBe(true);
+        await mkdir(dirname(file.targetPath), { recursive: true });
+        await cp(file.sourcePath, file.targetPath, { recursive: true });
+      }
+    });
+    await mkdir(join(remoteCwd, ".paperclip-runtime/paperclip-runner"), { recursive: true });
+    let continuationCount = 0;
+    let preparationError: Error | undefined;
+    const dispatch = vi.fn(async () => {
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { prepareExternalRunnerState: () => Promise<void> };
+      if (hasBackup) {
+        // Exercise the real bytes/manifest/remote-identity restore implementation.
+        // This is not a live model recall test; the earlier-turn transcript is fixture data.
+        const backupRoot = join(options.stateDirectory!, "failover-backups/current");
+        for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+          await mkdir(join(backupRoot, directory.name), { recursive: true });
+        await writeFile(join(backupRoot, "runner/runner-state.json"), JSON.stringify(durableRunnerState({
+          runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId,
+          runnerInstanceId, environmentLeaseId: "new-lease" }, "suspended")));
+        await writeFile(join(backupRoot, "runner/codex-provider-state.json"), JSON.stringify({
+          schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "earlier-provider-thread",
+          providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+        }));
+        await writeFile(join(backupRoot, "codex-home/earlier-turn.txt"), earlierTurn);
+        await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+          backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "old-box",
+          providerSessionIdentity: { providerSessionId: "earlier-provider-thread", providerBackendSessionId: null, providerSessionIdentity: null },
+        })));
+      }
+      try { await options.prepareExternalRunnerState(); }
+      catch (error) { preparationError = error as Error; throw error; }
+      continuationCount++;
+      if (hasBackup) {
+        const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+          createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
+        expect(await readFile(join(remoteSession, "filesystem/codex-home/earlier-turn.txt"), "utf8")).toBe(earlierTurn);
+        expect(JSON.parse(await readFile(join(remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId).toBe("earlier-provider-thread");
+      }
+      return { result: { summary: "boundary exercised" }, terminal: { runTerminalState: "succeeded" as const }, turnId: "new-turn",
+        normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "earlier-provider-thread",
+        driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 };
+    });
+    state.execute.mockReset().mockImplementationOnce(dispatch as never);
+    try {
+      const run = executePaperclipNativeSession({ db, execution: current, runnerInstanceId,
+        leaseOwner: "restart-controller", useRunnerd: true, conversationMode: true, runnerIngressAuthorized: true,
+        restartRecovery: { kind: "reattach_remote_runner", runId: current.binding.runId, leaseOwner: "restart-controller",
+          controllerGeneration: 2, providerAttempt: 1, restartKind: "hard", recoveryRequestId: null,
+          remote: { providerLeaseId: "old-box", remoteCwd: "/old-box" } },
+        predecessorEnvironmentRuntime: provenGonePredecessorRuntime,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment", leaseId: "new-lease",
+          providerKey: "daytona", reusableLeaseConfigured: true, effectiveCapabilities: { runnerWebSocketIngress: true },
+          sandboxLeaseAcquisition: acquisition, runner: { execute: remoteExecute, syncIn } } as never });
+      if (hasBackup) {
+        await run;
+        expect(dispatch).toHaveBeenCalledTimes(1);
+        expect(continuationCount).toBe(1);
+        expect(syncIn).toHaveBeenCalled();
+      } else {
+        const outcome = await run.then(value => ({ value }), error => ({ error }));
+        expect(continuationCount, "a reattach claim means prior work; absent backup must not authorize blank bootstrap").toBe(0);
+        expect(outcome).toHaveProperty("error");
+        // The small leaseDb fake cannot execute the later issue-notice transaction.
+        // Assert the REAL preparation refusal, not that fake's error handling.
+        console.info("JUDGE missing-backup preparation refusal", preparationError?.message);
+        expect(preparationError?.message).toBe("runner_harness_backup_unavailable");
+      }
+    } finally { state.execute.mockReset(); }
+  });
+
+  // Independent judge admission tests: mocked provider dispatch is not live recall proof.
+  it.each([
+    "same-box", "lease-id-only", "plugin-task", "foreign-acquired-issue",
+    "foreign-acquired-workspace", "retired-acquired-replacement", "metadata-disagreement",
+    "active-predecessor", "kept-predecessor-not-gone", "unlinked-retired-predecessor",
+    "foreign-predecessor-company", "foreign-predecessor-issue", "foreign-predecessor-workspace",
+    "stale-controller-generation", "foreign-claim-run",
+  ])("JUDGE refuses unsafe replacement admission: %s", async mode => {
+    const current = scopedNativeExecution(`judge-${mode}`);
+    const acquisition: Record<string, unknown> = { outcome: "replacement", providerLeaseId: "new-box", previousProviderLeaseId: "old-box" };
+    const predecessor: Record<string, unknown> = {
+      id: "old-lease", companyId: current.binding.companyId, environmentId: "environment",
+      executionWorkspaceId: current.binding.executionWorkspaceId, issueId: current.binding.issueId,
+      heartbeatRunId: current.binding.runId, status: "active", leasePolicy: "reuse_by_environment",
+      provider: "daytona", providerLeaseId: "old-box", acquiredAt: new Date(),
+      releasedAt: null, cleanupStatus: null, failureReason: null,
+      metadata: { remoteCwd: "/old-box", sandboxLeaseAcquisition: { outcome: "created" } },
+    };
+    const acquired: Record<string, unknown> = { ...predecessor, id: "new-lease", providerLeaseId: "new-box",
+      metadata: { remoteCwd: "/new-box", sandboxLeaseAcquisition: { ...acquisition } } };
+    const target: any = { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "new-lease",
+      providerKey: "daytona", remoteCwd: "/new-box", sandboxLeaseAcquisition: acquisition, runner: { execute: vi.fn() } };
+    const claim: any = { kind: "reattach_remote_runner", runId: current.binding.runId, leaseOwner: "restart-controller",
+      controllerGeneration: 2, providerAttempt: 2, restartKind: "hard", recoveryRequestId: null,
+      remote: { providerLeaseId: "old-box", remoteCwd: "/old-box" } };
+    if (mode === "same-box") {
+      acquisition.providerLeaseId = "old-box"; acquired.providerLeaseId = "old-box";
+      target.remoteCwd = "/old-box";
+      acquired.metadata = { remoteCwd: "/old-box", sandboxLeaseAcquisition: { ...acquisition } };
+    }
+    if (mode === "lease-id-only") acquisition.outcome = "resumed";
+    if (mode === "plugin-task") claim.remote.kind = "plugin_task";
+    if (mode === "foreign-acquired-issue") acquired.issueId = "another-issue";
+    if (mode === "foreign-acquired-workspace") acquired.executionWorkspaceId = "another-workspace";
+    if (mode === "retired-acquired-replacement") { acquired.status = "pending_cleanup"; acquired.failureReason = "resume_failed"; }
+    if (mode === "metadata-disagreement") (acquired.metadata as any).sandboxLeaseAcquisition.previousProviderLeaseId = "unrelated-box";
+    if (mode === "kept-predecessor-not-gone" || mode === "unlinked-retired-predecessor") {
+      delete acquisition.previousProviderLeaseId; acquisition.reason = "resume_failed";
+      acquired.metadata = { remoteCwd: "/new-box", sandboxLeaseAcquisition: { ...acquisition } };
+      if (mode === "kept-predecessor-not-gone") {
+        predecessor.status = "retained";
+        predecessor.metadata = { remoteCwd: "/old-box", reusableSandboxKeptAfterReplacement: { runId: current.binding.runId, replacementLeaseId: "new-lease" } };
+      } else {
+        predecessor.status = "pending_cleanup"; predecessor.failureReason = "resume_failed";
+      }
+    }
+    if (mode === "foreign-predecessor-company") predecessor.companyId = "another-company";
+    if (mode === "foreign-predecessor-issue") predecessor.issueId = "another-issue";
+    if (mode === "foreign-predecessor-workspace") predecessor.executionWorkspaceId = "another-workspace";
+    if (mode === "foreign-claim-run") claim.runId = "another-run";
+    const coordinator = mode === "stale-controller-generation"
+      ? { leaseOwner: "restart-controller", controllerGeneration: 99, controllerBootId: "newer-controller", controllerPid: 999999 }
+      : await currentRecoveryCoordinator("restart-controller");
+    // Mirror the production SQL company filter: foreign-company predecessor absent.
+    const rows = [acquired, predecessor].filter(row => row.companyId === current.binding.companyId);
+    const db = leaseDb(current, coordinator as never, {}, [], {}, "running", [], rows);
+    const dispatch = vi.fn(async () => ({ result: { summary: "unexpected continuation" },
+      terminal: { runTerminalState: "succeeded" as const }, turnId: "new-turn",
+      normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "new-provider-session",
+      driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 }));
+    state.execute.mockReset().mockImplementationOnce(dispatch as never);
+    try {
+      const result = await executePaperclipNativeSession({ db, execution: current, runnerInstanceId: "judge-controller",
+        leaseOwner: "restart-controller", useRunnerd: true, backend: { kind: "judge-admission-only" } as never,
+        conversationMode: true, restartRecovery: claim, runnerIngressAuthorized: true,
+        predecessorEnvironmentRuntime: {
+          execute: vi.fn(),
+          readPredecessorSandboxRecord: vi.fn(async () => mode === "active-predecessor" || mode === "kept-predecessor-not-gone"
+            ? { kind: "present" as const, state: "running", stoppedAt: null, lastRebootAt: null }
+            : { kind: "gone" as const }),
+        }, runnerExecutionTarget: target }).then(value => ({ value }), error => ({ error }));
+      expect(dispatch, `unsafe ${mode} must not dispatch new provider work`).not.toHaveBeenCalled();
+      expect(result).toHaveProperty("error");
+    } finally { state.execute.mockReset(); }
+  });
+
+  it("JUDGE concurrent recoveries for one run permit only one same-process continuation", async () => {
+    const current = scopedNativeExecution("judge-concurrent");
+    const acquisition = { outcome: "replacement" as const, providerLeaseId: "new-box", previousProviderLeaseId: "old-box" };
+    const acquired = { id: "new-lease", companyId: current.binding.companyId, environmentId: "environment",
+      executionWorkspaceId: current.binding.executionWorkspaceId, issueId: current.binding.issueId,
+      heartbeatRunId: current.binding.runId, status: "active", provider: "daytona", providerLeaseId: "new-box",
+      metadata: { remoteCwd: "/new-box", sandboxLeaseAcquisition: acquisition } };
+    const predecessor = { ...acquired, id: "old-lease", providerLeaseId: "old-box", metadata: { remoteCwd: "/old-box" } };
+    const db = leaseDb(current, await currentRecoveryCoordinator("restart-controller"), {}, [], {}, "running", [], [acquired, predecessor]);
+    const dispatch = vi.fn(async () => ({ result: { summary: "one continuation" }, terminal: { runTerminalState: "succeeded" as const },
+      turnId: "new-turn", normalizedSessionId: current.session.normalizedSessionId, providerSessionId: "new-provider-session",
+      driverKind: "codex_app_server", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1 }));
+    state.execute.mockReset().mockImplementation(dispatch as never);
+    const input: Parameters<typeof executePaperclipNativeSession>[0] = { db, execution: current, runnerInstanceId: "judge-controller",
+      leaseOwner: "restart-controller", useRunnerd: true, backend: { kind: "judge-admission-only" } as never, conversationMode: true,
+      restartRecovery: { kind: "reattach_remote_runner", runId: current.binding.runId, leaseOwner: "restart-controller",
+        controllerGeneration: 2, providerAttempt: 2, restartKind: "hard", recoveryRequestId: null,
+        remote: { providerLeaseId: "old-box", remoteCwd: "/old-box" } }, runnerIngressAuthorized: true,
+      predecessorEnvironmentRuntime: provenGonePredecessorRuntime,
+      runnerExecutionTarget: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "new-lease",
+        providerKey: "daytona", remoteCwd: "/new-box", sandboxLeaseAcquisition: acquisition, runner: { execute: vi.fn() } } as never };
+    try {
+      const results = await Promise.allSettled([executePaperclipNativeSession(input), executePaperclipNativeSession(input)]);
+      expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+      expect((results.find(result => result.status === "rejected") as PromiseRejectedResult).reason.message).toBe("native_session_supervisor_busy");
+      expect(dispatch).toHaveBeenCalledTimes(1);
+    } finally { state.execute.mockReset(); }
   });
 
   it.each(["reuse", "unsettled-describe", "claim-delay", "claim-expired", "claim-rollback", "unsupported", "fallback-clear-failed", "fallback-clear-expired", "fallback-clear-stopped"])("owns retained plugin startup through %s", async mode => {

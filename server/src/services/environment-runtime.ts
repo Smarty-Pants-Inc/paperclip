@@ -2266,6 +2266,7 @@ function createSandboxEnvironmentDriver(
               ? {
                   outcome: "replacement",
                   reason: replacementReason ?? "resume_failed",
+                  ...((replacementReason ?? "resume_failed") === "resume_failed" ? { previousProviderLeaseId: reusableLease.providerLeaseId } : {}),
                   ...(replacingUnretiredOwner ? { cause: NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE } : {}),
                 }
               : {
@@ -2513,6 +2514,7 @@ function createSandboxEnvironmentDriver(
               ? {
                   outcome: "replacement",
                   reason: "resume_failed",
+                  previousProviderLeaseId: reusableLease.providerLeaseId,
                 }
               : {
                   outcome: "created",
