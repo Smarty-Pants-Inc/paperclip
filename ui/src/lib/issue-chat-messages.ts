@@ -1160,6 +1160,19 @@ export function isRedundantAiRecoveryNotice(
       && interaction.sourceRunId === comment.metadata?.sourceRunId);
 }
 
+/** A replaced waiting note keeps `supersededByCommentId` pointing at its
+ * successor. Hide it only when that successor is in the same list, so a
+ * paged-out successor never leaves the thread with no note. */
+export function supersededCommentIds(comments: readonly IssueChatComment[]): Set<string> {
+  const ids = new Set(comments.map((comment) => comment.id));
+  const hidden = new Set<string>();
+  for (const comment of comments) {
+    const next = comment.metadata?.supersededByCommentId;
+    if (typeof next === "string" && next && ids.has(next)) hidden.add(comment.id);
+  }
+  return hidden;
+}
+
 export function buildIssueChatMessages(args: {
   comments: readonly IssueChatComment[];
   interactions?: readonly IssueThreadInteraction[];
@@ -1198,9 +1211,11 @@ export function buildIssueChatMessages(args: {
   } = args;
 
   const orderedMessages: MessageWithOrder[] = [];
+  const hiddenIds = supersededCommentIds(comments);
 
   for (const comment of sortByCreated(comments)) {
     if (isRedundantAiRecoveryNotice(comment, interactions)) continue;
+    if (hiddenIds.has(comment.id)) continue;
     orderedMessages.push({
       createdAtMs: toTimestamp(comment.createdAt),
       order: 1,
