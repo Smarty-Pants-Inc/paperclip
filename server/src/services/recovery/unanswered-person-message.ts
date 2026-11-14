@@ -59,18 +59,21 @@ const OVERDUE_NATIVE_RETRY_MS = 5 * 60_000;
 export const UNANSWERED_MESSAGE_NO_REPLY_CODE = "no_reply";
 export const UNANSWERED_MESSAGE_NO_RUN_CODE = "no_run";
 export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
-/** The run that carries the message is queued or scheduled and has not started. */
-export const UNANSWERED_MESSAGE_WAITING_CODE = "waiting_to_start";
-/** A waiting note stays true only this long: if the carrying run still has not
- * started by T0 + this bound, the SAME note becomes the failure text. */
+/** While the run that carries the message is queued and has not started, the
+ * turn header says "Waiting to start" (Paperclip's useWaitingToStart, #21447;
+ * DESIGN.md: a queued turn's hold is named once, in the turn header), so B'
+ * posts no note of its own. A carrying run that still has not started by
+ * T0 + this bound gets ONE no-run note, which its answer supersedes. */
 export const PENDING_WAIT_START_BOUND_MS = 10 * 60_000;
-/** The non-failure marker row of a waiting note (no "Failure code" row). */
+/** The non-failure marker row of a waiting-kind note (no "Failure code" row).
+ * A legacy "waiting to start" note (Waiting code waiting_to_start) still
+ * carries it and is replaced in place by the no-run text at the bound. */
 const WAITING_ROW_LABEL = "Waiting code";
 const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused"]);
+const WAITING_KIND_CODES = new Set(["agent_paused"]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -84,8 +87,6 @@ export const UNANSWERED_MESSAGE_TEXT =
   "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
-export const UNANSWERED_MESSAGE_WAITING_TEXT =
-  "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
 
@@ -434,7 +435,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A standing WAITING note is still an open obligation: it must stay true.
   if (noticed && !noticed.waiting) return { kind: "noticed_before" };
   const upgrading = noticed?.waiting ? noticed.id : null;
-  const standingWaitingCode = noticed?.waiting ? noticed.waitingCode ?? UNANSWERED_MESSAGE_WAITING_CODE : null;
+  const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
 
   // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
@@ -492,8 +493,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // scanSilentActiveRuns; doc/execution-semantics.md §12). A QUEUED or
   // scheduled run, carrying the message or not, is bounded: one that is never
   // claimed (the agent's slots are full, or its claim is refused) must not keep
-  // the person silent. When the run that waits carries the message, the note
-  // says it is waiting to start, not that it failed.
+  // the person silent. When the run that waits carries the message, the turn
+  // header already says it is waiting to start (useWaitingToStart): no note
+  // until PENDING_WAIT_START_BOUND_MS, then the no-run note.
   const live = runs.filter(candidate => LIVE.includes(candidate.status));
   const [otherLive] = live.length ? [] : await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
     contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
@@ -560,15 +562,12 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
-    // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
-    // carrying run has not started (a dead claim, a stuck queue): failure text.
+    // The turn header says "Waiting to start" until T0 + PENDING_WAIT_START_BOUND_MS;
+    // after that the carrying run has not started (a dead claim, a stuck
+    // queue): one no-run note.
     const startDeadline = (waitT0 ?? now.getTime()) + PENDING_WAIT_START_BOUND_MS;
-    if (startDeadline > now.getTime()) {
-      if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_WAITING_CODE) return { kind: "pending", recheckAt: startDeadline };
-      code = UNANSWERED_MESSAGE_WAITING_CODE;
-    } else {
-      code = UNANSWERED_MESSAGE_NO_RUN_CODE;
-    }
+    if (startDeadline > now.getTime()) return { kind: "pending", recheckAt: startDeadline };
+    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
@@ -646,24 +645,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  const body = paused ? agentPausedText(pausedName)
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : held ? "This conversation can't continue" : "Your message wasn't answered",
       body,
-      tone: paused ? "warning" : waiting ? "info" : "warning",
+      tone: "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
-        : waiting ? "No action is needed; it will start by itself."
         : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
     recoveryResponsibility: "user",
     sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: code } : null,
-    // A waiting note is not a failure: no "Failure code" row, a marker row instead.
+    // A waiting-kind note is not a failure: no "Failure code" row, a marker row instead.
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
