@@ -493,7 +493,7 @@ impl AcpxProviderDescriptor {
         if self.sidecar_command != launch_profile.command
             || self.sidecar_args != launch_profile.args
         {
-            return Err(DurableRunnerError::invalid(
+            return Err(DurableRunnerError::launch_profile_mismatch(
                 "ACPX descriptor sidecar launch does not match the runner-owned qualified profile",
             ));
         }

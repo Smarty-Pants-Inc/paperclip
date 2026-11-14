@@ -50,6 +50,9 @@ pub const PROVIDER_STATE_INCOMPATIBLE: &str = "provider_state_incompatible";
 /// The refusal leaves the saved state unchanged and repeats on every retry.
 pub const PROVIDER_ATTACH_REFUSED: &str = "provider_attach_refused";
 
+/// Qualified launch-profile drift is terminal without discarding saved history.
+pub const PROVIDER_LAUNCH_PROFILE_MISMATCH: &str = "provider_launch_profile_mismatch";
+
 /// The saved provider session still owns a side-effecting tool call without a
 /// recorded result. Replacing the session could repeat or lose that action.
 pub const PROVIDER_SIDE_EFFECT_PENDING: &str = "provider_side_effect_pending";
@@ -61,11 +64,27 @@ pub const PROVIDER_SIDE_EFFECT_PENDING: &str = "provider_side_effect_pending";
 pub const PROVIDER_SESSION_CLOSED: &str = "provider_session_closed";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DurableRunnerError(String, Option<serde_json::Value>, Option<&'static str>);
+pub struct DurableRunnerError(
+    String,
+    Option<serde_json::Value>,
+    Option<&'static str>,
+    Option<&'static str>,
+);
 
 impl DurableRunnerError {
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self(message.into(), None, None)
+        Self(message.into(), None, None, None)
+    }
+
+    pub fn launch_profile_mismatch(message: impl Into<String>) -> Self {
+        let mut error = Self::invalid(message);
+        error.3 = Some(PROVIDER_LAUNCH_PROFILE_MISMATCH);
+        error
+    }
+
+    pub fn with_refusal_code(mut self, code: &'static str) -> Self {
+        self.3 = Some(code);
+        self
     }
 
     pub fn with_provider_failure(mut self, value: Option<serde_json::Value>) -> Self {
@@ -86,6 +105,13 @@ impl DurableRunnerError {
 
     pub fn classification(&self) -> Option<&'static str> {
         self.2
+    }
+
+    /// Specific non-destructive refusal, additive to legacy recovery classes.
+    /// Older controllers retain their existing classification; newer ones must
+    /// honor this code before considering replacement or history-reset Retry.
+    pub fn refusal_code(&self) -> Option<&'static str> {
+        self.3
     }
 }
 
