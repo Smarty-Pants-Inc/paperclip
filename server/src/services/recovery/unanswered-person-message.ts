@@ -1,5 +1,6 @@
 import { and, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
+  activityLog,
   agentWakeupRequests,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -12,6 +13,7 @@ import {
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { logActivity } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -315,6 +317,11 @@ export async function settleUnansweredPersonMessage(
         message: "The unanswered-message notice waits for the native blocked-request repair to publish.",
         payload: { messageId: decision.recordDeferral.messageId, boundMs: NATIVE_REPAIR_PUBLISH_BOUND_MS } });
     }
+    if (decision.recordWait) {
+      await logActivity(db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
+        action: PENDING_WAIT_ACTION, entityType: "issue", entityId: issue.id, issueId: issue.id,
+        details: { messageId: decision.recordWait.messageId, runId: decision.recordWait.runId, boundMs: PENDING_WAIT_BOUND_MS } });
+    }
     return { kind: "pending", recheckAt: decision.recheckAt };
   }
   if (decision.kind !== "notice") return decision;
@@ -341,12 +348,22 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
-  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string } }
+  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
+      recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice> };
 
 /** The run event that records, once and durably, when this step first deferred
  * a person message's notice to the native blocked-request repair (T0). */
 export const NATIVE_REPAIR_DEFERRAL_EVENT = "unanswered_message.native_repair_deferral";
+
+/** The activity that records, once and durably, when this step first deferred
+ * a person message's notice to a further attempt that is not a running turn
+ * (a queued wake, a queued or scheduled run, a pending native finalization or
+ * retry, a queued missing-comment retry): T0, keyed by the message and the run
+ * that carries it (none, or its latest). The wait may have no run, so this
+ * lives in the activity log rather than in a run's events. */
+export const PENDING_WAIT_ACTION = "issue.unanswered_message_wait";
+export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
@@ -373,27 +390,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   if (noticed) return { kind: "noticed_before" };
 
-  // Something will still answer it by itself: a live or scheduled run.
+  // The run this message started (the latest run that carries it), if any.
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
-  const [liveRun] = await q.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
-    inArray(heartbeatRuns.status, LIVE))).limit(1);
-  if (liveRun) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-
-  // A board-owned hold means nothing moves by itself: queued wakes behind it
-  // do not count as a further attempt.
-  const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
-    .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  if (!boardHold) {
-    const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
-    if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-  }
-
-  // The run this message started, else the latest run after it.
   const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
     errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
@@ -415,6 +413,65 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     return { kind: "answered" };
   }
 
+  // Every wait for a further attempt is BOUNDED, except a turn in progress:
+  // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
+  // and its carrying run) the first time this step defers to such an attempt,
+  // and the wait ends at T0 + PENDING_WAIT_BOUND_MS. An attempt that never
+  // starts (a re-wake that is never claimed, a finalization stuck in a pending
+  // phase, a retry with no next attempt, a missing-comment retry that never
+  // runs) then no longer keeps the message silent: the decision continues and
+  // the fenced writer posts the one notice; a later answer supersedes it.
+  let waitT0: number | null | undefined;
+  const bounded = async (recheckAt: number): Promise<Decision | null> => {
+    if (waitT0 === undefined) {
+      const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
+        eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, PENDING_WAIT_ACTION), sql`${activityLog.details}->>'messageId' = ${message.id}`,
+        sql`coalesce(${activityLog.details}->>'runId', '') = ${run?.id ?? ""}`));
+      waitT0 = wait?.at ? new Date(wait.at).getTime() : null;
+    }
+    const bound = (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
+    if (bound <= now.getTime()) return null;
+    return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
+      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: run?.id ?? null } } : {}) };
+  };
+
+  // A turn in progress keeps an unbounded wait (a quiet healthy turn is never
+  // noticed): a run that is running on this task, or any live run (queued,
+  // running, scheduled retry) that carries the message. A running turn that
+  // does not carry it still unbounded: a person's message that arrives during
+  // a long turn waits for that turn to end, when its deferred wake is promoted.
+  // Any other live run (queued or scheduled, not carrying it) is bounded.
+  const live = runs.filter(candidate => LIVE.includes(candidate.status));
+  const [otherLive] = live.length ? [] : await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+    contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
+    inArray(heartbeatRuns.status, LIVE))).limit(1);
+  const liveRuns = otherLive ? [...live, otherLive] : live;
+  if (liveRuns.some(candidate => candidate.status === "running" || runCarriesMessage(candidate.contextSnapshot, message.id))) {
+    return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+  }
+  if (liveRuns.length) {
+    const wait = await bounded(now.getTime() + 30_000);
+    if (wait) return wait;
+  }
+
+  // A board-owned hold means nothing moves by itself: queued wakes behind it
+  // do not count as a further attempt.
+  const [boardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+    inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
+    .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  if (!boardHold) {
+    const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+      inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
+    if (wakes.some(wake => wakeCarriesIssue(wake.payload, issue.id))) {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+    }
+  }
+
   let code: string;
   if (!run) {
     // Paperclip records a deferred or coalesced wake that could not start as
@@ -433,14 +490,20 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
     if (due > now.getTime()) return { kind: "pending", recheckAt: due };
-    if (run.issueCommentStatus === "retry_queued") return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    if (run.issueCommentStatus === "retry_queued") {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
+    }
     const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
     if (coordinator && !boardHold) {
-      if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
-      if (coordinator.phase === "retryable_failure"
+      if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
+        const wait = await bounded(now.getTime() + 30_000);
+        if (wait) return wait;
+      } else if (coordinator.phase === "retryable_failure"
         && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime())) {
-        return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS) };
+        const wait = await bounded(Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS));
+        if (wait) return wait;
       }
     }
     // A declared blocker or attention request answers the person only when its
