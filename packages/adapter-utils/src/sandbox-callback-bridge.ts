@@ -309,6 +309,8 @@ export interface SandboxCallbackBridgeQueueClient {
 }
 
 export interface SandboxCallbackBridgeWorkerHandle {
+  pause(): Promise<void>;
+  resume(): Promise<void>;
   stop(options?: { drainTimeoutMs?: number }): Promise<void>;
 }
 
@@ -819,6 +821,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
+  /** Idle-listing backoff cap; defaults to pollIntervalMs (backoff disabled). */
+  idleBackoffMaxMs?: number | null;
+  /** Begin without polling until a native run is bound. */
+  startPaused?: boolean;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
   // `failPendingRequests`. Defaults to DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS.
@@ -862,6 +868,8 @@ export async function startSandboxCallbackBridgeWorker(input: {
   runtimeSpan?: RuntimeSpanRunner;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
+  // Idle backoff applies only while a run is attached; default = the interval (off).
+  const idleBackoffMaxMs = Math.max(pollIntervalMs, normalizeTimeoutMs(input.idleBackoffMaxMs, pollIntervalMs));
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
   const abortedHandlerGraceMs = normalizeTimeoutMs(
@@ -889,9 +897,26 @@ export async function startSandboxCallbackBridgeWorker(input: {
       await input.client.makeDir(directory);
     }
   }
+  const runStatePath = path.posix.join(directories.rootDir, "run-state.json");
+  let runStateManaged = Boolean(input.startPaused);
+  if (input.startPaused) {
+    await input.client.writeTextFile(runStatePath, "paused");
+  }
 
   let stopping = false;
+  let paused = input.startPaused ?? false;
+  let polling = false;
+  let resumePolling: (() => void) | null = null;
+  let pausedPromise: Promise<void> | null = null;
+  let pollSettled: (() => void) | null = null;
+  let pollSettledPromise: Promise<void> | null = null;
+  let pollStartedResolve: (() => void) | null = null;
+  let sleepTimer: ReturnType<typeof setTimeout> | null = null;
+  let wakeSleep: (() => void) | null = null;
+  let idlePollIntervalMs = pollIntervalMs;
+  let resetIdleOnNextEmpty = false;
   let inFlight = 0;
+  const inFlightWaiters: Array<() => void> = [];
   let settled = false;
   let stopDeadline = Number.POSITIVE_INFINITY;
   let settleResolve: (() => void) | null = null;
@@ -1493,7 +1518,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
     // per-iteration timeout does not catch. `unref` keeps it from holding the
     // process open. The loop `finally` clears it on every exit.
     const watchdogTimer = setInterval(() => {
-      if (settled || stopping) return;
+      if (settled || stopping || paused) return;
       const idleMs = Date.now() - lastSuccessfulIterationAt;
       if (idleMs < watchdogTimeoutMs) return;
       // Fire once per hang period. Re-arm only after the loop advances
@@ -1522,7 +1547,19 @@ export async function startSandboxCallbackBridgeWorker(input: {
       // keeps probing for recovery.
       let consecutivePollFailures = 0;
       while (true) {
+        if (stopping && paused) break;
+        if (paused) {
+          pausedPromise ??= new Promise<void>((resolve) => { resumePolling = resolve; });
+          await pausedPromise;
+          resumePolling = null;
+          pausedPromise = null;
+          if (stopping) break;
+        }
         let fileNames: string[];
+        polling = true;
+        pollStartedResolve?.();
+        pollStartedResolve = null;
+        pollSettledPromise = new Promise<void>((resolve) => { pollSettled = resolve; });
         try {
           fileNames = await withTimeout(
             input.client.listJsonFiles(directories.requestsDir),
@@ -1531,6 +1568,10 @@ export async function startSandboxCallbackBridgeWorker(input: {
           );
           consecutivePollFailures = 0;
         } catch (error) {
+          polling = false;
+          pollSettled?.();
+          pollSettled = null;
+          pollSettledPromise = null;
           if (stopping) {
             break;
           }
@@ -1550,6 +1591,12 @@ export async function startSandboxCallbackBridgeWorker(input: {
           await new Promise((resolve) => setTimeout(resolve, backoffMs));
           continue;
         }
+        polling = false;
+        pollSettled?.();
+        pollSettled = null;
+        pollSettledPromise = null;
+        if (paused) continue;
+        if (fileNames.length > 0) idlePollIntervalMs = pollIntervalMs;
         // A file whose attempt is still in flight (or waiting on its 504
         // backstop) is not actionable: `processRequestFile` would skip it via
         // the guard map. Treat an all-guarded listing like an empty one and
@@ -1560,10 +1607,20 @@ export async function startSandboxCallbackBridgeWorker(input: {
         const actionableFileNames = fileNames.filter((fileName) => !inFlightRequestGuards.has(fileName));
         if (actionableFileNames.length === 0) {
           lastSuccessfulIterationAt = Date.now();
+          if (resetIdleOnNextEmpty) {
+            idlePollIntervalMs = pollIntervalMs;
+            resetIdleOnNextEmpty = false;
+          }
           if (stopping) {
             break;
           }
-          await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+          await new Promise<void>((resolve) => {
+            wakeSleep = resolve;
+            sleepTimer = setTimeout(resolve, idlePollIntervalMs);
+          });
+          wakeSleep = null;
+          sleepTimer = null;
+          idlePollIntervalMs = Math.min(idlePollIntervalMs * 2, idleBackoffMaxMs);
           continue;
         }
         for (const fileName of actionableFileNames) {
@@ -1610,6 +1667,9 @@ export async function startSandboxCallbackBridgeWorker(input: {
             }
           } finally {
             inFlight -= 1;
+            if (inFlight === 0) {
+              for (const resolve of inFlightWaiters.splice(0)) resolve();
+            }
           }
         }
         lastSuccessfulIterationAt = Date.now();
@@ -1639,8 +1699,55 @@ export async function startSandboxCallbackBridgeWorker(input: {
   void loop;
 
   return {
+    pause: async () => {
+      if (stopping || paused) return;
+      paused = true;
+      runStateManaged = true;
+      await input.client.writeTextFile(runStatePath, "paused");
+      pausedPromise ??= new Promise<void>((resolve) => { resumePolling = resolve; });
+      if (sleepTimer) clearTimeout(sleepTimer);
+      sleepTimer = null;
+      wakeSleep?.();
+      wakeSleep = null;
+      if (polling && pollSettledPromise) {
+        await Promise.race([
+          pollSettledPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, iterationTimeoutMs)),
+        ]);
+      }
+      await failPendingRequests("Bridge run detached before request could be handled.", { abandonInFlight: true });
+      if (inFlight > 0) {
+        await new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const finish = () => { clearTimeout(timer); resolve(); };
+          inFlightWaiters.push(finish);
+          timer = setTimeout(finish, iterationTimeoutMs);
+        });
+      }
+    },
+    resume: async () => {
+      if (stopping || !paused) return;
+      await failPendingRequests("Bridge request belongs to a detached run.", { abandonInFlight: true });
+      await input.client.writeTextFile(runStatePath, "attached");
+      idlePollIntervalMs = pollIntervalMs;
+      resetIdleOnNextEmpty = true;
+      const pollStarted = new Promise<void>((resolve) => { pollStartedResolve = resolve; });
+      paused = false;
+      resumePolling?.();
+      resumePolling = null;
+      pausedPromise = null;
+      await pollStarted;
+    },
     stop: async (options = {}) => {
       stopping = true;
+      if (runStateManaged) await input.client.writeTextFile(runStatePath, "paused").catch(() => undefined);
+      resumePolling?.();
+      resumePolling = null;
+      pausedPromise = null;
+      if (sleepTimer) clearTimeout(sleepTimer);
+      sleepTimer = null;
+      wakeSleep?.();
+      wakeSleep = null;
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
       if (!settled) {
@@ -2387,6 +2494,14 @@ async function runFileGateway() {
       const receivedToken = readBridgeToken(req);
       if (!tokensMatch(receivedToken)) {
         writeJsonResponse(res, 401, { error: "Invalid bridge token." });
+        return;
+      }
+      // The host writes this shared queue marker at run detach. Reject here,
+      // before queue publication, so leftover sandbox processes fail immediately
+      // instead of waiting for the host's next attached-run poll.
+      const runState = await fs.readFile(path.posix.join(queueDir, "run-state.json"), "utf8").catch(() => "");
+      if (runState.trim() === "paused") {
+        writeJsonResponse(res, 503, { error: "The Paperclip run is detached; bridge requests are unavailable." });
         return;
       }
 

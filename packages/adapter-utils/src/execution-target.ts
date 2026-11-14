@@ -428,6 +428,10 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
    * is absent there.
    */
   onLoss?(listener: (reason: DuplexLossReason) => void): () => void;
+  /** Pause file-queue polling at a native-run detach boundary. */
+  pause?(): Promise<void>;
+  /** Quarantine paused queue entries before polling under a new run. */
+  resume?(): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -4465,6 +4469,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
   // request's execs group under one wrapper span. When it is absent, the request
   // work runs under the run parent with no wrapper span.
   runtimeSpan?: RuntimeSpanRunner;
+  /** Start file polling paused until a native run binding is attached. */
+  startPaused?: boolean;
   // The injected recorder for the fixed duplex observability surface. The factory
   // binds it to a provider-scoped telemetry facade, which records the channel-open
   // span, the request span, the guarded counters, and the transport event. The
@@ -5020,6 +5026,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       pollIntervalMs,
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
+      startPaused: input.startPaused,
       // The worker encodes binary bodies only at the queue boundary.
       handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
         reservation: options?.reservation,
@@ -5064,6 +5071,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
     },
     runLogTail,
+    pause: async () => { await worker?.pause(); },
+    resume: async () => { await worker?.resume(); },
     stop: async () => {
       await Promise.allSettled([
         server?.stop(),

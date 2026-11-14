@@ -195,7 +195,6 @@ describe("sandbox callback bridge", () => {
     const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
     const previousBackoff = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
     process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = "100";
-    process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS = "800";
     let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | undefined;
     try {
       const queueDir = "/workspace/bridge-lifecycle";
@@ -203,11 +202,13 @@ describe("sandbox callback bridge", () => {
       const requests = new Map<string, string>();
       const responses = new Map<string, string>();
       let listCalls = 0;
+      const listTimes: number[] = [];
       const client: SandboxCallbackBridgeQueueClient = {
         makeDir: async () => {}, makeDirs: async () => {},
         listJsonFiles: async (dir) => {
           if (dir !== directories.requestsDir) return [];
           listCalls++;
+          listTimes.push(Date.now());
           return [...requests.keys()];
         },
         fileSize: async (file) => Buffer.byteLength(requests.get(path.posix.basename(file)) ?? ""),
@@ -216,13 +217,13 @@ describe("sandbox callback bridge", () => {
           if (body === undefined) throw new Error("request was quarantined");
           return body;
         },
-        writeTextFile: async (file, body) => { responses.set(file, body); },
-        writeResponseFile: async (file, body) => { responses.set(file, body); return { wrote: true }; },
+        writeTextFile: async (file, body) => { responses.set(path.posix.basename(file), body); },
+        writeResponseFile: async (file, body) => { responses.set(path.posix.basename(file), body); return { wrote: true }; },
         rename: async () => {}, remove: async (file) => { requests.delete(path.posix.basename(file)); },
       };
       const handled: string[] = [];
       worker = await startSandboxCallbackBridgeWorker({
-        client, queueDir, pollIntervalMs: 100,
+        client, queueDir, pollIntervalMs: 100, idleBackoffMaxMs: 800,
         handleRequest: async (request) => { handled.push(request.id); return { status: 200, body: "ok" }; },
       });
       const lifecycle = worker as typeof worker & { pause(): Promise<void>; resume(): Promise<void> };
@@ -243,15 +244,15 @@ describe("sandbox callback bridge", () => {
 
       requests.set(requestFile("late-a"), JSON.stringify({ id: "late-a", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
       await lifecycle.resume();
-      await vi.advanceTimersByTimeAsync(100);
       expect(handled).not.toContain("late-a");
-      expect(JSON.stringify([...responses.values()])).toContain("late-a");
+      expect(JSON.parse(responses.get("late-a.json") ?? "{}")).toMatchObject({ id: "late-a", status: 503 });
 
       requests.set(requestFile("run-b"), JSON.stringify({ id: "run-b", method: "GET", path: "/api/issues/issue-1", query: "", headers: {}, body: "" }));
       await vi.advanceTimersByTimeAsync(100);
       expect(handled).toContain("run-b");
-      await vi.advanceTimersByTimeAsync(800);
+      await vi.advanceTimersByTimeAsync(2_000);
       expect(listCalls).toBeLessThan(20);
+      expect(listTimes.some((time, index) => index > 0 && time - listTimes[index - 1] === 800)).toBe(true);
       await lifecycle.pause();
       const callsWhilePaused = listCalls;
       await vi.advanceTimersByTimeAsync(120_000);
@@ -274,6 +275,45 @@ describe("sandbox callback bridge", () => {
         await vi.advanceTimersByTimeAsync(100);
         await stopping.catch(() => undefined);
       }
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("preserves the default attached 100ms poll interval when idle backoff is unset", async () => {
+    vi.useFakeTimers();
+    const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    const previousBackoff = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+    delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+    delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+    try {
+      let listCalls = 0;
+      const queueDir = "/workspace/default-poll-interval";
+      const client: SandboxCallbackBridgeQueueClient = {
+        makeDir: async () => {}, makeDirs: async () => {},
+        listJsonFiles: async (dir) => { if (dir.endsWith("/requests")) listCalls++; return []; },
+        fileSize: async () => 0, readTextFile: async () => "", writeTextFile: async () => {},
+        writeResponseFile: async () => ({ wrote: true }), rename: async () => {}, remove: async () => {},
+      };
+      const worker = await startSandboxCallbackBridgeWorker({
+        client, queueDir,
+        handleRequest: async () => ({ status: 200 }),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(listCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(99);
+      expect(listCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(listCalls).toBe(2);
+      await worker.pause();
+      const callsWhilePaused = listCalls;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(listCalls).toBe(callsWhilePaused);
+      await worker.stop();
+    } finally {
+      if (previousInterval === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = previousInterval;
+      if (previousBackoff === undefined) delete process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+      else process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS = previousBackoff;
       vi.useRealTimers();
     }
   }, 30_000);

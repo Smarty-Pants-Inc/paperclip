@@ -12479,7 +12479,7 @@ async function executePaperclipNativeSessionAttempt(
   let reusingReleasedRunner = false;
   let managedCredentialSession: NativeSession | undefined;
   let githubAccess: NativeGitHubAccess | undefined;
-  let releaseGitHubRun: (() => void) | undefined;
+  let releaseGitHubRun: (() => Promise<void>) | undefined;
   let persistedWarmSession: PersistedNativeSession | null | undefined = stagedRestart && !stagedRestart.hasTargetCheckpoint
     ? stagedRestart.checkpoint : undefined;
   let executionContext: NativeExecutionContext | undefined;
@@ -12729,7 +12729,7 @@ async function executePaperclipNativeSessionAttempt(
           onLog: input.onLog,
         }));
         executionContext?.assertOpen();
-        releaseGitHubRun = githubAccess.activate(input.execution.binding);
+        releaseGitHubRun = await githubAccess.activate(input.execution.binding);
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
       }
       return input.runnerEnvironment;
@@ -14281,7 +14281,7 @@ async function executePaperclipNativeSessionAttempt(
     // release and hand-back, which a follow-up's admission may wait for
     // (`warmSessionReleaseWait`). The outer execution's finally clears it.
     settlingNativeSessionScopes.set(nativeSessionScopeKey(input.execution), input.execution.binding.runId);
-    releaseGitHubRun?.();
+    await releaseGitHubRun?.();
     if (githubAccess && (!warmSessionId || warmNativeSessions.get(warmSessionId)?.githubAccess !== githubAccess)) {
       await timeController("github_stop", () => githubAccess!.stop());
     }

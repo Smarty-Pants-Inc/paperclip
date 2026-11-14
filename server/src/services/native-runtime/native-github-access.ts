@@ -81,12 +81,12 @@ export async function createNativeGitHubAccess(input: {
     active = null;
     bridge?.markOrderlyCompletion?.();
     server.closeAllConnections();
+    const bridgeStop = await Promise.allSettled([bridge?.stop()]);
     const results = await Promise.allSettled([
-      bridge?.stop(),
       new Promise<void>(resolve => server.close(() => resolve())),
       cleanupGitHubOperationLaunchers(location),
     ]);
-    if (results.some(result => result.status === "rejected")) {
+    if (bridgeStop.some(result => result.status === "rejected") || results.some(result => result.status === "rejected")) {
       await input.onLog?.("stderr", "[paperclip] GitHub session cleanup incomplete.\n").catch(() => undefined);
     }
   })();
@@ -108,6 +108,7 @@ export async function createNativeGitHubAccess(input: {
         hostApiToken: token,
         hostApiUrl: url,
         enableSandboxDuplexBridge: duplexRequested,
+        startPaused: true,
         duplexObservabilityRecorder: adapterExecutionTargetDuplexObservabilityRecorder(input.target),
         onLog: input.onLog,
       });
@@ -136,13 +137,21 @@ export async function createNativeGitHubAccess(input: {
       env,
       get ready() { return ready && !stopped && bridge?.readRunDisposition?.().failed !== true; },
       duplexRequested,
-      activate(binding: Binding) {
+      async activate(binding: Binding) {
         if (stopped || active) throw new Error("GitHub session is closed or busy");
         if (binding.companyId !== input.scope.companyId || binding.agentId !== input.scope.agentId ||
             binding.issueId !== input.scope.issueId) throw new Error("GitHub session scope mismatch");
+        // Quarantine requests left by the previous run and resume polling before
+        // publishing this run's authority. The broker stays inactive throughout.
+        await bridge?.resume?.();
         const owner = { ...binding };
         active = owner;
-        return () => { if (active === owner) active = null; };
+        return async () => {
+          if (active === owner) {
+            active = null;
+            await bridge?.pause?.();
+          }
+        };
       },
       stop,
     };
