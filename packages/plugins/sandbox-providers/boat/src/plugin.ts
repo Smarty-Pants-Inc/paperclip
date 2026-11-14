@@ -226,6 +226,28 @@ function q(v: string): string { return `'${v.replace(/'/g, `'"'"'`)}'`; }
 function validEnv(env: Record<string, string> = {}): void {
   for (const k of Object.keys(env)) if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`Invalid environment variable: ${k}`);
 }
+type BoatEnvFile = { path: string; dir: string; content: string };
+const boatEnvFiles = new Map<string, Promise<BoatEnvFile>>();
+function boatEnvLeasePrefix(id: string): string {
+  return `${createHash("sha256").update(id).digest("hex")}:`;
+}
+function boatEnvKey(id: string, content: string): string {
+  return `${boatEnvLeasePrefix(id)}${createHash("sha256").update(content).digest("hex")}`;
+}
+/** Best-effort cleanup for lease release/stop/destroy hooks; safe to call repeatedly. */
+export async function cleanupBoatEnvFiles(config: Config | Record<string, unknown>, id: string): Promise<void> {
+  const c = parse(config as Record<string, unknown>);
+  const prefix = boatEnvLeasePrefix(id);
+  const entries = [...boatEnvFiles.entries()].filter(([key]) => key.startsWith(prefix));
+  await Promise.all(entries.map(async ([key, pending]) => {
+    boatEnvFiles.delete(key);
+    const file = await pending.catch(() => null);
+    if (!file) return;
+    const base = `/sandboxes/${encodeURIComponent(id)}/files`;
+    await request(c, `${base}?path=${encodeURIComponent(file.path)}`, { method: "DELETE" }).catch(() => undefined);
+    await request(c, `${base}?path=${encodeURIComponent(file.dir)}&recursive=true`, { method: "DELETE" }).catch(() => undefined);
+  }));
+}
 async function waitReady(config: Config, id: string, allowArchived = false): Promise<any> {
   const until = Date.now() + 120_000;
   while (Date.now() < until) {
@@ -763,22 +785,40 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     };
     try {
       const env = Object.entries(params.env ?? {});
+      let envContent = "";
       if (env.length) {
         // Never include values (or names) in Boat's retained command text.
         // Keep files outside BOTH the exec cwd and the recorded copyback root.
         const roots = [params.cwd, params.lease.metadata?.remoteCwd].filter((p): p is string => typeof p === "string")
           .map(p => posix.resolve("/home/user", p));
-        const uuid = randomUUID();
-        envDir = [`/tmp/paperclip-boat-env-${uuid}`, `/home/user/.paperclip-boat-env-${uuid}`]
-          .find(dir => roots.every(root => dir !== root && !dir.startsWith(root === "/" ? root : `${root}/`))) ?? null;
-        if (!envDir) throw new Error("Boat env file requires a private directory outside the workspace.");
-        envPath = `${envDir}/env.sh`;
-        // No mode field in PUT /files. Precreate under umask 077 (0700/0600),
-        // then enforce 0600 again before sourcing in case upload replaces it.
-        // Non-recursive mkdir refuses an existing directory/symlink.
-        const made = await runCommand(c, id, `umask 077 && /bin/mkdir -- ${q(envDir)} && : > ${q(envPath)}`, 30_000);
-        if (made.timedOut || made.exitCode !== 0) throw new Error("Boat private env directory creation failed.");
-        await stage(envPath, env.map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
+        envContent = env.map(([k, v]) => `export ${k}=${q(v)}\n`).join("");
+        const key = boatEnvKey(id, envContent);
+        let pending = boatEnvFiles.get(key);
+        if (!pending) {
+          pending = (async () => {
+            const uuid = randomUUID();
+            const dir = [`/tmp/paperclip-boat-env-${uuid}`, `/home/user/.paperclip-boat-env-${uuid}`]
+              .find(candidate => roots.every(root => candidate !== root && !candidate.startsWith(root === "/" ? root : `${root}/`)));
+            if (!dir) throw new Error("Boat env file requires a private directory outside the workspace.");
+            const path = `${dir}/env.sh`;
+            // No mode field in PUT /files. Precreate under umask 077 (0700/0600),
+            // then enforce 0600 before every source in case upload replaced it.
+            // Non-recursive mkdir refuses an existing directory/symlink.
+            const made = await runCommand(c, id, `umask 077 && /bin/mkdir -- ${q(dir)} && : > ${q(path)}`, 30_000);
+            if (made.timedOut || made.exitCode !== 0) throw new Error("Boat private env directory creation failed.");
+            try { await stage(path, envContent, "env"); }
+            catch (error) {
+              await request(c, `${base}?path=${encodeURIComponent(path)}`, { method: "DELETE" }).catch(() => undefined);
+              await request(c, `${base}?path=${encodeURIComponent(dir)}&recursive=true`, { method: "DELETE" }).catch(() => undefined);
+              throw error;
+            }
+            return { path, dir, content: envContent };
+          })();
+          boatEnvFiles.set(key, pending);
+          pending.catch(() => { if (boatEnvFiles.get(key) === pending) boatEnvFiles.delete(key); });
+        }
+        const saved = await pending;
+        envPath = saved.path; envDir = saved.dir;
       }
       if (params.stdin !== undefined) {
         stdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
@@ -786,12 +826,29 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       const invocation = [q(params.command), ...(params.args ?? []).map(q)].join(" ");
       // Absolute cleanup utilities still work when the caller overrides PATH.
-      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && /bin/rmdir -- ${q(envDir!)} && ` : "";
-      const wrapped = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-      return await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      const timeoutMs = params.timeoutMs ?? params.commandTimeoutMs ?? 600_000;
+      const runExec = () => {
+        const environment = envPath
+          ? `if [ ! -f ${q(envPath)} ]; then printf 'PAPERCLIP_ENV_FILE_MISSING:${boatEnvKey(id, envContent)}' >&2; exit 125; fi && umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && `
+          : "";
+        const wrapped = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
+        return runCommand(c, id, wrapped, timeoutMs);
+      };
+      let result = await runExec();
+      if (envPath && result.exitCode === 125 && result.stderr?.includes(`PAPERCLIP_ENV_FILE_MISSING:${boatEnvKey(id, envContent)}`)) {
+        const key = boatEnvKey(id, envContent);
+        // Resume/restore may lose the file but retain its private directory.
+        // Refuse symlinks and unexpected files; recreate only this absent file.
+        const repaired = await runCommand(c, id,
+          `umask 077 && if [ -L ${q(envDir!)} ]; then exit 1; elif [ ! -d ${q(envDir!)} ]; then /bin/mkdir -- ${q(envDir!)}; fi && [ ! -L ${q(envPath)} ] && [ ! -e ${q(envPath)} ] && : > ${q(envPath)} && /bin/chmod 600 -- ${q(envPath)}`,
+          30_000);
+        if (repaired.timedOut || repaired.exitCode !== 0) throw new Error("Boat private env file recreation failed.");
+        await stage(envPath, envContent, "env");
+        result = await runExec();
+      }
+      return result;
     } finally {
-      for (const path of [envPath, stdinPath]) if (path) await request(c, `${base}?path=${encodeURIComponent(path)}`, { method: "DELETE" }).catch(() => undefined);
-      if (envDir) await request(c, `${base}?path=${encodeURIComponent(envDir)}&recursive=true`, { method: "DELETE" }).catch(() => undefined);
+      if (stdinPath) await request(c, `${base}?path=${encodeURIComponent(stdinPath)}`, { method: "DELETE" }).catch(() => undefined);
     }
   },
 }, leaseActivityKey), idleActivity));

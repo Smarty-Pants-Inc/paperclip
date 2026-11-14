@@ -60,7 +60,7 @@ describe("Boat provider", () => {
     expect(staged.some(file => file.content === "export FOO='a'\"'\"'b'\n")).toBe(true);
     const cmd = fetch.mock.calls.filter(([, init]) => init.method === "POST").map(([, init]) => JSON.parse(String(init.body)).command).at(-1);
     expect(cmd).toContain("cd '/tmp/my dir'"); expect(cmd).not.toContain("FOO="); expect(cmd).toContain("'printf' 'a'\"'\"'b'"); expect(cmd).toContain("< '/tmp/paperclip-stdin-");
-    expect(fetch.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(3);
+    expect(fetch.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(1);
   });
   it("caps the synchronous timeout at 600 seconds and preserves provider timeout results", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ exitCode: null, timedOut: true, stdout: "partial", stderr: "timeout" })); vi.stubGlobal("fetch", fetch);
