@@ -263,6 +263,7 @@ import {
 import {
   agentWakeupRequests,
   documentRevisions,
+  environments,
   environmentLeases,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -276,6 +277,7 @@ import {
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeCredentialUpdateOwner, appendNativeCredentialUpdate } from "./native-credential-updates.js";
@@ -10677,6 +10679,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
   turnTimeoutMs?: number;
   leaseOwner?: string;
   restartRecovery?: NativeRestartRecoveryClaim;
+  /** Original restart authority retained when the remote reattach path is abandoned. */
+  restartRecoveryFence?: NativeRestartRecoveryClaim;
   /** Release recovery preparation's renewal after execution owns its reference. */
   onExecutionLeaseAcquired?: () => Promise<void>;
   onSpawn?: (meta: {
@@ -11112,11 +11116,16 @@ const NATIVE_ATTEMPT_PROVIDER_KINDS: ReadonlySet<string> = new Set([
 async function remoteReattachLeaseWasReplaced(input: {
   db: Pick<Db, "select">;
   execution: NativeExecutionInput;
+  leaseOwner?: string;
   claim: Extract<NativeRestartRecoveryClaim, { kind: "reattach_remote_runner" }>;
   target: AdapterExecutionTarget | null | undefined;
+  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
 }): Promise<boolean> {
-  const { claim, target } = input;
-  if (claim.remote.kind === "plugin_task") return false;
+  const { claim, target, predecessorEnvironmentRuntime } = input;
+  const binding = input.execution.binding;
+  if (claim.remote.kind === "plugin_task" || claim.runId !== binding.runId
+    || claim.leaseOwner !== input.leaseOwner || !claim.remote.providerLeaseId || !claim.remote.remoteCwd
+    || !predecessorEnvironmentRuntime?.readPredecessorSandboxRecord) return false;
   const remoteClaim = claim.remote;
   if (target?.kind !== "remote" || target.transport !== "sandbox"
     || target.runnerTask || !target.leaseId || !target.environmentId || !target.providerKey
@@ -11124,32 +11133,67 @@ async function remoteReattachLeaseWasReplaced(input: {
   const acquiredProviderLeaseId = target.sandboxLeaseAcquisition.providerLeaseId;
   if (!acquiredProviderLeaseId || acquiredProviderLeaseId === remoteClaim.providerLeaseId) return false;
   const leases = await input.db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, input.execution.binding.companyId),
+    eq(environmentLeases.companyId, binding.companyId),
     eq(environmentLeases.environmentId, target.environmentId),
     inArray(environmentLeases.providerLeaseId, [acquiredProviderLeaseId, remoteClaim.providerLeaseId]),
   ));
   const acquired = leases.find(lease => lease.id === target.leaseId);
-  if (!acquired || acquired.status !== "active" || acquired.heartbeatRunId !== input.execution.binding.runId
-    || acquired.issueId !== input.execution.binding.issueId
-    || acquired.executionWorkspaceId !== input.execution.binding.executionWorkspaceId
+  if (!acquired || acquired.companyId !== binding.companyId || acquired.environmentId !== target.environmentId
+    || acquired.status !== "active" || acquired.heartbeatRunId !== claim.runId
+    || acquired.issueId !== binding.issueId || acquired.executionWorkspaceId !== binding.executionWorkspaceId
     || acquired.provider !== target.providerKey || acquired.providerLeaseId !== acquiredProviderLeaseId
     || record(acquired.metadata).remoteCwd !== target.remoteCwd) return false;
+  const targetAcquisition = target.sandboxLeaseAcquisition;
   const recordedAcquisition = record(record(acquired.metadata).sandboxLeaseAcquisition);
   if (recordedAcquisition.outcome !== "replacement"
     || (typeof recordedAcquisition.providerLeaseId === "string" && recordedAcquisition.providerLeaseId !== acquiredProviderLeaseId)
-    || (target.sandboxLeaseAcquisition.previousProviderLeaseId !== undefined
-      && recordedAcquisition.previousProviderLeaseId !== target.sandboxLeaseAcquisition.previousProviderLeaseId)) return false;
-  if (recordedAcquisition.previousProviderLeaseId !== undefined) {
-    return recordedAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId;
-  }
-  const predecessor = leases.find(lease => lease.id !== acquired.id && lease.provider === target.providerKey
-    && lease.providerLeaseId === remoteClaim.providerLeaseId && lease.executionWorkspaceId === acquired.executionWorkspaceId
-    && lease.issueId === acquired.issueId && record(lease.metadata).remoteCwd === remoteClaim.remoteCwd);
-  if (!predecessor) return false;
+    || recordedAcquisition.previousProviderLeaseId !== targetAcquisition.previousProviderLeaseId) return false;
+  const predecessors = leases.filter(lease => lease.id !== acquired.id && lease.companyId === binding.companyId
+    && lease.environmentId === target.environmentId && lease.heartbeatRunId === claim.runId
+    && lease.provider === target.providerKey && lease.providerLeaseId === remoteClaim.providerLeaseId
+    && lease.issueId === binding.issueId && lease.executionWorkspaceId === binding.executionWorkspaceId
+    && record(lease.metadata).remoteCwd === remoteClaim.remoteCwd);
+  if (predecessors.length !== 1) return false;
+  const predecessor = predecessors[0]!;
   const keptAfterReplacement = record(record(predecessor.metadata)[REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]);
-  return keptAfterReplacement.replacementLeaseId === acquired.id
-    || (recordedAcquisition.reason === "resume_failed" && predecessor.leasePolicy === "reuse_by_environment"
-      && predecessor.status === "pending_cleanup" && predecessor.failureReason === "resume_failed");
+  const directlyLinked = targetAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId
+    && recordedAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId;
+  const keptAndLinked = keptAfterReplacement.runId === claim.runId && keptAfterReplacement.replacementLeaseId === acquired.id;
+  if (!directlyLinked && !keptAndLinked) return false;
+
+  const [priorRun] = await input.db.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId, nativeSessionId: heartbeatRuns.nativeSessionId })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, binding.companyId), eq(heartbeatRuns.id, claim.runId)));
+  if (!priorRun?.runnerInstanceId || priorRun.nativeSessionId !== nativeSessionKey(input.execution)) return false;
+
+  const predecessorRunner: CommandManagedRuntimeRunner = {
+    execute: async request => {
+      const [scope] = await input.db.select({ lease: environmentLeases, environment: environments })
+        .from(environmentLeases)
+        .innerJoin(environments, eq(environments.id, environmentLeases.environmentId))
+        .where(and(eq(environmentLeases.id, predecessor.id), eq(environmentLeases.companyId, binding.companyId),
+          sql`${environmentLeases.environmentId} = ${target.environmentId}`));
+      if (!scope || scope.lease.companyId !== binding.companyId || scope.lease.environmentId !== target.environmentId
+        || scope.lease.heartbeatRunId !== claim.runId || scope.lease.issueId !== binding.issueId
+        || scope.lease.executionWorkspaceId !== binding.executionWorkspaceId || scope.lease.provider !== target.providerKey
+        || scope.lease.providerLeaseId !== remoteClaim.providerLeaseId
+        || record(scope.lease.metadata).remoteCwd !== remoteClaim.remoteCwd || scope.environment.driver !== "sandbox") {
+        throw new Error("native_replacement_predecessor_scope_changed");
+      }
+      const result = await predecessorEnvironmentRuntime.execute({ ...request,
+        environment: scope.environment as EnvironmentDriverExecuteInput["environment"],
+        lease: scope.lease as EnvironmentDriverExecuteInput["lease"], readOnlyProbe: true });
+      return { ...result, signal: result.signal ?? null, pid: null, startedAt: null };
+    },
+  };
+  const acquiredAt = predecessor.acquiredAt instanceof Date && Number.isFinite(predecessor.acquiredAt.getTime())
+    ? { at: predecessor.acquiredAt.toISOString(), source: "run" as const } : null;
+  return await remoteRunnerGenerationLost({ runner: predecessorRunner, remoteCwd: remoteClaim.remoteCwd,
+    identity: { runnerInstanceId: priorRun.runnerInstanceId, normalizedSessionId: priorRun.nativeSessionId },
+    predecessor: {
+      readSandbox: () => predecessorEnvironmentRuntime.readPredecessorSandboxRecord!({ companyId: binding.companyId, leaseId: predecessor.id }),
+      start: acquiredAt, providerLeaseId: remoteClaim.providerLeaseId, probedProviderLeaseId: remoteClaim.providerLeaseId,
+    },
+  });
 }
 
 /** The provider gate at the start of a native attempt (pi_rpc launches through runnerd like ACPX). */
@@ -11165,13 +11209,16 @@ async function executePaperclipNativeSessionAttempt(
   cleanupOnly = false,
   ownDiagnosticLease?: (lease: NativeDiagnosticLease) => void,
 ): Promise<AdapterExecutionResult> {
+  const restartRecoveryClaim = input.restartRecoveryFence ?? input.restartRecovery;
   if (input.restartRecovery?.kind === "reattach_remote_runner"
     && await remoteReattachLeaseWasReplaced({ db: input.db, execution: input.execution,
-      claim: input.restartRecovery, target: input.runnerExecutionTarget })) {
-    // Stop trying to adopt a Runner that the recorded replacement box cannot
-    // contain. Do not substitute bootstrap_incomplete: the regular cold path
-    // must retain its existing conversation-restore behavior.
-    input = { ...input, restartRecovery: undefined };
+      leaseOwner: input.leaseOwner, claim: input.restartRecovery, target: input.runnerExecutionTarget,
+      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime })) {
+    // Stop trying to adopt a Runner whose exact predecessor is proven gone.
+    // Keep the original claim separately: the coordinator transaction below
+    // still checks its run, owner, boot, PID, and generation before dispatch.
+    // The cold path retains its normal conversation-restore behavior.
+    input = { ...input, restartRecovery: undefined, restartRecoveryFence: input.restartRecovery };
   }
   if (input.execution.provider.kind === "acpx" && input.execution.provider.agent === "antigravity") {
     const candidate = resolveAntigravityCandidateAdmission({
@@ -11254,7 +11301,7 @@ async function executePaperclipNativeSessionAttempt(
     budget: {
       adapter: speedBudgetAdapter(input.execution.provider),
       environment: !input.runnerExecutionTarget || input.runnerExecutionTarget.kind === "local" ? "local" : "remote",
-      restartRecovery: Boolean(input.restartRecovery),
+      restartRecovery: Boolean(restartRecoveryClaim),
     },
   });
   controllerTrace = trace;
@@ -11531,7 +11578,7 @@ async function executePaperclipNativeSessionAttempt(
           }
           // A cancellation can win after heartbeat dispatch admission but
           // before this claim. Never revive a terminal run or a settled startup.
-          const stopRecovery = input.restartRecovery?.kind === "reattach_remote_runner"
+          const stopRecovery = restartRecoveryClaim?.kind === "reattach_remote_runner"
             && await readClaimedNativeStopRecovery(tx as unknown as Db, { ...boundRun, id: input.execution.binding.runId }, leaseOwner);
           if ((cleanupOnly && !stopRecovery) || boundRun.status !== "running" || (boundRun.resultJson?.startupCancellation && !stopRecovery) ||
               coordinator.phase === "terminal_failure") {
@@ -11571,7 +11618,7 @@ async function executePaperclipNativeSessionAttempt(
             coordinator.leaseOwner !== leaseOwner
           )
             throw new NativeControllerDetachedForRestartError();
-          const recovering = input.restartRecovery;
+          const recovering = restartRecoveryClaim;
           if (
             recovering &&
             (recovering.runId !== coordinator.runId ||
@@ -11714,7 +11761,7 @@ async function executePaperclipNativeSessionAttempt(
           const startup = nativeSessionStartups.get(input.execution.binding.runId);
           if (!startup) throw new Error("native_session_startup_owner_missing");
           startup.leaseOwner = leaseOwner;
-          if (!input.restartRecovery) freshClaimAttempt = claimedAttempt;
+          if (!restartRecoveryClaim) freshClaimAttempt = claimedAttempt;
           // Own renewal as soon as the claim commits, including slow tracing,
           // accounting history and retained-session cleanup before dispatch.
           startup.executionLeaseRenewal = startNativeSessionExecutionLeaseRenewal({
@@ -11740,7 +11787,7 @@ async function executePaperclipNativeSessionAttempt(
       { parentName: "task.prepare" },
     );
     const startup = nativeSessionStartups.get(input.execution.binding.runId);
-    if (input.restartRecovery && startup?.priorRestartDetach !== undefined
+    if (restartRecoveryClaim && startup?.priorRestartDetach !== undefined
       && nativeRunsDetachingForRestart.get(input.execution.binding.runId) === startup.priorRestartDetach) {
       nativeRunsDetachingForRestart.delete(input.execution.binding.runId);
     }

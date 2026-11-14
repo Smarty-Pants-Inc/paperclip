@@ -36,7 +36,8 @@ export async function provesNoNativeRunProviderWork(db: Pick<Db, "execute">, inp
     && row.acceptedResult === false && row.finalizedResult === false);
 }
 
-export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "execute">;
+export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "execute"> &
+  Partial<Pick<EnvironmentRuntimeService, "readPredecessorSandboxRecord">>;
 type ProofDb = Pick<Db, "select" | "execute">;
 type Predecessor = typeof heartbeatRuns.$inferSelect;
 
