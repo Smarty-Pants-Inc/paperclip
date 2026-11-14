@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  baselineRows, daytonaBaselineHolders, daytonaRetainsSandboxes, distribution, parseBaselineEnvironment, parseBaselinePhases, openShellExecutions, percentile, rankPreTurnSteps, recoverySamples, runMetrics, runWarmth,
+  baselineRows, daytonaBaselineHolders, daytonaRetainsSandboxes, distribution, parseBaselineEnvironment, parseBaselinePhases, openShellExecutions, percentile, rankPreTurnSteps, recoverySamples, runMetrics, runWarmth, stampProviderLoadStarts,
   type BaselineEvent, type BaselineRun,
 } from "./ttft-baseline-stats.js";
 
@@ -28,6 +28,23 @@ const coldRun = (id: string, scale = 1) => run(id, "cold", [
 ]);
 
 describe("ttft baseline statistics", () => {
+  it("reads span metrics and provider load timestamps from aggregate batches", () => {
+    const runWithBatch = run("batch", "restart", [{ eventType: "run.performance.span.batch", createdAt: at(6_100), payload: {
+      schema: "paperclip.run-performance-span-batch.v1", traceSchemaVersion: 3, spans: [
+        { schema: "paperclip.run-performance-span.v1", span: "heartbeat.queue", parentSpan: "task.provider_session",
+          startOffsetMs: 0, durationMs: 100, wallStartedAtMs: 1_800_000_000_000 },
+        { schema: "paperclip.run-performance-span.v1", span: "provider.session.load", parentSpan: "task.prepare",
+          startOffsetMs: 100, durationMs: 5_000, wallStartedAtMs: 1_800_000_000_100 },
+        { schema: "paperclip.run-performance-span.v1", span: "task.time_to_first_token", parentSpan: "task.provider_session",
+          startOffsetMs: 0, durationMs: 6_000, wallStartedAtMs: 1_800_000_000_000, anchor: "wake_request" },
+      ],
+    } }]);
+    expect(runMetrics(runWithBatch)).toMatchObject({ ttftMs: 6_000, ttftAnchor: "wake_request" });
+    expect(stampProviderLoadStarts(runWithBatch).events[0]?.payload?.spans).toContainEqual(expect.objectContaining({
+      span: "provider.session.load", wallStartMs: 1_800_000_000_100,
+    }));
+  });
+
   it("uses nearest-rank percentiles and ignores non-finite values", () => {
     expect(percentile([5, 1, 3, 2, 4], 50)).toBe(3);
     expect(percentile([5, 1, 3, 2, 4], 95)).toBe(5);

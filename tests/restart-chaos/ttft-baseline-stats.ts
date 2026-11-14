@@ -11,6 +11,15 @@ export interface BaselineEvent {
   payload?: Record<string, unknown> | null;
 }
 
+export function performanceSpanEvents(events: readonly BaselineEvent[]): BaselineEvent[] {
+  return events.flatMap(event => event.eventType === "run.performance.span" && event.payload
+    ? [event]
+    : event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+      ? (event.payload.spans as Record<string, unknown>[]).filter(payload => payload && typeof payload === "object")
+        .map(payload => ({ ...event, eventType: "run.performance.span", payload }))
+      : []);
+}
+
 export interface BaselineRun {
   runId: string;
   adapter: string;
@@ -50,7 +59,7 @@ export function distribution(values: readonly number[]): Distribution {
 export interface RunSpan { name: string; parent: string; startOffsetMs: number; durationMs: number; attributes: Record<string, unknown> }
 
 export function runSpans(run: BaselineRun): RunSpan[] {
-  return run.events.filter(event => event.eventType === "run.performance.span" && event.payload)
+  return performanceSpanEvents(run.events).filter(event => event.payload)
     .map(event => {
       const payload = event.payload!;
       return { name: String(payload.span), parent: String(payload.parentSpan ?? ""),
@@ -152,8 +161,8 @@ export interface RecoverySample { runId: string; adapter: string; kind: string; 
  * an upper bound (write time minus offset and duration); the earliest is used. */
 export function spanTraceStartMs(run: BaselineRun): number | null {
   let earliest: number | null = null;
-  for (const event of run.events) {
-    if (event.eventType !== "run.performance.span" || !event.payload) continue;
+  for (const event of performanceSpanEvents(run.events)) {
+    if (!event.payload) continue;
     const candidate = Date.parse(event.createdAt) - (Number(event.payload.startOffsetMs) + Number(event.payload.durationMs));
     if (Number.isFinite(candidate) && (earliest === null || candidate < earliest)) earliest = candidate;
   }
@@ -166,12 +175,23 @@ export function spanTraceStartMs(run: BaselineRun): number | null {
  * its write time. Call on the raw run, before outage removal rewrites offsets. */
 export function stampProviderLoadStarts(run: BaselineRun): BaselineRun {
   const anchor = spanTraceStartMs(run);
-  return { ...run, events: run.events.map(event => {
-    if (event.eventType !== "run.performance.span" || event.payload?.span !== "provider.session.load" || event.payload.wallStartMs !== undefined) return event;
-    const logged = Number(event.payload.wallStartedAtMs);
-    const offset = Number(event.payload.startOffsetMs);
+  const stamp = (payload: Record<string, unknown>): Record<string, unknown> => {
+    if (payload.span !== "provider.session.load" || payload.wallStartMs !== undefined) return payload;
+    const logged = Number(payload.wallStartedAtMs);
+    const offset = Number(payload.startOffsetMs);
     const start = Number.isFinite(logged) ? logged : anchor !== null && Number.isFinite(offset) ? anchor + offset : null;
-    return start === null ? event : { ...event, payload: { ...event.payload, wallStartMs: start } };
+    return start === null ? payload : { ...payload, wallStartMs: start };
+  };
+  return { ...run, events: run.events.map(event => {
+    if (event.eventType === "run.performance.span" && event.payload) {
+      const payload = stamp(event.payload);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    if (event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)) {
+      const spans = (event.payload.spans as Record<string, unknown>[]).map(stamp);
+      return { ...event, payload: { ...event.payload, spans } };
+    }
+    return event;
   }) };
 }
 
@@ -194,8 +214,8 @@ export function recoverySamples(runs: readonly BaselineRun[], faults: readonly B
         continue;
       }
       const stamped = stampProviderLoadStarts(run);
-      const loadStarts = nextAt === null ? [] : stamped.events.flatMap(event => {
-        if (event.eventType !== "run.performance.span" || event.payload?.span !== "provider.session.load") return [];
+      const loadStarts = nextAt === null ? [] : performanceSpanEvents(stamped.events).flatMap(event => {
+        if (event.payload?.span !== "provider.session.load") return [];
         const start = Number(event.payload.wallStartMs);
         return Number.isFinite(start) && start >= fault.readyAt && start <= nextAt ? [start] : [];
       });

@@ -1,7 +1,7 @@
 import { LOCAL_SPEED_BUDGETS, type SpeedBudget, type SpeedBudgetAdapter } from "../../server/src/services/native-runtime/native-speed-budgets.js";
 import type { ChaosApi } from "./api.js";
 import {
-  baselineRows, distribution, recoverySamples, runMetrics, runSpans, runWarmth, stampProviderLoadStarts,
+  baselineRows, distribution, performanceSpanEvents, recoverySamples, runMetrics, runSpans, runWarmth, stampProviderLoadStarts,
   type BaselineEvent, type BaselineFault, type BaselineRun, type Distribution,
 } from "./ttft-baseline-stats.js";
 import type { StorageFaultReceipt } from "./storage-chaos.js";
@@ -136,8 +136,8 @@ export function mergeWindows(windows: readonly OutageWindow[]): OutageWindow[] {
 
 export function traceStartMs(run: BaselineRun): number | null {
   let earliest: number | null = null;
-  for (const event of run.events) {
-    if (event.eventType !== "run.performance.span" || !event.payload) continue;
+  for (const event of performanceSpanEvents(run.events)) {
+    if (!event.payload) continue;
     const written = Date.parse(event.createdAt);
     const end = Number(event.payload.startOffsetMs) + Number(event.payload.durationMs);
     if (!Number.isFinite(written) || !Number.isFinite(end)) continue;
@@ -160,16 +160,25 @@ export function withoutOutage(run: BaselineRun, windows: readonly OutageWindow[]
   const clock = outageFreeClock(windows);
   const origin = clock(traceStart);
   let adjusted = 0, removedMs = 0;
-  const events = run.events.map(event => {
-    const payload = event.payload;
-    if (event.eventType !== "run.performance.span" || !payload) return event;
+  const adjust = (payload: Record<string, unknown>) => {
     const offset = Number(payload.startOffsetMs), duration = Number(payload.durationMs);
-    if (!Number.isFinite(offset) || !Number.isFinite(duration)) return event;
+    if (!Number.isFinite(offset) || !Number.isFinite(duration)) return payload;
     const start = traceStart + offset, end = start + duration;
     const startOffsetMs = clock(start) - origin, durationMs = clock(end) - clock(start);
-    if (startOffsetMs === offset && durationMs === duration) return event;
+    if (startOffsetMs === offset && durationMs === duration) return payload;
     if (durationMs !== duration) { adjusted += 1; removedMs += duration - durationMs; }
-    return { ...event, payload: { ...payload, startOffsetMs, durationMs } };
+    return { ...payload, startOffsetMs, durationMs };
+  };
+  const events = run.events.map(event => {
+    if (event.eventType === "run.performance.span" && event.payload) {
+      const payload = adjust(event.payload);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    if (event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)) {
+      return { ...event, payload: { ...event.payload,
+        spans: (event.payload.spans as Record<string, unknown>[]).map(adjust) } };
+    }
+    return event;
   });
   return { run: { ...run, events }, adjusted, removedMs, anchored: true };
 }

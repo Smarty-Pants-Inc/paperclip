@@ -455,6 +455,12 @@ describe("redaction", () => {
         span: "runner.example.com",
       })?.span,
     ).toBe("runner.example.com");
+    expect(redactEventPayload({
+      schema: "paperclip.run-performance-span-batch.v1",
+      traceSchemaVersion: 3,
+      spans: [{ schema: "paperclip.run-performance-span.v1", span: "native.controller.warm_owner_identity_check",
+        parentSpan: "task.prepare", identityPresent: false }],
+    })).toMatchObject({ spans: [{ span: "native.controller.warm_owner_identity_check", parentSpan: "task.prepare" }] });
   });
 
   it("redacts payload objects while preserving null", () => {

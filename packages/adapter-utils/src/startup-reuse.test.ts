@@ -47,9 +47,12 @@ describe("startup reuse evidence", () => {
   it("counts cumulative launch observations once, including a later respawn", () => {
     expect(summarizeStartupReuse([...fullReuse(), receipt("provider_process", "fresh", "created", 2), receipt("provider_process", "fresh", "created", 2)]).providerLaunchCount).toBe(2);
   });
-  it("reads the existing native physical Runner launch receipt without inferring provider launches", () => {
-    expect(summarizeStartupReuse([{ eventType: "run.performance.span", payload: { schema: "paperclip.run-performance-span.v1", span: "runner.process.launch", outcome: "ok" } }]))
-      .toMatchObject({ warmth: "unknown", providerLaunchCount: null, layers: { runner: { state: "fresh" }, provider_process: { state: "unknown" } } });
+  it("reads old per-span and new batched physical Runner launch receipts identically", () => {
+    const legacy = { eventType: "run.performance.span", payload: { schema: "paperclip.run-performance-span.v1", span: "runner.process.launch", outcome: "ok" } };
+    const batch = { eventType: "run.performance.span.batch", payload: { schema: "paperclip.run-performance-span-batch.v1", traceSchemaVersion: 3, spans: [legacy.payload] } };
+    const expected = { warmth: "unknown", providerLaunchCount: null, layers: { runner: { state: "fresh" }, provider_process: { state: "unknown" } } };
+    expect(summarizeStartupReuse([legacy])).toMatchObject(expected);
+    expect(summarizeStartupReuse([batch])).toMatchObject(expected);
   });
   it("drops unknown reasons and never projects identifiers or free-form payloads", () => {
     const event = receipt("workspace", "fresh", "/private/secret");

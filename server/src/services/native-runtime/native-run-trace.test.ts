@@ -18,6 +18,12 @@ import {
   NATIVE_RUN_TRACE_SCHEMA_VERSION,
 } from "./native-run-trace.js";
 
+function spanPayloads(events: AdapterRuntimeEvent[]): Record<string, unknown>[] {
+  return events.flatMap(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+    ? event.payload.spans as Record<string, unknown>[]
+    : event.eventType === NATIVE_RUN_SPAN_EVENT_TYPE ? [event.payload ?? {}] : []);
+}
+
 type RecordedSpan = {
   name: string;
   parentName: string | null;
@@ -71,6 +77,75 @@ function createRecordingTraceContext(): {
 }
 
 describe("native runner performance trace", () => {
+  it("batches spans at the cap, preserves exact per-span payloads, finishes before return, and exports each span to OTel", async () => {
+    const { traceContext, spans: otelSpans } = createRecordingTraceContext();
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "batch-run", startedAtMs: 1_000, traceContext,
+      onEvent: async event => { events.push(event); } });
+    const expected: Record<string, unknown>[] = [];
+    for (let index = 0; index < 250; index++) {
+      const span = { name: `runner.test.${index}`, parentName: "native.session.execute",
+        startedAtMs: 1_100 + index, endedAtMs: 1_150 + index, attributes: { mode: `mode-${index}` } };
+      const scope = trace.start(span.name, { parentName: span.parentName, startedAtMs: span.startedAtMs, attributes: span.attributes });
+      await trace.end(scope, { endedAtMs: span.endedAtMs });
+      expected.push({ schema: "paperclip.run-performance-span.v1", traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
+        span: span.name, parentSpan: "task.provider_session", startOffsetMs: span.startedAtMs - 1_000,
+        durationMs: 50, duration_ms: 50, outcome: "ok", mode: `mode-${index}`, wallStartedAtMs: span.startedAtMs });
+    }
+    const batchesBeforeFinish = events.filter(event => event.eventType === "run.performance.span.batch");
+    expect(batchesBeforeFinish).toHaveLength(3);
+    await trace.finish("ok");
+    const batches = events.filter(event => event.eventType === "run.performance.span.batch");
+    expect(batches).toHaveLength(4);
+    expect(batches.map(event => (event.payload?.spans as unknown[]).length)).toEqual([64, 64, 64, 59]);
+    const allSpans = batches.flatMap(event => event.payload?.spans as Record<string, unknown>[]);
+    expect(allSpans.filter(span => String(span.span).startsWith("runner.test."))).toEqual(expected);
+    expect(allSpans).toHaveLength(251);
+    expect(batches.length).toBeLessThanOrEqual(Math.ceil(allSpans.length / 64) + 1);
+    expect(allSpans.at(-1)?.span).toBe("task.provider_session.measured");
+    expect(events.at(-1)?.eventType).toBe("run.performance.span.batch");
+    expect(otelSpans.filter(span => span.name.startsWith("runner.test.")).length).toBe(250);
+  });
+
+  it("keeps the real Pi-turn span set while writing at most ceil(N/64)+1 span rows", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "pi-turn-batch", startedAtMs: 1_000,
+      onEvent: async event => { events.push(event); } });
+    const names = ["native.coordinator.claim", "task.prepare", "native.controller.wake_binding",
+      "native.controller.warm_owner_identity_check", "provider_pack.snapshot_select", "runner.transport.attach",
+      "runner.session.resume", "runner.turn.submit", "native.session.execute", "agent.turn", "provider.runtime"];
+    for (const [index, name] of names.entries()) {
+      await trace.record({ name, parentName: index ? names[index - 1] : undefined,
+        startedAtMs: 1_100 + index, endedAtMs: 1_110 + index, attributes: { mode: "pi_rpc" } });
+    }
+    await trace.finish("ok");
+    const rows = events.filter(event => event.eventType === "run.performance.span.batch");
+    const spans = rows.flatMap(event => event.payload?.spans as Record<string, unknown>[]);
+    expect(rows.length).toBeLessThanOrEqual(Math.ceil(names.length / 64) + 1);
+    expect(spans.map(span => span.span)).toEqual([...names, "task.provider_session.measured"]);
+  });
+
+  it("preserves a probe-gate identity span and every child field inside a batch row", async () => {
+    const events: AdapterRuntimeEvent[] = [];
+    const trace = createNativeRunTrace({ runId: "probe-gate-batch", startedAtMs: 1_000,
+      onEvent: async event => { events.push(event); } });
+    const parent = trace.start("task.prepare", { startedAtMs: 1_050 });
+    const scope = trace.start("native.controller.warm_owner_identity_check", {
+      parentName: "task.prepare", startedAtMs: 1_100, attributes: { reason: "identity_missing", identityPresent: false },
+    });
+    await trace.end(scope, { endedAtMs: 1_125, outcome: "failed" });
+    await trace.end(parent, { endedAtMs: 1_200 });
+    await trace.finish("ok");
+    const batchRows = events.filter(event => event.eventType === "run.performance.span.batch");
+    const spans = batchRows.flatMap(event => event.payload?.spans as Record<string, unknown>[]);
+    expect(batchRows).toHaveLength(1);
+    expect(spans).toContainEqual(expect.objectContaining({
+      schema: "paperclip.run-performance-span.v1", span: "native.controller.warm_owner_identity_check",
+      parentSpan: "task.prepare", startOffsetMs: 100, wallStartedAtMs: 1_100, durationMs: 25,
+      outcome: "failed", reason: "identity_missing", identityPresent: false,
+    }));
+  });
+
   it("persists Pi RPC spans and retained transport attach for the current run without OTLP", async () => {
     const events = new Map<string, AdapterRuntimeEvent[]>();
     const traces = ["old-run", "warm-run"].map(runId => createNativeRunTrace({ runId,
@@ -88,11 +163,11 @@ describe("native runner performance trace", () => {
       await trace.finish("ok");
     }
     for (const runId of ["old-run", "warm-run"]) {
-      const rows = events.get(runId)!.filter(event => event.eventType === NATIVE_RUN_SPAN_EVENT_TYPE);
-      expect(rows.map(event => event.payload?.span))
+      const rows = spanPayloads(events.get(runId)!);
+      expect(rows.map(payload => payload.span))
         .toEqual(expect.arrayContaining(["runner.transport.attach", "runner.pi.admission.get_state", "runner.pi.prompt_to_started"]));
-      expect(rows.filter(event => event.payload?.span === "runner.transport.attach")).toHaveLength(1);
-      for (const row of rows) expect(row.payload?.durationMs).toBeGreaterThanOrEqual(0);
+      expect(rows.filter(payload => payload.span === "runner.transport.attach")).toHaveLength(1);
+      for (const row of rows) expect(row.durationMs).toBeGreaterThanOrEqual(0);
     }
     if (process.env.PI_WARM_RUN_LOG_OUT) await writeFile(process.env.PI_WARM_RUN_LOG_OUT,
       JSON.stringify(Object.fromEntries(events), null, 2));
@@ -184,8 +259,7 @@ describe("native runner performance trace", () => {
         clock.mockRestore();
       }
       expect(
-        events.find((event) => event.payload?.span === "task.provider_session.measured")
-          ?.payload,
+        spanPayloads(events).find(payload => payload.span === "task.provider_session.measured"),
       ).toMatchObject({ durationMs: 19_000 });
       expect(original.createdAt).toBe(new Date(1_000).toISOString());
     },
@@ -287,7 +361,7 @@ describe("native runner performance trace", () => {
         clock.mockRestore();
       }
       expect(
-        events.find((event) => event.payload?.span === "task.prepare")?.payload,
+        spanPayloads(events).find(payload => payload.span === "task.prepare"),
       ).toMatchObject({
         durationMs: 50,
         startOffsetMs: attemptStartedAtMs - 900,
@@ -319,22 +393,21 @@ describe("native runner performance trace", () => {
       },
     });
 
+    expect(events).toHaveLength(0);
+    await trace.finish("ok");
+    const spans = spanPayloads(events);
     expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
-      stream: "system",
-      payload: {
-        schema: "paperclip.run-performance-span.v1",
-        traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
-        span: "runner.transport.selected",
-        parentSpan: "task.provider_session",
-        startOffsetMs: 125,
-        durationMs: 0,
-        outcome: "ok",
-        mode: "direct_loopback",
-      },
+    expect(spans[0]).toMatchObject({
+      schema: "paperclip.run-performance-span.v1",
+      traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
+      span: "runner.transport.selected",
+      parentSpan: "task.provider_session",
+      startOffsetMs: 125,
+      durationMs: 0,
+      outcome: "ok",
+      mode: "direct_loopback",
     });
-    expect(events[0]?.payload).not.toHaveProperty("credential");
+    expect(spans[0]).not.toHaveProperty("credential");
   });
 
   it("records failed measurements without changing the original error", async () => {
@@ -353,15 +426,10 @@ describe("native runner performance trace", () => {
       }),
     ).rejects.toBe(failure);
 
-    expect(events).toHaveLength(1);
-    expect(events[0]).toMatchObject({
-      eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
-      level: "warn",
-      payload: {
-        span: "runner.runtime.stage",
-        outcome: "failed",
-      },
-    });
+    await trace.finish("failed");
+    expect(spanPayloads(events)).toEqual(expect.arrayContaining([expect.objectContaining({
+      span: "runner.runtime.stage", outcome: "failed",
+    })]));
   });
 
   it("records skills.prepare beneath preparation with no attributes and tolerates a failed log sink", async () => {
@@ -380,7 +448,7 @@ describe("native runner performance trace", () => {
     const { traceContext, spans } = createRecordingTraceContext();
     await recordFailedSkillPreparation({ runId: "failed-skills", startedAtMs: Date.now() - 10,
       traceContext, onEvent: async (event) => { events.push(event); throw new Error("log unavailable"); } });
-    expect(events.find((event) => event.payload?.span === "skills.prepare")?.payload).toMatchObject({
+    expect(spanPayloads(events).find(payload => payload.span === "skills.prepare")).toMatchObject({
       span: "skills.prepare", parentSpan: "task.prepare", outcome: "failed",
     });
     expect(spans.find((span) => span.name === "skills.prepare")?.parentName).toBe("task.prepare");
@@ -504,7 +572,7 @@ describe("native runner performance trace", () => {
     expect(spans.filter((span) => span.name === "task.provider_session")).toHaveLength(1);
     expect(spans.some((span) => span.name === "task.provider_session.measured")).toBe(false);
     expect(
-      events.some((event) => event.payload?.span === "task.provider_session.measured"),
+      spanPayloads(events).some(payload => payload.span === "task.provider_session.measured"),
     ).toBe(true);
   });
 });
@@ -591,8 +659,9 @@ describe("time to first token anchor", () => {
       name: "task.time_to_first_token", parentName: "task.provider_session",
       startedAtMs: start.startedAtMs, endedAtMs: 7_000, attributes: { eventKind: "agentMessage", anchor: start.anchor },
     });
-    const span = events.find((event) => (event.payload as Record<string, unknown>)?.span === "task.time_to_first_token");
-    expect(span?.payload).toMatchObject({ durationMs: 3_000, startOffsetMs: -1_000, anchor: "wake_request", eventKind: "agentMessage" });
+    await trace.finish("ok");
+    const span = spanPayloads(events).find(payload => payload.span === "task.time_to_first_token");
+    expect(span).toMatchObject({ durationMs: 3_000, startOffsetMs: -1_000, anchor: "wake_request", eventKind: "agentMessage" });
   });
 });
 
@@ -612,13 +681,13 @@ describe("deferred diagnostics", () => {
     });
     // Later work keeps flowing while the deferred read is pending.
     await trace.record({ name: "response.first_nonempty_text", startedAtMs: 2_000, endedAtMs: 2_000 });
-    const span = (name: string) => events.some((event) => (event.payload as Record<string, unknown>)?.span === name);
-    expect(span("response.first_nonempty_text")).toBe(true);
+    const span = (name: string) => spanPayloads(events).some(payload => payload.span === name);
+    expect(span("response.first_nonempty_text")).toBe(false);
     expect(span("task.time_to_first_token")).toBe(false);
     const finished = trace.finish("ok");
     release();
     await finished;
-    const names = events.map((event) => (event.payload as Record<string, unknown>)?.span);
+    const names = spanPayloads(events).map(payload => payload.span);
     expect(names.indexOf("task.time_to_first_token")).toBeGreaterThan(-1);
     expect(names.indexOf("task.time_to_first_token")).toBeLessThan(names.indexOf("task.provider_session.measured"));
   });
@@ -630,7 +699,7 @@ describe("deferred diagnostics", () => {
     const gate = new Promise<void>((resolve) => { release = resolve; });
     const write = vi.fn(async (event: AdapterRuntimeEvent) => {
       await gate;
-      written.push((event.payload as Record<string, unknown>)?.span);
+      written.push(...((event.payload?.spans as Record<string, unknown>[] | undefined) ?? []).map(span => span.span));
     });
     const trace = createNativeRunTrace({ runId: "deferred-rows", startedAtMs: 1_000, traceContext, onEvent: write });
     trace.start("task.prepare", { parentName: "task.provider_session", startedAtMs: 1_000 });
@@ -693,12 +762,12 @@ describe("local runner startup sub-steps", () => {
     releaseSink();
     await ended;
     await finished;
-    const payloads = events.map((event) => event.payload as Record<string, unknown>);
+    const payloads = spanPayloads(events);
     const step = (name: string) => payloads.find((payload) => payload.span === name);
     expect(step("runner.runtime.stage")).toMatchObject({ parentSpan: "runner.session.startup", startOffsetMs: 0, durationMs: 200, outcome: "ok", mode: "bootstrap", target: "local" });
     expect(step("runner.process.launch")).toMatchObject({ parentSpan: "runner.session.startup", startOffsetMs: 200, durationMs: 700, outcome: "ok" });
     expect(step("provider.session.load")).toMatchObject({ parentSpan: "runner.session.startup", durationMs: 2_100, outcome: "failed", mode: "resume" });
-    expect(events.find((event) => (event.payload as Record<string, unknown>).span === "provider.session.load")?.level).toBe("warn");
+    expect(events.find(event => (event.payload?.spans as Record<string, unknown>[] | undefined)?.some(span => span.span === "provider.session.load"))?.level).toBe("warn");
     expect(spans.find((span) => span.name === "runner.process.launch")?.parentName).toBe("runner.session.startup");
     // Settled before the root measurement closes.
     const names = payloads.map((payload) => payload.span);
@@ -717,7 +786,7 @@ describe("local runner startup sub-steps", () => {
     recordNativeRunnerStartupStep(trace, { name: "provider.session.load", mode: "bootstrap", startedAtMs: 601_100, endedAtMs: 601_200, outcome: "ok" }, "remote");
     await trace.end(startup, { endedAtMs: 601_200 });
     await trace.finish("ok");
-    const payloads = events.map((event) => event.payload as Record<string, unknown>);
+    const payloads = spanPayloads(events);
     expect(payloads.find((payload) => payload.span === "runner.control_plane.open"))
       .toMatchObject({ parentSpan: "runner.session.startup", durationMs: 50, target: "remote" });
     expect(payloads.find((payload) => payload.span === "runner.launch.prepare"))

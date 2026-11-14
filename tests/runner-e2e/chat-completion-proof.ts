@@ -25,7 +25,7 @@ const requireProof = (condition: unknown, code: string) => {
 const time = (value: unknown) => typeof value === "string" ? Date.parse(value) : NaN;
 const scopeIssue = (run: Row) => run.nativeIssueId ?? run.contextSnapshot?.issueId;
 const completionEventTypes = new Set([
-  "legacy.case_handoff_cleanup_intent", "lifecycle", "run.startup.reuse", "run.performance.span",
+  "legacy.case_handoff_cleanup_intent", "lifecycle", "run.startup.reuse", "run.performance.span", "run.performance.span.batch",
   "native.process_start_requested", "native.process_identity_recorded", "session.resumed",
   "session.capabilities.updated", "session.goal.snapshot", "session.goal.cleared", "harness.diagnostic",
   "provider.notice.recorded", "turn.submitted", "turn.accepted", "turn.started", "turn.completed",

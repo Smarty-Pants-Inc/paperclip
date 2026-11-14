@@ -75,8 +75,14 @@ export function summarizeStartupReuse(events: readonly { eventType?: string; pay
     const p = record(event.payload);
     // Existing native physical-launch receipt. A session bootstrap/resume span
     // alone says nothing about the lifetime of its Runner or provider process.
-    if (event.eventType === "run.performance.span" && p.schema === "paperclip.run-performance-span.v1" &&
-        p.span === "runner.process.launch" && p.outcome === "ok") {
+    const spans = event.eventType === "run.performance.span"
+      ? [p]
+      : event.eventType === "run.performance.span.batch" &&
+          p.schema === "paperclip.run-performance-span-batch.v1" && Array.isArray(p.spans)
+        ? p.spans.map(record)
+        : [];
+    if (spans.some(span => span.schema === "paperclip.run-performance-span.v1" &&
+        span.span === "runner.process.launch" && span.outcome === "ok")) {
       layers.runner = { state: "fresh", reason: "created" };
       observed.add("runner");
     }

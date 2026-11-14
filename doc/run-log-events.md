@@ -105,10 +105,19 @@ instance run log and add no first-party Telemetry or OpenTelemetry export.
 
 ## Provider-pack preparation timing
 
-Every `run.performance.span` payload also carries `wallStartedAtMs`, the span's own
-start time in epoch milliseconds (since 2026-11-09). Span rows can be written late
-through deferred diagnostics, so readers take a span's start from this field (or
-from the trace start plus `startOffsetMs`), never from the row's write time.
+Native run spans are persisted as `run.performance.span.batch` events with payload
+schema `paperclip.run-performance-span-batch.v1`. Each batch contains up to 64
+`spans`; every child retains the `paperclip.run-performance-span.v1` payload,
+including `span`, `parentSpan`, `startOffsetMs`, `wallStartedAtMs`, `durationMs`,
+`outcome`, and its bounded attributes. Each flush writes one run-log row. The
+2-second flush timer bounds buffering, and finishing a trace flushes pending spans
+before returning. The existing single-span `run.performance.span` shape remains a
+supported legacy input for readers; new native traces write the batch shape.
+
+Every child span payload also carries `wallStartedAtMs`, the span's own start time
+in epoch milliseconds (since 2026-11-09). Span batches can be written late through
+deferred diagnostics, so readers take a span's start from this field (or from the
+trace start plus `startOffsetMs`), never from the row's write time.
 The preparation spans of a native run (`heartbeat.queue`, `heartbeat.prepare_*`,
 `environment.*`) are always written this way: in the order they ended, while the
 provider starts, and before the run's trace finishes. They can appear after the

@@ -234,6 +234,17 @@ describe("wave speed grade", () => {
     expect(traceStartMs(late)).toBe(1_000_000);
   });
 
+  it("removes outage time from spans inside an aggregate batch", () => {
+    const trace = 1_000_000;
+    const legacy = traced(trace, [["task.time_to_first_token", 0, 300_000]]);
+    const batch: BaselineRun = { ...legacy, events: [{ eventType: "run.performance.span.batch", createdAt: new Date(trace + 300_000).toISOString(),
+      payload: { schema: "paperclip.run-performance-span-batch.v1", spans: legacy.events.map(event => event.payload) } }] };
+    const windows = outageWindows([{ startedAt: trace + 10_000, readyAt: trace + 260_000 } as FaultReceipt]);
+    const trimmed = withoutOutage(batch, windows);
+    expect(trimmed).toMatchObject({ adjusted: 1, removedMs: 250_000, anchored: true });
+    expect((trimmed.run.events[0]?.payload?.spans as Record<string, unknown>[])[0]).toMatchObject({ durationMs: 50_000 });
+  });
+
   it("removes outage time from a held TTFT span", () => {
     const trace = 1_000_000;
     const windows = outageWindows([{ startedAt: trace + 10_000, readyAt: trace + 260_000 } as FaultReceipt,

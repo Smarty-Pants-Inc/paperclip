@@ -88,6 +88,17 @@ import { nativeSha256 } from "./canonical.js";
 import { resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, RemoteRunnerRecoveryError, readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "./native-runner-recovery-contract.js";
+
+type SpanTestEvent = { eventType?: string; payload?: Record<string, unknown> };
+function spanEvents(events: SpanTestEvent[]): SpanTestEvent[] {
+  return events.flatMap(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+    ? (event.payload.spans as Record<string, unknown>[]).map(payload => ({ ...event, payload }))
+    : event.eventType === "run.performance.span" ? [event] : []);
+}
+function eventHasSpan(event: SpanTestEvent, name: string): boolean {
+  return event.payload?.span === name || (Array.isArray(event.payload?.spans) &&
+    (event.payload.spans as Record<string, unknown>[]).some(span => span.span === name));
+}
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService } from "../agent-directory-working-copies.js";
 import { probeAgentDirectory } from "../agent-directory-probe.js";
@@ -3943,7 +3954,8 @@ describe("remote provider pack manifest", () => {
     })).resolves.toMatchObject({ source: "staged" });
     expect(memoFullVerify).toHaveBeenCalledOnce();
     expect(memoProbe).toHaveBeenCalledTimes(3); // cold before/after + one warm probe
-    expect(memoTrace.mock.calls.some(([event]) => event.payload?.span === "provider_pack.verify_memo_hit")).toBe(true);
+    await memoTraceRecorder.finish("ok");
+    expect(memoTrace.mock.calls.some(([event]) => eventHasSpan(event, "provider_pack.verify_memo_hit"))).toBe(true);
     const cursorPath = "provider-assets/cursor/linux-x64";
     await mkdir(join(root, cursorPath), { recursive: true });
     await writeFile(join(root, cursorPath, "runtime"), "pinned Cursor runtime");
@@ -10068,11 +10080,11 @@ describe("native resumed preparation timing", () => {
     });
     await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: "runner",
       onEvent: async event => { events.push(event); } });
-    const rows = events.filter(event => event.payload?.span === "pi.request.sent");
+    const rows = spanEvents(events).filter(event => event.payload?.span === "pi.request.sent");
     expect(rows).toHaveLength(accepted ? 1 : 0);
     if (accepted) expect(rows[0]?.payload).toMatchObject({ wallStartedAtMs: at, durationMs: 0, parentSpan: "provider.runtime" });
     expect(JSON.stringify(rows)).not.toContain("PRIVATE");
-    expect(events.some(event => event.payload?.span === "task.time_to_first_token")).toBe(false);
+    expect(spanEvents(events).some(event => event.payload?.span === "task.time_to_first_token")).toBe(false);
   });
 
   it("does not adopt the next run's trace when an old committed-event observer is called after reuse", async () => {
@@ -10101,14 +10113,14 @@ describe("native resumed preparation timing", () => {
     }).mockImplementationOnce(async () => {
       const activeObserver = accountingEvents.committed!;
       await oldObserver!(event(current.binding.runId, "old-turn"));
-      expect(secondEvents.filter(event => event.payload?.span === "pi.request.sent")).toEqual([]);
+      expect(spanEvents(secondEvents).filter(event => event.payload?.span === "pi.request.sent")).toEqual([]);
       await activeObserver(event(next.binding.runId, "new-turn"));
       return result;
     });
     await executePaperclipNativeSession({ db: leaseDb(current), execution: current, runnerInstanceId: "runner", onEvent: async event => { firstEvents.push(event); } });
     await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", onEvent: async event => { secondEvents.push(event); } });
-    expect(firstEvents.filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
-    expect(secondEvents.filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
+    expect(spanEvents(firstEvents).filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
+    expect(spanEvents(secondEvents).filter(event => event.payload?.span === "pi.request.sent")).toHaveLength(1);
   });
 
   it.each(["comment.to_run_created", "question_response.to_run_created", "heartbeat.queue", "native_dispatch"])(
@@ -10134,7 +10146,7 @@ describe("native resumed preparation timing", () => {
           event("tool.execution.started", { executionId: "tool-1" }),
         ]) await accountingEvents.committed!(candidate);
         await accountingEvents.duplicate!(event("item.delta", { kind: "agentMessage", text: "replayed text" }));
-        expect(events.some((candidate) => candidate.payload?.span === "task.time_to_first_token")).toBe(false);
+        expect(spanEvents(events).some((candidate) => candidate.payload?.span === "task.time_to_first_token")).toBe(false);
         clock.mockReturnValue(startedAtMs + 4_500);
         await accountingEvents.committed!(event("item.delta", { kind: "agentMessage", text: "first text" }));
         clock.mockReturnValue(startedAtMs + 4_750);
@@ -10150,13 +10162,13 @@ describe("native resumed preparation timing", () => {
           onEvent: async (event) => { events.push(event); },
         });
       } finally { clock.mockRestore(); }
-      const ttft = events.filter((event) => event.payload?.span === "task.time_to_first_token");
+      const ttft = spanEvents(events).filter((event) => event.payload?.span === "task.time_to_first_token");
       expect(ttft).toHaveLength(1);
       expect(ttft[0]?.payload).toMatchObject({ parentSpan: "task.provider_session", startOffsetMs: 0,
         durationMs: ingress === "native_dispatch" ? 500 : 4_500, eventKind: "agentMessage", outcome: "ok",
         anchor: ingress === "comment.to_run_created" ? "comment"
           : ingress === "question_response.to_run_created" ? "question_response" : "run_created" });
-      expect(events.find((event) => event.payload?.span === "provider.time_to_first_agent_event")?.payload)
+      expect(spanEvents(events).find((event) => event.payload?.span === "provider.time_to_first_agent_event")?.payload)
         .toMatchObject({ parentSpan: "agent.turn", eventKind: "agentMessage" });
       expect(JSON.stringify(ttft)).not.toContain("first text");
       expect(JSON.stringify(ttft)).not.toContain("later text");
@@ -10188,10 +10200,10 @@ describe("native resumed preparation timing", () => {
           events.push(event);
           // A slow run-log sink: writing the first-agent-event span takes 3 s.
           // That write must not count as time until the agent responded.
-          if (event.payload?.span === "provider.time_to_first_agent_event") clock.mockReturnValue(startedAtMs + 8_000);
+          if (eventHasSpan(event, "provider.time_to_first_agent_event")) clock.mockReturnValue(startedAtMs + 8_000);
         } });
     } finally { clock.mockRestore(); }
-    const span = (name: string) => events.filter((candidate) => candidate.payload?.span === name);
+    const span = (name: string) => spanEvents(events).filter((candidate) => candidate.payload?.span === name);
     expect(span("task.time_to_first_agent_activity")).toHaveLength(1);
     expect(span("task.time_to_first_agent_activity")[0]?.payload).toMatchObject({ parentSpan: "task.provider_session",
       startOffsetMs: 0, durationMs: 5_000, eventKind: "toolCall", anchor: "run_created" });
@@ -10213,7 +10225,7 @@ describe("native resumed preparation timing", () => {
       await accountingEvents.committed!(event("item.delta", { kind: "agentMessage", text: "first text" }));
       // The anchor read is still pending; later events are not held behind it.
       await accountingEvents.committed!(event("item.delta", { kind: "agentMessage", text: "later text" }));
-      expect(events.some((candidate) => candidate.payload?.span === "task.time_to_first_token")).toBe(false);
+      expect(spanEvents(events).some((candidate) => candidate.payload?.span === "task.time_to_first_token")).toBe(false);
       answerRead(startedAtMs - 2_000);
       return { result: { summary: "cancelled" }, terminal: { runTerminalState: "cancelled" },
         turnId: "turn", normalizedSessionId: "session", providerSessionId: null,
@@ -10227,7 +10239,7 @@ describe("native resumed preparation timing", () => {
       });
     } finally { clock.mockRestore(); }
     expect(wakeAnchor.read).toHaveBeenCalledWith(expect.anything(), execution.binding.runId);
-    const ttft = events.filter((event) => event.payload?.span === "task.time_to_first_token");
+    const ttft = spanEvents(events).filter((event) => event.payload?.span === "task.time_to_first_token");
     expect(ttft).toHaveLength(1);
     expect(ttft[0]?.payload).toMatchObject({ parentSpan: "task.provider_session", startOffsetMs: -2_000,
       durationMs: 6_500, anchor: "wake_request", eventKind: "agentMessage" });
@@ -10244,7 +10256,7 @@ describe("native resumed preparation timing", () => {
     state.execute.mockReset().mockImplementationOnce(async () => {
       const first = { eventType, payload, itemId: "message" } as unknown as PrpEvent;
       await accountingEvents.duplicate!(first);
-      expect(events.some((event) => event.payload?.span === "task.time_to_first_token")).toBe(false);
+      expect(spanEvents(events).some((event) => event.payload?.span === "task.time_to_first_token")).toBe(false);
       await accountingEvents.committed!(first);
       await accountingEvents.committed!({ eventType: "item.delta", itemId: "message",
         payload: { kind: "agentMessage", text: "later text" } } as unknown as PrpEvent);
@@ -10254,7 +10266,7 @@ describe("native resumed preparation timing", () => {
     });
     await executePaperclipNativeSession({ db: leaseDb(), execution, runnerInstanceId: "runner",
       onEvent: async (event) => { events.push(event); } });
-    const ttft = events.filter((event) => event.payload?.span === "task.time_to_first_token");
+    const ttft = spanEvents(events).filter((event) => event.payload?.span === "task.time_to_first_token");
     expect(ttft).toHaveLength(1);
     expect(ttft[0]?.payload).toMatchObject({ parentSpan: "task.provider_session", eventKind, outcome: "ok" });
     expect(JSON.stringify(ttft)).not.toContain("later text");
@@ -10272,7 +10284,7 @@ describe("native resumed preparation timing", () => {
         onEvent: async (event) => { events.push(event); },
       })).rejects.toBe(failure);
     } finally { issueProjection.mockRestore(); }
-    expect(events.some((event) => event.payload?.span === "task.time_to_first_token")).toBe(false);
+    expect(spanEvents(events).some((event) => event.payload?.span === "task.time_to_first_token")).toBe(false);
   });
 
   it("keeps answered-question ingress at the run root rather than charging it to preparation", async () => {
@@ -10318,7 +10330,7 @@ describe("native resumed preparation timing", () => {
       clock.mockRestore();
     }
     const payloadFor = (span: string) =>
-      events.find((event) => event.payload?.span === span)?.payload;
+      spanEvents(events).find((event) => event.payload?.span === span)?.payload;
     expect(payloadFor("question_response.to_run_created")).toMatchObject({
       parentSpan: "task.provider_session",
       durationMs: 50,
@@ -10370,7 +10382,7 @@ describe("native resumed preparation timing", () => {
       clock.mockRestore();
     }
     const payloadFor = (name: string) =>
-      events.find((event) => event.payload?.span === name)?.payload;
+      spanEvents(events).find((event) => event.payload?.span === name)?.payload;
     expect(payloadFor("heartbeat.prepare_before_environment")).toMatchObject({
       durationMs: 20,
     });
@@ -14378,11 +14390,11 @@ describe("native warm session supervision", () => {
       await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "runner" });
       await executePaperclipNativeSession({ db: leaseDb(second), execution: second, runnerInstanceId: "runner",
         onEvent: async event => { events.push(event); } });
-      const spans = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload!);
+      const spans = spanEvents(events).map(event => event.payload!);
       expect(spans.map(span => span.span)).toEqual(expect.arrayContaining([
         "native.controller.resume.transport_attach", "native.controller.resume.run_authority_read",
         "native.controller.resume.provider_pack_admission", "native.controller.resume.reuse_receipt",
-        "native.controller.submit.recovery_notice", "native.controller.submit.span_persistence",
+        "native.controller.submit.recovery_notice",
       ]));
       for (const [phase, wrapperName] of [["resume", "runner.session.resume"], ["submit", "runner.turn.submitted_to_started"]] as const) {
         const wrapper = spans.find(span => span.span === wrapperName)!;
@@ -15364,6 +15376,8 @@ describe("native session bounded recovery", () => {
     const releasePreparation = vi.fn(async () => {
       expect(renew).toHaveBeenCalledOnce();
       expect(stop).not.toHaveBeenCalled();
+      reached();
+      await preparation;
     });
     let reached!: () => void, release!: () => void;
     const claiming = new Promise<void>(resolve => { reached = resolve; });
@@ -15371,9 +15385,6 @@ describe("native session bounded recovery", () => {
     const running = executePaperclipNativeSession({ db, execution: fresh, runnerInstanceId: "fresh-runner",
       onExecutionLeaseAcquired: releasePreparation,
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "fresh-environment", leaseId: "fresh-lease" },
-      onEvent: async event => {
-        if (event.payload?.span === "native.coordinator.claim") { reached(); await preparation; }
-      },
     }).catch(error => error);
     try {
       await claiming;
@@ -17709,8 +17720,10 @@ describe("runnerd provider runtime wiring", () => {
       await expect(executePaperclipNativeSession({ db: nextDb, execution: next,
         runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, runnerExecutionTarget: target,
         onEvent: async event => { events.push(event); } })).resolves.toMatchObject({ exitCode: 0 });
-      const spans = events.filter(event => event.eventType === "run.performance.span"
-        && event.payload?.span === "native.controller.warm_owner_identity_check");
+      const spans = events.filter(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans))
+        .flatMap(event => event.payload!.spans as Record<string, unknown>[])
+        .filter(payload => payload.span === "native.controller.warm_owner_identity_check")
+        .map(payload => ({ payload }));
       expect(spans).toHaveLength(resumedFromState === "stopped" || resumedFromState === "archived" ? 0 : 1);
       if (spans.length) {
         expect(spans[0]!.payload).toMatchObject({ outcome: probe ? "failed" : "ok", parentSpan: "task.prepare" });
@@ -17928,8 +17941,7 @@ describe("runnerd provider runtime wiring", () => {
       }
       await expect(attempt).resolves.toMatchObject({ exitCode: 0 });
       await releasePreparation?.();
-      if (preparation) expect(managedEvents.filter(event => event.eventType === "run.performance.span"
-        && event.payload?.span === "native.controller.warm_owner_identity_check")).toEqual([
+      if (preparation) expect(spanEvents(managedEvents).filter(event => event.payload?.span === "native.controller.warm_owner_identity_check")).toEqual([
         expect.objectContaining({ payload: expect.objectContaining({ outcome: probe ? "failed" : "ok" }) }),
       ]);
       const probes = execute.mock.calls.filter(([request]) => request.args?.[2] === "paperclip-runner-generation-marker");
@@ -19122,7 +19134,9 @@ describe("runnerd provider runtime wiring", () => {
       expect(settled).toBe(false);
       releaseSnapshot();
       expect(await preparation).toMatchObject({ error: { message: "discovery failed" } });
-      const spans = onTraceEvent.mock.calls.map(([event]) => event.payload?.span);
+      await startupTrace.finish("failed");
+      const spans = onTraceEvent.mock.calls.flatMap(([event]) => Array.isArray(event.payload?.spans)
+        ? (event.payload.spans as Record<string, unknown>[]).map(span => span.span) : [event.payload?.span]);
       expect(spans).toEqual(expect.arrayContaining(["native.controller.wake_binding", "native.controller.review_binding", "provider_pack.snapshot_select"]));
       expect(state.createBackend).not.toHaveBeenCalled();
       expect(state.execute).not.toHaveBeenCalled();
@@ -23502,6 +23516,7 @@ describe("runnerd provider runtime wiring", () => {
         provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const }, runtimeContext }
       : { ...execution, runtimeContext };
     const onTraceEvent = vi.fn(async (_event: AdapterRuntimeEvent) => undefined);
+    const startupTrace = createNativeRunTrace({ runId: execution.binding.runId, onEvent: onTraceEvent });
     const controllerArtifact = join(isolatedStateDirectory, "bootstrap-runnerd");
     if (scenario.startsWith("external_")) await writeFile(controllerArtifact, "fixture bootstrap artifact");
     const backend = await createRunnerdBackend({
@@ -23510,7 +23525,7 @@ describe("runnerd provider runtime wiring", () => {
       ...(scenario.startsWith("interrupted_bootstrap") ? { restartRecovery: { kind: "bootstrap_incomplete" as const,
         runId: execution.binding.runId, leaseOwner: "controller", controllerGeneration: 3, providerAttempt: 1,
         restartKind: "hard" as const, recoveryRequestId: null } } : {}),
-      trace: createNativeRunTrace({ runId: execution.binding.runId, onEvent: onTraceEvent }),
+      trace: startupTrace,
       runnerIngressAuthorized: true,
       runnerExecutionTarget: {
         kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
@@ -23617,12 +23632,10 @@ describe("runnerd provider runtime wiring", () => {
       expect(remoteExecute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-claim-unstarted-session")).toHaveLength(1);
     } else if (scenario === "fresh" || scenario === "external_checkpoint") {
       await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();
-      expect(onTraceEvent).toHaveBeenCalledWith(expect.objectContaining({
-        payload: expect.objectContaining({
-          span: "sandbox.lease.acquisition",
-          stateSource: outcome === "replacement" ? "new_sandbox" : "sandbox_filesystem",
-        }),
-      }));
+      await startupTrace.finish("ok");
+      expect(onTraceEvent.mock.calls.some(([event]) => spanEvents([event]).some(span =>
+        span.payload?.span === "sandbox.lease.acquisition" && span.payload?.stateSource ===
+          (outcome === "replacement" ? "new_sandbox" : "sandbox_filesystem")))).toBe(true);
       expect(remoteExecute.mock.calls.some(([command]) => command.args?.[1]?.includes("install -d"))).toBe(false);
       expect(syncIn).not.toHaveBeenCalled();
       const claimCommand = remoteExecute.mock.calls.find(([command]) => command.args?.[2] === "paperclip-runner-claim-unstarted-session")![0];

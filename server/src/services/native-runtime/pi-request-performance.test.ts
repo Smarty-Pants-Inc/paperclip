@@ -30,7 +30,9 @@ function context() {
 }
 const instant = (at: number) => ({ name: "pi.request.sent", startedAtMs: at, endedAtMs: at, outcome: "ok" as const });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-const requestRows = (events: RunEvent[]) => events.filter(event => event.eventType === "run.performance.span" && event.payload?.span === "pi.request.sent");
+const spanRows = (events: RunEvent[]) => events.flatMap(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+  ? (event.payload.spans as Record<string, unknown>[]).map(payload => ({ ...event, payload })) : []);
+const requestRows = (events: RunEvent[]) => spanRows(events).filter(event => event.payload?.span === "pi.request.sent");
 
 // Keep reason: the durable diagnostic -> local run-log boundary currently disables all child writes.
 // These inputs are already normalized; source/provider authorization belongs to the executor, not this recorder.
@@ -49,12 +51,12 @@ describe("native Pi logical-request instant persistence (not physical wire/inter
     await trace.finish("ok");
     const rows = requestRows(events);
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ eventType: "run.performance.span", stream: "system", level: "info", payload: {
+    expect(rows[0]).toMatchObject({ eventType: "run.performance.span.batch", stream: "system", level: "info", payload: {
       schema: "paperclip.run-performance-span.v1", span: "pi.request.sent", parentSpan: "provider.runtime",
       startOffsetMs: 234, durationMs: 0, wallStartedAtMs: 1234, outcome: "ok",
     } });
     expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|forged|prompt|attributes/);
-    expect(events.filter(event => ["provider.runtime", "provider.context.environment", "provider.model.stream"].includes(String(event.payload?.span)))).toEqual([]);
+    expect(spanRows(events).filter(event => ["provider.runtime", "provider.context.environment", "provider.model.stream"].includes(String(event.payload?.span)))).toEqual([]);
     expect(spans.find(span => span.name === "provider.runtime")).toMatchObject({ parentName: "native.session.execute", endedAtMs: 1300 });
     expect(spans.find(span => span.name === "pi.request.sent")).toMatchObject({ parentName: "provider.runtime", endedAtMs: 1234 });
   });
@@ -73,14 +75,14 @@ describe("native Pi logical-request instant persistence (not physical wire/inter
     const barrier = new Promise<void>(resolve => { release = resolve; });
     const events: RunEvent[] = [];
     const trace = createNativeRunTrace({ runId: "blocked-pi-sink", startedAtMs: 1000, traceContext: context().traceContext,
-      onEvent: async event => { events.push(event); if (event.payload?.span === "pi.request.sent") await barrier; },
+      onEvent: async event => { events.push(event); if ((event.payload?.spans as Record<string, unknown>[] | undefined)?.some(span => span.span === "pi.request.sent")) await barrier; },
     });
     let returned = false;
     const work = recordNativeProviderPerformanceSpans(trace, [instant(1234)]).then(() => { returned = true; });
     try {
       await tick();
       expect(returned, "diagnostic persistence must not stall the committed-event observer").toBe(true);
-      expect(requestRows(events)).toHaveLength(1);
+      expect(requestRows(events)).toHaveLength(0);
     } finally { release(); await work; await trace.finish("ok"); }
     expect(requestRows(events)).toHaveLength(1);
   });
@@ -88,7 +90,7 @@ describe("native Pi logical-request instant persistence (not physical wire/inter
   it("fails open on a rejected Pi diagnostic sink and does not synthesize Pi measurements for absent/OpenCode-only diagnostics", async () => {
     const events: RunEvent[] = [];
     const trace = createNativeRunTrace({ runId: "failed-pi-sink", startedAtMs: 1000, traceContext: context().traceContext,
-      onEvent: async event => { events.push(event); if (event.payload?.span === "pi.request.sent") throw new Error("sink unavailable"); },
+      onEvent: async event => { events.push(event); if ((event.payload?.spans as Record<string, unknown>[] | undefined)?.some(span => span.span === "pi.request.sent")) throw new Error("sink unavailable"); },
     });
     await expect(recordNativeProviderPerformanceSpans(trace, [instant(1234)])).resolves.toBeUndefined();
     await expect(trace.finish("ok")).resolves.toBeUndefined();
@@ -99,6 +101,6 @@ describe("native Pi logical-request instant persistence (not physical wire/inter
     await recordNativeProviderPerformanceSpans(absent, [{ name: "provider.model.stream", startedAtMs: 1100, endedAtMs: 1200 }]);
     await absent.finish("ok");
     expect(requestRows(absentEvents)).toEqual([]);
-    expect(absentEvents.filter(event => event.payload?.span === "provider.model.stream")).toEqual([]);
+    expect(spanRows(absentEvents).filter(event => event.payload?.span === "provider.model.stream")).toEqual([]);
   });
 });

@@ -324,6 +324,7 @@ export const PRP_V2_EVENT_TYPES = new Set([
   "session.goal.cleared",
 ]);
 const NATIVE_RUN_SPAN_SCHEMA = "paperclip.run-performance-span.v1";
+const NATIVE_RUN_SPAN_BATCH_SCHEMA = "paperclip.run-performance-span-batch.v1";
 const NATIVE_RUN_SPAN_FIELDS = ["span", "parentSpan"] as const;
 const NATIVE_RUN_SPAN_NAMES = new Set([
   "agent.turn",
@@ -979,17 +980,22 @@ export function redactEventPayload(
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
   const sanitized = sanitizeRecord(payload);
-  if (payload.schema !== NATIVE_RUN_SPAN_SCHEMA) return sanitized;
-
-  // Native run span identities are controlled diagnostics emitted by
-  // createNativeRunTrace, not provider data. Their dotted names overlap the
-  // broad JWT-value heuristic, so restore only these two fields on the exact
-  // run-performance schema. Hostnames and JWT-shaped values on every other
-  // field and schema still fail closed through sanitizeRecord above.
-  for (const field of NATIVE_RUN_SPAN_FIELDS) {
-    const value = payload[field];
-    if (typeof value === "string" && NATIVE_RUN_SPAN_NAMES.has(value)) {
-      sanitized[field] = value;
+  const restoreSpanIdentity = (source: Record<string, unknown>, target: Record<string, unknown>): void => {
+    for (const field of NATIVE_RUN_SPAN_FIELDS) {
+      const value = source[field];
+      if (typeof value === "string" && NATIVE_RUN_SPAN_NAMES.has(value)) target[field] = value;
+    }
+  };
+  if (payload.schema === NATIVE_RUN_SPAN_SCHEMA) {
+    // Keep native identities on the exact run-performance schema only.
+    restoreSpanIdentity(payload, sanitized);
+  } else if (payload.schema === NATIVE_RUN_SPAN_BATCH_SCHEMA && Array.isArray(payload.spans) && Array.isArray(sanitized.spans)) {
+    for (let index = 0; index < payload.spans.length; index++) {
+      const source = payload.spans[index];
+      const target = sanitized.spans[index];
+      if (isPlainObject(source) && isPlainObject(target) && source.schema === NATIVE_RUN_SPAN_SCHEMA) {
+        restoreSpanIdentity(source, target);
+      }
     }
   }
   return sanitized;

@@ -97,7 +97,9 @@ export async function runTaskWorkspacesFlow(input: {
     }
     const events = await collectRunEvents<Row>((afterSeq, limit) => api.get(`/api/heartbeat-runs/${run.id}/events?afterSeq=${afterSeq}&limit=${limit}`));
     eventEvidence.push({ runId: run.id, events });
-    const spans = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload);
+    const spans = events.flatMap(event => event.eventType === "run.performance.span" ? [event.payload]
+      : event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+        ? event.payload.spans as Record<string, any>[] : []);
     const nativeInput = run.runnerProfileJson?.nativeExecutionInput;
     const point: TaskWorkspaceCheckpoint = { turn,
       issue: { id: issue!.id, projectId: issue!.projectId, executionWorkspaceId: issue!.executionWorkspaceId, status: issue!.status, scheduledRetry: issue!.scheduledRetry },

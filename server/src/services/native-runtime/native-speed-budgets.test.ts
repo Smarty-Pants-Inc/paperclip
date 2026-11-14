@@ -48,6 +48,11 @@ describe("speed budgets", () => {
   });
 });
 
+function spanPayloads(events: AdapterRuntimeEvent[]): Record<string, unknown>[] {
+  return events.flatMap(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+    ? event.payload.spans as Record<string, unknown>[] : []);
+}
+
 describe("speed budget checks in the native run trace", () => {
   function traced(budget?: Parameters<typeof createNativeRunTrace>[0]["budget"]) {
     const events: AdapterRuntimeEvent[] = [];
@@ -57,6 +62,14 @@ describe("speed budget checks in the native run trace", () => {
       .map(event => event.payload as Record<string, unknown>);
     return { trace, breaches };
   }
+
+  it("evaluates speed budgets at span end without waiting for the aggregate flush", async () => {
+    const { trace, breaches } = traced({ adapter: "codex", environment: "local" });
+    trace.setBudgetStart("cold");
+    const budget = LOCAL_SPEED_BUDGETS.codex.time_to_first_activity.cold.p95Ms;
+    await trace.record({ name: "task.time_to_first_agent_activity", startedAtMs: 0, endedAtMs: budget + 1 });
+    expect(breaches()).toEqual([expect.objectContaining({ metric: "time_to_first_activity", measuredMs: budget + 1 })]);
+  });
 
   it("writes one run-log breach for a slow agent boot and none for a fast TTFT", async () => {
     const { trace, breaches } = traced({ adapter: "codex", environment: "local" });
@@ -192,7 +205,7 @@ describe("speed budget checks in the native run trace", () => {
     const trace = createNativeRunTrace({ runId: "run-1", startedAtMs: 1_000, onEvent: async event => { events.push(event); } });
     await trace.record({ name: "provider.session.load", startedAtMs: 4_000, endedAtMs: 9_000 });
     await trace.finish("ok");
-    expect(events.find(event => (event.payload as Record<string, unknown>)?.span === "provider.session.load")?.payload)
+    expect(spanPayloads(events).find(payload => payload.span === "provider.session.load"))
       .toMatchObject({ startOffsetMs: 3_000, durationMs: 5_000, wallStartedAtMs: 4_000 });
   });
 

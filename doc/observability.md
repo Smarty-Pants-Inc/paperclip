@@ -833,8 +833,9 @@ values, paths, output, credentials, and raw identifiers are discarded by the
 trace helper. `task.provider_session.measured` records that same interval in the
 local run log, without a duplicate full-width OTel span. The separate heartbeat
 `task.run.measured` event is the authoritative end-to-end duration.
-Persisted `run.performance.span` events retain the v1 run-log schema and include
-`traceSchemaVersion: 3` so local tooling can distinguish the hierarchy.
+Persisted `run.performance.span.batch` events use the batch v1 envelope and carry
+`traceSchemaVersion: 3`; each child retains the v1 run-performance span schema so
+local tooling can distinguish the hierarchy.
 
 Like every span in this document, native-run spans are opt-in. When
 `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, the tracer remains a no-op; the local

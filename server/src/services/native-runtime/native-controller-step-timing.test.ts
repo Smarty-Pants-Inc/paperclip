@@ -6,6 +6,11 @@ import { measureRunnerOperation } from "./runner-operation-timing.js";
 
 afterEach(() => vi.restoreAllMocks());
 
+function spanPayloads(events: AdapterRuntimeEvent[]): Record<string, unknown>[] {
+  return events.flatMap(event => event.eventType === "run.performance.span.batch" && Array.isArray(event.payload?.spans)
+    ? event.payload.spans as Record<string, unknown>[] : []);
+}
+
 describe("controller warm-start wait attribution", () => {
   it("partitions nested waits across warm resume and submitted-to-started without double counting", async () => {
     let now = 100;
@@ -25,7 +30,7 @@ describe("controller warm-start wait attribution", () => {
     await trace.record({ name: "runner.session.resume", startedAtMs: 100, endedAtMs: 150 });
     timing.flush("resume", 100, 150);
     await Promise.resolve();
-    expect(events.some(event => String(event.payload?.span).startsWith("native.controller."))).toBe(false);
+    expect(spanPayloads(events).some(payload => String(payload.span).startsWith("native.controller."))).toBe(false);
     await runWithNativeControllerSteps(timing, () => measureNativeControllerStep("event_write", async () => { now = 175; }));
     now = 180;
     await trace.record({ name: "runner.turn.submitted_to_started", startedAtMs: 150, endedAtMs: 180 });
@@ -33,7 +38,7 @@ describe("controller warm-start wait attribution", () => {
     finishRpc();
     await rpc;
     await trace.finish("ok");
-    const payloads = events.filter(event => event.eventType === "run.performance.span").map(event => event.payload!);
+    const payloads = spanPayloads(events);
     for (const [phase, wrapperName] of [["resume", "runner.session.resume"], ["submit", "runner.turn.submitted_to_started"]] as const) {
       const wrapper = payloads.find(row => row.span === wrapperName)!;
       const children = payloads.filter(row => String(row.span).startsWith(`native.controller.${phase}.`));
@@ -60,7 +65,7 @@ describe("controller warm-start wait attribution", () => {
     timing.flush("resume", 100, 90);
     timing.finish();
     await trace.finish("ok");
-    expect(events.find(event => event.payload?.span === "native.controller.resume.env_resolution")?.payload)
+    expect(spanPayloads(events).find(payload => payload.span === "native.controller.resume.env_resolution"))
       .toMatchObject({ durationMs: 0, wallStartedAtMs: 100, outcome: "ok" });
   });
 
@@ -80,7 +85,7 @@ describe("controller warm-start wait attribution", () => {
     // Flush/finish returned although every diagnostic write is blocked.
     release();
     await trace.finish("ok");
-    expect(events.some(event => event.payload?.span === "native.controller.resume.credential_projection" && event.payload.outcome === "failed")).toBe(true);
+    expect(spanPayloads(events).some(payload => payload.span === "native.controller.resume.credential_projection" && payload.outcome === "failed")).toBe(true);
     expect(JSON.stringify(events)).not.toContain(failure.message);
   });
 
@@ -100,7 +105,7 @@ describe("controller warm-start wait attribution", () => {
     timingB.finish();
     await a.finish("ok");
     await b.finish("ok");
-    expect(first.mock.calls[0]![0]).toMatchObject({ payload: { span: "native.controller.resume.transport_resume", wallStartedAtMs: 100 } });
-    expect(second.mock.calls[0]![0]).toMatchObject({ payload: { span: "native.controller.resume.transport_resume", wallStartedAtMs: 110 } });
+    expect(first.mock.calls[0]![0].payload?.spans).toEqual(expect.arrayContaining([expect.objectContaining({ span: "native.controller.resume.transport_resume", wallStartedAtMs: 100 })]));
+    expect(second.mock.calls[0]![0].payload?.spans).toEqual(expect.arrayContaining([expect.objectContaining({ span: "native.controller.resume.transport_resume", wallStartedAtMs: 110 })]));
   });
 });

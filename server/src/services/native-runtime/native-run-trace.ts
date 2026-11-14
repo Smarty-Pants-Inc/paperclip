@@ -19,7 +19,11 @@ import {
 } from "./native-speed-budgets.js";
 
 export const NATIVE_RUN_SPAN_EVENT_TYPE = "run.performance.span";
+export const NATIVE_RUN_SPAN_BATCH_EVENT_TYPE = "run.performance.span.batch";
 export const NATIVE_RUN_TRACE_SCHEMA_VERSION = 3;
+const NATIVE_RUN_SPAN_BATCH_SCHEMA = "paperclip.run-performance-span-batch.v1";
+const NATIVE_RUN_SPAN_BATCH_CAP = 64;
+const NATIVE_RUN_SPAN_BATCH_INTERVAL_MS = 2_000;
 
 export type NativeRunSpanOutcome = "ok" | "failed";
 
@@ -412,6 +416,37 @@ export function createNativeRunTrace(input: {
     }
   };
 
+  const completedSpanPayloads: Record<string, unknown>[] = [];
+  let spanBatchTimer: ReturnType<typeof setTimeout> | undefined;
+  let spanBatchFlush: Promise<void> = Promise.resolve();
+  const flushCompletedSpanEvents = async (): Promise<void> => {
+    if (spanBatchTimer) clearTimeout(spanBatchTimer);
+    spanBatchTimer = undefined;
+    if (!completedSpanPayloads.length) { await spanBatchFlush; return; }
+    const spans = completedSpanPayloads.splice(0, completedSpanPayloads.length);
+    const write = spanBatchFlush.then(async () => {
+      try {
+        await input.onEvent?.({
+          eventType: NATIVE_RUN_SPAN_BATCH_EVENT_TYPE,
+          stream: "system",
+          level: spans.some(span => span.outcome === "failed") ? "warn" : "info",
+          message: `runner span batch: ${spans.length} spans`,
+          payload: { schema: NATIVE_RUN_SPAN_BATCH_SCHEMA,
+            traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION, spans },
+        });
+      } catch { /* A diagnostic sink failure must not fail the task. */ }
+    });
+    spanBatchFlush = write;
+    await write;
+  };
+  const scheduleSpanBatchFlush = (): void => {
+    if (spanBatchTimer || completedSpanPayloads.length === 0) return;
+    spanBatchTimer = setTimeout(() => {
+      spanBatchTimer = undefined;
+      void flushCompletedSpanEvents();
+    }, NATIVE_RUN_SPAN_BATCH_INTERVAL_MS);
+    spanBatchTimer.unref?.();
+  };
   const emitCompletedSpanEvent = async (
     span: NativeRunHistoricalSpan,
   ): Promise<void> => {
@@ -420,31 +455,19 @@ export function createNativeRunTrace(input: {
     const durationMs = endedAtMs - startedAtMs;
     const outcome = span.outcome ?? "ok";
     const attributes = safeAttributes(span.attributes);
-    try {
-      await input.onEvent?.({
-        eventType: NATIVE_RUN_SPAN_EVENT_TYPE,
-        stream: "system",
-        level: outcome === "failed" ? "warn" : "info",
-        message: `runner span: ${span.name} (${durationMs.toFixed(1)}ms)`,
-        payload: {
-          // Keep the persisted schema identifier stable; traceSchemaVersion
-          // describes the OTel hierarchy independently of the run-log shape.
-          schema: "paperclip.run-performance-span.v1",
-          traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
-          span: span.name,
-          parentSpan: span.parentName ?? "task.provider_session",
-          startOffsetMs: startedAtMs - traceStartedAtMs,
-          durationMs,
-          outcome,
-          ...attributes,
-          // The span's own start time. The row can be written late (deferred
-          // diagnostics), so readers must not infer the start from its write time.
-          wallStartedAtMs: startedAtMs,
-        },
-      });
-    } catch {
-      // A diagnostic sink failure must not fail the task.
-    }
+    completedSpanPayloads.push({
+      schema: "paperclip.run-performance-span.v1",
+      traceSchemaVersion: NATIVE_RUN_TRACE_SCHEMA_VERSION,
+      span: span.name,
+      parentSpan: span.parentName ?? "task.provider_session",
+      startOffsetMs: startedAtMs - traceStartedAtMs,
+      durationMs,
+      outcome,
+      ...attributes,
+      wallStartedAtMs: startedAtMs,
+    });
+    if (completedSpanPayloads.length >= NATIVE_RUN_SPAN_BATCH_CAP) await flushCompletedSpanEvents();
+    else scheduleSpanBatchFlush();
   };
 
   const start = (
@@ -698,6 +721,9 @@ export function createNativeRunTrace(input: {
       outcome,
       attributes: { runtime: "paperclip_runner" },
     });
+    // Flush the final batch before finish returns to the caller that emits
+    // run lifecycle events.
+    await flushCompletedSpanEvents();
   };
 
   /** Labels the run cold (fresh provider session) or warm (reused). */

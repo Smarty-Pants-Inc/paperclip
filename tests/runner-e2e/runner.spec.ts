@@ -2869,15 +2869,15 @@ for (const execution of executions) {
             const currentEvents =
               runEventsByRun.find((captured) => captured.runId === current.id)
                 ?.events ?? [];
-            const recordedContinuityBreak = currentEvents.some((event) => {
-              const payload = record(event.payload);
-              return (
-                event.eventType === "run.performance.span" &&
-                payload.span === "provider.session.continuity_break" &&
-                payload.previousProviderSessionId === previousSessionId &&
-                payload.replacementProviderSessionId === currentSessionId
-              );
-            });
+            const currentSpanPayloads = currentEvents.flatMap((event) => event.eventType === "run.performance.span"
+              ? [record(event.payload)]
+              : event.eventType === "run.performance.span.batch" && Array.isArray(record(event.payload).spans)
+                ? (record(event.payload).spans as unknown[]).map(record) : []);
+            const recordedContinuityBreak = currentSpanPayloads.some((payload) =>
+              payload.span === "provider.session.continuity_break" &&
+              payload.previousProviderSessionId === previousSessionId &&
+              payload.replacementProviderSessionId === currentSessionId);
+
             if (!recordedContinuityBreak) {
               invariantFailures.push(
                 `ACPX provider session changed from ${previousSessionId} to ${currentSessionId} without a matching continuity event`,
@@ -2885,9 +2885,10 @@ for (const execution of executions) {
             }
           }
         }
-        const spanPayloads = runEvents
-          .filter((event) => event.eventType === "run.performance.span")
-          .map((event) => record(event.payload));
+        const spanPayloads = runEvents.flatMap((event) => event.eventType === "run.performance.span"
+          ? [record(event.payload)]
+          : event.eventType === "run.performance.span.batch" && Array.isArray(record(event.payload).spans)
+            ? (record(event.payload).spans as unknown[]).map(record) : []);
         const selectedTransport = spanPayloads.find(
           (payload) => payload.span === "runner.transport.selected",
         );
