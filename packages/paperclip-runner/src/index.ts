@@ -35,6 +35,7 @@ export {
   summarizeCodexTurnDiff,
 } from "./drivers/codex/codex-turn-diff.js";
 export * from "./native-session-runtime.js";
+export * from "./native-provider-turn-wait.js";
 export * from "./steering-delivery.js";
 export {
   DurablePrpControlPlane,

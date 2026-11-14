@@ -1103,6 +1103,7 @@ export function environmentRoutes(
       ),
       config: await normalizeEnvironmentConfigForPersistence({
         db,
+        operation: "create",
         companyId,
         environmentName: req.body.name,
         driver: req.body.driver,
