@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,39 @@ async function launch(root: string, childSource: string, script = REMOTE_RUNNER_
   child.stderr.on("data", chunk => { stderr += String(chunk); });
   const code = await new Promise<number | null>(resolve => child.once("exit", resolve));
   return { code, stderr, pid: child.pid! };
+}
+
+async function launchWithFence(root: string, report: { verified: false; reason: string }, childSource: string,
+  shell = "/bin/sh", shellArgs: string[] = []) {
+  const state = join(root, "state");
+  const binary = join(root, "paperclip-runnerd");
+  await mkdir(state);
+  await writeFile(join(root, "runner.js"), childSource);
+  await writeFile(binary, `#!/bin/sh\nif test "$1" = reap-lineage; then printf '%s\\n' '${JSON.stringify(report)}'; exit 1; fi\nexec '${process.execPath}' '${join(root, "runner.js")}'\n`, { mode: 0o700 });
+  const stale = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--state-dir", state],
+    { argv0: binary, stdio: "ignore", detached: true });
+  const stopped = new Promise<void>(resolve => stale.once("exit", () => resolve()));
+  let child: ReturnType<typeof spawn> | undefined;
+  let exited: Promise<number | null> | undefined;
+  try {
+    await vi.waitFor(async () => expect((await readFile(`/proc/${stale.pid}/cmdline`, "utf8")).split("\0")).toContain(state));
+    child = spawn(shell, [...shellArgs, "-c", REMOTE_RUNNER_CHILD_LAUNCH_SCRIPT, "paperclip-runner-child",
+      join(state, "identity"), "fence-nonce", "runner-id", join(root, "diagnostics"), binary, "--state-dir", state],
+    { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", chunk => { stderr += String(chunk); });
+    exited = new Promise<number | null>(resolve => child!.once("exit", resolve));
+    const code = await exited;
+    await vi.waitFor(() => expect(stale.exitCode !== null || stale.signalCode !== null).toBe(true));
+    await stopped;
+    await vi.waitFor(async () => expect(await copierPids(child!.pid!)).toEqual([]), { timeout: 5_000 });
+    return { code, stderr, pid: child.pid!, stalePid: stale.pid! };
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    if (exited) await exited;
+    stale.kill("SIGKILL");
+    await stopped;
+  }
 }
 
 describe("remote runnerd stderr evidence", () => {
@@ -211,6 +245,73 @@ describe("remote runnerd stderr evidence", () => {
       for (const name of names) expect((await stat(join(directory, name))).mode & 0o777).toBe(0o600);
     } finally { await rm(root, { recursive: true, force: true }); }
   }, 60_000);
+
+  it("keeps partial-lineage fence evidence before runnerd output in the generation file after live trim", async () => {
+    const root = await mkdtemp(join(tmpdir(), "runner-fence-partial-"));
+    try {
+      const log = join(root, "diagnostics", REMOTE_RUNNER_PROCESS_STDERR_FILE);
+      const snapshot = join(root, "shared-before-trim");
+      const result = await launchWithFence(root, { verified: false, reason: "journal_unavailable" }, `
+        const fs = require("node:fs");
+        const log = ${JSON.stringify(log)}, snapshot = ${JSON.stringify(snapshot)};
+        process.stderr.write("RUNNERD_START\\n");
+        const started = Date.now(); let written = false, grown = false;
+        const check = () => {
+          if (Date.now() - started > 35000) process.exit(91);
+          let shared = ""; try { shared = fs.readFileSync(log, "utf8"); } catch {}
+          if (!written && shared.includes("RUNNERD_START\\n")) {
+            fs.writeFileSync(snapshot, shared); written = true;
+            let data = Buffer.from("x".repeat(${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES + 4096}) + "\\nRUNNERD_END\\n");
+            while (data.length) data = data.subarray(fs.writeSync(2, data));
+          }
+          if (shared.length > ${REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES}) grown = true;
+          if (grown && shared.length <= ${REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES}) process.exit(0);
+          setTimeout(check, 100);
+        }; check();`);
+      expect(result.code).toBe(0);
+      expect(result.stderr).toBe("");
+      const fence = `runner_stale_lineage_partial: runner ${result.stalePid}: journal_unavailable\n`;
+      expect(await readFile(snapshot, "utf8")).toBe(`${fence}RUNNERD_START\n`);
+      const own = join(root, "diagnostics", `runnerd.launch-stderr.fence-nonce.${result.pid}.log`);
+      const shared = await readFile(log, "utf8");
+      expect(shared.length).toBe(REMOTE_RUNNER_PROCESS_STDERR_MAX_BYTES);
+      expect(shared).not.toContain(fence);
+      expect(shared.endsWith("\nRUNNERD_END\n")).toBe(true);
+      expect((await readdir(join(root, "diagnostics"))).sort()).toEqual([
+        `runnerd.launch-stderr.fence-nonce.${result.pid}.log`, REMOTE_RUNNER_PROCESS_STDERR_FILE,
+      ].sort());
+      const generation = await readFile(own, "utf8");
+      expect(generation.startsWith(fence)).toBe(true);
+      expect(generation).toBe(`${fence}RUNNERD_START\n${"x".repeat(REMOTE_RUNNER_PROCESS_STDERR_TRIM_BYTES + 4096)}\nRUNNERD_END\n`);
+      expect((await stat(own)).mode & 0o777).toBe(0o600);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 60_000);
+
+  describe.each([
+    ["dash", "/bin/dash", []], ["bash", "/bin/bash", []], ["busybox sh", "/usr/bin/busybox", ["sh"]],
+  ] as const)("fence refusal with %s", (_name, shell, args) => {
+    it.skipIf(!existsSync(shell))("keeps both logs and exits 75 without starting runnerd", async () => {
+      const root = await mkdtemp(join(tmpdir(), "runner-fence-refusal-"));
+      const marker = join(root, "runnerd-started");
+      try {
+        const result = await launchWithFence(root, { verified: false, reason: "survivors_remaining" },
+          `require("node:fs").writeFileSync(${JSON.stringify(marker)}, "started")`, shell, [...args]);
+        expect(result.code).toBe(75);
+        expect(result.stderr).toBe("");
+        const fence = `runner_stale_lineage_unproven: runner ${result.stalePid}: survivors_remaining\n`;
+        const directory = join(root, "diagnostics");
+        const files = [REMOTE_RUNNER_PROCESS_STDERR_FILE, `runnerd.launch-stderr.fence-nonce.${result.pid}.log`];
+        for (const name of files) {
+          expect(await readFile(join(directory, name), "utf8")).toBe(fence);
+          expect((await stat(join(directory, name))).mode & 0o777).toBe(0o600);
+        }
+        expect((await readdir(directory)).sort()).toEqual(files.sort());
+        await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(stat(join(root, "state", "identity"))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await copierPids(result.pid)).toEqual([]);
+      } finally { await rm(root, { recursive: true, force: true }); }
+    });
+  });
 
   // The copy into the shared log runs beside runnerd, never in its write path:
   // a stopped or killed copier must not block runnerd, fail its writes, or change its exit status.
