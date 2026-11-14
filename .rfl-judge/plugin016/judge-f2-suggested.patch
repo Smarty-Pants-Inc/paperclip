@@ -1,0 +1,15 @@
+--- ../boat/src/plugin.ts	2026-11-14 09:44:33.138956137 +0000
++++ src/plugin.ts	2026-11-14 10:07:27.158624755 +0000
+@@ -288,8 +288,10 @@
+     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}`);
+     const sandbox = result.sandbox ?? result;
+     assertSandboxId(sandbox, id);
+-    const stop = sandbox.stop ?? result.stop ?? result.operation ?? operation;
+-    if (["archived", "stopped"].includes(sandbox.state) || stop?.status === "completed") {
++    const seen = sandbox.stop ?? result.stop ?? result.operation;
++    const stop = seen ?? operation;
++    // Judge F2: "completed" counts only for the stop POST /stop returned, as read back by GET.
++    if (["archived", "stopped"].includes(sandbox.state) || (stopId !== undefined && seen?.id === stopId && seen?.status === "completed")) {
+       idleActivity.confirm(proof); return { providerLeaseId: id, state: "stopped" };
+     }
+     // A missing id on 202 is not failure: observe the sandbox until its stop
