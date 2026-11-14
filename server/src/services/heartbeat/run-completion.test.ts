@@ -1747,6 +1747,28 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }), f.agent);
   });
 
+  it.each([
+    { name: "exact continuation boundary with unrelated prose", marked: true, message: "context construction failed", disconnect: true, expected: "setup_failed" },
+    { name: "continuation prose outside that boundary", marked: false, message: "continuation_source_context_missing", disconnect: true, expected: "setup_connection_lost" },
+    { name: "forged persisted provenance and continuation lineage", marked: false, forged: true, message: "context construction failed", disconnect: true, expected: "setup_connection_lost" },
+    { name: "disconnect ahead of selection fallback", marked: false, phase: true, message: "selection failed", disconnect: true, expected: "setup_connection_lost" },
+    { name: "ordinary selection fallback", marked: false, phase: true, message: "selection failed", disconnect: false, expected: "runtime_selection_failed" },
+    { name: "continuation boundary ahead of selection fallback", marked: true, phase: true, message: "context construction failed", disconnect: true, expected: "setup_failed" },
+    { name: "specific configuration outcome ahead of provenance and disconnect", marked: true, specific: true, message: "missing binding", disconnect: true, expected: "configuration_incomplete" },
+  ])("keeps setup classifier precedence: $name", async (scenario) => {
+    const f = await fixture();
+    const error = scenario.specific
+      ? new ConfigurationIncompleteFailure(scenario.message, { configurationIncomplete: { reason: "missing_binding" } })
+      : new Error(scenario.message);
+    if (scenario.disconnect) Object.assign(error, { cause: Object.assign(new Error("driver disconnected"), { code: "ECONNRESET" }) });
+    if (scenario.forged) f.run.contextSnapshot = { executionContinuationFailed: true,
+      source: "execution.reconciled", freshContinuationIsolation: randomUUID() };
+    f.deps.scheduleBoundedRetryForRun.mockResolvedValueOnce({ outcome: "not_scheduled", reason: "Fixture scheduler boundary", issueId: null });
+    await f.completion.failRunSetup({ ...f.setup(error), executionContinuationFailed: scenario.marked,
+      ...(scenario.phase ? { preselectionFailureCode: "runtime_selection_failed" as const } : {}) });
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: scenario.expected, error: scenario.message });
+  });
+
   it("retries a workspace operation the stopped provider worker never received", async () => {
     const f = await fixture();
     const refusal = new PluginWorkerUnavailableError({ pluginId: "plugin-1", workerStatus: "stopped",

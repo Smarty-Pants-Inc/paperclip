@@ -2024,6 +2024,7 @@ function createHeartbeatService(
     const runtimePreparation: { phase: RuntimePreparationPhase } = { phase: "workspace_prep" };
     let nativeEligibilityConfirmed = false;
     let runtimeSelected = false;
+    let executionContinuationFailed = false;
     let legacyAdapterEntered = false;
     let legacyLocalAdapterEntered = false;
     let legacyPreparationFailedBeforeDispatch = false;
@@ -2917,6 +2918,7 @@ function createHeartbeatService(
         continuationSummary, executionContinuation, paperclipWakePayload, safeWakeComments, safeWakeCommentContext, pinnedSkillTest,
       } = await timePreparation("task_context", () => prepareHeartbeatTaskContext(db, {
         run, agent,
+        onExecutionContinuationFailure: () => { executionContinuationFailed = true; },
         task: { issueRef, issueContext, context, taskSession },
         policy: { trustPreset, experimentalInstanceSettings, recovering: Boolean(runOptions.nativeRestartRecovery || runOptions.nativeLeaseOwner) },
         services: { issuesSvc, getPinnedSkillTestContext },
@@ -4150,6 +4152,7 @@ function createHeartbeatService(
           await (!legacyAdapterEntered && !nativeDispatchStarted && !nativeDispatchMayHaveStarted()
             ? settleFailedPreparation : runCompletion.failRunSetup)({
             run, runId, outerErr, signal: executionControl.controller.signal,
+            executionContinuationFailed,
             preselectionFailureCode: nativeEligibilityConfirmed && !runtimeSelected
               ? runtimePreparation.phase === "instruction_prep" ? "instruction_preparation_failed" : "runtime_selection_failed"
               : undefined,

@@ -2409,10 +2409,17 @@ When preparation actually fails before dispatch, completion runs on a fresh
 pool rather than the failed request connection. It makes at most three logged
 settlement attempts, with 2-second connection/statement timeouts and a 1-second
 pause between attempts. A retry after a committed failure resumes the remaining
-wakeup, claim, note, agent-status and environment-lease settlement. Wrapped driver
-codes (`ECONNRESET`, `57P01`, `08006` and driver connection-closed codes) become
-`setup_connection_lost`; an unprovable foreign preparation owner becomes
-`setup_owner_lost`. Both use the existing bounded preparation-retry owner. That
+wakeup, claim, note, agent-status and environment-lease settlement. Established
+specific semantic outcomes take precedence over nested driver codes, including
+`environment_provider_unavailable` when lease recording fails. An untyped error
+escaping exactly `buildExecutionContinuation` retains `setup_failed`, with its
+original message, stack and cause. The task-context owner signals that boundary
+to the executor in memory; neither persisted context, continuation lineage nor
+`continuation_*` message text establishes this provenance. Otherwise wrapped
+driver codes (`ECONNRESET`, `57P01`, `08006` and driver connection-closed codes)
+during owned preparation become `setup_connection_lost`, including preparation
+of a restored fresh-isolated continuation; an unprovable foreign preparation
+owner becomes `setup_owner_lost`. Both use the existing bounded preparation-retry owner. That
 owner can atomically transfer the failed run's issue claim to a durable
 `scheduled_retry` successor; a failed predecessor never keeps the claim. The
 existing unanswered-message owner posts one idempotent, pre-dispatch explanation

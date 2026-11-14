@@ -177,6 +177,8 @@ export interface FailHeartbeatRunInput extends RunCompletionInput {
 export interface FailHeartbeatRunSetupInput {
   /** Resume idempotent settlement after a connection failed after the terminal write. */
   resumeSettlement?: boolean;
+  /** Set only by the executor's exact buildExecutionContinuation boundary. */
+  executionContinuationFailed?: boolean;
   /** A fresh native-eligible run failed before its durable selection committed. */
   preselectionFailureCode?: "instruction_preparation_failed" | "runtime_selection_failed";
   run: Run;
@@ -1701,7 +1703,6 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const namedPreparationCode = !providerDispatchStarted && ["setup_owner_lost", "runtime_mode_adapter_incompatible"].includes(String((outerErr as { code?: unknown })?.code))
       ? String((outerErr as { code: string }).code) : null;
     const setupFailureErrorCode =
-      (!providerDispatchStarted && preparationConnectionLost(outerErr) ? "setup_connection_lost" : null) ??
       namedPreparationCode ??
       (controllerLeaseLost ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
@@ -1722,6 +1723,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         : null) ??
       recordedResponsibleUserDenialCode ??
       nonRetryablePreflightCode ??
+      // Specific semantic outcomes win over nested driver codes. Only an error
+      // escaping continuation construction retains the generic setup outcome;
+      // the run's lineage, phase and error prose are not trusted provenance.
+      (!providerDispatchStarted && input.executionContinuationFailed ? "setup_failed" : null) ??
+      (!providerDispatchStarted && preparationConnectionLost(outerErr) ? "setup_connection_lost" : null) ??
       (!providerDispatchStarted ? input.preselectionFailureCode : null) ??
       "setup_failed";
     const failureCause = GENERIC_RUN_FAILURE_CODES.has(setupFailureErrorCode) ? thrownFailureCause : null;

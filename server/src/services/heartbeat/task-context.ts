@@ -24,6 +24,8 @@ type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecutionContext"]>>>;
 
 export interface HeartbeatTaskContextInput {
+  /** Trusted executor-local provenance; never read from the persisted task context. */
+  onExecutionContinuationFailure?: () => void;
   run: Pick<typeof heartbeatRuns.$inferSelect, "id">;
   agent: Pick<typeof agents.$inferSelect, "id" | "companyId" | "adapterType">;
   task: {
@@ -132,20 +134,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   } else {
     delete context.paperclipSkillTest;
   }
-  const executionContinuation =
-    issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id
-      ? await buildExecutionContinuation({
-          db,
-          companyId: agent.companyId,
-          issueId: issueRef.id,
-          agentId: agent.id,
-          runId: run.id,
-          context,
-          previousContextRunId: taskSession?.lastRunId,
-          summary: safeContinuationSummary?.body ?? null,
-          exposeLowTrustRaw,
-        })
-      : null;
+  let executionContinuation: Awaited<ReturnType<typeof buildExecutionContinuation>> | null = null;
+  if (issueRef && !isConversation(issueContext) && issueContext?.assigneeAgentId === agent.id) {
+    try {
+      executionContinuation = await buildExecutionContinuation({
+        db,
+        companyId: agent.companyId,
+        issueId: issueRef.id,
+        agentId: agent.id,
+        runId: run.id,
+        context,
+        previousContextRunId: taskSession?.lastRunId,
+        summary: safeContinuationSummary?.body ?? null,
+        exposeLowTrustRaw,
+      });
+    } catch (error) {
+      // Only this boundary retains an untyped continuation construction failure.
+      // Rethrow unchanged so typed cancellation and original diagnostics survive.
+      input.onExecutionContinuationFailure?.();
+      throw error;
+    }
+  }
   context.executionContinuation = executionContinuation;
   const paperclipWakePayload = await buildPaperclipWakePayload({
     db,
