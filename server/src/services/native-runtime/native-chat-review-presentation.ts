@@ -1,5 +1,5 @@
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
-import { and, eq, inArray, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -349,7 +349,10 @@ export async function authorizeNativeChatReviewPresentation(
         eq(nativeRunFinalizations.runId, input.runId),
         eq(nativeRunFinalizations.companyId, input.companyId),
         eq(nativeRunFinalizations.issueId, input.issueId),
-        eq(nativeRunFinalizations.phase, "committed"),
+        or(eq(nativeRunFinalizations.phase, "committed"), and(
+          eq(nativeRunFinalizations.phase, "retryable_failure"),
+          eq(nativeRunFinalizations.failureCode, "native_workspace_sync_out_failed"),
+        )),
       ),
     );
   const [coordinator] = await (lockMode === "read"
@@ -519,7 +522,10 @@ export async function restoreNativeChatReviewPresentationInTransaction(
         eq(nativeRunFinalizations.companyId, input.companyId),
         eq(nativeRunFinalizations.issueId, input.issueId),
         eq(nativeRunFinalizations.runId, input.runId),
-        eq(nativeRunFinalizations.phase, "committed"),
+        or(eq(nativeRunFinalizations.phase, "committed"), and(
+          eq(nativeRunFinalizations.phase, "retryable_failure"),
+          eq(nativeRunFinalizations.failureCode, "native_workspace_sync_out_failed"),
+        )),
         eq(nativeRunFinalizations.decisionId, input.decisionId),
         eq(nativeRunFinalizations.resultId, input.resultId),
         eq(nativeRunFinalizations.assessmentId, input.assessmentId),

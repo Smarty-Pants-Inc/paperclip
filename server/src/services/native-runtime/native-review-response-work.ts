@@ -1,4 +1,4 @@
-import { and, asc, eq, gt, isNotNull, isNull, notExists, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNotNull, isNull, notExists, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issueComments, nativeRunFinalizations, statusDecisions, type Db } from "@paperclipai/db";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
@@ -19,13 +19,17 @@ export function nativeReviewResponseWork(db: Db) {
       issueId: nativeRunFinalizations.issueId, agentId: heartbeatRuns.agentId,
       decisionId: nativeRunFinalizations.decisionId, resultId: nativeRunFinalizations.resultId,
       assessmentId: nativeRunFinalizations.assessmentId, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
+      failureCode: nativeRunFinalizations.failureCode,
     }).from(nativeRunFinalizations)
       .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, nativeRunFinalizations.runId),
         eq(heartbeatRuns.companyId, nativeRunFinalizations.companyId), eq(heartbeatRuns.nativeIssueId, nativeRunFinalizations.issueId)))
       .innerJoin(statusDecisions, and(eq(statusDecisions.id, nativeRunFinalizations.decisionId),
         eq(statusDecisions.companyId, nativeRunFinalizations.companyId), eq(statusDecisions.issueId, nativeRunFinalizations.issueId),
         eq(statusDecisions.runId, nativeRunFinalizations.runId), eq(statusDecisions.assessmentId, nativeRunFinalizations.assessmentId)))
-      .where(and(eq(nativeRunFinalizations.phase, "committed"), isNull(nativeRunFinalizations.leaseOwner),
+      .where(and(or(eq(nativeRunFinalizations.phase, "committed"), and(
+        eq(nativeRunFinalizations.phase, "retryable_failure"),
+        eq(nativeRunFinalizations.failureCode, "native_workspace_sync_out_failed"))),
+        isNull(nativeRunFinalizations.leaseOwner),
         isNotNull(nativeRunFinalizations.resultId), isNotNull(nativeRunFinalizations.assessmentId),
         eq(heartbeatRuns.runtimeMode, "native"), eq(heartbeatRuns.status, "succeeded"),
         eq(statusDecisions.reasonCode, "governed_response_waiting"), eq(statusDecisions.applicationState, "applied"),
@@ -50,7 +54,8 @@ export function nativeReviewResponseWork(db: Db) {
     while (canRun() && !signal?.aborted) {
       const rows = await candidates(scope, after);
       for (const row of rows) entries.push({ id: row.id, companyId: row.companyId,
-        issueId: row.issueId, agentId: row.agentId, dueAt: row.nextAttemptAt?.getTime() ?? 0 });
+        issueId: row.issueId, agentId: row.agentId,
+        dueAt: row.failureCode === "native_workspace_sync_out_failed" ? 0 : row.nextAttemptAt?.getTime() ?? 0 });
       if (rows.length < 100) return entries;
       after = rows[rows.length - 1].id;
     }
@@ -61,13 +66,17 @@ export function nativeReviewResponseWork(db: Db) {
     const scope = { companyId: entry.companyId, issueId: entry.issueId };
     const [current] = await candidates(scope, undefined, entry.id);
     if (!current) return null;
-    if (current.nextAttemptAt && current.nextAttemptAt.getTime() > Date.now()) return { ...entry, dueAt: current.nextAttemptAt.getTime() };
+    if (current.failureCode !== "native_workspace_sync_out_failed"
+      && current.nextAttemptAt && current.nextAttemptAt.getTime() > Date.now())
+      return { ...entry, dueAt: current.nextAttemptAt.getTime() };
     if (signal?.aborted) throw new Error("Governed review response recovery stopped");
     const recoveryStartedAt = Date.now();
     await recoverCommittedNativeReviewResponse(db, { ...scope, runId: entry.id,
-      decisionId: current.decisionId!, resultId: current.resultId!, assessmentId: current.assessmentId!, onlyWhenDue: true });
+      decisionId: current.decisionId!, resultId: current.resultId!, assessmentId: current.assessmentId!,
+      onlyWhenDue: current.failureCode !== "native_workspace_sync_out_failed" });
     const [remaining] = await candidates(scope, undefined, entry.id);
-    return remaining?.nextAttemptAt && remaining.nextAttemptAt.getTime() > recoveryStartedAt
+    return current.failureCode !== "native_workspace_sync_out_failed"
+      && remaining?.nextAttemptAt && remaining.nextAttemptAt.getTime() > recoveryStartedAt
       ? { ...entry, dueAt: remaining.nextAttemptAt.getTime() } : null;
   }
   function register(coordinator: ReturnType<typeof createDeliveryWorkCoordinator>, canRun: () => boolean) {
