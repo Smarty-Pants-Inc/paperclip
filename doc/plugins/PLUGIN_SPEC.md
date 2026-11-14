@@ -653,6 +653,16 @@ revision field or schema migration is required. Each worker-ready event starts a
 new process generation, even when the host reuses its worker handle. Outstanding
 reads and queued deliveries from retired generations are discarded; a slow
 company's callback does not block settings delivery to another company.
+Per company and process generation, the host retains at most one active delivery
+and one pending successor. Requests arriving before the successor starts share
+its fresh row read and result, even if the preceding RPC fails. Requests arriving
+during that successor may schedule one further delivery. There is no automatic
+retry without another delivery request.
+
+These guarantees describe host RPC admission and ordering, not cancellation of
+plugin code: an RPC timeout does not stop an already-running `onConfigChanged`
+callback. In particular, successful delivery of newer config after a timeout is
+not proof that an older callback cannot later mutate plugin-owned state.
 
 ### 13.5 `onEvent`
 
