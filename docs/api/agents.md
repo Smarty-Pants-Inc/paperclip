@@ -73,11 +73,12 @@ POST /api/companies/{companyId}/adapters/{type}/test-environment
 Requires agent-creation permission and, for a saved agent, permission to configure
 that agent. A completed probe returns `adapterType`, `status`, `testedAt` and
 `checks` (`code`, `level`, `message`, and optional `detail`, `hint`, `retryable`).
-Passes and warnings return HTTP `200`. A failed probe returns HTTP `422` with the
-same structured checks, plus `code` for the failed check and `error` for its
-bounded guidance. A non-HTTP exception thrown by the probe also returns a
-structured failure rather than a bare `500`; an unclassified exception uses
-`adapter_probe_failed`. Existing HTTP errors, managed-native cleanup-pending
+Every completed probe returns HTTP `200`, including a returned `status: "fail"`.
+Returned failures keep the same structured checks, plus an additive `code` for
+the failed check and `error` for its bounded guidance. Only a non-HTTP exception
+thrown by the probe returns HTTP `422` with a structured, redacted failure rather
+than a bare `500`; an unclassified exception uses `adapter_probe_failed`.
+Existing HTTP errors, managed-native cleanup-pending
 responses, authorization, configuration selection, allocation and release errors
 retain their existing HTTP error contracts and cleanup ownership. Probe text is secret-redacted and each
 message, detail and hint is limited to 2,000 characters.

@@ -3342,10 +3342,10 @@ export function agentRoutes(
       const aiBinding = requestedBinding?.mode === "router" ? undefined : requestedBinding;
       if (aiBinding && req.body.testCredentials && Object.keys(req.body.testCredentials).length) throw unprocessable("A managed connection test cannot override its credentials");
       const inputAdapterConfig = aiBinding ? { ...req.body.adapterConfig, env: stripAiAuthBindings(req.body.adapterConfig?.env) } : (req.body?.adapterConfig ?? {}) as Record<string, unknown>;
-      const respond = (result: AdapterEnvironmentTestResult, config = inputAdapterConfig) => {
+      const respond = (result: AdapterEnvironmentTestResult, config = inputAdapterConfig, statusCode = 200) => {
         const redacted = redactAdapterTestResult(result, config);
         const failure = redacted.status === "fail" ? adapterTestFailureDiagnostic(redacted) : null;
-        res.status(failure ? 422 : 200).json({ ...redactEventPayload({ ...redacted }),
+        res.status(statusCode).json({ ...redactEventPayload({ ...redacted }),
           ...(failure ? { code: failure.failureCode, error: failure.failureDetail } : {}) });
       };
       const savedAgentId = typeof req.body.agentId === "string" ? req.body.agentId : null;
@@ -3591,6 +3591,7 @@ export function agentRoutes(
           }
         }
         let diagnosticConfig = effectiveAdapterConfig;
+        let probeThrew = false;
         const probe = async (work: () => Promise<AdapterEnvironmentTestResult>) => {
           try { return await work(); }
           catch (error) {
@@ -3599,6 +3600,7 @@ export function agentRoutes(
             // Managed cleanup must reach withManagedAiProbe, which retains
             // credential ownership until native retirement is confirmed.
             if (error instanceof HttpError || aiBinding && error instanceof NativeEnvironmentProbeCleanupError) throw error;
+            probeThrew = true;
             return adapterTestErrorResult(type, error, diagnosticConfig);
           }
         };
@@ -3626,7 +3628,7 @@ export function agentRoutes(
           ...result,
           status,
           checks: prefixChecks.length > 0 ? [...prefixChecks, ...result.checks] : result.checks,
-        }, diagnosticConfig);
+        }, diagnosticConfig, probeThrew ? 422 : 200);
       } catch (err) {
         releaseStatus = "failed";
         throw err;
