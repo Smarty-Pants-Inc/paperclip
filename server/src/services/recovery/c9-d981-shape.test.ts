@@ -8,6 +8,8 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import * as blockerModule from "../execution-blocker.js";
 import { heartbeatService } from "../heartbeat.js";
 import { UNRESTORED_FILES_NEXT_ACTION } from "../legacy-execution-recovery.js";
+import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { STORAGE_CREDENTIALS_REJECTED_HELD_MESSAGE, STORAGE_UNAVAILABLE_HELD_MESSAGE } from "../../storage/storage-unavailable.js";
 import { settleUnansweredPersonMessage } from "./unanswered-person-message.js";
 
 // PROD d981 (adopt-lead 03:13Z): a warm chat after the env move. Person comment
@@ -76,12 +78,46 @@ describe.skipIf(!support.supported)("d981 shape: unrestored saved files, Retry n
     expect(rewrite!(UNRESTORED_FILES_NEXT_ACTION, true)).toBe(UNRESTORED_FILES_NEXT_ACTION);
     expect(rewrite!(UNRESTORED_FILES_NEXT_ACTION, false)).toBe("The task's saved files could not be put back after the run stopped. "
       + "They are kept where they were and are not applied. Create a new task to continue the work.");
-    expect(rewrite!("Saved work recovered. Retry or send a message to continue.", false))
-      .toBe("Saved work recovered. Send a message to continue.");
-    expect(rewrite!("Saved work recovered. Retry or send a message to continue.", true))
-      .toBe("Saved work recovered. Retry or send a message to continue.");
     expect(rewrite!("Send a new chat message to continue this conversation.", false))
       .toBe("Send a new chat message to continue this conversation.");
+  });
+
+  // RFL 03:50Z: every banner source that can carry a Retry instruction while
+  // Retry is disabled. The rewrite never says "send a message" (a message can
+  // be refused where Retry is): it always names the new-task action.
+  it.each([
+    // execution-blocker.ts final banner: recovered work with canRetry, no chat
+    // binding, but a held task-Retry refusal a click cannot change (retryOffered=false).
+    ["recovered work, Retry refused", "Saved work recovered. Retry or send a message to continue.",
+      "Saved work recovered. Create a new task to continue the work."],
+    // Stored recovery copy (#21348): legacy-execution-recovery.ts, the non-restore case.
+    ["legacy run stopped, uncertain actions", "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. "
+      + "Press Retry to continue the task in a fresh run; the agent checks those actions before repeating any.",
+      "The run stopped before it finished, and Paperclip cannot tell which of its last actions took effect. Create a new task to continue the work."],
+    // Stored held-run copy: storage/storage-unavailable.ts (both variants).
+    ["file storage unavailable", STORAGE_UNAVAILABLE_HELD_MESSAGE, "File storage was unavailable, so this attempt stopped before it could save its work. "
+      + "Paperclip is not retrying it automatically. Create a new task to continue the work."],
+    ["file storage credentials rejected", STORAGE_CREDENTIALS_REJECTED_HELD_MESSAGE, "File storage rejected Paperclip's storage credentials "
+      + "(they may have expired or been rotated), so this attempt stopped before it could save its work. "
+      + "Paperclip is not retrying it automatically. Create a new task to continue the work."],
+    // Stored recovery copy (#21348): the unrestored-files case (the d981 banner).
+    ["unrestored files", UNRESTORED_FILES_NEXT_ACTION, "The task's saved files could not be put back after the run stopped. "
+      + "They are kept where they were and are not applied. Create a new task to continue the work."],
+  ])("Retry disabled, %s -> names the new-task action, never 'Retry' or 'send a message'", (_name, text, expected) => {
+    const rewrite = (blockerModule as Record<string, unknown>).withoutUnavailableRetry as
+      ((text: string, retryOffered: boolean) => string) | undefined;
+    expect(typeof rewrite).toBe("function");
+    expect(rewrite!(text, false)).toBe(expected);
+    expect(rewrite!(text, false)).not.toMatch(/\bRetry\b|send a message/i);
+    expect(rewrite!(text, true)).toBe(text);
+  });
+
+  it("held conversation banner (HELD_PREDECESSOR_NOTICE) names no Retry and stays unchanged: its action is the new task", () => {
+    const rewrite = (blockerModule as Record<string, unknown>).withoutUnavailableRetry as
+      ((text: string, retryOffered: boolean) => string) | undefined;
+    expect(typeof rewrite).toBe("function");
+    expect(rewrite!(HELD_PREDECESSOR_NOTICE, false)).toBe(HELD_PREDECESSOR_NOTICE);
+    expect(HELD_PREDECESSOR_NOTICE).toContain("Assign this agent a new task to continue.");
   });
 
   it("B': the banner does not silence the message; after the bound it gets exactly one notice", async () => {
