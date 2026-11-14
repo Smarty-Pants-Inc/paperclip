@@ -82,6 +82,36 @@ describe("Boat provider", () => {
     const receipt = await plugin.definition.onEnvironmentDestroyLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" });
     expect(fetch).toHaveBeenCalledTimes(2); expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(fetch.mock.calls[1][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
   });
+  it("reports a retryable lease_closing error when stop races an outbound file read (RED)", async () => {
+    let commandStarted!: () => void, finishCommand!: () => void;
+    const started = new Promise<void>(resolve => { commandStarted = resolve; });
+    const commandGate = new Promise<void>(resolve => { finishCommand = resolve; });
+    const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/commands")) { commandStarted(); await commandGate; return response({ exitCode: 0, stdout: "", stderr: "" }); }
+      if (url.pathname.endsWith("/stop")) return response({ stop: { id: "stop_race", status: "pending" } }, 202);
+      if (url.pathname === "/api/v1/sandboxes/bx_race") return response({ sandbox: { id: "bx_race", state: "archived" } });
+      throw new Error(`Unexpected fake Boat request ${url.pathname} ${init.method ?? "GET"}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    const params = {
+      driverKey: "boat", companyId: "c", environmentId: "e", config: cfg,
+      lease: { providerLeaseId: "bx_race" },
+      operations: [{ operationId: "read", files: [{ sourcePath: "/home/user/source", targetPath: "/tmp/host-copy", kind: "file" as const }] }],
+    };
+    const read = plugin.definition.onEnvironmentSyncOut!(params as never);
+    await started;
+    await plugin.definition.onEnvironmentStopLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_race" });
+    finishCommand();
+    const failure = await read.then(() => null, error => error as Error & { category?: string });
+    // Today's behavior: request() wraps the admission error as a generic request_error.
+    expect(failure).toMatchObject({ category: "request_error" });
+    // Desired contract: callers can distinguish and retry this non-data failure.
+    // This assertion is intentionally RED on cl/plugin-boat-0.1.16.
+    expect(failure).toMatchObject({ category: "lease_closing" });
+    expect(failure?.message).toContain("lease_closing");
+    expect(fetch.mock.calls.some(([input]) => String(input).includes("/files/download-url"))).toBe(false);
+  });
   it("does not report stopped or destroyed when stop returns 404", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ error: "not_found" }, 404)); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentReleaseLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" })).rejects.toThrow("failed (404)");
