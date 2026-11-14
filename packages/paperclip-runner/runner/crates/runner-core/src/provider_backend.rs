@@ -1516,6 +1516,31 @@ impl CodexProviderState {
     }
 
     fn is_settled_for_run_rebinding(&self) -> bool {
+        self.is_settled_except_retained_events()
+            && self.pending_events.is_empty()
+            && self.queued_events.is_empty()
+    }
+
+    fn is_settled_for_run_attachment(&self) -> bool {
+        self.is_settled_except_retained_events()
+            && self
+                .pending_events
+                .iter()
+                .chain(self.queued_events.iter())
+                .all(|event| {
+                    // Restore's admission notices are history, not provider work.
+                    // Unknown diagnostics and substantive retained facts still fence
+                    // prepare; attachment retains the admitted notices for draining.
+                    event.event_type == "session.resumed"
+                        || (event.event_type == "harness.diagnostic"
+                            && matches!(
+                                event.payload.get("code").and_then(Value::as_str),
+                                Some("provider_startup_ownership" | "provider_startup_retired")
+                            ))
+                })
+    }
+
+    fn is_settled_except_retained_events(&self) -> bool {
         matches!(
             self.lifecycle.as_str(),
             "prepared" | "session_open" | "provider_exited"
@@ -1524,8 +1549,6 @@ impl CodexProviderState {
             && self.startup_attempt.is_none()
             && !self.receipt_limit_interrupt_pending
             && self.tool_bridge.pending_calls().next().is_none()
-            && self.pending_events.is_empty()
-            && self.queued_events.is_empty()
             && self
                 .goal
                 .as_ref()
@@ -3385,6 +3408,14 @@ impl CodexCommandExecutor {
     }
 
     fn prepare(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
+        self.prepare_with_legacy_attachment(payload, false)
+    }
+
+    fn prepare_with_legacy_attachment(
+        &mut self,
+        payload: &Value,
+        allow_legacy_attachment: bool,
+    ) -> Result<CommandExecution, DurableRunnerError> {
         let mut config: CodexProviderConfig = serde_json::from_value(
             payload
                 .get("provider")
@@ -3423,8 +3454,15 @@ impl CodexCommandExecutor {
                 .as_ref()
                 .zip(self.event_identity.as_ref())
                 .is_some_and(|(saved, current)| saved.run_id != current.run_id);
-            let rebind_run = different_run
-                && state.is_settled_for_run_rebinding()
+            // Only the public command path, after restoring the durable provider
+            // and under its authenticated current authority, may attach C8 state
+            // with no saved owner. The private preparation helper stays strict:
+            // changed contracts alone are never evidence of a different owner.
+            let legacy_attachment = allow_legacy_attachment
+                && state.run_identity.is_none()
+                && self.event_identity.is_some();
+            let rebind_run = (different_run || legacy_attachment)
+                && state.is_settled_for_run_attachment()
                 && state.pi_deferred_terminal.is_none()
                 && state.descendant_thread_ids.is_empty()
                 && self.provider.as_ref().is_none_or(|provider| {
@@ -3434,7 +3472,7 @@ impl CodexCommandExecutor {
                 });
             if state.config != config
                 || (state.completion_contract != completion_contract && !rebind_run)
-                || (different_run && !rebind_run)
+                || ((different_run || legacy_attachment) && !rebind_run)
             {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
@@ -3461,6 +3499,8 @@ impl CodexCommandExecutor {
                 ));
             }
             if rebind_run && state.thread_id.is_some() {
+                let refresh_pi_process =
+                    config.provider == "pi_rpc" && state.pi_runtime_context != pi_runtime_context;
                 // Reuse attachment's tool/accounting reset and live-provider
                 // contract update; changing only the saved binding is not enough.
                 let mut attachment_payload = payload.clone();
@@ -3470,7 +3510,7 @@ impl CodexCommandExecutor {
                     .as_object_mut()
                     .expect("validated prepare payload")
                     .remove("paperclipNextAuthority");
-                self.attach_run(&attachment_payload)?;
+                self.attach_run_with_provider_refresh(&attachment_payload, refresh_pi_process)?;
             } else {
                 let state = self.state.as_mut().expect("checked prepared state");
                 let mut changed = false;
@@ -3794,6 +3834,14 @@ impl CodexCommandExecutor {
     }
 
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
+        self.attach_run_with_provider_refresh(payload, false)
+    }
+
+    fn attach_run_with_provider_refresh(
+        &mut self,
+        payload: &Value,
+        refresh_provider: bool,
+    ) -> Result<(), DurableRunnerError> {
         self.retain_completed_accounting_tail()?;
         let mut next_state = self
             .state
@@ -4008,7 +4056,10 @@ impl CodexCommandExecutor {
         };
         let mut attachment_accounting = Vec::new();
         let retention = if let Some(provider) = self.provider.as_mut() {
-            if runtime_launch_changed || upgraded_skill_config {
+            if refresh_provider || runtime_launch_changed || upgraded_skill_config {
+                // prepare's changed Pi startup context must reload company skills,
+                // even when an ordinary warm run.attach could refresh in place.
+                // The predecessor's tail was retained before cloning next_state.
                 Ok(false)
             } else {
                 provider
@@ -6458,7 +6509,7 @@ impl CommandExecutor for CodexCommandExecutor {
                 ));
             }
             match command.command_type.as_str() {
-                "run.prepare" => self.prepare(&command.payload),
+                "run.prepare" => self.prepare_with_legacy_attachment(&command.payload, true),
                 "run.attach" => {
                     if self.state.is_none() && command.payload.get("provider").is_some() {
                         self.prepare(&command.payload)?;
@@ -8394,6 +8445,10 @@ done
         );
         fs::remove_dir_all(directory).unwrap();
     }
+
+    include!("provider_backend_tests/cross_run_base.rs");
+    include!("provider_backend_tests/cross_run_judge.rs");
+    include!("provider_backend_tests/cross_run_round2.rs");
 
     fn prepared_skill_checkpoint(
         provider: &str,
