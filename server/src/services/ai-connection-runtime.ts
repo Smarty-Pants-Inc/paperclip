@@ -3,6 +3,7 @@ import type { ManagedAiCredentialWritebackBinding } from "./managed-ai-credentia
 import { OPENROUTER_ATTRIBUTION_HEADERS, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { createHash } from "node:crypto";
 import { HttpError, unprocessable } from "../errors.js";
+import { adapterTestCleanupErrorResult, recordAdapterTestFailure } from "../lib/adapter-test-failure.js";
 import { mkdtemp, mkdir, writeFile, readFile, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -651,7 +652,11 @@ export async function withManagedAiProbe<T>(
       const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
-      throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
+      // Keep the HTTP/retry contract and retained owner, but attach the cleanup's
+      // own evidence while the selected runtime still supplies redaction values.
+      throw recordAdapterTestFailure(
+        unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" }),
+        adapterTestCleanupErrorResult(input.adapterType, error.cleanupErrors, runtime.config));
     }
     throw error;
   } finally {

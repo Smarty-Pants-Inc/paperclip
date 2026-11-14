@@ -51,11 +51,26 @@ export function readAdapterTestFailure(error: unknown): AdapterTestFailureDiagno
   return error instanceof Error ? failures.get(error) : undefined;
 }
 
+function probeErrorCheck(error: unknown, fallbackCode: string, cleanup = false) {
+  const candidate = error as { code?: unknown; details?: { code?: unknown } } | null;
+  const message = error instanceof Error ? error.message
+    : cleanup && typeof error === "string" ? error : "The adapter environment probe failed.";
+  // Runner checkpoint errors historically name their code in the message.
+  // Recognize only that narrow convention, and never override an explicit code.
+  const code = candidate?.details?.code ?? candidate?.code
+    ?? (cleanup ? /^(runner_[A-Za-z0-9_]{1,120})(?=:|$)/.exec(message)?.[1] : undefined);
+  return { code: typeof code === "string" ? code : fallbackCode, level: "error" as const, message };
+}
+
 /** Only call at the probe boundary, not for authorization, allocation or release errors. */
 export function adapterTestErrorResult(adapterType: string, error: unknown, config: Record<string, unknown> = {}): AdapterEnvironmentTestResult {
-  const candidate = error as { code?: unknown; details?: { code?: unknown } } | null;
-  const code = candidate?.details?.code ?? candidate?.code;
   return redactAdapterTestResult({ adapterType, status: "fail", testedAt: new Date().toISOString(),
-    checks: [{ code: typeof code === "string" ? code : "adapter_probe_failed", level: "error",
-      message: error instanceof Error ? error.message : "The adapter environment probe failed." }] }, config);
+    checks: [probeErrorCheck(error, "adapter_probe_failed")] }, config);
+}
+
+/** Normalize teardown causes, not the operation failure or its cleanup-pending wrapper. */
+export function adapterTestCleanupErrorResult(adapterType: string, cleanupErrors: readonly unknown[], config: Record<string, unknown> = {}): AdapterEnvironmentTestResult {
+  const checks = cleanupErrors.map(error => probeErrorCheck(error, "native_probe_cleanup_failed", true));
+  return redactAdapterTestResult({ adapterType, status: "fail", testedAt: new Date().toISOString(),
+    checks: checks.length ? checks : [{ code: "native_probe_cleanup_failed", level: "error", message: "Native probe cleanup did not complete." }] }, config);
 }

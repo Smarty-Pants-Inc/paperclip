@@ -116,6 +116,27 @@ describe.skipIf(!support.supported)("agent roster read projections", () => {
     expect(await agentRecordQueries(db).getById(randomUUID())).toBeNull();
   });
 
+  // Keep: failure diagnostics cross the API boundary, worker authority must not.
+  it("projects only stored failure evidence and omits it after the operation is repaired", async () => {
+    const f = await fixture(), records = agentRecordQueries(db);
+    const operation = { id: randomUUID(), hostComplete: false, completedPluginIds: [randomUUID()], attempts: 3,
+      leaseOwner: "private-worker-owner", leaseHolder: { bootId: randomUUID(), pid: 123, hostHash: "private-host", processStartedAt: null },
+      responsibleUserId: "private-responsible-user", failureCode: "fixture_sync_out_failed", failureDetail: "Sync out failed" };
+    await db.update(agents).set({ lifecycleOperation: operation, lifecycleRequiredPluginIds: [randomUUID()],
+      harnessVerifiedDigest: "private-verification-digest" }).where(eq(agents.id, f.workerId));
+    const detail = await records.getById(f.workerId);
+    const roster = await agentService(db).list(f.companyId);
+    for (const row of [detail, roster.find(agent => agent.id === f.workerId)]) {
+      expect(row?.lifecycleOperation).toEqual({ failureCode: "fixture_sync_out_failed", failureDetail: "Sync out failed" });
+      expect(row).not.toHaveProperty("lifecycleRequiredPluginIds");
+      expect(row).not.toHaveProperty("harnessVerifiedDigest");
+      expect(JSON.stringify(row)).not.toMatch(/private-worker-owner|private-host|private-responsible-user/);
+    }
+    const { failureCode: _code, failureDetail: _detail, ...repaired } = operation;
+    await db.update(agents).set({ lifecycleOperation: repaired }).where(eq(agents.id, f.workerId));
+    expect(await records.getById(f.workerId)).not.toHaveProperty("lifecycleOperation");
+  });
+
   it("rechecks manager status, name, selected configuration, missing managers, and cycles on later reads", async () => {
     const f = await fixture(), records = agentRecordQueries(db);
     expect((await records.getById(f.workerId))?.orgChainHealth.reason).toBe("terminated_ancestor");

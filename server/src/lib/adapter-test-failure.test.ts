@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AdapterEnvironmentTestResult } from "@paperclipai/adapter-utils";
-import { adapterTestErrorResult, adapterTestFailureDiagnostic, readAdapterTestFailure, recordAdapterTestFailure, redactAdapterTestResult } from "./adapter-test-failure.js";
+import { adapterTestCleanupErrorResult, adapterTestErrorResult, adapterTestFailureDiagnostic, readAdapterTestFailure, recordAdapterTestFailure, redactAdapterTestResult } from "./adapter-test-failure.js";
 
 // Keep: provider diagnostics cross a credential boundary into durable state and logs.
 describe("adapter probe diagnostic boundary", () => {
@@ -51,11 +51,45 @@ describe("adapter probe diagnostic boundary", () => {
     expect(JSON.stringify(result)).not.toContain("sk-code-canary");
   });
 
+  it("keeps the first teardown's code and redacts every cleanup check before persistence", () => {
+    const credential = "cleanup secret/+?";
+    const first = Object.assign(new Error(`Sync out failed: ${credential}; ${encodeURIComponent(credential)}; api_key=sk-cleanup-canary; ${"x".repeat(3_000)}`),
+      { code: "fixture_sync_out_failed" });
+    const second = Object.assign(new Error(`Authority release failed: ${credential}`), { details: { code: "fixture_release_failed" } });
+    const result = adapterTestCleanupErrorResult("paperclip_runner", [first, second], { env: { CUSTOM: credential } });
+    expect(result.checks.map(check => check.code)).toEqual(["fixture_sync_out_failed", "fixture_release_failed"]);
+    const diagnostic = adapterTestFailureDiagnostic(result);
+    expect(diagnostic).toMatchObject({ failureCode: "fixture_sync_out_failed", failureDetail: expect.stringContaining("Sync out failed") });
+    expect(diagnostic.failureDetail.length).toBeLessThanOrEqual(2_000);
+    expect(JSON.stringify(result)).not.toContain(credential);
+    expect(JSON.stringify(result)).not.toContain(encodeURIComponent(credential));
+    expect(JSON.stringify(result)).not.toContain("sk-cleanup-canary");
+  });
+
+  it.each(["runner_remote_checkpoint_archive_unsafe_entry", "runner_remote_checkpoint_archive_unsafe_entry: forbidden link"])("recognizes the Runner's message-only cleanup code: %s", message => {
+    expect(adapterTestFailureDiagnostic(adapterTestCleanupErrorResult("paperclip_runner", [new Error(message)])))
+      .toEqual({ failureCode: "runner_remote_checkpoint_archive_unsafe_entry", failureDetail: message });
+    // Message inference is deliberately restricted to teardown normalization.
+    expect(adapterTestErrorResult("paperclip_runner", new Error(message)).checks[0]!.code).toBe("adapter_probe_failed");
+  });
+
+  it("does not replace explicit cleanup codes with message prefixes", () => {
+    const reason = Object.assign(new Error("runner_remote_checkpoint_archive_unsafe_entry: evidence lost"), { code: "fixture_sync_out_failed" });
+    expect(adapterTestCleanupErrorResult("paperclip_runner", [reason]).checks[0]!.code).toBe("fixture_sync_out_failed");
+  });
+
+  it.each([{ reasons: [] }, { reasons: [new Error("Cleanup proof unavailable")] }, { reasons: ["Cleanup proof unavailable"] }])("names uncoded or absent cleanup errors without inventing a provider code: $reasons", ({ reasons }) => {
+    const diagnostic = adapterTestFailureDiagnostic(adapterTestCleanupErrorResult("paperclip_runner", reasons));
+    expect(diagnostic.failureCode).toBe("native_probe_cleanup_failed");
+    expect(diagnostic.failureDetail).toBeTruthy();
+  });
+
   it("preserves cleanup and HTTP probe codes, and names a code-less thrown probe", () => {
     expect(adapterTestErrorResult("paperclip_runner", { code: "NATIVE_ENVIRONMENT_PROBE_CLEANUP_PENDING" }).checks[0]!.code)
       .toBe("NATIVE_ENVIRONMENT_PROBE_CLEANUP_PENDING");
     expect(adapterTestErrorResult("paperclip_runner", { details: { code: "native_probe_cleanup_pending" } }).checks[0]!.code)
       .toBe("native_probe_cleanup_pending");
     expect(adapterTestErrorResult("paperclip_runner", new Error("Probe failed")).checks[0]!.code).toBe("adapter_probe_failed");
+    expect(adapterTestErrorResult("paperclip_runner", "Non-Error probe throw").checks[0]!.message).toBe("The adapter environment probe failed.");
   });
 });

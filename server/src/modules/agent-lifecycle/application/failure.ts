@@ -1,7 +1,9 @@
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
+import { readAdapterTestFailure } from "../../../lib/adapter-test-failure.js";
 import type { LifecycleFailure } from "./ports.js";
 
-// Only fixed text may leave this boundary. Provider errors can contain secrets.
+// Only fixed text and owned, redacted probe codes may leave this boundary.
+// Raw provider errors can contain secrets.
 const connectionReasons = {
   ai_connection_responsible_user_missing: "Set the responsible user before selecting this agent's AI connection.",
   ai_connection_default_missing: "Connect an AI account and choose the responsible user's personal default for this provider.",
@@ -58,7 +60,8 @@ export function lifecycleFailureMessage(context: LifecycleFailure, error: unknow
     : context.stage === "select_plugins" ? `${phase}: finding required plugins`
     : ["save_plugins", "complete_host", "complete_plugin", "transition"].includes(context.stage)
       ? `${phase}: saving progress` : phase;
-  const code = lifecycleFailureCode(error);
+  // Presentation may name owned probe evidence without changing retry policy.
+  const code = lifecycleFailureCode(error) ?? readAdapterTestFailure(error)?.failureCode;
   const retryRequired = lifecycleVerificationNeedsRetry(context, error);
   const reason = code && Object.hasOwn(connectionReasons, code) ? connectionReasons[code as keyof typeof connectionReasons]
     : code && Object.hasOwn(reasons, code) ? reasons[code as keyof typeof reasons]

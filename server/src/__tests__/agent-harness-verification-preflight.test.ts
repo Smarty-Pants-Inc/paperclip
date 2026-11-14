@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import express from "express";
+import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { agents, aiProviderDefaults, companies, companyMemberships, connectionGrants, createDb, environments, plugins } from "@paperclipai/db";
@@ -13,6 +15,14 @@ import { aiConnectionService } from "../services/ai-connections.js";
 import { secretService } from "../services/secrets.js";
 import { readAiConnectionConfigurationFailure } from "../services/ai-connection-configuration-failure.js";
 import { readAdapterTestFailure } from "../lib/adapter-test-failure.js";
+import { NativeEnvironmentProbeCleanupError } from "../vendor/paperclip-runner/index.js";
+import { createLifecycleWorker } from "../modules/agent-lifecycle/application/worker.js";
+import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
+import { createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
+import { reconcileRetainedAiCleanup } from "../services/retained-ai-credential-cleanup.js";
+import { agentRoutes } from "../routes/agents.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { logger } from "../middleware/logger.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -134,6 +144,70 @@ describePostgres("saved harness account preflight", () => {
       failureDetail: expect.stringContaining("Fixture probe failure") });
     expect(readAdapterTestFailure(error)?.failureDetail).not.toContain("fixture-preflight-key");
     expect(release).toHaveBeenCalledExactlyOnceWith("failed");
+  });
+
+  // Keep: real hires lost unrelated teardown errors at the managed-account
+  // boundary. Exercise the persisted lifecycle row and the UI's real GET route.
+  it.each(["coded", "runner-message", "multiple", "uncoded"] as const)("persists and returns the cleanup's own failure, not the pending wrapper (%s)", async mode => {
+    const code = mode === "runner-message" ? "runner_remote_checkpoint_archive_unsafe_entry"
+      : mode === "uncoded" ? "native_probe_cleanup_failed" : "fixture_sync_out_failed";
+    const message = `${mode === "uncoded" ? "Sync out failed" : code}: failed to retain runtime evidence; fixture-preflight-key; api_key=sk-cleanup-canary; ${"x".repeat(3_000)}`;
+    const reason = mode === "coded" || mode === "multiple" ? Object.assign(new Error(message), { code }) : new Error(message);
+    const additional = Object.assign(new Error("second teardown reason: fixture-preflight-key"), { code: "fixture_authority_release_failed" });
+    probe.mockRejectedValueOnce(new NativeEnvironmentProbeCleanupError(Promise.resolve(), new Error("unrelated operation failure"),
+      mode === "multiple" ? [reason, additional] : [reason]));
+    [agent] = await db.update(agents).set({ lifecycleRequiredPluginIds: [], lifecycleOperation: {
+      id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0, verificationFailures: 2,
+    } }).where(eq(agents.id, agent.id)).returning();
+    const effects = createAgentLifecycleEffects();
+    const report = vi.fn(effects.reportFailure);
+    const log = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const worker = createLifecycleWorker(createLifecycleStore(db, effects), {
+      requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost: () => verify(),
+    }, report);
+    try {
+      await worker.process(agent.id);
+      expect(report).toHaveBeenCalledOnce();
+      const failure = report.mock.calls[0]![1];
+      expect(failure).toMatchObject({ details: { code: "native_probe_cleanup_pending" } });
+      expect.soft(readAdapterTestFailure(failure)).toMatchObject({ failureCode: code,
+        failureDetail: expect.stringContaining("failed to retain runtime evidence") });
+      const [saved] = await db.select().from(agents).where(eq(agents.id, agent.id));
+      expect.soft(saved!.lifecycleOperation).toMatchObject({ failureCode: code,
+        failureDetail: expect.stringContaining("failed to retain runtime evidence"), verificationFailures: 3, retryRequired: true });
+      expect.soft(saved!.lifecycleError).not.toContain("unclassified");
+      const app = express();
+      app.use((req, _res, next) => {
+        req.actor = { type: "board", source: "session", userId, companyIds: [agent.companyId], isInstanceAdmin: true };
+        next();
+      });
+      app.use("/api", agentRoutes(db));
+      app.use(errorHandler);
+      const response = await request(app).get(`/api/agents/${agent.id}`);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect.soft(response.body.lifecycleOperation).toEqual({ failureCode: code,
+        failureDetail: expect.stringContaining("failed to retain runtime evidence") });
+      expect.soft(response.body.lifecycleError).toContain(code);
+      expect(response.body).not.toHaveProperty("lifecycleRequiredPluginIds");
+      expect(response.body).not.toHaveProperty("harnessVerifiedDigest");
+      const roster = await request(app).get(`/api/companies/${agent.companyId}/agents`);
+      expect(roster.status).toBe(200);
+      expect.soft(roster.body.find((row: { id: string }) => row.id === agent.id)?.lifecycleOperation)
+        .toEqual(response.body.lifecycleOperation);
+      expect.soft(log).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ stage: "host", agentId: agent.id,
+        operationId: agent.lifecycleOperation!.id, failureCode: code,
+        failureDetail: expect.stringContaining("failed to retain runtime evidence") }), "Agent lifecycle operation failed");
+      for (const surface of [saved!.lifecycleOperation, response.body.lifecycleOperation, log.mock.calls]) {
+        expect(JSON.stringify(surface)).not.toMatch(/fixture-preflight-key|sk-cleanup-canary|unrelated operation failure/);
+      }
+      expect(response.body.lifecycleOperation.failureDetail).toBe(saved!.lifecycleOperation!.failureDetail);
+      expect(response.body.lifecycleOperation.failureDetail.length).toBeLessThanOrEqual(2_000);
+      expect(release).toHaveBeenCalledExactlyOnceWith("failed");
+    } finally {
+      await worker.stop();
+      const managed = probe.mock.calls[0]![3];
+      await reconcileRetainedAiCleanup(managed.retainedCleanupScope!);
+    }
   });
 
   async function useRunnerTaskEnvironment(runtimeConfig: Record<string, unknown>, homeMode?: string) {

@@ -8,6 +8,7 @@ import { startAgentLifecycle } from "../index.js";
 import { createAgentLifecycleEffects } from "../../../services/agent-lifecycle.js";
 import { logger } from "../../../middleware/logger.js";
 import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "../application/failure.js";
+import { adapterTestErrorResult, recordAdapterTestFailure } from "../../../lib/adapter-test-failure.js";
 
 const agent: LifecycleAgent = { id: "agent", companyId: "company", lifecycleState: "verifying", lifecycleVersion: 3,
   lifecycleRequiredPluginIds: null, lifecycleError: null,
@@ -136,6 +137,17 @@ describe("lifecycle failure diagnostics", () => {
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("secret provider output");
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("unknown private code");
     await worker.stop();
+  });
+
+  it.each(["fixture_sync_out_failed", "harness_auth_failed"])("names owned cleanup evidence without changing broad retry classification: %s", code => {
+    const error = recordAdapterTestFailure(unprocessable("Cleanup pending", { code: "native_probe_cleanup_pending" }),
+      adapterTestErrorResult("paperclip_runner", Object.assign(new Error("Safe cleanup detail"), { code })));
+    expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying", verificationFailures: 1 }, error)).toBe(false);
+    const context = { stage: "host" as const, phase: "verifying" as const, verificationFailures: 3 };
+    expect(lifecycleVerificationNeedsRetry(context, error)).toBe(true);
+    expect(lifecycleFailureMessage(context, error)).not.toContain("unclassified");
+    if (code === "fixture_sync_out_failed") expect(lifecycleFailureMessage(context, error)).toContain(code);
+    expect(lifecycleFailureMessage(context, unprocessable("Cleanup pending", { code }))).toContain("unclassified");
   });
 
   it("does not treat prototype properties as allowed failure codes", () => {

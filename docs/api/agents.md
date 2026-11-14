@@ -90,6 +90,19 @@ unchanged. A single lifecycle warning includes these fields with the agent and
 operation IDs. Retry, repaired configuration and successful verification clear
 stale probe diagnostics; these fields do not imply that verification passed.
 
+Managed native cleanup keeps the `native_probe_cleanup_pending` HTTP contract and
+retained cleanup ownership, but lifecycle diagnostics name the first teardown
+failure rather than that pending wrapper or the original probe operation error.
+Explicit cleanup codes are preserved; Runner checkpoint errors that name their
+code at the beginning of their message preserve that code too. Other uncoded
+cleanup failures use `native_probe_cleanup_failed`.
+
+Agent detail and company agent-list responses expose a failure-only
+`lifecycleOperation` projection containing `failureCode` and `failureDetail` when
+present. Worker leases, operation bookkeeping, required-plugin IDs and harness
+verification digests remain server-only. The projection is omitted once those
+stored diagnostics are cleared.
+
 ## Create Agent
 
 ```

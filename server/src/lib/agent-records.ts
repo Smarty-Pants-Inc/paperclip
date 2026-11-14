@@ -335,6 +335,10 @@ export function agentRecordQueries(db: Db) {
     const { lifecycleOperation, lifecycleRequiredPluginIds, harnessVerifiedDigest, harnessVerifiedAt, ...publicRow } = row;
     return withUrlKey({
       ...publicRow,
+      // Publish only probe diagnostics, never worker leases or plugin progress.
+      ...(lifecycleOperation?.failureCode !== undefined || lifecycleOperation?.failureDetail !== undefined ? {
+        lifecycleOperation: { failureCode: lifecycleOperation.failureCode, failureDetail: lifecycleOperation.failureDetail },
+      } : {}),
       permissions: normalizeAgentPermissions(row.permissions, { role: row.role }),
     });
   }

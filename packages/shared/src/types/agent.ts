@@ -1,4 +1,4 @@
-import type { AgentLifecycleState } from "./agent-lifecycle.js";
+import type { AgentLifecycleOperation, AgentLifecycleState } from "./agent-lifecycle.js";
 import type { AgentAppearance } from "../agent-appearance.js";
 import type { AiConnectionLoginIntent } from "../ai-connections.js";
 import type {
@@ -104,6 +104,8 @@ export interface Agent {
   lifecycleState?: AgentLifecycleState;
   lifecycleVersion?: number;
   lifecycleError?: string | null;
+  /** Public failure-only projection; worker leases and plugin progress stay private. */
+  lifecycleOperation?: Pick<AgentLifecycleOperation, "failureCode" | "failureDetail">;
   reportsTo: string | null;
   capabilities: string | null;
   adapterType: AgentAdapterType;

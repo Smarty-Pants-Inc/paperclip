@@ -24,6 +24,16 @@ describe("agentsApi.testEnvironment", () => {
   });
 });
 
+// Keep: the agent page must receive the persisted diagnostic, not just a generic lifecycle error.
+it("preserves lifecycle cleanup diagnostics returned by the agent-detail API", async () => {
+  const lifecycleOperation = { failureCode: "fixture_sync_out_failed", failureDetail: "Sync out failed while saving probe evidence" };
+  vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({ id: "agent-1", lifecycleOperation }), {
+    status: 200, headers: { "Content-Type": "application/json" },
+  }));
+  const agent = await agentsApi.get("agent-1");
+  expect(agent.lifecycleOperation).toEqual(lifecycleOperation);
+});
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("agentsApi.retryFailedRun", () => {
