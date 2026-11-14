@@ -9,6 +9,8 @@ export const FRESH_THREAD_REFUSAL_CODES = [
   "native_controller_recovery_missing_evidence:snapshot_binding",
   "native_controller_recovery_unsupported:metadata_format",
   "runner_remote_state_unavailable",
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   "native_runner_refresh_required",
   "native_runner_launch_profile_mismatch",
 ] as const;
@@ -20,6 +22,10 @@ export function freshThreadRefusalCode(error: unknown, depth = 0): FreshThreadRe
   if (!error || typeof error !== "object" || depth > 5) return null;
   const value = error as { code?: unknown; cause?: unknown };
   if (isCode(value.code)) return value.code;
+  // C1 carries the specific authenticated prepare refusal. Preserve it before
+  // the generic refresh class so restoration failures never claim a skill edit.
+  const prepareCode = runnerPrepareRefusalCode(error);
+  if (isCode(prepareCode)) return prepareCode;
   const failureClass = runnerReconciliationFailureClass(error);
   if (failureClass === "provider_refresh_required") return "native_runner_refresh_required";
   if (failureClass === PROVIDER_LAUNCH_PROFILE_MISMATCH) return "native_runner_launch_profile_mismatch";

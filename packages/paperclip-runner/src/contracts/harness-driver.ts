@@ -605,17 +605,23 @@ export interface HarnessSessionRecoveryResult {
   runnerExitConfirmed?: true;
   refreshWaitForTurn?: true;
   prepareRefusalCode?: RunnerPrepareRefusalCode;
-  /** Server-authored remote read refusal; diagnostics are not authority. */
-  recoveryRefusalCode?: "runner_remote_state_unavailable";
+  /** Server-authored restoration refusal; diagnostics are not authority. */
+  recoveryRefusalCode?: "runner_remote_state_unavailable"
+    | "runner_harness_state_mismatch: backup_without_reusable_lease"
+    | "native_controller_recovery_missing_evidence:retained_sandbox_binding";
 }
 
-/** Keep the remote-state refusal across driver recovery without interpreting
- * serialized errors or unknown future codes as a deterministic refusal. */
+/** Keep closed controller restoration refusals across driver recovery and C1
+ * prepare/attach receipts. Serialized prose and future codes are not authority. */
 export function runnerRecoveryRefusalCode(error: unknown, depth = 0): HarnessSessionRecoveryResult["recoveryRefusalCode"] {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   const failure = error as { code?: unknown; cause?: unknown };
-  return failure.code === "runner_remote_state_unavailable" ? failure.code
-    : runnerRecoveryRefusalCode(failure.cause, depth + 1);
+  for (const code of [failure.code, runnerPrepareRefusalCode(error)]) {
+    if (code === "runner_remote_state_unavailable"
+      || code === "runner_harness_state_mismatch: backup_without_reusable_lease"
+      || code === "native_controller_recovery_missing_evidence:retained_sandbox_binding") return code;
+  }
+  return runnerRecoveryRefusalCode(failure.cause, depth + 1);
 }
 
 /** The additive prepare/attach channel. Unknown and old no-code receipts map
@@ -627,12 +633,19 @@ export const RUNNER_PREPARE_REFUSAL_CODES = [
   "provider_launch_profile_mismatch", "provider_session_closed",
   "provider_reconciliation_required", "provider_pending_tool_calls",
   "provider_prepare_refused",
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
+  "native_controller_recovery_missing_evidence:retained_sandbox_binding",
 ] as const;
 export type RunnerPrepareRefusalCode = typeof RUNNER_PREPARE_REFUSAL_CODES[number];
 export function runnerPrepareRefusalCode(error: unknown, depth = 0): RunnerPrepareRefusalCode | undefined {
   if (!error || typeof error !== "object" || depth > 5) return undefined;
   if (error instanceof NativeRunnerRefreshRequiredError && error.prepareRefusalCode) return error.prepareRefusalCode;
   const value = error as Record<string, unknown>;
+  // Runtime recovery preserves C1's specific code beside the closed
+  // controller refusal. Accept only a matching pair, never an arbitrary field.
+  if ((value.code === "runner_harness_state_mismatch: backup_without_reusable_lease"
+    || value.code === "native_controller_recovery_missing_evidence:retained_sandbox_binding")
+    && value.prepareRefusalCode === value.code) return value.code;
   const record = (v: unknown): Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v)
     ? v as Record<string, unknown> : {};
   const receipt = record(value.runnerCommandResult);

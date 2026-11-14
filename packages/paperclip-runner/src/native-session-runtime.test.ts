@@ -28,7 +28,7 @@ import {
   NativeSessionProtocolIntegrityError,
   nativeRestartContinuationInFlight, nativeRestartInterruptedTurnId,
 } from "./contracts/native-session-backend.js";
-import { NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
+import { runnerPrepareRefusalCode, NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -6723,34 +6723,35 @@ describe("executeNativeSession recovery", () => {
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
   ] as const)("D10b preserves exact refusal through actual driver recovery (%s)", async refusalCode => {
     for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
-      for (const structuredPrepare of refusalCode === "runner_remote_state_unavailable" ? [false] : [false, true]) {
-      const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
-      const transport = new FakeCodexTransport();
-      transport.rejectMethods.set("initialize", Object.assign(new Error("opaque remote read failure"),
-        structuredPrepare ? { runnerCommandResult: { commandType: "run.prepare", status: "failed",
-          result: { code: "command_execution_failed", refusalCode, message: "opaque" } } } : { code: refusalCode }));
-      const transportFactory = vi.fn(() => transport);
-      const backend = createCodexNativeSessionBackend(executionInput, {
-        runnerInstanceId: "runner-recovery", transportFactory,
-      });
-      const openRun = vi.fn(), appendEvent = vi.fn(), completeRun = vi.fn();
-      const failure = await executeNativeSession({ input: executionInput, backend,
-        runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
-        controlPlane: { openRun, appendEvent, completeRun,
-          loadSessionCheckpoint: async () => ({ backendKind: "runner", driverKind: "codex_app_server",
-            sessionId: "earlier-driver", providerSessionId: "earlier-provider", identity,
-            workingDirectory: WORKSPACE, cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy }),
-          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
-        },
-      }).catch((error: unknown) => error);
-      expect(failure).toMatchObject({ code: refusalCode });
-      expect(openRun).not.toHaveBeenCalled();
-      expect(completeRun).not.toHaveBeenCalled();
-      expect(transport.calls.some(call => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
-      expect(transportFactory).toHaveBeenCalledOnce();
+      for (const commandType of refusalCode === "runner_remote_state_unavailable" ? [null] : [null, "run.prepare", "run.attach"]) {
+        const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
+        const transport = new FakeCodexTransport();
+        transport.rejectMethods.set("initialize", Object.assign(new Error("opaque remote read failure"),
+          commandType ? { code: "opaque_transport_error", runnerCommandResult: { commandType, status: "failed",
+            result: { code: "command_execution_failed", refusalCode, message: "opaque" } } } : { code: refusalCode }));
+        const transportFactory = vi.fn(() => transport);
+        const backend = createCodexNativeSessionBackend(executionInput, {
+          runnerInstanceId: "runner-recovery", transportFactory,
+        });
+        const openRun = vi.fn(), appendEvent = vi.fn(), completeRun = vi.fn();
+        const failure = await executeNativeSession({ input: executionInput, backend,
+          runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+          controlPlane: { openRun, appendEvent, completeRun,
+            loadSessionCheckpoint: async () => ({ backendKind: "runner", driverKind: "codex_app_server",
+              sessionId: "earlier-driver", providerSessionId: "earlier-provider", identity,
+              workingDirectory: WORKSPACE, cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy }),
+            replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+          },
+        }).catch((error: unknown) => error);
+        expect(failure).toMatchObject({ code: refusalCode });
+        expect(runnerPrepareRefusalCode(failure)).toBe(commandType ? refusalCode : undefined);
+        expect(openRun).not.toHaveBeenCalled();
+        expect(completeRun).not.toHaveBeenCalled();
+        expect(transport.calls.some(call => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
+        expect(transportFactory).toHaveBeenCalledOnce();
       }
     }
-    });
+  });
 
   it("C3 retains launch-profile refusal before every legacy replacement callback", async () => {
     for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {

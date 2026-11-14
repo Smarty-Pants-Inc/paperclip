@@ -30,6 +30,9 @@ it.each([
   "native_controller_recovery_missing_evidence:retained_sandbox_binding",
 ])("D10b preserves exact controller and C1 refusal without trusting prose (%s)", code => {
   expect(freshThreadRefusalCode(nativeReconciliationError(code))).toBe(code);
+  expect(runnerPrepareRefusalCode({ code, prepareRefusalCode: code })).toBe(code);
+  expect(runnerPrepareRefusalCode({ prepareRefusalCode: code })).toBeUndefined();
+  expect(runnerPrepareRefusalCode({ code, prepareRefusalCode: "provider_active_turn" })).toBeUndefined();
   expect(freshThreadRefusalCode(new Error(code))).toBeNull();
   expect(isFreshThreadRefusal({ errorCode: "native_session_interrupted", error: code })).toBe(true);
   expect(isFreshThreadRefusal({ error: `provider said ${code}` })).toBe(false);

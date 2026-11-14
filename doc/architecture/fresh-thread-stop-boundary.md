@@ -31,10 +31,15 @@ introduced by the server policy.
 
 ## Contract and existing owners
 
-* **Input/classification:** only the five exact codes in
+* **Input/classification:** only the exact closed codes in
   [`FRESH_THREAD_REFUSAL_CODES`](../../server/src/services/native-runtime/runner-reconciliation-refusal.ts).
   Structured codes and bounded error causes survive the runner boundary. Diagnostic
-  prose never grants authority. Older rows may contain a whole reserved code in
+  prose never grants authority. The archived-chat refusals
+  `runner_harness_state_mismatch: backup_without_reusable_lease` and
+  `native_controller_recovery_missing_evidence:retained_sandbox_binding` use this
+  same owner and proof predicate; C1 prepare/attach receipts preserve their exact
+  codes ahead of generic refresh classification. They never claim a skill edit.
+  Older rows may contain a whole reserved code in
   their generic error envelope; quoted/embedded diagnostic text is not accepted.
 * **Decision owner:** `continueFreshInTransaction`, under the existing task,
   coordinator, run and recovery-record locks. It checks assignment, newer work,

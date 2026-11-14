@@ -18,6 +18,7 @@ import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
+import { nativeReconciliationError } from "./runner-reconciliation-refusal.js";
 
 export const NATIVE_CONTROLLER_RECOVERY_MAX_BYTES = 4 * 1024;
 
@@ -353,19 +354,19 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: Retained
   if (!owner || owner.recoveryState || typeof recordedCwd !== "string"
     || !sameSandboxWorkspaceAllocation(recordedCwd, target.remoteCwd)
     || !["active", "released", "expired"].includes(leases[0].status)) {
-    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   if (!owner.resultId) {
     // A failed or missing observation must retain the existing refusal, never
     // degrade into the committed-source lane or an implicit fresh session.
     if (await stoppedRetainedPiSource(db, input, owner, leases[0]).catch(() => false)) return { remoteCwd: recordedCwd };
-    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   if (owner.leaseOwner && owner.leaseExpiresAt && owner.leaseExpiresAt > new Date()) {
     throw new NativeControllerRecoveryWaitingError(owner.leaseExpiresAt);
   }
   if (owner.leaseOwner || owner.phase !== "committed") {
-    throw new Error("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   return { remoteCwd: recordedCwd };
 }
