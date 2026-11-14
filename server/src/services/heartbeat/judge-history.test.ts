@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { currentNotices } from "../rfl-current-notice-assertions.js";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -389,7 +390,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect((await notices()).filter(comment => comment.authorType === "system")).toMatchObject([{
       body: expect.stringContaining("fresh thread in this conversation"),
-      metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` },
+      metadata: { authorizationReason: `fresh_provider_thread_pending:${oldId}` },
     }]);
     expect((await notices()).find(comment => comment.id === message!.id)?.body).toBe("Finish this in the saved conversation.");
     expect((await read(run!.id)).runnerProfileJson).toMatchObject({ piConversation: {
@@ -428,9 +429,12 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     });
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect(comments.find(comment => comment.id === person.id)?.body).toBe(person.body);
-    expect(comments.filter(comment => comment.authorType === "system"))
-      .toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
-    expect(comments.filter(comment => comment.authorType === "system")).toHaveLength(1);
+    const allNotes = comments.filter(comment => comment.authorType === "system");
+    expect(allNotes).toHaveLength(2);
+    const old = allNotes.find(note => note.body === "Stopping the earlier attempt before starting fresh.")!;
+    expect(old).toBeDefined();
+    expect(currentNotices(allNotes)).toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
+    expect(old.metadata?.supersededByCommentId).toBe(currentNotices(allNotes)[0].id);
   });
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
@@ -504,7 +508,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         trigger: "held_recovery", now: new Date(Date.now() + 3600_000) })).toMatchObject({ kind: "exact_recovery_pending" });
       const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
       expect(notes).toHaveLength(1);
-      expect(notes[0].body).toContain(scenario === "active-turn" ? "your skill change takes effect after the current step" : "stopping the earlier attempt before starting fresh");
+      expect(notes[0].body).toContain(scenario === "active-turn" ? "The working configuration has changed." : "stopping the earlier attempt before starting fresh");
+      if (scenario === "active-turn") expect(notes[0].body).not.toContain("skill change");
       if (activeRunId) await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
       await confirmStop();
     }
@@ -516,6 +521,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       heldCommentId = held.id;
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
     }
+    const beforeNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
     // The existing disposition owner runs again when cleanup/turn completion
     // signals it. No Retry, new message, or time advance supplies authority.
     await settleUnrecoverableExecutions(db);
@@ -554,11 +560,14 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       appendFileSync("/srv/scratch/paul/tasks/direct/rfl-d10c3b/artifacts/logs/judge-history.jsonl", JSON.stringify({ shape, hasFollowUp: text.includes(message.body),
         hasEarlierUserTurn: text.includes("remember the codeword zebra-quartz-71"), hasEarlierAgentAnswer: text.includes("noted, the codeword is zebra-quartz-71"),
         promptChars: text.length, newSession: selected.nativeExecution.session.normalizedSessionId !== oldId }) + "\n"); }
-    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
+    expect(allNotes).toHaveLength(beforeNotes.length + 1);
+    const notes = currentNotices(allNotes, beforeNotes);
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toContain("fresh thread in this conversation");
     if (heldCommentId) {
-      expect(notes[0].id).toBe(heldCommentId);
+      expect(notes[0].id).not.toBe(heldCommentId);
+      expect(allNotes.find(note => note.id === heldCommentId)?.metadata?.supersededByCommentId).toBe(notes[0].id);
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toBeNull();
     }
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
