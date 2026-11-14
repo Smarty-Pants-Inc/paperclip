@@ -11,6 +11,7 @@ export const FRESH_THREAD_REFUSAL_CODES = [
   "runner_remote_state_unavailable",
   "native_runner_refresh_required",
   "native_runner_launch_profile_mismatch",
+  "native_runner_backup_without_reusable_lease",
 ] as const;
 export type FreshThreadRefusalCode = typeof FRESH_THREAD_REFUSAL_CODES[number];
 const isCode = (value: unknown): value is FreshThreadRefusalCode =>

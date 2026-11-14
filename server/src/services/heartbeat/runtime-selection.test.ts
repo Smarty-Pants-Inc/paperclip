@@ -599,7 +599,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   // not a stand-in success from a classifier or a note-only recovery.
   it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
-    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare"] as const)(
+    "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare", "cold-restore", "codex-cold-restore"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
     const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
@@ -611,7 +611,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
     await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
       seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
-    const error = scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
+    const error = scenario === "cold-restore" ? "native_runner_backup_without_reusable_lease"
+      : scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
       : scenario === "generic-prepare" ? "native_runner_refresh_required"
       : scenario === "metadata-format" || scenario.startsWith("already-stranded")
       ? "native_controller_recovery_unsupported:metadata_format"

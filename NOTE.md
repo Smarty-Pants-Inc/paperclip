@@ -1,3 +1,57 @@
+# D10 cold-restore refusal: backup_without_reusable_lease
+
+## Starting-head answer (064991ce08)
+
+**No: this refusal does not reach the D10 classifier/gate on the starting head.**
+`server/src/services/native-runtime/native-session-executor.ts:18828` throws a
+plain `Error("runner_harness_state_mismatch: backup_without_reusable_lease")`
+when a durable backup exists without a recorded reusable lease and in-place
+harness identity is unavailable. It correctly refuses ambiguous exact restore,
+but supplies no structured code. The closed D10 family at
+`server/src/services/native-runtime/runner-reconciliation-refusal.ts:8-14` does
+not include it, and `freshThreadRefusalCode` at `:19-26` reads structured codes
+and owned Runner refusal channels, never diagnostic prose. The executor's
+source classifier calls it at `native-session-executor.ts:9385`; run completion
+calls it at `server/src/services/heartbeat/run-completion.ts:1333` and `:1758`.
+Thus that plain error cannot select the strict D10 branch at
+`server/src/services/fresh-continuation-fallback.ts:605`. A generic fallback,
+even if it later runs, is not this designed-end authority.
+
+## Authorized correction
+
+Attach the closed server-owned code `native_runner_backup_without_reusable_lease`
+at that exact throw while preserving its existing diagnostic message. Include
+that code in the existing D10 family; reuse the existing classifier, durable
+refusal receipt, fresh-thread stop gate, note owner and history handoff. Do not
+infer it from arbitrary provider/model prose. Missing lease/allocation/process
+records and elapsed time cannot authorize continuation. A positive same-boot
+process-table read or bound positive remote stop receipt remains mandatory.
+After proof, append one current fresh-history note, preserve older note bodies
+and titles with supersession metadata, and deliver one fresh successor.
+
+Regression evidence is retained with this task: the actual cold-preparation
+refusal must classify to the structured code (RED on 064991ce08), and the same
+code must stay pending without stop proof then admit exactly once when positive
+proof arrives. These are controlled candidate tests, not deployed/daily-work
+or Boat live qualification.
+
+Executed before this production commit, with `--maxWorkers=1`:
+
+- Exact `064991ce08` archive + only the cold-restore regression patch:
+  **1 passed / 4 failed** (three missing-positive-proof continuations and the
+  actual cold-preparation classification); matching migration remains green.
+- Candidate same probes + closed-code controls: **11 passed / 0 failed**.
+- Exact `064991ce08` archive + completion/selection regressions:
+  **0 passed / 4 failed**; candidate identical probes: **4 passed / 0 failed**.
+  These cover execute/setup durable refusal receipts, no generic Retry dispatch,
+  and actual saved-history answers through both Pi and Codex selections.
+- Raw command/exit receipts and JSON: `cold-restore-base-red.*`,
+  `cold-restore-green.*`, `cold-restore-base-end-red.*`,
+  `cold-restore-end-green.*` in the task's retained artifact directory.
+  Nonselected tests in these focused runs are pending, not claimed as passes.
+
+---
+
 # Pi warm reattach: step one, not a PRP shortcut
 
 > Historical implementation/proof notes from source commit `48c7bf23` (base

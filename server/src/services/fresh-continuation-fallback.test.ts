@@ -406,6 +406,57 @@ suite("fresh-continuation fallback", () => {
       }
     });
 
+  it.each(["missing-allocation", "failed-process-read", "bound-remote"])("D10 cold restore backup_without_reusable_lease uses positive stop proof (%s)", async shape => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_runner_backup_without_reusable_lease",
+      error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
+    const [lease] = shape === "failed-process-read" ? [] : await db.insert(environmentLeases).values({ companyId,
+      heartbeatRunId: f.runId, issueId: f.issueId, provider: "boat",
+      providerLeaseId: shape === "missing-allocation" ? null : `cold-restore-${randomUUID()}`,
+      status: "released", metadata: { pluginId: "fixture-boat" } }).returning();
+    const root = await mkdtemp(join(tmpdir(), "d10-cold-restore-positive-proof-"));
+    await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    try {
+      if (shape === "failed-process-read") vi.stubEnv("PATH", root);
+      for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
+        expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
+          .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+        expect(await successors(f.runId)).toHaveLength(0);
+      }
+      const before = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(before).toHaveLength(1);
+      const held = before[0];
+      expect(held.body).toMatch(shape === "bound-remote" ? /stopping the earlier attempt/ : /cannot confirm.*stopped/i);
+      if (shape !== "bound-remote") {
+        expect(held.body).toContain("Retry");
+        const task = await issue(f.issueId);
+        expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
+          assigneeAgentId: task.assigneeAgentId, projectId: task.projectId })).toMatchObject({ state: "failed", canRetry: true });
+      }
+      vi.unstubAllEnvs();
+      if (lease) {
+        const stoppedAt = new Date();
+        const providerLeaseId = lease.providerLeaseId ?? `found-cold-restore-${randomUUID()}`;
+        await db.update(environmentLeases).set({ providerLeaseId, status: "released", releasedAt: stoppedAt, cleanupStatus: "success",
+          metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
+            companyId, runId: f.runId, leaseId: lease.id, provider: "boat", providerLeaseId,
+            state: "stopped", confirmedAt: stoppedAt.toISOString() } } }).where(eq(environmentLeases.id, lease.id));
+      }
+      // This is a positive process-table read or an identity-bound remote stop
+      // receipt; merely removing the missing record would not supply proof.
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "continued" });
+      await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
+      const after = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      const current = after.filter(note => note.deletedAt === null && !note.metadata?.supersededByCommentId);
+      expect(current).toHaveLength(1);
+      expect(current[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+      expect(after.find(note => note.id === held.id)).toMatchObject({ body: held.body, deletedAt: null,
+        metadata: { ...held.metadata, supersededByCommentId: current[0].id } });
+      await expectOneFreshSuccessor(f);
+    } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
+  });
+
   it("RFL F3 appends changed notes, supersedes without rewriting another owner's note, and is idempotent", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID();

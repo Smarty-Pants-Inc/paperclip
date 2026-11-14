@@ -1103,7 +1103,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable",
-    "native_runner_refresh_required", "native_runner_launch_profile_mismatch",
+    "native_runner_refresh_required", "native_runner_launch_profile_mismatch", "native_runner_backup_without_reusable_lease",
   ])("RFL F5 keeps the agent idle after an execute-path D10 refusal (%s)", async code => {
     const f = await fixture({ runtimeMode: "native" }, `RF${randomUUID().slice(0, 6)}`);
     await f.completion.failRun(f.failure(Object.assign(new Error("Opaque refusal"), { code })));
@@ -1114,6 +1114,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it.each([
     "native_controller_recovery_missing_evidence:snapshot_binding",
     "native_controller_recovery_unsupported:metadata_format", "runner_remote_state_unavailable", "native_runner_refresh_required",
+    "native_runner_backup_without_reusable_lease",
   ])("persists structured fresh-thread refusal without generic Retry (%s)", async code => {
     for (const phase of ["execute", "setup"]) {
       const f = await fixture({ runtimeMode: "native" }, `FR${randomUUID().slice(0, 6)}`);

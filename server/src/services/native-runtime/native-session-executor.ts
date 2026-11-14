@@ -18824,8 +18824,10 @@ async function createRunnerdBackendWithinSessionClaim(
                     } else if (backupAvailable) {
                       // A continuation that has a durable backup but no recorded reusable
                       // lease was not provider-confirmed lost. Never silently create a new
-                      // provider session from that ambiguous state.
-                      throw new Error("runner_harness_state_mismatch: backup_without_reusable_lease");
+                      // provider session from that ambiguous state. The owned code
+                      // routes the refusal through D10's positive stop-proof gate.
+                      throw Object.assign(new Error("runner_harness_state_mismatch: backup_without_reusable_lease"),
+                        { code: "native_runner_backup_without_reusable_lease" });
                     } else if (restartableBootstrapState(state)) {
                       if (!(await moveInterruptedBootstrapSessionAside()
                         && takeRemoteBootstrapRestartProof(input.execution.binding.runId)
