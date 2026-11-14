@@ -2318,27 +2318,47 @@ impl CodexCommandExecutor {
             .as_ref()
             .is_some_and(|goal| goal.status == "active" || goal.working_now);
         let changed_contract = state.completion_contract != completion_contract(payload)?;
-        if !active && !descendants && !goal && !changed_contract {
+        if active || descendants {
+            let prepare_refusal_code = if active {
+                "provider_active_turn"
+            } else {
+                "provider_live_descendants"
+            };
+            self.refresh_admission = Some("refresh_wait");
+            return Ok(Some(CommandExecution::result(json!({ "status": "refresh_wait",
+                "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
+                "waitForTurn": active }))));
+        }
+        if !goal && !changed_contract {
             return Ok(None);
         }
-        let status = if active || descendants {
-            "refresh_wait"
-        } else {
-            "refresh_fresh"
+
+        // An idle instruction refresh is an admitted fresh-history boundary,
+        // not a provider refusal. Use the existing close path and commit its
+        // session.closed receipt with run.prepare before session.open can start.
+        // If close cannot be confirmed, retain the strict D10 refresh refusal.
+        let close = match self.close_session() {
+            Ok(close) => close,
+            Err(_) => {
+                let prepare_refusal_code = if goal {
+                    "provider_active_goal"
+                } else {
+                    "provider_contract_changed"
+                };
+                self.refresh_admission = Some("refresh_fresh");
+                return Ok(Some(CommandExecution::result(json!({ "status": "refresh_fresh",
+                    "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
+                    "waitForTurn": false }))));
+            }
         };
-        let prepare_refusal_code = if active {
-            "provider_active_turn"
-        } else if descendants {
-            "provider_live_descendants"
-        } else if goal {
-            "provider_active_goal"
-        } else {
-            "provider_contract_changed"
-        };
-        self.refresh_admission = Some(status);
-        Ok(Some(CommandExecution::result(json!({ "status": status,
-            "refusalCode": "provider_refresh_required", "prepareRefusalCode": prepare_refusal_code,
-            "waitForTurn": active }))))
+        // The old session is now closed. Its task history belongs to the server;
+        // build a new provider state rather than attaching the old goal/thread.
+        self.state = None;
+        let mut prepared = self.prepare_with_legacy_attachment(payload, true)?;
+        let mut events = close.events;
+        events.append(&mut prepared.events);
+        prepared.events = events;
+        Ok(Some(prepared))
     }
 
     fn bind_opencode_launch_profile(
