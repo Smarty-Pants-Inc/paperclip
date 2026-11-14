@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, prepareUnconfirmedSourceSandboxStop, readStopOnlyCleanup, retryUnconfirmedSourceSandboxStop, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
@@ -169,13 +169,21 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
   // Classify from durable execution evidence before consulting this host's
   // process table. A persisted remote target with a missing/mismatched lease is
   // still unproven; controller-local absence says nothing about that allocation.
+  // Read EVERY launch/identity event: a later identity-only event must never
+  // erase an earlier remote target. Location is classified before PID proof.
+  const launches = await tx.select({ runId: heartbeatRunEvents.runId, payload: heartbeatRunEvents.payload })
+    .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId),
+      inArray(heartbeatRunEvents.runId, owners.map(owner => owner.id)), isNull(heartbeatRunEvents.sourceEventId),
+      inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded"])));
   const unidentifiedLocalOwners: string[] = [];
   for (const owner of owners) {
     const remoteWorkspace = owner.runnerProfileJson?.remoteWorkspace as Record<string, unknown> | undefined;
     const remoteProviderLeaseId = typeof remoteWorkspace?.providerLeaseId === "string"
       ? remoteWorkspace.providerLeaseId : null;
-    const hasRemoteProfile = remoteWorkspace?.schema === "paperclip.remote-workspace-run.v1"
-      && remoteProviderLeaseId !== null;
+    // Any present remote workspace (complete or not, any schema) or any remote
+    // target event means NOT local: only allocation-bound proof may apply.
+    const hasRemoteProfile = remoteWorkspace != null || launches.some(event => event.runId === owner.id
+      && event.payload?.targetKind === "remote");
     const hasRemoteAllocation = leases.some(lease => lease.heartbeatRunId === owner.id
       && lease.provider && lease.provider !== "local" && lease.providerLeaseId
       && (!remoteProviderLeaseId || lease.providerLeaseId === remoteProviderLeaseId));
@@ -190,16 +198,11 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
     }
   }
   if (unidentifiedLocalOwners.length) {
-    const launches = await tx.selectDistinctOn([heartbeatRunEvents.runId], { payload: heartbeatRunEvents.payload })
-      .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId),
-        inArray(heartbeatRunEvents.runId, unidentifiedLocalOwners), isNull(heartbeatRunEvents.sourceEventId),
-        inArray(heartbeatRunEvents.eventType, ["native.process_start_requested", "native.process_identity_recorded"])))
-      .orderBy(heartbeatRunEvents.runId, desc(heartbeatRunEvents.seq));
     // A local OS read cannot establish absence on another host/allocation.
     const foreignOwner = owners.some(owner => unidentifiedLocalOwners.includes(owner.id)
       && owner.processHostHash && owner.processHostHash !== currentProcessSpaceHash())
-      || launches.some(event => event.payload?.targetKind === "remote"
-        || (event.payload?.hostname && event.payload.hostname !== hostname()));
+      || launches.some(event => unidentifiedLocalOwners.includes(event.runId)
+        && event.payload?.hostname && event.payload.hostname !== hostname());
     if (foreignOwner || !await noLocalRunnerProcessesForRuns(unidentifiedLocalOwners)) { gone = false; unavailable = true; }
   }
   // Only the settlement owner can say it is starting fresh: a newer run or a
