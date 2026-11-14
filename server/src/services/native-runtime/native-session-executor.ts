@@ -175,7 +175,7 @@ import {
 import { lstat, readFile, readdir, readlink, realpath as providerPackRealpath, stat as providerPackStat } from "node:fs/promises";
 import { hostname, tmpdir, userInfo } from "node:os";
 import { DatabaseSync } from "node:sqlite";
-import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRemoteBootstrapEvidence, nativeRunnerNeverAuthenticated, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
+import { NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES, loadNativeRunnerCheckpoint, loadNativeRunnerCheckpointHeader, loadNativeUnclaimedBootstrapCheckpoint, nativeRunnerCheckpointPersistence, nativeRunnerCheckpointRemoteBootstrapEvidence, nativeRunnerNeverAuthenticated, nativeRunnerCheckpointRegistration, restoreNativeRunnerCheckpoint, restoreNewestNativeRunnerCheckpoint, stampNativeRunnerCommandIssuer } from "./native-runner-checkpoint.js";
 import { REMOTE_CONTROLLER_LEASE_MS, REMOTE_RUNNER_RECONNECT_GRACE_MS, localRunnerProcessReconnectGraceMs } from "./native-runner-recovery-contract.js";
 import { publishPiConversationInTransaction, type NativeTaskSessionPublicationContext } from "./native-task-session-publication.js";
 import { basename, dirname, join, posix, resolve } from "node:path";
@@ -310,6 +310,8 @@ import {
   remoteRecoveryProbeReason, runnerStateRequestsFreshBootstrap,
 } from "./remote-runner-recovery-diagnostics.js";
 import { isPluginRpcTimeout, readRemoteRunnerRecoveryProbe, REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS, remoteRunnerPluginStall, type RemoteRunnerPluginStall } from "./remote-runner-recovery-probe.js";
+import { newerSettledNativeJournal } from "./native-settled-journal.js";
+import { planNativeLifecycleSettlement } from "./native-lifecycle-command-settlement.js";
 import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettledRemoteWarmControlState, summarizePostTerminalEvents, type RemoteWarmSessionRecovery, unsettledControllerCommands } from "./remote-warm-session-recovery.js";
 import { assertNativeWarmIngressRetirement, nativeWarmIngressAllocation, nativeWarmIngressIdentity, type NativeWarmIngressClaim, type NativeWarmIngressOwner } from "./native-warm-ingress-ownership.js";
 import { resolveNativeStagedAttachmentRecovery, type NativeStagedAttachmentRecovery } from "./native-staged-attachment-recovery.js";
@@ -5953,7 +5955,8 @@ const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_to
   "session.goal.get"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean;
+    settledLifecycleCommands?: readonly Record<string, unknown>[] } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
@@ -5979,10 +5982,13 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
       : LOCAL_RUNNER_LIFECYCLE_COMMANDS;
     // A remote Runner whose own environment restarted can no longer act on its
     // lifecycle commands either. Its deliveries and tool answers still count.
-    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
+    const stoppedCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
       || options.remoteRunnerStopped) && Array.isArray(control.commands)
       ? commands.filter(command => !goneCommandTypes.has(String(command.type)) || command.status === "completed")
       : commands;
+    const settledCommands = options.settledLifecycleCommands?.length ? stoppedCommands.filter(command =>
+      !options.settledLifecycleCommands!.some(candidate => JSON.stringify(candidate) === JSON.stringify(command)
+        && Number(record(control.commandDeliveryCounts)[String(command.commandId)] ?? 0) === 0)) : stoppedCommands;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
     // The controller journals a tool's answer after the tool ran. Only its
     // delivery can be outstanding, and only to a Runner that is gone.
@@ -6120,10 +6126,13 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   });
   const parkedGovernedWait = remoteRunnerGone && await priorRunParkedOnGovernedWait(input.db, {
     companyId: binding.companyId, issueId: binding.issueId, runId: identity.runId });
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait };
+  const lifecycleSettlement = input.projectedControlBytes ? null : await planNativeLifecycleSettlement({ db: input.db,
+    root: input.root, bytes: originalBytes, identity, ...binding, currentRunId: binding.runId }).catch(() => null);
+  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait,
+    settledLifecycleCommands: lifecycleSettlement?.commands };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   if (projection.refused !== undefined) return refuse(projection.refused);
-  const controlBytes = projection.bytes;
+  let controlBytes = projection.bytes;
   let prior: { run: typeof heartbeatRuns.$inferSelect; owner: typeof nativeRunFinalizations.$inferSelect } | undefined;
   try {
     [prior] = await input.db.select({ run: heartbeatRuns, owner: nativeRunFinalizations }).from(heartbeatRuns)
@@ -6196,8 +6205,18 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait });
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait,
+        settledLifecycleCommands: lifecycleSettlement?.commands });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
+    }
+  }
+  if (lifecycleSettlement) {
+    try { originalBytes = controlBytes = await lifecycleSettlement.commit(); }
+    catch { return refuse("lifecycle_settlement_proof_changed"); }
+    const legacyCount = lifecycleSettlement.commands.filter(command => command.issuer === undefined).length;
+    if (legacyCount) {
+      logger.info({ companyId: binding.companyId, runId: identity.runId, count: legacyCount }, "native_legacy_lifecycle_abandoned; delete_compatibility_at=M2");
+      await input.onLog?.("stderr", `native_legacy_lifecycle_abandoned count=${legacyCount}; delete_compatibility_at=M2\n`);
     }
   }
   const recheck = async (): Promise<string | null> => {
@@ -7605,7 +7624,7 @@ async function restorePerTurnRunnerdController(input: {
           NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
           throw new Error("native_runner_checkpoint_projection_held:journal_changed");
         }
-        checkpoint.restoreSessionDirectory(root);
+        restoreNewestNativeRunnerCheckpoint(checkpoint, root);
       } finally { rmSync(scratch, { recursive: true, force: true }); }
       return;
     }
@@ -7652,7 +7671,8 @@ async function refreshFinishedPerTurnRunnerdProjection(
         NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
       const originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8");
       if (originalBytes !== referenceBytes) return refuse("journal_changed");
-      if (!external && sourceRunId === reference.runId && originalBytes === sourceBytes) return;
+      if (!external && sourceRunId === reference.runId
+        && (originalBytes === sourceBytes || newerSettledNativeJournal(originalBytes, sourceBytes))) return;
       let projectedControlBytes: string | undefined;
       if (external) {
         const marker = record(JSON.parse(originalBytes));
@@ -7665,7 +7685,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
           if (readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "native_runner_checkpoint_invalid").toString("utf8") !== referenceBytes) {
             return refuse("journal_changed");
           }
-          recovered.checkpoint.restoreSessionDirectory(root);
+          restoreNewestNativeRunnerCheckpoint(recovered.checkpoint, root);
           return;
         }
         const previous = await loadNativeRunnerCheckpoint(tx as unknown as Db, { ...input.execution.binding, runId: reference.runId });
@@ -7701,7 +7721,7 @@ async function refreshFinishedPerTurnRunnerdProjection(
       const archivedAt = Date.now(), archiveRoot = resolve(archiveParent, `${archivedAt}-${randomUUID()}`);
       mkdirSync(archiveRoot, { mode: 0o700 });
       renameSync(resolve(root, "control-plane"), resolve(archiveRoot, "control-plane"));
-      recovered.checkpoint.restoreSessionDirectory(root);
+      restoreNewestNativeRunnerCheckpoint(recovered.checkpoint, root);
       noteNativeRunnerEvidence(archivedAt);
     } finally {
       rmSync(scratch, { recursive: true, force: true });
@@ -17461,8 +17481,12 @@ async function createRunnerdBackendWithinSessionClaim(
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         ...owner.driver, get authorityRunId() { return owner.driver.authorityRunId; }, runnerArtifact: input.controllerPersistence?.runnerArtifact ?? description.runner,
         onCredentialsUpdated: event => owner.credentialsUpdated(event),
-        controlPlaneRegistration: input.controllerPersistence ? async (authority, identity, signal) => {
-          await nativeRunnerCheckpointRegistration({
+        controlPlaneRegistration: async (authority, identity, signal) => {
+          const current = sessionToolAuthorityEpochs.get(sessionScopeId);
+          const controller = await currentNativeControllerIdentity();
+          await stampNativeRunnerCommandIssuer(input.db, { ...input.execution.binding,
+            runId: current?.runId ?? input.execution.binding.runId }, controller.bootId, authority);
+          if (input.controllerPersistence) await nativeRunnerCheckpointRegistration({
             ...nativeRunnerCheckpointPersistence(input.db, input.controllerPersistence!.bootId,
               () => {
                 const current = sessionToolAuthorityEpochs.get(sessionScopeId);
@@ -17472,7 +17496,7 @@ async function createRunnerdBackendWithinSessionClaim(
             binding: input.execution.binding,
           })(authority, identity);
           return owner.driver.controlPlaneRegistration!(authority, identity, signal);
-        } : owner.driver.controlPlaneRegistration,
+        },
         recoverSemanticToolInput: input.controllerPersistence ? call => {
           const current = sessionToolAuthorityEpochs.get(sessionScopeId);
           if (!current || current.runId !== call.correlation.runId) throw new Error("native_tool_authority_epoch_revoked");
@@ -19350,6 +19374,10 @@ async function createRunnerdBackendWithinSessionClaim(
       return targetPath;
     },
     beforeConnect: async (identity, authority) => {
+      const current = sessionToolAuthorityEpochs.get(sessionScopeId);
+      const controller = await currentNativeControllerIdentity();
+      await stampNativeRunnerCommandIssuer(input.db, { ...input.execution.binding,
+        runId: current?.runId ?? input.execution.binding.runId }, controller.bootId, authority);
       runnerControlPlane = authority;
       // Cold registration omits the optional attachment identity. Capture the
       // initialized controller's expected generation once, before authentication;

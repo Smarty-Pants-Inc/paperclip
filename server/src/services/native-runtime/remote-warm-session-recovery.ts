@@ -48,6 +48,12 @@ export function unsettledControllerCommands(commands: readonly Record<string, un
     .map(command => Number(command.controllerSeq)));
   return commands.filter(command => {
     if (command.status === "completed") return false;
+    // Only server-authored journal disposition settles an abandoned lifecycle
+    // command; a runner's result code alone never grants this exception.
+    const abandonment = record(command.abandonment);
+    if (command.status === "rejected" && RUNNER_LIFECYCLE_COMMAND_TYPES.has(String(command.type))
+      && abandonment.disposition === "ABANDONED" && typeof abandonment.abandonedAt === "string"
+      && typeof abandonment.settledByBootId === "string") return false;
     if (outcomeUnknown(command)) {
       return !(command.type === "turn.start" && Number(command.controllerSeq) < lastCompletedTurnStart);
     }
