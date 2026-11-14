@@ -639,6 +639,7 @@ Input includes:
 
 - new resolved config
 - `companyId` for the company-scoped config row
+- optional `revision`, the row's monotonically increasing `updatedAt` timestamp in milliseconds (not a field inside the plugin config)
 
 If the worker implements this method, it applies the new config without restarting. If the worker does not implement this method, the host restarts the worker process with the new config (graceful shutdown then restart).
 
@@ -659,10 +660,20 @@ its fresh row read and result, even if the preceding RPC fails. Requests arrivin
 during that successor may schedule one further delivery. There is no automatic
 retry without another delivery request.
 
-These guarantees describe host RPC admission and ordering, not cancellation of
-plugin code: an RPC timeout does not stop an already-running `onConfigChanged`
-callback. In particular, successful delivery of newer config after a timeout is
-not proof that an older callback cannot later mutate plugin-owned state.
+The SDK also serializes `onConfigChanged` callbacks per company through actual
+callback settlement. Before a queued callback starts, it drops revisions at or
+below the last successfully applied revision, or below any revision whose apply
+has already started. Failed callbacks do not mark a revision applied; retrying
+that revision remains possible. Deliveries without a revision retain legacy
+repeated-apply behavior. Different companies have independent callback queues.
+
+On a config-delivery timeout the host kills the uncertain worker and uses its
+existing bounded crash-restart path. The worker-ready event replays the current
+stored company rows into the fresh process; old callbacks cannot resume there.
+Disable/shutdown still wins over automatic recovery. The settings response
+acknowledges persistence, not that replay has already completed. This fences
+worker-local application, not external effects already issued before termination;
+plugins remain responsible for idempotency of external writes.
 
 ### 13.5 `onEvent`
 
