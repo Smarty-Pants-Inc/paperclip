@@ -15,6 +15,7 @@ import { legacyControllerBootId } from "../legacy-controller-lease.js";
 import { assertNativeSourceCheckpointConsumer, lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
 import { runnerdStateHasNoProviderTurn, runnerdStateIsIncompleteBootstrap } from "./native-bootstrap-proof.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { logger } from "../../middleware/logger.js";
 
 type Binding = { companyId: string; issueId: string; runId: string };
 export const NATIVE_CHECKPOINT_HEADER_INSPECTION_MAX_BYTES = 1024 * 1024;
@@ -233,13 +234,26 @@ export function nativeRunnerCheckpointRegistration(input: Omit<Parameters<typeof
   });
 }
 
+type CommandIssuerStampResult = { stamped: true } | { stamped: false; refused: "native_runner_command_issuer_missing" };
+
+function bindNativeRunnerCommandIssuer(binding: Binding, bootId: string, authority: DurablePrpControlPlane,
+  owner: { controllerGeneration: number } | undefined): CommandIssuerStampResult {
+  if (!owner || !Number.isSafeInteger(owner.controllerGeneration) || owner.controllerGeneration < 1) {
+    authority.setCommandIssuer(null);
+    const result = { stamped: false, refused: "native_runner_command_issuer_missing" } as const;
+    logger.info({ ...binding, reason: result.refused }, "native lifecycle issuer stamping refused; runner admission unchanged");
+    return result;
+  }
+  authority.setCommandIssuer({ bootId, generation: owner.controllerGeneration });
+  return { stamped: true };
+}
+
 export async function stampNativeRunnerCommandIssuer(db: Pick<Db, "select">, binding: Binding, bootId: string,
-  authority: DurablePrpControlPlane): Promise<void> {
+  authority: DurablePrpControlPlane): Promise<CommandIssuerStampResult> {
   const [owner] = await db.select().from(nativeRunFinalizations).where(and(
     eq(nativeRunFinalizations.companyId, binding.companyId), eq(nativeRunFinalizations.issueId, binding.issueId),
     eq(nativeRunFinalizations.runId, binding.runId), eq(nativeRunFinalizations.controllerBootId, bootId)));
-  if (!owner || owner.controllerGeneration < 1) throw new Error("native_runner_command_issuer_missing");
-  authority.setCommandIssuer({ bootId, generation: owner.controllerGeneration });
+  return bindNativeRunnerCommandIssuer(binding, bootId, authority, owner);
 }
 
 export async function registerNativeRunnerCheckpoint(input: {
@@ -256,7 +270,7 @@ export async function registerNativeRunnerCheckpoint(input: {
     eq(nativeRunFinalizations.controllerBootId, input.bootId),
     gt(nativeRunFinalizations.leaseExpiresAt, sql`now()`))));
   if (!owner?.leaseOwner) throw new Error("native_runner_checkpoint_owner_lost");
-  input.authority.setCommandIssuer({ bootId: input.bootId, generation: owner.controllerGeneration });
+  bindNativeRunnerCommandIssuer(input.binding, input.bootId, input.authority, owner);
   let writers = authorities.get(input.authority);
   if (!writers) {
     writers = new Map();

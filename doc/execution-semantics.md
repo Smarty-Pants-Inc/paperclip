@@ -3759,12 +3759,20 @@ All of these must be true:
 - Each quarantined root for the scope passes the same journal and local
   Runner evidence checks for the same owner.
 
-Lifecycle commands issued by a native server carry an immutable server-only
-`issuer: { bootId, generation }` in the durable controller journal. Checkpoint
-restore and command-id replay retain the original issuer; PRP sends neither
-this stamp nor the server's abandonment disposition to old runnerd binaries.
-A fenced issuing boot and an idle session can settle its never-released
-lifecycle commands. The DB must have no other in-flight run for this session,
+Lifecycle commands issued by a native server with a recorded controller
+generation carry an immutable server-only `issuer: { bootId, generation }` in
+the durable controller journal. Checkpoint restore and command-id replay retain
+the original issuer; PRP sends neither this stamp nor the server's abandonment
+disposition to old runnerd binaries. Missing owners and legacy generation-0
+owners refuse optional issuer stamping with `native_runner_command_issuer_missing`,
+not runner connection or plugin-task registration. Rebinding clears an unavailable
+issuer rather than retaining another owner's stamp or inventing a generation.
+The existing checkpoint lease and write-authority checks still apply.
+
+Upstream's shared owner proof must report the exact issuing boot gone: a
+recorded graceful stop or fencing is a successful close. Lease expiry, an
+unrecorded stop or a missing boot row is not a close. With that proof, an idle
+session can settle its never-released lifecycle commands. The DB must have no other in-flight run for this session,
 and the journal must have a terminal with no live turn, pending delivery or
 unanswered tool input. A delivery count greater than zero is not recallable:
 settlement refuses rather than letting a stale drain land in the new turn.
@@ -3773,8 +3781,14 @@ M1 has a temporary compatibility path for unstamped lifecycle commands only.
 Every other `controller_instances` row must be stopped or fenced, and each
 command's `issuedAt` must be strictly before this boot's `startedAt` minus
 five seconds. The same DB/journal idle proof applies. Before admission, the
-source coordinator lock and boot proof are rechecked, and the encrypted DB
-command records are durably marked `ABANDONED` (terminal `rejected` with a
+source coordinator rows are locked first, then the controller table is locked
+in SHARE mode to repeat the all-other-boots proof. Stamped-only settlement takes
+no controller-table SHARE lock, so it cannot stall another boot's lease renewal.
+Both lock acquisitions use a transaction-local one-second lock timeout, matching
+legacy workspace settlement. Timeout rolls back the transaction, leaves the
+local journal unchanged and refuses with `lifecycle_settlement_lock_timeout`.
+The boot and idle proofs are rechecked, and the encrypted DB command records
+are durably marked `ABANDONED` (terminal `rejected` with a
 server-only disposition). Restores cannot requeue them. Each compatibility
 settlement logs `native_legacy_lifecycle_abandoned` with its command count.
 **Delete this unstamped compatibility path at M2.**

@@ -6226,7 +6226,8 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   }
   if (lifecycleSettlement) {
     try { originalBytes = controlBytes = await lifecycleSettlement.commit(); }
-    catch { return refuse("lifecycle_settlement_proof_changed"); }
+    catch (error) { return refuse(error instanceof Error && error.message === "native_lifecycle_settlement_lock_timeout"
+      ? "lifecycle_settlement_lock_timeout" : "lifecycle_settlement_proof_changed"); }
     const legacyCount = lifecycleSettlement.commands.filter(command => command.issuer === undefined).length;
     if (legacyCount) {
       logger.info({ companyId: binding.companyId, runId: identity.runId, count: legacyCount }, "native_legacy_lifecycle_abandoned; delete_compatibility_at=M2");
