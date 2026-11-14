@@ -709,6 +709,18 @@ export function createHeartbeatScheduling(
         }
       : {};
 
+    // Pause is a temporary admission hold, not a consumed monitor attempt.
+    // Recheck the actual target (which can be a review participant) after claim.
+    const targetAgent = await getAgent(targetAgentId);
+    const [company] = await db.select({ status: companies.status }).from(companies)
+      .where(eq(companies.id, claimed.companyId));
+    if (targetAgent?.status === "paused" || company?.status === "paused") {
+      await releaseIssueMonitorWithDiagnostic(claimed, input, {
+        action: "issue.monitor_deferred", reason: "monitor_pause_held",
+      });
+      return { outcome: "skipped" as const, reason: "monitor_pause_held" };
+    }
+
     if (clearReason) {
       return clearIssueMonitorAndRecover({
         claimed,
@@ -871,6 +883,16 @@ export function createHeartbeatScheduling(
       return { outcome: "triggered" as const };
     } catch (err) {
       if (err instanceof HttpError && err.status >= 400 && err.status < 500) {
+        // Pause can race the query/claim above. Queue admission reports a
+        // structured status; do not turn this temporary refusal into deletion.
+        const details = parseObject(err.details);
+        if (details.status === "paused" || details.agentStatus === "paused" || details.reason === "paused") {
+          await releaseIssueMonitorWithDiagnostic(claimed, input, {
+            action: "issue.monitor_deferred", reason: "monitor_pause_held",
+          });
+          if (!input.clearOnClientError) throw err;
+          return { outcome: "skipped" as const, reason: "monitor_pause_held" };
+        }
         if (input.clearOnClientError) {
           await db.transaction(async tx => {
             await notifyIssueReviewState(tx, { companyId: claimed.companyId, issueId: claimed.id });
@@ -1027,6 +1049,16 @@ export function createHeartbeatScheduling(
     });
   }
 
+  function noPausedMonitorAssignee() {
+    // Use the same eligibility for due selection, claim and restored deadline.
+    // Otherwise a retained overdue monitor would keep the scheduler hot while
+    // paused. Lifecycle Resume notifies this existing delivery queue.
+    return sql`not exists (select 1 from ${agents} monitor_agent
+      where monitor_agent.id = ${issues.assigneeAgentId}
+        and monitor_agent.company_id = ${issues.companyId}
+        and monitor_agent.status = 'paused')`;
+  }
+
   async function tickDueIssueMonitors(now: Date, canContinue: () => boolean) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const dueMonitors = await db
@@ -1036,6 +1068,7 @@ export function createHeartbeatScheduling(
       .where(
         and(
           eq(companies.status, "active"),
+          noPausedMonitorAssignee(),
           noActiveNativeMonitorRun(),
           sql`${issues.monitorNextCheckAt} is not null`,
           lte(issues.monitorNextCheckAt, now),
@@ -1068,6 +1101,7 @@ export function createHeartbeatScheduling(
           .where(
             and(
               eq(issues.id, due.id),
+              noPausedMonitorAssignee(),
               noActiveNativeMonitorRun(),
               sql`${issues.monitorNextCheckAt} is not null`,
               lte(issues.monitorNextCheckAt, now),
@@ -1126,7 +1160,7 @@ export function createHeartbeatScheduling(
     const [row] = await db.select({ at: sql<string | null>`min(greatest(${issues.monitorNextCheckAt},
       ${issues.monitorWakeRequestedAt} + interval '5 minutes' + interval '1 millisecond'))` })
       .from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(and(eq(companies.status, "active"), noActiveNativeMonitorRun(),
+      .where(and(eq(companies.status, "active"), noPausedMonitorAssignee(), noActiveNativeMonitorRun(),
         sql`${issues.monitorNextCheckAt} is not null`, isNull(issues.assigneeUserId),
         sql`${issues.assigneeAgentId} is not null`, inArray(issues.status, ["in_progress", "in_review"])));
 

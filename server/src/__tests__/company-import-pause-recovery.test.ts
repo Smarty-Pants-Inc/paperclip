@@ -6,6 +6,8 @@ import { errorHandler } from "../middleware/index.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { and, eq, isNull } from "drizzle-orm";
+import { subscribeDatabaseWork } from "@paperclipai/db/work-signals";
+import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { companyPortabilityService } from "../services/company-portability.js";
 import { companyService } from "../services/companies.js";
@@ -193,11 +195,16 @@ describe.skipIf(!support.supported)("company import safety pause recovery (M12 S
       }
       // A held past-due deadline must not hot-loop the existing work scheduler.
       expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
-      if (hold === "company") await companyService(db).update(f.companyId, { status: "active" });
-      else {
-        await createAgentLifecycle(db).resumeAgent(f.agentId);
-        await worker.process(f.agentId);
-      }
+      const resumeEvents: string[] = [];
+      const unsubscribe = subscribeDatabaseWork(db, DELIVERY_QUEUES.issueMonitors, event => resumeEvents.push(event));
+      try {
+        if (hold === "company") await companyService(db).update(f.companyId, { status: "active" });
+        else {
+          await createAgentLifecycle(db).resumeAgent(f.agentId);
+          await worker.process(f.agentId);
+        }
+        expect(resumeEvents).toContain("settled");
+      } finally { unsubscribe(); }
       expect(await heartbeat.nextIssueMonitorAt()).toBe(due.getTime());
       // Competing controllers and the next tick must not duplicate admission.
       await Promise.all([heartbeat.tickIssueMonitors(new Date(due.getTime() + 3)),

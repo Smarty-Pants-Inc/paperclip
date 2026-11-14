@@ -158,7 +158,7 @@ After activation, carried-over todo and in-progress tasks without a local run us
 
 The import safety pause leaves assigned open tasks waiting without blocking them or adding stopped-task or unanswered-message notices. Resuming the assignee admits carried-over work with no local run through normal assignment recovery; it does not require an unblock comment on each task. An additional manual pause still uses the normal paused-agent notice.
 
-Task monitor notes and provenance are imported, but their schedules arrive unarmed (with an import warning). Re-arm an imported monitor from its task page when ready. Recovery preserves an already-armed monitor while its assignee waits on the import safety pause.
+Task monitor notes and provenance are imported, but their schedules arrive unarmed (with an import warning). Re-arm an imported monitor from its task page when ready. Recovery preserves an already-armed monitor while its assignee waits on the import safety pause. If the monitor becomes due while its agent or company is paused, its schedule is retained; after Resume, the existing monitor timer admits the overdue check once.
 
 ### Common Workflows
 
