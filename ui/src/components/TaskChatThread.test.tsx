@@ -6312,6 +6312,27 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
       expect(container.textContent).not.toContain(BPRIME_NO_RUN);
     });
 
+    it.skipIf(conversationMode)("classic UI marks a notice superseded only by supersededByInteractionId", () => {
+      const notice = { ...bPrimeNoRunNotice(5), metadata: { ...bPrimeNoRunNotice(5).metadata, supersededByInteractionId: "new-interaction" } };
+      render(<IssueChatThread comments={[personMessage("person-message", "Please continue.", 0), notice]}
+        onAdd={async () => {}} issueStatus="in_progress" linkedRuns={[]} currentUserId="viewer" />);
+      expect(container.textContent).not.toContain(BPRIME_NO_RUN);
+      expect(container.textContent).toContain("· Superseded");
+    });
+
+    it("hides a notice marked only by supersededByInteractionId from live chat and retains its history row", () => {
+      const notice = {
+        ...bPrimeNoRunNotice(5),
+        metadata: { ...bPrimeNoRunNotice(5).metadata, supersededByInteractionId: "new-interaction" },
+      };
+      const comments = [personMessage("person-message", "Please continue.", 0), notice];
+      paint({ comments, linkedRuns: [], issueStatus: "in_progress", compactHistory: true });
+      expect(anchor("bprime-no-run-notice")).toBeNull();
+      expect(comments).toContain(notice);
+      expect(notice.deletedAt).toBeNull();
+      expect(notice.metadata.supersededByInteractionId).toBe("new-interaction");
+    });
+
     it("hides a superseded no-run notice from the live thread without deleting its history row", () => {
       const notice = {
         ...bPrimeNoRunNotice(5),

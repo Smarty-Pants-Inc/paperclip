@@ -9,7 +9,7 @@ import {
   scheduleIssueDetailPaintMeasure,
   recordIssueDetailReadiness,
 } from "@/lib/issue-detail-performance";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, isSupersededNotice } from "@paperclipai/shared";
 import { workspaceRestoreMarkerDetail } from "@/lib/workspace-restore-marker";
 import { credentialAccessNotice } from "@/lib/credential-access-notice";
 import type { ActivityEvent, Issue, IssueQueuedCommentQueue, TaskBrowser } from "@paperclipai/shared";
@@ -55,7 +55,6 @@ import {
 } from "@/components/task-chat/TaskChatTurnStatusIsland";
 import { commentsToTaskChatItems } from "@/components/task-chat/task-chat-adapter";
 import {
-  isSupersededNotice,
   taskChatStatusRelevance,
   withoutHistoricalRunStatus,
 } from "@/components/task-chat/status-relevance";
@@ -934,7 +933,9 @@ export function TaskChatThread(props: TaskChatThreadProps) {
         if (comment.authorType === "system" && comment.metadata?.recoveryResponsibility === "system") return [];
         if (statusRelevance.isHistoricalNotice(comment)) return [];
         // Superseded: off the live view, kept collapsed in expanded history.
-        if (isSupersededNotice(comment)) {
+        if (comment.conversationSessionGeneration == null
+          && (comment.authorType === "system" || comment.presentation?.kind === "system_notice")
+          && isSupersededNotice(comment.metadata)) {
           if (props.compactHistory) return [];
           return [comment.presentation ? { ...comment, presentation: { ...comment.presentation, detailsDefaultOpen: false } } : comment];
         }
