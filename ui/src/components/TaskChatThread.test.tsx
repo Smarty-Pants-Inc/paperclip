@@ -6327,3 +6327,111 @@ describe("C9 unanswered person message notice (B' stranded sweep) in the chat", 
     });
   });
 });
+
+// RFL turn-steps verdict on 2e64e580 (F1-F3). The upstream "More run output"
+// disclosure (TaskChatThread historyControl, present by upstream 6dcf4160dd)
+// is the only control. One activation must show each compacted turn's saved
+// tool targets; no second Activity/"Read files" click and no new label.
+describe("compact history disclosure reaches every saved turn's steps", () => {
+  const nativeRun = (runId: string, status: string, minute: number) => ({
+    runId, status, runtimeMode: "native" as const, agentId: "agent", agentName: "Assistant", adapterType: "paperclip_runner",
+    createdAt: `2025-01-01T10:0${minute}:00Z`, startedAt: `2025-01-01T10:0${minute}:01Z`, finishedAt: `2025-01-01T10:0${minute}:30Z`,
+  });
+  const reply = (id: string, body: string, runId: string, minute: number) => ({
+    id, body, runId, companyId: "company", issueId: "issue", authorType: "agent" as const,
+    authorAgentId: "agent", authorUserId: null, presentation: null, metadata: null,
+    createdAt: new Date(`2025-01-01T10:0${minute}:20Z`), updatedAt: new Date(`2025-01-01T10:0${minute}:20Z`),
+  });
+  const ask = (id: string, body: string, minute: number) => ({
+    id, body, companyId: "company", issueId: "issue", authorType: "user" as const,
+    authorAgentId: null, authorUserId: "user", presentation: null, metadata: null,
+    createdAt: new Date(`2025-01-01T10:0${minute}:00Z`), updatedAt: new Date(`2025-01-01T10:0${minute}:00Z`),
+  });
+  const answer = (runId: string, minute: number) => `Turn ${minute} answer for ${runId}.`;
+  const finalOnly = (runId: string, minute: number) => [
+    { kind: "assistant" as const, channel: "final" as const, ts: `2025-01-01T10:0${minute}:20Z`, text: answer(runId, minute) },
+  ];
+  const fullTranscript = (runId: string, minute: number) => [
+    { kind: "tool_call" as const, ts: `2025-01-01T10:0${minute}:02Z`, name: "Read", input: { path: `${runId}-source.txt` }, toolUseId: `${runId}-read` },
+    { kind: "tool_result" as const, ts: `2025-01-01T10:0${minute}:03Z`, toolUseId: `${runId}-read`, content: "Recorded source" },
+    { kind: "tool_call" as const, ts: `2025-01-01T10:0${minute}:04Z`, name: "Bash", input: { command: `echo ${runId}-verified` }, toolUseId: `${runId}-bash` },
+    { kind: "tool_result" as const, ts: `2025-01-01T10:0${minute}:05Z`, toolUseId: `${runId}-bash`, content: `${runId}-verified` },
+    ...finalOnly(runId, minute),
+  ];
+  const targets = (runId: string) => [`${runId}-source.txt`, `echo ${runId}-verified`];
+  const control = () => [...container.querySelectorAll("button")].filter(button => button.textContent === "More run output");
+  // Simulates IssueDetail: the click flips compactHistory and loads full events.
+  const expandOnce = (props: ComponentProps<typeof TaskChatThread>, runs: [string, number][]) => {
+    const buttons = control();
+    expect(buttons).toHaveLength(1);
+    act(() => buttons[0]!.click());
+    expect(props.onExpandHistory).toHaveBeenCalledOnce();
+    for (const [id, minute] of runs) nativeTranscriptState.transcriptByRun.set(id, fullTranscript(id, minute));
+    render(<TaskChatThread {...props} compactHistory={false} />);
+  };
+  const expectTargetsShown = (runId: string) => {
+    for (const target of targets(runId)) expect(container.textContent, `${target} hidden after one activation`).toContain(target);
+  };
+
+  beforeEach(() => { streamlinedState.enabled = true; });
+
+  it("F1: one activation of More run output shows the saved tool targets of a deferred turn", async () => {
+    const props = {
+      issueId: "f1-one-click", compactHistory: true, onAdd: async () => {}, onExpandHistory: vi.fn(),
+      issueBrief: { description: "", author: "human" as const, onSave: async () => {} },
+      comments: [ask("ask-1", "Inspect turn 1", 1), reply("reply-1", answer("run-one", 1), "run-one", 1)],
+      linkedRuns: [nativeRun("run-one", "succeeded", 1)],
+    };
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent).not.toContain("run-one-source.txt");
+    expandOnce(props, [["run-one", 1]]);
+    expectTargetsShown("run-one");
+  });
+
+  it("F2: with every visible turn's run supplied, one activation shows both turns' saved tool targets", async () => {
+    const props = {
+      issueId: "f2-two-turns", compactHistory: true, onAdd: async () => {}, onExpandHistory: vi.fn(),
+      issueBrief: { description: "", author: "human" as const, onSave: async () => {} },
+      comments: [ask("ask-1", "Inspect turn 1", 1), reply("reply-1", answer("run-one", 1), "run-one", 1),
+        ask("ask-2", "Inspect turn 2", 2), reply("reply-2", answer("run-two", 2), "run-two", 2)],
+      linkedRuns: [nativeRun("run-one", "succeeded", 1), nativeRun("run-two", "succeeded", 2)],
+    };
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expandOnce(props, [["run-one", 1], ["run-two", 2]]);
+    expectTargetsShown("run-one");
+    expectTargetsShown("run-two");
+  });
+
+  it.each([
+    { name: "event-only answer without a saved reply", status: "succeeded", saved: false },
+    { name: "failed run with a saved reply", status: "failed", saved: true },
+  ])("F3: native conversation-filtered history ($name) shows the disclosure and one activation opens its 2 tools", async ({ status, saved }) => {
+    nativeTranscriptState.transcriptByRun.set("run-native", finalOnly("run-native", 1));
+    nativeTranscriptState.hydratedRunIds = new Set(["run-native"]);
+    const props = {
+      issueId: `f3-${status}`, compactHistory: true, onAdd: async () => {}, onExpandHistory: vi.fn(),
+      issueBrief: { description: "", author: "human" as const, onSave: async () => {} },
+      comments: [ask("ask-1", "Inspect turn 1", 1), ...(saved ? [reply("reply-1", answer("run-native", 1), "run-native", 1)] : [])],
+      linkedRuns: [nativeRun("run-native", status, 1)],
+    };
+    render(<TaskChatThread {...props} />);
+    await settleThreadLayout();
+    expect(container.textContent).toContain(answer("run-native", 1));
+    expect(transcriptHookRuns.native.at(-1)).toMatchObject([{ id: "run-native", conversationOnly: true }]);
+    expandOnce(props, [["run-native", 1]]);
+    expect(transcriptHookRuns.native.at(-1)).toMatchObject([{ id: "run-native", conversationOnly: false }]);
+    expectTargetsShown("run-native");
+  });
+
+  it("keeps an already-expanded task's activity collapsed by default", async () => {
+    nativeTranscriptState.transcriptByRun.set("run-one", fullTranscript("run-one", 1));
+    render(<TaskChatThread issueId="full-history-default" onAdd={async () => {}}
+      comments={[ask("ask-1", "Inspect turn 1", 1), reply("reply-1", answer("run-one", 1), "run-one", 1)]}
+      linkedRuns={[nativeRun("run-one", "succeeded", 1)]} />);
+    await settleThreadLayout();
+    expect(control()).toHaveLength(0);
+    expect(container.textContent).not.toContain("run-one-source.txt");
+  });
+});

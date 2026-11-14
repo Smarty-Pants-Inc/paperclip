@@ -12,7 +12,7 @@ import {
 import { useReducedMotion } from "motion/react";
 import { MarkdownBody } from "@/components/MarkdownBody";
 import { cn } from "@/lib/utils";
-import { useTaskChatExpansion } from "./expansion-state";
+import { useRevealableTaskChatExpansion, useTaskChatExpansion } from "./expansion-state";
 import type { TaskChatActivityPhaseItem, TaskChatAutoReview } from "./task-chat-model";
 import { AutoApprovedBadge, AutoReviewDetail } from "./TaskChatAutoReview";
 import {
@@ -549,7 +549,7 @@ function readRunPreview(items: ToolActivity[]): string {
 
 function ReadRunActivity({ items }: { items: ToolActivity[] }) {
   const id = `runner-reads:${items[0]!.id}`;
-  const [open, setOpen] = useTaskChatExpansion(id, false);
+  const [open, setOpen] = useRevealableTaskChatExpansion(id, false);
   const listId = useId();
   return (
     <li className="min-w-0" data-activity-read-run={items.length}>
@@ -590,7 +590,7 @@ export function TaskChatRunnerActivityGroup({
   item: TaskChatActivityPhaseItem;
   defaultExpanded?: boolean;
 }) {
-  const [expanded, setExpanded] = useTaskChatExpansion(
+  const [expanded, setExpanded] = useRevealableTaskChatExpansion(
     item.id,
     defaultExpanded,
   );

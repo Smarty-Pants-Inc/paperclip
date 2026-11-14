@@ -22,7 +22,7 @@ import { CoordinatorChatHandoffStatus, CoordinatorChatTaskHandoff, standaloneCha
 import { CoordinatorChatReceiptStatus, useCoordinatorChatDecisionReceipts } from "@/components/coordinator/CoordinatorChatDecisionReceipts";
 import { CoordinatorChatQuestionStatus, useCoordinatorChatPendingQuestions } from "@/components/coordinator/CoordinatorChatPendingQuestions";
 import { requiresExecutionReconciliation } from "@paperclipai/shared";
-import { TaskChatExpansionState } from "@/components/task-chat/expansion-state";
+import { TaskChatExpansionState, TaskChatRevealedRunIds } from "@/components/task-chat/expansion-state";
 import { TaskChatScrollReady, taskChatHashAnchor, useTaskChatScrollNavigation } from "@/components/task-chat/scroll-navigation";
 import {
   useCallback,
@@ -278,6 +278,7 @@ const INITIAL_HISTORY_REVEAL_TIMEOUT_MS = 15_000;
 // "More run output" control instead of inserting output after the reveal.
 export const INITIAL_TRANSCRIPT_REVEAL_BUDGET_MS = 600;
 const EMPTY_RUN_IDS: ReadonlySet<string> = new Set<string>();
+const sameRunIds = (a: ReadonlySet<string>, b: ReadonlySet<string>) => a.size === b.size && [...a].every((id) => b.has(id));
 const INITIAL_FONT_REVEAL_TIMEOUT_MS = 3000;
 const EMPTY_LIVE_ISSUE_IDS: ReadonlySet<string> = new Set<string>();
 const LONG_THREAD_BLOCKER_REPEAT_COUNT = 4;
@@ -3075,9 +3076,42 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     ],
   );
 
+  // Settled runs whose saved output the compact view leaves out: deferred
+  // transcripts, truncated legacy logs, and native history read through the
+  // conversation-only view, which omits ordinary tool activity whether or not
+  // a saved reply exists (server conversation-events.ts).
+  // A run watched live while open keeps the tools it streamed, so only runs
+  // already settled when first seen count.
+  const [liveObservedRuns, setLiveObservedRuns] = useState<{ issueId: typeof issueId; ids: ReadonlySet<string> }>({ issueId, ids: EMPTY_RUN_IDS });
+  const liveRunIdsNow = runs.filter((run) => !isTerminalRunStatus(run.status)).map((run) => run.id);
+  if (liveObservedRuns.issueId !== issueId) {
+    setLiveObservedRuns({ issueId, ids: new Set(liveRunIdsNow) });
+  } else if (liveRunIdsNow.some((id) => !liveObservedRuns.ids.has(id))) {
+    setLiveObservedRuns({ issueId, ids: new Set([...liveObservedRuns.ids, ...liveRunIdsNow]) });
+  }
+  const liveObservedRunIds = liveObservedRuns.issueId === issueId ? liveObservedRuns.ids : EMPTY_RUN_IDS;
+  const compactRunHistoryIds = useMemo(() => {
+    const ids = new Set<string>(deferredTranscriptRunIds);
+    for (const run of logRuns) if (truncatedRunIds?.has(run.id)) ids.add(run.id);
+    for (const run of nativeRuns) {
+      if (run.conversationOnly && isTerminalRunStatus(run.status) && !liveObservedRunIds.has(run.id)) ids.add(run.id);
+    }
+    return ids;
+  }, [deferredTranscriptRunIds, logRuns, truncatedRunIds, nativeRuns, liveObservedRunIds]);
+  // Expanding history (More run output, or the page's own history control)
+  // opens the activity of exactly the runs the compact view had left out, so
+  // one activation shows their saved steps.
+  const [compactRunHistory, setCompactRunHistory] = useState<{ issueId: typeof issueId; ids: ReadonlySet<string> }>({ issueId, ids: compactRunHistoryIds });
+  const [revealedRunHistory, setRevealedRunHistory] = useState<{ issueId: typeof issueId; ids: ReadonlySet<string> } | null>(null);
+  if (props.compactHistory && (compactRunHistory.issueId !== issueId || !sameRunIds(compactRunHistory.ids, compactRunHistoryIds))) {
+    setCompactRunHistory({ issueId, ids: compactRunHistoryIds });
+  } else if (!props.compactHistory && compactRunHistory.issueId === issueId && compactRunHistory.ids.size > 0) {
+    setRevealedRunHistory({ issueId, ids: compactRunHistory.ids });
+    setCompactRunHistory({ issueId, ids: EMPTY_RUN_IDS });
+  }
+  const revealedRunIds = revealedRunHistory?.issueId === issueId ? revealedRunHistory.ids : EMPTY_RUN_IDS;
   const historyControl = props.historyControl ?? (
-    props.compactHistory && props.onExpandHistory
-    && (deferredTranscriptRunIds.size > 0 || logRuns.some((run) => truncatedRunIds?.has(run.id)))
+    props.compactHistory && props.onExpandHistory && compactRunHistoryIds.size > 0
       ? <Button type="button" variant="ghost" size="sm" onClick={props.onExpandHistory}>More run output</Button>
       : null
   );
@@ -3376,6 +3410,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     <McpAppIssueProvider issueId={issueId} sendMessage={composerDisabledReason ? null : sendMcpAppMessage}>
     <ProviderToolIconsProvider companyId={companyId}>
     <TaskChatExpansionState.Provider value={expansionState.current}>
+    <TaskChatRevealedRunIds.Provider value={revealedRunIds}>
       <TaskChatScrollReady.Provider value={(historyRevealed || !historyPending || historyWaitExpired) && !scrollTargetPending}>
         <TaskChatPresentationProvider
           mode={streamlinedUiEnabled ? "streamlined" : "production"}
@@ -3746,6 +3781,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           </div>
         </TaskChatPresentationProvider>
       </TaskChatScrollReady.Provider>
+    </TaskChatRevealedRunIds.Provider>
     </TaskChatExpansionState.Provider>
     </ProviderToolIconsProvider>
     </McpAppIssueProvider>
