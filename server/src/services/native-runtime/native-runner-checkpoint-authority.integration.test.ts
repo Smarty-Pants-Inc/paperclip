@@ -5,10 +5,47 @@ import { expect, it } from "vitest";
 import { completionContracts, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults } from "@paperclipai/db";
 import { DurablePrpControlPlane } from "../../vendor/paperclip-runner/index.js";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "../../__tests__/helpers/native-restart.js";
-import { registerNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
+import { nativeRunnerCheckpointRegistration, registerNativeRunnerCheckpoint, stampNativeRunnerCommandIssuer } from "./native-runner-checkpoint.js";
 
 describeEmbeddedPostgres("checkpoint writer business-authority handover", () => {
   const environment = nativeRestartFixture();
+  it.each(["missing", "schema_default_local", "schema_default_plugin", "stamped"] as const)(
+    "refuses only issuer stamping, not runner registration, for %s owners", async scenario => {
+      const { db, runId, issueId, native } = await environment.seedRun(`ISSUER-${scenario}`);
+      const { companyId, successor, runtimeRoot } = environment.current;
+      const binding = { companyId, issueId, runId };
+      const core = new DurablePrpControlPlane({ stateDirectory: join(runtimeRoot, runId), identity: {
+        runnerInstanceId: native.runnerInstanceId, environmentLeaseId: native.environmentLeaseId, runId,
+        normalizedSessionId: native.normalizedSessionId, turnId: native.turnId, itemId: native.itemId },
+        expectedRunnerVersion: "fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      try {
+        const [original] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        expect(original.controllerGeneration).toBe(0);
+        core.setCommandIssuer({ bootId: randomUUID(), generation: 9 });
+        if (scenario === "missing") await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        else await db.update(nativeRunFinalizations).set({ controllerBootId: successor.bootId,
+          ...(scenario === "stamped" ? { controllerGeneration: 2 } : {}), leaseOwner: randomUUID(),
+          leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, runId));
+        const result = await stampNativeRunnerCommandIssuer(db, binding, successor.bootId, core);
+        expect(result).toEqual(scenario === "stamped" ? { stamped: true }
+          : { stamped: false, refused: "native_runner_command_issuer_missing" });
+        expect(core.queueCommand("turn.start", { prompt: "ordinary work" }).status).toBe("pending");
+        if (scenario === "missing") {
+          await expect(registerNativeRunnerCheckpoint({ db, authority: core, bootId: successor.bootId, binding }))
+            .rejects.toThrow("native_runner_checkpoint_owner_lost");
+        } else if (scenario === "schema_default_plugin") {
+          await expect(nativeRunnerCheckpointRegistration({ db, bootId: successor.bootId, binding })(core))
+            .resolves.toBeUndefined();
+        } else {
+          await expect(registerNativeRunnerCheckpoint({ db, authority: core, bootId: successor.bootId, binding }))
+            .resolves.toBeUndefined();
+        }
+        const command = core.queueCommand("runner.drain");
+        expect(command.issuer).toEqual(scenario === "stamped" ? { bootId: successor.bootId, generation: 2 } : undefined);
+        if (scenario !== "missing") await expect(core.flushCheckpoint()).resolves.toBeUndefined();
+      } finally { await core.stop(); }
+    });
+
   // REG-30 / trust boundary: idle cancellation is maintenance authority, not
   // a result and not permission for a cancelled turn to admit new work.
   it.each(["valid", "missing", "foreign_run", "foreign_session", "wrong_generation", "unacknowledged", "recovery_blocked", "new_work"] as const)(
