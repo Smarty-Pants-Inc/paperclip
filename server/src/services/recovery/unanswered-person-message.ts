@@ -22,7 +22,7 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
-import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { conversationResetSql, currentNoticeSql } from "../issue-comment-current.js";
@@ -839,10 +839,39 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt), isReset,
     sql`(${issueComments.createdAt}, ${issueComments.id}) > (${message.createdAt.toISOString()}::timestamptz, ${message.id}::uuid)`))
     .orderBy(issueComments.createdAt, issueComments.id).limit(1);
-  if (boundary && (await decideForMessage(q, issue, message, boundary.createdAt, nativeBlockedRepairApplies, true)).kind === "pending") {
+  if (!boundary) return decision;
+  // RFL ruling (0), 18:04Z (b3 G1): for a message BEFORE a reset whose run
+  // failed with a code Paperclip's own fallback lane continues
+  // (BACKLOG_CONTINUATION_SOURCE_CODES), B' does NOT consult the fallback
+  // verdict, whose inputs are current state (a later descendant, review,
+  // question or operator hold would rewrite the past). No note, unless one
+  // was already posted before the reset: that note is left as it is (the
+  // noticed lookup returned above), with no second note and no withdrawal.
+  // This is a SUPPRESSION in the benign direction, accepted by RFL: only a
+  // note that came due within the last sweep interval before the /new can be
+  // lost; it can never post a false "safe". Messages after the last /new keep
+  // the full verdict path; every other message keeps the as-of reading below.
+  if (await failedOnFallbackLane(q, issue, message)) return { kind: "none" };
+  if ((await decideForMessage(q, issue, message, boundary.createdAt, nativeBlockedRepairApplies, true)).kind === "pending") {
     return { kind: "none" };
   }
   return decision;
+}
+
+/** True when a run carrying the message, or a continuation of it (retryOfRunId),
+ * ended with a code Paperclip's own fallback lane continues by itself. */
+async function failedOnFallbackLane(q: Db, issue: DecisionIssue, message: { id: string; createdAt: Date }): Promise<boolean> {
+  const fallback = await import("../fresh-continuation-fallback.js");
+  const runs = await q.select({ id: heartbeatRuns.id, errorCode: heartbeatRuns.errorCode, retryOfRunId: heartbeatRuns.retryOfRunId,
+    contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId),
+    or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`),
+    gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000))))
+    .orderBy(heartbeatRuns.createdAt).limit(40);
+  const lineage = new Set(runs.filter(run => runCarriesMessage(run.contextSnapshot, message.id)).map(run => run.id));
+  for (const run of runs) if (run.retryOfRunId && lineage.has(run.retryOfRunId)) lineage.add(run.id);
+  const laneCodes = fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[];
+  return runs.some(run => lineage.has(run.id) && run.errorCode !== null && laneCodes.includes(run.errorCode));
 }
 
 /**
@@ -856,9 +885,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
  *   (will_continue, needs_stop_proof) or to look again (exact_recovery_pending,
  *   backoff). person_owned (in_review, a Stop, an operator decision, ...),
  *   not_applicable, successor_exists and dependency_wait are not a retry.
- * As of a past instant (a reset, b2 F2) only the recovery facts that existed
- * then count: a continuation recorded later, or a chain step recorded later,
- * was still to come then; a later verdict never revokes a completed reset.
+ * As of a past instant (a reset) it never consults the verdict, whose inputs
+ * are current state (RFL b3 G1, ruling (0)): it reads as still pending then.
  */
 async function recoveryVerdictPending(q: Db, issue: DecisionIssue, run: { id: string; status: string; errorCode: string | null;
   error: string | null; finishedAt: Date | null }, now: Date, asOf = false): Promise<boolean> {
@@ -867,19 +895,10 @@ async function recoveryVerdictPending(q: Db, issue: DecisionIssue, run: { id: st
   if (!run.finishedAt || !run.errorCode
     || !(fallback.BACKLOG_CONTINUATION_SOURCE_CODES as readonly string[]).includes(run.errorCode)) return false;
   if (run.finishedAt.getTime() + fallback.BACKLOG_CONTINUATION_MAX_AGE_MS <= now.getTime()) return false;
+  // Never the CURRENT verdict for a past instant (RFL b3 G1, ruling (0)).
+  if (asOf) return true;
   const verdict = await fallback.freshContinuationVerdict(q, { companyId: issue.companyId, runId: run.id, now });
-  if (["will_continue", "needs_stop_proof", "exact_recovery_pending", "backoff"].includes(verdict.kind)) return true;
-  if (!asOf) return false;
-  if (verdict.kind === "already_continued") {
-    const [record] = await q.select({ createdAt: issueRecoveryActions.createdAt }).from(issueRecoveryActions).where(and(
-      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.id, verdict.recoveryActionId)));
-    return Boolean(record && record.createdAt > now);
-  }
-  if (verdict.kind === "not_applicable" && verdict.reason === "fresh_continuation_chain_exhausted") {
-    const chain = await freshContinuationChain(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id, asOf: now });
-    return chain.attempts < fallback.FRESH_CONTINUATIONS_PER_CHAIN;
-  }
-  return false;
+  return ["will_continue", "needs_stop_proof", "exact_recovery_pending", "backoff"].includes(verdict.kind);
 }
 
 /**

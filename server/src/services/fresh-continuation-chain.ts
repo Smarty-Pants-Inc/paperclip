@@ -51,15 +51,13 @@ export async function freshContinuationDescendsFrom(db: Db, input: FreshContinua
   return result?.related === true;
 }
 
-/** `asOf`: count only the fresh continuations recorded by then (a past instant's view). */
-export async function freshContinuationChain(db: Db, input: FreshContinuationChainInput & { asOf?: Date }) {
+export async function freshContinuationChain(db: Db, input: FreshContinuationChainInput) {
   const [chain] = await db.execute<{ rootRunId: string; attempts: number }>(sql`${freshContinuationSourceChain(input)}
     select coalesce((select id::text from source_chain ancestor
       order by (parent_id is null or not exists (select 1 from source_chain parent where parent.id::text = ancestor.parent_id)) desc,
         id limit 1), ${input.runId}) as "rootRunId",
       (select count(*)::int from issue_recovery_actions action
         where action.company_id = ${input.companyId} and action.source_issue_id = ${input.issueId}
-          and action.evidence#>>'{freshContinuation,sourceRunId}' in (select id::text from source_chain)
-          ${input.asOf ? sql`and action.created_at <= ${input.asOf.toISOString()}::timestamptz` : sql``}) as attempts`);
+          and action.evidence#>>'{freshContinuation,sourceRunId}' in (select id::text from source_chain)) as attempts`);
   return chain!;
 }
