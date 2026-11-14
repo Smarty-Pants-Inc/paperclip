@@ -20,6 +20,9 @@ import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNative
 import { createNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { currentControllerProcessStamp } from "../controller-process-identity.js";
+import * as controllerProcessIdentity from "../controller-process-identity.js";
+import { logger } from "../../middleware/logger.js";
+import * as controllerLease from "../controller-instance-lease.js";
 import { proveControllerInstance, registerControllerInstanceLeaseWork, resetControllerInstanceLeaseForTests,
   tickControllerInstanceLease } from "../controller-instance-lease.js";
 import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
@@ -1391,10 +1394,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       // is needed: the test drives the production renewal explicitly.
       const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
         ReturnType<typeof createDeliveryWorkCoordinator>;
-      const work = registerControllerInstanceLeaseWork(db, coordinator);
+      let work: ReturnType<typeof registerControllerInstanceLeaseWork> | undefined;
       try {
-        currentControllerProcessStamp();
-        await tickControllerInstanceLease();
         const prior = await seedRecoveredPriorRun("settled", { lifecycle: "warm", interruptedLifecycle: true });
         const followUp = await admitFollowUp(prior);
         const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
@@ -1413,8 +1414,11 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         expect(await plan()).toBeNull();
         expect(await readFile(path, "utf8")).toBe(bytes);
         expect([...(await loadNativeRunnerCheckpoint(db, binding))!.records]).toEqual([...checkpoint.records]);
-        // The owned fixture's last-write time is recorded, not inferred from
-        // command age. Any older epoch can be fenced, not just the predecessor.
+        // Without a registered serving lease B1 remains closed. The explicit
+        // owned-record route remains supported alongside B1's ownerless route.
+        work = registerControllerInstanceLeaseWork(db, coordinator);
+        currentControllerProcessStamp();
+        await tickControllerInstanceLease();
         expect(await proveControllerInstance(db, stale, owned!.updatedAt)).toBe("fenced");
         const [fenced] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
         expect(fenced).toMatchObject({ stoppedAt: null, fencedByEpoch: boot!.epoch });
@@ -1423,13 +1427,151 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         expect(await followUp.start()).toBe(ADMITTED);
         expect(followUp.logs.join("")).toContain("native_legacy_lifecycle_abandoned count=2");
       } finally {
-        await work.stop();
+        await work?.stop();
         resetControllerInstanceLeaseForTests();
         await db.delete(environmentLeases).where(eq(environmentLeases.id, leaseId));
         await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
         await db.delete(controllerInstances).where(eq(controllerInstances.bootId, recent));
       }
     }, 60_000);
+
+  // Keep: ownerless production boot 4f539509; real PG/checkpoint safety boundary.
+  it.each(["expired", "lease-grace", "write-grace", "live", "equal", "newer"] as const)(
+    "B1 ownerless boot: %s uses only an older epoch past both grace windows", async shape => {
+      const fixture = await lifecyclePlan(false);
+      const current = await currentNativeControllerIdentity();
+      const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+      const stale = randomUUID(), old = new Date(Date.now() - 2 * 86_400_000);
+      const renewedAt = shape === "write-grace" ? new Date(Date.now() - 95_000) : old;
+      const leaseExpiresAt = shape === "live" ? new Date(Date.now() + 60_000)
+        : shape === "lease-grace" ? new Date(Date.now() - 5_000) : new Date(old.getTime() + 90_000);
+      // Equal epochs are excluded by the production unique index. Deliberately
+      // model that defensive/corrupt-state case in this isolated real PG only.
+      if (shape === "equal") await db.execute(sql`drop index controller_instances_epoch_idx`);
+      const epoch = shape === "newer" ? Math.max(...(await db.select().from(controllerInstances)).map(row => row.epoch)) + 1
+        : boot!.epoch + (shape === "equal" ? 0 : -1);
+      await db.insert(controllerInstances).values({ bootId: stale, pid: 7, processSpace: "ownerless-production-shape",
+        epoch,
+        startedAt: new Date(old.getTime() - 3_000_000), renewedAt, leaseExpiresAt });
+      const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+        ReturnType<typeof createDeliveryWorkCoordinator>;
+      const work = registerControllerInstanceLeaseWork(db, coordinator);
+      const fenceLog = vi.spyOn(logger, "info");
+      try {
+        currentControllerProcessStamp(); await tickControllerInstanceLease();
+        const [servingBefore] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+        const plan = await planNativeLifecycleSettlement({ db, root: fixture.root, bytes: fixture.bytes,
+          identity: fixture.prior.identity, companyId, agentId, issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId });
+        const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+        const [servingAfter] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+        expect(servingAfter).toEqual(servingBefore);
+        if (shape === "expired") {
+          expect(plan).not.toBeNull();
+          expect(after).toMatchObject({ fencedByEpoch: boot!.epoch, stoppedAt: null, renewedAt });
+          expect(after!.fencedAt).toBeInstanceOf(Date);
+          expect(fenceLog).toHaveBeenCalledWith(expect.objectContaining({ bootId: stale, epoch: boot!.epoch - 1,
+            lastRenewedAt: renewedAt, fencingEpoch: boot!.epoch }), "controller instance fenced");
+          expect(await fixture.followUp.start()).toBe(ADMITTED);
+          expect(fixture.followUp.logs.join("")).toContain("native_legacy_lifecycle_abandoned count=2");
+          // The late old boot uses the REAL renewal, not a hand-written SQL imitation.
+          await work.stop(); resetControllerInstanceLeaseForTests();
+          const identity = vi.spyOn(controllerProcessIdentity, "currentControllerBootId").mockReturnValue(stale);
+          const onLost = vi.fn();
+          const late = registerControllerInstanceLeaseWork(db, coordinator, { onLost });
+          try {
+            currentControllerProcessStamp(); await tickControllerInstanceLease();
+            expect(onLost).toHaveBeenCalledExactlyOnceWith("fenced");
+            const [held] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+            expect(held).toEqual(after);
+          } finally { await late.stop(); identity.mockRestore(); }
+        } else {
+          expect(plan).toBeNull();
+          expect(after).toMatchObject({ fencedAt: null, fencedByEpoch: null, stoppedAt: null, renewedAt, leaseExpiresAt });
+          expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+          expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
+        }
+      } finally {
+        await work.stop(); resetControllerInstanceLeaseForTests(); fenceLog.mockRestore();
+        await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+        if (shape === "equal") await db.execute(sql`create unique index controller_instances_epoch_idx on controller_instances (epoch)`);
+      }
+    }, 60_000);
+
+  it("B1 ownerless fence is idempotent across two racing settlements and never upgrades a SHARE lock", async () => {
+    const fixtures = [await lifecyclePlan(false), await lifecyclePlan(false)];
+    const current = await currentNativeControllerIdentity();
+    const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+    const stale = randomUUID(), old = new Date(Date.now() - 2 * 86_400_000);
+    await db.insert(controllerInstances).values({ bootId: stale, epoch: boot!.epoch - 1, pid: 7,
+      processSpace: "ownerless-racing", startedAt: old, renewedAt: old, leaseExpiresAt: old });
+    const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+      ReturnType<typeof createDeliveryWorkCoordinator>;
+    const work = registerControllerInstanceLeaseWork(db, coordinator);
+    const fenceLog = vi.spyOn(logger, "info");
+    const realProver = controllerLease.proveControllerInstance;
+    let release!: () => void, entrants = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const verdicts: unknown[] = [];
+    // Scheduling barrier only: both planners must enter the real mutating
+    // prover before either can fence. No proof or database result is mocked.
+    const prover = vi.spyOn(controllerLease, "proveControllerInstance").mockImplementation(async (...args) => {
+      if (args[1] !== stale || args[3]?.readOnly) return realProver(...args);
+      if (++entrants === 2) release();
+      await gate;
+      const verdict = await realProver(...args);
+      verdicts.push(verdict);
+      return verdict;
+    });
+    try {
+      currentControllerProcessStamp(); await tickControllerInstanceLease();
+      const plans = await Promise.all(fixtures.map(fixture => planNativeLifecycleSettlement({ db,
+        root: fixture.root, bytes: fixture.bytes, identity: fixture.prior.identity, companyId, agentId,
+        issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId })));
+      expect(plans.every(Boolean)).toBe(true);
+      expect(verdicts).toEqual(["fenced", "fenced"]);
+      const [fenced] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      expect(fenced).toMatchObject({ fencedByEpoch: boot!.epoch });
+      expect(fenced!.fencedAt).toBeInstanceOf(Date);
+      expect(fenceLog.mock.calls.filter(([fields, message]) => message === "controller instance fenced"
+        && (fields as { bootId?: string }).bootId === stale)).toHaveLength(1);
+      expect(await Promise.all(plans.map(plan => plan!.commit()))).toEqual([
+        expect.stringContaining("ABANDONED"), expect.stringContaining("ABANDONED")]);
+      expect(await realProver(db, stale, old)).toBe("fenced");
+      const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      expect(after).toEqual(fenced);
+    } finally {
+      release(); prover.mockRestore();
+      await work.stop(); resetControllerInstanceLeaseForTests(); fenceLog.mockRestore();
+      await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+    }
+  }, 60_000);
+
+  it("B1 transaction recheck refuses a newly arrived stale boot without mutating under SHARE", async () => {
+    const fixture = await lifecyclePlan(false);
+    const current = await currentNativeControllerIdentity();
+    const [boot] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, current.bootId));
+    const stale = randomUUID(), old = new Date(Date.now() - 2 * 86_400_000);
+    await db.insert(controllerInstances).values({ bootId: stale, epoch: boot!.epoch - 1, pid: 7,
+      processSpace: "arrived-after-plan", startedAt: old, renewedAt: old, leaseExpiresAt: old });
+    const coordinator = { register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }) } as unknown as
+      ReturnType<typeof createDeliveryWorkCoordinator>;
+    const work = registerControllerInstanceLeaseWork(db, coordinator);
+    try {
+      currentControllerProcessStamp(); await tickControllerInstanceLease();
+      await expect(fixture.plan.commit()).rejects.toThrow("native_lifecycle_settlement_proof_changed");
+      const [after] = await db.select().from(controllerInstances).where(eq(controllerInstances.bootId, stale));
+      expect(after).toMatchObject({ fencedAt: null, fencedByEpoch: null, stoppedAt: null });
+      expect(await readFile(fixture.path, "utf8")).toBe(fixture.bytes);
+      expect([...(await loadNativeRunnerCheckpoint(db, fixture.binding))!.records]).toEqual([...fixture.checkpoint.records]);
+      const fresh = await planNativeLifecycleSettlement({ db, root: fixture.root, bytes: fixture.bytes,
+        identity: fixture.prior.identity, companyId, agentId, issueId: fixture.prior.issueId, currentRunId: fixture.followUp.runId });
+      expect(fresh).not.toBeNull();
+      await expect(fresh!.commit()).resolves.toContain("ABANDONED");
+    } finally {
+      await work.stop(); resetControllerInstanceLeaseForTests();
+      await db.delete(controllerInstances).where(eq(controllerInstances.bootId, stale));
+    }
+  }, 60_000);
 
   it.each([{ offset: -1, admitted: true }, { offset: 0, admitted: false }, { offset: 1, admitted: false }])(
     "SMA-122 B2 strict skew boundary offset=$offset", async ({ offset, admitted }) => {

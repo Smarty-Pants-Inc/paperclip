@@ -2476,7 +2476,7 @@ Railway services too: a process can crash and restart inside the same deployment
 and some saved ownership records do not contain a deployment identity.
 `PAPERCLIP_CONTROLLER_INSTANCE_LEASE=off` explicitly disables it.
 
-Controller fencing is **record-driven, not an all-boot expiry sweep**. The
+Ownership-reconciliation fencing is **record-driven, not an all-boot expiry sweep**. The
 ownership reconciler enumerates in-progress ownership records, not every
 `controller_instances` row. Its shared owner prover calls
 `proveControllerInstance(db, bootId, touchedAt)` with the owned record's last
@@ -2506,10 +2506,28 @@ For an operational investigation of such a row:
    reconciler cannot be claimed to reach the historical row; escalate that
    evidence gap rather than manufacture an owner or a timestamp.
 
-Legacy lifecycle-command settlement deliberately does not run this mutating
-proof itself. It keeps refusing while **any** other boot lacks a recorded stop
-or fence, including a long-expired boot on the same host. Fencing that boot
-through the existing route discharges this one guard; every other lifecycle,
+Legacy lifecycle-command settlement's temporary M1 B1 guard also visits
+**ownerless** controller rows that the record-driven reconciler cannot reach.
+Before opening its settlement transaction, it calls the same documented
+`proveControllerInstance` primitive for every noncurrent, unclosed row with an
+epoch older than the serving boot. The timestamp is the row's persisted
+`renewed_at` (`renewedAt` in the schema), its last lease write, not a command's
+age or a fabricated owned-record timestamp. The primitive still requires
+`max(lease_expires_at, renewed_at + 90 seconds) + 30 seconds` to have elapsed
+and a registered serving lease with a newer epoch. Only `stopped` or `fenced`
+discharges B1; `live`, `grace`, `expired` and absent proof still refuse. The
+current boot and equal/newer epochs are never fenced by settlement. Each actual
+fence logs the boot id, epoch, last renewal and fencing epoch once; racing
+provers observe the same recorded fence, and a later renewal by that identity
+is rejected by the existing lease writer.
+
+The mutating proof runs **outside and before** the settlement transaction. The
+transaction retains `SET LOCAL lock_timeout = '1s'`, coordinator rows first,
+and the controller table SHARE lock only for legacy/unstamped command sets.
+Its repeated proof is nonmutating: a newly arrived unclosed boot refuses and
+requires a fresh planning pass, rather than upgrading competing SHARE locks.
+Thus a safe boot fence can persist even if another settlement guard later
+refuses; it grants no command or provider authority. Every other lifecycle,
 delivery, checkpoint, provider-work and ownership guard still applies.
 
 Native execution and restart claims register held preparation with this lease before
