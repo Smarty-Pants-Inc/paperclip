@@ -598,15 +598,18 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   it.each(["confirmed-stop", "unconfirmed-stop", "metadata-format", "already-stranded", "idle-descendants", "active-turn", "held-notice", "already-stranded-unconfirmed",
     "codex-confirmed-stop", "codex-unconfirmed-stop", "codex-metadata-format", "codex-already-stranded", "codex-idle-descendants", "codex-active-turn", "codex-held-notice", "codex-already-stranded-unconfirmed",
     "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare",
-    "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted"] as const)(
+    "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted",
+    "codex-tl08", "codex-tl08-unconfirmed"] as const)(
     "designed end answers from history with one note and no Retry (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
+    const tl08 = scenario.startsWith("tl08");
+    const seedSequence = tl08 || scenario.startsWith("seed-a");
     const f = shape.startsWith("codex-") ? await fixture() : await piFixture();
     f.input.workspace.executionWorkspace.cwd = instructionRoot;
     const first = await selectHeartbeatRuntime(db, f.input);
     if (!first.selected || !first.nativeExecution) throw new Error("Expected first selection");
     const oldId = first.nativeExecution.session.normalizedSessionId!;
-    if (scenario.startsWith("seed-a")) {
+    if (seedSequence) {
       await db.insert(issueComments).values({ companyId: f.agent.companyId, issueId: f.issue.id,
         authorType: "user", authorUserId: "local-board", body: "Remember ALDER as the original conversation word.",
         createdAt: new Date(f.run.createdAt.getTime() - 10_000) });
@@ -640,7 +643,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       authorType: "user", authorUserId: "local-board", body: `Answer the saved ${shape} request, using the earlier history.` }).returning();
     await db.insert(heartbeatRunEvents).values({ companyId: f.agent.companyId, agentId: f.agent.id, runId: f.run.id,
       seq: 64, stream: "system", eventType: "native.process_start_requested", createdAt: new Date("2026-11-14T08:16:07.439508Z") });
-    const error = scenario === "backup-without-lease" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
+    const error = tl08 ? "runner_harness_state_mismatch: resumed_unavailable"
+      : scenario === "backup-without-lease" ? "runner_harness_state_mismatch: backup_without_reusable_lease"
       : scenario === "retained-binding" || scenario.startsWith("seed-a") ? "native_controller_recovery_missing_evidence:retained_sandbox_binding"
       : scenario === "launch-profile" ? "native_runner_launch_profile_mismatch"
       : scenario === "generic-prepare" ? "native_runner_refresh_required"
@@ -649,7 +653,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       : scenario === "idle-descendants" || scenario === "active-turn" ? "native_runner_refresh_required"
       : "native_controller_recovery_missing_evidence:snapshot_binding";
     await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
-      errorCode: scenario.startsWith("seed-a") ? "native_continuation_requires_reconciliation" : error, error,
+      errorCode: tl08 ? "native_session_interrupted" : scenario.startsWith("seed-a") ? "native_continuation_requires_reconciliation" : error, error,
       resultJson: { failureCause: "provider_http_429" } }).where(eq(heartbeatRuns.id, f.run.id));
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", attempt: 1, controllerBootId: randomUUID(),
       leaseOwner: null, leaseExpiresAt: null, recoveryState: "blocked", failureCode: error }).where(eq(nativeRunFinalizations.runId, f.run.id));
@@ -672,8 +676,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     // and the person's resend both refuse the resumed retained binding. These
     // are real persisted failure rows, not an invented successful continuation.
     const seedLeases: (typeof lease)[] = [];
-    if (scenario.startsWith("seed-a")) {
-      for (const [index, code] of ["runner_harness_state_mismatch: backup_without_reusable_lease",
+    if (seedSequence) {
+      for (const [index, code] of [tl08 ? "native_predecessor_retirement_unproven" : "runner_harness_state_mismatch: backup_without_reusable_lease",
         "native_controller_recovery_missing_evidence:retained_sandbox_binding"].entries()) {
         const [failed] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
           nativeIssueId: f.issue.id, nativeSessionId: oldId, runtimeMode: "native", status: "failed",
@@ -702,7 +706,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
           providerLeaseId: lease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, lease.id));
     };
     const waiting = scenario === "unconfirmed-stop" || scenario === "active-turn" || scenario === "already-stranded-unconfirmed"
-      || scenario === "seed-a-unconfirmed";
+      || scenario === "seed-a-unconfirmed" || scenario === "tl08-unconfirmed";
     if (!waiting) await confirmStop();
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.agent.companyId, sourceIssueId: f.issue.id,
       kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active", ownerType: "board",
@@ -772,13 +776,13 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
     expect(answered.settled.status).toBe("succeeded");
     expect(JSON.stringify(answered.prompts)).toContain(message.body);
-    if (scenario.startsWith("seed-a")) expect(JSON.stringify(answered.prompts)).toContain("ALDER");
+    if (seedSequence) expect(JSON.stringify(answered.prompts)).toContain("ALDER");
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
     expect(allNotes).toHaveLength(beforeNotes.length + 1);
     const notes = currentNotices(allNotes, beforeNotes);
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toContain("fresh thread in this conversation");
-    if (scenario.startsWith("seed-a") || scenario === "backup-without-lease" || scenario === "retained-binding") {
+    if (seedSequence || scenario === "backup-without-lease" || scenario === "retained-binding") {
       expect(notes[0].body).not.toMatch(/skill change|cannot continue|Retry/);
       await settleUnrecoverableExecutions(db);
       await settleUnrecoverableExecutions(db);
