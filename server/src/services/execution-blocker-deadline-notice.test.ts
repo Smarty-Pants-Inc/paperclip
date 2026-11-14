@@ -4,6 +4,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "./execution-blocker.js";
 import { issueService } from "./issues.js";
+import { RECOVERED_WORK_RETRY_MESSAGE } from "./workspace-recovery-receipt.js";
 // Upstream ef2a49b6 shows its own deadline message for an active deadline action.
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 
@@ -19,7 +20,7 @@ const cause = "execution_finalization_deadline_exceeded";
 const deadlineNotice = "Paperclip could not resume or finish this reply before its execution deadline. "
   + "Open the failed run for details. Before retrying, verify that the previous execution has stopped "
   + "and reconcile any uncertain action.";
-const recoveredRetry = "Saved work recovered. Retry or send a message to continue.";
+const recoveredRetry = RECOVERED_WORK_RETRY_MESSAGE;
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("execution blocker follows a standing execution-deadline notice (SMAA-1444)", () => {
