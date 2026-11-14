@@ -258,7 +258,7 @@ describe("SMA-43/SMA-63 resolved native hold restore twin", () => {
     const refusal = issueAfterRefusal.body.activeRecoveryAction.evidence.taskRetryRefusal;
     expect(refusal).toMatchObject({ schema: "paperclip.task-retry-source-refusal.v1",
       recoveryActionId: f.board.id, sourceRunId: f.failed.id, currentRunId: newer!.id,
-      reason: expect.stringContaining("older run"), nextAction: expect.stringContaining("latest run") });
+      reason: expect.stringContaining("no longer current"), nextAction: expect.stringContaining("Try again") });
     expect(issueAfterRefusal.body.activeRecoveryAction.evidence.latestRunId).toBe(newer!.id);
     expect(issueAfterRefusal.body.activeRecoveryAction.nextAction).toBe(refusal.nextAction);
 

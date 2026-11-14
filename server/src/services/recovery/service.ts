@@ -4158,6 +4158,67 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  async function refreshStrandedAssignedIssueRecoveryProjection(input: {
+    companyId: string;
+    issueId: string;
+    recoveryActionId: string;
+    sourceRunId: string;
+    currentRunId: string;
+  }) {
+    return db.transaction(async (tx) => {
+      const [issue] = await tx.select().from(issues).where(and(
+        eq(issues.companyId, input.companyId),
+        eq(issues.id, input.issueId),
+      )).for("update").limit(1);
+      if (!issue || issue.hiddenAt || ["done", "cancelled"].includes(issue.status)) return null;
+
+      const [latestRun] = await tx.select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      if (!latestRun || latestRun.id !== input.currentRunId) return null;
+
+      const [action] = await tx.select().from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.id, input.recoveryActionId),
+        eq(issueRecoveryActions.companyId, input.companyId),
+        eq(issueRecoveryActions.sourceIssueId, input.issueId),
+        eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+        eq(issueRecoveryActions.ownerType, "board"),
+        inArray(issueRecoveryActions.status, ["active", "escalated"]),
+      )).for("update").limit(1);
+      const evidence = parseObject(action?.evidence);
+      const refusal = parseObject(evidence.taskRetryRefusal);
+      if (!action || evidence.latestRunId !== input.sourceRunId ||
+          refusal.schema !== "paperclip.task-retry-source-refusal.v1" ||
+          refusal.recoveryActionId !== action.id || refusal.sourceRunId !== input.sourceRunId ||
+          refusal.currentRunId !== input.currentRunId) return null;
+
+      const nextAction = "The current run is shown on this card. Try again will use it and still honor any recovery hold.";
+      const refreshedEvidence = {
+        ...evidence,
+        latestIssueStatus: issue.status,
+        latestRunId: latestRun.id,
+        latestRunStatus: latestRun.status,
+        latestRunErrorCode: latestRun.errorCode,
+        taskRetryRefusal: {
+          ...refusal,
+          reason: "The earlier Try again request named a run that was no longer current. This card now shows the current run; any earlier recovery hold remains in force.",
+          nextAction,
+        },
+      };
+      const [updated] = await tx.update(issueRecoveryActions).set({
+        evidence: refreshedEvidence,
+        nextAction,
+        updatedAt: new Date(),
+      }).where(eq(issueRecoveryActions.id, action.id)).returning();
+      return updated ?? null;
+    });
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: RecoveryIssue;
     previousStatus: StrandedPreviousStatus;
@@ -6881,6 +6942,7 @@ export function recoveryService(
     buildRunOutputSilences,
     escalateStrandedRecoveryIssueInPlace,
     escalateStrandedAssignedIssue,
+    refreshStrandedAssignedIssueRecoveryProjection,
     recordWatchdogDecision,
     scanSilentActiveRuns,
     registerActiveRunSilenceWork: watchdog.registerSilenceWork,
