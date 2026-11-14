@@ -539,15 +539,17 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
       )).orderBy(issueComments.createdAt, issueComments.id);
     type Note = (typeof notes)[number];
 
-    // Never edit or delete a posted note (org 09:18Z; RFL d8line2 F1/F2): the
-    // note is kept byte-identical, its held record is closed, and it is marked
-    // metadata.supersededBy = the comment that took its place.
-    const supersede = async (note: Note, held: HeldReplyMetadata, byCommentId: string, byRunId?: string | null) => {
-      const nextHeld: HeldReplyMetadata = { ...held, state: "superseded", superseded: true, supersededAt: now.toISOString(),
-        supersededByCommentId: byCommentId, ...(byRunId ? { supersededByRunId: byRunId } : {}) };
-      const metadata = { ...withHeldReplyMetadata(note.metadata, nextHeld), supersededBy: byCommentId } as never;
-      await tx.update(issueComments).set({ metadata, updatedAt: now })
-        .where(and(eq(issueComments.id, note.id), isNull(issueComments.deletedAt)));
+    // Never edit or delete a posted note (org 09:18Z; RFL d8line2 F1/F2, m15
+    // F2): the ONLY change is the atomic JSONB merge of metadata.supersededBy =
+    // the comment that took its place, as the other writers do, so a marker
+    // another writer set (supersededByInteractionId) is never lost. The held
+    // record is not rewritten: "closed" is read from that marker
+    // (heldReplyOutstandingSql).
+    const supersede = async (note: Note, byCommentId: string) => {
+      await tx.execute(sql`update ${issueComments} set metadata = coalesce(metadata, '{}'::jsonb)
+          || jsonb_build_object('supersededBy', ${byCommentId}::text), updated_at = ${now.toISOString()}::timestamptz
+        where id = ${note.id} and company_id = ${issue.companyId} and deleted_at is null
+          and coalesce(metadata->>'supersededBy', '') = ''`);
     };
 
     type Group = { cardIds: string[]; ended: { id: string; status: string; agentId: string; errorCode: string | null } | null;
@@ -566,7 +568,7 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
       // The visible reply that answers this note (F1/F2): the held run's own
       // reply published later, or a continuation reply of one of its answered
       // cards. The same check serves a held note and a follow-up note.
-      const [published] = await tx.select({ id: issueComments.id, runId: issueComments.createdByRunId })
+      const [published] = await tx.select({ id: issueComments.id })
         .from(issueComments).leftJoin(heartbeatRuns, and(eq(heartbeatRuns.id, issueComments.createdByRunId),
           eq(heartbeatRuns.companyId, issueComments.companyId)))
         .where(and(
@@ -576,7 +578,7 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
             ? inArray(sql<string>`${heartbeatRuns.contextSnapshot}->>'interactionId'`, answeredIds) : sql`false`),
         )).orderBy(issueComments.createdAt, issueComments.id).limit(1);
       if (published) {
-        await supersede(note, held, published.id, published.runId);
+        await supersede(note, published.id);
         continue;
       }
       // A follow-up note already says what happened; only a reply replaces it.
@@ -660,7 +662,7 @@ async function reconcileHeldReplyNotes(db: Db, issue: DecisionIssue, now: Date):
         if (!comment?.id) continue;
         targetId = comment.id;
       }
-      for (const member of group.members) await supersede(member.note, member.held, targetId);
+      for (const member of group.members) await supersede(member.note, targetId);
     }
   });
 }
