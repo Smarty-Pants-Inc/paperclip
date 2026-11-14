@@ -35,6 +35,7 @@ import {
   executionWorkspaces,
   heartbeatRuns,
   heartbeatRunEvents,
+  issueComments,
   issues,
   nativeRunFinalizations,
   plugins,
@@ -75,6 +76,7 @@ import { createNativeHarnessBackupStamp } from "../services/native-runtime/nativ
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
+import * as runnerPackIdentity from "../services/native-runtime/runner-pack-reuse-identity.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -5161,6 +5163,147 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
       else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
       await rm(backupBase, { recursive: true, force: true });
+    }
+  });
+
+  // Keep: the C8 → M1 incident lost a person's next chat turn at a release boundary.
+  it.each(["changed pack", "same pack", "in flight", "legacy in flight", "legacy pack", "legacy full fingerprint", "missing backup", "source changed", "creation failed"] as const)(
+    "admits reusable runners by their build-owned pack identity: %s", async scenario => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "runner-pack-cutover-"));
+    const oldPackPath = process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH;
+    const oldStatePath = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH = root;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = root;
+    try {
+      const writePack = async (revision: string) => {
+        const payload = { runnerSourceRevision: revision.repeat(40), runnerInputsDigest: revision.repeat(64),
+          target: { platform: "linux", architecture: "x64" } };
+        await writeFile(path.join(root, "provider-pack.json"), JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1",
+          digest: `sha256:${createHash("sha256").update(stableStringify(payload)).digest("hex")}`, payload }));
+      };
+      await writePack("a");
+      const pluginId = randomUUID();
+      const config = { provider: "fake-plugin", from: "unchanged-C8-snapshot", reuseLease: true, timeoutMs: 1234 };
+      const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config });
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Continue my daily chat", status: "todo", assigneeAgentId: agentId });
+      await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{ driverKey: "fake-plugin", kind: "sandbox_provider",
+        displayName: "Pack cutover", supportsReusableLeases: true, configSchema: { type: "object" } }] });
+      let acquisitions = 0;
+      const worker = { isRunning: () => true,
+        getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+        call: vi.fn(async (_id: string, method: string, params: any) => {
+          if (method === "environmentAcquireLease") {
+            acquisitions++;
+            if (acquisitions === 2 && scenario === "creation failed") throw new Error("pack-cutover-create-failed");
+            if (acquisitions === 2 && scenario === "source changed") {
+              const source = (await environmentService(db).getLeaseById(first.lease.id))!;
+              await environmentService(db).updateLeaseMetadata(source.id, { ...source.metadata, checkpointChangedWhileCreating: true });
+            }
+            return { providerLeaseId: `pack-box-${acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" } };
+          }
+          if (method === "environmentResumeLease") return { providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" } };
+          if (["environmentReleaseLease", "environmentDestroyLease"].includes(method)) return undefined;
+          throw new Error(`Unexpected cutover method: ${method}`);
+        }) } as unknown as PluginWorkerManager;
+      const service = environmentRuntimeService(db, { pluginWorkerManager: worker });
+      const acquire = (heartbeatRunId: string) => service.acquireRunLease({ companyId, environment, issueId, agentId,
+        adapterType: "paperclip_runner", heartbeatRunId, persistedExecutionWorkspace: null });
+      // Legacy fixtures must have M1's actual pre-input digests, not merely
+      // omit the metadata marker while retaining a modern pack-A fingerprint.
+      const legacyIdentity = scenario.startsWith("legacy ")
+        ? vi.spyOn(runnerPackIdentity, "runnerPackReuseIdentity").mockReturnValue(null) : null;
+      const first = await (async () => {
+        try { return await acquire(runId); }
+        finally { legacyIdentity?.mockRestore(); }
+      })();
+      const admittedScope = first.lease.metadata?.reusableSandboxLease;
+      const normalizedSessionId = randomUUID(), runnerInstanceId = "pack-cutover-runner", sessionScopeId = "pack-cutover-scope";
+      const backup = path.join(root, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+      await mkdir(path.join(backup, "runner"), { recursive: true });
+      await mkdir(path.join(backup, "pi-agent"), { recursive: true });
+      await mkdir(path.join(backup, "pi"), { recursive: true });
+      await writeFile(path.join(backup, "runner", "runner-state.json"), "settled C8 runner");
+      await writeFile(path.join(backup, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"remember my daily work"}\n');
+      const manifest = buildNativeHarnessBackupManifest({ backupRoot: backup, runnerInstanceId,
+        sourceProviderLeaseId: first.lease.providerLeaseId!, providerSessionIdentity: { providerSessionId: "pi-thread" },
+        execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId, issueId, agentId, executionWorkspaceId: null },
+          workspace: { cwd: "/workspace" }, session: { normalizedSessionId, driverKind: "pi_rpc" } } as never });
+      const manifestPath = path.join(backup, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId, normalizedSessionId, runnerInstanceId,
+        authorizedProviderLeaseId: first.lease.providerLeaseId!, completedAt: manifest.completedAt });
+      if (scenario !== "missing backup") await environmentService(db).updateLeaseMetadata(first.lease.id,
+        { ...first.lease.metadata, nativeHarnessBackup: stamp });
+      if (scenario === "legacy pack" || scenario === "legacy full fingerprint") {
+        const scope = { ...(first.lease.metadata?.reusableSandboxLease as Record<string, unknown>) };
+        delete scope.runnerPackIdentity;
+        // Exercise both full-fingerprint legacy admission and the older
+        // runtime-only fallback. Neither can inherit today's pack identity.
+        if (scenario === "legacy pack") {
+          delete scope.leaseFingerprint;
+          delete scope.leaseIdentityFingerprint;
+        }
+        await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata,
+          nativeHarnessBackup: stamp, reusableSandboxLease: scope });
+      }
+      let nextRunId = runId;
+      if (!["in flight", "legacy in flight"].includes(scenario)) {
+        await service.releaseRunLeases(runId);
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(), nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, runId));
+        nextRunId = randomUUID();
+        await insertRunningManualRun(nextRunId, companyId, agentId);
+      }
+      // Environment admission precedes runtime selection: a fresh chat wake
+      // carries its issue in context before nativeIssueId is populated.
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId } }).where(eq(heartbeatRuns.id, nextRunId));
+      if (scenario !== "same pack") await writePack("b");
+      vi.mocked(worker.call).mockClear();
+      if (scenario === "source changed" || scenario === "creation failed") {
+        await expect(acquire(nextRunId)).rejects.toThrow(scenario === "source changed"
+          ? "Reusable sandbox changed during compatible configuration drain" : "pack-cutover-create-failed");
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
+        expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+        if (scenario === "source changed") expect(await environmentService(db).listLeases(environment.id)).toEqual(expect.arrayContaining([
+          expect.objectContaining({ providerLeaseId: "pack-box-2", status: "pending_cleanup", failureReason: "lease_fingerprint_mismatch_source_changed" }),
+        ]));
+      } else if (scenario === "missing backup") {
+        await expect(acquire(nextRunId)).rejects.toThrow("runner_pack_reuse_blocked");
+        await expect(acquire(nextRunId)).rejects.toThrow("runner_pack_reuse_blocked");
+        const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+        expect(notices).toHaveLength(1);
+        expect(notices[0]!.body).toContain("preserved");
+        expect(worker.call).not.toHaveBeenCalled();
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "released" });
+      } else {
+        const next = await acquire(nextRunId);
+        if (["same pack", "in flight", "legacy in flight"].includes(scenario)) {
+          expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+          expect(acquisitions).toBe(1);
+          expect(next.lease.metadata?.reusableSandboxLease).toEqual(admittedScope);
+          expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+        } else {
+          expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
+          expect(acquisitions).toBe(2);
+          expect(next.lease.metadata?.nativeHarnessBackup).toEqual(stamp);
+          expect(next.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "replacement", reason: "lease_fingerprint_mismatch",
+            previousProviderLeaseId: first.lease.providerLeaseId });
+          expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
+          // The same server replacement owner durably retires the old box;
+          // its existing claimed teardown can then destroy it, never before
+          // the replacement and verified conversation backup are recorded.
+          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "pending_cleanup", failureReason: "lease_fingerprint_mismatch" });
+          expect(worker.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+          await service.destroyReusableSandboxLeases({ companyId, issueId, failureReason: "lease_fingerprint_mismatch" });
+          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({ status: "expired", failureReason: "lease_fingerprint_mismatch" });
+        }
+      }
+    } finally {
+      if (oldPackPath === undefined) delete process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH;
+      else process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH = oldPackPath;
+      if (oldStatePath === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = oldStatePath;
+      await rm(root, { recursive: true, force: true });
     }
   });
 

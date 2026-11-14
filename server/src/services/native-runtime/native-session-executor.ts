@@ -352,6 +352,7 @@ import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
   readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+import { NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH, runnerLaunchProfileMismatch, noticeRunnerReuseRefusal } from "./runner-reuse-refusal.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -7763,6 +7764,14 @@ const HELD_PREDECESSOR_REFUSAL = /^(?:Error: )?(?:runner_state_identity_mismatch
  */
 /** Exported for the notice-writer regression only. */
 export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution: NativeExecutionInput }, error: unknown): Promise<void> {
+  // This is also the outer executor catch's notice boundary. A launch-profile
+  // refusal is not an unfinished-owner diagnosis and needs no failed predecessor.
+  if (runnerLaunchProfileMismatch(error)) {
+    const { companyId, issueId, agentId, runId } = input.execution.binding;
+    if (issueId) await noticeRunnerReuseRefusal(input.db, { companyId, issueId, agentId, runId,
+      normalizedSessionId: nativeSessionKey(input.execution), reason: "runner_launch_profile_mismatch" });
+    return;
+  }
   const message = error instanceof Error ? error.message : String(error);
   if (!HELD_PREDECESSOR_REFUSAL.test(message)) return;
   const { companyId, issueId, agentId, runId } = input.execution.binding;
@@ -9149,6 +9158,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "runner_remote_provider_artifact_incompatible" ||
     sourceFailureCode === "runner_remote_provider_verification_unavailable" ||
     sourceFailureCode === "native_provider_terminal_failed" ||
+    sourceFailureCode === NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH ||
     sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE ||
     sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING ||
     sourceFailureCode === NATIVE_CURRENT_WAKE_COMMENTS_UNREAD ||
@@ -9345,6 +9355,7 @@ export function nativeSessionFailureSourceCode(
   | "native_permission_declined"
   | "native_provider_terminal_failed"
   | "native_governed_wait_settlement_pending"
+  | typeof NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH
   | typeof NATIVE_PROVIDER_STATE_INCOMPATIBLE
   | typeof NATIVE_PROVIDER_SIDE_EFFECT_PENDING
   | "native_provider_approval_required"
@@ -9386,6 +9397,7 @@ export function nativeSessionFailureSourceCode(
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
+  if (runnerLaunchProfileMismatch(error)) return NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH;
   if (error instanceof NativePermissionDeclinedError) return "native_permission_declined";
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
@@ -14154,6 +14166,8 @@ async function executePaperclipNativeSessionAttempt(
                 ? NATIVE_STARTUP_MODEL_REJECTED_ACTION
               : sourceFailureCode === "native_provider_model_rejected"
                 ? NATIVE_TURN_MODEL_REJECTED_ACTION
+              : sourceFailureCode === NATIVE_RUNNER_LAUNCH_PROFILE_MISMATCH
+                ? "The saved computer has an incompatible Runner launch profile. Preserve it, verify its saved conversation, then retire it through server lease replacement before retrying on a fresh Runner; do not reset conversation history."
               : sourceFailureCode === NATIVE_PROVIDER_STATE_INCOMPATIBLE
                 ? NATIVE_PROVIDER_STATE_INCOMPATIBLE_ACTION
               : sourceFailureCode === NATIVE_PROVIDER_SIDE_EFFECT_PENDING
@@ -15887,7 +15901,17 @@ export const REMOTE_RUNNER_AUTHORITY_ARCHIVE_SCRIPT =
   'if test -f "$1" && test ! -L "$1" && test ! -e "$3" && test ! -L "$3"; then umask 077; install -d -m 0700 "$2"; mv -- "$1" "$3"; ' +
   'elif test ! -e "$1" && test ! -L "$1" && test -f "$3" && test ! -L "$3"; then :; ' +
   'elif test -f "$1" && test ! -L "$1" && test -f "$3" && test ! -L "$3" && command -v cmp >/dev/null 2>&1 && cmp -s "$1" "$3"; then rm -f -- "$1"; ' +
-  'else exit 1; fi; base64 < "$3"';
+  'else exit 1; fi; ' +
+  // Pi's transcript, not its process-scoped facade, owns history. Match the
+  // existing local Pi cold-open protocol: archive that facade too, so a new
+  // Runner does not restore C8 launch paths before M1's session.open. Optional
+  // arguments leave every other provider's durable recovery unchanged.
+  'if test "$#" -ge 5; then ' +
+  'if test -f "$4" && test ! -L "$4" && test ! -e "$5" && test ! -L "$5"; then mv -- "$4" "$5"; ' +
+  'elif test ! -e "$4" && test ! -L "$4" && test -f "$5" && test ! -L "$5"; then :; ' +
+  'elif test -f "$4" && test ! -L "$4" && test -f "$5" && test ! -L "$5" && command -v cmp >/dev/null 2>&1 && cmp -s "$4" "$5"; then rm -f -- "$4"; ' +
+  'elif test ! -e "$4" && test ! -L "$4" && test ! -e "$5" && test ! -L "$5"; then :; ' +
+  'else exit 1; fi; fi; base64 < "$3"';
 
 /**
  * A detached remote runnerd has no controller-side stderr. Its stderr goes to
@@ -19175,6 +19199,10 @@ async function createRunnerdBackendWithinSessionClaim(
               sourcePath,
               archiveDirectory,
               archivedStatePath,
+              ...(input.execution.provider.kind === "pi_rpc" ? [
+                posix.join(remoteStateDirectory, "codex-provider-state.json"),
+                posix.join(archiveDirectory, "codex-provider-state.json"),
+              ] : []),
             ],
             bypassSession: true,
             timeoutMs: 10_000,

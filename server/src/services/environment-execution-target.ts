@@ -101,7 +101,10 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? candidate.providerLeaseId
       : providerLeaseId;
   if (!resolvedProviderLeaseId) return null;
-  const reason = candidate.reason;
+  // Core's detailed cleanup reason uses the adapter's existing replacement
+  // identity classification. Keep outcome + predecessor intact so the native
+  // restore owner never mistakes a pack cutover for a resumed old computer.
+  const reason = candidate.reason === "lease_fingerprint_mismatch" ? "identity_mismatch" : candidate.reason;
   if (
     reason !== undefined &&
     reason !== "not_found" &&

@@ -180,7 +180,7 @@ export async function retireReplacedReusableSandboxLease(input: {
   lease: EnvironmentLease;
   companyId: string;
   heartbeatRunId: string;
-  reason?: "compatible_environment_change";
+  reason?: "compatible_environment_change" | "lease_fingerprint_mismatch";
 }): Promise<boolean> {
   const { db, lease } = input;
   if (!lease.providerLeaseId) return false;
@@ -201,7 +201,7 @@ export async function retireReplacedReusableSandboxLease(input: {
     eq(environmentLeases.companyId, input.companyId),
     eq(environmentLeases.providerLeaseId, lease.providerLeaseId!),
     inArray(environmentLeases.status, ["released", "retained"]),
-    ...(input.reason === "compatible_environment_change" ? [
+    ...(input.reason ? [
       eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!),
       sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`,
       sql`NOT EXISTS (SELECT 1 FROM ${environmentLeases} AS live_source

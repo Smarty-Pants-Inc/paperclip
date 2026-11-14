@@ -176,6 +176,18 @@ describe("resolveEnvironmentExecutionTarget", () => {
     expect(target).toMatchObject({ kind: "remote", transport: "sandbox", sandboxLeaseAcquisition: acquisition });
   });
 
+  it("carries a Runner-pack fingerprint replacement through the existing identity-mismatch restore contract", async () => {
+    mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({ driver: "sandbox", config: { provider: "test-provider" } });
+    const target = await resolveEnvironmentExecutionTarget({ db: {} as never, companyId: "company",
+      adapterType: "paperclip_runner", environment: { id: "env", driver: "sandbox", config: { provider: "test-provider" } },
+      leaseId: "lease", leaseMetadata: {}, environmentRuntime: null,
+      lease: { providerLeaseId: "new-allocation", metadata: { sandboxLeaseAcquisition: { outcome: "replacement",
+        previousProviderLeaseId: "old-allocation", reason: "lease_fingerprint_mismatch" } } } as never });
+    expect(target).toMatchObject({ kind: "remote", transport: "sandbox", sandboxLeaseAcquisition: {
+      outcome: "replacement", providerLeaseId: "new-allocation", previousProviderLeaseId: "old-allocation", reason: "identity_mismatch",
+    } });
+  });
+
   it("keeps sandbox targets on bridge mode even when lease metadata includes a Paperclip API URL", async () => {
     mockResolveEnvironmentDriverConfigForRuntime.mockResolvedValue({
       driver: "sandbox",

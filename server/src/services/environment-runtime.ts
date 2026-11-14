@@ -1,4 +1,6 @@
 import { settleWarmRetention } from "./environment-warm-retention.js";
+import { admittedRunnerPackIdentity, runnerPackReuseIdentity } from "./native-runtime/runner-pack-reuse-identity.js";
+import { noticeRunnerReuseRefusal } from "./native-runtime/runner-reuse-refusal.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
@@ -886,9 +888,12 @@ function reusableRuntimeFingerprint(input: {
   provider: string;
   adapterType: string | null;
   config: Record<string, unknown>;
+  runnerPackIdentity?: string | null;
 }): string {
+  const { runnerPackIdentity: admittedIdentity, ...runtime } = input;
+  const identity = admittedIdentity === undefined ? runnerPackReuseIdentity(input.adapterType) : admittedIdentity;
   return createHash("sha256")
-    .update(stableStringify(input))
+    .update(stableStringify({ ...runtime, ...(identity ? { runnerPackIdentity: identity } : {}) }))
     .digest("hex");
 }
 
@@ -1016,9 +1021,11 @@ async function buildReusableSandboxLeaseFingerprints(input: {
   });
   const workspaceMigration = input.executionWorkspaceId
     ? await readNativeWorkspaceMigration(input.db, { companyId: input.companyId, id: input.executionWorkspaceId }) : null;
-  // Both digests share the exact company/session/security context. Keep the
-  // full digest unchanged for older leases and eventual config adoption.
-  const fingerprintForConfig = (providerConfig: Record<string, unknown>) => createEffectiveRunConfigFingerprints({
+  // Both digests share the exact company/session/security context and one
+  // Runner-supplied build input. Null explicitly reproduces the legacy digest
+  // only for a run that still owns its already-admitted active lease.
+  const currentRunnerPackIdentity = runnerPackReuseIdentity(input.adapterType);
+  const fingerprintForConfig = (providerConfig: Record<string, unknown>, runnerPackIdentity = currentRunnerPackIdentity) => createEffectiveRunConfigFingerprints({
     lease: {
       companyId: input.companyId,
       environment: {
@@ -1030,6 +1037,7 @@ async function buildReusableSandboxLeaseFingerprints(input: {
       ...(input.executionWorkspaceId ? {} : { projectlessIssueId: input.issueId }),
       agentId: input.agentId,
       adapterType: input.adapterType,
+      ...(runnerPackIdentity ? { runnerPackIdentity } : {}),
       provider: input.provider,
       providerPlugin: input.providerPlugin ?? null,
       providerConfig,
@@ -1062,6 +1070,7 @@ function buildReusableSandboxLeaseScope(input: {
   if ((!input.executionWorkspaceId && !input.issueId) || !input.agentId) return null;
   const providerMetadata = input.providerMetadata ?? {};
   const adapterType = input.adapterType ?? null;
+  const runnerPackIdentity = runnerPackReuseIdentity(adapterType);
   const remoteCwd = readString(providerMetadata.remoteCwd);
   const workspaceSentinel = isRecord(providerMetadata.workspaceSentinel)
     ? { ...providerMetadata.workspaceSentinel }
@@ -1075,10 +1084,12 @@ function buildReusableSandboxLeaseScope(input: {
     agentId: input.agentId,
     adapterType,
     provider: input.provider,
+    ...(runnerPackIdentity ? { runnerPackIdentity } : {}),
     runtimeFingerprint: reusableRuntimeFingerprint({
       provider: input.provider,
       adapterType,
       config: input.config,
+      runnerPackIdentity,
     }),
     ...(input.leaseFingerprint
       ? { leaseFingerprint: serializeLeaseFingerprint(input.leaseFingerprint) }
@@ -1133,6 +1144,7 @@ function reusableSandboxLeaseScopeMatches(input: {
     provider: input.provider,
     adapterType,
     config: input.config,
+    ...(input.allowLegacyRuntimeFingerprint ? { runnerPackIdentity: admittedRunnerPackIdentity(input.lease.metadata) } : {}),
   });
 }
 
@@ -1700,6 +1712,10 @@ function createSandboxEnvironmentDriver(
       if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) continue;
       const admittedConfig = admittedSandboxLeaseConfig(input.config, lease.metadata ?? {});
       const scope = { ...input, lease };
+      // A release never changes an in-flight run's admitted Runner. Only the
+      // next run compares against today's pack and replaces the old box.
+      const ownsActiveLease = lease.status === "active" && lease.heartbeatRunId === input.heartbeatRunId;
+      const admittedPack = ownsActiveLease ? admittedRunnerPackIdentity(lease.metadata) : undefined;
       const hasIdentityFingerprint = isRecord(lease.metadata?.reusableSandboxLease)
         && readLeaseFingerprint(lease.metadata.reusableSandboxLease.leaseIdentityFingerprint) !== null;
       const compatible = (hasIdentityFingerprint
@@ -1710,8 +1726,8 @@ function createSandboxEnvironmentDriver(
         // TODAY's security context. Source drift was rejected above; account,
         // secret, plugin and mount drift therefore still fail closed.
         || reusableSandboxLeaseScopeMatches({ ...scope, config: admittedConfig,
-            leaseFingerprint: input.fingerprints.fingerprintForConfig(admittedConfig),
-            allowLegacyRuntimeFingerprint: lease.status === "active" && lease.heartbeatRunId === input.heartbeatRunId });
+            leaseFingerprint: input.fingerprints.fingerprintForConfig(admittedConfig, admittedPack),
+            allowLegacyRuntimeFingerprint: ownsActiveLease });
       if (!compatible) continue;
       compatibleLeases.push(lease);
       if (input.exactMatches.length === 0 && !rolloverLease && await reusableSandboxConfigurationChangeIsSafe({
@@ -1723,14 +1739,15 @@ function createSandboxEnvironmentDriver(
     return { pinnedConfigs, compatibleLeases, rolloverLease };
   }
 
-  async function retireCompatibleConfigurationSource(source: EnvironmentLease, replacement: EnvironmentLease, heartbeatRunId: string) {
+  async function retireCompatibleConfigurationSource(source: EnvironmentLease, replacement: EnvironmentLease, heartbeatRunId: string,
+    reason: "compatible_environment_change" | "lease_fingerprint_mismatch" = "compatible_environment_change") {
     if (await retireReplacedReusableSandboxLease({ db, lease: source, companyId: source.companyId,
-      heartbeatRunId, reason: "compatible_environment_change" })) return;
+      heartbeatRunId, reason })) return;
     // Another admission/checkpoint changed the source while creation was in
     // flight. Never serve an older backup or delete that source. The existing
     // cleanup worker owns only our unused new allocation; a retry rereads truth.
     await environmentsSvc.releaseLease(replacement.id, "pending_cleanup", {
-      failureReason: "compatible_environment_change_source_changed", cleanupStatus: "failed",
+      failureReason: `${reason}_source_changed`, cleanupStatus: "failed",
     });
     throw new Error("Reusable sandbox changed during compatible configuration drain; retry acquisition.");
   }
@@ -1740,7 +1757,13 @@ function createSandboxEnvironmentDriver(
     environment: Environment;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
+    heartbeatRunId: string | null;
+    adapterType: string | null;
+    agentId: string | null;
+    issueId: string | null;
   }) {
+    let runnerPackReplacement: EnvironmentLease | null = null;
+    const currentPack = runnerPackReuseIdentity(input.adapterType);
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
     for (const lease of input.leases) {
       if (reusableIds.has(lease.id)) continue;
@@ -1756,12 +1779,32 @@ function createSandboxEnvironmentDriver(
         else if (stale?.status === "released") await prepareHistoricalSandboxStopVerification(db, stale);
         continue;
       }
+      if (admittedRunnerPackIdentity(lease.metadata) !== currentPack) {
+        // Candidates are newest first. Never replace an admitted current box's
+        // backup with an older source or make an older unsaved box block it.
+        if (input.reusableLeases.length > 0 || runnerPackReplacement) continue;
+        // The old box may hold the only conversation. A changed pack is not
+        // permission to delete it: require the existing saved-work/F7 proof,
+        // carry that backup to the replacement, and retire only after creation.
+        if (!await reusableSandboxConfigurationChangeIsSafe({ db, lease, config: input.config,
+          companyId: lease.companyId, heartbeatRunId: input.heartbeatRunId,
+          executionWorkspaceId: lease.executionWorkspaceId, adapterType: input.adapterType })) {
+          if (input.heartbeatRunId && input.issueId && input.agentId) await noticeRunnerReuseRefusal(db, {
+            companyId: lease.companyId, issueId: input.issueId, agentId: input.agentId, runId: input.heartbeatRunId,
+            reason: "runner_pack_reuse_blocked",
+          });
+          throw new Error("runner_pack_reuse_blocked: the old Runner's conversation is not safely saved; its computer was preserved");
+        }
+        runnerPackReplacement ??= lease;
+        continue;
+      }
       await destroyReusableSandboxLease({
         environment: input.environment,
         lease,
         failureReason: "lease_fingerprint_mismatch",
       });
     }
+    return runnerPackReplacement;
   }
 
   async function callPluginEnvironmentSync(
@@ -1985,14 +2028,14 @@ function createSandboxEnvironmentDriver(
           provider: parsed.config.provider, config: providerConfigForLease,
         });
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
-        if (reusableCandidateLeases.length > reusableExistingLeases.length) {
-          await cleanupObsoleteReusableSandboxLeases({
+        const fingerprintMismatchLease = reusableCandidateLeases.length > reusableExistingLeases.length
+          ? await cleanupObsoleteReusableSandboxLeases({
             config: providerConfigForLease,
             environment: input.environment,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
-          });
-        }
+            heartbeatRunId: input.heartbeatRunId, adapterType: input.adapterType, agentId: input.agentId, issueId: input.issueId,
+          }) : null;
         const reusableProviderLeaseId =
           supportsReusableLeases &&
           parsed.config.reuseLease &&
@@ -2230,7 +2273,9 @@ function createSandboxEnvironmentDriver(
           metadata: acquiredLease.metadata,
           schema: pluginProvider.resolved.driver.configSchema as Record<string, unknown> | null | undefined,
         });
-        const reusableScope = resolvedLeasePolicy === "reuse_by_environment"
+        const reusableScope = reusableLease?.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+          ? reusableLease.metadata?.reusableSandboxLease
+          : resolvedLeasePolicy === "reuse_by_environment"
           ? buildReusableSandboxLeaseScope({
               companyId: input.companyId,
               environmentId: input.environment.id,
@@ -2256,7 +2301,9 @@ function createSandboxEnvironmentDriver(
           sandboxProviderPlugin: true,
           ...(providerLease && pinnedConfig ? pinnedConfig : sandboxConfigForLeaseMetadata(storedConfig)),
           ...sanitizedProviderMetadata,
-          sandboxLeaseAcquisition: rolloverLease
+          sandboxLeaseAcquisition: fingerprintMismatchLease
+            ? { outcome: "replacement", reason: "lease_fingerprint_mismatch", previousProviderLeaseId: fingerprintMismatchLease.providerLeaseId }
+            : rolloverLease
             ? { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: rolloverLease.providerLeaseId }
             : providerLease
             ? {
@@ -2272,8 +2319,8 @@ function createSandboxEnvironmentDriver(
               : {
                   outcome: "created",
                 },
-          ...((rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
-            ? { nativeHarnessBackup: (rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
+          ...((fingerprintMismatchLease ?? rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
+            ? { nativeHarnessBackup: (fingerprintMismatchLease ?? rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
             : {}),
           ...(providerLease && reusableLease?.metadata?.nativeWorkspaceSync
             ? {
@@ -2313,6 +2360,8 @@ function createSandboxEnvironmentDriver(
         // Retire the unresumable sandbox only once its replacement, which
         // carries the harness backup, is recorded. A failed creation or a
         // restart before this point leaves it eligible for the next attempt.
+        if (fingerprintMismatchLease && input.heartbeatRunId) await retireCompatibleConfigurationSource(
+          fingerprintMismatchLease, recordedLease, input.heartbeatRunId, "lease_fingerprint_mismatch");
         if (rolloverLease && input.heartbeatRunId) {
           await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
         }
@@ -2415,14 +2464,14 @@ function createSandboxEnvironmentDriver(
         provider: parsed.config.provider, config: providerConfigForLease,
       });
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
-      if (reusableCandidateLeases.length > reusableExistingLeases.length) {
-        await cleanupObsoleteReusableSandboxLeases({
+      const fingerprintMismatchLease = reusableCandidateLeases.length > reusableExistingLeases.length
+        ? await cleanupObsoleteReusableSandboxLeases({
           config: providerConfigForLease,
           environment: input.environment,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
-        });
-      }
+          heartbeatRunId: input.heartbeatRunId, adapterType: input.adapterType, agentId: input.agentId, issueId: input.issueId,
+        }) : null;
       const reusableProviderLeaseId =
         supportsReusableLeases &&
         parsed.config.reuseLease &&
@@ -2483,7 +2532,9 @@ function createSandboxEnvironmentDriver(
       const resolvedLeasePolicy = supportsReusableLeases && parsed.config.reuseLease && input.heartbeatRunId !== null
         ? "reuse_by_environment"
         : "ephemeral";
-      const reusableScope = resolvedLeasePolicy === "reuse_by_environment"
+      const reusableScope = reusableLease?.status === "active" && reusableLease.heartbeatRunId === input.heartbeatRunId
+        ? reusableLease.metadata?.reusableSandboxLease
+        : resolvedLeasePolicy === "reuse_by_environment"
         ? buildReusableSandboxLeaseScope({
             companyId: input.companyId,
             environmentId: input.environment.id,
@@ -2504,7 +2555,9 @@ function createSandboxEnvironmentDriver(
         driver: input.environment.driver,
         executionWorkspaceMode: input.executionWorkspaceMode,
         ...providerLease.metadata,
-        sandboxLeaseAcquisition: rolloverLease
+        sandboxLeaseAcquisition: fingerprintMismatchLease
+          ? { outcome: "replacement", reason: "lease_fingerprint_mismatch", previousProviderLeaseId: fingerprintMismatchLease.providerLeaseId }
+          : rolloverLease
           ? { outcome: "replacement", reason: "compatible_environment_change", previousProviderLeaseId: rolloverLease.providerLeaseId }
           : reusableLease && providerLease.providerLeaseId === reusableLease.providerLeaseId
             ? {
@@ -2519,8 +2572,8 @@ function createSandboxEnvironmentDriver(
               : {
                   outcome: "created",
                 },
-        ...((rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
-          ? { nativeHarnessBackup: (rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
+        ...((fingerprintMismatchLease ?? rolloverLease ?? reusableLease)?.metadata?.nativeHarnessBackup
+          ? { nativeHarnessBackup: (fingerprintMismatchLease ?? rolloverLease ?? reusableLease)!.metadata!.nativeHarnessBackup }
           : {}),
         ...(reusableLease &&
         providerLease.providerLeaseId === reusableLease.providerLeaseId &&
@@ -2561,6 +2614,8 @@ function createSandboxEnvironmentDriver(
             ? reusableLease.id
             : null,
       });
+      if (fingerprintMismatchLease && input.heartbeatRunId) await retireCompatibleConfigurationSource(
+        fingerprintMismatchLease, recordedLease, input.heartbeatRunId, "lease_fingerprint_mismatch");
       if (rolloverLease && input.heartbeatRunId) {
         await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
       }
