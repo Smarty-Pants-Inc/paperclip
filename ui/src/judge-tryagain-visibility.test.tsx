@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 // Independent requirement probes. The 10-second/remount probes render the real
 // recovery card from a normal issue GET, without a ToastProvider.
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { act, type AnchorHTMLAttributes } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -31,8 +32,12 @@ const payload: ToastInput = { title: "Recovery resolution failed", body: error.m
 
 function readNormalGetCard(): IssueRecoveryAction {
   const evidenceDir = process.env.JUDGE_EVIDENCE_DIR;
-  if (!evidenceDir) throw new Error("JUDGE_EVIDENCE_DIR must contain the server judge's normal GET fixture");
-  return JSON.parse(readFileSync(`${evidenceDir}/refused-card-from-get.json`, "utf8")) as IssueRecoveryAction;
+  const fixturePath = evidenceDir
+    ? `${evidenceDir}/refused-card-from-get.json`
+    : [resolve(process.cwd(), "ui/src/__fixtures__/refused-card-from-get.json"),
+      resolve(process.cwd(), "../ui/src/__fixtures__/refused-card-from-get.json")].find(existsSync)!;
+  const fixture = readFileSync(fixturePath, "utf8");
+  return JSON.parse(fixture) as IssueRecoveryAction;
 }
 
 describe("Judge: native-continuation recovery refusal stays visible on the card", () => {

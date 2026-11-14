@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
@@ -164,6 +165,37 @@ describe("Independent round-3 delta probes", () => {
     const stranded = await svc.reconcileStrandedAssignedIssues({ companyId: f.companyId, issueId: f.issueId });
     const active = await svc.reconcileActiveRecoveryActions({ companyId: f.companyId });
     const refreshed = await request(f.app).get(`/api/issues/${f.issueId}`).expect(200);
+    // Pin the generated IDs and wall-clock fields so the byte comparison still catches GET-shape drift.
+    const normalGetCard = refreshed.body.activeRecoveryAction;
+    const fixturePath = [resolve(process.cwd(), "ui/src/__fixtures__/refused-card-from-get.json"),
+      resolve(process.cwd(), "../ui/src/__fixtures__/refused-card-from-get.json")].find(existsSync)!;
+    expect(JSON.stringify({
+      ...normalGetCard,
+      id: "8e8153f0-7868-4200-bfd4-aab67e0c2287",
+      companyId: "944eec99-d2f1-4bab-a52a-139ebcc36004",
+      sourceIssueId: "332ea2a8-da19-430f-8eec-01c0fb680701",
+      previousOwnerAgentId: "d7862449-edc0-4f29-b9f0-2fb4d6cc7b99",
+      returnOwnerAgentId: "d7862449-edc0-4f29-b9f0-2fb4d6cc7b99",
+      fingerprint: "source_scoped_recovery:944eec99-d2f1-4bab-a52a-139ebcc36004:332ea2a8-da19-430f-8eec-01c0fb680701:stranded_assigned_issue",
+      lastAttemptAt: "2026-11-14T06:55:13.414Z",
+      createdAt: "2026-11-14T06:55:13.410Z",
+      updatedAt: "2026-11-14T06:55:13.549Z",
+      evidence: {
+        ...normalGetCard.evidence,
+        latestRunId: "55e8e4d1-54a3-4f86-ba60-9d15f511adbf",
+        sourceIssueId: "332ea2a8-da19-430f-8eec-01c0fb680701",
+        sourceIdentifier: "RH944EEC-1",
+        taskRetryRefusal: {
+          ...normalGetCard.evidence.taskRetryRefusal,
+          recordedAt: "2026-11-14T06:55:13.543Z",
+          sourceRunId: "47f4b520-4171-4120-9218-902ac650205d",
+          currentRunId: "55e8e4d1-54a3-4f86-ba60-9d15f511adbf",
+          recoveryActionId: "8e8153f0-7868-4200-bfd4-aab67e0c2287",
+        },
+      },
+    }, null, 2)).toBe(
+      readFileSync(fixturePath, "utf8"),
+    );
     const again = await click(f);
     const cards = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     const visible = cards.filter(c => c.status === "active" || c.status === "escalated");

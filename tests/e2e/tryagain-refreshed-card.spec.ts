@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { and, eq } from "../../server/node_modules/drizzle-orm/index.js";
 import { test, expect, type APIResponse } from "@playwright/test";
@@ -287,7 +287,8 @@ test("refused A reload exposes current B and Try again queues one B continuation
     await page.context().close();
     if (video) {
       try {
-        await video.saveAs(path.join(artifactDir, "video.webm"));
+        const recordedPath = await video.path();
+        await copyFile(recordedPath, path.join(artifactDir, "video.webm"));
         await info.attach("tryagain-video", { path: path.join(artifactDir, "video.webm"), contentType: "video/webm" });
       } catch (error) {
         await writeFile(path.join(artifactDir, "video-save-error.txt"), String(error));
