@@ -292,8 +292,9 @@ export const agentsApi = {
       data,
       options,
     ).catch((error: unknown) => {
-      // A failed probe is still a result to display. Other 422s (selection,
-      // permissions, secret bindings) remain ordinary errors.
+      // Returned failures arrive as HTTP 200. A thrown probe's structured 422
+      // is also a result to display; other 422s (selection, permissions, secret
+      // bindings) remain ordinary errors.
       const result = error instanceof ApiError && error.status === 422
         ? error.body as Partial<AdapterEnvironmentTestResult> | null : null;
       if (result?.status === "fail" && typeof result.adapterType === "string"

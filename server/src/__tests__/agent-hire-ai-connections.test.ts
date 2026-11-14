@@ -339,7 +339,7 @@ describe("agent-created hires use managed AI connections", () => {
         const response = operation === "test"
           ? await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} })
           : await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
-        expect(response.status, JSON.stringify(response.body)).toBe(422);
+        expect(response.status, JSON.stringify(response.body)).toBe(operation === "test" ? 200 : 422);
         const rejected = status === 401 || status === 403;
         if (operation === "test") expect(response.body).toMatchObject({ status: "fail",
           code: rejected ? "ai_connection_api_key_rejected" : "ai_connection_verification_failed" });
@@ -361,7 +361,7 @@ describe("agent-created hires use managed AI connections", () => {
       const response = operation === "test"
         ? await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} })
         : await request(f.app).patch(`/api/agents/${f.agentId}`).send({ adapterConfig: { model: "changed-model" } });
-      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.status, JSON.stringify(response.body)).toBe(operation === "test" ? 200 : 422);
       if (operation === "test") expect(response.body).toMatchObject({ status: "fail", code: "claude_hello_probe_auth_required" });
       const service = aiConnectionService(db);
       expect(await service.list(f.companyId, f.userId)).toEqual([expect.objectContaining({ id: f.account.connectionId, isDefault: true, status: "needs_attention" })]);
@@ -404,7 +404,7 @@ describe("agent-created hires use managed AI connections", () => {
     } });
     try {
       const response = await request(f.app).post(`/api/companies/${f.companyId}/adapters/${f.adapterType}/test-environment`).send({ agentId: f.agentId, aiConnection: f.binding, adapterConfig: {} });
-      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
       expect(response.body).toMatchObject({ status: "fail", code: reconnected ? "claude_hello_probe_auth_required" : "claude_cli_not_found" });
       expect(await aiConnectionService(db).list(f.companyId, f.userId)).toEqual([expect.objectContaining({ status: "connected" })]);
     } finally { unregisterServerAdapter(f.adapterType); }

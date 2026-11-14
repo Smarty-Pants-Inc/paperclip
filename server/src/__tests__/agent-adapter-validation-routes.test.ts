@@ -848,7 +848,7 @@ describe("agent routes adapter validation", () => {
         .send({ agentId: "11111111-1111-4111-8111-111111111111", adapterConfig: {
           ...adapterConfig, env: { CODEX_HOME: { type: "plain", value: "***REDACTED***" } },
         } }));
-      expect(res.status, JSON.stringify(res.body)).toBe(status === "fail" ? 422 : 200);
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
       expect(res.body).toMatchObject({ adapterType: "codex_local", status });
       if (status === "fail") expect(res.body.code).toBe("adapter_auth_missing");
       expect(probe).toHaveBeenCalledOnce();
@@ -906,7 +906,7 @@ describe("agent routes adapter validation", () => {
       const res = await requestApp(app, baseUrl => request(baseUrl)
         .post("/api/companies/company-1/adapters/paperclip_runner/test-environment")
         .send({ agentId: "11111111-1111-4111-8111-111111111111", adapterConfig }));
-      expect(res.status, JSON.stringify(res.body)).toBe(422);
+      expect(res.status, JSON.stringify(res.body)).toBe(mode === "throw" ? 422 : 200);
       expect(res.body).toMatchObject({ adapterType: "paperclip_runner", status: "fail", code,
         checks: [expect.objectContaining({ code, level: "error", message: expect.stringContaining('Model "paperclip/claude-opus-5-5" not found') })] });
       expect(JSON.stringify(res.body)).not.toMatch(/opaque-route-canary|sk-route-canary/);
