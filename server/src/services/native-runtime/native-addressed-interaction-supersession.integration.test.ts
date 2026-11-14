@@ -74,7 +74,7 @@ async function fixture(keyKind: "reason" | "legacy UUID") {
   })));
   await db.insert(heartbeatRuns).values(failedRunIds.map(id => ({
     id, companyId, agentId: responderAgentId, status: "failed", runtimeMode: "native",
-    nativeIssueId: issueId, issueId, scopeKind: "issue", nativePhase: "terminal_failure",
+    nativeIssueId: issueId, issueId, scopeKind: "issue" as const, nativePhase: "terminal_failure",
     errorCode: "native_addressed_interaction_failed",
     contextSnapshot: { issueId, taskId: issueId, interactionId: cardId, sourceRunId: ownerRunId },
   })));
