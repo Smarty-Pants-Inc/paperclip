@@ -198,19 +198,20 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
   return prepareStopAndRetain(db, lease, lease.status);
 }
 
-/** The exact provider GET has finished outside locks without positive stop
- * proof. Cleanup can dispatch only from pending_cleanup: retain the complete
- * ended-row evidence inside that SAME stop intent before changing its status.
- * This is never called from the preparation gate or for an active turn. */
-export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
+/** Only an exact positive RUNNING provider GET can authorize a stop request.
+ * Error, absent, unknown and foreign observations leave ended rows unchanged.
+ * The existing cleanup owner dispatches only from pending_cleanup; preserve
+ * the COMPLETE ended row durably as well as in its intent before re-arming.
+ * This alternative still changes status and needs RFL's row-immutability ruling.
+ * Never called from the preparation gate or for an active turn. */
+export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, observation: unknown) {
+  if (!observation || typeof observation !== "object" || Array.isArray(observation)) return null;
+  const resource = observation as { providerLeaseId?: unknown; state?: unknown };
+  if (resource.providerLeaseId !== lease.providerLeaseId || !["active", "running"].includes(String(resource.state))) return null;
   if (!["released", "expired"].includes(lease.status)) return prepareUnconfirmedSourceSandboxStop(db, lease);
   if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
     || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease) || hasBoundRemoteStopReceipt(lease)) return null;
-  return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: {
-    status: lease.status, cleanupStatus: lease.cleanupStatus, failureReason: lease.failureReason,
-    releasedAt: lease.releasedAt?.toISOString() ?? null, lastUsedAt: lease.lastUsedAt.toISOString(),
-    metadata: lease.metadata,
-  } });
+  return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: lease });
 }
 
 /** A deliberate user Retry re-arms only the existing, validated stop owner.
@@ -246,6 +247,9 @@ async function prepareStopAndRetain(db: Db, lease: Lease, fromStatus: string, re
     ...(retention ? { leasePolicy: retention.leasePolicy } : {}),
     metadata: sql`${priorMetadata} || ${JSON.stringify({
       [SANDBOX_STOP_AND_RETAIN_KEY]: intent, pendingCleanupAttemptId: requestId,
+      // The intent is removed on successful stop; original ended evidence must
+      // survive that settlement, including all identity and timestamp fields.
+      ...(preserveEndedEvidence ? { endedLeaseEvidence: recovery.endedLeaseEvidence } : {}),
       ...(fromStatus === "active" && Object.keys(recovery).length
         ? { [ORPHANED_SANDBOX_RECOVERY_KEY]: { ...recovery, runId: lease.heartbeatRunId, recoveredAt: now.toISOString() } } : {}),
       pendingCleanupInFlight: false, pendingCleanupLeaseExpiresAtMs: 0,

@@ -105,9 +105,15 @@ export async function inspectFreshThreadStopResources(db: Db, run: typeof heartb
     if (peer) continue;
     const observation = await inspectLeaseResource(lease.id).catch(() => undefined);
     if (!remoteTerminationReceipt(lease, observation)) {
-      // The resource read came first. An ended row's status is not stop proof;
-      // the existing bounded stop owner keeps its historical evidence intact.
-      if (["released", "expired"].includes(lease.status)) await prepareInspectedSourceSandboxStop(db, lease);
+      // A non-proof GET is not stop authority. Only an exact positive running
+      // observation can re-arm the existing bounded cleanup owner; otherwise
+      // retain the ended row byte-for-byte and record only unavailability.
+      if (["released", "expired"].includes(lease.status)
+        && !await prepareInspectedSourceSandboxStop(db, lease, observation)) {
+        await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+          ${`{${FRESH_THREAD_STOP_STATE_KEY}}`}, ${JSON.stringify({ schema: "paperclip.fresh-thread-stop.v1", state: "unavailable" })}::jsonb)` })
+          .where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+      }
       continue;
     }
     const prepared = ["released", "expired"].includes(lease.status) ? lease : await prepareUnconfirmedSourceSandboxStop(db, lease);
@@ -198,7 +204,8 @@ async function inspectFreshThreadStopProof(tx: ProofReader, run: typeof heartbea
       // Missing/unbound proof waits for the outside-lock provider read first.
       // A bound but inadmissible receipt (for example bad-time) stays immutable
       // and unavailable; never erase it to re-arm a stop.
-      if (hasBoundRemoteStopReceipt(lease)
+      const previousState = owners.find(owner => owner.id === run.id)?.resultJson?.[FRESH_THREAD_STOP_STATE_KEY] as { state?: unknown } | undefined;
+      if (hasBoundRemoteStopReceipt(lease) || previousState?.state === "unavailable"
         || lease.metadata?.pluginId == null && !isBuiltinSandboxProvider(lease.provider!)) unavailable = true;
       continue;
     }
