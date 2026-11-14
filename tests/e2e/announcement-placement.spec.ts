@@ -1,5 +1,7 @@
 import { test, expect, type APIRequestContext, type APIResponse, type Locator, type Page } from "@playwright/test";
 
+import { setup as agentChatSetup } from "./agent-chat.shared";
+
 /**
  * N-17: a new user's first task view must stay usable while the in-app
  * announcement card is showing. The card is optional product news; it must not
@@ -144,6 +146,43 @@ test.describe("Announcement placement on a new company's first task", () => {
       return { hit: hit?.outerHTML ?? null, sendHit: Boolean(hit && (hit === button || button.contains(hit))) };
     });
     expect(result.sendHit, `Send center was covered by ${result.hit}`).toBe(true);
+  });
+
+  test("on a phone, defer announcements on the agent chat route and keep Send hit-testable", async ({ page, request }, testInfo) => {
+    // Agent chat is an instance experimental setting; the shared agent-chat
+    // setup enables it, creates the agents, and restores the setting after.
+    const f = await agentChatSetup(request);
+    try {
+      // Open the agent's chat so the route renders a real conversation.
+      await (await request.post(f.chatPath, { data: {} })).json();
+      await serveConnectorsAnnouncement(page);
+      await page.setViewportSize({ width: 390, height: 844 });
+      expect(f.agent.urlKey, "agent has a URL key").toBeTruthy();
+      const announcement = page.getByRole("complementary", { name: "Paperclip announcements" });
+
+      // Control: on a non-chat page the floating phone card does show.
+      await page.goto(`/${f.company.issuePrefix}/dashboard`);
+      await expect(announcement.getByRole("heading", { name: CONNECTORS_ANNOUNCEMENT.title })).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await page.goto(`/${f.company.issuePrefix}/chats/${f.agent.urlKey}`);
+      const send = page.getByTestId("task-chat-composer-send").last();
+      await expect(send).toBeVisible({ timeout: 30_000 });
+      // useAnnouncement shows a card only ANNOUNCEMENT_SETTLE_MS (3s) after it
+      // loads; wait past that so a floating card would have mounted.
+      await page.waitForTimeout(5_000);
+      await page.screenshot({ path: testInfo.outputPath("announcement-chat-390x844.png") });
+      const result = await send.evaluate(button => {
+        const rect = button.getBoundingClientRect();
+        const hit = document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2);
+        return { hit: hit?.outerHTML ?? null, sendHit: Boolean(hit && (hit === button || button.contains(hit))) };
+      });
+      expect(result.sendHit, `Send center was covered by ${result.hit}`).toBe(true);
+      await expect(announcement).toHaveCount(0);
+    } finally {
+      await f.restore();
+    }
   });
 
   test("a long announcement docked in a narrow sidebar keeps navigation and the account menu usable", async ({ page, request }) => {
