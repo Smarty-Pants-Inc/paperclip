@@ -1,4 +1,5 @@
 import { releaseAbandonedNativeOwners } from "../services/native-runtime/native-failed-run-owner-release.js";
+import { NATIVE_CONTINUATION_REFUSED_ACTION } from "../services/native-continuation-refusal.js";
 import { guardSlackFixtureNetwork } from "./helpers/slack-cloud/transport.js";
 import { chatHistoryActionBlocks } from "./helpers/chat-history-proof.js";
 import type { NativeExecutionInput, NativeSession, NativeSessionBackend, PrpEvent } from "../vendor/paperclip-runner/index.js";
@@ -9149,7 +9150,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         await vi.waitFor(async () => {
           expect(f.runtime.get(f.endpoint.id)).not.toBeNull();
           expect(f.runtime.get(f.endpoint.id)).not.toBe(old);
-          expect(idleWorkSnapshot().active).toBe(0);
+          // This receiver has restarted; unrelated deferred secret audits are
+          // legitimately tracked as process-wide idle work.
+          expect(f.runtime.get(f.endpoint.id)!.initialize).toHaveBeenCalledOnce();
+          expect(databaseWorkPending(db, DELIVERY_QUEUES.chatReceivers)).toBe(false);
           expect(coordinator.nextWakeAt()).toBeNull();
         });
         expect(onError).not.toHaveBeenCalled();
@@ -66869,7 +66873,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_session_cleanup_quarantined" })
         .where(eq(heartbeatRuns.id, f.runId));
       const quarantined = await getExecutionBlocker(db, companyId, issueId);
-      expect(quarantined).toMatchObject({ canRetry: false, nextAction: "Saved work recovered.",
+      // The retained execution-blocker-read gate explicitly requires the
+      // held-conversation guidance for a recovered cleanup quarantine.
+      expect(quarantined).toMatchObject({ canRetry: false, nextAction: NATIVE_CONTINUATION_REFUSED_ACTION,
         workspaceRecovery: { message: "Saved work recovered." } });
       await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" })
         .where(eq(heartbeatRuns.id, f.runId));
