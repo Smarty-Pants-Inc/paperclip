@@ -331,6 +331,29 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  it("D10 row 12: a comment-less successful continuation and its old reply do not answer the pending follow-up", async () => {
+    const f = await fixture();
+    const commentId = await f.message("What about my follow-up?");
+    const failed = await f.run({ commentId, status: "failed", errorCode: "adapter_failed", error: "native_workspace_required" });
+    await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
+    const before = await f.visible();
+    expect(before).toHaveLength(1);
+    expect(before[0]!.body).toBe(NOT_ANSWERED);
+    const continuation = await f.run({ commentId: null, status: "succeeded", retryOfRunId: failed,
+      wakeReason: "issue_continuation_needed" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId,
+      wakeReason: "issue_continuation_needed", wakeCommentId: null, wakeCommentIds: [],
+      firstTurnQueuedInput: { commentIds: [] } } }).where(eq(heartbeatRuns.id, continuation));
+    await f.reply(continuation);
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId });
+    expect(outcome.kind).not.toBe("answered");
+    const after = await f.visible();
+    expect(after).toHaveLength(1);
+    expect(after[0]!.id).toBe(before[0]!.id);
+    expect(after[0]!.body).toBe(NOT_ANSWERED);
+    expect(after[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+  });
+
   it("RFL F4: an unrelated timer run's success is not evidence; the message's own path gives exactly one notice", async () => {
     const f = await fixture();
     await f.message();

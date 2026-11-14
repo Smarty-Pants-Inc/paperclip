@@ -37,6 +37,7 @@ import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
@@ -523,15 +524,19 @@ export async function deliverReconciledExecutions(
         // A fresh continuation is the task's next run only while nothing else
         // started one: a person's Retry or saved input that ran since it was
         // recorded already continues the task, so it is never a second run.
-        const fresh = action.evidence.freshContinuation as { recordedAt?: unknown } | undefined;
+        const fresh = action.evidence.freshContinuation as { recordedAt?: unknown; previousExecutionGone?: unknown } | undefined;
         if (fresh && typeof fresh.recordedAt === "string") {
           // Pending records from an older release must not get one last doomed
           // wake after the fallback's creation guard has been fixed. This action
           // already counts as an attempt, so the second one is still deliverable.
-          const [source] = await db.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
+          const [source] = await db.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode,
+            resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns)
             .where(and(eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, decision.runId)));
           const chain = await freshContinuationChain(db, { companyId: action.companyId, issueId: task.id, runId: decision.runId });
-          const stopReason = isNativeContinuationRefusal(source) ? "native_continuation_refused"
+          // Do not invalidate the typed boundary that already earned physical-stop
+          // proof; keep the base's legacy refusal and chain-limit protections.
+          const provenFreshBoundary = source && isFreshThreadRefusal(source) && fresh.previousExecutionGone === true;
+          const stopReason = isNativeContinuationRefusal(source) && !provenFreshBoundary ? "native_continuation_refused"
             : chain.attempts > FRESH_CONTINUATIONS_PER_CHAIN ? "fresh_continuation_chain_exhausted" : null;
           if (stopReason) {
             await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
@@ -678,7 +683,7 @@ export function unresolvedExecutionDispositions(db: Db, limit: number) {
     .where(
       and(
         not(conversationRecoveryActionPredicate()!),
-        sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`,
+        or(sql`not (${issueRecoveryActions.evidence} ? 'systemRecovery')`, inArray(heartbeatRuns.errorCode, [...FRESH_THREAD_REFUSAL_CODES])),
         inArray(issueRecoveryActions.status, ["active", "escalated"]),
         eq(issueRecoveryActions.kind, "active_run_watchdog"),
         // A fresh continuation that backed off is checked again when due.
@@ -864,7 +869,7 @@ export async function settleUnrecoverableExecutions(
         // Adoption transfers maintenance to the retained-workspace owner.
         // This compatibility resolver must not close its hold or relabel it
         // as a user repair merely because old return-owner metadata is absent.
-        if (readSystemRecovery(action.evidence)) return;
+        if (readSystemRecovery(action.evidence) && !isFreshThreadRefusal(run)) return;
         // Give durable native recovery its chance; never preempt a resume,
         // replacement, result finalizer, or still-owned execution.
         if (
@@ -889,7 +894,7 @@ export async function settleUnrecoverableExecutions(
         // waiting for a person.
         // A preparation that never started provider work keeps its own replay
         // lane, which takes over the settled hold; the held sweep follows it.
-        if (current && !isInterruptedNativePreparationCandidate(run)) {
+        if ((current || isFreshThreadRefusal(run)) && !isInterruptedNativePreparationCandidate(run)) {
           const fresh = await continueFreshInTransaction(tx as unknown as Db, { companyId: task.companyId, runId: run.id,
             trigger: "recovery_refused", now });
           if (["continued", "already_continued", "successor_exists"].includes(fresh.kind)) return;

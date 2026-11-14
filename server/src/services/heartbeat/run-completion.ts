@@ -1,6 +1,7 @@
+import { freshThreadRefusalCode, isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { isContextCompactionRun } from "../context-compaction.js";
-import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
+import { providerFailureFromError, runnerPrepareRefusalCode } from "../../vendor/paperclip-runner/index.js";
 import { GENERIC_RUN_FAILURE_CODES, NATIVE_PRE_DISPATCH_FAILURE_CODE, NATIVE_PRE_DISPATCH_FAILURE_KEY, NATIVE_PRE_DISPATCH_FAILURE_RECORD, failureCauseFromAdapterResult, failureCauseFromError,
   hasNativePreDispatchFailureRecord, isNativePreDispatchTransientFailure } from "./run-failure-cause.js";
 import { INTERRUPTED_PREPARATION_RETRY_REASON } from "../execution-recovery-attempt.js";
@@ -1175,6 +1176,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
   }
 
   async function settlePreDispatchFailureIfRecorded(run: Run) {
+    if (isFreshThreadRefusal(run)) {
+      // A named non-admission is terminal for exact recovery, not a claim that
+      // the old provider stopped. The strict continuation gate owns that proof.
+      await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: run.errorCode,
+        nextAttemptAt: null, recoveryState: "blocked", updatedAt: new Date() }).where(and(
+        eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, run.id),
+        isNull(nativeRunFinalizations.leaseOwner), isNull(nativeRunFinalizations.resultId)));
+      return;
+    }
     if (!hasNativePreDispatchFailureRecord(run.resultJson)) return;
     try {
       await settleUnclaimedNativeCoordinator(run);
@@ -1318,7 +1328,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ? { ...exactResumeCause, originalMessage: redactFailureText(exactResumeCause.originalMessage) }
       : null;
     const storageUnavailable = isStorageUnavailableError(err);
+    const freshRefusal = freshThreadRefusalCode(err);
     const failureErrorCode =
+      freshRefusal ??
       workspaceValidationFailure?.code ??
       configurationIncompleteFailure?.code ??
       nonRetryablePreflightFailureCode(err) ??
@@ -1388,6 +1400,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         resultJson: {
           ...parseObject(stopSnapshot?.resultJson),
           ...(failureCause && !stoppedDuringFailure ? { failureCause } : {}),
+          ...(freshRefusal ? { nativeFreshContinuationRefusal: { code: freshRefusal,
+            ...(runnerPrepareRefusalCode(err) ? { prepareRefusalCode: runnerPrepareRefusalCode(err) } : {}),
+            waitForTurn: (err as { waitForTurn?: unknown })?.waitForTurn === true } } : {}),
           ...(providerFailure ? { providerFailure: { ...providerFailure,
             message: redactCurrentUserText(identityRedactor.redact(providerFailure.message), currentUserRedactionOptions) } } : {}),
           ...(interruptedExactResume ? { nativeExactResumeRefusal: {
@@ -1480,7 +1495,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       if (
         !isWorkspaceValidationFailedRun(livenessRun) &&
-        !isConfigurationIncompleteFailedRun(livenessRun)
+        !isConfigurationIncompleteFailedRun(livenessRun) && !isFreshThreadRefusal(livenessRun)
       ) {
         await finalizeIssueCommentPolicy(livenessRun, agent);
       }
@@ -1499,7 +1514,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       let fallbackRetry: { outcome: string } | null | undefined = nativePreDispatchRetry;
       // The predecessor fallback already asked the interaction continuation retry once.
       if (storageWait?.outcome !== "scheduled" && storageWait?.outcome !== "retry_exhausted" && nativePreDispatchRetry === null
-        && !(predecessorRetirementFallback && !stoppedDuringFailure)) {
+        && !(predecessorRetirementFallback && !stoppedDuringFailure) && !freshRefusal) {
         fallbackRetry = await scheduleInteractionContinuationInfrastructureRetryIfEligible(
           livenessRun,
           agent,
@@ -1512,7 +1527,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // exhaustion. Once its durable coordinator has classified a
         // terminal failure, generic issue recovery must not create a
         // replacement retryOfRunId chain for the same provider work.
-        suppressImmediateRecovery: nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
+        suppressImmediateRecovery: freshRefusal !== null || nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
           || storageWait?.outcome === "retry_exhausted" || nativePreDispatchRetry?.outcome === "scheduled",
       });
       await handleIssueReviewPathDisposition(livenessRun);
@@ -1641,7 +1656,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         (await getRun(runId).catch(() => null))?.errorCode,
       );
     const nonRetryablePreflightCode =
-      nonRetryablePreflightFailureCode(outerErr);
+      freshThreadRefusalCode(outerErr) ?? nonRetryablePreflightFailureCode(outerErr);
     const workspaceGitScanFailure = isWorkspaceGitScanError(outerErr) ? outerErr : null;
     const remoteWorkspacePreparationTimeout = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && outerErr instanceof RemoteWorkspacePreparationTimeoutError
@@ -1738,8 +1753,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           )
         : null);
     const connectionFailure = readGitConnectionFailure(outerErr);
+    const setupFreshRefusal = freshThreadRefusalCode(outerErr);
     const setupFailureResultJson = {
       ...setupFailureDetails,
+      ...(setupFreshRefusal ? { nativeFreshContinuationRefusal: { code: setupFreshRefusal,
+        ...(runnerPrepareRefusalCode(outerErr) ? { prepareRefusalCode: runnerPrepareRefusalCode(outerErr) } : {}),
+        waitForTurn: (outerErr as { waitForTurn?: unknown })?.waitForTurn === true } } : {}),
       ...(failureCause ? { failureCause } : {}),
       ...(repositoryCatalogUnavailable ? { errorFamily: "transient_upstream",
         ...(repositoryCatalogUnavailable.retryAt ? { retryNotBefore: new Date(repositoryCatalogUnavailable.retryAt).toISOString() } : {}),
@@ -1851,7 +1870,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         ).catch(() => undefined);
         if (
           !isWorkspaceValidationFailedRun(livenessRun) &&
-          !isConfigurationIncompleteFailedRun(livenessRun) &&
+          !isConfigurationIncompleteFailedRun(livenessRun) && !isFreshThreadRefusal(livenessRun) &&
           livenessRun.errorCode !== PROJECT_ACCESS_DENIED
         ) {
           await finalizeIssueCommentPolicy(livenessRun, failedAgent).catch(
@@ -1870,7 +1889,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               logger.error({ err: escalationError, runId: livenessRun.id }, "failed to record a recovery action for a remote workspace restore failure");
             });
           }
-        } else if (livenessRun.errorCode !== PROJECT_ACCESS_DENIED) {
+        } else if (livenessRun.errorCode !== PROJECT_ACCESS_DENIED && !isFreshThreadRefusal(livenessRun)) {
           // An accepted interaction keeps its own continuation retry, which
           // carries the interaction and escalates on exhaustion.
           const interactionOwnsRetry = (livenessRun.errorCode === PLUGIN_WORKER_UNAVAILABLE_CODE
@@ -1902,7 +1921,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: isFreshThreadRefusal(livenessRun) || storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||

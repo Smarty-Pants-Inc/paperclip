@@ -23,6 +23,8 @@ import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -440,7 +442,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   const runs = await q.select({
     id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, error: heartbeatRuns.error,
-    errorCode: heartbeatRuns.errorCode, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
+    errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
@@ -457,6 +459,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // else, and any approval, can hold the task but do not answer the message.
   if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
     return { kind: "answered" };
+  }
+
+  // A refused fresh continuation that descends from the message's run is the
+  // run the person's message ended on: its refusal is the explanation
+  // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
+  const latest = runs[0];
+  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+    && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
+      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
+
+  // Impossible reconciliation has its own one-note, proven-stop owner. A
+  // generic 'send again' notice must never race or time out that ownership.
+  if (run && isFreshThreadRefusal(run)) {
+    await notifyDeliveryWork(q, DELIVERY_QUEUES.executionDisposition);
+    return { kind: "pending", recheckAt: now.getTime() + 60_000 };
   }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
@@ -547,14 +564,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       if (wait) return wait;
     }
   }
-
-  // A refused fresh continuation that descends from the message's run is the
-  // run the person's message ended on: its refusal is the explanation
-  // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
-  const latest = runs[0];
-  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
-    && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
 
   let code: string;
   if (agentPaused) {
