@@ -1215,7 +1215,11 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const [note] = await db.select().from(issueComments).where(eq(issueComments.id, initialNote!.id));
     expect(note).toBeDefined();
     expect(note!.deletedAt).toBeNull();
-    expect(heldReplyOf(note!)).toMatchObject({ superseded: true, cardId: card!.id });
+    expect(heldReplyOf(note!)).toMatchObject({ cardId: card!.id });
+    // RFL m15 F2 (13:01Z): the ONLY change to the kept note is the atomic supersededBy marker; its "Held reply
+    // record" row is not rewritten (closed is read from the marker). This row asserted the rewritten record before.
+    const { supersededBy: _marker, ...unchanged } = (note!.metadata ?? {}) as Record<string, unknown>;
+    expect(unchanged, "metadata changed only by the marker").toEqual(initialNote!.metadata);
     // RFL d8line2 F1 (11:25Z; org 09:18Z): never edited in place. The held note is kept byte-identical as history,
     // marked supersededBy the visible continuation reply; no CURRENT B' note remains (this row asserted the
     // in-place "Earlier: ..." rewrite, which stayed current, before).
