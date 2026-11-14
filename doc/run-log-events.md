@@ -535,6 +535,13 @@ create a task warning, recovery action, Telemetry event, or OpenTelemetry export
 
 ## Native Restart Recovery Run-Log Event
 
+The temporary legacy lifecycle settlement path writes
+`native_legacy_lifecycle_abandoned count=<n>; delete_compatibility_at=M2` to
+run stderr after durably abandoning never-delivered, unstamped lifecycle
+commands. The structured server log carries the same message plus company,
+run and command count. Stamped-command settlement does not increment this
+legacy count. This is local operational logging, not a Telemetry export.
+
 Paperclip writes a `native.recovery.transition` event for native restart
 classifications and for graceful restart suspension. A blocked remote retry
 records a changed hold reason once; repeated visits with the same hold reason,

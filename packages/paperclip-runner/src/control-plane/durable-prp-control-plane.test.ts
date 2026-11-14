@@ -1932,6 +1932,69 @@ it("keeps a failed command result behind the events the Runner sent before it", 
   }
 }, 30_000);
 
+// Keep: SMA-122 data-safety regression. An abandoned old drain must never
+// land during the new turn, including after cold restore and command-id replay.
+it("never releases an ABANDONED stale drain or suspend during a new turn", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-abandoned-lifecycle-"));
+  let core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  try {
+    const old = [core.queueCommand("runner.drain", {}, "old-drain"), core.queueCommand("runner.suspend", {}, "old-suspend")];
+    for (const command of old) Object.assign(command, { status: "rejected", result: { status: "rejected", code: "controller_command_abandoned" },
+      abandonment: { disposition: "ABANDONED", abandonedAt: new Date().toISOString(), settledByBootId: "new-controller" } });
+    let saved!: DurablePrpCheckpoint;
+    core.setCheckpointPersistence(async checkpoint => { saved = checkpoint; });
+    await core.flushCheckpoint();
+    await core.stop();
+    const restored = resolve(root, "restored");
+    decodeDurablePrpCheckpoint(saved.records).restoreSessionDirectory(restored);
+    core = new DurablePrpControlPlane({ stateDirectory: resolve(restored, "control-plane"), identity, expectedRunnerVersion, expectedRunnerDigest });
+    for (const command of old) expect(core.queueCommand(command.type, command.payload, command.commandId).status).toBe("rejected");
+    const turn = core.queueCommand("turn.start", { text: "New turn must stay alive" }, "new-turn");
+    await core.start();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    try {
+      expect((client.welcome.payload as { pendingCommands: unknown[] }).pendingCommands).toMatchObject([{ commandId: turn.commandId, type: "turn.start" }]);
+      expect((client.welcome.payload as { pendingCommands: unknown[] }).pendingCommands).toHaveLength(1);
+      sendSecure(client, commandResultFrame(client, turn));
+      await vi.waitFor(() => expect(core.commandOutcome(turn.commandId)?.status).toBe("completed"));
+      const next = core.queueCommand("session.snapshot", {}, "new-turn-snapshot", true);
+      expect((await receiveCommand(client)).payload).toMatchObject({ commandId: next.commandId, type: "session.snapshot" });
+      expect(core.store.state.commandDeliveryCounts["old-drain"]).toBeUndefined();
+      expect(core.store.state.commandDeliveryCounts["old-suspend"]).toBeUndefined();
+    } finally { client.socket.destroy(); }
+  } finally { await core.stop(); await core.drainPendingConnectionProcessing(); rmSync(root, { recursive: true, force: true }); }
+}, 30_000);
+
+it("stamps every lifecycle issue, preserves the original issuer on replay/restore, and strips server metadata from the wire", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-lifecycle-issuer-"));
+  let core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  try {
+    core.setCommandIssuer({ bootId: "old-controller", generation: 7 });
+    const drain = core.queueCommand("runner.drain", {}, "old-drain");
+    expect(drain.issuer).toEqual({ bootId: "old-controller", generation: 7 });
+    let saved!: DurablePrpCheckpoint;
+    core.setCheckpointPersistence(async checkpoint => { saved = checkpoint; });
+    await core.flushCheckpoint();
+    await core.stop();
+    const restored = resolve(root, "restored");
+    decodeDurablePrpCheckpoint(saved.records).restoreSessionDirectory(restored);
+    core = new DurablePrpControlPlane({ stateDirectory: resolve(restored, "control-plane"), identity, expectedRunnerVersion, expectedRunnerDigest });
+    core.setCommandIssuer({ bootId: "new-controller", generation: 8 });
+    expect(core.queueCommand("runner.drain", {}, "old-drain").issuer).toEqual({ bootId: "old-controller", generation: 7 });
+    for (const type of ["runner.suspend", "runner.shutdown"]) expect(core.queueCommand(type).issuer).toEqual({ bootId: "new-controller", generation: 8 });
+    await core.start();
+    const client = (await authenticate(core, core.issueBootstrapTicket()))!;
+    try {
+      const wire = (client.welcome.payload as { pendingCommands: Record<string, unknown>[] }).pendingCommands;
+      expect(wire[0]).toMatchObject({ commandId: "old-drain", type: "runner.drain" });
+      for (const command of wire) {
+        expect(command).not.toHaveProperty("issuer");
+        expect(command).not.toHaveProperty("abandonment");
+      }
+    } finally { client.socket.destroy(); }
+  } finally { await core.stop(); await core.drainPendingConnectionProcessing(); rmSync(root, { recursive: true, force: true }); }
+}, 30_000);
+
 function staleToolResult(core: DurablePrpControlPlane) {
   return core.queueCommand("semantic_tool.result", { callId: "call-earlier-generation", operationId: "get_task_context",
     sourceEventId: "tool-input-earlier-generation", sourceEventType: "semantic_tool.input", inputDigest: "digest",
