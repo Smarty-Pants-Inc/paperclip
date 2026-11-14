@@ -18,6 +18,7 @@ import {
 
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
+import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import {
   flushNativeQuestionResponses,
   projectNativeRuntimeRequest,
@@ -304,6 +305,11 @@ export function runnerPrpCoordinator(
         },
       });
 
+      // This direct coordinator has one generation per server boot (unlike
+      // the leased native executor, whose checkpoint registration binds its
+      // DB controllerGeneration). Keep lifecycle provenance server-side here
+      // too; old runnerd wire contracts receive neither field.
+      authority.setCommandIssuer({ bootId: (await currentNativeControllerIdentity()).bootId, generation: 1 });
       let registration: Awaited<ReturnType<typeof registerRunnerPrpAuthority>>;
       try {
         registration = await registerRunnerPrpAuthority({

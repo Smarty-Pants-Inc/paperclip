@@ -8481,6 +8481,7 @@ function leaseDb(
     issueId: boundExecution.binding.issueId,
     phase: "observed",
     attempt: 0,
+    controllerGeneration: 1,
     leaseOwner: null,
     leaseExpiresAt: null,
     resultId: null,
@@ -17805,7 +17806,7 @@ describe("runnerd provider runtime wiring", () => {
       // must prove that same generation before the next run attaches.
       await driver.mock.calls.at(-1)![0].beforeConnect?.(identity as never,
         { activeRunnerConnectionCount: () => connected ? 1 : 0,
-          checkRunnerIdentity: identityCheck } as never);
+          setCommandIssuer: vi.fn(), checkRunnerIdentity: identityCheck } as never);
       await options.onSession?.(session);
       return result;
     }).mockImplementationOnce(async options => {
@@ -17974,6 +17975,7 @@ describe("runnerd provider runtime wiring", () => {
     state.execute.mockReset().mockImplementationOnce(async options => {
       const core = {
         store: { state: { identity } },
+        setCommandIssuer: vi.fn(),
         activeRunnerConnectionCount: () => connectionCount,
         ...(name !== "missing control plane" ? { checkRunnerIdentity: identityCheck } : {}),
       };
@@ -20137,7 +20139,7 @@ describe("runnerd provider runtime wiring", () => {
       const notification = { eventType: "auth.credentials.updated" } as never;
       await options.onCredentialsUpdated!(notification);
       expect(owner.mock.results.at(-1)!.value.credentialsUpdated).toHaveBeenCalledWith(notification);
-      expect(options).toMatchObject({ ...driver, runnerArtifact: { version: "fixture" },
+      expect(options).toMatchObject({ ...driver, controlPlaneRegistration: expect.any(Function), runnerArtifact: { version: "fixture" },
         prpIdentity: { environmentLeaseId: "plugin-task-lease" } });
       if (kind === "acpx") expect(options).toMatchObject({ acpxAgent: "claude", claudeEffort: "high" });
       for (const key of ["environment", "codexCommand", "codexArgs", "runnerRuntimePaths", "readRunnerState", "archiveExternalRunnerState"]) {
@@ -24042,9 +24044,11 @@ describe("runnerd provider runtime wiring", () => {
       .calls[0]![0] as RunnerTransportOptions & {
       controlPlaneRegistration: (authority: unknown) => Promise<unknown>;
     };
-    await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
+    const issuer = vi.fn();
+    await expect(transport.controlPlaneRegistration({ setCommandIssuer: issuer })).rejects.toThrow(
       "reached-preinstalled-codex-verification",
     );
+    expect(issuer).toHaveBeenCalledWith({ bootId: expect.any(String), generation: 1 });
     if (version !== "0.160.0") {
       expect(onLog).toHaveBeenCalledWith("stderr", expect.stringContaining(`using installed Codex ${version === "unknown" || version.includes("alpha") ? "unrecognized version" : version}`));
     }
@@ -24171,9 +24175,11 @@ describe("runnerd provider runtime wiring", () => {
         version === "0.158.0" ? "gpt-6-sol" : "gpt-5.6-sol",
       );
     }
-    await expect(transport.controlPlaneRegistration({})).rejects.toThrow(
+    const issuer = vi.fn();
+    await expect(transport.controlPlaneRegistration({ setCommandIssuer: issuer })).rejects.toThrow(
       "reached-preinstalled-codex-verification",
     );
+    expect(issuer).toHaveBeenCalledWith({ bootId: expect.any(String), generation: 1 });
     expect(remoteExecute.mock.calls.some(([call]) => call.command === "npm")).toBe(false);
 
   });
