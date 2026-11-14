@@ -4916,7 +4916,12 @@ export function recoveryService(
       }
 
       const agent = await getAgent(agentId);
-      if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
+      // Resume can remove the last hold before an in-flight Pause finishes.
+      // Its compatibility status stays paused until Stop settles and startup
+      // completes. Like setup/resuming, this is an admission wait, not a lost
+      // assignee; readiness will notify recovery to recheck normal invokability.
+      if (agent?.companyId === issue.companyId && (isAgentAwaitingSetup(agent) ||
+        agent.lifecycleState === "pausing" && agent.lifecycleHolds.length === 0)) {
         result.skipped += 1;
         continue;
       }
