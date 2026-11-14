@@ -1120,7 +1120,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)))[0])
         .toMatchObject({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null, leaseOwner: null });
       { const { appendFileSync } = await import("node:fs"); const calls = (f.deps.finalizeAgentStatus as unknown as { mock?: { calls: unknown[][] } }).mock?.calls ?? [];
-        appendFileSync("/srv/scratch/paul/tasks/direct/rfl-d10c3b/artifacts/logs/judge-agent-status.jsonl", JSON.stringify({ code, phase, finalizeAgentStatusCalls: calls.map(call => ({ outcome: call[1], options: call[3] })) }) + "\n"); }
+        appendFileSync(join(process.env.RFL_JUDGE_LOG_DIR ?? tmpdir(), "judge-agent-status.jsonl"), JSON.stringify({ code, phase, finalizeAgentStatusCalls: calls.map(call => ({ outcome: call[1], options: call[3] })) }) + "\n"); }
       expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
       expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
       expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();

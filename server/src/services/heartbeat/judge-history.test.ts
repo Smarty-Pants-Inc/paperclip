@@ -557,7 +557,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(answered.settled.status).toBe("succeeded");
     expect(JSON.stringify(answered.prompts)).toContain(message.body);
     { const { appendFileSync } = await import("node:fs"); const text = JSON.stringify(answered.prompts);
-      appendFileSync("/srv/scratch/paul/tasks/direct/rfl-d10c3b/artifacts/logs/judge-history.jsonl", JSON.stringify({ shape, hasFollowUp: text.includes(message.body),
+      appendFileSync(join(process.env.RFL_JUDGE_LOG_DIR ?? tmpdir(), "judge-history.jsonl"), JSON.stringify({ shape, hasFollowUp: text.includes(message.body),
         hasEarlierUserTurn: text.includes("remember the codeword zebra-quartz-71"), hasEarlierAgentAnswer: text.includes("noted, the codeword is zebra-quartz-71"),
         promptChars: text.length, newSession: selected.nativeExecution.session.normalizedSessionId !== oldId }) + "\n"); }
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");

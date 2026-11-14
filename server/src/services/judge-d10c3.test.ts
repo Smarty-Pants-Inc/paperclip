@@ -1,3 +1,5 @@
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { currentNotices } from "./rfl-current-notice-assertions.js";
 import { appendFileSync } from "node:fs";
@@ -151,7 +153,7 @@ suite("fresh-continuation fallback", () => {
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
     return f;
   }
-  const report = (name: string, value: unknown) => appendFileSync("/srv/scratch/paul/tasks/direct/rfl-d10c3b/artifacts/logs/judge-probes-c3prime.jsonl", `JUDGE ${name} ${JSON.stringify(value)}
+  const report = (name: string, value: unknown) => appendFileSync(join(process.env.RFL_JUDGE_LOG_DIR ?? tmpdir(), "judge-probes-c3prime.jsonl"), `JUDGE ${name} ${JSON.stringify(value)}
 `);
 
   it("P1 no lease and no recorded process: what ends the wait?", async () => {
