@@ -28,8 +28,9 @@ saved host configuration, not a config-change notification or plugin KV row.
 [`PluginCompaniesClient.list()` (SDK types.ts:1180–1193)](../sdk/src/types.ts#L1180-L1193)
 provides company IDs; [`ctx.config.get(companyId)` (430–437)](../sdk/src/types.ts#L430-L437)
 reads each company's saved config. Empty configs are unconfigured; a nonempty
-invalid config or multiple configured companies fails closed. No ID, config or
-credential is copied into instance state. This also recovers pre-0.1.2 installs
+invalid config or multiple configured companies fails closed. No config or
+credential is copied into instance state; since 0.1.6 the only instance-scoped
+row is the list of company IDs the host reported as configured (see 0.1.6 below). This also recovers pre-0.1.2 installs
 with saved config but **zero plugin_state rows**, without a config re-save.
 
 ### 0.1.3 / 0.1.4 fixes found on a real c1dea0db host
@@ -42,6 +43,29 @@ with saved config but **zero plugin_state rows**, without a config re-save.
   into params). 0.1.3 refused it and reported the wrong code, `config invalid`.
   Bad action input now reports `params invalid`. An enabled tick with missing or
   malformed seen state now reports `state invalid`, not `mailbox read failed`.
+
+### 0.1.6 (review-fleet-2 F1/F2 residuals)
+
+- F1: the set of companies the host reported as configured (`configChanged`)
+  is kept in the plugin's own durable state: instance-scoped key
+  `mail-intake/configured-companies`, value `{version:1, companies:[ids]}`
+  (company IDs only). It is written when `configChanged` arrives and read at
+  worker init (`setup`). A worker-only respawn (the worker manager's crash
+  restart, `server/src/services/plugin-worker-manager.ts:3253-3276,3354-3383`)
+  gets no `configChanged` replay (only the loader's activation does,
+  `plugin-loader.ts:2497-2501`), so 0.1.5's in-memory set was empty after it and
+  a refused configured company was skipped again. Now the refusal still fails
+  the job and health with `config read failed`. If the stored set cannot be read
+  or written, discovery fails with `state read failed` / `state write failed`
+  (or `state invalid` for a corrupt row) instead of skipping any refusal. The set
+  is instance-scoped because the host gate refuses company-scoped state for a
+  company it refuses (`sdk host-client-factory.ts:595-598`); instance scope is
+  not company-gated (`:614`). It only grows: no host route deletes a company's
+  config row.
+- F2: in an enabled tick, plugin-state failures are no longer reported as
+  `mailbox read failed`: the seen-state read gives `state read failed`, a
+  corrupt row `state invalid`, and the pruning or per-delivery checkpoint write
+  `state write failed`.
 
 ### 0.1.5 (review-fleet-2 F1/F2, live prod F3)
 

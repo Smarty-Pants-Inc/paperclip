@@ -2,7 +2,7 @@ import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { configSchema } from "./config.js";
 
 const manifest: PaperclipPluginManifestV1 = {
-  id: "smarty.mail-intake", apiVersion: 1, version: "0.1.5",
+  id: "smarty.mail-intake", apiVersion: 1, version: "0.1.6",
   displayName: "Mail intake", author: "Smarty Pants", categories: ["automation"],
   description: "Code-only Gmail watcher; new message IDs trigger the existing routing routine.",
   capabilities: ["jobs.schedule", "http.outbound", "secrets.read-ref", "plugin.state.read", "plugin.state.write", "companies.read"],

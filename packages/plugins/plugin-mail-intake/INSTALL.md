@@ -17,7 +17,7 @@ pnpm typecheck
 pnpm test
 pnpm build
 pnpm pack --pack-destination /approved/artifacts
-sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.5.tgz
+sha256sum /approved/artifacts/smarty-plugin-mail-intake-0.1.6.tgz
 ```
 
 Only GitHub automation commits the root lockfile; do not commit install churn.
@@ -36,7 +36,7 @@ local-path installer, for example on a non-managed authorized TEST instance:
 ```sh
 mkdir -p /approved/plugins/mail-intake
 # Verify the supplied SHA-256 before extracting.
-tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.5.tgz \
+tar -xzf /approved/artifacts/smarty-plugin-mail-intake-0.1.6.tgz \
   -C /approved/plugins/mail-intake --strip-components=1
 paperclipai plugin install /approved/plugins/mail-intake --api-base https://TEST-ORIGIN
 ```
@@ -45,6 +45,22 @@ Do not pass a tgz directly as a directory or claim that it is catalog-installed.
 Cloud-managed hosts reject arbitrary local/npm paths; the image owner must
 confirm its approved day-one staging/admission route. A tgz alone does not
 bypass that guard. Catalog/image integration is deferred, not silently added.
+
+## Upgrading to 0.1.6 (from 0.1.5 or earlier)
+
+No new capability. On its first activation the host replays `configChanged`
+for each saved config row, and 0.1.6 stores those company IDs in its own
+instance-scoped plugin state (`mail-intake/configured-companies`, company
+IDs only). It is how a respawned worker tells a refused configured company
+from an unconfigured one. The host removes a company's config row only when
+the company is deleted (FK cascade; it then no longer appears in
+`companies.list`) or the plugin is uninstalled (plugin_state cascades too), so
+the set only grows. If a config row is ever removed out of band, the job fails
+`config read failed` for that company; delete the `configured-companies` row
+and restart the server, which replays every saved row and rebuilds the set. Health/job codes added to enabled ticks:
+`state read failed`, `state invalid`, `state write failed`.
+
+The 0.1.5 notes below still apply.
 
 ## Upgrading to 0.1.5 (from 0.1.4 or earlier)
 

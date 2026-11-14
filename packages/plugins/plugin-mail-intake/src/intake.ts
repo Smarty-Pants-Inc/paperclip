@@ -126,11 +126,20 @@ export async function readMailbox(ctx: Pick<Context, "http" | "secrets">, compan
   if (failed || lanes.some(l => l.status === "rejected")) fail();
   return messages;
 }
+// Plugin-state steps inside an enabled tick keep their own code (review-fleet-2
+// F2 residual); everything else in the tick stays the caller's "mailbox read failed".
+const STATE_CODES: readonly string[] = Object.freeze(["state read failed", "state invalid", "state write failed"]);
+async function stateStep<T>(code: string, fn: () => Promise<T> | T): Promise<T> {
+  try { return await fn(); } catch { fail(code); }
+}
 export async function runTick(ctx: Context, companyId: string, config: MailConfig): Promise<void> {
   if (!config.enabled) return;
+  const write = (key: ReturnType<typeof seenKey>, value: unknown) =>
+    stateStep("state write failed", () => ctx.state.set(key, value));
   try {
     const key = seenKey(companyId, config.mailbox);
-    const stored = parseState(await ctx.state.get(key));
+    const raw = await stateStep("state read failed", () => ctx.state.get(key));
+    const stored = await stateStep("state invalid", () => parseState(raw));
     const since = cutoff(config.scanWindowDays);
     const state = prune(stored, since);
     const skip = new Set([...state.seen.map(m => m.id), ...state.failures
@@ -139,7 +148,7 @@ export async function runTick(ctx: Context, companyId: string, config: MailConfi
     // Finish ALL reads before any fire or pruning write. Backoff cannot block later IDs.
     const pending = (await readMailbox(ctx, companyId, config, http, skip)).filter(m => m.internalDate >= state.notBefore);
     if (stored.notBefore !== state.notBefore || stored.seen.length !== state.seen.length ||
-        stored.failures.length !== state.failures.length) await ctx.state.set(key, state);
+        stored.failures.length !== state.failures.length) await write(key, state);
     if (pending.length) {
       const secret = await ctx.secrets.resolve(config.routineFireSecretRef, { companyId, configPath: "routineFireSecretRef" });
       if (!secret || /[\r\n]/.test(secret)) fail();
@@ -159,10 +168,15 @@ export async function runTick(ctx: Context, companyId: string, config: MailConfi
         if (accepted) state.seen.push({ id: message.id, internalDate: message.internalDate });
         else state.failures.push(failedDelivery(message.id, message.internalDate, prior));
         // State failure is fatal, not a delivery failure. Commit each result before continuing.
-        await ctx.state.set(key, state);
+        await write(key, state);
       }
     }
     const parked = state.failures.filter(m => m.attempts >= MAX_FAILURES);
     if (parked.length) ctx.logger.warn(parkedWarning(parked));
-  } catch { fail(); } // No provider body, error cause, URL, mail text, or secret escapes.
+  } catch (error) {
+    // Only a fixed state code passes through; no provider body, error cause, URL,
+    // mail text, or secret escapes.
+    const code = error instanceof Error ? error.message : "";
+    fail(STATE_CODES.includes(code) ? code : undefined);
+  }
 }

@@ -33,7 +33,7 @@ const READ_BUDGET_MS = 240_000;
 // SDK types.ts:430-437,1184-1193: discover company IDs, then read saved host config.
 // This plugin supports one configured company; never pick one arbitrarily.
 //
-// `configured` holds every company the HOST told this worker it has a saved config
+// `configured` (KnownCompanies below) holds every company the HOST told this plugin it has a saved config
 // row for: the loader replays configChanged for each stored row at worker start
 // (server/src/services/plugin-loader.ts:2497-2501) from the same rows that seed the
 // proactive company scopes (plugin-loader.ts:2461), and every config save sends
@@ -42,8 +42,69 @@ const READ_BUDGET_MS = 240_000;
 // denial ("company context is required", sdk host-client-factory.ts:639/668) for a
 // company NOT in this set is "no config here"; for a company IN it, it is a
 // configured company the worker cannot read, which must fail loudly.
-async function configuredCompany(host: Host, configured: ReadonlySet<string>): Promise<Binding | null> {
+//
+// The set is also kept in the plugin's OWN durable state (review-fleet-2 F1
+// residual). The host replays configChanged only when the loader activates the
+// plugin (plugin-loader.ts:2497-2501). A crashed worker is respawned by the
+// worker manager alone: handle exit -> scheduleRestart -> startInternal
+// (server/src/services/plugin-worker-manager.ts:3179,3253-3276,3354-3383; the
+// only configChanged there is a listener, :4315), which
+// spawns a fresh process and replays nothing, while the handle keeps its
+// proactive scope set (plugin-worker-manager.ts:1112-1115). An in-memory set
+// would be empty after that respawn and a refused configured company would be
+// skipped again. It is instance-scoped state on purpose: a company-scoped row
+// for a refused company could not be read either (the same gate refuses
+// scopeKind "company" for it, sdk host-client-factory.ts:595-598), while an
+// instance-scoped key names no company and is not gated (host-client-factory.ts:
+// 614). No host route deletes a company's config row (registry deleteConfig,
+// plugin-registry.ts:475, has no caller), so the set only grows.
+const CONFIGURED_KEY = Object.freeze({ scopeKind: "instance" as const, namespace: "mail-intake",
+  stateKey: "configured-companies" });
+const MAX_KNOWN_COMPANIES = 10_000;
+function parseKnown(value: unknown): Set<string> {
+  if (value === null) return new Set();
+  if (!record(value)) fail();
+  only(value, ["version", "companies"]);
+  if (value.version !== 1 || !Array.isArray(value.companies) || value.companies.length > MAX_KNOWN_COMPANIES ||
+      !value.companies.every(id => typeof id === "string" && id.length > 0 && id.length <= 200)) fail();
+  return new Set(value.companies as string[]);
+}
+/**
+ * Companies the host has told any worker of this plugin it holds a saved config
+ * row for. `reported` is this worker's own configChanged deliveries; `durable` is
+ * the stored set (null until read). Every discovery loads it (once) and writes
+ * back any reported company not yet stored; a read or write failure fails the
+ * discovery ("state read failed" / "state write failed"), never skips a refusal.
+ */
+class KnownCompanies {
+  private readonly reported = new Set<string>();
+  private durable: Set<string> | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
+  report(companyId: string) { this.reported.add(companyId); }
+  load(host: Pick<Host, "state">): Promise<ReadonlySet<string>> {
+    const run = this.chain.then(() => this.sync(host));
+    this.chain = run.catch(() => undefined); // Serialize read-modify-write.
+    return run;
+  }
+  private async sync(host: Pick<Host, "state">): Promise<ReadonlySet<string>> {
+    if (this.durable === null) {
+      const raw = await step("state read failed", () => host.state.get(CONFIGURED_KEY));
+      this.durable = await step("state invalid", () => parseKnown(raw));
+    }
+    const stored = this.durable;
+    const missing = [...this.reported].filter(id => !stored.has(id));
+    if (missing.length === 0) return stored;
+    const next = new Set([...stored, ...missing]);
+    if (next.size > MAX_KNOWN_COMPANIES) fail("state write failed");
+    await step("state write failed", () => host.state.set(CONFIGURED_KEY, { version: 1, companies: [...next].sort() }));
+    this.durable = next;
+    return next;
+  }
+}
+async function configuredCompany(host: Host, known: KnownCompanies): Promise<Binding | null> {
   const companies = await step("host read failed", () => host.companies.list());
+  // Durable, so a worker-only respawn (no configChanged replay) still knows them.
+  const configured = await known.load(host);
   let result: Binding | null = null;
   for (const company of companies) {
     let raw: Record<string, unknown>;
@@ -97,7 +158,7 @@ export function createMailDefinition(): PluginDefinition {
   let companyId: string | null = null;
   let running = false;
   let host: Host | null = null;
-  const configured = new Set<string>();
+  const known = new KnownCompanies();
   return {
     // The plugin is still single-company and fails closed on a second config
     // ("multiple companies configured"). It sets this so the SDK hands every
@@ -108,7 +169,10 @@ export function createMailDefinition(): PluginDefinition {
     multiCompanyConfig: true,
     async setup(ctx) {
       host = ctx;
-      try { companyId = (await configuredCompany(ctx, configured))?.companyId ?? null; }
+      // Rebuild the configured-company set from durable state at worker init,
+      // before any job or health discovery (a respawn gets no configChanged).
+      try { await known.load(ctx); } catch { /* Discovery retries it and fails loudly. */ }
+      try { companyId = (await configuredCompany(ctx, known))?.companyId ?? null; }
       catch { /* Health and jobs retry discovery and surface a fixed error. */ }
       // Explicit one-time setup, not implicit history replay on a missing KV row.
       // SDK protocol.ts:442-460: BOARD is exposed as "user", with host company scope.
@@ -160,7 +224,7 @@ export function createMailDefinition(): PluginDefinition {
         running = true;
         try {
           // Cron has no ambient company. Reconstruct from durable host config every tick.
-          const binding = await configuredCompany(ctx, configured);
+          const binding = await configuredCompany(ctx, known);
           companyId = binding?.companyId ?? null;
           if (!binding) fail("not configured"); // A missing company is a FAILED run, never a quiet success.
           const seen = await step("state read failed", () => ctx.state.get(seenKey(binding.companyId, binding.config.mailbox)));
@@ -187,7 +251,7 @@ export function createMailDefinition(): PluginDefinition {
       try {
         if (!host) return { status: "error", message: NOT_CONFIGURED };
         const h = host;
-        const binding = await configuredCompany(h, configured);
+        const binding = await configuredCompany(h, known);
         companyId = binding?.companyId ?? null;
         if (!binding) return { status: "error", message: NOT_CONFIGURED };
         const raw = await step("state read failed", () => h.state.get(seenKey(binding.companyId, binding.config.mailbox)));
@@ -213,9 +277,15 @@ export function createMailDefinition(): PluginDefinition {
       }
     },
     async onConfigChanged(raw, context) {
-      // The host has a saved row for this company whatever its content; remember it
-      // so a later scope denial for it is a failure, not "unconfigured".
-      if (context?.companyId) configured.add(context.companyId);
+      // The host has a saved row for this company whatever its content; remember it,
+      // durably, so a later scope denial for it is a failure, not "unconfigured",
+      // even after a worker-only respawn. A failed write is retried by every
+      // discovery (which fails "state write failed" until it lands).
+      let persisted = true;
+      if (context?.companyId) {
+        known.report(context.companyId);
+        if (host) { try { await known.load(host); } catch { persisted = false; } }
+      }
       try {
         if (!context?.companyId || (companyId !== null && context.companyId !== companyId)) fail("actor/company mismatch");
         parseConfig(raw);
@@ -224,6 +294,7 @@ export function createMailDefinition(): PluginDefinition {
         const code = error instanceof Error ? error.message : "";
         fail(code === "actor/company mismatch" ? code : "config invalid");
       }
+      if (!persisted) fail("state write failed");
     },
     async onValidateConfig(raw) {
       try { parseConfig(raw); return { ok: true }; }
