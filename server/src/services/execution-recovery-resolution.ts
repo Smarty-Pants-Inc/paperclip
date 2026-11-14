@@ -37,9 +37,10 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { continueFreshInTransaction, continueHeldExecutions, freshContinuationCheckDue, recordFreshContinuationCheck,
-  settleCoalescedFreshContinuationHolds } from "./fresh-continuation-fallback.js";
+  settleCoalescedFreshContinuationHolds, freshContinuationChain, FRESH_CONTINUATIONS_PER_CHAIN } from "./fresh-continuation-fallback.js";
 import { alias } from "drizzle-orm/pg-core";
 import { RECOVERY_BACKLOG_AGE_MS, RECOVERY_WAKE_REASONS } from "./heartbeat/queued-run-dispatch-order.js";
 import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
@@ -523,6 +524,20 @@ export async function deliverReconciledExecutions(
         // recorded already continues the task, so it is never a second run.
         const fresh = action.evidence.freshContinuation as { recordedAt?: unknown } | undefined;
         if (fresh && typeof fresh.recordedAt === "string") {
+          // Pending records from an older release must not get one last doomed
+          // wake after the fallback's creation guard has been fixed. This action
+          // already counts as an attempt, so the second one is still deliverable.
+          const [source] = await db.select({ error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
+            .where(and(eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, decision.runId)));
+          const chain = await freshContinuationChain(db, { companyId: action.companyId, issueId: task.id, runId: decision.runId });
+          const stopReason = isNativeContinuationRefusal(source) ? "native_continuation_refused"
+            : chain.attempts > FRESH_CONTINUATIONS_PER_CHAIN ? "fresh_continuation_chain_exhausted" : null;
+          if (stopReason) {
+            await db.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify(
+              { continuationDelivery: "invalidated", continuationStopReason: stopReason })}::jsonb` }).where(pendingDecision);
+            await settleCoalescedFreshContinuationHolds(db, { companyId: action.companyId, primaryId: action.id, delivery: "invalidated" });
+            continue;
+          }
           const [newer] = await db.select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
             eq(heartbeatRuns.companyId, action.companyId), sql`${heartbeatRuns.id}::text <> ${decision.runId}`,
             or(eq(heartbeatRuns.nativeIssueId, task.id), eq(heartbeatRuns.issueId, task.id),
