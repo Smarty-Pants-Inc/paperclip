@@ -509,9 +509,10 @@ describe.each(["unlocked", "locked"] as const)("conversation guardian v0 — rea
       expect(await readWake(wake.id)).toMatchObject({ status: "deferred_issue_execution", runId: null, finishedAt: null });
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id))).toHaveLength(1);
       console.log("GUARDIAN_C35_ROLLBACK", JSON.stringify({ hits: await fault.hits(), wake: await readWake(wake.id) }));
-      const note = await oneNote(f, "read this and finished without a reply", "C35 / rollback");
+      const note = await oneNote(f, "hasn't been picked up yet", "C35 / rollback");
       expect(note.body).toContain(f.agent.name);
       expect(note.body).toContain(`/agents/${f.agent.id}/runs/${source.id}`);
+      expect(note.body).not.toMatch(/busy with other work|sending it again is safe/i);
     } finally { await fault.close(); }
   });
 
