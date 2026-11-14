@@ -12,6 +12,15 @@ import type {
 const DEFAULT_STARTUP_DEADLINE_MS = 60_000;
 const DEFAULT_RECOVERY_GRACE_MS = REMOTE_RUNNER_RECONNECT_GRACE_MS;
 const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+const HANDSHAKE_TIMEOUT_MS = 15_000;
+const MIN_CONNECT_ATTEMPTS = 3;
+// Explicit sub-handshake budgets remain hard caps; normal startup/recovery
+// budgets reserve up to three actual dials, even if an event-loop stall eats
+// the original deadline. A provider refresh that exhausts its deadline stops
+// recovery instead of starting overlapping provider work.
+function minimumConnectAttempts(budgetMs: number): number {
+  return Math.max(1, Math.min(MIN_CONNECT_ATTEMPTS, Math.ceil(budgetMs / HANDSHAKE_TIMEOUT_MS)));
+}
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
 // Do not flood a serial listener with new handshakes while repairing its route.
 const MIN_ROUTE_REACQUIRE_DELAY_MS = 1_000;
@@ -260,7 +269,7 @@ async function openEndpoint(input: {
       followRedirects: false,
       perMessageDeflate: false,
       maxPayload: MAX_FRAME_BYTES,
-      handshakeTimeout: Math.min(15_000, remaining),
+      handshakeTimeout: Math.min(HANDSHAKE_TIMEOUT_MS, remaining),
     });
     const wire = new WsJsonWireConnection(socket);
     const onAbort = () => {
@@ -346,7 +355,7 @@ async function waitForPrpReady(input: {
 
 export interface RunnerPrpOutboundHandle {
   readonly ready: Promise<void>;
-  /** Rejects only when active-run recovery has exhausted its fixed budget. */
+  /** Rejects only when active-run recovery has exhausted its retry policy. */
   readonly failure: Promise<never>;
   /** Stop liveness and reconnect work, preserving an established receive/ACK path. */
   quiesce(): void;
@@ -376,8 +385,8 @@ export function connectRunnerPrpIngress(input: {
   const ownedWires = new Set<WsJsonWireConnection>();
   let endpoint = input.endpoint;
   const startupBudgetStartedAt = Date.now();
-  const startupDeadline =
-    startupBudgetStartedAt + (input.startupDeadlineMs ?? DEFAULT_STARTUP_DEADLINE_MS);
+  const startupBudgetMs = input.startupDeadlineMs ?? DEFAULT_STARTUP_DEADLINE_MS;
+  const startupDeadline = startupBudgetStartedAt + startupBudgetMs;
   const recoveryGraceMs = input.recoveryGraceMs ?? DEFAULT_RECOVERY_GRACE_MS;
   const random = input.random ?? Math.random;
   let readyResolve!: () => void;
@@ -403,19 +412,33 @@ export function connectRunnerPrpIngress(input: {
     let attempt = 0;
     let failedAttemptNumber = 0;
     let recoveryDeadline = startupDeadline;
+    let nextAttemptDeadline = startupDeadline;
+    let connectAttempts = 0;
+    let minimumAttempts = minimumConnectAttempts(startupBudgetMs);
     // A runner whose connection lease lapsed exits without another
     // authenticated frame. Keep the authority's reason so the run log and the
     // terminal error name it instead of a generic transport loss.
     let leaseFailureCode: RunnerIngressFailureCode | null = null;
     while (!abort.signal.aborted) {
+      let dialStarted = false;
       try {
         input.onStateChange?.(attempt === 0 ? "connecting" : "reconnecting");
         if (abort.signal.aborted) return;
+        // The event loop may have stalled before even constructing the socket.
+        if (
+          minimumAttempts > 1 && connectAttempts < minimumAttempts
+          && leaseFailureCode === null && !input.authority.connectionLeaseFailure
+          && Date.now() >= nextAttemptDeadline
+        ) {
+          nextAttemptDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+        }
         const opened = await openEndpoint({
           endpoint,
           signal: abort.signal,
-          deadline: recoveryDeadline,
+          deadline: nextAttemptDeadline,
           onWire: (wire) => {
+            dialStarted = true;
+            connectAttempts += 1;
             ownedWires.add(wire);
             wire.socket.once("close", () => ownedWires.delete(wire));
           },
@@ -425,7 +448,7 @@ export function connectRunnerPrpIngress(input: {
         const authenticated = await waitForPrpReady({
           isAuthenticated: attachment.isAuthenticated,
           wire: opened.wire,
-          deadline: recoveryDeadline,
+          deadline: nextAttemptDeadline,
           signal: abort.signal,
         });
         if (!authenticated) {
@@ -456,6 +479,9 @@ export function connectRunnerPrpIngress(input: {
         }
         if (abort.signal.aborted) return;
         recoveryDeadline = Date.now() + recoveryGraceMs;
+        nextAttemptDeadline = recoveryDeadline;
+        connectAttempts = 0;
+        minimumAttempts = minimumConnectAttempts(recoveryGraceMs);
         const leaseFailure = input.authority.connectionLeaseFailure ?? null;
         if (leaseFailure) {
           leaseFailureCode = "runner_connection_lease_expired";
@@ -467,6 +493,7 @@ export function connectRunnerPrpIngress(input: {
         // an active-run transport failure and must not reject the long-lived
         // failure promise (an unobserved rejection here can terminate Node).
         if (abort.signal.aborted) return;
+        if (input.authority.connectionLeaseFailure) leaseFailureCode = "runner_connection_lease_expired";
         // Intentional close() is not a failed attempt; log only real failures.
         failedAttemptNumber += 1;
         const summary = ingressErrorSummary(error);
@@ -483,9 +510,11 @@ export function connectRunnerPrpIngress(input: {
             && (error as { statusCode?: unknown }).statusCode != null
             ? Number((error as { statusCode?: unknown }).statusCode)
             : null;
-        const transportFailure = (statusCode === null || statusCode >= 500)
+        const transportFailure = leaseFailureCode === null
+          && (statusCode === null || statusCode >= 500)
           && !(failure instanceof RunnerIngressConnectionError && failure.code !== "runner_ingress_unavailable");
         if (
+          leaseFailureCode === null &&
           (statusCode === 401 || statusCode === 403) &&
           Date.now() < recoveryDeadline
         ) {
@@ -507,37 +536,60 @@ export function connectRunnerPrpIngress(input: {
             failure = refreshError;
           }
         }
-        if (Date.now() < recoveryDeadline) {
+        // A timed-out dial is an attempt, not evidence that three attempts ran.
+        // Reserve one bounded repair+dial window for each missing attempt. Do
+        // not apply this floor to auth/known-expired leases, invalid endpoints,
+        // or a refresh that itself used up the provider-operation deadline.
+        const floorRetry = transportFailure && dialStarted
+          && connectAttempts < minimumAttempts && Date.now() >= recoveryDeadline;
+        let retryDeadline = floorRetry ? Date.now() + HANDSHAKE_TIMEOUT_MS : recoveryDeadline;
+        if (Date.now() < retryDeadline) {
           const base = Math.max(RECONNECT_DELAYS_MS[
             Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
-          ]!, transportFailure ? MIN_ROUTE_REACQUIRE_DELAY_MS : 0);
+          ]!, transportFailure && recoveryDeadline - Date.now() > MIN_ROUTE_REACQUIRE_DELAY_MS
+            ? MIN_ROUTE_REACQUIRE_DELAY_MS : 0);
           attempt += 1;
-          await delay(
+          // No catch-up sleeps after a stalled dial; the floor permits at most
+          // two extra dials. Inside a short cold budget retain the old 250/500ms
+          // cadence instead of spending the entire budget on the added spacing.
+          if (!floorRetry) await delay(
             Math.min(
               Math.max(1, Math.round(base * (0.75 + random() * 0.5))),
-              Math.max(1, recoveryDeadline - Date.now()),
+              Math.max(1, retryDeadline - Date.now()),
             ),
             abort.signal,
           );
           if (abort.signal.aborted) return;
-          if (Date.now() < recoveryDeadline) {
+          // Expiry can become known while the backoff timer is pending.
+          if (input.authority.connectionLeaseFailure) leaseFailureCode = "runner_connection_lease_expired";
+          // A stall during backoff must not spend an unmade dial either.
+          if (
+            !floorRetry && transportFailure && leaseFailureCode === null && dialStarted
+            && connectAttempts < minimumAttempts && Date.now() >= retryDeadline
+          ) {
+            retryDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+          }
+          if (Date.now() < retryDeadline) {
             // Re-post the route on this same sandbox before another handshake.
-            // Space refreshes with the existing backoff; never reset the budget
-            // or turn an authentication/lease failure into transport recovery.
-            if (transportFailure) {
+            // Keep the original budget except for the bounded missing-attempt
+            // windows above; never turn auth/lease failure into route repair.
+            if (transportFailure && leaseFailureCode === null) {
               try {
                 const refreshedEndpoint = await awaitWithinDeadline({
                   operation: () => endpoint.refresh(),
-                  deadline: recoveryDeadline,
+                  deadline: retryDeadline,
                   signal: abort.signal,
                 });
-                if (Date.now() < recoveryDeadline) endpoint = refreshedEndpoint;
+                if (Date.now() < retryDeadline) endpoint = refreshedEndpoint;
               } catch (refreshError) {
                 if (abort.signal.aborted) return;
                 failure = refreshError;
               }
             }
-            if (Date.now() < recoveryDeadline) continue;
+            if (Date.now() < retryDeadline) {
+              nextAttemptDeadline = retryDeadline;
+              continue;
+            }
           }
         }
         const terminal =
