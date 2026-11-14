@@ -170,15 +170,16 @@ describe("assigned-work invariant", () => {
     it("repairs only an unanswered in_review conversation with a succeeded run", () => {
       const source = { id: "run-1", status: "succeeded", errorCode: null, finishedAt: ago(3 * 60 * 60_000),
         settlingUntil: null, operatorStopped: false };
-      expect(evaluateAssignedWork(facts({ issue: { status: "in_review", isConversation: true,
+      expect(evaluateAssignedWork(facts({ issue: { status: "in_review", isConversation: true, conversationState: "waiting",
         conversationHasPersonMessage: true, conversationAnswered: false }, latestRun: source }), now))
         .toEqual({ kind: "violation", reason: "no_pending_path", stale: false });
       for (const overrides of [
         { issue: { status: "in_review", isConversation: false, conversationHasPersonMessage: true, conversationAnswered: false } },
         { issue: { status: "in_review", isConversation: true, conversationAnswered: false } },
         { issue: { status: "in_review", isConversation: true, conversationHasPersonMessage: true, conversationAnswered: true } },
-        { issue: { status: "in_review", isConversation: true, conversationHasPersonMessage: true, conversationAnswered: false },
+        { issue: { status: "in_review", isConversation: true, conversationState: "waiting", conversationHasPersonMessage: true, conversationAnswered: false },
           latestRun: { ...source, status: "failed" } },
+        { issue: { status: "in_review", isConversation: true, conversationState: "active", conversationHasPersonMessage: true, conversationAnswered: false } },
       ] as Overrides[]) {
         expect(evaluateAssignedWork(facts(overrides), now)).toEqual({ kind: "not_applicable" });
       }

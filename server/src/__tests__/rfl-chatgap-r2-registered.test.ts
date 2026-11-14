@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import express from "express";
+import request from "supertest";
 import { createServer, type Server } from "node:http";
 import { and, eq, sql } from "drizzle-orm";
 import { afterEach, expect, it } from "vitest";
@@ -11,6 +13,8 @@ import { ensureFreshContinuation } from "../services/fresh-continuation-fallback
 import { conversationRunsForLastMessages } from "../services/agent-conversations.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { issueRoutes } from "../routes/issues.js";
+import { errorHandler } from "../middleware/index.js";
 
 // Independent ROUND 2 acceptance. The real heartbeat registration installs the
 // production recovery workers and dispatcher on a real coordinator + PostgreSQL.
@@ -25,6 +29,14 @@ describeIssueRecovery("RFL round 2 registered production sweep", () => {
       await new Promise<void>(resolve => listener.close(() => resolve()));
     }
   });
+  function personFacingApp() {
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
+    app.use("/api", issueRoutes(state.db, {} as any));
+    app.use(errorHandler);
+    return app;
+  }
   async function seed(status: string, answered = false) {
     const f = await state.fixture();
     await instanceSettingsService(state.db).updateExperimental({ enableAgentChat: true });
@@ -118,6 +130,20 @@ describeIssueRecovery("RFL round 2 registered production sweep", () => {
     const [gateEvidence] = gate === "stopped"
       ? await state.db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson }).from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId))
       : await state.db.select({ status: agents.status, pauseReason: agents.pauseReason }).from(agents).where(eq(agents.id, f.agentId));
+    const app = personFacingApp();
+    const issueRead = await request(app).get(`/api/issues/${f.issueId}`).expect(200);
+    const commentsRead = await request(app).get(`/api/issues/${f.issueId}/comments?order=asc`).expect(200);
+    const visibleCommentBodies = commentsRead.body.map((comment: { body: string }) => comment.body);
+    if (gate === "paused" || gate === "budget") {
+      expect(issueRead.body.status).toBe("blocked");
+      expect(visibleCommentBodies).toContain("Recovery process can't run right now, so Paperclip stopped this task instead of retrying it. It is still assigned to them. To continue, resume or fix the agent, or assign the task to someone else.");
+    } else {
+      expect(issueRead.body.interruption).toMatchObject({ state: "failed", canRetry: true });
+      const visibleStopNotice = issueRead.body.interruption.retryWait?.message
+        ?? (issueRead.body.interruption.state === "failed" ? "Couldn’t finish this attempt. Your message is saved." : null);
+      expect(visibleStopNotice).toBe("Couldn’t finish this attempt. Your message is saved.");
+      expect(visibleCommentBodies).toContain("What is the result?");
+    }
     appendFileSync(`${process.env.TASK_OUT}/registered-receipts.jsonl`, JSON.stringify({ name: `gate-evidence-${gate}`, gateEvidence }) + "\n");
     expect(result.successors).toHaveLength(0);
     if (gate === "paused") expect(gateEvidence).toMatchObject({ status: "paused", pauseReason: "manual" });

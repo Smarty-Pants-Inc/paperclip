@@ -73,7 +73,7 @@ const PROVIDER_LIMIT_CAUSES = ["provider_quota", "native_provider_usage_limit"];
 
 type IssueRow = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "assigneeUserId" | "hiddenAt"
   | "blockedTransitionAt" | "updatedAt" | "unblockDescriptor" | "monitorNextCheckAt" | "conversationAgentId" | "originKind"
-  | "projectId" | "statusVersion" | "executionState" | "identifier" | "createdAt" | "blockedOwnerNotifiedAt">;
+  | "projectId" | "statusVersion" | "executionState" | "identifier" | "createdAt" | "blockedOwnerNotifiedAt" | "conversationState">;
 
 type RunRow = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status" | "agentId" | "runtimeMode" | "errorCode" | "finishedAt"
   | "scheduledRetryAt" | "controllerBootId" | "controllerLeaseExpiresAt" | "controllerProcess" | "resultJson"> & { issueId: string };
@@ -386,6 +386,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           unblockOwner: (issue.unblockDescriptor?.owner ?? null) as AssignedWorkFacts["issue"]["unblockOwner"],
           monitorNextCheckAt: issue.monitorNextCheckAt,
           isConversation: Boolean(issue.conversationAgentId) || issue.originKind === "chat_channel",
+          conversationState: issue.conversationState,
           conversationHasPersonMessage: inReviewPersonMessageIds.has(issue.id),
           conversationAnswered: answeredConversationIds.has(issue.id),
           awaitingFirstMessage: onboardingIds.has(issue.id),
@@ -431,7 +432,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     id: issues.id, companyId: issues.companyId, status: issues.status, assigneeAgentId: issues.assigneeAgentId,
     assigneeUserId: issues.assigneeUserId, hiddenAt: issues.hiddenAt, blockedTransitionAt: issues.blockedTransitionAt,
     updatedAt: issues.updatedAt, unblockDescriptor: issues.unblockDescriptor, monitorNextCheckAt: issues.monitorNextCheckAt,
-    conversationAgentId: issues.conversationAgentId, originKind: issues.originKind, projectId: issues.projectId,
+    conversationAgentId: issues.conversationAgentId, conversationState: issues.conversationState,
+    originKind: issues.originKind, projectId: issues.projectId,
     statusVersion: issues.statusVersion, executionState: issues.executionState, identifier: issues.identifier,
     createdAt: issues.createdAt, blockedOwnerNotifiedAt: issues.blockedOwnerNotifiedAt,
   };
@@ -444,6 +446,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       issueId ? eq(issues.id, issueId) : undefined,
       inArray(issues.status, [...OPEN_STATUSES]),
       sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
+      sql`(${issues.status} <> 'in_review' or ${issues.conversationState} = 'waiting')`,
       sql`${issues.assigneeAgentId} is not null`,
       isNull(issues.assigneeUserId),
       isNull(issues.hiddenAt),
@@ -459,126 +462,140 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
    */
   async function listSuspects(scope: { companyId?: string; issueId?: string; createdAfter?: Date | null }, cursor: string | null, limit: number) {
     const at = now();
-    const liveRun = sql`exists (select 1 from heartbeat_runs r where r.company_id = ${issues.companyId}
-        and (r.context_snapshot->>'issueId') = ${issues.id}::text
-        and r.status in ('queued', 'running', 'scheduled_retry')
-        and not (r.status = 'running' and r.runtime_mode = 'legacy' and r.controller_lease_expires_at is not null
-          and r.controller_lease_expires_at < ${at.toISOString()}::timestamptz))`;
-    const candidates = await db.select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt,
-      conversationAgentId: issues.conversationAgentId, assigneeAgentId: issues.assigneeAgentId, originKind: issues.originKind })
-      .from(issues).where(and(
-      scope.companyId ? eq(issues.companyId, scope.companyId) : undefined,
-      scope.issueId ? eq(issues.id, scope.issueId) : undefined,
-      cursor ? sql`${issues.id} > ${cursor}` : undefined,
-      scope.createdAfter ? gte(issues.createdAt, scope.createdAfter) : undefined,
-      inArray(issues.status, [...OPEN_STATUSES]),
-      sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
-      sql`${issues.assigneeAgentId} is not null`,
-      isNull(issues.assigneeUserId),
-      isNull(issues.hiddenAt),
-      sql`(
-        (${issues.conversationAgentId} is null and coalesce(${issues.originKind}, '') <> 'chat_channel')
-        or (
-          (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel')
-          and exists (select 1 from ${issueComments} person where person.company_id = ${issues.companyId}
-            and person.issue_id = ${issues.id} and person.author_user_id is not null and person.author_agent_id is null
-            and person.created_by_run_id is null and person.deleted_at is null)
-          and not exists (
-            select 1 from ${issueComments} last_person
-            where last_person.company_id = ${issues.companyId} and last_person.issue_id = ${issues.id}
-              and last_person.author_user_id is not null and last_person.author_agent_id is null
-              and last_person.created_by_run_id is null and last_person.deleted_at is null
-              and last_person.id = (select person.id from ${issueComments} person
-                where person.company_id = ${issues.companyId} and person.issue_id = ${issues.id}
-                  and person.author_user_id is not null and person.author_agent_id is null
-                  and person.created_by_run_id is null and person.deleted_at is null
-                order by person.created_at desc, person.id desc limit 1)
-              and exists (
-                select 1 from ${heartbeatRuns} response_run
-                where response_run.company_id = ${issues.companyId}
-                  and response_run.agent_id = coalesce(${issues.conversationAgentId}, ${issues.assigneeAgentId})
-                  and response_run.context_snapshot->>'issueId' = ${issues.id}::text
-                  and (response_run.context_snapshot->>'wakeCommentId' = last_person.id::text
-                    or response_run.context_snapshot->>'commentId' = last_person.id::text
-                    or (response_run.context_snapshot->'firstTurnQueuedInput'->>'schema' = 'paperclip.first-turn-queued-input.v1'
-                      and response_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = response_run.id::text
-                      and jsonb_typeof(response_run.context_snapshot->'firstTurnQueuedInput'->'claimedAt') = 'string'
-                      and nullif(trim(response_run.context_snapshot->'firstTurnQueuedInput'->>'claimedAt'), '') is not null
-                      and response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text)))
-                  and exists (select 1 from ${issueComments} reply where reply.company_id = ${issues.companyId}
-                    and reply.issue_id = ${issues.id} and reply.created_by_run_id = response_run.id
-                    and reply.author_agent_id = response_run.agent_id and reply.origin = 'comment'
-                    and reply.deleted_at is null and (reply.created_at, reply.id) > (last_person.created_at, last_person.id))
-                  and not exists (select 1 from ${issueThreadInteractions}
-                    where ${issueThreadInteractions.companyId} = ${issues.companyId}
-                      and ${issueThreadInteractions.issueId} = ${issues.id}
-                      and ${issueThreadInteractions.status} = 'pending'
-                      and ${activeIssueInteractionCondition({ runId: sql`response_run.id`, conversationMode: true })})
-              )
+    const eligible: Array<{ id: string; companyId: string; updatedAt: Date }> = [];
+    let pageCursor = cursor;
+    let exhausted = false;
+    while (!exhausted && eligible.length < limit) {
+      const liveRun = sql`exists (select 1 from heartbeat_runs r where r.company_id = ${issues.companyId}
+          and (r.context_snapshot->>'issueId') = ${issues.id}::text
+          and r.status in ('queued', 'running', 'scheduled_retry')
+          and not (r.status = 'running' and r.runtime_mode = 'legacy' and r.controller_lease_expires_at is not null
+            and r.controller_lease_expires_at < ${at.toISOString()}::timestamptz))`;
+      const candidates = await db.select({ id: issues.id, companyId: issues.companyId, updatedAt: issues.updatedAt,
+        conversationAgentId: issues.conversationAgentId, assigneeAgentId: issues.assigneeAgentId, originKind: issues.originKind })
+        .from(issues).where(and(
+        scope.companyId ? eq(issues.companyId, scope.companyId) : undefined,
+        scope.issueId ? eq(issues.id, scope.issueId) : undefined,
+        pageCursor ? sql`${issues.id} > ${pageCursor}` : undefined,
+        scope.createdAfter ? gte(issues.createdAt, scope.createdAfter) : undefined,
+        inArray(issues.status, [...OPEN_STATUSES]),
+        sql`(${issues.status} <> 'in_review' or (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel'))`,
+        sql`(${issues.status} <> 'in_review' or ${issues.conversationState} = 'waiting')`,
+        sql`${issues.assigneeAgentId} is not null`,
+        isNull(issues.assigneeUserId),
+        isNull(issues.hiddenAt),
+        sql`(
+          (${issues.conversationAgentId} is null and coalesce(${issues.originKind}, '') <> 'chat_channel')
+          or (
+            (${issues.conversationAgentId} is not null or ${issues.originKind} = 'chat_channel')
+            and exists (select 1 from ${issueComments} person where person.company_id = ${issues.companyId}
+              and person.issue_id = ${issues.id} and person.author_user_id is not null and person.author_agent_id is null
+              and person.created_by_run_id is null and person.deleted_at is null)
+            and not exists (
+              select 1 from ${issueComments} last_person
+              where last_person.company_id = ${issues.companyId} and last_person.issue_id = ${issues.id}
+                and last_person.author_user_id is not null and last_person.author_agent_id is null
+                and last_person.created_by_run_id is null and last_person.deleted_at is null
+                and last_person.id = (select person.id from ${issueComments} person
+                  where person.company_id = ${issues.companyId} and person.issue_id = ${issues.id}
+                    and person.author_user_id is not null and person.author_agent_id is null
+                    and person.created_by_run_id is null and person.deleted_at is null
+                  order by person.created_at desc, person.id desc limit 1)
+                and exists (
+                  select 1 from ${heartbeatRuns} response_run
+                  where response_run.company_id = ${issues.companyId}
+                    and response_run.agent_id = coalesce(${issues.conversationAgentId}, ${issues.assigneeAgentId})
+                    and response_run.context_snapshot->>'issueId' = ${issues.id}::text
+                    and (response_run.context_snapshot->>'wakeCommentId' = last_person.id::text
+                      or response_run.context_snapshot->>'commentId' = last_person.id::text
+                      or (response_run.context_snapshot->'firstTurnQueuedInput'->>'schema' = 'paperclip.first-turn-queued-input.v1'
+                        and response_run.context_snapshot->'firstTurnQueuedInput'->>'runId' = response_run.id::text
+                        and jsonb_typeof(response_run.context_snapshot->'firstTurnQueuedInput'->'claimedAt') = 'string'
+                        and nullif(trim(response_run.context_snapshot->'firstTurnQueuedInput'->>'claimedAt'), '') is not null
+                        and response_run.context_snapshot->'firstTurnQueuedInput'->'commentIds' @> jsonb_build_array(last_person.id::text)))
+                    and exists (select 1 from ${issueComments} reply where reply.company_id = ${issues.companyId}
+                      and reply.issue_id = ${issues.id} and reply.created_by_run_id = response_run.id
+                      and reply.author_agent_id = response_run.agent_id and reply.origin = 'comment'
+                      and reply.deleted_at is null and (reply.created_at, reply.id) > (last_person.created_at, last_person.id))
+                    and not exists (select 1 from ${issueThreadInteractions}
+                      where ${issueThreadInteractions.companyId} = ${issues.companyId}
+                        and ${issueThreadInteractions.issueId} = ${issues.id}
+                        and ${issueThreadInteractions.status} = 'pending'
+                        and ${activeIssueInteractionCondition({ runId: sql`response_run.id`, conversationMode: true })})
+                )
+            )
           )
-        )
-      )`,
-      sql`(${issues.status} <> 'blocked' or coalesce(${issues.blockedTransitionAt}, ${issues.updatedAt}) > ${new Date(at.getTime() - STALE_BLOCK_MS).toISOString()}::timestamptz)`,
-      sql`(${issues.monitorNextCheckAt} is null or ${issues.monitorNextCheckAt} <= ${at.toISOString()}::timestamptz)`,
-      // A legacy run whose controller lease lapsed may have lost its owner;
-      // the predicate judges it with the owner proof. Other active runs are live.
-      sql`(${issues.status} = 'blocked' or not ${liveRun})`,
-      sql`((${issues.status} = 'blocked' and ${liveRun}) or not exists (select 1 from agent_wakeup_requests w where w.company_id = ${issues.companyId}
-        and (w.payload->>'issueId') = ${issues.id}::text
-        and (w.status = 'queued'
-          or (w.status = 'deferred_issue_execution' and w.created_at > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)
-          or (w.status = 'claimed' and (w.run_id is not null
-            or coalesce(w.claimed_at, w.created_at) > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)))))`,
-      sql`not exists (select 1 from issue_thread_interactions t where t.company_id = ${issues.companyId}
-        and t.issue_id = ${issues.id} and t.status = 'pending'
-        and ${interactionNotSupersededSql(sql`t.company_id`, sql`t.issue_id::text`, sql`t.created_at`)})`,
-      // Plain waits on someone else, decided without the full read. The
-      // predicate re-checks every task this lets through.
-      sql`not exists (select 1 from issue_relations rel inner join issues blocker
-        on blocker.id = rel.issue_id and blocker.company_id = rel.company_id
-        where rel.company_id = ${issues.companyId} and rel.related_issue_id = ${issues.id}
-          and rel.type = 'blocks' and blocker.status not in ('done', 'cancelled'))`,
-      sql`not exists (select 1 from issue_approvals ia inner join approvals ap on ap.id = ia.approval_id
-        where ia.company_id = ${issues.companyId} and ia.issue_id = ${issues.id} and ap.status = 'pending')`,
-      // A credential or board-confirmation hold waits on a person; any active
-      // hold on a blocked task is re-continued by the hold's owner.
-      sql`not exists (select 1 from issue_recovery_actions ra where ra.company_id = ${issues.companyId}
-        and ra.source_issue_id = ${issues.id} and ra.status in ('active', 'escalated')
-        and (ra.cause in ('configuration_incomplete', 'ownership_owner_unprovable') or ${issues.status} = 'blocked')
-        -- except a recent board escalation, which the predicate judges by its failed run's cause
-        and not (ra.kind = ${STRANDED_KIND} and ra.owner_type = 'board' and exists (select 1 from heartbeat_runs sr
-          where sr.company_id = ra.company_id and sr.id::text = ra.evidence->>'latestRunId'
-            and sr.finished_at > ${new Date(at.getTime() - STRANDED_CONTINUATION_MAX_AGE_MS).toISOString()}::timestamptz)))`,
-      // An assignee that cannot take work (paused, being set up, held) is
-      // its own wait; the predicate names it when anything else asks.
-      sql`exists (select 1 from agents a where a.id = ${issues.assigneeAgentId} and a.company_id = ${issues.companyId}
-        and a.status not in ('paused', 'terminated', 'pending_approval')
-        and a.lifecycle_state not in ('preparing', 'verifying', 'resuming')
-        and jsonb_array_length(a.lifecycle_holds) = 0)`,
-      sql`(${issues.status} <> 'blocked' or ${issues.unblockDescriptor} is null
-        or (${issues.unblockDescriptor}->'owner'->>'agentId') = ${issues.assigneeAgentId}::text)`,
-    )).orderBy(issues.id).limit(limit);
-    // Keep the indexed SQL prefilter, then verify the shared answer predicate
-    // across qualified continuation ancestry before exposing a chat as suspect.
-    const byCompany = new Map<string, typeof candidates>();
-    for (const candidate of candidates) {
-      if (!candidate.conversationAgentId && candidate.originKind !== "chat_channel") continue;
-      const rows = byCompany.get(candidate.companyId) ?? [];
-      rows.push(candidate);
-      byCompany.set(candidate.companyId, rows);
+        )`,
+        sql`(${issues.status} <> 'blocked' or coalesce(${issues.blockedTransitionAt}, ${issues.updatedAt}) > ${new Date(at.getTime() - STALE_BLOCK_MS).toISOString()}::timestamptz)`,
+        sql`(${issues.monitorNextCheckAt} is null or ${issues.monitorNextCheckAt} <= ${at.toISOString()}::timestamptz)`,
+        // A legacy run whose controller lease lapsed may have lost its owner;
+        // the predicate judges it with the owner proof. Other active runs are live.
+        sql`(${issues.status} = 'blocked' or not ${liveRun})`,
+        sql`((${issues.status} = 'blocked' and ${liveRun}) or not exists (select 1 from agent_wakeup_requests w where w.company_id = ${issues.companyId}
+          and (w.payload->>'issueId') = ${issues.id}::text
+          and (w.status = 'queued'
+            or (w.status = 'deferred_issue_execution' and w.created_at > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)
+            or (w.status = 'claimed' and (w.run_id is not null
+              or coalesce(w.claimed_at, w.created_at) > ${new Date(at.getTime() - DEFERRED_WAKE_PENDING_BOUND_MS).toISOString()}::timestamptz)))))`,
+        sql`not exists (select 1 from issue_thread_interactions t where t.company_id = ${issues.companyId}
+          and t.issue_id = ${issues.id} and t.status = 'pending'
+          and ${interactionNotSupersededSql(sql`t.company_id`, sql`t.issue_id::text`, sql`t.created_at`)})`,
+        // Plain waits on someone else, decided without the full read. The
+        // predicate re-checks every task this lets through.
+        sql`not exists (select 1 from issue_relations rel inner join issues blocker
+          on blocker.id = rel.issue_id and blocker.company_id = rel.company_id
+          where rel.company_id = ${issues.companyId} and rel.related_issue_id = ${issues.id}
+            and rel.type = 'blocks' and blocker.status not in ('done', 'cancelled'))`,
+        sql`not exists (select 1 from issue_approvals ia inner join approvals ap on ap.id = ia.approval_id
+          where ia.company_id = ${issues.companyId} and ia.issue_id = ${issues.id} and ap.status = 'pending')`,
+        // A credential or board-confirmation hold waits on a person; any active
+        // hold on a blocked task is re-continued by the hold's owner.
+        sql`not exists (select 1 from issue_recovery_actions ra where ra.company_id = ${issues.companyId}
+          and ra.source_issue_id = ${issues.id} and ra.status in ('active', 'escalated')
+          and (ra.cause in ('configuration_incomplete', 'ownership_owner_unprovable') or ${issues.status} = 'blocked')
+          -- except a recent board escalation, which the predicate judges by its failed run's cause
+          and not (ra.kind = ${STRANDED_KIND} and ra.owner_type = 'board' and exists (select 1 from heartbeat_runs sr
+            where sr.company_id = ra.company_id and sr.id::text = ra.evidence->>'latestRunId'
+              and sr.finished_at > ${new Date(at.getTime() - STRANDED_CONTINUATION_MAX_AGE_MS).toISOString()}::timestamptz)))`,
+        // An assignee that cannot take work (paused, being set up, held) is
+        // its own wait; the predicate names it when anything else asks.
+        sql`exists (select 1 from agents a where a.id = ${issues.assigneeAgentId} and a.company_id = ${issues.companyId}
+          and a.status not in ('paused', 'terminated', 'pending_approval')
+          and a.lifecycle_state not in ('preparing', 'verifying', 'resuming')
+          and jsonb_array_length(a.lifecycle_holds) = 0)`,
+        sql`(${issues.status} <> 'blocked' or ${issues.unblockDescriptor} is null
+          or (${issues.unblockDescriptor}->'owner'->>'agentId') = ${issues.assigneeAgentId}::text)`,
+      )).orderBy(issues.id).limit(limit);
+      if (candidates.length === 0) {
+        exhausted = true;
+        break;
+      }
+      pageCursor = candidates.at(-1)!.id;
+      // Keep the indexed SQL prefilter, then verify the shared answer predicate
+      // across qualified continuation ancestry before exposing a chat as suspect.
+      const byCompany = new Map<string, typeof candidates>();
+      for (const candidate of candidates) {
+        if (!candidate.conversationAgentId && candidate.originKind !== "chat_channel") continue;
+        const rows = byCompany.get(candidate.companyId) ?? [];
+        rows.push(candidate);
+        byCompany.set(candidate.companyId, rows);
+      }
+      const answered = new Set<string>();
+      for (const [companyId, rows] of byCompany) {
+        const carriers = await conversationReplyRunsForLastMessages(db, { companyId, issues: rows.flatMap(row => {
+          const agentId = row.conversationAgentId ?? row.assigneeAgentId;
+          return agentId ? [{ issueId: row.id, agentId }] : [];
+        }) });
+        await Promise.all(carriers.map(async carrier => {
+          if (await conversationTurnAnswered({ db, companyId, issueId: carrier.issueId, runId: carrier.runId })) answered.add(carrier.issueId);
+        }));
+      }
+      eligible.push(...candidates.filter(candidate => !answered.has(candidate.id))
+        .map(({ id, companyId, updatedAt }) => ({ id, companyId, updatedAt })));
     }
-    const answered = new Set<string>();
-    for (const [companyId, rows] of byCompany) {
-      const carriers = await conversationReplyRunsForLastMessages(db, { companyId, issues: rows.flatMap(row => {
-        const agentId = row.conversationAgentId ?? row.assigneeAgentId;
-        return agentId ? [{ issueId: row.id, agentId }] : [];
-      }) });
-      await Promise.all(carriers.map(async carrier => {
-        if (await conversationTurnAnswered({ db, companyId, issueId: carrier.issueId, runId: carrier.runId })) answered.add(carrier.issueId);
-      }));
-    }
-    return candidates.filter(candidate => !answered.has(candidate.id))
-      .map(({ id, companyId, updatedAt }) => ({ id, companyId, updatedAt }));
+    // A short eligible page is only complete after the raw SQL cursor is
+    // exhausted. Answered chats can occupy arbitrarily many earlier pages.
+    return eligible.slice(0, limit);
   }
 
   /** Evaluate one task, and repair it when it violates the invariant. */
