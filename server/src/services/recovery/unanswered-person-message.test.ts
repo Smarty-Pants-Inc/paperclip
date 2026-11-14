@@ -334,6 +334,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const message = await f.message("What word did I ask you to remember?");
     const failed = await f.run({ commentId: message, status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    // As in the live TES-79 record: the failure itself blocked the task (blocked_transition_at at the run's finish,
+    // no status decision), so Paperclip's fallback owns that block and would continue the run (RFL b2 F3).
+    const [failedRow] = await db.select({ finishedAt: heartbeatRuns.finishedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+    await db.update(issues).set({ blockedTransitionAt: failedRow!.finishedAt }).where(eq(issues.id, f.issueId));
     await f.sweep();
     const safe = /Sending it again is safe/;
     expect((await f.history()).filter(note => safe.test(note.body)), "the first note never promises a resend").toHaveLength(0);
@@ -626,6 +630,10 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const message = await f.message("What word did I ask you to remember?");
     const failed = await f.run({ commentId: message, status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
+    // As in the live TES-79 record: the failure itself blocked the task (blocked_transition_at at the run's finish,
+    // no status decision), so Paperclip's fallback owns that block and would continue the run (RFL b2 F3).
+    const [failedRow] = await db.select({ finishedAt: heartbeatRuns.finishedAt }).from(heartbeatRuns).where(eq(heartbeatRuns.id, failed));
+    await db.update(issues).set({ blockedTransitionAt: failedRow!.finishedAt }).where(eq(issues.id, f.issueId));
     await settleAt(f, 0);
     expect(await f.history(), "within T0: Paperclip's recovery is still to decide").toHaveLength(0);
     await settleAt(f, 3 * 60_000);
