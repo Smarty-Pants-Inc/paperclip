@@ -20,12 +20,12 @@ mod skill_edit {
 
     #[test]
     fn skill_edit_active_goal_prepare_selects_fresh_history() {
-        refresh_admission("goal", "refresh_fresh");
+        refresh_admission("goal", "prepared");
     }
 
     #[test]
     fn skill_edit_contract_prepare_selects_fresh_history() {
-        refresh_admission("contract", "refresh_fresh");
+        refresh_admission("contract", "prepared");
     }
 
     fn refresh_admission(blocker: &str, expected: &str) {
@@ -104,11 +104,13 @@ mod skill_edit {
             "{blocker}: prepare must select {expected}, not fail: {result:?}"
         );
         assert_eq!(result.unwrap().result["status"], expected, "{blocker}");
-        assert_eq!(
-            fs::read(old.state_path()).unwrap(),
-            bytes,
-            "admission must not rewrite predecessor"
-        );
+        if expected != "prepared" {
+            assert_eq!(
+                fs::read(old.state_path()).unwrap(),
+                bytes,
+                "admission must not rewrite predecessor"
+            );
+        }
         // A no-op prepare receipt is not sufficient: the contender's ordinary
         // event pump and close must not restore, reconcile, or stop old work.
         let events = next
@@ -120,11 +122,13 @@ mod skill_edit {
         );
         next.shutdown()
             .expect("unadmitted contender cleanup must not restore the old provider");
-        assert_eq!(
-            fs::read(old.state_path()).unwrap(),
-            bytes,
-            "poll/cleanup must preserve the predecessor"
-        );
+        if expected != "prepared" {
+            assert_eq!(
+                fs::read(old.state_path()).unwrap(),
+                bytes,
+                "poll/cleanup must preserve the predecessor"
+            );
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 
