@@ -4573,6 +4573,10 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       path: string;
       query: string;
       headers: Record<string, string>;
+      /** Host-issued run generation stamped when the gateway accepted the request. */
+      bridgeGeneration?: string;
+      /** Internal marker for requests delivered through the file-queue worker. */
+      bridgeTransport?: "queue_v1";
       /** Legacy text envelopes remain strings; binary uploads are raw bytes. */
       body?: string | Buffer;
     },
@@ -4604,6 +4608,8 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     }
     headers.set("authorization", `Bearer ${hostApiToken}`);
     headers.set("x-paperclip-run-id", input.runId);
+    if (request.bridgeGeneration) headers.set("x-paperclip-bridge-generation", request.bridgeGeneration);
+    if (request.bridgeTransport) headers.set("x-paperclip-bridge-transport", request.bridgeTransport);
     // Abort the forward when the caller aborts the request (its per-iteration
     // timeout or watchdog fired, or the broker's forward budget ended), or after
     // the forward budget here, whichever comes first.
@@ -5028,7 +5034,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       runtimeSpan: input.runtimeSpan,
       startPaused: input.startPaused,
       // The worker encodes binary bodies only at the queue boundary.
-      handleRequest: (request, options) => forwardBridgeRequest(request, options?.signal, {
+      handleRequest: (request, options) => forwardBridgeRequest({ ...request, bridgeTransport: "queue_v1" }, options?.signal, {
         reservation: options?.reservation,
       }),
     });
@@ -5072,7 +5078,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     },
     runLogTail,
     pause: async () => { await worker?.pause(); },
-    resume: async () => { await worker?.resume(); },
+    resume: async (generation?: string) => { await worker?.resume(generation); },
     stop: async () => {
       await Promise.allSettled([
         server?.stop(),
