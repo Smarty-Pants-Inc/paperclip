@@ -1024,16 +1024,49 @@ not conversation history. The namespace and cache must be owned by the execution
 uid and private (`0700`), and the cache must pass an actual write probe. An
 existing unsafe path is never chmodded or trusted; provisioning failures disable
 caching without refusing the launch. An inherited `NODE_COMPILE_CACHE` cannot
-redirect it. A custom temporary directory that places the cache inside the Pi
-runtime disables caching instead.
+redirect it. A custom temporary directory that places the cache inside a
+persisted root disables caching instead, including physical symlink aliases.
 
 The native Pi persistence profile copies `runner/`, `pi-agent/` (without launch
 credentials/settings), and `pi/`. Conversation evidence retains whole retired
-session or backup trees. Keep the execution host's temporary directory outside
-those trees: the host-local compile cache is not part of either persistence
-boundary. No cache-name filter is applied during backup or evidence retention.
-Existing caches already inside older session trees are not moved or deleted by
-this launch-policy change.
+session or backup trees. The launch check covers the enclosing local session
+(`scope/pi`, `scope/pi-agent`, `scope/runner`) or remote session
+(`scope/filesystem/pi`, `scope/filesystem/pi-agent`, `scope/runner`), not just
+`pi/`. It also covers the enclosing `durable-sessions`/`.paperclip-runtime`
+state base (backup publications, quarantine and conversation evidence), an
+explicit `PAPERCLIP_RUNNER_STATE_DIR`, and the actual selected agent-file/home
+roots. Standalone custom runtimes have no inferred sibling layout; callers of
+the environment helper can supply additional persisted directories. No fallback
+cache is placed inside these trees when the host temporary directory is unsafe.
+
+Before launching Pi, the driver removes only the exact legacy
+`<physical runtimeDirectory>/node-compile-cache` when it is a real directory
+owned by the execution uid. It never follows cache symlinks, removes a file or
+foreign-owner root, or searches for other cache names. Cleanup errors do not
+refuse the turn. Conversation JSONL bytes are untouched. Cleanup runs before
+backup manifest hashing/copying, so the next backup's normal manifest and stamp
+still describe its exact copied tree. Backup and evidence code need no filters;
+old backup/evidence trees are not rewritten. Restoring an old backup triggers
+this same cleanup on its next Pi launch. An already-live Pi must be relaunched
+to adopt the policy.
+
+If the new cache is empty, launch first tries the legacy runtime cache before
+removing it, then the image's existing
+`<physical OS temporary directory>/node-compile-cache`. The copy accepts only
+real directories/files owned by this uid or root, protected from other users'
+writes (a private source root also protects Node's umask-created descendants).
+It rejects symlinks and special files, limits traversal to 10,000 entries/four
+levels/128 MiB, writes private staged bytes and atomically publishes into the
+still-empty destination. A populated cache wins; the source is not modified.
+Missing, unsafe or incompatible image state remains a normal cold start. The
+distribution installer's `<staging>/node-compile-cache` is npm build scratch
+and is deleted before publication; it is not an image seed. Node validates its
+own version/V8/architecture cache compatibility. No image build is necessary
+to adopt an already-present compatible OS cache.
+
+This is a same-uid optimization, not cross-company isolation: compiled modules
+can contain private source literals, and the host cache can outlive a session.
+Use separate execution uids/filesystems where that is an isolation requirement.
 
 ## Prepared harness storage
 

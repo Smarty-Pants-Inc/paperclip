@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
-import { piCompileCacheEnvironment } from "./pi-compile-cache-environment.js";
+import { piCompileCacheEnvironment, removeLegacyPiCompileCache } from "./pi-compile-cache-environment.js";
 import type { NativeRuntimeContextSnapshot } from "../../contracts/runtime-context.js";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -165,7 +165,7 @@ export class PiRpcDriver implements HarnessDriver {
     const sessionFile = recovery?.sessionFile ?? join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
-    const environment = { ...(this.#options.environment ?? {}), ...await piCompileCacheEnvironment(directory) };
+    const environment = { ...(this.#options.environment ?? {}) };
     // Capture the runner's original Pi home before selecting the managed home.
     const originalModelsFile = originalPiModelsFile({ ...process.env, ...environment, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR });
     // Environment paths may still name a controller-side copy. Only the
@@ -198,6 +198,12 @@ export class PiRpcDriver implements HarnessDriver {
       environment.AGENT_HOME = agentFiles.root;
       environment.PAPERCLIP_PI_AGENT_HOME = agentFiles.root;
     }
+    Object.assign(environment, await piCompileCacheEnvironment(this.#options.runtimeDirectory, [
+      agentHome, ...(agentFiles ? [agentFiles.root] : []),
+      ...((environment.PAPERCLIP_RUNNER_STATE_DIR ?? process.env.PAPERCLIP_RUNNER_STATE_DIR)
+        ? [environment.PAPERCLIP_RUNNER_STATE_DIR ?? process.env.PAPERCLIP_RUNNER_STATE_DIR!] : []),
+    ]));
+    await removeLegacyPiCompileCache(directory);
     const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
     const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];
     await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
