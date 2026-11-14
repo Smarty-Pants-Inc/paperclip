@@ -1171,6 +1171,12 @@ export const issueCommentMetadataSchema = z
       sourceRunId: z.uuid(),
       contentHash: z.string().regex(/^[a-f0-9]{64}$/),
     }).strict().optional(),
+    inputOrigin: z.object({
+      kind: z.enum(["human_session", "human_relay", "board_key"]),
+      userId: z.string().min(1),
+      admittedRunId: z.uuid().optional(),
+      sourceRunId: z.uuid().optional(),
+    }).strict().optional(),
     recoveryResponsibility: z.enum(["system", "user"]).optional(),
     attachmentPreparation: z.object({ attachmentId: z.uuid() }).strict().optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
@@ -1190,9 +1196,12 @@ export const issueCommentMetadataSchema = z
       reason: z.string().trim().min(1).max(160),
       assigneeAgentId: z.string().guid().nullable(),
     }).strict().optional(),
-    sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
+    sections: z.array(issueCommentMetadataSectionSchema).max(20),
   })
-  .strict();
+  .strict()
+  .refine(value => value.sections.length > 0 || value.inputOrigin != null, {
+    message: "Metadata requires sections or a server-owned input origin",
+  });
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 

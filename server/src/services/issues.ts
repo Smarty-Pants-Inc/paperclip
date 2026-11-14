@@ -13607,13 +13607,17 @@ export function issueService(db: Db) {
         proactiveChatMessage?: { sourceTaskId: string; userId: string };
         /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
         mirrorToSlack?: boolean;
+        authenticatedUserSession?: boolean;
+        boardKeyOrigin?: { runId?: string };
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
       const pluginOrigin = currentPluginInteractionOrigin();
+      if (options?.metadata?.inputOrigin) throw forbidden("Comment input origin is server-owned");
       if (pluginOrigin) {
         actor = { ...actor, agentId: pluginOrigin.agentId, runId: pluginOrigin.runId ?? undefined, userId: undefined };
       }
+      const humanSession = options?.authenticatedUserSession === true && actor.userId && !actor.agentId && !actor.runId && !pluginOrigin;
       if (dbOrTx === db) {
         const append = () =>
           measureRunTransaction(db, "response", async (tx) => {
@@ -13822,7 +13826,14 @@ export function issueService(db: Db) {
                 options?.metadata ?? null,
                 options?.authorizationReason,
               )
-            : (options?.metadata ?? null),
+            : humanSession ? {
+                ...(options?.metadata ?? { version: 1, sections: [] }),
+                inputOrigin: { kind: "human_session", userId: actor.userId! },
+              } : options?.boardKeyOrigin && actor.userId && !actor.agentId && !pluginOrigin ? {
+                ...(options?.metadata ?? { version: 1, sections: [] }),
+                inputOrigin: { kind: "board_key", userId: actor.userId,
+                  ...(options.boardKeyOrigin.runId && isUuidLike(options.boardKeyOrigin.runId) ? { sourceRunId: options.boardKeyOrigin.runId } : {}) },
+              } : (options?.metadata ?? null),
         );
       let comment: typeof issueComments.$inferSelect | null = null;
       if (createdByRunId && !options?.proactiveChatMessage && !(actor.userId && options?.clientRequestId)) {

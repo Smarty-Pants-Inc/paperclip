@@ -29,7 +29,8 @@ describe.skipIf(!support.supported)("fresh-continuation person-turn boundary", (
       kind: "active_run_watchdog", status: "resolved", cause: "fresh_continuation", fingerprint: sourceRunId,
       nextAction: "Continue", evidence: { freshContinuation: { sourceRunId } } });
     const [message] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
-      body: "A new person turn" }).returning();
+      body: "A new person turn", metadata: { version: 1, sections: [],
+        inputOrigin: { kind: "human_session", userId, admittedRunId: person } } }).returning();
     const explicit = { previousRunId: second, commentId: message!.id };
     const context = { issueId, previousRunId: second, wakeReason: "issue_commented", wakeCommentId: message!.id };
     const input = { companyId, issueId, runId: person };
@@ -81,6 +82,16 @@ describe.skipIf(!support.supported)("fresh-continuation person-turn boundary", (
         actorId: f.userId, ...(automatic ? { automaticRetry: { sourceRunId: f.second } } : {}) } } });
     expect(await freshContinuationChain(db, f.input)).toEqual(automatic
       ? { rootRunId: f.root, attempts: 2 } : { rootRunId: f.person, attempts: 0 });
+  });
+
+  it.each(["missing_origin", "already_admitted", "agent_comment"])("%s cannot borrow reset authority from a user-labelled wake", async shape => {
+    const f = await fixture();
+    await f.wake("user", f.userId, true);
+    await db.update(issueComments).set(shape === "agent_comment" ? { createdByRunId: f.root }
+      : { metadata: shape === "missing_origin" ? null : { version: 1, sections: [],
+        inputOrigin: { kind: "human_session", userId: f.userId, admittedRunId: f.second } } })
+      .where(eq(issueComments.id, f.messageId));
+    expect(await freshContinuationChain(db, f.input)).toEqual({ rootRunId: f.root, attempts: 2 });
   });
 
   it("company/task scope, malformed parents and cyclic legacy lineage remain bounded", async () => {

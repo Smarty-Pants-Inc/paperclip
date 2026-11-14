@@ -1666,10 +1666,16 @@ records from before these markers existed, with company and task scope on every
 hop. It does not reset on restart or when the separate six-per-hour rolling
 budget expires. A genuinely admitted new person turn starts a new chain even
 when it retains `previousRunId` or `retryOfRunId` as execution provenance. The
-lineage stops at the admission owner's explicit-user authorization or a
-user-owned wake carrying that person's comment, not an arbitrary wake reason
-or a copied continuation marker. Automatic retries of that turn remain in its
-chain. Pending fallback records from older releases are invalidated before
+lineage stops only at a server-recorded person input bound to that exact
+admitted run. The comment writer records an authenticated human session's own
+message; board keys and plugin human attribution do not establish that origin.
+A relay requires the chat ingress owner's durable inbound message/delivery
+link. Admission binds an unconsumed input to its first run under the task lock.
+The lineage query validates that binding and excludes run-created comments on
+both wake and explicit-admission receipt paths. An actor label, member ID,
+reused input or copied continuation marker cannot reset the budget. Automatic
+retries of that turn remain in its chain. Legacy comments without recorded
+origin do not grant reset authority; a new signed-in message still can. Pending fallback records from older releases are invalidated before
 delivery if their source is permanently refused or they exceed the chain bound;
 invalidation starts no run
 and posts no additional note. If a fresh continuation fails in preparation with

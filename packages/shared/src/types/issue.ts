@@ -1247,6 +1247,12 @@ export interface IssueCommentMetadataSection {
 
 export interface IssueCommentMetadata {
   version: 1;
+  inputOrigin?: {
+    kind: "human_session" | "human_relay" | "board_key";
+    userId: string;
+    admittedRunId?: string;
+    sourceRunId?: string;
+  };
   chatMessage?: {
     sourceTaskId: string;
     sourceTaskIdentifier: string;

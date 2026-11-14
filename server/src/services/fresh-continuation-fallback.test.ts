@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { issueService } from "./issues.js";
 import { spawnSync } from "node:child_process";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -330,8 +331,8 @@ suite("fresh-continuation fallback", () => {
     const child = spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" });
     expect(child.status).toBe(0);
     await db.update(heartbeatRuns).set({ processPid: Number(child.stdout.trim()) }).where(eq(heartbeatRuns.id, second.id));
-    const [comment] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
-      body: "Please try again now; this is a new question." }).returning();
+    const comment = await issueService(db).addComment(f.issueId, "Please try again now; this is a new question.",
+      { userId }, { authenticatedUserSession: true });
     const admitted = await heartbeatService(db).wakeup(agentId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
       requestedByActorType: "user", requestedByActorId: userId, payload: { issueId: f.issueId, commentId: comment!.id },
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", wakeCommentId: comment!.id } });

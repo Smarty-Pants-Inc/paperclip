@@ -16055,6 +16055,7 @@ export function issueRoutes(
                 },
                 {
                   attachmentIds: commentAttachmentIds,
+                  authenticatedUserSession: req.actor.type === "board" && req.actor.source === "session" && !req.actor.runId,
                   clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
                   mirrorToSlack: actor.actorType === "user",
                   authorizationReason: issueMutationAuthorizationReason,
@@ -16669,6 +16670,7 @@ export function issueRoutes(
           },
           {
             authorizationReason: issueMutationAuthorizationReason,
+            authenticatedUserSession: req.actor.type === "board" && req.actor.source === "session" && !req.actor.runId,
             clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
             mirrorToSlack: actor.actorType === "user",
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
@@ -19869,6 +19871,8 @@ export function issueRoutes(
             eq(issueComments.clientRequestId, req.body.clientRequestId),
           ));
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
+            authenticatedUserSession: req.actor.source === "session" && !req.actor.runId,
+            boardKeyOrigin: req.actor.source === "board_key" ? { runId: req.actor.runId } : undefined,
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
           if (!existing) await logActivity(tx as unknown as Db, {
@@ -19925,7 +19929,8 @@ export function issueRoutes(
           eq(issueComments.authorUserId, req.actor.userId), eq(issueComments.clientRequestId, req.body.clientRequestId),
         ));
         if (accepted) {
-          const receipt = await svc.addComment(issue.id, req.body.body, { userId: req.actor.userId }, {
+          const receipt = await svc.addComment(issue.id, req.body.body, { userId: req.actor.userId, runId: req.actor.runId }, {
+            authenticatedUserSession: req.actor.source === "session" && !req.actor.runId,
             clientRequestId: req.body.clientRequestId, attachmentIds: req.body.attachmentIds,
             authorType: "user",
           });
@@ -20295,6 +20300,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
+          authenticatedUserSession: req.actor.type === "board" && req.actor.source === "session" && !req.actor.runId,
           attachmentIds: req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
@@ -20408,6 +20414,7 @@ export function issueRoutes(
             (actor.actorType === "agent" ? "agent" : "user"),
           presentation: commentPresentation,
           metadata: req.body.metadata ?? null,
+          authenticatedUserSession: req.actor.type === "board" && req.actor.source === "session" && !req.actor.runId,
           attachmentIds: req.body.attachmentIds,
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",

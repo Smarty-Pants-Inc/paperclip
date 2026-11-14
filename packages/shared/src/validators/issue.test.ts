@@ -16,6 +16,14 @@ import {
 import { createAgentSchema } from "./agent.js";
 
 describe("issue validators", () => {
+  it("preserves server-owned input provenance without requiring visible metadata rows", () => {
+    const inputOrigin = { kind: "human_session", userId: "person", admittedRunId: "037152ed-15bb-4b25-987f-cda606d8aab4" };
+    expect(issueCommentMetadataSchema.parse({ version: 1, sections: [], inputOrigin }).inputOrigin).toEqual(inputOrigin);
+    expect(issueCommentMetadataSchema.safeParse({ version: 1, sections: [] }).success).toBe(false);
+    for (const patch of [{ kind: "user" }, { userId: "" }, { admittedRunId: "not-a-run" }, { extraAuthority: true }]) {
+      expect(issueCommentMetadataSchema.safeParse({ version: 1, sections: [], inputOrigin: { ...inputOrigin, ...patch } }).success).toBe(false);
+    }
+  });
   it.each(["BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR", "PAPERCLIP_GITHUB_LAUNCHER_DIR"])("rejects task-owned managed shell selector %s", key => {
     for (const name of [key, key.toLowerCase()]) {
       const overrides = {adapterConfig:{env:{[name]:"/workspace/startup"}}};

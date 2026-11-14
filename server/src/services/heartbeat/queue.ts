@@ -1,3 +1,4 @@
+import { capturePersonInputOrigin } from "../person-input-origin.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -5201,6 +5202,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .returning()
             .then((rows) => rows[0]);
 
+          await capturePersonInputOrigin(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, runId: newRun.id,
+            actorType: opts.requestedByActorType, actorId: opts.requestedByActorId,
+            commentIds: [...new Set([...adoptedCommentIds, ...(wakeCommentId ? [wakeCommentId] : [])])],
+          });
           if (ownsReconstructionContinuation) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
               continuationDelivery: "delivered", continuationRunId: newRun.id,

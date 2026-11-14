@@ -1,5 +1,6 @@
 import { sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { personCommentOriginSql } from "./person-input-origin.js";
 
 type FreshContinuationChainInput = { companyId: string; issueId: string; runId: string };
 
@@ -10,20 +11,25 @@ function automaticChainParent(alias: string, issueId: string): SQL {
     where wake.company_id = ${run}.company_id and wake.id = ${run}.wakeup_request_id
       and wake.run_id = ${run}.id and wake.requested_by_actor_type = 'user'
       and wake.requested_by_actor_id is not null
-      and (jsonb_typeof(${run}.context_snapshot->'explicitUserContinuation') = 'object'
-        or exists (select 1 from issue_comments message
-          where message.company_id = ${run}.company_id and message.issue_id = ${issueId}
-            and message.author_type = 'user' and message.author_user_id = wake.requested_by_actor_id
-            and message.created_by_run_id is null
-            and (message.id::text = ${run}.context_snapshot->>'wakeCommentId'
-              or message.id::text = ${run}.context_snapshot->>'commentId'
-              or coalesce(${run}.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? message.id::text))))
+      and exists (select 1 from issue_comments message
+        where message.company_id = ${run}.company_id and message.issue_id = ${issueId}
+          and message.author_user_id = wake.requested_by_actor_id and ${personCommentOriginSql("message")}
+          and message.metadata#>>'{inputOrigin,admittedRunId}' = ${run}.id::text
+          and (message.id::text = ${run}.context_snapshot->>'wakeCommentId'
+            or message.id::text = ${run}.context_snapshot->>'commentId'
+            or coalesce(${run}.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? message.id::text)))
     or exists (select 1 from issue_recovery_actions receipt
       where receipt.company_id = ${run}.company_id and receipt.source_issue_id = ${issueId}
         and receipt.status = 'resolved'
         and receipt.evidence#>>'{explicitUserContinuation,runId}' = ${run}.id::text
         and nullif(receipt.evidence#>>'{explicitUserContinuation,actorId}', '') is not null
-        and receipt.evidence#>'{explicitUserContinuation,automaticRetry}' is null)
+        and receipt.evidence#>'{explicitUserContinuation,automaticRetry}' is null
+        and exists (select 1 from issue_comments message
+          where message.company_id = ${run}.company_id and message.issue_id = ${issueId}
+            and message.id::text = receipt.evidence#>>'{explicitUserContinuation,commentId}'
+            and message.author_user_id = receipt.evidence#>>'{explicitUserContinuation,actorId}'
+            and ${personCommentOriginSql("message")}
+            and message.metadata#>>'{inputOrigin,admittedRunId}' = ${run}.id::text))
     then null else coalesce(${run}.retry_of_run_id::text, nullif(${run}.context_snapshot->>'previousRunId', ''),
       nullif(${run}.context_snapshot->>'retryOfRunId', '')) end`;
 }
