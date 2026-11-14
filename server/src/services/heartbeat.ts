@@ -3935,6 +3935,7 @@ export function heartbeatService(
             .where(eq(nativeRunFinalizations.runId, run.id))
             .limit(1)
             .then((rows) => rows[0] ?? null);
+          const retryScheduled = !err.terminalFailure && coordinator?.nextAttemptAt != null;
           await appendRunEvent(run, {
             eventType: "lifecycle",
             stream: "system",
@@ -3943,12 +3944,14 @@ export function heartbeatService(
               ? err.reasonCode === "workspace_sync_out_failed"
                   ? "native result is durable; automatic workspace copy-back retries stopped and saved work is retained for export repair"
                   : "native result is durable, but the sandbox containing unexported workspace changes is unrecoverable"
-              : "native result is durable; workspace copy-back will retry without another provider turn",
+              : retryScheduled
+                ? "native result is durable; workspace copy-back will retry without another provider turn"
+                : "native result is durable; workspace copy-back is owned by another finalizer, with no provider turn scheduled",
             payload: {
               attempt: coordinator?.attempt ?? null,
               nextAttemptAt: coordinator?.nextAttemptAt?.toISOString() ?? null,
               fallbackSuppressed: true,
-              retryReasonCode: err.reasonCode,
+              ...(retryScheduled ? { retryReasonCode: err.reasonCode } : {}),
             },
           }).catch(() => undefined);
           if (err.terminalFailure) {

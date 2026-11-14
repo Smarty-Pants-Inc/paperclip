@@ -9,8 +9,10 @@ import { setTimeout as delay } from "node:timers/promises";
 import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunResults, issueRecoveryActions, workspaceOperations, type Db } from "@paperclipai/db";
+  nativeRunResults, issueRecoveryActions, issueComments, workspaceOperations, type Db } from "@paperclipai/db";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { releaseSettledNativeRunProcess } from "../services/native-local-process-stop.js";
+import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-lifecycle.js";
 import { issueService } from "../services/issues.js";
 import { nativeWorkspaceFinalizationWork } from "../services/native-runtime/native-workspace-finalization-work.js";
 import { attemptNativeWorkspaceFinalization } from "../services/native-runtime/native-workspace-finalizer.js";
@@ -37,7 +39,9 @@ describe("workspace finalization scheduled lifecycle", () => {
   const companyId = randomUUID(), agentId = randomUUID();
   let admitted = true;
   const errors: unknown[] = [];
-  const settled = vi.fn(async () => {});
+  const settled = vi.fn(async (input: { runId: string }) => {
+    await releaseSettledNativeRunProcess(db, input.runId);
+  });
   beforeAll(async () => {
     root = await mkdtemp(join(tmpdir(), "workspace-finalization-work-"));
     process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = join(root, "logs");
@@ -62,10 +66,10 @@ describe("workspace finalization scheduled lifecycle", () => {
     if (priorLogs === undefined) delete process.env.WORKSPACE_OPERATION_LOG_BASE_PATH;
     else process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = priorLogs;
   });
-  async function start() {
+  async function start(attempt?: typeof attemptNativeWorkspaceFinalization) {
     coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => admitted, canReconcile: () => admitted,
       onError: error => errors.push(error) });
-    worker = nativeWorkspaceFinalizationWork(db, { onWorkspaceSettled: settled }).register(coordinator, () => admitted);
+    worker = nativeWorkspaceFinalizationWork(db, { attempt, onWorkspaceSettled: settled }).register(coordinator, () => admitted);
     await worker.ready;
   }
   async function flush() {
@@ -415,8 +419,17 @@ describe("workspace finalization scheduled lifecycle", () => {
     await vi.advanceTimersByTimeAsync(Math.max(0, failed.nextAttemptAt!.getTime() - Date.now())); await flush();
     expect(await successful(binding.runId)).toHaveLength(1); await quiet();
   });
-  it("names the last redacted copy-back cause on the run and coordinator after retries stop", async () => {
+  it("schedules retries for a committed result, then releases the runner and posts one lost-copyback notice", async () => {
     const binding = await seed(); await complete(binding);
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { sessionCheckpoint: { providerSessionId: "workspace-copyback-test" } } })
+      .where(eq(heartbeatRuns.id, binding.runId));
+    await persistHeartbeatRunProcessMetadata(db, binding.runId, { pid: 2_000_000_000, processGroupId: 2_000_000_000,
+      startedAt: new Date(Date.now() - 5_000).toISOString(), targetKind: "local" });
+    // A concurrent status commit can win after the result is accepted but
+    // before the live copy-back failure is recorded. The result remains durable;
+    // that must not suppress the independent workspace retry deadline.
+    await db.update(nativeRunFinalizations).set({ phase: "committed" })
+      .where(eq(nativeRunFinalizations.runId, binding.runId));
     const cause = "remote_workspace_operation_failed: operation=archive_helper transport=sandbox_lease_inactive";
     // The last attempt timed out; the server-built timeout text must also reach the run.
     const timeout = "remote_workspace_operation_timed_out: capture (configured timeout 300000ms)";
@@ -428,19 +441,44 @@ describe("workspace finalization scheduled lifecycle", () => {
         metadata: { workspaceSync: { code: "workspace_sync_out_failed", cause: causes[attempt.mock.calls.length - 1] } } }).returning();
       return { kind: "completed", operation } as const;
     });
-    const service = nativeWorkspaceFinalizationWork(db, { attempt, onWorkspaceSettled: settled });
+    await start(attempt);
     for (let index = 0; index < 3; index++) {
-      const [entry] = await service.load({ companyId, runId: binding.runId });
-      if (!entry) break;
-      await vi.advanceTimersByTimeAsync(Math.max(0, entry.dueAt - Date.now()));
-      await service.check(entry);
+      await vi.waitFor(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(attempt).toHaveBeenCalledTimes(index + 1);
+        const [row] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, binding.runId));
+        expect(row.failureDetail?.workspaceFinalizeAttempt).toBe(index + 1);
+        if (index < 2) expect(row).toMatchObject({ phase: "retryable_failure", failureCode: "native_workspace_sync_out_failed",
+          nextAttemptAt: expect.any(Date) });
+        else expect(row).toMatchObject({ phase: "terminal_failure", failureCode: "native_workspace_sync_out_retry_exhausted",
+          nextAttemptAt: null, failureDetail: { workspaceCopyback: { state: "lost", attempts: 3 } } });
+      }, { timeout: 15_000 });
       const [coordinatorRow] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, binding.runId));
+      if (index < 2) {
+        const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, binding.runId));
+        expect(runRow.resultJson).toMatchObject({ failureCode: "native_workspace_sync_out_failed",
+          nextAttemptAt: expect.any(String) });
+        expect(coordinatorRow).toMatchObject({ nextAttemptAt: expect.any(Date) });
+        await vi.waitFor(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+          expect(coordinator!.nextWakeAt()).toBe(coordinatorRow.nextAttemptAt!.getTime());
+        }, { timeout: 15_000 });
+        await vi.advanceTimersByTimeAsync(Math.max(0, coordinatorRow.nextAttemptAt!.getTime() - Date.now()));
+      }
       // A cause outside the fixed grammar never reaches the run.
       expect(coordinatorRow.failureDetail?.failureCause ?? null).toBe([cause, null, timeout][index]);
     }
+    await flush();
     expect(attempt).toHaveBeenCalledTimes(3);
+    expect(settled).toHaveBeenCalledExactlyOnceWith({ runId: binding.runId, companyId, agentId, succeeded: false });
+    const notice = await db.select().from(issueComments).where(and(eq(issueComments.issueId, binding.issueId),
+      eq(issueComments.createdByRunId, binding.runId), eq(issueComments.authorType, "system")));
+    expect(notice).toHaveLength(1);
+    expect(notice[0]?.body).toMatch(/workspace copy-back was lost/i);
+    expect(notice[0]?.body).toContain("result is saved");
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, binding.runId));
     expect(run).toMatchObject({ status: "failed", errorCode: "native_workspace_sync_out_retry_exhausted",
+      processPid: null, processGroupId: null, processStartedAt: null,
       resultJson: expect.objectContaining({ failureCause: timeout }) });
     expect(run.error).toContain(`Last cause: ${timeout}`);
     expect(JSON.stringify(run)).not.toContain("SYNTHETIC");
