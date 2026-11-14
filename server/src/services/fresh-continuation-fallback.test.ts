@@ -569,7 +569,7 @@ suite("fresh-continuation fallback", () => {
     for (const now of [new Date(), new Date(Date.now() + 24 * 3600_000)]) expect(await ensureFreshContinuation(db, {
       companyId, runId: f.runId, trigger: "held_recovery", now })).toMatchObject({ kind: "exact_recovery_pending" });
     const beforeNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(beforeNotes).toMatchObject([{ authorType: "system", body: expect.stringContaining(shape === "live-peer"
+    expect(beforeNotes).toMatchObject([{ authorType: "system", body: expect.stringContaining(shape === "live-peer" || shape === "bad-time"
       ? "cannot confirm that the earlier attempt stopped" : "stopping the earlier attempt before starting fresh") }]);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
       .not.toHaveProperty("freshContinuation");
