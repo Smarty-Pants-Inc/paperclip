@@ -122,6 +122,28 @@ describe("review-path recovery", () => {
     },
   );
 
+  it("uses the review-path owner label instead of inheriting assigned-work attribution", () => {
+    const decision = decideIssueReviewPathRecovery({
+      issueId: "issue-1",
+      sourceRunId: "run-1",
+      assigneeAgentId: "agent-1",
+      contextSnapshot: {
+        source: "issue.assigned_work_invariant",
+        wakeCommentId: "person-comment-1",
+        previousRunId: "run-0",
+      },
+      reviewAttention: stalled,
+      existingWake: false,
+    });
+
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.contextSnapshot.source).toBe("heartbeat.review_path_disposition");
+    expect(decision.contextSnapshot).not.toHaveProperty("wakeCommentIds");
+    expect(decision.contextSnapshot).not.toHaveProperty("wakeCommentId");
+    expect(decision.contextSnapshot).not.toHaveProperty("commentId");
+  });
+
   it.each(["issue.comment", "chat:agentmail", "chat:agentmail:recovery"])(
     "does not carry a chat batch for unsupported source %s",
     (source) => {
