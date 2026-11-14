@@ -348,6 +348,25 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${message}`);
   });
 
+  // RFL b2 F1, the NAMED LIMIT (smarty-dev#20619, durable transition records): the as-of-reset reading takes a
+  // finalization phase as decided by the run's native_phase_updated_at. A writer that re-stamps an UNCHANGED terminal
+  // phase after the reset reads as "still being decided then", so a note already due before the reset is suppressed.
+  // Benign direction (only a suppression for a message the person reset away from, never a false "safe"); this row
+  // states the exact rule and flips when #20619 gives a true transition record.
+  it.fails("RFL b2 F1 limit (#20619): a terminal phase re-stamped unchanged AFTER '/new' must not hide a note already due before it", async () => {
+    const f = await fixture({ status: "in_review" });
+    const message = await f.message("Please continue.");
+    const runId = await f.run({ commentId: message, status: "failed", errorCode: "adapter_failed", error: "native_session_lease_lost" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase: "terminal_failure" });
+    await db.update(heartbeatRuns).set({ nativePhase: "terminal_failure", nativePhaseUpdatedAt: run!.finishedAt }).where(eq(heartbeatRuns.id, runId));
+    await f.message("/new", 60_000);
+    // A later writer stamps the same terminal phase again, after the reset.
+    await db.update(heartbeatRuns).set({ nativePhase: "terminal_failure", nativePhaseUpdatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await f.sweep(); await f.sweep();
+    expect(await f.visible(), "the note was due 15 s after the run ended, long before the reset").toHaveLength(1);
+  });
+
   it("conversation clause: an ANSWERED waiting chat is a valid wait (no notice); an UNANSWERED one is not (one notice)", async () => {
     const answered = await fixture({ status: "in_review" });
     await answered.reply(await answered.run({ commentId: await answered.message(), status: "succeeded" }));

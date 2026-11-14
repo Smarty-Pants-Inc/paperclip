@@ -939,7 +939,7 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
     errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson,
     contextSnapshot: heartbeatRuns.contextSnapshot, finishedAt: heartbeatRuns.finishedAt,
     updatedAt: heartbeatRuns.updatedAt, createdAt: heartbeatRuns.createdAt, issueCommentStatus: heartbeatRuns.issueCommentStatus,
-    retryOfRunId: heartbeatRuns.retryOfRunId, startedAt: heartbeatRuns.startedAt,
+    retryOfRunId: heartbeatRuns.retryOfRunId, startedAt: heartbeatRuns.startedAt, nativePhaseUpdatedAt: heartbeatRuns.nativePhaseUpdatedAt,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun,
     gt(heartbeatRuns.createdAt, new Date(message.createdAt.getTime() - 60 * 60_000)), ...existedBy(heartbeatRuns.createdAt)))
@@ -1144,14 +1144,26 @@ async function decideForMessage(q: Db, issue: DecisionIssue, message: { id: stri
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
     }
-    // As of a past instant this run had already ENDED (asOfRun): its terminal
-    // moment is the run's own finished_at, which the finalizer sets with the
-    // terminal verdict (native-run-finalizer.ts terminalFinalizationRunPatch).
-    // The finalization row's updated_at is NOT a phase-transition time (lease
-    // and history maintenance touch it, RFL B1 F1), so the phase is read as it
-    // is; a scheduled resume keeps its durable nextAttemptAt.
-    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+    // As of a past instant (a reset), the run's finalization phase is the one
+    // DECIDED by then. The transition evidence is the run's own
+    // native_phase_updated_at, written with native_phase whenever the phase is
+    // decided (the finalizer's failure transaction, the reconcilers, restart
+    // recovery), never by lease or history maintenance on the finalization row,
+    // whose updated_at is not a transition time (RFL B1 F1). Stamped by then
+    // (or never): the current phase held then. Stamped later: the phase was
+    // still being decided then, so it reads as pending (RFL b2 F1: a retry
+    // pending at the reset that ends later stays pending; run.finished_at can
+    // predate the verdict, terminalFinalizationRunPatch keeps an earlier one).
+    // NAMED LIMIT (smarty-dev#20619, durable transition records): a writer that
+    // re-stamps an UNCHANGED terminal phase on an ended run after the reset
+    // (explicit-native-continuation.ts:712, native-failed-run-owner-release.ts
+    // :315, native-finalization-reconciler.ts:274/349) also reads as pending.
+    // That direction is benign: it can only SUPPRESS a note for a message the
+    // person already reset away from; it can never post a false "safe".
+    const [recorded] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
+    const decidedLater = asOf && "nativePhaseUpdatedAt" in run && run.nativePhaseUpdatedAt instanceof Date && run.nativePhaseUpdatedAt > now;
+    const coordinator = recorded && decidedLater ? { ...recorded, phase: NATIVE_PENDING_PHASES[0]! } : recorded;
     if (coordinator && !boardHold) {
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
         const wait = await bounded(now.getTime() + 30_000);
