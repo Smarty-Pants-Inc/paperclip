@@ -73,7 +73,7 @@ async function faux(protocol: "chat" | "messages" = "chat", rejectForSize = fals
     req.on("end", () => {
       if (req.headers.authorization !== "Bearer upstream-binding-canary") { res.writeHead(401).end(); return; }
       requests.push(JSON.parse(body)); const n = requests.length;
-      if (rejectForSize) {
+      if (rejectForSize && n === 1) {
         res.writeHead(413, { "content-type": "application/json" }).end(JSON.stringify({ type: "error", error: { type: "request_too_large", message: `Fixture request too large: ${requests.at(-1)!.tools.length} tools; catalog not trimmed` } }));
         return;
       }
@@ -102,7 +102,7 @@ async function fixture(options: Partial<PiRpcDriverOptions> = {}, fault?: "stale
   const upstream = await faux(); const transport = new FakeTransport(); const ipc: PiBindCommand[] = [];
   transport.thinkingLevel = options.piRpcThinkingLevel ?? "off";
   let launch!: PiRpcTransportOptions;
-  const driver = new PiRpcDriver({ model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), systemInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 }, startupTimeoutMs: 120,
+  const driver = new PiRpcDriver({ model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), systemInstructions: "initial π", dynamicTools: [], runtimeContext: { revision: 1 }, startupTimeoutMs: 120,
     ...options, environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent"), ...options.environment },
     transportFactory: opts => {
       launch = opts;
@@ -379,7 +379,9 @@ describe("resident Pi model binding", () => {
 
   it("boots a 200 KiB binding through a private file instead of an E2BIG environment entry", async () => {
     const large = { ...tool("large"), inputSchema: { type: "object", properties: { body: { type: "string", description: "x".repeat(200 * 1024) } } } };
-    const f = await fixture({ dynamicTools: [large] });
+    // Messages retains the initial-file fast path; Chat now registers only
+    // after measured inventory, over the independently bounded bind frame.
+    const f = await fixture({ dynamicTools: [large], environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" } });
     const path = f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE;
     expect(path).toBe(join(dirname(f.launch.env!.PAPERCLIP_PI_BIND_SOCKET!), "initial.json"));
     expect(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL).toBeUndefined();
@@ -397,7 +399,7 @@ describe("resident Pi model binding", () => {
     const handler = vi.fn(async (_call: { tool: string }) => ({ content: [{ type: "text", text: "created" }], details: {} }));
     const f = await fixture({ dynamicTools: [original, { name: "empty", description: "", inputSchema: { type: "object" } },
       { name: "long", description: "😀".repeat(3000), inputSchema: { type: "object" } },
-      { name: "bad", description: "bad", inputSchema: null }], dynamicToolHandler: handler });
+      { name: "bad", description: "bad", inputSchema: null }], dynamicToolHandler: handler, environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" } });
     const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(validateBindingConfig(initial)).toBe(true);
     expect(initial.tools).toHaveLength(3);
@@ -480,8 +482,10 @@ describe("resident Pi model binding", () => {
     const tools = [tool("request_human_input"), tool("search_api"), tool("read_task_document"), tool("app_one")];
     const f = await fixture({ dynamicTools: tools }, undefined, false, ["bash", "subagent"]);
     const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
-    expect(initial.tools).toEqual(tools);
-    expect(f.ipc.some(command => command.type === "bind")).toBe(false);
+    expect(initial.tools).toEqual([]); // inventory-only Chat bootstrap
+    const bind = f.ipc.find(command => command.type === "bind") as Extract<PiBindCommand, { type: "bind" }>;
+    expect(bind.tools).toEqual(tools); // fitting DELIVERED catalog is unchanged
+    expect(f.ipc.map(command => command.type)).toEqual(["settle", "bind", "begin_turn"]);
     expect(initial.instructions).not.toContain("tool_delivery_notice");
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     expect(f.events.filter(event => String(event.payload.code).startsWith("pi_dynamic_tool"))).toEqual([]);
@@ -507,7 +511,7 @@ describe("resident Pi model binding", () => {
   it("uses stable distinct aliases independent of catalog order and isolates unserializable schemas", async () => {
     const circular: Record<string, unknown> = {}; circular.self = circular;
     const tools = [tool("issues.create"), tool("issues_create"), tool("9/other"), { ...tool("circular"), inputSchema: circular }];
-    const f = await fixture({ dynamicTools: tools });
+    const f = await fixture({ dynamicTools: tools, environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" } });
     const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     expect(initial.tools).toHaveLength(3);
     expect(new Set(initial.tools.map((entry: { name: string }) => entry.name)).size).toBe(3);
@@ -554,7 +558,7 @@ describe("resident Pi model binding", () => {
     const bind = f.ipc.find(command => command.type === "bind");
     expect(bind).toMatchObject({ type: "bind", thinkingLevel: level, provider: { models: [expected] } });
   });
-  it("bootstraps nonsecret INITIAL + merged models before spawn; turn 1 has zero bind/begin IPC", async () => {
+  it("bootstraps nonsecret INITIAL + merged models before spawn; an empty Chat catalog needs no bind/begin IPC", async () => {
     const f = await fixture();
     expect(f.launch.args).not.toContain("--no-extensions"); expect(f.launch.args).toContain("--extension");
     expect(f.launch.args).toContain("--append-system-prompt");
@@ -562,7 +566,7 @@ describe("resident Pi model binding", () => {
     expect((await stat(instructionFile)).mode & 0o777).toBe(0o600);
     expect(await readFile(instructionFile, "utf8")).toContain("initial π");
     const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
-    expect(initial).toMatchObject({ schema: 1, sessionId: "host-session", epoch: 1, runId: "run-a", model: "paperclip/faux", thinkingLevel: "off", tools: [tool("old_tool")] });
+    expect(initial).toMatchObject({ schema: 1, sessionId: "host-session", epoch: 1, runId: "run-a", model: "paperclip/faux", thinkingLevel: "off", tools: [] });
     expect(initial.instructions).toContain("initial π"); expect(initial.instructions).toContain('"revision":1');
     expect(JSON.stringify(initial)).not.toContain("upstream-binding-canary");
     expect(f.launch.env!.PAPERCLIP_AI_PROVIDER_KEY).toBeUndefined();
@@ -573,7 +577,7 @@ describe("resident Pi model binding", () => {
     await finish(f);
   });
   it("keeps INITIAL for initial/same-context attach and post-claim admission, without bind/begin IPC", async () => {
-    const f = await fixture(); const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+    const f = await fixture({ environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" }, dynamicTools: [tool("old_tool")] }); const initial = JSON.parse(await readFile(f.launch.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
     await f.session.attachRun({ runId: "run-a", baseInstructions: "initial π", dynamicTools: [tool("old_tool")], runtimeContext: { revision: 1 } });
     await f.session.revalidateAfterClaim();
     expect((await f.session.snapshot()).binding).toMatchObject({ epoch: 1, preparedTurnId: initial.turnId });
@@ -633,8 +637,20 @@ describe("resident Pi model binding", () => {
     await expect(f.session.attachRun({ runId: "run-b" })).rejects.toThrow(/receipt/i);
     expect(f.transport.commands.filter(command => command === "prompt")).toHaveLength(1); expect(await revoked((f.ipc[0] as any).provider)).toBe(true);
   });
+  it.each(["live", "wrong-epoch", "wrong-run", "wrong-turn", "foreign", "wrong-api"])("accepts only a live owned final-request limit receipt: %s", async kind => {
+    const f = await fixture(); const turn = await f.session.startTurn({ message: { role: "user", text: "one" } });
+    const origin = { epoch: kind === "wrong-epoch" ? 2 : 1, runId: kind === "wrong-run" ? "old-run" : "run-a", turnId: kind === "wrong-turn" ? "old-turn" : turn.turnId };
+    f.transport.send({ type: "agent_start" });
+    f.transport.send({ type: "entry_appended", entry: { type: "custom", customType: kind === "foreign" ? "foreign" : "paperclip.tool-limit.v1", data: { origin, api: kind === "wrong-api" ? "anthropic-messages" : "openai-completions", cap: 128, toolCount: 129, privatePayload: "PRIVATE_PAYLOAD_CANARY" } } });
+    f.transport.send({ type: "agent_settled", aborted: true });
+    const expected = kind === "live" ? "turn.failed" : "turn.cancelled";
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === expected)).toBe(true));
+    if (kind === "live") expect(f.events.at(-1)).toMatchObject({ eventType: "turn.failed", payload: { error: { code: "pi_tool_limit_exceeded", message: expect.stringContaining("129 tools") } } });
+    expect(JSON.stringify(f.events)).not.toContain("PRIVATE_PAYLOAD_CANARY");
+    expect(f.events.filter(event => ["turn.failed", "turn.cancelled"].includes(event.eventType))).toHaveLength(1);
+  });
   it("refuses unannounced semantic callbacks and cancels anonymous UI with the exact native ID", async () => {
-    const handler = vi.fn(); const f = await fixture({ dynamicToolHandler: handler });
+    const handler = vi.fn(); const f = await fixture({ dynamicToolHandler: handler, dynamicTools: [tool("old_tool")], environment: { PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages" } });
     await f.session.startTurn({ message: { role: "user", text: "one" } });
     f.transport.send({ type: "extension_ui_request", id: "old-ui", method: "confirm", title: "stale" });
     f.transport.send({ type: "extension_ui_request", id: 0, method: "input", title: "anonymous" });
@@ -688,13 +704,61 @@ real("real Pi 1.5.2 resident binding", () => {
       environment: { ...upstream.environment, PI_CODING_AGENT_DIR: join(root, "agent") }, shutdownTimeoutMs: 1000,
     }).openSession({ runId: "size-proof", normalizedSessionId: "size-native", workingDirectory: workspace }) as PiRpcHarnessSession;
     sessions.push(session); const iterator = session.events()[Symbol.asyncIterator](); await session.startTurn({ message: { role: "user", text: "Say hello" } });
-    let terminal: PrpEvent;
-    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) { terminal = next.value; break; } }
+    let terminal: PrpEvent; const firstEvents: PrpEvent[] = [];
+    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); firstEvents.push(next.value); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) { terminal = next.value; break; } }
     expect(terminal.eventType).toBe("turn.failed");
+    expect(terminal.payload).toMatchObject({ error: { code: "pi_provider_error", message: expect.stringContaining("reduce this agent's tools or ask the board") } });
+    expect(firstEvents.filter(event => /reduce this agent's tools or ask the board/i.test(JSON.stringify(event.payload)))).toHaveLength(1);
     expect(JSON.stringify(terminal.payload)).toContain("Fixture request too large");
     expect(upstream.requests).toHaveLength(1);
     expect(upstream.requests[0]!.tools.length).toBeGreaterThan(151);
     expect(upstream.requests[0]!.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(d981ToolNames));
+    const nativeId = session.ids().providerSessionId;
+    await session.attachRun({ runId: "size-proof-next" });
+    await session.startTurn({ message: { role: "user", text: "Try the next message with the same catalog" } });
+    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) { expect(next.value.eventType).toBe("turn.completed"); break; } }
+    expect(session.ids().providerSessionId).toBe(nativeId);
+    expect(upstream.requests).toHaveLength(2);
+    expect(upstream.requests[1]!.tools).toHaveLength(upstream.requests[0]!.tools.length);
+    expect(upstream.requests[1]!.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(d981ToolNames));
+  }, 60_000);
+  it("preserves the owned late-tool limit cause as a failed turn before abort, with zero HTTP requests", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-toolcap-late-")); const workspace = join(root, "workspace"); await mkdir(workspace);
+    const agent = join(root, "agent"); await mkdir(join(agent, "extensions"), { recursive: true });
+    await writeFile(join(agent, "extensions", "late-tool.ts"), `export default function(pi) {
+      pi.on("before_agent_start", () => {
+        pi.appendEntry("toolcap-test-inventory", { names: pi.getAllTools().map(tool => tool.name), active: pi.getActiveTools() });
+        pi.registerTool({ name: "addon_after_inventory", label: "Late addon", description: "Added after inventory", parameters: { type: "object", properties: {} }, execute: async () => ({ content: [{ type: "text", text: "ok" }] }) });
+        pi.setActiveTools([...pi.getActiveTools(), "addon_after_inventory"]);
+      });
+    }`);
+    const upstream = await faux(); const nativeEvents: PiRpcRecord[] = [];
+    const core = d981ToolNames.filter(name => !name.startsWith("app_"));
+    const tools = [...Array.from({ length: 200 }, (_, i) => tool(`app_${String(i).padStart(3, "0")}`)), ...core.map(name => ({ ...tool(name), paperclipToolSource: { kind: "core" } }))];
+    const session = await new PiRpcDriver({ command: process.env.PI_TEST_BINARY, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: join(root, "sessions"), dynamicTools: tools,
+      transportFactory: options => { const transport = new PiRpcTransport(options); const events = transport.events.bind(transport);
+        transport.events = () => ({ async *[Symbol.asyncIterator]() { for await (const event of events()) { nativeEvents.push(event); yield event; } } }); return transport; },
+      environment: { ...upstream.environment, PI_CODING_AGENT_DIR: agent }, shutdownTimeoutMs: 1000,
+    }).openSession({ runId: "late-proof", normalizedSessionId: "late-native", workingDirectory: workspace }) as PiRpcHarnessSession;
+    sessions.push(session); const iterator = session.events()[Symbol.asyncIterator](); const events: PrpEvent[] = [];
+    await session.startTurn({ message: { role: "user", text: "Say hello" } });
+    for (;;) { const next = await iterator.next(); if (next.done) throw new Error("stream ended"); events.push(next.value); if (["turn.failed", "turn.completed", "turn.cancelled"].includes(next.value.eventType)) break; }
+    expect(upstream.requests).toHaveLength(0);
+    expect(events.at(-1)).toMatchObject({ eventType: "turn.failed", payload: { error: { code: "pi_tool_limit_exceeded", message: expect.stringContaining("129 tools") } } });
+    expect(events.filter(event => /total tool cap 128 exceeded/.test(JSON.stringify(event.payload)))).toHaveLength(1);
+    expect(events.at(-1)!.payload.error).toMatchObject({ message: expect.stringContaining("ask the board") });
+    // The 137 omitted names must never even have been registered hidden during
+    // bootstrap: registration itself happens only after measured selection.
+    const inventory = nativeEvents.find(event => event.type === "entry_appended" && (event.entry as any)?.customType === "toolcap-test-inventory");
+    const registered = (inventory?.entry as any)?.data.names as string[];
+    // getAllTools also includes inactive built-in Pi tools. Count all dynamic
+    // definitions, not only active ones, and separately check the active budget.
+    expect(registered.filter(name => tools.some(tool => tool.name === name))).toHaveLength(124);
+    expect((inventory?.entry as any)?.data.active).toHaveLength(128);
+    expect(registered).toEqual(expect.arrayContaining(core));
+    expect(registered.filter(name => name.startsWith("app_"))).toHaveLength(63);
+    await writeFile(join(root, "late-guard-proof.json"), JSON.stringify({ requests: upstream.requests, events, nativeEvents }, null, 2));
+    console.log(`LATE_TOOLCAP_PROOF ${join(root, "late-guard-proof.json")}`);
   }, 60_000);
   it("runs three turns across two runs in one PID/session with refreshed instructions and tools, idle revoked", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-resident-real-")); const workspace = join(root, "workspace"); await mkdir(workspace);

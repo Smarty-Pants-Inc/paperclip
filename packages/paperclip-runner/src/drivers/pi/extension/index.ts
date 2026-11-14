@@ -9,6 +9,7 @@ import { installSubagentSeam, installUnboundChildParent } from "./subagents/seam
 import { piManagedModelRegistration } from "../pi-managed-model.js";
 import { isPiThinkingLevelAtMost } from "../pi-native-config.js";
 import { installPiPerformanceDiagnostics } from "../pi-performance-diagnostics.js";
+import { PI_TOOL_LIMIT_ENTRY, piToolLimitMessage } from "../pi-tool-limit-diagnostics.js";
 import {
   PI_BIND_ERROR, PI_BIND_MAX_FRAME_BYTES, PI_BIND_TIMEOUT_MS, PI_DYNAMIC_TOOL_LIMIT_BY_API, RunAuthority, bindContent, digest, dispatchPiToolCall,
   isDigest, sendPiToolRequest, stringList, validSocketPath, validateBindingConfig, validateOrigin,
@@ -192,7 +193,10 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
   function updateTools(candidate: PiBindingConfig, api?: PiBindProvider["api"]) {
     const wanted = new Map(candidate.tools.map(tool => [tool.name, tool]));
     const allNames = new Set([...registeredTools.keys(), ...wanted.keys()]);
-    if (allNames.size > 256) throw new Error(PI_BIND_ERROR);
+    // No external 256-name registration limit: Pi 1.5.2 docs/extensions.md
+    // (pi.registerTool) supports dynamic registration; loader.js stores tools in
+    // a Map. This was our own undocumented count guard (acb1858cef), not an API
+    // constraint. Keep the existing bounded private frames, not a guessed cap.
     const native = nativeTools().filter(name => !wanted.has(name));
     const cap = api === undefined ? undefined : PI_DYNAMIC_TOOL_LIMIT_BY_API[api];
     if (cap !== undefined && native.length + wanted.size > cap) throw new Error(`Pi ${api} total tool cap ${cap} exceeded: ${native.length} active native/extension + ${wanted.size} dynamic tools`);
@@ -406,8 +410,12 @@ export function installPiBindExtension(pi: PiBindApi, options: PiBindOptions) {
     if (cap === undefined) return;
     const tools = event.payload?.tools;
     if (Array.isArray(tools) && tools.length > cap) {
-      fence(); context.abort();
-      throw new Error(`Pi ${api} total tool cap ${cap} exceeded in provider request: ${tools.length} tools. Request refused; no tools were silently trimmed.`);
+      // Pi catches before_provider_request throws as extension_error and an
+      // abort alone looks like user cancellation. Publish the owned bounded
+      // cause on its supported custom-entry seam BEFORE revoking/aborting.
+      try { pi.appendEntry?.(PI_TOOL_LIMIT_ENTRY, { origin: running, api, cap, toolCount: tools.length }); }
+      finally { fence(); context.abort(); }
+      throw new Error(piToolLimitMessage(tools.length));
     }
   });
   pi.on("cache_warming_decision", () => ({ action: "stop" }));
