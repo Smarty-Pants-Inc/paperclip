@@ -15,7 +15,7 @@ import { prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-s
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { selectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
-import { createCapabilityRunnerdCodexTransport } from "../../../../packages/paperclip-runner/src/live/runnerd-codex-transport.js";
+import { createRunnerdCodexTransport as createCapabilityRunnerdCodexTransport } from "@paperclipai/paperclip-runner";
 
 vi.mock("../native-runtime/runtime-context.js", async original => ({
   ...await original<typeof import("../native-runtime/runtime-context.js")>(),
