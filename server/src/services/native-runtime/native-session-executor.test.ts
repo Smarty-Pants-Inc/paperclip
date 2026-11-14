@@ -525,6 +525,7 @@ import {
   shouldRestoreNativeHarnessBackupIntoSandbox,
   remoteProviderStateNeverOpened,
 } from "./native-session-executor.js";
+import { closeWarmNativeSessionForLease, warmNativeSessionLeaseCloseDecision } from "./native-session-executor.js";
 import { onNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 
 beforeEach(() => {
@@ -12484,6 +12485,82 @@ describe("native warm session supervision", () => {
       expect(close).toHaveBeenCalledOnce();
     } finally {
       sandboxStopped = false;
+      await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+    }
+  });
+
+  async function warmSandboxOwner(name: string, close: () => Promise<void>) {
+    const current = { ...execution,
+      binding: { ...execution.binding, runId: `${name}-run`, executionWorkspaceId: name },
+      session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 600_000 } },
+    } as NativeExecutionInputV1;
+    const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: name,
+      remoteCwd: `/tmp/${name}`, sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: name } };
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close });
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" },
+        turnId: name, normalizedSessionId: name, providerSessionId: name, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    await expect(executePaperclipNativeSession({ db: leaseDb(current), execution: current,
+      runnerInstanceId: name, runnerExecutionTarget: target })).resolves.toMatchObject({ exitCode: 0 });
+    return { current, lease: { leaseId: `${name}-lease`, companyId: current.binding.companyId,
+      runId: current.binding.runId, providerLeaseId: name } };
+  }
+
+  it("F5: a busy agent directory during a sweep-driven close is reported busy (no failure counted) and keeps the owner", async () => {
+    const name = "warm-sweep-close-directory-busy";
+    let busy = true;
+    const close = vi.fn(async () => { if (busy) throw new AgentDirectoryOperationBusyError(); });
+    const { lease } = await warmSandboxOwner(name, close);
+    try {
+      expect(await closeWarmNativeSessionForLease(lease)).toMatchObject({ outcome: "busy" });
+      expect(close).toHaveBeenCalledOnce();
+      // The owner stays registered, so the next sweep can close it.
+      expect(readNativeSessionIdleWork()).toBe("present");
+      busy = false;
+      expect(await closeWarmNativeSessionForLease(lease)).toMatchObject({ outcome: "closed" });
+      expect(close).toHaveBeenCalledTimes(2);
+      expect(await closeWarmNativeSessionForLease(lease)).toMatchObject({ outcome: "absent" });
+    } finally {
+      busy = false;
+      await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+    }
+  });
+
+  it("F5: any other close failure is reported failed and keeps the owner registered", async () => {
+    const name = "warm-sweep-close-fails";
+    const close = vi.fn<() => Promise<void>>(async () => { throw new Error("provider shutdown failed"); });
+    const { lease } = await warmSandboxOwner(name, close);
+    try {
+      expect(await closeWarmNativeSessionForLease(lease)).toMatchObject({ outcome: "failed" });
+      expect(readNativeSessionIdleWork()).toBe("present");
+    } finally {
+      close.mockResolvedValue(undefined);
+      await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
+    }
+  });
+
+  it("F6: a sweep never closes a Runner another owner holds (a successor run, or a released Runner)", async () => {
+    const name = "warm-sweep-close-not-ours";
+    const close = vi.fn(async () => undefined);
+    const { lease } = await warmSandboxOwner(name, close);
+    try {
+      // The lease of an earlier run on the same sandbox: the Runner now belongs to another run.
+      expect(await closeWarmNativeSessionForLease({ ...lease, runId: "an-earlier-run" })).toMatchObject({ outcome: "not_owned" });
+      expect(close).not.toHaveBeenCalled();
+      // Another sandbox: not this owner at all.
+      expect(await closeWarmNativeSessionForLease({ ...lease, providerLeaseId: "another-sandbox" })).toMatchObject({ outcome: "absent" });
+      expect(close).not.toHaveBeenCalled();
+      const entry = { companyId: lease.companyId, runId: lease.runId, providerLeaseId: lease.providerLeaseId, busy: false };
+      expect(warmNativeSessionLeaseCloseDecision(entry, lease)).toBe("close");
+      // A released Runner may be adopted by a successor, possibly in another server process.
+      expect(warmNativeSessionLeaseCloseDecision({ ...entry, released: true }, lease)).toBe("not_owned");
+      expect(warmNativeSessionLeaseCloseDecision({ ...entry, controllerDetachedForRestart: true }, lease)).toBe("not_owned");
+      expect(warmNativeSessionLeaseCloseDecision({ ...entry, busy: true }, lease)).toBe("busy");
+      expect(warmNativeSessionLeaseCloseDecision({ ...entry, preparingRunId: "successor" }, lease)).toBe("busy");
+      expect(warmNativeSessionLeaseCloseDecision({ ...entry, companyId: "other-company" }, lease)).toBe("other");
+    } finally {
       await closeWarmNativeSessionsForEnvironment({ environmentId: name, reason: "test cleanup" });
     }
   });
