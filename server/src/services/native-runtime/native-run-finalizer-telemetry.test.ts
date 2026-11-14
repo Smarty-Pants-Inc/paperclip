@@ -633,6 +633,10 @@ describeEmbeddedPostgres("native run finalizer / status decision committer — a
     const fixture = await seedNativeRun();
     await driveToCompleteResult(fixture, CONTROL_PLANE_CONFORMANCE_TERMINAL);
     await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    // A successful workspace-finalize operation is the durable evidence that
+    // fences a late failure; committed run projection alone is insufficient.
+    await db.insert(workspaceOperations).values({ companyId, heartbeatRunId: fixture.runId,
+      issueId: fixture.issueId, phase: "workspace_finalize", status: "succeeded" });
     const [before] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, fixture.runId));
     const late = await recordNativeFinalizationFailure({
       db, runId: fixture.runId, error: new Error("native_workspace_sync_out_failed"),

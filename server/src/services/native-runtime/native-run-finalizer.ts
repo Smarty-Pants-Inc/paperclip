@@ -509,13 +509,10 @@ async function recordRetryableFailure(input: {
         eq(workspaceOperations.phase, "workspace_finalize"),
       ));
       const exported = workspaceOperationsForRun.some((operation) => operation.status === "succeeded");
-      const failedExport = workspaceOperationsForRun.some((operation) => operation.status === "failed");
-      // A committed result can be reopened only by durable evidence of an
-      // unfinished copy-back. A late error without a failed export operation
-      // must not undo a successful finalization.
-      if (exported || (committedWorkspaceRetry && !failedExport
-        && record(currentRun.resultJson).finalizationPhase === "committed")
-        || record(currentRun.runnerProfileJson).nativeWorkspaceFinalizationOwner) return current;
+      // Only a successful operation for this run proves copy-back completed.
+      // Preflight failures can occur before an operation row exists, so their
+      // absence is not evidence that a committed result needs no retry.
+      if (exported) return current;
     }
     input = { ...input, coordinator: current, run: currentRun };
     const issue = await tx
@@ -766,7 +763,7 @@ async function recordRetryableFailure(input: {
       const attempts = workspaceFinalizeAttempt ?? 0;
       const attemptLabel = attempts === 1 ? "attempt" : "attempts";
       await issueService(tx as unknown as Db).addComment(input.coordinator.issueId,
-        `The result is saved. Workspace copy-back was lost after ${attempts} failed ${attemptLabel}; the original box was stopped and retained with the files. Retry workspace export from that exact box using the workspace export recovery action; no provider turn is needed.`,
+        `The result is saved. Workspace copy-back was lost after ${attempts} failed ${attemptLabel}; the original box is being stopped and retained with the files. Retry workspace export from that exact box using the workspace export recovery action; no provider turn is needed.`,
         { runId: input.run.id }, { authorType: "system" }, tx);
     }
     if (!supersededByNewerRun) {
