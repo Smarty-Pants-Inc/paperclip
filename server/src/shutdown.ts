@@ -8,7 +8,8 @@ type ShutdownLogger = {
 };
 
 export const PRE_DRAIN_SHUTDOWN_BUDGET_MS = 20_000;
-export const RESTART_WARM_CLOSE_CONCURRENCY = 5;
+// about 12 warm chats per stop at ~6 s each, fewer if earlier pre-drain steps use part of the 20 s budget
+export const RESTART_WARM_CLOSE_CONCURRENCY = 4;
 
 export type ShutdownStepResult<T> =
   | { outcome: "completed"; value: T; durationMs: number }

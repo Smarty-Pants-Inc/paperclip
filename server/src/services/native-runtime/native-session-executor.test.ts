@@ -14245,11 +14245,11 @@ describe("native warm session supervision", () => {
       expect(readNativeSessionIdleWork()).toBe("none");
     });
 
-    it("closes thirteen idle warm sessions within the restart drain window despite an individual failure", async () => {
+    it("closes twelve idle warm sessions within the restart drain window despite an individual failure", async () => {
       await closeIdleWarmNativeSessionsForRestart();
       const closeFns: ReturnType<typeof vi.fn<() => Promise<void>>>[] = [];
       const finishCloseDelays: Array<() => void> = [];
-      for (let index = 0; index < 14; index++) {
+      for (let index = 0; index < 12; index++) {
         const close = vi.fn(async () => {
           if (index === 4 && close.mock.calls.length > 1) return;
           await new Promise<void>(resolve => finishCloseDelays.push(resolve));
@@ -14265,8 +14265,8 @@ describe("native warm session supervision", () => {
       const flush = async () => { for (let index = 0; index < 10; index++) await Promise.resolve(); };
       try {
         closing = closeIdleWarmNativeSessionsForRestart().then(result => { completed = result; });
-        // Each release represents one 6-second close completing. Five workers
-        // drain fourteen closes in three waves (18 seconds), inside the 20-second budget.
+        // Each release represents one 6-second close completing. Four workers
+        // drain twelve closes in three waves (18 seconds), inside the 20-second budget.
         for (let tick = 0; tick < 3; tick++) {
           while (finishCloseDelays.length === 0) await flush();
           const pending = finishCloseDelays.splice(0);
@@ -14275,10 +14275,10 @@ describe("native warm session supervision", () => {
           await flush();
         }
         expect(completed).toEqual({
-          closed: 13, busy: 0, failed: 1,
+          closed: 11, busy: 0, failed: 1,
           failures: [expect.objectContaining({ reason: expect.stringContaining("fixture close failure") })],
         });
-        expect(closeFns.map(close => close.mock.calls.length)).toEqual(Array(14).fill(1));
+        expect(closeFns.map(close => close.mock.calls.length)).toEqual(Array(12).fill(1));
         expect(modeledElapsedMs).toBe(18_000);
         expect(modeledElapsedMs).toBeLessThan(20_000);
         await closing;
