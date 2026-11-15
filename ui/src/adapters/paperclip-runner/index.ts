@@ -869,4 +869,8 @@ export const paperclipRunnerUIAdapter: UIAdapterModule = {
   },
   ConfigFields: CodexLocalConfigFields,
   buildAdapterConfig: buildPaperclipRunnerConfig,
+  // Paperclip Runner reasoning (pi_rpc and the other providers) shows inline
+  // in task chat by default; a person's per-agent choice on the agent page
+  // still wins. Issue chat only reacts to "scrollLog", so it keeps its ticker.
+  transcriptPresentation: { liveReasoningView: "inline" },
 };
