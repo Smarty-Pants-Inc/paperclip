@@ -3287,15 +3287,25 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.update).not.toHaveBeenCalled();
       });
 
-      it("rejects request-changes from a stale run of the current reviewing agent", async () => {
-        const issue = reviewIssue([finalStage]);
+      it.each([
+        { holderStatus: "running", status: "done" },
+        { holderStatus: "running", status: "in_progress" },
+        { holderStatus: "queued", status: "done" },
+        { holderStatus: "queued", status: "in_progress" },
+        { holderStatus: null, status: "done" },
+        { holderStatus: null, status: "in_progress" },
+        { holderStatus: "failed", status: "done" },
+        { holderStatus: "failed", status: "in_progress" },
+      ])("handles a non-lock-holding reviewer requesting $status with a $holderStatus lock holder", async ({ holderStatus, status }) => {
+        const issue = { ...reviewIssue([finalStage]),
+          ...(holderStatus === null ? { executionRunId: null, checkoutRunId: null } : {}) };
         const staleRunId = "77777777-7777-4777-8777-777777777777";
         mockIssueService.getById.mockResolvedValue(issue);
         mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
         let lockHolderStopped = false;
         mockHeartbeatService.getRun.mockImplementation(async (id: string) =>
           id === staleRunId ? { ...nativeRun, id: staleRunId } : id === ownerRunId
-            ? { ...nativeRun, status: lockHolderStopped ? "cancelled" : "running" } : null);
+            ? { ...nativeRun, status: lockHolderStopped ? "cancelled" : holderStatus } : null);
         // Do not get a false 409 merely because the unrelated stop path fails.
         mockHeartbeatService.cancelRun.mockImplementation(async () => {
           lockHolderStopped = true;
@@ -3304,7 +3314,23 @@ describe("agent issue mutation checkout ownership", () => {
         const db = createRunContextDb({ issueId }, ownerAgentId, staleRunId);
 
         const res = await request(createApp({ ...runActor(), runId: staleRunId }, db)).patch(`/api/issues/${issueId}`)
-          .send({ status: "in_progress", comment: "Reviewer decision: request changes - stale run must not decide." });
+          .send({ status, comment: "Reviewer decision: verified the current review stage." });
+
+        if (holderStatus === null || holderStatus === "failed") {
+          // c2's ordinary policy path: without a live owner there is no run
+          // whose execution lock needs protection, so apply the decision now.
+          expect(res.status, JSON.stringify(res.body)).toBe(200);
+          expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status,
+            ...(status === "in_progress" ? { assigneeAgentId: peerAgentId } : {}) });
+          expect(res.body.status).toBe(status);
+          expect(res.body.executionState).toMatchObject({
+            lastDecisionOutcome: status === "done" ? "approved" : "changes_requested",
+          });
+          expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
+          expect(db.insert).toHaveBeenCalled();
+          expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+          return;
+        }
 
         expect(res.status, JSON.stringify(res.body)).toBe(409);
         expect(res.body.details).toMatchObject({ code: "native_review_decision_run_lock", actorRunId: staleRunId,
