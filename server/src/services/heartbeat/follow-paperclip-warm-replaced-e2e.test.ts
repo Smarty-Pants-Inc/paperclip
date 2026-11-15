@@ -19,7 +19,13 @@
  * The unfinished-goal control lives in the Pi row file and in D-B5's policy
  * equality rows: with the fake provider's active goal the Codex opening turn
  * never settles in this fixture (observed: 20 s turn timeout on S1).
- * The governed-wait row (prior 'yielded' + response_wake) rides with D-B4.
+ * (G)  governed wait, warm (prior 'yielded' + response_wake; the real selector
+ *      gives 'allow_replacement_after_governed_wait'): the first follow-up on the
+ *      created box must ANSWER, with at most one note and no FRESH_THREAD_* note.
+ *      No history assertion: upstream's governed-wait fresh start carries no
+ *      earlier context. D-B6's RED: the warm rebind keeps the prior cursor, so
+ *      upstream's governed-wait fresh start refuses. If it fails, the row records
+ *      a second person message (E2E-G-OBSERVATION) and fails naming the first error.
  *
  * REAL: embedded PG, lease fingerprints/acquisition, runtime selection, the
  * checkpoint policy (native-session-resume.ts), controller restoration,
@@ -60,6 +66,7 @@ import { issueService } from "../issues.js";
 import { FRESH_CONTINUATION_PENDING_BOUND_MS } from "../fresh-continuation-fallback.js";
 import { PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
+import { FRESH_THREAD_STARTED_NOTE, FRESH_THREAD_STOPPING_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { closeIdleWarmNativeSessionsForRestart, executePaperclipNativeSession, scopedRunnerdStateRoot } from "../native-runtime/native-session-executor.js";
@@ -143,13 +150,23 @@ child.on("exit", code => process.exit(code ?? 1));
 const quote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
 const FOLLOW_UP = "What was our conversation word? Please answer this follow-up.";
 const ANSWER_WITH_HISTORY = "Our conversation word was ALDER. This answers your follow-up.";
+const SECOND_FOLLOW_UP = "What was our conversation word? I am asking again.";
 
 type Shape = {
-  row: "R"; title: string; policy: string; fakeArgs: string[]; opening: "done" | "yielded";
+  row: "R" | "G"; title: string; policy: string; fakeArgs: string[]; opening: "done" | "yielded";
 };
 const SHAPES: Shape[] = [
   { row: "R", title: "(R) plain policy: the first follow-up on a replaced box answers in a fresh thread from the earlier conversation",
     policy: "allow_replacement_after_resume_failure", fakeArgs: [], opening: "done" },
+  // D-B6's RED (code-lead's sixth hole): the warm cross-run rebind keeps the prior
+  // run's cursor, and upstream's governed-wait fresh start requires cursor null or
+  // "0" (native-session-runtime.ts governedWaitFollowUpMayStartFresh). The opening
+  // yields through the agent's own pending question: the fake provider calls
+  // request_human_input (--repair-first-task-confirmation), and the executor builds
+  // the 'interaction-response:<id>' governed wait (native-session-executor.ts
+  // nativeGovernedWaitResult). The deployed Pi shape is the Pi file's G row.
+  { row: "G", title: "(G) governed wait, warm: the first follow-up on a created box answers, with at most one note and no fresh-thread note",
+    policy: "allow_replacement_after_governed_wait", fakeArgs: ["--repair-first-task-confirmation"], opening: "done" },
 ];
 
 describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a created box without runner state", () => {
@@ -200,7 +217,8 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
     // Do not silently pass/skip a missing real-runner prerequisite in this gate.
     expect(existsSync(defaultCapabilityRunnerdBinary()), "build the real fixture runner before running this gate").toBe(true);
     expect(existsSync(fakeCodexAppServer), "build fake-codex-app-server before running this gate").toBe(true);
-    const seeded = await fixture.seedRun(`WARM-REPLACED-${row}-${randomUUID().slice(0, 8)}`);
+    const label = `WARM-REPLACED-${row}-${randomUUID().slice(0, 8)}`;
+    const seeded = await fixture.seedRun(label);
     const { db, issueId, runId } = seeded;
     const { companyId, agentId, runtimeRoot } = fixture.current;
     const [agent] = await db.update(agents).set({ adapterConfig: { provider: "codex", model: "gpt-5.6-luna",
@@ -270,7 +288,8 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
     const resultFile = join(runtimeRoot, `${runId}-provider-result.json`);
     const codex = join(runtimeRoot, `${runId}-codex`);
     await writeFile(requestFile, "");
-    await writeFile(codex, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.110.0'; exit 0; fi\nexec ${quote(process.execPath)} ${quote(bridge)} ${quote(fakeCodexAppServer)} ${quote(resultFile)} ${quote(requestFile)}${fakeArgs.map(a => ` ${quote(a)}`).join("")}\n`, { mode: 0o700 });
+    const writeCodex = (args: string[]) => writeFile(codex, `#!/bin/sh\nif [ "$1" = "--version" ]; then echo 'codex-cli 0.110.0'; exit 0; fi\nexec ${quote(process.execPath)} ${quote(bridge)} ${quote(fakeCodexAppServer)} ${quote(resultFile)} ${quote(requestFile)}${args.map(a => ` ${quote(a)}`).join("")}\n`, { mode: 0o700 });
+    await writeCodex(fakeArgs);
     const writeResult = (execution: Execution, summary: string, disposition: "done" | "yielded" = "done") => writeFile(resultFile, JSON.stringify({
       schema: "paperclip.run_result.v1", reportedWorkDisposition: disposition, summary,
       completionClaim: { contractRevision: execution.completionContract.contract.revision, objectiveSatisfied: disposition === "done",
@@ -317,6 +336,10 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       expect(previousProviderId).toBeTruthy();
       // Each shape's precondition on the REAL saved checkpoint (the policy's input).
       expect(sourceCheckpoint.goal ?? null).toBeNull();
+      if (row === "G") {
+        expect(sourceCheckpoint.semanticResult, "G prerequisite: the opening yielded to the next message")
+          .toMatchObject({ reportedWorkDisposition: "yielded", continuation: { kind: "response_wake" } });
+      }
       expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ busy: 0, failed: 0 });
       await environmentService(db).releaseLease(original.lease.id, "retained");
       const sourceEvidence = (await readRun(runId)).runnerProfileJson;
@@ -328,6 +351,9 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       if (existsSync(failoverBackups)) await rename(failoverBackups, join(runtimeRoot, `${runId}-failover-backups-moved-aside`));
       expect(await db.select().from(nativeHarnessBackups).where(eq(nativeHarnessBackups.companyId, companyId))).toHaveLength(0);
 
+      // The opening's provider flags shape only the opening turn; a later provider
+      // process is an ordinary one.
+      await writeCodex([]);
       const started = performance.now();
       await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board", body: FOLLOW_UP });
       const [changed] = await db.update(environments).set({ config: { ...environment.config, image: "fixture:new" } })
@@ -381,6 +407,37 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       console.info(`E2E-${row}-FIRST-OUTCOME: ${outcomeText.slice(0, 400)}`);
       const comments = async () => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
       const systemNotes = async () => (await comments()).filter(c => c.authorType === "system" && c.deletedAt === null);
+      if (row === "G") {
+        console.info(`E2E-G-CURSOR: ${JSON.stringify({ source: (sourceCheckpoint as { cursor?: unknown }).cursor ?? null,
+          admitted: ((await readRun(current.id)).runnerProfileJson?.sessionCheckpoint as { cursor?: unknown } | undefined)?.cursor ?? null })}`);
+      }
+      if (row === "G" && outcome instanceof Error) {
+        // Record what a SECOND person message does behind the failed run. Only the
+        // heartbeat's own failure write is emulated; finalization is the REAL one.
+        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: outcome.message.slice(0, 2000),
+          errorCode: (outcome as { code?: string }).code ?? "adapter_failed" }).where(eq(heartbeatRuns.id, current.id));
+        const finalized = await finalizeNativeRun({ db, runId: current.id, workspaceFinalizeStatus: "failed", projectRunStatus: true })
+          .then(() => "finalized", (error: unknown) => `finalize: ${error instanceof Error ? error.message : String(error)}`);
+        await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board", body: SECOND_FOLLOW_UP });
+        const second = await admit(SECOND_FOLLOW_UP);
+        const again = await acquire(second.id, changed);
+        input.workspace.activeEnvironmentLease = again;
+        input.workspace.executionTarget = target(again.lease);
+        let secondOutcome: unknown;
+        try {
+          const secondSelection = await selectHeartbeatRuntime(db, input);
+          secondOutcome = secondSelection;
+          if (secondSelection.selected && secondSelection.nativeExecution) {
+            await writeResult(secondSelection.nativeExecution, "I do not know our conversation word.");
+            secondOutcome = await execute(secondSelection).catch((error: unknown) => error);
+          }
+        } catch (error) { secondOutcome = error; }
+        const secondText = secondOutcome instanceof Error
+          ? `refused: ${(secondOutcome as { code?: string }).code ?? "no-code"}: ${secondOutcome.message}`
+          : (secondOutcome as { exitCode?: number } | null)?.exitCode === 0 ? "answered" : `refused: ${JSON.stringify(secondOutcome).slice(0, 300)}`;
+        console.info(`E2E-G-OBSERVATION: first=${outcomeText.slice(0, 300)} | ${finalized} | second=${secondText.slice(0, 300)} | system notes=${(await systemNotes()).length}`);
+        expect.fail(`G: the first governed-wait follow-up did not answer (${outcomeText.slice(0, 300)}); second message: ${secondText.slice(0, 200)}`);
+      }
 
 
       expect(outcome, "the replaced-box follow-up must answer, not refuse").toMatchObject({ exitCode: 0 });
@@ -413,6 +470,8 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       const notes = await systemNotes();
       expect(notes.length, "answered path: at most one system note (zero duplicates)").toBeLessThanOrEqual(1);
       expect(notes.filter(n => n.body.includes(HELD_PREDECESSOR_NOTICE)), "answered path: no held/stop notice").toHaveLength(0);
+      expect(notes.filter(n => n.body.includes(FRESH_THREAD_STOPPING_NOTE) || n.body.includes(FRESH_THREAD_STARTED_NOTE)),
+        "answered path: our fresh-thread gate is not entered (no FRESH_THREAD_STOPPING/STARTED note)").toHaveLength(0);
       const persisted = await persistedJson(current.id);
       expect(persisted, "no recoveryRefusalCode on the answered run").not.toContain("recoveryRefusalCode");
       expect(persisted, "no structured runner_remote_state_unavailable code").not.toMatch(/"(?:code|errorCode|prepareRefusalCode)":"runner_remote_state_unavailable"/);

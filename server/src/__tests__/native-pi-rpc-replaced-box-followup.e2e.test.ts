@@ -1,5 +1,8 @@
 // RFL row R / N-gating: deployed follow-up 562da3cc-5ad3-4bf8-acba-962e3c4c2c86.
-// Expected RED on 74ccf170; GREEN target on 74ccf170 + D-B1 + D-B2 + D-B4 + D-B5.
+// Deployed row: RED on 74ccf170; GREEN on D-B1 + D-B2 + D-B4 + D-B5.
+// G-warm: Runner-accepted yielded result then replaced box (D-B6 target).
+// G-warm-reviewer-shape: diagnostic rejected key, NOT an authorized GitHub wait.
+// SB-cold: keep-green same allocation/disk with killed Runner and Pi.
 // Real: DB resume admission, two OS controller processes with different bootIds,
 // surviving controller state, default sandbox driver/commands, runnerd, TLS PRP
 // preview, qualified Pi 1.5.2 and its JSONL, native history handoff and events.
@@ -28,7 +31,7 @@ import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { expect, it, vi } from "vitest";
 import {
   agents, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
-  environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, plugins,
+  environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueThreadInteractions, nativeRunFinalizations, nativeRunResults, plugins,
 } from "@paperclipai/db";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -50,6 +53,7 @@ import { materializeAsset } from "../services/native-runtime/runtime-context.js"
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
+import { FRESH_THREAD_STARTED_NOTE, FRESH_THREAD_STOPPING_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const WARM_IDLE_MS = 300_000;
@@ -183,13 +187,26 @@ type RecoveryCase = {
   name: string; localEnvelope: "present" | "absent"; dbCheckpoint: "present" | "absent";
   priorRun: "done" | "yielded-response-wake" | "failed-launched";
   failoverBackups: "present" | "absent"; control: "none" | "unfinished-goal" | "pending-request" | "active-turn";
-  expected: ExpectedOutcome;
+  expected: ExpectedOutcome; box: "replaced" | "same-box-cold";
+  responseWait?: "board" | "github-review-shape";
+  /** Expected red BY NAME (org 11:23Z): the piece it waits for, its image and owner. */
+  awaits?: string;
 };
-// First delivery is the deployed-shape gate. Remaining matrix rows/controls/G
-// must be implemented before adding them here; a declared axis is not coverage.
+// Keep the deployed-shape gate FIRST. All rows share the real controller/runner
+// path, opt-in gate, binary qualification, and non-skipping prerequisites.
 const recoveryCases: RecoveryCase[] = [{ name: "deployed: warm envelope + DB checkpoint, done, no established backup",
-  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history" }];
-it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "replaced" },
+{ name: "G-warm: warm envelope + DB checkpoint, yielded response_wake, CREATED box",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "answers-no-history", box: "replaced", responseWait: "board",
+  awaits: "D-B8: exit=66 classification at the Pi governed-wait read site, N+1, owner adopt-lead" },
+{ name: "G-warm-reviewer-shape (diagnostic: no GitHub authority)",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "record", box: "replaced", responseWait: "github-review-shape" },
+{ name: "SB-cold: warm envelope + DB checkpoint, done, same box with cold runner",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-no-history", box: "same-box-cold" }];
+const runRecoveryCase = async (scenario: RecoveryCase) => {
+  const governedWait = scenario.priorRun === "yielded-response-wake";
+  const reviewerShape = scenario.responseWait === "github-review-shape";
+  const sameBoxCold = scenario.box === "same-box-cold";
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY;
@@ -208,7 +225,9 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
   };
   await installImagePack();
   const fact = `PI_REPLACED_FACT_${randomUUID()}`;
-  const followupPrompt = "What private fact did I tell you earlier? Repeat it exactly; do not invent it.";
+  const governedReply = `ANSWERED_${randomUUID()}`;
+  const followupPrompt = governedWait ? `Reply with exactly ${governedReply}.`
+    : "What private fact did I tell you earlier? Repeat it exactly; do not invent it.";
   const stages: unknown[] = [], commands: Array<Record<string, unknown>> = [], requests: Array<Record<string, unknown>> = [];
   const providerCalls: Array<Record<string, unknown>> = [], startupEvents: Array<{ runId: string; event: AdapterRuntimeEvent }> = [];
   const targets: Array<Record<string, unknown>> = [];
@@ -236,6 +255,8 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     await vi.waitFor(() => expect(owned.some(sameBirth), "owned box processes ended").toBe(false), { timeout: 15_000 });
   };
   let activeRunId: string | undefined;
+  let openingRunId: string | undefined, openingReport: Record<string, unknown> | undefined;
+  const openingToolCallId = `g-warm-finish-${randomUUID()}`;
   let generation = 1;
   const allocationIds = [`image-A-${randomUUID()}`, `image-B-${randomUUID()}`];
   const allocations = new Map(allocationIds.map(id => [id, "running" as "running" | "stopped"]));
@@ -247,22 +268,46 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
       try {
         const parsed = JSON.parse(body);
         const first = requests.length === 0;
+        const opening = governedWait && activeRunId === openingRunId;
+        const useFinishTool = opening && first;
+        const messages = parsed.messages as Array<{ role: string; content: unknown }>;
+        const latestUserContent = messages.findLast(message => message.role === "user")?.content;
+        const toolResult = Array.isArray(latestUserContent) ? latestUserContent.map(record)
+          .find(block => block.type === "tool_result" && block.tool_use_id === openingToolCallId) : undefined;
         const containsFact = JSON.stringify(parsed.messages).includes(fact);
         const handoffHasFact = (parsed.messages as Array<{ content: unknown }>).some(message => {
           const content = JSON.stringify(message.content); return content.includes("Fresh session handoff") && content.includes(fact);
         });
-        // The answer oracle never returns the secret merely because this is turn
-        // two: a missing handoff yields HISTORY_LOST, including after replacement.
-        const reply = first && containsFact ? `ACK_${fact}` : handoffHasFact ? `RECALLED_${fact}` : "HISTORY_LOST";
-        requests.push({ runId: activeRunId, path: req.url, request: parsed, containsFact, handoffHasFact, reply });
+        // Never return the secret just because this is turn two. Replaced/done
+        // needs its handoff; SB needs the real Pi history. G asks a new question
+        // and makes no claim to the earlier fact.
+        const reply = (first || opening && toolResult) && containsFact ? `ACK_${fact}`
+          : governedWait && JSON.stringify(parsed.messages).includes(governedReply) ? governedReply
+          : handoffHasFact || sameBoxCold && containsFact ? `RECALLED_${fact}` : "HISTORY_LOST";
+        // Only author the provider's tool_use. Pi executes the real Runner
+        // callback and returns its tool_result before our final text turn.
+        const toolUse = useFinishTool ? { name: "paperclip_finish", input: openingReport } : undefined;
+        if (useFinishTool) {
+          expect(openingReport, "G opening report bound to the actual run and contract").toBeDefined();
+          expect((parsed.tools as Array<{ name: string }>).map(tool => tool.name), "Pi exposes the real semantic result tool")
+            .toContain("paperclip_finish");
+        } else if (opening) expect(toolResult, "Pi returns the opening result-tool receipt before final text").toBeDefined();
+        requests.push({ runId: activeRunId, path: req.url, request: parsed, containsFact, handoffHasFact, reply, toolUse, toolResult });
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
         const emit = (type: string, value: Record<string, unknown>) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...value })}\n\n`);
         emit("message_start", { message: { id: `msg-${requests.length}`, type: "message", role: "assistant", model: "faux", content: [],
           stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } });
-        emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
-        emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: reply } });
+        if (useFinishTool) {
+          // completion-result.ts:2,384 and pi/extension/index.ts:206-207:
+          // paperclip_finish, with the Runner's bridge schema unchanged in Pi.
+          emit("content_block_start", { index: 0, content_block: { type: "tool_use", id: openingToolCallId, name: "paperclip_finish", input: {} } });
+          emit("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(openingReport) } });
+        } else {
+          emit("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+          emit("content_block_delta", { index: 0, delta: { type: "text_delta", text: reply } });
+        }
         emit("content_block_stop", { index: 0 });
-        emit("message_delta", { delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
+        emit("message_delta", { delta: { stop_reason: useFinishTool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } });
         emit("message_stop", {}); res.end();
       } catch (error) { res.writeHead(500).end(String(error)); }
     });
@@ -367,7 +412,15 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
       const allocationId = allocationIds[generation - 1]!;
       providerCalls.push({ at: new Date().toISOString(), method, input, generation, activeRunId });
       if (method === "environmentAcquireLease") return { providerLeaseId: allocationId, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), metadata: { remoteCwd } };
-      if (method === "environmentResumeLease") throw new Error("image swap must select a created allocation, never resume the old one");
+      if (method === "environmentResumeLease") {
+        if (!sameBoxCold && !(governedWait && generation === 2))
+          throw new Error("image swap must select a created allocation, never resume the old one");
+        // Same allocation/disk; a cold runner is not a stopped/replaced box.
+        // G's second-message diagnostic may also reuse the already-created B.
+        expect(input.providerLeaseId).toBe(allocationId);
+        expect(allocations.get(allocationId)).toBe("running");
+        return { providerLeaseId: allocationId, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), metadata: { remoteCwd } };
+      }
       if (method === "environmentDestroyLease") throw new Error("box destroy is forbidden in row R");
       if (method === "environmentStopLease" || method === "environmentReleaseLease") {
         const id = String(input.providerLeaseId); allocations.set(id, "stopped"); leaseActive.set(id, false);
@@ -409,10 +462,14 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     const runtime = environmentRuntimeService(db, { pluginWorkerManager: providerWorker });
     const heartbeat = heartbeatService(db, { environmentRuntime: runtime, pluginWorkerManager: providerWorker });
     const [issue] = await db.insert(issues).values({ id: issueId, companyId, title: "Recall the pre-replacement fact", description: null,
-      assigneeAgentId: agentId, status: "in_progress" }).returning();
+      assigneeAgentId: agentId, status: "in_progress", // issues_conversation_identity_check: a conversation issue names its agent AND
+      // person, and is active or waiting.
+      ...(governedWait ? { conversationAgentId: agentId, conversationUserId: "local-board", conversationState: "active" as const } : {}) }).returning();
     const runtimeContext = nativeRuntimeContextFixture();
     runtimeContext.instructions.bundle = await materializeAsset([{ path: "AGENTS.md", mode: 0o444,
-      content: Buffer.from("Use only supplied conversation history. Do not invent missing facts or use tools.\n") }]);
+      content: Buffer.from(governedWait
+        ? "Use only supplied conversation history. Do not invent missing facts. Report the opening response wait through paperclip_finish, then acknowledge the private fact in final text.\n"
+        : "Use only supplied conversation history. Do not invent missing facts or use tools.\n") }]);
     runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(runtimeContext);
     const controllerFile = join(root, "controller.mjs"); await writeFile(controllerFile, controllerSource());
     const startController = async () => {
@@ -500,16 +557,70 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     const [openingComment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
       body: `Remember my private fact: ${fact}. Acknowledge it.` }).returning();
     const first = await seed(openingComment!.body, A.identity, undefined, openingComment!.id);
+    openingRunId = first.runId;
+    if (governedWait) {
+      const continuation = { kind: "response_wake", idempotencyKey: reviewerShape
+        ? `github-review-response:${first.runId}:${randomUUID()}:${createHash("sha256").update(fact).digest("hex").slice(0, 40)}`
+        : `g-ops-date-check-${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+      summary: reviewerShape ? "Wait for the next authorized GitHub response to the published review." : "Wake only on a new ops or Paul comment." };
+      openingReport = { schema: "paperclip.run_result.v1", reportedWorkDisposition: "yielded", summary: `ACK_${fact}`,
+        completionClaim: { contractRevision: first.native.completionContract.revision, objectiveSatisfied: false,
+          criteria: first.native.completionContract.criterionIds.map(criterionId => ({ criterionId, status: "not_satisfied", evidenceRefs: [] })),
+          remainingWork: [{ description: continuation.summary, blocksCompletion: true }] },
+        evidence: [], verification: [], attentionRequests: [], artifacts: [], continuation };
+    }
     activeRunId = first.runId;
     const firstOptions = await executionOptions(first);
     const firstOutcome = await A.call("execute", firstOptions.input);
+    if (governedWait) {
+      const openingRequests = requests.filter(request => request.runId === first.runId);
+      const openingEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, first.runId));
+      const acceptedResults = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, first.runId));
+      const [openingRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first.runId));
+      const openingInteractions = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+      // Persist rejected receipts too: a synthesized reply must never stand in
+      // for the deployed Runner-proposed wait. No result rows are fixture-written.
+      const openingEvidence = { scenario, runId: first.runId, report: openingReport, requests: openingRequests,
+        outcome: firstOutcome, events: openingEvents, acceptedResults, resultJson: openingRun?.resultJson, interactions: openingInteractions };
+      console.log(`E2E-PI-OPENING-RESULT: ${JSON.stringify({ scenario, runId: first.runId, report: openingReport,
+        toolResults: openingRequests.map(request => request.toolResult ?? null), acceptedResults,
+        resultJson: openingRun?.resultJson, interactionCount: openingInteractions.length, outcome: firstOutcome })}`);
+      await writeFile(join(root, "opening-result.json"), JSON.stringify(openingEvidence, null, 2));
+      expect(openingRequests).toHaveLength(2);
+      expect(openingRequests[0]?.toolUse).toEqual({ name: "paperclip_finish", input: openingReport });
+      expect(openingRequests[1]?.toolResult).toMatchObject({ type: "tool_result", tool_use_id: openingToolCallId });
+      if (reviewerShape) {
+        // A GitHub-shaped key is not authority. This row qualifies only the
+        // real completion-feedback rejection, never deployed reviewer recovery.
+        expect(record(openingRequests[1]?.toolResult).is_error).toBe(true);
+        expect(JSON.stringify(openingRequests[1]?.toolResult)).toContain("The published GitHub review wait is no longer authorized for this run.");
+        stage("diagnostic: GitHub-shaped continuation rejected without authority", { runId: first.runId });
+        await firstOptions.sync.restoreWorkspace();
+        return;
+      }
+      expect(record(openingRequests[1]?.toolResult).is_error ?? false, "real result-tool acceptance").toBe(false);
+      const proposedEvents = openingEvents.filter(event => event.eventType === "run.result.proposed");
+      const acceptedEvents = openingEvents.filter(event => event.eventType === "run.result.accepted");
+      expect(proposedEvents, "G opening result is Runner-proposed, not synthesized from final text").toHaveLength(1);
+      expect(record(proposedEvents[0]?.payload).prpEvent).toMatchObject({ sourceKind: "runner", payload: openingReport });
+      expect(acceptedEvents).toHaveLength(1);
+      expect(record(record(acceptedEvents[0]?.payload).prpEvent).payload).toMatchObject({ result: openingReport });
+      expect(acceptedEvents[0]!.seq).toBeGreaterThan(proposedEvents[0]!.seq);
+      expect(acceptedResults).toHaveLength(1);
+      expect(acceptedResults[0]?.schemaStatus).toBe("accepted");
+      expect(record(acceptedResults[0]?.resultJson).result, "accepted opening preserves the exact authored continuation").toMatchObject(openingReport!);
+      expect(openingRun?.resultJson).toMatchObject({ prpReportedWorkDisposition: "yielded",
+        nativeTerminal: { runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "yielded" } });
+      expect(openingInteractions, "deployed governed waits have no interaction cards").toEqual([]);
+    }
     expect(firstOutcome.error, JSON.stringify(firstOutcome)).toBeUndefined();
     expect(firstOutcome.result).toMatchObject({ exitCode: 0, summary: `ACK_${fact}` });
     observeRunnerProcesses();
     expect(spawned).toHaveLength(1); expect(piBirths, "real warm Pi lives after opening turn").toHaveLength(1);
     expect(sameBirth(spawned[0]!)).toBe(true); expect(sameBirth(piBirths[0]!)).toBe(true);
     stage("actual Pi process command", { requestedBinary: process.env.PI_TEST_BINARY, actual: piBirths[0]!.command });
-    expect(await readFile(sessionFile(piBirths[0]!), "utf8")).toContain(fact);
+    const openingSessionFile = sessionFile(piBirths[0]!);
+    expect(await readFile(openingSessionFile, "utf8")).toContain(fact);
     await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, first.runId));
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, first.runId));
     await firstOptions.sync.restoreWorkspace();
@@ -530,7 +641,23 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     console.log(`E2E-PI-BACKUPS: ${JSON.stringify({ scenario, naturalInventory: backupsBeforeRestart, createdByFixture: false, removedByFixture: false })}`);
     expect(checkpointBeforeRestart, "deployed case MUST retain the LOCAL warm envelope").not.toBeNull();
     expect(backupsBeforeRestart, "Pi's natural backup state must match the incident; none removed").toEqual([]);
+    if (governedWait) {
+      // REAL paperclip_finish tool execution above, followed by the model's
+      // final text. The warm envelope must retain the accepted Runner result,
+      // never the conversation-mode missing-result synthesis fallback.
+      const openingSnapshot = record(record(JSON.parse(checkpointBeforeRestart!.toString("utf8"))).snapshot);
+      expect(openingSnapshot.semanticResult, "G prerequisite: actual opening yielded for the next person message").toMatchObject({
+        reportedWorkDisposition: "yielded", continuation: { kind: "response_wake", ...record(openingReport?.continuation) },
+      });
+    }
     stage("opening completed; controller files retained", { stateRoot, checkpointPath, backupsBeforeRestart });
+    if (sameBoxCold) {
+      // Idle-timeout shape without waiting five minutes: kill only the measured
+      // box process births. Keep its allocation, disk, JSONL and runner state.
+      await stopBoxProcesses();
+      expect(allocations.get(allocationIds[0]!)).toBe("running");
+      expect(await readFile(openingSessionFile, "utf8")).toContain(fact);
+    }
 
     // Stage 2: hard controller restart, not idle closure of the box. SIGKILL A
     // after its accepted turn deliberately avoids graceful drain generating a
@@ -545,44 +672,61 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     expect(B.identity.bootId).not.toBe(A.identity.bootId); expect(B.identity.pid).not.toBe(A.identity.pid);
     stage("real controller restart, same durable root and authority", { A: A.identity, B: B.identity, stateRoot, home: process.env.PAPERCLIP_HOME });
 
-    // Stage 3: an external image swap, not product destruction. Stop measured
-    // old-box births; retain the whole old disk; recreate the identical mount.
-    await stopBoxProcesses(); allocations.set(allocationIds[0]!, "stopped"); leaseActive.set(allocationIds[0]!, false);
-    const oldDisk = join(root, "image-A-disk-retained"); await rename(remoteCwd, oldDisk); await mkdir(remoteCwd);
-    expect(readdirSync(remoteCwd), "new allocation starts with an empty disk").toEqual([]);
-    generation = 2;
     const remoteState = join(stagedRuntime, "sessions", createHash("sha256").update(first.native.normalizedSessionId).digest("hex"), "runner", "runner-state.json");
-    expect(existsSync(remoteState)).toBe(false);
-    // The new image has the qualified pack preinstalled, but no conversation.
-    await installImagePack(); expect(existsSync(remoteState)).toBe(false);
-    const [changedEnvironment] = await db.update(environments).set({ config: { ...environment.config, image: "fixture:image-B" } })
-      .where(eq(environments.id, environmentId)).returning(); environment = changedEnvironment as Environment;
-    stage("image swap replaced box at same workspace path", { remoteCwd, oldDisk, oldProviderLeaseId: allocationIds[0], newProviderLeaseId: allocationIds[1] });
+    if (sameBoxCold) {
+      expect(generation).toBe(1);
+      expect(existsSync(remoteState), "SB prerequisite: original runner state retained on original disk").toBe(true);
+      expect(await readFile(openingSessionFile, "utf8")).toContain(fact);
+      stage("same box retained with cold runner across controller restart", { remoteCwd, providerLeaseId: allocationIds[0], remoteState });
+    } else {
+      // Stage 3: an external image swap, not product destruction. Stop measured
+      // old-box births; retain the whole old disk; recreate the identical mount.
+      await stopBoxProcesses(); allocations.set(allocationIds[0]!, "stopped"); leaseActive.set(allocationIds[0]!, false);
+      const oldDisk = join(root, "image-A-disk-retained"); await rename(remoteCwd, oldDisk); await mkdir(remoteCwd);
+      expect(readdirSync(remoteCwd), "new allocation starts with an empty disk").toEqual([]);
+      generation = 2;
+      expect(existsSync(remoteState)).toBe(false);
+      // The new image has the qualified pack preinstalled, but no conversation.
+      await installImagePack(); expect(existsSync(remoteState)).toBe(false);
+      const [changedEnvironment] = await db.update(environments).set({ config: { ...environment.config, image: "fixture:image-B" } })
+        .where(eq(environments.id, environmentId)).returning(); environment = changedEnvironment as Environment;
+      stage("image swap replaced box at same workspace path", { remoteCwd, oldDisk, oldProviderLeaseId: allocationIds[0], newProviderLeaseId: allocationIds[1] });
+    }
 
     // Stage 4: base harness's real acquisition -> prepare -> find/rebind/persist
     // checkpoint -> resolve target/workspace sync -> execute path, no checkpoint
     // fabricated and no providerRecoveryPolicy patched into a local snapshot.
+    const admitFollowup = async (fixture: Fixture) => {
+      const selected = await findNativeSessionResumeRun(db!, { companyId, agentId, issueId, normalizedSessionId: first.native.normalizedSessionId,
+        currentRunId: fixture.runId, beforeCreatedAt: fixture.run.createdAt });
+      if (!selected) throw new Error("follow-up admission stuck behind the failed run: no resumable predecessor");
+      fixture.native.runnerInstanceId = selected.runnerInstanceId!;
+      await db!.update(heartbeatRuns).set({ runnerInstanceId: fixture.native.runnerInstanceId }).where(eq(heartbeatRuns.id, fixture.runId));
+      const admission = buildNativeExecutionWithCheckpoint({ previousRun: selected, normalizedSessionId: first.native.normalizedSessionId,
+        executionTargetKind: "remote", buildExecution: () => fixture.execution });
+      fixture.execution = admission.execution;
+      expect(admission.checkpoint).not.toBeNull();
+      await db!.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+        || ${JSON.stringify({ sessionCheckpoint: admission.checkpoint, nativeExecutionInput: fixture.execution })}::jsonb` }).where(eq(heartbeatRuns.id, fixture.runId));
+      return { selected, admission };
+    };
     const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board", body: followupPrompt }).returning();
     expect(comment!.body).not.toContain(fact);
     const next = await seed(comment!.body, B.identity, first.native.normalizedSessionId, comment!.id);
     followupRunId = next.runId; activeRunId = next.runId;
-    expect(next.lease.id).not.toBe(first.lease.id); expect(next.lease.providerLeaseId).toBe(allocationIds[1]);
-    const selected = await findNativeSessionResumeRun(db, { companyId, agentId, issueId, normalizedSessionId: first.native.normalizedSessionId,
-      currentRunId: next.runId, beforeCreatedAt: next.run.createdAt });
+    expect(next.lease.id).not.toBe(first.lease.id);
+    expect(next.lease.providerLeaseId).toBe(allocationIds[sameBoxCold ? 0 : 1]);
+    const { selected, admission } = await admitFollowup(next);
     expect(selected?.id).toBe(first.runId);
-    next.native.runnerInstanceId = selected!.runnerInstanceId!;
-    await db.update(heartbeatRuns).set({ runnerInstanceId: next.native.runnerInstanceId }).where(eq(heartbeatRuns.id, next.runId));
-    const admission = buildNativeExecutionWithCheckpoint({ previousRun: selected, normalizedSessionId: first.native.normalizedSessionId,
-      executionTargetKind: "remote", buildExecution: () => next.execution });
-    // The rebind keeps the admitted execution's schema version (built above).
-    next.execution = admission.execution as typeof next.execution;
-    expect(admission.checkpoint).not.toBeNull();
-    await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
-      || ${JSON.stringify({ sessionCheckpoint: admission.checkpoint, nativeExecutionInput: next.execution })}::jsonb` }).where(eq(heartbeatRuns.id, next.runId));
     const nextOptions = await executionOptions(next);
-    expect(nextOptions.target.sandboxLeaseAcquisition).toMatchObject({ outcome: "created", providerLeaseId: allocationIds[1] });
+    expect(nextOptions.target.sandboxLeaseAcquisition).toMatchObject({ outcome: sameBoxCold ? "resumed" : "created", providerLeaseId: allocationIds[sameBoxCold ? 0 : 1] });
     const envelope = existsSync(checkpointPath) ? record(JSON.parse(await readFile(checkpointPath, "utf8"))) : null;
     const localSnapshot = record(envelope?.snapshot);
+    if (sameBoxCold) {
+      const openingWarmSnapshot = record(record(JSON.parse(checkpointBeforeRestart!.toString("utf8"))).snapshot);
+      expect(localSnapshot.cursor, "SB keeps the opening warm cursor EXACTLY through restart and follow-up admission")
+        .toEqual(openingWarmSnapshot.cursor);
+    }
     // Diagnostic only, intentionally NOT an assertion about local warm policy.
     // Runtime prefers a compatible local snapshot over its DB load. The command
     // provenance below establishes whether recovery actually reached the box.
@@ -595,7 +739,27 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
       failoverBackups: backupInventory(), backupsRemoved: false };
     console.log(`E2E-PI-WARM-CHECKPOINT: ${JSON.stringify(diagnostic)}`);
     await writeFile(join(root, "warm-checkpoint-diagnostic.json"), JSON.stringify(diagnostic, null, 2));
-    const outcome = await B.call("execute", nextOptions.input);
+    if (governedWait) {
+      expect(localSnapshot.semanticResult, "G prerequisite: warm envelope still owns the yielded opening").toMatchObject({
+        reportedWorkDisposition: "yielded", continuation: { kind: "response_wake", ...record(openingReport?.continuation) },
+      });
+      expect(admission.checkpoint?.providerRecoveryPolicy, "G prerequisite: actual governed-wait admission policy")
+        .toBe("allow_replacement_after_governed_wait");
+      console.log(`E2E-PI-WARM-CURSOR: ${JSON.stringify({ runId: next.runId, localWarmCursor: localSnapshot.cursor ?? null,
+        admittedCheckpointCursor: admission.checkpoint?.cursor ?? null })}`);
+    }
+    const outcome = await B.call("execute", nextOptions.input).catch(error => {
+      if (!governedWait) throw error;
+      return { error: String(error), stack: error instanceof Error ? error.stack : null } as Record<string, unknown>;
+    });
+    if (governedWait) {
+      // This witness is emitted by the child immediately before the REAL
+      // executePaperclipNativeSession call, from the very target it passes.
+      // Do not mistake parent-side workspace resolution for executor admission.
+      expect(targets.find(target => target.runId === next.runId)?.acquisition,
+        "G prerequisite: executor receives the CREATED-box acquisition required by scoped D-B6")
+        .toMatchObject({ outcome: "created", providerLeaseId: allocationIds[1] });
+    }
     const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, next.runId));
     const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(row => row.authorType === "system");
@@ -606,9 +770,49 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
         : note.body.includes("stopping the earlier attempt") ? "server/src/services/native-runtime/fresh-thread-stop-gate.ts:17" : null,
       metadata: note.metadata })))}`);
     await writeFile(join(root, "notes.json"), JSON.stringify(notes, null, 2));
+    const throwSite = (stack: unknown) => typeof stack === "string" ? stack.split("\n").find(line => /^\s+at /.test(line))?.trim() ?? null : null;
     console.log(`E2E-PI-OUTCOME: ${JSON.stringify({ runId: next.runId, error: persisted?.error ?? outcome.error ?? null,
-      errorCode: persisted?.errorCode ?? outcome.errorCode ?? null, outcome, events })}`);
+      errorCode: persisted?.errorCode ?? outcome.errorCode ?? null, throwSite: throwSite(outcome.stack), outcome, events })}`);
     await writeFile(join(root, "followup-outcome.json"), JSON.stringify({ outcome, persisted, events }, null, 2));
+
+    if (sameBoxCold) {
+      const eventCountByType = events.reduce<Record<string, number>>((counts, event) => {
+        counts[event.eventType] = (counts[event.eventType] ?? 0) + 1; return counts;
+      }, {});
+      console.log(`E2E-PI-SB-COUNT: ${JSON.stringify({ runId: next.runId, eventCountByType, localWarmCursor: localSnapshot.cursor ?? null })}`);
+    }
+    if (governedWait && (outcome.error != null || persisted?.error != null
+      || record(outcome.result).exitCode !== 0 || record(outcome.result).summary !== governedReply)) {
+      // Capture the FIRST failure before a second person message. Do not repair,
+      // bypass, or overwrite the failed predecessor: use the same admission.
+      const firstError = String(persisted?.error ?? outcome.error ?? `non-answer: ${JSON.stringify(outcome)}`);
+      let secondRunId: string | undefined;
+      let secondOutcome: Record<string, unknown>;
+      let secondSelectedRunId: string | undefined;
+      try {
+        const [secondComment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
+          body: `One more person message. ${followupPrompt}` }).returning();
+        const second = await seed(secondComment!.body, B.identity, first.native.normalizedSessionId, secondComment!.id);
+        secondRunId = second.runId; activeRunId = second.runId;
+        const secondAdmission = await admitFollowup(second);
+        secondSelectedRunId = secondAdmission.selected.id;
+        const secondOptions = await executionOptions(second);
+        secondOutcome = await B.call("execute", secondOptions.input);
+      } catch (error) {
+        secondOutcome = { error: String(error), stack: error instanceof Error ? error.stack : null };
+      }
+      const [secondPersisted] = secondRunId ? await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, secondRunId)) : [];
+      const secondEvents = secondRunId ? await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, secondRunId)) : [];
+      const secondAnswered = secondOutcome.error == null && secondPersisted?.error == null
+        && record(secondOutcome.result).exitCode === 0 && record(secondOutcome.result).summary === governedReply;
+      const secondEvidence = { message: 2, runId: secondRunId ?? null, selectedRunId: secondSelectedRunId ?? null,
+        expected: "stuck behind the failed run", expectedBlockedByRunId: next.runId, disposition: secondAnswered ? "answered" : "refused",
+        error: secondPersisted?.error ?? secondOutcome.error ?? null, errorCode: secondPersisted?.errorCode ?? secondOutcome.errorCode ?? null,
+        throwSite: throwSite(secondOutcome.stack), outcome: secondOutcome, events: secondEvents };
+      console.log(`E2E-PI-OUTCOME: ${JSON.stringify(secondEvidence)}`);
+      await writeFile(join(root, "second-followup-outcome.json"), JSON.stringify(secondEvidence, null, 2));
+      throw new Error(`G-warm first follow-up failed: ${firstError}; throw site: ${throwSite(outcome.stack) ?? "see outcome stack"}; second message ${secondEvidence.disposition}: ${secondEvidence.error ?? "see outcome"}`);
+    }
 
     // Row-R prerequisites ALWAYS precede the target outcome assertions. A RED
     // from backup_without_reusable_lease, admission or TLS cannot masquerade as
@@ -620,29 +824,84 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
       && (command.args as string[])[1].startsWith(`test -f '${remoteState}' `)
       && (command.args as string[])[1].endsWith(`base64 < '${remoteState}'`)
       && typeof command.exitCode === "number" && command.exitCode !== 0 && command.timedOut === false);
-    expect(failedStateReads, `real readRemoteRunnerState must fail on the NEW box; backups retained: ${JSON.stringify(diagnostic)}`).not.toHaveLength(0);
+    if (!sameBoxCold) expect(failedStateReads, `real readRemoteRunnerState must fail on the NEW box; backups retained: ${JSON.stringify(diagnostic)}`).not.toHaveLength(0);
     expect(events.some(event => event.eventType === "native.process_start_requested"), "deployed seq-59 execution start evidence").toBe(true);
-    expect(admission.checkpoint?.providerRecoveryPolicy, "Paul's plain 17/19 admission policy").toBe("allow_replacement_after_resume_failure");
-    expect(targets.find(target => target.runId === next.runId)?.acquisition).toMatchObject({ outcome: "created", providerLeaseId: allocationIds[1] });
+    if (!governedWait) expect(admission.checkpoint?.providerRecoveryPolicy, "Paul's plain 17/19 admission policy").toBe("allow_replacement_after_resume_failure");
+    expect(targets.find(target => target.runId === next.runId)?.acquisition).toMatchObject({ outcome: sameBoxCold ? "resumed" : "created", providerLeaseId: allocationIds[sameBoxCold ? 0 : 1] });
 
-    // Target (RED S1 / GREEN target D-B1+D-B2+D-B4+D-B5), never relaxed to accept refusal.
-    expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
-    expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: `RECALLED_${fact}` });
-    const finalCheckpoint = record(record(persisted?.runnerProfileJson).sessionCheckpoint);
-    expect(finalCheckpoint.providerSessionId).toBeTruthy();
-    expect(finalCheckpoint.providerSessionId, "fresh provider session, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
-    const followupRequests = requests.filter(request => request.runId === next.runId);
-    expect(followupRequests).toHaveLength(1);
-    expect(followupRequests[0]).toMatchObject({ containsFact: true, handoffHasFact: true, reply: `RECALLED_${fact}` });
-    expect(notes.length).toBeLessThanOrEqual(1);
-    expect(notes.filter(note => note.body.includes(HELD_PREDECESSOR_NOTICE)), "no held notice on the answered path").toHaveLength(0);
-    expect(notes.some(note => String(record(note.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"))).toBe(false);
-    const persistedEvidence = JSON.stringify({ resultJson: persisted?.resultJson, runnerProfileJson: persisted?.runnerProfileJson, events });
-    expect(persistedEvidence).not.toContain("recoveryRefusalCode");
-    expect(persistedEvidence).not.toContain('"code":"runner_remote_state_unavailable"');
+    if (governedWait) {
+      // G TARGET (expected RED before D-B6): answer, not a fresh-thread refusal.
+      // No history claim: upstream governed-wait replacement omits old context.
+      expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
+      expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
+      expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
+      expect(notes.length).toBeLessThanOrEqual(1);
+      expect(notes.filter(note => note.body.includes(FRESH_THREAD_STOPPING_NOTE))).toHaveLength(0);
+      expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toHaveLength(0);
+    } else if (sameBoxCold) {
+      // SB KEEP-GREEN TARGET: same normalized conversation, no replay and no
+      // fresh-session history re-send even though both Runner and Pi were cold.
+      expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
+      expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: `RECALLED_${fact}` });
+      expect(next.native.normalizedSessionId).toBe(first.native.normalizedSessionId);
+      expect(persisted?.nativeSessionId).toBe(first.native.normalizedSessionId);
+      const sequenceErrors = [outcome.error, outcome.errorCode, persisted?.error, persisted?.errorCode,
+        ...events.flatMap(event => {
+          const payload = record(record(event.payload).prpEvent).payload;
+          return [event.message, record(payload).error, record(payload).message, record(payload).code];
+        })];
+      expect(JSON.stringify(sequenceErrors), "SB has no sourceSeq/ackedSourceSeq error")
+        .not.toMatch(/sourceSeq|ackedSourceSeq|source_seq|acked_source_seq/i);
+      const sourceIds = events.map(event => event.sourceEventId).filter((id): id is string => id !== null);
+      expect(new Set(sourceIds).size, "no duplicate follow-up sourceEventId").toBe(sourceIds.length);
+      const openingEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, first.runId));
+      const openingSourceIds = new Set(openingEvents.map(event => event.sourceEventId).filter(Boolean));
+      expect(sourceIds.filter(id => openingSourceIds.has(id)), "no opening PRP events replayed into follow-up").toEqual([]);
+      expect(events.filter(event => event.eventType === "turn.started")).toHaveLength(1);
+      expect(events.filter(event => event.eventType === "turn.completed")).toHaveLength(1);
+      const prpEvents = events.filter(event => record(event.payload).prpEvent != null).map(event => record(record(event.payload).prpEvent));
+      expect(prpEvents.length, "real follow-up PRP events").toBeGreaterThan(0);
+      expect(prpEvents.every(event => event.runId === next.runId && event.normalizedSessionId === first.native.normalizedSessionId)).toBe(true);
+      const followupTurns = prpEvents.filter(event => event.eventType === "turn.started" || event.eventType === "turn.completed");
+      expect(followupTurns.every(event => typeof event.turnId === "string" && event.turnId.length > 0)).toBe(true);
+      expect(new Set(followupTurns.map(event => event.turnId)).size, "one follow-up turn, started and completed").toBe(1);
+      const openingTurnIds = new Set(openingEvents.map(event => record(record(event.payload).prpEvent).turnId).filter(Boolean));
+      expect(followupTurns.some(event => openingTurnIds.has(event.turnId)), "no opening turn replay").toBe(false);
+      const followupRequests = requests.filter(request => request.runId === next.runId);
+      expect(followupRequests).toHaveLength(1);
+      // The fact comes from Pi's own resumed conversation. The opening message in
+      // that history is itself a first-turn handoff envelope, so only the NEW
+      // message is checked for a re-sent history handoff.
+      expect(followupRequests[0]).toMatchObject({ containsFact: true, reply: `RECALLED_${fact}` });
+      const followupMessages = record(followupRequests[0]!.request).messages as Array<{ role: string; content: unknown }>;
+      expect(followupMessages.map(message => message.role), "the resumed Pi history plus the new message").toEqual(["user", "assistant", "user"]);
+      expect(JSON.stringify(followupMessages.at(-1)?.content), "no fresh-session history handoff in the new message").not.toContain("Fresh session handoff");
+      expect(generation).toBe(1);
+      expect(providerCalls.filter(call => call.method === "environmentAcquireLease"), "one allocation only").toHaveLength(1);
+      expect(providerCalls.filter(call => ["environmentStopLease", "environmentReleaseLease", "environmentDestroyLease"].includes(String(call.method))),
+        "box kept throughout cold-runner recovery").toHaveLength(0);
+    } else {
+      // Target (RED S1 / GREEN target D-B1+D-B2+D-B4+D-B5), never relaxed to accept refusal.
+      expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
+      expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: `RECALLED_${fact}` });
+      const finalCheckpoint = record(record(persisted?.runnerProfileJson).sessionCheckpoint);
+      expect(finalCheckpoint.providerSessionId).toBeTruthy();
+      expect(finalCheckpoint.providerSessionId, "fresh provider session, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
+      const followupRequests = requests.filter(request => request.runId === next.runId);
+      expect(followupRequests).toHaveLength(1);
+      expect(followupRequests[0]).toMatchObject({ containsFact: true, handoffHasFact: true, reply: `RECALLED_${fact}` });
+      expect(notes.length).toBeLessThanOrEqual(1);
+      expect(notes.filter(note => note.body.includes(HELD_PREDECESSOR_NOTICE)), "no held notice on the answered path").toHaveLength(0);
+      expect(notes.some(note => String(record(note.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"))).toBe(false);
+      const persistedEvidence = JSON.stringify({ resultJson: persisted?.resultJson, runnerProfileJson: persisted?.runnerProfileJson, events });
+      expect(persistedEvidence).not.toContain("recoveryRefusalCode");
+      expect(persistedEvidence).not.toContain('"code":"runner_remote_state_unavailable"');
+    }
     expect(providerCalls.some(call => call.method === "environmentDestroyLease"), "never destroy either box").toBe(false);
     await nextOptions.sync.restoreWorkspace();
-    stage("GREEN: replaced-box follow-up answered from real history handoff", { runId: next.runId, failedStateReads });
+    stage(governedWait ? "GREEN: governed-wait replaced-box follow-up answered"
+      : sameBoxCold ? "GREEN: same-box cold-runner follow-up answered without replay or history re-send"
+      : "GREEN: replaced-box follow-up answered from real history handoff", { runId: next.runId, failedStateReads });
   } catch (error) { failure = error; throw error; }
   finally {
     const errors: unknown[] = [];
@@ -681,4 +940,9 @@ it.skipIf(!enabled).each(recoveryCases)("RFL R: $name", async (scenario) => {
     if (failure) await writeFile(join(root, "failure.txt"), failure instanceof Error ? failure.stack ?? failure.message : String(failure));
     if (errors.length) throw new AggregateError([...(failure ? [failure] : []), ...errors], "replaced-box body/cleanup failed; evidence retained");
   }
-}, 600_000);
+};
+it.skipIf(!enabled).each(recoveryCases.filter(scenario => !scenario.awaits))("RFL R: $name", runRecoveryCase, 600_000);
+// Expected red BY NAME: it.fails passes while the row is red and fails as soon as its
+// piece makes it green; that commit removes the .fails.
+(enabled ? it.fails : it.skip).each(recoveryCases.filter(scenario => scenario.awaits))(
+  "RFL R (expected red, awaits $awaits): $name", runRecoveryCase, 600_000);
