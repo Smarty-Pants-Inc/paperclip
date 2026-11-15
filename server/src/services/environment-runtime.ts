@@ -58,7 +58,7 @@ import type {
   SandboxEnvironmentConfig,
   SandboxProviderCapabilities,
 } from "@paperclipai/shared";
-import { resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
+import { AGENT_ADAPTER_TYPES, resolveDeclaredSandboxCapabilities } from "@paperclipai/shared";
 import type { EffectiveExecutionCapabilities } from "@paperclipai/adapter-utils/execution-target";
 import { MAX_SANDBOX_SYNC_TIMEOUT_MS } from "@paperclipai/adapter-utils/sandbox-managed-runtime";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
@@ -1745,9 +1745,12 @@ function createSandboxEnvironmentDriver(
       // (verifyRecoverableNativeHarnessBackup). Without it nothing is
       // destroyed: the box is stopped and kept through the existing stop-only
       // owners, so billing stops and the disk stays (RFL 06:21Z). The source
-      // mismatch already keeps it from serving the next run.
+      // mismatch already keeps it from serving the next run. Fails closed: only
+      // a lease recorded with a KNOWN non-native adapter skips custody (RFL 06:33Z).
       const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
-      if ((input.adapterType === "paperclip_runner" || scope?.adapterType === "paperclip_runner")
+      const knownNonNative = input.adapterType !== "paperclip_runner" && typeof scope?.adapterType === "string"
+        && scope.adapterType !== "paperclip_runner" && (AGENT_ADAPTER_TYPES as readonly string[]).includes(scope.adapterType);
+      if (!knownNonNative
         && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
           stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }))) {
         const [stale] = await db.select().from(environmentLeases).where(and(
