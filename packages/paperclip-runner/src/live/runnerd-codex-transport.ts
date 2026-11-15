@@ -9778,7 +9778,7 @@ export async function probeNativeRunnerEnvironment(options: {
   workingDirectory?: string;
   transportOptions?: CapabilityRunnerdCodexTransportOptions;
   onCodexCredentialRefresh?: (filename: string) => Promise<void>;
-  onCleanupConfirmed?: () => Promise<void>;
+  onCleanupConfirmed?: (result?: { succeeded: boolean; failure?: unknown }) => Promise<void>;
 }): Promise<{
   provider: "codex" | "opencode" | "acpx" | "pi_rpc";
   piMetadata?: Record<string, unknown>;
@@ -10010,7 +10010,10 @@ export async function probeNativeRunnerEnvironment(options: {
     }
     const confirmCleanup = (retry = false) => {
       if (retry && cleanupCallbackFailed) { cleanupCallbackOperation = undefined; cleanupCallbackFailed = false; }
-      return cleanupCallbackOperation ??= Promise.resolve().then(() => options.onCleanupConfirmed?.())
+      return cleanupCallbackOperation ??= Promise.resolve().then(() => options.onCleanupConfirmed?.({
+        succeeded: failure === undefined && completed,
+        ...(failure !== undefined ? { failure } : {}),
+      }))
         .catch(error => { cleanupCallbackFailed = true; throw error; });
     };
     if (!teardownErrors.length && options.onCleanupConfirmed) {
