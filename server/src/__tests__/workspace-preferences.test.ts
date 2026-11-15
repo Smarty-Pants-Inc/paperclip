@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, companies, createDb, userWorkspacePreferences } from "@paperclipai/db";
+import { activityLog, agentConfigRevisions, agentRuntimeState, agentTaskSessions, agents, companies, createDb, userWorkspacePreferences } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { workspacePreferenceRoutes } from "../routes/workspace-preferences.js";
@@ -40,7 +40,7 @@ if (!support.supported) console.warn(`Workspace preference database tests unavai
 
   it("defaults to Coordinator without creating a row", async () => {
     const userId = randomUUID();
-    expect(await workspacePreferenceService(db).get(userId)).toEqual({ userId, coordinatorWorkspaceEnabled: true, timeZone: null, updatedAt: null });
+    expect(await workspacePreferenceService(db).get(userId)).toEqual({ userId, coordinatorWorkspaceEnabled: true, timeZone: null, agentReasoningDisplay: {}, updatedAt: null });
     expect(await db.select().from(userWorkspacePreferences).where(eq(userWorkspacePreferences.userId, userId))).toHaveLength(0);
   });
 
@@ -109,6 +109,85 @@ if (!support.supported) console.warn(`Workspace preference database tests unavai
   it("rolls the preference back when the audit cannot be persisted", async () => {
     const userId = randomUUID();
     await expect(workspacePreferenceService(db).set(randomUUID(), userId, { coordinatorWorkspaceEnabled: true })).rejects.toThrow();
-    expect(await workspacePreferenceService(db).get(userId)).toEqual({ userId, coordinatorWorkspaceEnabled: true, timeZone: null, updatedAt: null });
+    expect(await workspacePreferenceService(db).get(userId)).toEqual({ userId, coordinatorWorkspaceEnabled: true, timeZone: null, agentReasoningDisplay: {}, updatedAt: null });
+  });
+
+  // Reasoning display: the person's choice per agent, set on the agent's page.
+  // It is stored here, never in the agent record, so saving it is not an
+  // agent-configuration change and cannot start a fresh thread (#20303).
+  async function agent(companyId: string, adapterType = "codex_local") {
+    const [row] = await db.insert(agents).values({ companyId, name: "Reasoner", role: "engineer", status: "active",
+      adapterType, adapterConfig: { model: "gpt-test" }, runtimeConfig: { heartbeat: { enabled: false } }, permissions: {} }).returning();
+    return row!;
+  }
+
+  it("saves reasoning display per agent for this person only, merging agents and clearing with null", async () => {
+    const companyId = await company(), userId = randomUUID(), otherUser = randomUUID();
+    const first = await agent(companyId), second = await agent(companyId);
+    const saved = await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: first.id, display: "inline" } }).expect(200);
+    expect(saved.body).toMatchObject({ userId, coordinatorWorkspaceEnabled: true, agentReasoningDisplay: { [first.id]: "inline" } });
+    await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: second.id, display: "fold" } }).expect(200);
+    const mine = await request(app(actor(companyId, userId))).get("/api/workspace-preferences/me").expect(200);
+    expect(mine.body.agentReasoningDisplay).toEqual({ [first.id]: "inline", [second.id]: "fold" });
+    expect((await workspacePreferenceService(db).get(otherUser)).agentReasoningDisplay).toEqual({});
+    // Other personal fields are untouched by a reasoning save, and vice versa.
+    await request(app(actor(companyId, userId))).put(url(companyId)).send({ timeZone: "Europe/Paris" }).expect(200);
+    expect(await workspacePreferenceService(db).get(userId)).toMatchObject({
+      timeZone: "Europe/Paris", agentReasoningDisplay: { [first.id]: "inline", [second.id]: "fold" } });
+    await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: first.id, display: null } }).expect(200);
+    expect((await workspacePreferenceService(db).get(userId)).agentReasoningDisplay).toEqual({ [second.id]: "fold" });
+  });
+
+  it("rejects reasoning display for another company's agent, an unknown agent and bad values", async () => {
+    const companyId = await company(), foreignId = await company(), userId = randomUUID();
+    const foreign = await agent(foreignId);
+    await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: foreign.id, display: "inline" } }).expect(404);
+    await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: randomUUID(), display: "inline" } }).expect(404);
+    const own = await agent(companyId);
+    for (const body of [
+      { agentReasoningDisplay: { agentId: own.id, display: "expanded" } },
+      { agentReasoningDisplay: { agentId: "not-a-uuid", display: "inline" } },
+      { agentReasoningDisplay: { agentId: own.id } },
+      { agentReasoningDisplay: { [own.id]: "inline" } },
+    ]) {
+      await request(app(actor(companyId, userId))).put(url(companyId)).send(body).expect(400);
+    }
+    expect((await workspacePreferenceService(db).get(userId)).agentReasoningDisplay).toEqual({});
+  });
+
+  it("does not touch the agent row or its sessions, so saving never starts a fresh thread (#20303)", async () => {
+    const companyId = await company(), userId = randomUUID();
+    const row = await agent(companyId);
+    await db.insert(agentConfigRevisions).values({ companyId, agentId: row.id, source: "patch", changedKeys: ["adapterConfig"],
+      beforeConfig: {}, afterConfig: { adapterConfig: row.adapterConfig } });
+    await db.insert(agentTaskSessions).values({ companyId, agentId: row.id, adapterType: row.adapterType, taskKey: "issue:reasoning",
+      sessionParamsJson: { sessionId: "provider-thread-1" }, sessionDisplayId: "provider-thread-1" });
+    await db.insert(agentRuntimeState).values({ agentId: row.id, companyId, adapterType: row.adapterType, sessionId: "provider-thread-1" });
+    const snapshot = async () => ({
+      agent: await db.select().from(agents).where(eq(agents.id, row.id)),
+      revisions: await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, row.id)),
+      sessions: await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, row.id)),
+      runtime: await db.select().from(agentRuntimeState).where(eq(agentRuntimeState.agentId, row.id)),
+    });
+    const before = await snapshot();
+    expect(before.agent).toHaveLength(1);
+    for (const display of ["inline", "fold", null] as const) {
+      await request(app(actor(companyId, userId))).put(url(companyId))
+        .send({ agentReasoningDisplay: { agentId: row.id, display } }).expect(200);
+    }
+    await request(app(actor(companyId, userId))).put(url(companyId))
+      .send({ agentReasoningDisplay: { agentId: row.id, display: "inline" } }).expect(200);
+    // Byte-for-byte the same agent (config, runtimeConfig, updatedAt), the same
+    // config revisions and the same provider sessions: no new generation.
+    expect(await snapshot()).toEqual(before);
+    const audit = await db.select().from(activityLog).where(and(eq(activityLog.actorId, userId), eq(activityLog.companyId, companyId)));
+    expect(audit.map(event => [event.action, event.entityType])).toEqual(
+      Array(4).fill(["workspace_preferences.updated", "user_preference"]));
+    expect((await workspacePreferenceService(db).get(userId)).agentReasoningDisplay).toEqual({ [row.id]: "inline" });
   });
 });
