@@ -4,7 +4,8 @@ import { useIssueRowDetails } from "../hooks/useIssueRowDetails";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { topRenderedNavEntryRefs, usePreloadTaskChats } from "../hooks/usePreloadTaskChats";
 import { IssueRowDetailsNotice } from "./IssueRowDetailsNotice";
-import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
+import { useShowAgentCreatedTasks, useShowHiddenTasks } from "../hooks/useShowAgentCreatedTasks";
+import { HiddenTaskBadge } from "./HiddenTaskBadge";
 import { useIssueHierarchyContext } from "../hooks/useIssueHierarchyContext";
 import { includeIssueHierarchyContext } from "../lib/issue-hierarchy-context";
 import { AgentIdentity } from "@/components/AgentIdentity";
@@ -494,6 +495,8 @@ interface IssuesListProps {
    */
   parentIssueIdForCostSummary?: string;
   enableAgentCreatedVisibilityFilter?: boolean;
+  /** Offer Show hidden tasks; the page must fetch with `includeHidden`. */
+  enableHiddenVisibilityFilter?: boolean;
   hasMoreIssues?: boolean;
   isLoadingMoreIssues?: boolean;
   mutedIssueIds?: Set<string>;
@@ -749,6 +752,7 @@ function StreamlinedIssuesList({
   showProgressSummary = false,
   parentIssueIdForCostSummary,
   enableAgentCreatedVisibilityFilter = false,
+  enableHiddenVisibilityFilter = false,
   hasMoreIssues = false,
   isLoadingMoreIssues = false,
   mutedIssueIds,
@@ -846,6 +850,12 @@ function StreamlinedIssuesList({
     setViewState((previous) => previous.showAgentCreatedTasks === showAgentCreatedTasks
       ? previous : { ...previous, showAgentCreatedTasks });
   }, [enableAgentCreatedVisibilityFilter, showAgentCreatedTasks]);
+  const showHiddenTasks = useShowHiddenTasks(selectedCompanyId, viewStateKey);
+  useEffect(() => {
+    if (!enableHiddenVisibilityFilter) return;
+    setViewState((previous) => (previous.showHiddenTasks === true) === showHiddenTasks
+      ? previous : { ...previous, showHiddenTasks });
+  }, [enableHiddenVisibilityFilter, showHiddenTasks]);
   const [assigneePickerIssueId, setAssigneePickerIssueId] = useState<string | null>(null);
   const [assigneeSearch, setAssigneeSearch] = useState("");
   const [issueSearch, setIssueSearch] = useState(initialSearch ?? "");
@@ -2013,6 +2023,7 @@ function StreamlinedIssuesList({
             currentUserId={currentUserId}
             enableExternalObjectFilters={externalObjectsEnabled}
             enableAgentCreatedVisibilityFilter={enableAgentCreatedVisibilityFilter}
+            enableHiddenVisibilityFilter={enableHiddenVisibilityFilter}
             iconOnly
             presentation={rowPresentation === "task" ? "streamlined" : "legacy"}
           />
@@ -2344,6 +2355,7 @@ function StreamlinedIssuesList({
                                 </Badge>
                               )
                             ) : null}
+                            {issue.hiddenAt ? <HiddenTaskBadge /> : null}
                             {isSuccessfulRunHandoffRequired(issue) ? (
                               <Badge variant="outline"
                                 className="ml-1.5 border-amber-400/45 bg-amber-50/60 px-1.5 text-(length:--text-nano) text-amber-700 dark:border-amber-300/35 dark:bg-amber-400/10 dark:text-amber-300"
