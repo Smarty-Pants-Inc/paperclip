@@ -322,7 +322,7 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
         ...projectedConnectionHeaders(connection),
         ...(await resolveCredentialHeaders(connection, actor, { forceRefresh: true })),
       };
-      response = await sendToolsList(headers);
+      response = await relistAfterCredentialRefresh();
     }
     if (
       response.status === 401 &&
@@ -598,7 +598,7 @@ export function createToolCatalogDiscovery(db: Db, { now, audit, secrets, creden
     assertSupportedConnection(connection);
     await assertConnectorConnectionSetupEnabled(connection);
     if (connection.connectionPurpose === "ai") throw unprocessable("AI connections provide runtime authentication, not tool actions");
-    if (isGitHubAppConnection(connection)) return remoteTools(connection, undefined, actor);
+    if (isGitHubAppConnection(connection)) return remoteTools(connection, undefined, actor, undefined, unavailableServices, listOptions);
     const restConnector = restConnectorFor(connection);
     if (restConnector) {
       const headers = credentialHeaders ?? await resolveCredentialHeaders(connection, actor);
