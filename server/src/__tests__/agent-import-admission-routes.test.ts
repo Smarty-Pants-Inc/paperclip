@@ -14,6 +14,16 @@ import { agentRoutes } from "../routes/agents.js";
 import { companyRoutes } from "../routes/companies.js";
 import { teamsCatalogRoutes } from "../routes/teams-catalog.js";
 import { listCatalogTeams } from "../services/teams-catalog.js";
+import { secretService } from "../services/secrets.js";
+
+// The non-local hire fixture from agent-report-runtime-autonomy.test.ts:257-260.
+// Keep runner selection explicit: "legacy" would convert this back to pi_local
+// and measure the local host guard instead of the runner-backed hire policy.
+const runnerHire = {
+  adapterType: "paperclip_runner",
+  runner: "paperclip",
+  adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "high" },
+} as const;
 
 const support = await getEmbeddedPostgresTestSupport();
 const describePg = support.supported ? describe : describe.skip;
@@ -64,7 +74,8 @@ describePg("agent-actor import admission fence", () => {
     const files: Record<string, string> = {
       "COMPANY.md": `---\nname: Imported\nincludes:\n${proposed.map(a => `  - agents/${a.slug}/AGENTS.md`).join("\n")}\n---\n`,
       ".paperclip.yaml": stringify({ schema: "paperclip/v1", agents: Object.fromEntries(proposed.map(a => [a.slug, {
-        role: "engineer", adapter: { type: a.adapterType ?? "codex_local", runner: "legacy", config: a.config ?? {} },
+        role: "engineer", adapter: { type: a.adapterType ?? "codex_local",
+          runner: a.adapterType === runnerHire.adapterType ? runnerHire.runner : "legacy", config: a.config ?? {} },
         runtime: a.runtime ?? {}, budgetMonthlyCents: a.budgetMonthlyCents ?? 0,
         permissionGrants: a.permissionGrants ?? [],
       }])) }),
@@ -89,9 +100,11 @@ describePg("agent-actor import admission fence", () => {
     const before = await snapshot(companyId);
     const response = await request(app(actor)).post(`/api/companies/${companyId}/imports/apply`).send(bundle(companyId, proposed));
     const after = await snapshot(companyId);
-    console.log(JSON.stringify({ row, status: response.status, error: response.body.error, before, after }));
+    console.log(JSON.stringify({ row, status: response.status, error: response.body.error, before, after,
+      proposedAdapterType: proposed[0]?.adapterType ?? "codex_local" }));
     expect.soft([403, 422], JSON.stringify(response.body)).toContain(response.status);
     expect.soft(after).toEqual(before);
+    return { companyId, actor, response, after };
   }
 
   it.each(["command", "args", "cwd"])("R1 refuses submitted local host %s without writes", async key => {
@@ -99,7 +112,17 @@ describePg("agent-actor import admission fence", () => {
   });
   it.each(["string", "plain"])("R2 refuses a %s credential without writes", async shape => {
     const value = "sk-synthetic-fixture-not-a-real-credential";
-    await refused(`R2:${shape}`, [{ slug: "credential", config: { env: { OPENAI_API_KEY: shape === "plain" ? { type: "plain", value } : value } } }]);
+    const adapterConfig = { ...runnerHire.adapterConfig,
+      env: { OPENAI_API_KEY: shape === "plain" ? { type: "plain", value } : value } };
+    const f = await refused(`R2:${shape}`, [{ slug: "credential", adapterType: runnerHire.adapterType, config: adapterConfig }]);
+    const hired = await request(app(f.actor)).post(`/api/companies/${f.companyId}/agent-hires`)
+      .send({ ...runnerHire, name: "credential-hire", role: "engineer", adapterConfig });
+    const afterHire = await snapshot(f.companyId);
+    console.log(JSON.stringify({ row: `R2:${shape}:paired`, importStatus: f.response.status, hireStatus: hired.status,
+      hireError: hired.body.error, afterImport: f.after, afterHire }));
+    expect.soft([403, 422], JSON.stringify(hired.body)).toContain(hired.status);
+    expect.soft(f.response.status >= 200 && f.response.status < 300).toBe(hired.status >= 200 && hired.status < 300);
+    expect.soft(afterHire).toEqual(f.after);
   });
 
   it.each([
@@ -107,18 +130,40 @@ describePg("agent-actor import admission fence", () => {
     ["TZ plain binding", { TZ: { type: "plain", value: "UTC" } }, true],
     ["credential string", { OPENAI_API_KEY: "sk-synthetic-fixture" }, false],
     ["credential plain binding", { OPENAI_API_KEY: { type: "plain", value: "sk-synthetic-fixture" } }, false],
-  ] as const)("R2b import and hire have the same env answer: %s", async (label, env, allowed) => {
+    ["secret_ref", {}, true],
+  ] as const)("R2b import and hire have the same env answer: %s", async (label, suppliedEnv, allowed) => {
     const { companyId, actor } = await seed();
+    let env: Record<string, unknown> = suppliedEnv;
+    if (label === "secret_ref") {
+      // Real synthetic fixture secret, bound to the caller, not an invalid id
+      // that could turn a downstream missing-secret error into false evidence.
+      const secrets = secretService(db);
+      const secret = await secrets.create(companyId, { name: "import-fence-fixture", provider: "local_encrypted",
+        value: "sk-synthetic-fixture-not-a-real-credential" });
+      await secrets.createBinding({ companyId, secretId: secret.id, targetType: "agent", targetId: actor.agentId!,
+        configPath: "env.OPENAI_API_KEY" });
+      env = { OPENAI_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+    }
     const instance = app(actor);
+    const adapterConfig = { ...runnerHire.adapterConfig, env };
+    const beforeImport = await snapshot(companyId);
     const imported = await request(instance).post(`/api/companies/${companyId}/imports/apply`)
-      .send(bundle(companyId, [{ slug: "env-import", config: { env } }]));
+      .send(bundle(companyId, [{ slug: "env-import", adapterType: runnerHire.adapterType, config: adapterConfig }]));
+    const afterImport = await snapshot(companyId);
     const hired = await request(instance).post(`/api/companies/${companyId}/agent-hires`).send({
-      name: "env-hire", role: "engineer", adapterType: "codex_local", runner: "legacy", adapterConfig: { env },
+      ...runnerHire, name: "env-hire", role: "engineer", adapterConfig,
     });
+    const afterHire = await snapshot(companyId);
     const importAllowed = imported.status >= 200 && imported.status < 300;
     const hireAllowed = hired.status >= 200 && hired.status < 300;
     console.log(JSON.stringify({ row: `R2b:${label}`, importStatus: imported.status, hireStatus: hired.status,
-      importError: imported.body.error, hireError: hired.body.error, importAllowed, hireAllowed, expectedAllowed: allowed }));
+      importError: imported.body.error, hireError: hired.body.error, importAllowed, hireAllowed, expectedAllowed: allowed,
+      requestedAdapterType: runnerHire.adapterType, requestedProvider: runnerHire.adapterConfig.provider,
+      importedAdapterType: (await db.select().from(agents).where(eq(agents.companyId, companyId)))
+        .find(a => a.name === "env-import")?.adapterType,
+      beforeImport, afterImport, afterHire }));
+    if (!allowed) expect.soft(afterImport).toEqual(beforeImport);
+    if (!hireAllowed) expect.soft(afterHire).toEqual(afterImport);
     expect.soft(importAllowed, JSON.stringify(imported.body)).toBe(allowed);
     expect.soft(hireAllowed, JSON.stringify(hired.body)).toBe(allowed);
     expect.soft(importAllowed).toBe(hireAllowed);
