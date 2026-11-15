@@ -39,6 +39,7 @@ export const createServiceCostEventSchema = costEventFields.extend({
 export type CreateCostEvent = z.input<typeof createCostEventSchema>;
 
 export const updateBudgetSchema = z.object({
+  principalRequestUrl: z.string().trim().max(4096).optional(),
   budgetMonthlyCents: z.number().int().nonnegative(),
 });
 

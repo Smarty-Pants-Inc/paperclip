@@ -88,6 +88,8 @@ export interface BudgetOverview {
 }
 
 export interface BudgetPolicyUpsertInput {
+  /** Task/comment link supplied by a primary for the company-budget audit. */
+  principalRequestUrl?: string;
   scopeType: BudgetScopeType;
   scopeId: string;
   metric?: BudgetMetric;

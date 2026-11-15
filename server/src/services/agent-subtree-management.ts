@@ -1,9 +1,8 @@
-import { agents, budgetPolicies, type Db } from "@paperclipai/db";
-import { addCents, compareCents, type PermissionKey } from "@paperclipai/shared";
+import { agents, projects, type Db } from "@paperclipai/db";
+import { type BudgetScopeType, type PermissionKey } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { forbidden } from "../errors.js";
 import { authorizationService, authorizationDeniedDetails, isAgentInSubtree } from "./authorization.js";
-import { computeObservedSpend } from "./budget-exposure.js";
 import { lockAccountingCompany } from "./accounting-transaction.js";
 
 type Actor = Parameters<ReturnType<typeof authorizationService>["decide"]>[0]["actor"];
@@ -121,21 +120,33 @@ function onlySubtreeRoots(scope: Record<string, unknown>): string[] | null {
 export async function assertSubordinateBudgetChange(db: Db, actor: Actor, target: Target, amount: number) {
   if (actor.type !== "agent") return;
   await assertCanManageSubordinateAgent(db, actor, target);
-  const [lead] = await db.select().from(agents).where(and(
-    eq(agents.id, actor.agentId!), eq(agents.companyId, target.companyId),
-  ));
-  if (!lead) throw forbidden("Agent not found");
-  const [policy] = await db.select().from(budgetPolicies).where(and(
-    eq(budgetPolicies.companyId, target.companyId), eq(budgetPolicies.scopeType, "agent"),
-    eq(budgetPolicies.scopeId, lead.id), eq(budgetPolicies.metric, "billed_cents"),
-    eq(budgetPolicies.windowKind, "calendar_month_utc"),
-  ));
-  const limit = policy ? (policy.isActive ? policy.amount : 0) : lead.budgetMonthlyCents;
-  const observed = await computeObservedSpend(db, { companyId: target.companyId, scopeType: "agent",
-    scopeId: lead.id, metric: "billed_cents", windowKind: "calendar_month_utc" });
-  // Zero disables enforcement, so it is not a zero-dollar delegated allowance.
-  // Use the budget engine's exact ledger/live/reservation exposure, not the cached agent spend.
-  if (!Number.isSafeInteger(amount) || amount <= 0 || compareCents(addCents(amount, observed.ledgerCents, observed.effectiveHeldCents), limit) > 0) {
-    throw forbidden("A subordinate budget must be positive and no greater than the caller's remaining budget");
+  // Setting a report's policy is not spending against the hirer's allowance.
+  // Zero means unlimited for this scope; company enforcement remains the cap.
+  if (!Number.isSafeInteger(amount) || amount < 0) throw forbidden("A subordinate budget must be a nonnegative integer");
+}
+
+/** Called inside the existing company-locked budget writer, shared with
+ * reportsTo mutations. Role/title do not confer primary authority. */
+export async function assertAgentBudgetPolicyChange(
+  db: Db, actor: Actor, companyId: string,
+  scope: { scopeType: BudgetScopeType; scopeId: string; amount?: number },
+) {
+  if (actor.type !== "agent") return;
+  if (!actor.agentId || actor.companyId !== companyId) throw forbidden("Budget scope must belong to the caller's company");
+  if (scope.scopeType === "agent") {
+    await assertCanManageSubordinateAgent(db, actor, { id: scope.scopeId, companyId });
+    if (scope.amount !== undefined) await assertSubordinateBudgetChange(db, actor, { id: scope.scopeId, companyId }, scope.amount);
+    return;
+  }
+  const [caller] = await db.select().from(agents).where(and(eq(agents.id, actor.agentId), eq(agents.companyId, companyId)));
+  if (!caller) throw forbidden("Agent not found");
+  if (scope.scopeType === "company") {
+    if (scope.scopeId !== companyId || caller.reportsTo !== null) throw forbidden("Only a primary agent (reportsTo null) may change the company budget");
+    return;
+  }
+  const [project] = await db.select().from(projects).where(and(eq(projects.id, scope.scopeId), eq(projects.companyId, companyId))).for("update");
+  if (!project?.leadAgentId) throw forbidden("Agents may change only the budgets of projects they lead");
+  if (project.leadAgentId !== actor.agentId) {
+    await assertCanManageSubordinateAgent(db, actor, { id: project.leadAgentId, companyId });
   }
 }

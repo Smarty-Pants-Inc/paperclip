@@ -357,10 +357,12 @@ export function costRoutes(
     "/companies/:companyId/budgets/policies",
     validate(upsertBudgetPolicySchema),
     async (req, res) => {
-      assertBoard(req);
+      if (req.actor.type !== "agent") assertBoard(req);
       const companyId = req.params.companyId as string;
       assertCompanyAccess(req, companyId);
-      const summary = await budgets.upsertPolicy(companyId, req.body, req.actor.userId ?? "board");
+      const summary = await budgets.upsertPolicy(companyId, req.body,
+        req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+        req.actor.type === "agent" ? req.actor.agentId : undefined, req.actor);
       res.json(summary);
     },
   );
@@ -398,7 +400,7 @@ export function costRoutes(
   });
 
   router.patch("/companies/:companyId/budgets", validate(updateBudgetSchema), async (req, res) => {
-    assertBoard(req);
+    if (req.actor.type !== "agent") assertBoard(req);
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     await budgets.upsertPolicy(
@@ -406,11 +408,14 @@ export function costRoutes(
       {
         scopeType: "company",
         scopeId: companyId,
+        principalRequestUrl: req.body.principalRequestUrl,
         amount: req.body.budgetMonthlyCents,
         isActive: req.body.budgetMonthlyCents > 0,
         windowKind: "calendar_month_utc",
       },
-      req.actor.userId ?? "board",
+      req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+      req.actor.type === "agent" ? req.actor.agentId : undefined,
+      req.actor,
     );
 
     res.json(await companies.getById(companyId));
@@ -435,6 +440,7 @@ export function costRoutes(
       },
       req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       req.actor.type === "agent" ? req.actor.agentId : undefined,
+      req.actor,
     );
 
     res.json(await agents.getById(agentId));
