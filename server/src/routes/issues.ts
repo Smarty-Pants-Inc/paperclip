@@ -14868,7 +14868,10 @@ export function issueRoutes(
   ): Promise<"defer_final_status" | undefined> {
     const runId = req.actor.type === "agent" ? req.actor.runId : null;
     if (!runId || !req.actor.agentId || req.actor.agentId !== issue.assigneeAgentId) return;
-    if (runId !== issue.executionRunId && runId !== issue.checkoutRunId) return;
+    const holdsExecutionLock = runId === issue.executionRunId || runId === issue.checkoutRunId;
+    const stageDecisionRequested = options.allowStageDecision && (requestedStatus === "done" || requestedStatus === "in_progress") && issue.status === "in_review" &&
+      activeExecutionParticipantAgentId(issue) === req.actor.agentId;
+    if (!holdsExecutionLock && !stageDecisionRequested) return;
     if (requestedStatus === undefined || requestedStatus === issue.status) return;
     if (isConversation(issue)) return;
     const keepsAssignment =
@@ -14878,10 +14881,13 @@ export function issueRoutes(
     const run = await heartbeat.getRun(runId);
     if (!run || run.runtimeMode !== "native" || run.status !== "running"
       || run.agentId !== req.actor.agentId || run.companyId !== issue.companyId) return;
-    if (options.allowStageDecision && (requestedStatus === "done" || requestedStatus === "in_progress") && issue.status === "in_review" &&
-        activeExecutionParticipantAgentId(issue) === req.actor.agentId) {
-      return "defer_final_status";
+    if (!holdsExecutionLock) {
+      throw conflict("Only the run holding the task's execution lock can record its native review decision.", {
+        code: "native_review_decision_run_lock", actorRunId: runId,
+        executionRunId: issue.executionRunId, checkoutRunId: issue.checkoutRunId,
+      });
     }
+    if (stageDecisionRequested) return "defer_final_status";
     // A blocker that the dependency rules reject anyway keeps its specific
     // error; otherwise the run reports the block with paperclip_block.
     if (Array.isArray(req.body.blockedByIssueIds) && req.body.blockedByIssueIds.length > 0) {
