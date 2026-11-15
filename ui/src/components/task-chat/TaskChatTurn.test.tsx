@@ -187,6 +187,7 @@ describe("TaskChatTurn", () => {
       finalResponse: { id: "response", kind: "message", author: "agent", text: "Saved response" } });
     expect(container.textContent).toContain("Assistant");
     expect(container.textContent).toContain("Saved response");
+    expect(container.querySelector('[data-testid="task-chat-agent-bubble"]')?.getAttribute("data-conversation-text")).toBe("final");
     expect(container.textContent).toContain("c1");
     expect(container.textContent).not.toContain("Stopped");
     expect(container.textContent).not.toContain("Worked");
