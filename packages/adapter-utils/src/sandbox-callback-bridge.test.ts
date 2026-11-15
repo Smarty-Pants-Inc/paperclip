@@ -2545,6 +2545,100 @@ describe("sandbox callback bridge", () => {
     await worker.stop({ drainTimeoutMs: 10 });
   });
 
+  it("does not lose requests at the long-poll iteration-timeout edge", async () => {
+    const runCase = async (arrival: "before-list" | "during-list") => {
+      vi.useFakeTimers();
+      const queueDir = `/virtual-bridge/timeout-edge-${arrival}`;
+      const directories = sandboxCallbackBridgeDirectories(queueDir);
+      const requestPath = path.posix.join(directories.requestsDir, "req-edge.json");
+      const requestBodies = new Map<string, string>();
+      const responseWrites: Array<{ path: string; body: string }> = [];
+      const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+      const originalListing = new Map<string, string>();
+      let listCalls = 0;
+      let signalFirstListStarted!: () => void;
+      const firstListStarted = new Promise<void>((resolve) => { signalFirstListStarted = resolve; });
+      let resolveFirstList!: (names: string[]) => void;
+      let releaseIdleList!: () => void;
+
+      const client: SandboxCallbackBridgeQueueClient = {
+        supportsListWait: true,
+        maxListWaitMs: 7_000,
+        makeDir: async () => {},
+        makeDirs: async () => {},
+        listJsonFiles: async (dir) => {
+          if (dir !== directories.requestsDir) return [];
+          listCalls += 1;
+          if (listCalls === 1) {
+            // Snapshot what the timed-out Boat listing would eventually return,
+            // but keep it pending beyond the 10s iteration budget.
+            for (const name of requestBodies.keys()) originalListing.set(name, name);
+            signalFirstListStarted();
+            return await new Promise<string[]>((resolve) => { resolveFirstList = resolve; });
+          }
+          if (listCalls === 2) return [...requestBodies.keys()].map((name) => path.posix.basename(name));
+          if (listCalls === 3) {
+            // A real long-poll waits for work; keep the subsequent empty poll
+            // blocked so the fake client cannot create a microtask-only loop.
+            return await new Promise<string[]>((resolve) => {
+              releaseIdleList = () => resolve([]);
+            });
+          }
+          return [];
+        },
+        fileSize: async () => 0,
+        readTextFile: async (file) => requestBodies.get(file) ?? "",
+        writeTextFile: async () => {},
+        writeResponseFile: async (file, body) => {
+          responseWrites.push({ path: file, body });
+          return { wrote: true };
+        },
+        rename: async () => {},
+        remove: async (file) => { requestBodies.delete(file); },
+      };
+
+      if (arrival === "before-list") requestBodies.set(requestPath, bridgeRequestJson("req-edge"));
+      const worker = await startSandboxCallbackBridgeWorker({
+        client,
+        queueDir,
+        iterationTimeoutMs: 10_000,
+        watchdogTimeoutMs: 60_000,
+        runtimeSpan,
+        authorizeRequest: async () => null,
+        handleRequest: async () => ({ status: 200, body: "real-handler-result" }),
+      });
+      try {
+        await firstListStarted;
+        if (arrival === "during-list") requestBodies.set(requestPath, bridgeRequestJson("req-edge"));
+        expect(originalListing.has(requestPath)).toBe(arrival === "before-list");
+
+        await vi.advanceTimersByTimeAsync(10_001);
+        // The poll timeout backs off and retries; the next listing sees the file.
+        await vi.advanceTimersByTimeAsync(250);
+        expect(listCalls).toBeGreaterThanOrEqual(2);
+        expect(workerErrors.some((message) => message.includes("timed out"))).toBe(true);
+        const answers = responseWrites.filter((write) => write.path === path.posix.join(directories.responsesDir, "req-edge.json"));
+        expect(answers).toHaveLength(1);
+        expect(JSON.parse(answers[0]!.body)).toMatchObject({
+          id: "req-edge",
+          status: 200,
+          body: "real-handler-result",
+        });
+      } finally {
+        // Settle the abandoned fake Boat call so it cannot outlive this case.
+        resolveFirstList(originalListing.has(requestPath) ? ["req-edge.json"] : []);
+        releaseIdleList?.();
+        const stopping = worker.stop({ drainTimeoutMs: 0 });
+        await vi.advanceTimersByTimeAsync(0);
+        await stopping;
+        vi.useRealTimers();
+      }
+    };
+
+    await runCase("during-list");
+    await runCase("before-list");
+  });
+
   it("does not abandon an in-flight handler, so a started mutation is not applied twice", async () => {
     // Prove the completion fence for a request whose handler already started. The
     // per-iteration timeout rejects the wrapper but does not stop the handler, so
