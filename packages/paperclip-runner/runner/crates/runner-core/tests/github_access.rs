@@ -94,6 +94,7 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
         .to_string()
         .contains("ghp_RFL_SENTINEL_TOKEN"));
     assert_eq!(request.frame().as_object().unwrap().len(), 6);
+    assert!(ingress.try_next_request().is_none(), "only one PRP frame is forwarded");
 
     request
         .respond(json!({
@@ -109,6 +110,37 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
         response.contains("{\"status\":\"available\"}"),
         "{response}"
     );
+}
+
+#[test]
+fn private_socket_forwards_only_the_exact_github_credentials_route() {
+    let mut ingress = GitHubAccessIngress::start().expect("start private Unix socket ingress");
+    for (method, path, expected_status) in [
+        ("GET", "/runtime-tools/github/credentials", 405),
+        ("POST", "/runtime-tools/other", 404),
+        ("POST", "/../runtime-tools/github/credentials", 404),
+        ("POST", "/%2e%2e/runtime-tools/github/credentials", 404),
+        ("POST", "/runtime-tools/github/credentials?scope=repo", 404),
+    ] {
+        let mut client = connect(ingress.socket_path());
+        write!(
+            client,
+            "{method} {path} HTTP/1.1\r\nHost: paperclip.local\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        )
+        .unwrap();
+        let response = read_response(&mut client);
+        assert!(response.starts_with(&format!("HTTP/1.1 {expected_status} ")), "{method} {path}: {response}");
+        let error = if expected_status == 405 {
+            r#"{"error":"Method not allowed"}"#
+        } else {
+            r#"{"error":"Not found"}"#
+        };
+        assert!(response.contains(error), "{method} {path}: {response}");
+        assert!(
+            ingress.try_next_request().is_none(),
+            "{method} {path} must not create a PRP frame"
+        );
+    }
 }
 
 #[test]
