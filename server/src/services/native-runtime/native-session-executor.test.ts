@@ -14261,6 +14261,7 @@ describe("native warm session supervision", () => {
 
       let completed: Awaited<ReturnType<typeof closeIdleWarmNativeSessionsForRestart>> | undefined;
       let closing: Promise<void> | undefined;
+      let modeledElapsedMs = 0;
       const flush = async () => { for (let index = 0; index < 10; index++) await Promise.resolve(); };
       try {
         closing = closeIdleWarmNativeSessionsForRestart().then(result => { completed = result; });
@@ -14269,6 +14270,7 @@ describe("native warm session supervision", () => {
         for (let tick = 0; tick < 3; tick++) {
           while (finishCloseDelays.length === 0) await flush();
           const pending = finishCloseDelays.splice(0);
+          modeledElapsedMs += 6_000;
           pending.forEach(finish => finish());
           await flush();
         }
@@ -14277,6 +14279,8 @@ describe("native warm session supervision", () => {
           failures: [expect.objectContaining({ reason: expect.stringContaining("fixture close failure") })],
         });
         expect(closeFns.map(close => close.mock.calls.length)).toEqual(Array(14).fill(1));
+        expect(modeledElapsedMs).toBe(18_000);
+        expect(modeledElapsedMs).toBeLessThan(20_000);
         await closing;
       } finally {
         for (let tick = 0; closing && completed === undefined && tick < 12; tick++) {
