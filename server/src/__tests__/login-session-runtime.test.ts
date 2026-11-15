@@ -51,6 +51,7 @@ function makeBinding(overrides: Partial<LoginPtySessionBinding> = {}): LoginPtyS
     environment: { id: "env-1", driver: "sandbox" } as never,
     lease: {
       id: "lease-1",
+      providerLeaseId: "provider-lease-9",
       metadata: { pluginId: "paperclip.daytona", provider: "daytona" },
     } as never,
     ...overrides,

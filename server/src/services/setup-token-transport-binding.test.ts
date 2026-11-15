@@ -603,6 +603,7 @@ describe("worker-bound live pseudo-terminal opener", () => {
       scope: SCOPE,
       environmentId: "env-1",
       leaseId: "lease-42",
+      acquiredProviderLeaseId: "provider-lease-9",
     });
     // The opener resolved the server lease id to the provider lease id.
     expect(getLeaseById).toHaveBeenCalledWith("lease-42");
@@ -656,6 +657,7 @@ describe("worker-bound live pseudo-terminal opener", () => {
         scope: { ...SCOPE, adapterType: "gemini_local" },
         environmentId: "env-1",
         leaseId: "lease-42",
+        acquiredProviderLeaseId: "provider-lease-9",
       }),
     ).rejects.toMatchObject({ status: 503 });
     expect(openLoginPtySession).not.toHaveBeenCalled();
@@ -672,7 +674,7 @@ describe("worker-bound live pseudo-terminal opener", () => {
     });
 
     await expect(
-      openLivePtySession({ scope: SCOPE, environmentId: "env-1", leaseId: "lease-42" }),
+      openLivePtySession({ scope: SCOPE, environmentId: "env-1", leaseId: "lease-42", acquiredProviderLeaseId: null }),
     ).rejects.toMatchObject({ status: 503 });
     // The opener never reached the worker manager.
     expect(openLoginPtySession).not.toHaveBeenCalled();
@@ -685,7 +687,7 @@ describe("worker-bound live pseudo-terminal opener", () => {
     });
 
     await expect(
-      openLivePtySession({ scope: SCOPE, environmentId: "env-1", leaseId: "missing" }),
+      openLivePtySession({ scope: SCOPE, environmentId: "env-1", leaseId: "missing", acquiredProviderLeaseId: null }),
     ).rejects.toMatchObject({ status: 503 });
   });
 });
