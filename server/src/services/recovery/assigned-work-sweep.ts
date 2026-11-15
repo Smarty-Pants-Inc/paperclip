@@ -309,10 +309,10 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           and not exists (select 1 from issue_comments comment
             where comment.company_id = assessment.company_id and comment.issue_id = assessment.issue_id
               and comment.author_type = 'user' and comment.created_by_run_id is null and comment.deleted_at is null
-              and greatest(comment.created_at, comment.updated_at) > assessment.created_at)
+              and greatest(comment.created_at, comment.updated_at) > result.created_at)
           and not exists (select 1 from issue_thread_interactions interaction
             where interaction.company_id = assessment.company_id and interaction.issue_id = assessment.issue_id
-              and greatest(interaction.created_at, interaction.updated_at, interaction.resolved_at) > assessment.created_at)
+              and greatest(interaction.created_at, interaction.updated_at, interaction.resolved_at) > result.created_at)
       `),
     ]);
 
