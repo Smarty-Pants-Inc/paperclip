@@ -1184,74 +1184,80 @@ async function closeIdleWarmNativeSessions(input: {
   let busy = 0;
   let failed = 0;
   const failures: WarmNativeSessionCloseFailure[] = [];
-  for (const [sessionId, entry] of [...warmNativeSessions]) {
-    if (input.canRetire && !input.canRetire()) break;
-    if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) {
-      continue;
-    }
-    if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
-      || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
-      // A busy turn can complete while another idle session is checkpointing.
-      // Fence that entry now so its eventual release cannot leave a new idle
-      // owner behind after the shutdown sweep has already passed it.
-      if (input.closeBusyOnRelease) entry.closeOnReleaseReason = input.reason;
-      busy += 1;
-      continue;
-    }
-    // The host owns retention after release; a quiet local handle needs no retirement for sleep.
-    if (input.canRetire && entry.released && !entry.closeOnReleaseReason) continue;
-    const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
-    if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
-    // Keep a fenced owner until both retirement and stopped collection succeed.
-    // Failure must not make a live directory eligible for a replacement owner.
-    entry.busy = true;
-    if (!detach) entry.closeOnReleaseReason = input.reason;
-    let forcedStopFailure: unknown;
-    const closing = Promise.resolve().then(() =>
-      detach ? detachReleasedWarmNativeSession(entry) : closeWarmNativeSession(entry, input.reason, input.forceStopUnsettled ? {
-        discardUnsettledSession: true,
-        onForcedStopFailed: error => { forcedStopFailure = error; },
-      } : undefined),
-    );
-    closingWarmNativeSessions.set(sessionId, closing);
-    try {
-      await closing;
-      forgetWarmNativeSession(sessionId, entry);
-      closed += 1;
-    } catch (error) {
-      if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
-      if (!detach && error instanceof AgentDirectoryOperationBusyError) {
+  const entries = [...warmNativeSessions];
+  let nextIndex = 0;
+  const closeNext = async (): Promise<void> => {
+    while (true) {
+      if (input.canRetire && !input.canRetire()) return;
+      const next = entries[nextIndex++];
+      if (!next) return;
+      const [sessionId, entry] = next;
+      if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) continue;
+      if (entry.busy || entry.preparingRunId || executingRunnerdSessionScopes.has(sessionId)
+        || (input.canRetire && (entry.instructionPreparationRunId || closingWarmNativeSessions.has(sessionId)))) {
+        // A busy turn can complete while another idle session is checkpointing.
+        // Fence that entry now so its eventual release cannot leave a new idle
+        // owner behind after the shutdown sweep has already passed it.
+        if (input.closeBusyOnRelease) entry.closeOnReleaseReason = input.reason;
         busy += 1;
         continue;
       }
-      const destroyed = !detach && input.forceStopUnsettled && input.db
-        ? await warmSandboxDestroyed(input.db, entry).catch(proofError => {
-          logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
-          return false;
-        })
-        : false;
-      if (destroyed) {
-        logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
-          providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
-        "warm native session's sandbox was already destroyed; released its owner");
+      // The host owns retention after release; a quiet local handle needs no retirement for sleep.
+      if (input.canRetire && entry.released && !entry.closeOnReleaseReason) continue;
+      const detach = input.detachReleased === true && entry.released === true && !entry.closeOnReleaseReason;
+      if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+      // Keep a fenced owner until both retirement and stopped collection succeed.
+      // Failure must not make a live directory eligible for a replacement owner.
+      entry.busy = true;
+      if (!detach) entry.closeOnReleaseReason = input.reason;
+      let forcedStopFailure: unknown;
+      const closing = Promise.resolve().then(() =>
+        detach ? detachReleasedWarmNativeSession(entry) : closeWarmNativeSession(entry, input.reason, input.forceStopUnsettled ? {
+          discardUnsettledSession: true,
+          onForcedStopFailed: error => { forcedStopFailure = error; },
+        } : undefined),
+      );
+      closingWarmNativeSessions.set(sessionId, closing);
+      try {
+        await closing;
         forgetWarmNativeSession(sessionId, entry);
         closed += 1;
-        continue;
+      } catch (error) {
+        if (detach) entry.closeOnReleaseReason = "released Runner local detach is unconfirmed";
+        if (!detach && error instanceof AgentDirectoryOperationBusyError) {
+          busy += 1;
+          continue;
+        }
+        const destroyed = !detach && input.forceStopUnsettled && input.db
+          ? await warmSandboxDestroyed(input.db, entry).catch(proofError => {
+            logger.warn({ err: proofError, runId: entry.runId }, "could not read the warm session's sandbox lease");
+            return false;
+          })
+          : false;
+        if (destroyed) {
+          logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+            providerLeaseId: entry.providerLeaseId ?? null, reason: input.reason, closeFailure: describeWarmCloseFailure(error) },
+          "warm native session's sandbox was already destroyed; released its owner");
+          forgetWarmNativeSession(sessionId, entry);
+          closed += 1;
+          continue;
+        }
+        failed += 1;
+        const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
+        failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+          providerLeaseId: entry.providerLeaseId ?? null,
+          reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
+      } finally {
+        entry.busy = false;
+        if (closingWarmNativeSessions.get(sessionId) === closing) {
+          closingWarmNativeSessions.delete(sessionId);
+        }
+        releaseIdleSessionToolAuthority(sessionId);
       }
-      failed += 1;
-      const forced = forcedStopFailure === undefined ? "" : `; forced Runner stop failed: ${describeWarmCloseFailure(forcedStopFailure)}`;
-      failures.push({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
-        providerLeaseId: entry.providerLeaseId ?? null,
-        reason: `${detach ? "released Runner detach failed" : "close failed"}: ${describeWarmCloseFailure(error)}${forced}` });
-    } finally {
-      entry.busy = false;
-      if (closingWarmNativeSessions.get(sessionId) === closing) {
-        closingWarmNativeSessions.delete(sessionId);
-      }
-      releaseIdleSessionToolAuthority(sessionId);
+      if (input.canRetire && !input.canRetire()) return;
     }
-    if (input.canRetire && !input.canRetire()) break;
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => closeNext()));
   if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
   return { closed, busy, failed, failures };
 }
