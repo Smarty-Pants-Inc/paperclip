@@ -1658,6 +1658,14 @@ A person's task Retry on a connected task first asks the chat retry owner to rep
 
 #### Impossible reconciliation: one automatic fresh-history boundary
 
+> **Superseded by follow-Paperclip Cut B.** The proven-gone admission gate below is
+> removed. This typed family now takes upstream's fresh-continuation fallback: a bounded
+> wait, then a fenced epoch or a new isolated workspace. The typed diagnostic channel
+> (`nativeFreshContinuationRefusal`) and the K=2 chain cap stay. When the cap is reached,
+> the unanswered-message sweep writes the one note ("Paperclip tried to continue this
+> task twice from its saved work, and both attempts failed. Your message and the saved
+> work are kept. Send a new message to try again."). The text below is historical.
+
 The typed refusal codes `native_controller_recovery_missing_evidence:snapshot_binding`, `native_controller_recovery_unsupported:metadata_format`, `runner_remote_state_unavailable`, `native_runner_launch_profile_mismatch`, and `native_runner_refresh_required` use the existing fresh-continuation owner, not a provider-text match, bounded same-run retry, or a bare failed-run reply. Runner prepare/attach carries an authenticated refusal code; a prepare result requiring refresh is consumed **before** the controller queues `session.open`. The refusing contender may not restore, poll, rewrite, or stop its predecessor's provider state. The additive refusal channel preserves distinct `provider_active_turn`, `provider_live_descendants`, `provider_active_goal`, `provider_config_changed`, `provider_contract_changed_same_run`, `provider_contract_changed`, and `provider_launch_profile_mismatch` codes through PRP and server completion. Old no-code and unknown receipts become only `provider_prepare_refused`; English diagnostics and serialized prose never promote them to launch-profile mismatch. The legacy recovery classifier remains unchanged; the fresh-history policy explicitly opts into the new channel. A structured `runner_remote_state_unavailable` code also survives the Codex recovery driver, backend adapter and native runtime boundary as `recoveryRefusalCode`; runtime recovery must not turn it into diagnostic-only text or bootstrap a replacement under a legacy policy. Only the exact structured code or its bounded error cause is accepted; old diagnostic-only errors and unknown codes are not promoted. Older controller rows that saved a whole reserved D10 code in `error` under the generic reconciliation envelope use the same strict stop gate. This accepts only the exact named code, never a code quoted inside prose or a provider-message field; removing it from permanent refusal must not accidentally send it through the generic isolation-only fallback.
 
 For this closed family, workspace isolation and elapsed time are **not** proof that the previous execution ended. [`freshThreadStopGate`](../server/src/services/native-runtime/fresh-thread-stop-gate.ts) checks every earlier lease belonging to the same issue/agent/native conversation, including an original stranded attempt when its later metadata-refused follow-up acquired no lease. It reuses [`hasConfirmedSandboxStopAndRetain`](../server/src/services/sandbox-stop-and-retain.ts) and the exact company/run/lease/provider/allocation-bound [`hasRemoteTerminationReceipt`](../server/src/services/remote-execution-termination.ts), with confirmation inside the acquired/released interval, no cleanup in flight and no other live allocation holder. Local recorded process ownership uses [`proveRunProcessGone`](../server/src/services/run-process-owner.ts). A successful RPC with no receipt, `stopping`, an expired lease label, a foreign receipt or a timeout cannot grant admission. The existing stop-only cleanup owner requests and confirms plugin release; a cleanup notification wakes disposition again when evidence lands. Periodic rechecks may discover evidence but never supply it. The separate standing remote marker/provider predicate remains [`remoteRunnerGenerationLost`](../server/src/services/native-runtime/native-session-executor.ts): exact absent-process exit 45, changed generation/boot, or a fresh bound provider record—not a timer.
@@ -1684,13 +1692,9 @@ The exact replay can also be refused after the click is accepted. This happens w
 
 ### Automatic fresh-continuation limits
 
-A permanent native conversation refusal outside the typed D10 family (for
-example, an indeterminate prior-owner terminal state) never starts an
-automatic fresh continuation. D10's metadata-format, snapshot-binding,
-remote-state, and prepare-refresh codes are not permanent conversation refusals;
-they use the proven-gone fresh-history boundary above. Recovery uses the same refusal classification as
-the execution blocker; the existing conversation notice remains the only note.
-Transient failures may create at most two fresh continuations per task and
+A native conversation refusal (typed or not) takes the same fresh-continuation
+fallback as any other system-owned failure, under the bound below; a refusal's
+text never decides admission (follow-Paperclip Cut B, R4). Transient failures may create at most two fresh continuations per task and
 source-run chain. The task lock serializes recording, and the existing recovery
 actions retain `freshContinuation.chainRootRunId` and `chainAttempt`. The bound
 counts durable records along `retryOfRunId` / previous-run context, including
@@ -2105,8 +2109,9 @@ The task card's Retry agrees with the task's execution blocker. When the card
 would offer Retry, it reads the blocker of a held workspace restore and the
 conversation's standing notice (the held-conversation notice that no later
 committed success on the same session superseded). Where the blocker refuses
-Retry, or the notice stands, the card offers no Retry, and it shows the notice's
-own text instead of the generic failure line. Both reads are batched for a list.
+Retry, the card offers no Retry. A standing notice is output only: the card shows
+its own text instead of the generic failure line, and never decides Retry by
+itself (follow-Paperclip Cut B, R4). Both reads are batched for a list.
 
 A server restart in the middle of a host-tool callback (for example an assigned
 app tool or `connections_search`) must not cause that gate. The replacement

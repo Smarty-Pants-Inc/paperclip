@@ -12,16 +12,14 @@ export const EXECUTION_DEADLINE_NOTICE_REASON_PREFIX = `${EXECUTION_DEADLINE_NOT
 
 export const EXECUTION_DEADLINE_NOTICE_BODY =
   "Paperclip could not resume or finish this reply before its execution deadline. "
-    + "Open the failed run for details. Before retrying, verify that the previous execution has stopped "
-    + "and reconcile any uncertain action.";
+    + "Open the failed run for details.";
 
 export type ExecutionDeadlineNotice = { commentId: string; body: string; createdAt: Date };
 
 /**
  * The issue's newest execution-deadline notice, unless a LATER run (created
- * after the notice) on the same issue succeeded with a committed result. The
- * notice warns against retrying before the stopped execution is verified, so
- * while it stands the blocker must not offer Retry over it.
+ * after the notice) on the same issue succeeded with a committed result. Output
+ * only: it never decides whether Retry is offered.
  */
 export async function readUnsupersededExecutionDeadlineNotice(db: Db,
   input: { companyId: string; issueId: string }): Promise<ExecutionDeadlineNotice | null> {

@@ -26,11 +26,10 @@ import { notifyRoutineExecutionStatus } from "./routine-execution-status-notific
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
-import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { freshThreadStartedNote, freshThreadStopGate, readFreshThreadStopProof, writeFreshThreadNotice } from "./native-runtime/fresh-thread-stop-gate.js";
+import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 
@@ -54,12 +53,6 @@ export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPers
  * - The opening context of the continuation names the cut-off run and every
  *   action whose outcome is unknown, so the agent checks before repeating a
  *   side effect.
- *
- * EXCEPTION: the closed impossible-reconciliation refusal family uses
- * `freshThreadStopGate` before any generic wait bound or isolation decision.
- * Its old execution must be positively proven gone; no elapsed time or
- * workspace fencing grants that authority. One history notice is updated
- * from stopping/waiting-for-turn to fresh-thread admission.
  *
  * Eligibility is by classification, not by an allowlist: every failure is
  * eligible except a permanent conversation refusal or a cause a person must
@@ -138,8 +131,6 @@ type Input = {
    * task in the same transaction, and that wake is the continuation.
    */
   delivery?: "record" | "caller_owns";
-  /** A validated deliberate Retry may re-arm the existing stop-only owner. */
-  retryStop?: boolean;
 };
 
 const object = (value: unknown): Record<string, unknown> =>
@@ -375,8 +366,8 @@ async function hasAnswerSinceSettlement(db: Pick<Db, "select">, source: typeof h
  * isolation. Consumers may leave that source's provider thread exactly once:
  * only while their current thread still equals sourceSessionId. No execution
  * or snapshot proof is relaxed by this authorization. Every rotation also
- * revalidates physical-stop proof and refuses a settlement answered since it
- * was recorded. Caller holds the task lock, serializing this decision with
+ * refuses a settlement answered since it was recorded. Caller holds the task
+ * lock, serializing this decision with
  * admission, Stop and chat resets. */
 export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select" | "selectDistinctOn">,
   run: typeof heartbeatRuns.$inferSelect, issueId: string) {
@@ -406,8 +397,7 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   const settlement = object(action.evidence.freshContinuationSettlement);
   const reconciliation = object(action.evidence.executionReconciliation);
   const context = object(run.contextSnapshot);
-  if ((isFreshThreadRefusal(source) && fresh.previousExecutionGone !== true)
-    || fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
+  if (fresh.schema !== FRESH_CONTINUATION_SCHEMA || settlement.schema !== FRESH_CONTINUATION_SCHEMA
     || fresh.sourceRunId !== source.id || settlement.sourceRunId !== source.id
     || settlement.actorType !== "system" || settlement.actorId !== FRESH_CONTINUATION_ACTOR
     || settlement.decision !== "continue_in_fresh_run" || settlement.replay !== "none"
@@ -427,14 +417,8 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   // unanswered boundary. This includes turns admitted before recordedAt but
   // answered afterwards. Caller holds the issue lock used by turn admission.
   if (await hasAnswerSinceSettlement(db, source, issueId, fresh.recordedAt, run.id)) return null;
-  // Old generic settlements predate the typed strict family. Neither their
-  // writer_ended label nor isolation nor the lack of a PID proves a stop.
-  // Revalidate the same physical-stop owner for EVERY thread rotation.
-  const stop = await readFreshThreadStopProof(db, source, issueId);
-  if (!stop.gone) return null;
   return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
-    startedNote: await freshThreadStartedNote(db, source),
-    ...(typeof fresh.noticeAuthorizationReason === "string" ? { noticeAuthorizationReason: fresh.noticeAuthorizationReason } : {}) };
+    startedNote: await freshThreadStartedNote(db, source) };
 }
 
 /**
@@ -553,8 +537,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
 
   // A later refusal can have NO hold of its own. Include only physically
   // settled predecessors in this conversation, so their stale system actions
-  // cannot veto the follow-up. The strict gate below still re-proves every
-  // allocation; human gates and unrelated Blocked decisions remain intact.
+  // cannot veto the follow-up. Human gates and unrelated Blocked decisions
+  // remain intact.
   const stoppedPredecessors = isFreshThreadRefusal(run) && run.nativeSessionId
     ? await tx.select({ run: heartbeatRuns }).from(heartbeatRuns).innerJoin(nativeRunFinalizations, and(
       eq(nativeRunFinalizations.companyId, heartbeatRuns.companyId), eq(nativeRunFinalizations.runId, heartbeatRuns.id)))
@@ -571,28 +555,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     .orderBy(asc(issueRecoveryActions.createdAt), asc(issueRecoveryActions.id)).for("update");
   const ownsBlockedStatus = (hold: typeof issueRecoveryActions.$inferSelect) => holdOwnsBlockedStatus(hold, issue,
     holdSources.find(source => source.id === holdRunId(hold.evidence)) ?? run);
-  // A physical-stop gate must not promise an automatic restart after a
-  // person's Stop, pause, approval, or reassignment decision. Keep these
-  // task-level gates ahead of both the waiting note and stop requests.
-  if (isFreshThreadRefusal(run)) {
-    const cancellation = readRunCancellation(run.resultJson);
-    if ((cancellation && ["user", "agent"].includes(cancellation.initiator.type))
-      || object(run.resultJson).operatorInterrupted === true
-      || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run))
-      return { kind: "person_owned", reason: "stopped_on_request" };
-    if (issue.status === "in_review") return { kind: "person_owned", reason: "in_review" };
-    if (holds.some(hold => blocksExecution(hold) && isHumanGate(hold) && !hold.evidence.executionReconciliation)
-      || holds.some(hold => hold.ownerUserId || hold.evidence.ownerGoneAttestation || hold.evidence.explicitUserContinuation))
-      return { kind: "person_owned", reason: "operator_decision_recorded" };
-    const taskWait = await personOwnedTaskWait(tx, { companyId, issue, run });
-    if (taskWait) return { kind: "person_owned", reason: taskWait };
-  }
   const prior = holds.find(hold => object(hold.evidence.freshContinuation).sourceRunId === run.id);
-  // Do not touch the old executor or narrate a restart after the conversation
-  // has moved on. This fence precedes EVERY strict stop-gate call, including
-  // the upgrade of an older isolation-only settlement. An earlier live turn
-  // is not a successor: the gate below must wait for it without stopping it.
-  if (isFreshThreadRefusal(run) && (!prior || object(prior.evidence.freshContinuation).previousExecutionGone !== true)) {
+  // Do not narrate a restart after the conversation has moved on: a newer
+  // run, or an answer since this run started, already follows it.
+  if (isFreshThreadRefusal(run) && !prior) {
     const [newer] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
       or(eq(heartbeatRuns.nativeIssueId, issue.id), eq(heartbeatRuns.issueId, issue.id),
@@ -611,30 +577,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (typeof recordedAt === "string" && await hasAnswerSinceSettlement(tx, run, issue.id, recordedAt)) {
       return { kind: "successor_exists" };
     }
-    // Upgrade an older isolated-only settlement before allowing this stronger
-    // refusal family to leave its provider thread. Isolation is not stop proof.
-    if (isFreshThreadRefusal(run) && object(prior.evidence.freshContinuation).previousExecutionGone !== true) {
-      const gate = await freshThreadStopGate(tx, run, issue.id, input.retryStop);
-      if (!gate.gone) return { kind: "exact_recovery_pending", reason: gate.reason,
-        retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
-      const noticeAuthorizationReason = input.delivery !== "caller_owns"
-        || await hasFreshThreadNotice(tx, companyId, issue.id, gate.noticeAuthorizationReason)
-        ? gate.noticeAuthorizationReason : undefined;
-      const { noticeAuthorizationReason: _oldNoticeReason, ...fresh } = object(prior.evidence.freshContinuation);
-      await tx.update(issueRecoveryActions).set({ evidence: { ...prior.evidence,
-        freshContinuation: { ...fresh, previousExecutionGone: true,
-          ...(noticeAuthorizationReason ? { noticeAuthorizationReason } : {}) } } }).where(eq(issueRecoveryActions.id, prior.id));
-      if (input.delivery !== "caller_owns") await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
-    }
     await settleLateHolds(tx, { companyId, issue, run, prior, holds: holds.filter(isOwnedReconciliationHold), now,
       ownsBlock: holds.filter(isOwnedReconciliationHold).some(ownsBlockedStatus) });
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
-  // A refusal cannot be made continuable by repeatedly creating new run IDs.
-  // Only the closed typed family below can instead earn a proven-stop boundary;
-  // legacy diagnostic-only refusals retain the base's permanent refusal guard.
-  if (isNativeContinuationRefusal(run) && !isFreshThreadRefusal(run))
-    return { kind: "not_applicable", reason: "native_continuation_refused" };
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
   if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
@@ -643,12 +589,6 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // task. Workspace restore/repair holds stay with workspace recovery, and
   // resolved history is never rewritten.
   const ownedHolds = holds.filter(isOwnedReconciliationHold);
-
-  // This closed refusal family has stronger admission than the generic
-  // isolated fallback. No timeout or abandoned epoch can waive physical stop.
-  const strictBoundary = isFreshThreadRefusal(run) ? await freshThreadStopGate(tx, run, issue.id, input.retryStop) : null;
-  if (strictBoundary && !strictBoundary.gone) return { kind: "exact_recovery_pending",
-    reason: strictBoundary.reason, retryAt: new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS) };
 
   const [refused] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, companyId), sql`${heartbeatRuns.id} <> ${run.id}`,
@@ -666,9 +606,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (!personAsked && decision?.recent !== true) return { kind: "person_owned", reason: "retry_needed" };
   }
 
-  // Generic exact-recovery waits are bounded. The strict physical-stop gate
-  // above is deliberately NOT bounded: no timer can authorize that boundary.
-  // About 10 minutes from the first pending
+  // Every wait is bounded in time: about 10 minutes from the first pending
   // check, or 15 while the exact-recovery owner shows progress (a new run
   // event, output or lease renewal since the last check). Then the fallback
   // stops waiting and continues in isolation (writes revoked, new root).
@@ -845,18 +783,10 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
       : isolation === "fresh_isolated_workspace"
         ? `The previous writer of run ${run.id} is not proven stopped, so the continuation starts in a new isolated workspace; no unverified files are applied.`
         : `The continuation of run ${run.id} starts from the task's last saved workspace; no unverified files are applied.` };
-  // A caller-owned wake has not consumed its thread boundary yet. Reuse a
-  // waiting notice only if one actually exists; otherwise admission owns the
-  // first notice and its action-specific key, after rechecking later answers.
-  const noticeAuthorizationReason = strictBoundary && (delivery !== "caller_owns"
-    || await hasFreshThreadNotice(tx, companyId, issue.id, strictBoundary.noticeAuthorizationReason))
-    ? strictBoundary.noticeAuthorizationReason : undefined;
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: run.id, trigger: input.trigger,
     chainRootRunId: chain.rootRunId, chainAttempt: chain.attempts + 1,
     failureCode: run.errorCode ?? null, delivery, recordedAt: now.toISOString(), isolation,
     stopProof: isolation === "writer_ended" ? "writer_ended" : fenced ? "unproven_epoch_abandoned" : "unproven_isolated",
-    ...(strictBoundary ? { previousExecutionGone: true } : {}),
-    ...(noticeAuthorizationReason ? { noticeAuthorizationReason } : {}),
     unverifiedActions: unverified, createdObjects: created, ...(fenced ? { workspace: fenced } : {}) };
   const reconciliation = { ...decision, actorId: FRESH_CONTINUATION_ACTOR, recordedAt: now.toISOString() };
   // Who, what, why and when. A fresh run is not a replay: the interrupted turn
@@ -943,19 +873,9 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     action: "issue.continued_from_saved_work", entityType: "issue", entityId: issue.id, agentId: run.agentId, runId: run.id,
     details: { recoveryActionId: primaryId, sourceRunId: run.id, failureCode: run.errorCode ?? null, trigger: input.trigger,
       delivery, workspaceEpochAbandoned: Boolean(fenced), unverifiedActionCount: unverified.length } });
-  if (strictBoundary && delivery !== "caller_owns") await writeFreshThreadNotice(tx, run, issue.id, await freshThreadStartedNote(tx, run));
   logger.info({ runId: run.id, issueId: issue.id, failureCode: run.errorCode, trigger: input.trigger, delivery },
     "Unfinished run continues in a fresh run from saved work");
   return { kind: "continued", recoveryActionId: primaryId, delivery, isolation };
-}
-
-async function hasFreshThreadNotice(tx: Db, companyId: string, issueId: string, authorizationReason: string) {
-  const [notice] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-    sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`,
-    sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
-  return notice !== undefined;
 }
 
 async function settleLateHolds(tx: Db, input: { companyId: string; issue: typeof issues.$inferSelect; run: typeof heartbeatRuns.$inferSelect;
@@ -1013,21 +933,7 @@ export async function recordFreshContinuationCheck(db: Db, input: { companyId: s
 /** Not yet checked, or due for another check. */
 export function freshContinuationCheckDue(now: Date) {
   return sql`(${issueRecoveryActions.evidence}->${FRESH_CONTINUATION_CHECK_KEY} is null
-    or coalesce((${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,nextCheckAt}')::bigint, 9223372036854775807) <= ${now.getTime()}
-    or (${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,reason}' in ('active_provider_turn', 'previous_execution_stop_unconfirmed')
-      and exists (select 1 from heartbeat_runs source where source.company_id = ${issueRecoveryActions.companyId}
-        and source.id::text = coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')
-        and (exists (select 1 from environment_leases lease where lease.company_id = source.company_id
-          and (lease.heartbeat_run_id = source.id or exists (select 1 from heartbeat_runs lease_owner
-            where lease_owner.id = lease.heartbeat_run_id and lease_owner.company_id = source.company_id
-              and lease_owner.agent_id = source.agent_id and lease_owner.native_issue_id = source.native_issue_id
-              and lease_owner.native_session_id = source.native_session_id and lease_owner.created_at <= source.created_at))
-          and lease.cleanup_status = 'success'
-          and lease.metadata#>>'{remoteExecutionTermination,state}' in ('stopped', 'destroyed'))
-          or (${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,reason}' = 'active_provider_turn'
-            and not exists (select 1 from heartbeat_runs owner where owner.company_id = source.company_id
-              and owner.native_issue_id = source.native_issue_id and owner.native_session_id = source.native_session_id
-              and owner.id <> source.id and owner.status in ('running', 'queued', 'scheduled_retry')))))))`;
+    or coalesce((${issueRecoveryActions.evidence}#>>'{freshContinuationCheck,nextCheckAt}')::bigint, 9223372036854775807) <= ${now.getTime()})`;
 }
 
 /**

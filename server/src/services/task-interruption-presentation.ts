@@ -1,4 +1,3 @@
-import { isFreshThreadRefusal, freshThreadStopNeedsRetry } from "./native-runtime/runner-reconciliation-refusal.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { AGENT_DIRECTORY_WAIT_RETRY_REASON, INTERRUPTED_PREPARATION_RETRY_REASON } from "./execution-recovery-attempt.js";
 import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-setup-command-failure.js";
@@ -258,13 +257,6 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
         ? "budget" : input.paused || project?.pausedAt || agent?.status === "paused" || company?.status === "paused" ? "resume" : null;
   if (userAction) return { ...base, responsibility: "user", state: "waiting_for_user", userAction,
     ...(userAction === "choose_model" && run.rejectedModel ? { rejectedModel: run.rejectedModel } : {}) };
-  // Impossible reconciliation is system-owned until actual stop proof lands.
-  // A timer, Retry, or generic 'Trying again' countdown is not its escape hatch.
-  if (isFreshThreadRefusal(run)) return freshThreadStopNeedsRetry(run)
-    ? { ...base, state: "failed", canRetry: true, nextRetryAt: null,
-      retryWait: { reason: "previous_execution_stop_unconfirmed",
-        message: "Paperclip cannot confirm that the earlier attempt stopped. Your message and saved work are kept. Retry checks again before starting fresh." } }
-    : { ...base, state: "working", canRetry: false, nextRetryAt: null };
   // The previous controller cannot confirm its own stop. Name the one board
   // action instead of showing the fenced run as working (RC-47).
   if (input.ownerStopRequired) return { ...base, responsibility: "user", state: "waiting_for_user", userAction: "confirm_owner_stop" };
@@ -502,9 +494,6 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
         'timeoutFired', coalesce(${heartbeatRuns.resultJson}->'timeoutFired' = 'true'::jsonb, false),
         'projectAccessDenied', ${heartbeatRuns.resultJson}->'projectAccessDenied',
-        'nativeFreshContinuationStop', jsonb_build_object(
-          'schema', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeFreshContinuationStop'->'schema'`, 64)},
-          'state', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeFreshContinuationStop'->'state'`, 32)}),
         'cancelledByActorType', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByActorType'`, 32)},
         'cancelledByUserId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'cancelledByUserId'`, 160)},
         'queuedCommentInterruptQueueId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'queuedCommentInterruptQueueId'`, 160)},
@@ -835,9 +824,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   // Upstream paperclipai/paperclip b4861d5e task-interruption-presentation.ts:824-840:
   // a card that offers Retry asks the task's execution blocker, and withholds
   // Retry where the blocker refuses it. C9 also selects tasks whose conversation
-  // has a standing notice (getExecutionBlocker withholds Retry for it,
-  // execution-blocker.ts readUnsupersededHeldConversationNotice), and the card
-  // shows that notice's own text. One batched read; blockers only for those tasks.
+  // has a standing notice, and the card shows that notice's own text. One
+  // batched read; blockers only for those tasks.
   const offered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
   if (offered.length) {
     const [{ executionBlockerPredicate, getExecutionBlocker, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate },
@@ -849,13 +837,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     for (const issueId of new Set([...held.map(row => row.issueId), ...notices.keys()])) {
       const presentation = result.get(issueId);
       const notice = notices.get(issueId);
-      // The same standing notice the blocker reads: shown in place of generic
-      // text, and Retry only where a retry can work while it stands.
-      if (presentation && notice) {
-        presentation.notice = { code: notice.code, text: notice.text };
-        presentation.canRetry = presentation.canRetry && notice.retryCanWork;
-        if (!presentation.canRetry) delete presentation.retryAction;
-      }
+      // The standing notice is shown in place of generic text. Whether Retry
+      // is offered is the execution blocker's decision below.
+      if (presentation && notice) presentation.notice = { code: notice.code, text: notice.text };
       const blocker = await getExecutionBlocker(db, companyId, issueId);
       if (!presentation || !blocker || blocker.canRetry) continue;
       presentation.canRetry = false;
