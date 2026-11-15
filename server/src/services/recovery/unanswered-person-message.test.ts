@@ -21,8 +21,10 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-import { noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
-import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition } from "./unanswered-person-message.js";
+import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
+import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
+  UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
+  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -30,10 +32,7 @@ import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition 
 // or a production record shape named in the test title, on an agent with
 // managed instructions. "Visible" is the v2 chat filter (TaskChatThread.tsx:930):
 // a system comment is hidden only when recoveryResponsibility is "system".
-const HELD = "Your saved work is kept, but this conversation cannot continue. Assign this agent a new task to continue.";
-const NOT_ANSWERED = "Your message wasn't answered. Sending it again is safe; if it fails again, assign this agent a new task.";
-const NO_RUN = "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
-const NO_REPLY = "This run finished without a reply to your message. Sending it again is safe.";
+// follow-Paperclip Cut B R8: held copy preserves the message and offers a new message, never a permanent ban.
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("unanswered person message notice (C9, the stranded sweep)", () => {
@@ -104,17 +103,17 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
   };
 
-  // Keep: recorded D10 F0 catch. The read-only gate decision must not
-  // register transaction work or abort the ordinary conversations behind it.
-  it("RFL round4 F0 sweeps a gate-held conversation with five ordinary unanswered ones without throwing", async () => {
+  // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
+  it("RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
     const held = await fixture();
     const heldRunId = await held.run({ commentId: await held.message(), status: "failed", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, heldRunId));
     await db.insert(environmentLeases).values({ companyId: held.companyId, issueId: held.issueId,
       heartbeatRunId: heldRunId, provider: "boat", providerLeaseId: `gate-held-${randomUUID()}`, status: "retained" });
     const { ensureFreshContinuation } = await import("../fresh-continuation-fallback.js");
+    // follow-Paperclip Cut B R1/R8: unknown physical stop no longer prevents ordinary continuation or its one-note sweep.
     expect(await ensureFreshContinuation(db, { companyId: held.companyId, runId: heldRunId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      .toMatchObject({ kind: "continued" });
     const ordinary = [];
     for (let i = 0; i < 5; i++) {
       const f = await fixture();
@@ -130,13 +129,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       }
       const heldNotices = await held.visible();
       expect(heldNotices).toHaveLength(1);
-      expect(heldNotices[0]!.body).toContain("cannot confirm that the earlier attempt stopped");
-      expect(heldNotices[0]!.body).toContain("Retry");
+      expect(heldNotices[0]!.body).toBe(NOT_ANSWERED);
+      expect(heldNotices[0]!.presentation).toMatchObject({ title: "Your message wasn't answered" });
       expect(heldNotices[0]!.body).not.toContain("I'm stopping");
     }
   });
 
-  it("D10b SMAA-143 exhausted backup refusal requests disposition, never tells a person resend is safe", async () => {
+  it("D10b SMAA-143 exhausted backup refusal gets exactly one factual unanswered notice", async () => {
     const f = await fixture({ status: "blocked" });
     const id = await f.run({ commentId: await f.message(), status: "failed", errorCode: "native_session_interrupted",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
@@ -144,16 +143,14 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       heartbeatRunId: id, provider: "boat", providerLeaseId: null, status: "expired" });
     await f.boardHold("native_session_retry_exhausted", id);
     await f.sweep();
-    expect(await f.visible()).toHaveLength(0);
+    // follow-Paperclip Cut B R8: the unanswered-message owner no longer defers typed refusals to the removed stop gate.
+    expect(await f.visible()).toHaveLength(1);
     await settleUnrecoverableExecutions(db);
     const notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toContain("cannot confirm that the earlier attempt stopped");
-    expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without|Sending it again is safe/);
-    // RFL 16:5xZ: superseded rule. D10's waiting notice is Paperclip's own, not a person-responsibility
-    // note; both fields are absent by design (the missing failure code is filed as a gold finding).
-    expect(codeOf(notices[0]!)).toBeUndefined();
-    expect(notices[0]!.metadata?.recoveryResponsibility).toBeUndefined();
+    expect(notices[0]!.body).toBe(NOT_ANSWERED);
+    expect(notices[0]!.body).not.toMatch(/native_|runner_|backup_without/);
+    expect(codeOf(notices[0]!)).toBe("runner_harness_state_mismatch");
     await f.sweep();
     await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
@@ -171,15 +168,19 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
     await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(Date.now() - 10 * 60_000) }).where(eq(nativeRunFinalizations.runId, id));
     await f.sweep();
-    expect(await f.visible()).toHaveLength(0);
-    // A timer is not terminal settlement or stop proof. Only the existing
-    // recovery owner settling its attempt makes this refusal disposable.
+    // follow-Paperclip Cut B R8: an overdue retry can be explained without preempting its recovery owner.
+    expect(await f.visible()).toHaveLength(1);
+    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+    expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id)))[0].phase)
+      .toBe("retryable_failure");
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+    // Only the existing recovery owner settles the attempt; a notice does not execute or stop it.
     await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", nextAttemptAt: null })
       .where(eq(nativeRunFinalizations.runId, id));
     await f.boardHold("native_session_retry_exhausted", id);
     await settleUnrecoverableExecutions(db);
     expect(await f.visible()).toHaveLength(1);
-    expect((await f.visible())[0].body).toContain("cannot confirm that the earlier attempt stopped");
+    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
   });
 
   it("SMA-94 (live C8): adapter_failed 'Native session failed' under an ACTIVE board-owned native_continuation_requires_reconciliation hold -> exactly one notice", async () => {
@@ -693,7 +694,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
 
   // RFL 03:16Z (E3.04): only a RUNNING turn is unbounded. A queued run that
   // carries the message but is never claimed gets one "waiting to start" note.
-  const WAITING = "Your message is waiting for the agent to be free; it will start by itself.";
   it("E3.04: a carrying run queued behind a full agent -> one 'waiting' note at the bound; it starts later -> no second note; its answer supersedes it", async () => {
     const f = await fixture();
     const commentId = await f.message();
