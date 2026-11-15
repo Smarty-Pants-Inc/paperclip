@@ -23530,10 +23530,13 @@ describe("runnerd provider runtime wiring", () => {
     if (hold === "idle_warm_claim_lost") {
       // A run resumed the warm source between the proof and the claim; the
       // compare-and-swap matches no row and the backup stays unrestored.
-      db.update = ((table: unknown) => ({ set: () => ({ where: () => ({ returning: async () => {
-        expect(table).toBe(environmentLeases);
-        return [];
-      } }) }) })) as unknown as Db["update"];
+      const transaction = db.transaction.bind(db);
+      db.transaction = (operation, config) => transaction(tx => operation({ ...tx,
+        update: ((table: unknown) => table === environmentLeases ? { set: () => ({ where: () => ({ returning: async () => {
+          expect(table).toBe(environmentLeases);
+          return [];
+        } }) }) } : tx.update(table as never)) as Db["update"],
+      } as typeof tx), config);
     }
     const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
       if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
