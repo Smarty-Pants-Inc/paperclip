@@ -37,10 +37,10 @@ const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 // A typed fresh-thread refusal (runner-reconciliation-refusal.ts FRESH_THREAD_REFUSAL_CODES).
 const TYPED = "runner_remote_state_unavailable";
-// B-2 (proposed for RFL's ruling): the ONE bound is the fork's K=2 chain cap; this is the text the person
-// sees when it is reached. Factual, keeps the input, names the person's next step; no permanent refusal.
+// B-2 (RFL ruled 05:51Z): the ONE bound is the fork's K=2 chain cap; this is the text the person sees when it is
+// reached. "Press Retry" only where the task view proves a Retry control in that state, so the ruled default applies.
 const BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, and both attempts failed. "
-  + "Your message and the saved work are kept. Press Retry or send a new message to try again.";
+  + "Your message and the saved work are kept. Send a new message to try again.";
 
 suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   let db!: ReturnType<typeof createDb>;
