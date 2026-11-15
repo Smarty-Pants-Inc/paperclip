@@ -4438,6 +4438,12 @@ html:has(.design-proposal-theme) [data-slot="card"] { border-color: var(--border
 html:has(.design-proposal-theme) [data-slot="card"][data-elevation="middle"] { background: var(--muted-alt); }
 html:has(.design-proposal-theme) [data-slot="card"][data-elevation="high"] { background: var(--muted); }
 html:has(.design-proposal-theme) [data-slot="card-title"] { color: var(--foreground); }
+/* Keep the leading task cell inside narrow viewports so persistent badges fit.
+   Other selected columns retain their widths and remain horizontally scrollable. */
+.task-list-viewport {
+  container-type: inline-size;
+  --task-list-column-title-min: min(calc(var(--spacing) * 80), calc(100cqw - var(--task-list-column-status) - var(--task-row-gap) - var(--task-row-padding-inline) * 2));
+}
 .task-list-columns-scroll { overflow-x: auto; isolation: isolate; }
 .task-list-viewport,
 .horizontal-scroll-viewport { position: relative; min-width: 0; background: var(--task-list-surface); }

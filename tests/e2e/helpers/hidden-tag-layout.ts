@@ -43,7 +43,7 @@ export async function expectHiddenTagLayout(row: Locator, testInfo: TestInfo, na
     expect(layout.badge.left).toBeGreaterThanOrEqual(ancestor.left);
   }
   expect(layout.title.right, "Title must leave room for the badge").toBeLessThanOrEqual(layout.badge.left);
-  if (layout.viewport.width === 390 && await row.getAttribute("data-appearance") === "refreshed") {
+  if (layout.viewport.width === 390) {
     expect(layout.titleTextWidth, "On phone, truncate the title instead of the badge").toBeGreaterThan(layout.title.width);
     expect(layout.titleOverflow).toBe("ellipsis");
   }
