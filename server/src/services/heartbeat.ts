@@ -80,7 +80,7 @@ import {
   formatIssueIdentifierLink,
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
-import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -4423,33 +4423,49 @@ export function heartbeatService(
     }
   }
 
-  async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
+  async function agentInvocationStopBlocker(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
     await cancelInvocationsForAgentsInternal(agentIds, reason, options);
     const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
     const leasesToRelease = await db.select({ runId: environmentLeases.heartbeatRunId }).from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
       .where(and(inArray(heartbeatRuns.agentId, agentIds),
         or(and(eq(heartbeatRuns.status, "cancelled"), inArray(environmentLeases.status, ["active", "pending_cleanup"])),
-          and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed")))));
+          and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed"))),
+        sql`not (coalesce((${environmentLeases.metadata}->'releaseDeferral'->>'retryAt')::timestamptz > now(), false)
+          and (${options.trigger ?? null}::text is null
+            or coalesce(${environmentLeases.metadata}->'releaseDeferral'->'triggers', '[]'::jsonb) ? ${options.trigger ?? ""}::text))`));
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
+    let blocker: string | null = null;
+    let pendingRunId: string | undefined;
     for (const run of runs) {
-      if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
-          adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
-          (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) {
-        options.onPending?.(run.id);
-        return false;
+      const runBlocker = !isHeartbeatRunTerminalStatus(run.status) ? "run_not_terminal"
+        : liveRunExecutions.has(run.id) || adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id)
+          ? "run_executing_here"
+          : run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date() ? "run_controller_lease_held" : null;
+      if (runBlocker) {
+        if (!blocker) { blocker = runBlocker; pendingRunId = run.id; }
+        continue;
       }
       if (needsRelease.has(run.id)) {
-        // Retry incomplete cleanup after a run becomes terminal.
         await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId,
-          agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
+          agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy",
+          ...(options.trigger ? { trigger: options.trigger } : {}) });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds, options.onPending);
+    if (blocker) {
+      options.onPending?.(pendingRunId!);
+      return blocker;
+    }
+    return agentExecutionStopBlocker(db, agentIds, options.onPending);
+  }
+
+  async function stopInvocationsForAgents(agentIds: string[], reason: string, options: StopInvocationOptions = {}) {
+    return (await agentInvocationStopBlocker(agentIds, reason, options)) === null;
   }
 
   return {
     stopInvocationsForAgents,
+    agentInvocationStopBlocker,
     waitForRunExecutionDrain: async (
       runId: string,
       options: { timeoutMs?: number; intervalMs?: number } = {},

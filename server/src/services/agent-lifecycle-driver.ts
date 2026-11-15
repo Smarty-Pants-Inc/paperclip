@@ -1,4 +1,5 @@
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { pendingFailedNativeRetryCancellationCondition } from "./native-runtime/native-cancellation-request.js";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
@@ -87,12 +88,13 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
           await db.update(heartbeatRuns).set({
             resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${pauseStop}`,
           }).where(and(eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id),
-            inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]),
+            or(inArray(heartbeatRuns.status, [...CANCELLABLE_HEARTBEAT_RUN_STATUSES]), pendingFailedNativeRetryCancellationCondition()),
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
         let invocationId: string | undefined;
         if (!await heartbeat.stopInvocationsForAgents(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing", onPending: id => { invocationId = id; } })) {
+          { preservePauseDeferred: agent.lifecycleState === "pausing", onPending: id => { invocationId = id; },
+            ...(agent.lifecycleOperation?.id ? { trigger: `lifecycle:${agent.lifecycleOperation.id}` } : {}) })) {
           return { status: "pending", ...(invocationId ? { invocationId } : {}) };
         }
       }
