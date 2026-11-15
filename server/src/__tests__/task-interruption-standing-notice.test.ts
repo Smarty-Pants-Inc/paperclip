@@ -2,7 +2,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { EXECUTION_BLOCKER_PERSON_RETRY_ACTION, getExecutionBlocker } from "../services/execution-blocker.js";
+import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "../services/execution-control-deadline.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { readStandingRunNotice } from "../services/standing-run-notice.js";
 import { EXECUTION_DEADLINE_NOTICE_BODY, EXECUTION_DEADLINE_NOTICE_REASON_PREFIX } from "../services/execution-deadline-notice.js";
@@ -66,16 +67,17 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     return listed;
   };
 
-  it("(a) a held conversation whose last run failed: the card carries the notice text and no Retry", async () => {
+  // follow-Paperclip Cut B R8: the held notice stays visible but cannot withhold an otherwise valid Retry.
+  it("(a) a held conversation whose last run failed: the card carries the notice text and offers Retry", async () => {
     const f = await conversation("native_controller_recovery_missing_evidence:retained_sandbox_binding");
     await holdConversation(f);
     const presentation = await card(f);
-    expect(presentation).toMatchObject({ state: "failed", canRetry: false,
+    expect(presentation).toMatchObject({ state: "failed", canRetry: true,
       notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
-    // The SAME standing notice the blocker and the leaf reader see.
+    // The output reader and the card show the same standing notice.
     expect(await readStandingRunNotice(db, { companyId: f.companyId, issueId: f.issueId }))
-      .toMatchObject({ source: "held", retryCanWork: false, text: HELD_PREDECESSOR_NOTICE });
-    // No recovery action here, so getExecutionBlocker has no blocker; the notice still withholds Retry.
+      .toMatchObject({ source: "held", text: HELD_PREDECESSOR_NOTICE });
+    // No recovery action here, so there is no execution blocker to refuse Retry.
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
@@ -86,10 +88,11 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     expect(presentation?.notice).toBeUndefined();
   });
 
+  // follow-Paperclip Cut B R8: success supersedes notice output; Retry does not wait for that success.
   it("(c) a later committed success on the same conversation clears it", async () => {
     const f = await conversation("runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate");
     await holdConversation(f);
-    expect(await card(f)).toMatchObject({ canRetry: false, notice: { text: HELD_PREDECESSOR_NOTICE } });
+    expect(await card(f)).toMatchObject({ canRetry: true, notice: { text: HELD_PREDECESSOR_NOTICE } });
     const succeeded = await f.run("succeeded", null);
     await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: succeeded.id, phase: "committed" });
     // A later ordinary failure on the continued conversation shows the generic card again.
@@ -119,10 +122,11 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     expect(presentation?.notice).toBeUndefined();
   });
 
-  it.each(PARTIAL_ROWS)("(d) %s %s: a standing held notice withholds Retry and shows its text", async (_row, code) => {
+  // follow-Paperclip Cut B R8: every diagnostic row keeps its notice text without a notice-derived Retry veto.
+  it.each(PARTIAL_ROWS)("(d) %s %s: a standing held notice shows its text without withholding Retry", async (_row, code) => {
     const f = await conversation(code);
     await holdConversation(f);
-    expect(await card(f)).toMatchObject({ state: "failed", canRetry: false,
+    expect(await card(f)).toMatchObject({ state: "failed", canRetry: true,
       notice: { code: "native_prior_owner_held", text: HELD_PREDECESSOR_NOTICE } });
   });
   // C2 (RFL 4x3): the execution-deadline notice exactly as reconciliation commits it.
@@ -134,7 +138,8 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
   }
   const deadlineCause = "execution_finalization_deadline_exceeded";
 
-  it("(C2) a standing deadline notice with no workspace hold: the card says no Retry and shows the notice, as the blocker does", async () => {
+  // follow-Paperclip Cut B R8: deadline text is output; the card follows the real blocker's Retry decision.
+  it("(C2) a standing deadline notice with no workspace hold: the card offers Retry and shows the notice", async () => {
     const f = await conversation(deadlineCause);
     await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId, kind: "active_run_watchdog",
       cause: deadlineCause, fingerprint: `execution-control:${f.failed.id}`, status: "active", nextAction: "Inspect the failed run.",
@@ -142,18 +147,20 @@ describe.skipIf(!support.supported)("chat task-status card reads the standing no
     expect(await card(f)).toMatchObject({ state: "failed", canRetry: true });
     await deadlineNotice(f);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
-    expect(blocker).toMatchObject({ canRetry: false, nextAction: EXECUTION_DEADLINE_NOTICE_BODY });
+    expect(blocker).toMatchObject({ canRetry: true,
+      nextAction: `${EXECUTION_FINALIZATION_DEADLINE_MESSAGE} ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
     const presentation = await card(f);
-    expect(presentation).toMatchObject({ state: "failed", canRetry: false,
+    expect(presentation).toMatchObject({ state: "failed", canRetry: true,
       notice: { code: deadlineCause, text: EXECUTION_DEADLINE_NOTICE_BODY } });
     expect(presentation?.canRetry).toBe(blocker!.canRetry);
-    expect(await readStandingRunNotice(db, f)).toMatchObject({ source: "deadline", retryCanWork: false });
+    expect(await readStandingRunNotice(db, f)).toMatchObject({ source: "deadline", text: EXECUTION_DEADLINE_NOTICE_BODY });
   });
 
-  it("(C2) a standing deadline notice with no recovery action still withholds the card's Retry", async () => {
+  // follow-Paperclip Cut B R8: a deadline notice alone cannot disable the card's Retry.
+  it("(C2) a standing deadline notice with no recovery action leaves the card's Retry offered", async () => {
     const f = await conversation(deadlineCause);
     await deadlineNotice(f);
-    expect(await card(f)).toMatchObject({ state: "failed", canRetry: false,
+    expect(await card(f)).toMatchObject({ state: "failed", canRetry: true,
       notice: { code: deadlineCause, text: EXECUTION_DEADLINE_NOTICE_BODY } });
   });
 
