@@ -2677,6 +2677,63 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn unknown_and_duplicate_github_access_replies_leave_only_matching_waiter_completed() {
+        use std::collections::HashMap;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut ingress = GitHubAccessIngress::start().expect("start private socket");
+        let socket_path = ingress.socket_path().to_path_buf();
+        let client = thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).expect("connect private socket");
+            write!(
+                stream,
+                "POST /runtime-tools/github/credentials HTTP/1.1\r\nHost: paperclip.local\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .expect("send HTTP request");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read HTTP response");
+            response
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            if let Some(request) = ingress.try_next_request() {
+                break request;
+            }
+            assert!(Instant::now() < deadline, "socket request was not queued");
+            thread::sleep(Duration::from_millis(5));
+        };
+        let request_id = request.request_id().to_owned();
+        let mut pending = HashMap::from([(request_id.clone(), request)]);
+        let unknown = json!({
+            "requestId": "unknown-request-id",
+            "status": 200,
+            "headers": {},
+            "bodyBase64": "e30=",
+        });
+        assert!(complete_github_access_reply(&unknown, &mut pending));
+        assert_eq!(pending.len(), 1);
+
+        let reply = json!({
+            "requestId": request_id,
+            "status": 200,
+            "headers": { "content-type": "application/json" },
+            "bodyBase64": "e30=",
+        });
+        assert!(complete_github_access_reply(&reply, &mut pending));
+        assert!(pending.is_empty());
+        assert!(complete_github_access_reply(&reply, &mut pending));
+        assert!(pending.is_empty());
+        assert!(client
+            .join()
+            .expect("HTTP client thread")
+            .starts_with("HTTP/1.1 200 "));
+    }
+
     struct CountingExecutor {
         calls: usize,
     }

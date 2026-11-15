@@ -31,6 +31,43 @@ describe("managed GitHub launchers", () => {
     expect((await exec(launcher, ["--version"], { env })).stdout).toBe("private interpreter works");
   });
 
+  it("uses the private runner Unix socket and never falls back to the callback URL", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-runner-socket-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const managed = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(managed); await mkdir(real);
+    await writeFile(path.join(managed, "git"), githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
+    await writeFile(path.join(real, "git"), "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+    const socketPath = path.join(root, "runner.sock");
+    let socketRequests = 0, fallbackRequests = 0;
+    let received: { method?: string; url?: string; body?: string } = {};
+    const socketServer = createServer((req, res) => {
+      socketRequests += 1;
+      const chunks: Buffer[] = [];
+      req.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      req.on("end", () => {
+        received = { method: req.method, url: req.url, body: Buffer.concat(chunks).toString("utf8") };
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ status: "unavailable", reason: "No active GitHub run" }));
+      });
+    });
+    await new Promise<void>(resolve => socketServer.listen(socketPath, resolve));
+    cleanups.push(() => new Promise<void>(resolve => socketServer.close(() => resolve())));
+    const fallbackServer = createServer((_req, res) => { fallbackRequests += 1; res.end("{}"); });
+    await new Promise<void>(resolve => fallbackServer.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => new Promise<void>(resolve => fallbackServer.close(() => resolve())));
+    const { port } = fallbackServer.address() as { port: number };
+    const env = {
+      ...githubBrokerEnvironment({}, { url: `http://127.0.0.1:${port}`, token: "fallback-capability" }),
+      PAPERCLIP_GITHUB_RUNNER_SOCKET: socketPath,
+      PATH: `${managed}${path.delimiter}${real}${path.delimiter}${process.env.PATH}`,
+    };
+    await exec(path.join(managed, "git"), ["remote", "-v"], { cwd: root, env });
+    expect(socketRequests).toBe(1);
+    expect(received).toEqual({ method: "POST", url: "/runtime-tools/github/credentials", body: "{}" });
+    expect(fallbackRequests).toBe(0);
+  });
+
   it.each(["", "relative/node", "/runtime/node --flag", "/runtime/node\nexit 1", "/runtime/node\0"])(
     "rejects an invalid interpreter path %j", interpreterPath => {
       expect(() => githubLauncherSource({ interpreterPath })).toThrow("absolute path without whitespace");
