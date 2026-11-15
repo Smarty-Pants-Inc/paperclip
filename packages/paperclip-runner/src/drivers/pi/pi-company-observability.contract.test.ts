@@ -1,4 +1,4 @@
-import { writeFile } from "node:fs/promises";
+import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
@@ -55,10 +55,23 @@ describe("R1 native Pi / shared observability contract (obs3, revised by Addenda
 
 it("R2: credentials stay out of Pi child env/argv/config, run receipts and diagnostics", async () => {
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-  const pi = await run();
-  expect(JSON.stringify([pi.child, pi.events, warn.mock.calls])).not.toContain(sentinel);
-  for (const key of AGENT_OBSERVABILITY_ENV_KEYS) expect(pi.child.env).not.toHaveProperty(key);
-  expect(transport.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: `Bearer ${sentinel}` });
+  const pi = await openPi();
+  try {
+    await pi.start(); pi.peer.send(...assistant("key-check", { tool: "read" }), ...tool("key-check"), ...terminal); await pi.settled();
+    const configuration: string[] = [];
+    const inspect = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const file = join(directory, entry.name);
+        if (entry.isDirectory()) await inspect(file);
+        else if (entry.isFile()) configuration.push(await readFile(file, "utf8"));
+      }
+    };
+    await inspect(pi.root);
+    expect(configuration.length).toBeGreaterThan(0);
+    expect(JSON.stringify([pi.child, await pi.session.snapshot(), pi.events, configuration, warn.mock.calls])).not.toContain(sentinel);
+    for (const key of AGENT_OBSERVABILITY_ENV_KEYS) expect(pi.child.env).not.toHaveProperty(key);
+    expect(transport.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: `Bearer ${sentinel}` });
+  } finally { await pi.close(); }
 });
 it("R3: Langfuse golden mapping includes I/O, native session, provider cost and all Paperclip ids", async () => {
   await run();

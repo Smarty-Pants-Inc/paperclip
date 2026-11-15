@@ -13333,24 +13333,33 @@ describe("native warm session supervision", () => {
       expect(nextLog).toHaveBeenCalledWith("stderr", expect.stringContaining("synthetic attachment failed before onSession"));
     });
 
-    it.each([false, true])("compares export process compatibility without changing conversation identity (changed: %s)", async changed => {
-      const { base } = fixture(`observability-${changed}`);
-      const next = { ...base, binding: { ...base.binding, runId: `observability-${changed}-next` } };
+    it.each(["codex", "pi"] as const)("compares %s export process compatibility without changing conversation identity", async kind => {
+      const f = fixture(`observability-${kind}`);
+      const base = kind === "pi" ? { ...f.base, provider: { kind: "pi_rpc" as const, model: "neutral/model", piRpcThinkingLevel: "high" as const } } : f.base;
+      const next = { ...base, binding: { ...base.binding, runId: `observability-${kind}-next` } };
       const close = vi.fn(async () => undefined);
       const shared = { close };
-      const observability = (key: string) => ({ kind: "codex" as const, compatibilityKey: key, otelConfig: { exporter: "none", trace_exporter: "none", metrics_exporter: "none" }, environment: {} });
+      const observability = (enabled: boolean): import("@paperclipai/adapter-utils/agent-observability").ProviderObservabilityLaunch => ({ kind, compatibilityKey: enabled ? "revision-on" : "revision-off",
+        ...(kind === "codex" ? { otelConfig: { exporter: "none", trace_exporter: "none", metrics_exporter: "none" } } : {}),
+        environment: kind === "pi" ? { PAPERCLIP_OBSERVABILITY_PI: enabled ? "1" : "0",
+          ...(enabled ? { OTEL_EXPORTER_OTLP_TRACES_HEADERS: "authorization=sentinel" } : {}) } : {} });
       state.execute.mockReset().mockImplementationOnce(async options => {
         options.onSession?.(shared); return result;
       }).mockImplementationOnce(async options => {
         expect(options.input.session.normalizedSessionId).toBe(base.session.normalizedSessionId);
-        expect(options.existingSession).toBe(changed ? undefined : shared);
-        if (changed) expect(close).toHaveBeenCalledWith({ reason: "warm native session configuration changed" });
-        else expect(close).not.toHaveBeenCalled();
+        expect(options.existingSession).toBe(shared);
+        expect(close).not.toHaveBeenCalled();
+        return result;
+      }).mockImplementationOnce(async options => {
+        expect(options.existingSession).toBeUndefined();
+        expect(close).toHaveBeenCalledWith({ reason: "warm native session configuration changed" });
         return result;
       });
-      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", observability: observability("revision-one") });
-      await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", observability: observability(changed ? "revision-two" : "revision-one") });
-      expect(state.execute).toHaveBeenCalledTimes(2);
+      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner", observability: observability(true) });
+      await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner", observability: observability(true) });
+      const off = { ...next, binding: { ...next.binding, runId: `observability-${kind}-off` } };
+      await executePaperclipNativeSession({ db: leaseDb(off), execution: off, runnerInstanceId: "runner", observability: observability(false) });
+      expect(state.execute).toHaveBeenCalledTimes(3);
     });
 
     it("replaces an older warm process before the first turn with cryptographic identity", async () => {
