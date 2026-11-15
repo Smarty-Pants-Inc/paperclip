@@ -303,7 +303,7 @@ export interface SandboxCallbackBridgeQueueClient {
   supportsListWait?: boolean;
   /** Maximum wait supported by the client's own command timeout. */
   maxListWaitMs?: number;
-  listJsonFiles(remotePath: string, waitMs?: number): Promise<string[]>;
+  listJsonFiles(remotePath: string, waitMs?: number, runStatePath?: string): Promise<string[]>;
   fileSize?(remotePath: string): Promise<number>;
   readTextFile(remotePath: string, maxBytes?: number): Promise<string>;
   writeTextFile(remotePath: string, body: string): Promise<void>;
@@ -675,7 +675,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const quoted = remotePaths.map((remotePath) => shellQuote(remotePath));
       await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
     },
-    listJsonFiles: async (remotePath, waitMs) => {
+    listJsonFiles: async (remotePath, waitMs, runStatePath) => {
       const requestedWaitMs = typeof waitMs === "number" && Number.isFinite(waitMs) && waitMs > 0
         ? Math.trunc(waitMs)
         : 0;
@@ -687,9 +687,19 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         [
           `if [ -d ${shellQuote(remotePath)} ]; then`,
           ...(waitChecks > 0 ? [
+            ...(runStatePath ? [
+              `  initial_run_state=`,
+              `  IFS= read -r initial_run_state < ${shellQuote(runStatePath)} || :`,
+            ] : []),
             `  wait_checks=${waitChecks}`,
             `  while [ "$wait_checks" -gt 0 ]; do`,
+            ...(runStatePath ? [
+              `    current_run_state=`,
+              `    IFS= read -r current_run_state < ${shellQuote(runStatePath)} || :`,
+              `    [ "$current_run_state" = "$initial_run_state" ] || break`,
+            ] : []),
             `    found_file=`,
+
             `    for file in ${shellQuote(remotePath)}/*.json; do`,
             `      [ -f "$file" ] || continue`,
             `      found_file=1`,
@@ -1621,7 +1631,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         pollSettledPromise = new Promise<void>((resolve) => { pollSettled = resolve; });
         try {
           fileNames = await withTimeout(
-            input.client.listJsonFiles(directories.requestsDir, pollListWaitMs),
+            input.client.listJsonFiles(directories.requestsDir, pollListWaitMs, runStatePath),
             iterationTimeoutMs,
             "Sandbox callback bridge list requests",
           );
