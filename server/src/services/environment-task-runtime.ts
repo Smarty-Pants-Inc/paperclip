@@ -482,7 +482,8 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
       executionContextSupported: 1 as const,
       ...(executionContext ? { executionContext } : {}),
     };
-    const setupTimeoutSeconds = driverConfig.setupTimeoutSeconds;
+    const setupTimeoutSeconds = driverConfig.setupTimeoutSeconds ??
+      (config.provider === metadata.driverKey ? config.setupTimeoutSeconds : undefined);
     const describeTimeout = typeof setupTimeoutSeconds === "number" && Number.isInteger(setupTimeoutSeconds) && setupTimeoutSeconds >= 1
       ? Math.max(90_000, Math.min(setupTimeoutSeconds, 600) * 1_000) : 90_000;
     const timeout = operation.kind === "copilot_metadata" ? Math.max(1, Math.min(40_000, Number(probe?.expiresAtMs) - Date.now()))
