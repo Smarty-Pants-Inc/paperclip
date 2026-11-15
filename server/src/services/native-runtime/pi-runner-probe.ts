@@ -8,6 +8,8 @@ import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
+import { describeExitedRemoteRunnerRunLog, readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
+import { redactSensitiveText } from "../../redaction.js";
 
 const SAFE_FAILURES: Record<string, string> = {
   pi_prompt_rejected: "Pi handled or rejected hello without starting a model turn.",
@@ -30,6 +32,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
   const testedAt = new Date().toISOString();
   const checks: AdapterEnvironmentTestResult["checks"] = [];
   let stage = "metadata";
+  let runnerExitFailureMessage: string | undefined;
   try {
     // Reuse exact model/profile/config admission; capability caps belong to config.
     const profile = resolvePaperclipRunnerProviderProfile(context.config, { companyId: context.companyId });
@@ -41,7 +44,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (target?.kind !== "remote" || target.transport === "sandbox" && target.runnerTask) throw new Error("Native Pi setup requires a remote command factory");
     const runner = target.transport === "ssh" ? createNativeSshCommandRunner({ spec: target.spec, defaultCwd: target.remoteCwd }) : target.runner;
     if (!runner) throw new Error("The selected factory has no process runner");
-    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
+    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, readRemoteRunnerExitEvidence, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
     const source = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
     // Validate native entries before staging or acquiring an inference authority.
     nativePiRemoteLaunchOptions("/unused", source.manifest, "/unused");
@@ -60,6 +63,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       const remoteFilesystemRoot = posix.join(remoteRoot, "filesystem"), runnerStateDirectory = posix.join(remoteRoot, "runner");
       const remoteBinary = posix.join(remoteRoot, "bin", "paperclip-runnerd");
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
+      let runnerExitEvidence: string | undefined;
       let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
       const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
         if (prepared) return;
@@ -74,6 +78,9 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       };
       const cleanup = async () => {
         if (remoteCreated) {
+          // Capture a possible exited Runner's diagnostics before the remote
+          // runtime is archived and removed. Success never reports this evidence.
+          runnerExitEvidence = (await readRemoteRunnerExitEvidence(runner!, [posix.join(remoteRoot, "diagnostics")], Date.now() + 5_000)).runnerExitEvidence;
           // Reuse the retained-backup sync-out path, without exclusions. A
           // failed/partial pull must never authorize removal of the sole copy.
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
@@ -100,15 +107,26 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
             await stageRemoteRunnerFile({ target: target!, runner: runner!, sourcePath, targetPath, mode: 0o600 }); return targetPath;
           },
           process: { runnerProcessLauncher, runnerStateDirectory, readRunnerState: () => readRemoteRunnerState({ runner: runner!, stateDirectory: runnerStateDirectory }) } });
-        return await probeNativeRunnerEnvironment({ runtimeDirectory, provider: "pi_rpc", model, admissionOnly,
-          workingDirectory: target!.remoteCwd, environment, timeoutMs: 45_000,
+        try {
+          return await probeNativeRunnerEnvironment({ runtimeDirectory, provider: "pi_rpc", model, admissionOnly,
+            workingDirectory: target!.remoteCwd, environment, timeoutMs: 45_000,
           transportOptions: { ...executionDriver, runnerProcessLauncher, runnerBinary, runnerFilesystemRoot: remoteFilesystemRoot,
             ...nativePiRemoteLaunchOptions(pack.root, source.manifest, remoteRoot), piRpcThinkingLevel,
             externallySandboxed: target!.transport === "sandbox",
             prpIdentity: { runnerInstanceId, runId: id, normalizedSessionId: id,
               environmentLeaseId: target!.transport === "sandbox" && target!.leaseId ? target!.leaseId : id, turnId: `turn-${id}`, itemId: `item-${id}` } },
-          onCleanupConfirmed: cleanup,
-        });
+            onCleanupConfirmed: cleanup,
+          });
+        } catch (error) {
+          const diagnostic = readRemoteRunnerRecoveryError(error);
+          if (diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") {
+            const evidence = runnerExitEvidence ? { runnerExitEvidence } :
+              await readRemoteRunnerExitEvidence(runner!, [posix.join(remoteRoot, "diagnostics")], Date.now() + 5_000);
+            const message = describeExitedRemoteRunnerRunLog({ ...diagnostic, ...evidence });
+            if (message) runnerExitFailureMessage = message;
+          }
+          throw error;
+        }
       } catch (error) {
         if (error instanceof NativeEnvironmentProbeCleanupError) { cleanupTransferred = true; throw error; }
         throw error;
@@ -133,7 +151,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
     const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
     // No raw provider error, argv, environment, request body or credential is reflected.
-    const message = error instanceof PaperclipRunnerProviderProfileError ? error.message : SAFE_FAILURES[code]
+    const message = error instanceof PaperclipRunnerProviderProfileError ? error.message : runnerExitFailureMessage ?? SAFE_FAILURES[code]
       ?? (stage === "hello" ? "Native Pi did not prove a nonempty tool-free hello and successful retirement. The connection was not adopted." : "The selected factory could not complete native Pi metadata admission. No hello prompt was sent.");
     checks.push({ code: stage === "hello" ? "pi_hello_probe_failed" : "pi_rpc_metadata_failed", level: "error", message });
     return { adapterType: "paperclip_runner", testedAt, status: "fail", checks };

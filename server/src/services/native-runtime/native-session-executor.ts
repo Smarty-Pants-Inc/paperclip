@@ -16531,7 +16531,7 @@ async function readPredecessorSandbox(read: () => Promise<PredecessorSandboxReco
 }
 
 /** Best effort: a missing, slow or unreadable file leaves the recovery outcome unchanged. */
-async function readRemoteRunnerExitEvidence(runner: CommandManagedRuntimeRunner, diagnosticsDirectories: string[], deadline: number):
+export async function readRemoteRunnerExitEvidence(runner: CommandManagedRuntimeRunner, diagnosticsDirectories: string[], deadline: number):
   Promise<{ runnerExitEvidence?: string }> {
   try {
     const result = await readRemoteRunnerRecoveryProbe({
