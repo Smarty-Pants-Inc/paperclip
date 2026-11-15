@@ -2823,6 +2823,26 @@ mod tests {
     }
 
     #[test]
+    fn pi_open_performance_spans_cross_the_existing_diagnostic_boundary() {
+        let spans = json!([{
+            "name":"runner.pi.open.total","startedAtMs":1000,"endedAtMs":1010,"outcome":"ok"
+        },{
+            "name":"runner.pi.open.native_mcp_config","startedAtMs":1001,"endedAtMs":1005,"outcome":"failed"
+        }]);
+        let events = normalize_codex_notification(
+            "paperclip/providerPerformance",
+            &json!({"spans":spans}),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "harness.diagnostic");
+        assert_eq!(events[0].payload["code"], "provider_performance_spans");
+        assert_eq!(events[0].payload["spans"], json!([
+            {"name":"runner.pi.open.total","startedAtMs":1000.0,"endedAtMs":1010.0,"outcome":"ok"},
+            {"name":"runner.pi.open.native_mcp_config","startedAtMs":1001.0,"endedAtMs":1005.0,"outcome":"failed"}
+        ]));
+    }
+
+    #[test]
     fn pi_request_sent_instant_is_closed_bounded_and_content_free() {
         let instant = json!({"name":"pi.request.sent","startedAtMs":1234,"endedAtMs":1234,
             "outcome":"ok","attributes":{"prompt":"private"},"runId":"forged"});

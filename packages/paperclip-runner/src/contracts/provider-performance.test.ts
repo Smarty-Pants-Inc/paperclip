@@ -1,5 +1,8 @@
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseProviderPerformanceSpans } from "./provider-performance.js";
+import { PROVIDER_PERFORMANCE_PHASES, parseProviderPerformanceSpans } from "./provider-performance.js";
 
 const now = 1_800_000_000_000;
 const day = 86_400_000;
@@ -23,6 +26,15 @@ describe("closed provider-performance timing admission", () => {
     expect(JSON.stringify(row)).toBe(before);
     expect(parse(existingPhases.map(name => ({ name, startedAtMs: now - 20, endedAtMs: now, outcome: "failed", prompt: "PRIVATE" }))))
       .toEqual(existingPhases.map(name => ({ name, startedAtMs: now - 20, endedAtMs: now, outcome: "failed" })));
+  });
+
+  it("keeps every TS provider-performance phase admitted by runnerd's Rust allowlist", () => {
+    const rustPath = resolve(dirname(fileURLToPath(import.meta.url)), "../../runner/crates/runner-core/src/provider_events.rs");
+    const source = readFileSync(rustPath, "utf8");
+    const matchArm = source.match(/if !matches!\(name,([\s\S]*?)\)\s*\{\s*return None;\s*\}/);
+    expect(matchArm, "provider_performance_spans Rust allowlist match arm").not.toBeNull();
+    const rustNames = new Set([...matchArm![1]!.matchAll(/\"([^\"]+)\"/g)].map(match => match[1]));
+    expect(PROVIDER_PERFORMANCE_PHASES.filter(name => !rustNames.has(name))).toEqual([]);
   });
 
   it("admits all closed cold-open phases and strips extra fields at the server/facade boundary", () => {
