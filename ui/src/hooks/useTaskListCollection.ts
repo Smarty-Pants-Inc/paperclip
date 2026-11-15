@@ -46,7 +46,8 @@ export function useTaskListCollection({ items, companyId, userId, viewStorageKey
     const id = `${kind}:${rawId}`;
     creatorsById.set(id, { id, kind, label: item.createdBy || rawId });
   }
-  const filteredIds = new Set(applyIssueFilters(companyItems.map(item => item.issue), filters, userId, false, liveIssueIds).map(issue => issue.id));
+  const effectiveFilters = view === "hidden" ? { ...filters, showHiddenTasks: true } : filters;
+  const filteredIds = new Set(applyIssueFilters(companyItems.map(item => item.issue), effectiveFilters, userId, false, liveIssueIds).map(issue => issue.id));
   const normalizedQuery = query.trim().toLocaleLowerCase();
   const matchingItems = companyItems.filter(item => filteredIds.has(item.issue.id)
     && matchesTaskListView(view, item.issue, Boolean(item.unread), userId)

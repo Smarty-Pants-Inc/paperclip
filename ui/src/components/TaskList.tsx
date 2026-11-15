@@ -133,7 +133,7 @@ export function TaskList({ items, allItems = items, initialColumns = defaultTask
         <IssueRow
           issue={issue} presentation="task" appearance="refreshed" density={density} issueLinkState={issueLinkState}
           unreadState={item.unread ? "visible" : "hidden"}
-          titleSuffix={issue.hiddenAt ? <HiddenTaskBadge /> : undefined}
+          titleBadge={issue.hiddenAt ? <HiddenTaskBadge /> : undefined}
           treeGuides={depth} chevronInGuide={depth > 0 && children.length > 0}
           leadingControl={children.length ? (
             <Button variant="ghost" size="icon-xs" className="task-row-disclosure" aria-label={`${expanded ? "Collapse" : "Expand"} ${issue.title}`} aria-expanded={expanded} onClick={() => {

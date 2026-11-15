@@ -556,6 +556,17 @@ describe("IssueRow", () => {
     });
   });
 
+  it.each(["legacy", "task"] as const)("keeps persistent row badges outside the clipped title (%s)", presentation => {
+    const root = createRoot(container);
+    act(() => root.render(<IssueRow issue={createIssue({ title: "A long hidden task title" })} presentation={presentation}
+      titleBadge={<span data-testid="hidden-badge">Hidden</span>} />));
+    const badge = container.querySelector('[data-testid="hidden-badge"]');
+    expect(badge).not.toBeNull();
+    expect(badge?.closest('[data-slot="task-row-title"]')).toBeNull();
+    expect(badge?.closest('[data-slot="task-row-title-cluster"]')).not.toBeNull();
+    act(() => root.unmount());
+  });
+
   it("renders checklist step numbers beside the issue identifier", () => {
     const root = createRoot(container);
 

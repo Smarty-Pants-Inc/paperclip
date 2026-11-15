@@ -170,6 +170,13 @@ them. Agents cannot transfer routine responsibility.
 
 ### Task collection creation filters
 
+Tasks offers a **Hidden** view at `/issues?view=hidden` in Coordinator and Classic.
+Choose it in Views, or **Filters → Hidden tasks only** in Classic without combined views.
+It lists only hidden tasks, with their Hidden tag; open a task to Unhide it using
+its banner or menu. The empty view says “No hidden tasks.” This is separate from
+**Show hidden tasks**, which includes hidden tasks alongside visible tasks. Search,
+personal inbox views, and unread lists continue to exclude hidden tasks.
+
 Tasks opens All tasks for new users. A saved view or an explicit view in the URL
 takes precedence over this default.
 The task table orders rows by Last updated, newest first, without highlighting a

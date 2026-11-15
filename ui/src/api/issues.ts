@@ -219,6 +219,8 @@ export type IssueListFilters = {
   includeAgentCreatedTasks?: boolean;
   /** Ordinary task lists only; search and inbox filters keep excluding hidden tasks. */
   includeHidden?: boolean;
+  /** Return only hidden non-harness tasks; ignored by search and personal queues. */
+  hiddenOnly?: boolean;
   includeParticipatedTasks?: boolean;
   includeRoutineExecutions?: boolean;
   includeBlockedBy?: boolean;
@@ -268,6 +270,7 @@ function issueListSearchParams(filters?: IssueListFilters) {
   if (filters?.includeAgentCreatedTasks !== undefined)
     params.set("includeAgentCreatedTasks", String(filters.includeAgentCreatedTasks));
   if (filters?.includeHidden) params.set("includeHidden", "true");
+  if (filters?.hiddenOnly) params.set("hiddenOnly", "true");
   if (filters?.includeRoutineExecutions)
     params.set("includeRoutineExecutions", "true");
   if (filters?.includeBlockedBy) params.set("includeBlockedBy", "true");

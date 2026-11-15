@@ -8,9 +8,11 @@ export function visibleIssueCondition(): SQL {
 
 /**
  * Task lists can opt in to hidden tasks (`includeHidden`) so a person can find
- * and un-hide them. Harness-owned tasks stay excluded either way.
+ * and un-hide them, or select only hidden tasks (`hiddenOnly`). Hidden-only
+ * takes precedence over inclusion. Harness-owned tasks stay excluded.
  */
-export function listVisibleIssueCondition(includeHidden = false): SQL {
+export function listVisibleIssueCondition(includeHidden = false, hiddenOnly = false): SQL {
+  if (hiddenOnly) return and(isNotNull(issues.hiddenAt), isNull(issues.harnessKind))!;
   return includeHidden ? isNull(issues.harnessKind) : visibleIssueCondition();
 }
 

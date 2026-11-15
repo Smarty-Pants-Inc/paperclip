@@ -113,6 +113,8 @@ export function IssueFiltersPopover({
   enableLiveRunsFilter = true,
   enableAgentCreatedVisibilityFilter = false,
   enableHiddenVisibilityFilter = false,
+  hiddenOnly = false,
+  onHiddenOnlyChange,
   enableRoutineTasksFilter = false,
   buttonVariant = "ghost",
   iconOnly = false,
@@ -132,6 +134,9 @@ export function IssueFiltersPopover({
   enableAgentCreatedVisibilityFilter?: boolean;
   /** Offer Show hidden tasks; the collection must fetch with `includeHidden`. */
   enableHiddenVisibilityFilter?: boolean;
+  /** Classic Tasks exposes the Hidden view here when no Views menu is present. */
+  hiddenOnly?: boolean;
+  onHiddenOnlyChange?: (checked: boolean) => void;
   enableRoutineTasksFilter?: boolean;
   buttonVariant?: "ghost" | "outline";
   iconOnly?: boolean;
@@ -188,6 +193,7 @@ export function IssueFiltersPopover({
   );
   const clearFilters = () => {
     onChange(defaultIssueFilterState);
+    if (hiddenOnly) onHiddenOnlyChange?.(false);
     inboxScopeFilters?.onClear();
   };
 
@@ -523,7 +529,7 @@ export function IssueFiltersPopover({
                 </div>
               ) : null}
 
-              {enableLiveRunsFilter || enableAgentCreatedVisibilityFilter || enableHiddenVisibilityFilter || enableRoutineTasksFilter ? <div className="space-y-1" data-filter-options="visibility">
+              {enableLiveRunsFilter || enableAgentCreatedVisibilityFilter || enableHiddenVisibilityFilter || onHiddenOnlyChange || enableRoutineTasksFilter ? <div className="space-y-1" data-filter-options="visibility">
                 <span className="text-xs text-muted-foreground">Visibility</span>
                 {enableLiveRunsFilter ? <label className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
                   <Checkbox
@@ -539,6 +545,12 @@ export function IssueFiltersPopover({
                       onCheckedChange={(checked) => onChange({ showAgentCreatedTasks: checked === true })}
                     />
                     <span className="text-sm">Show agent-created tasks</span>
+                  </label>
+                ) : null}
+                {onHiddenOnlyChange ? (
+                  <label className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                    <Checkbox checked={hiddenOnly} onCheckedChange={checked => onHiddenOnlyChange(checked === true)} />
+                    <span className="text-sm">Hidden tasks only</span>
                   </label>
                 ) : null}
                 {enableHiddenVisibilityFilter ? (

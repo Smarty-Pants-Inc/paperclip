@@ -7,8 +7,8 @@ import { TaskList, type TaskListItem } from "./TaskList";
 import { TooltipProvider } from "./ui/tooltip";
 import { readTaskListSortParams } from "../lib/task-list";
 
-vi.mock("./IssueRow", () => ({ IssueRow: ({ issue, leadingControl, titleSuffix }: { issue: { id: string; title: string }; leadingControl?: ReactNode; titleSuffix?: ReactNode }) =>
-  <div data-issue-row-details={issue.id}>{leadingControl}<button>{issue.title}</button>{titleSuffix}</div> }));
+vi.mock("./IssueRow", () => ({ IssueRow: ({ issue, leadingControl, titleBadge }: { issue: { id: string; title: string }; leadingControl?: ReactNode; titleBadge?: ReactNode }) =>
+  <div data-issue-row-details={issue.id}>{leadingControl}<button>{issue.title}</button>{titleBadge}</div> }));
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
 const tasks = (count: number, parentId: string | null = null): TaskListItem[] => Array.from({ length: count }, (_, i) => ({

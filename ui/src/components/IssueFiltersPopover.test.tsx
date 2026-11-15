@@ -112,6 +112,24 @@ describe("IssueFiltersPopover", () => {
     act(() => root.unmount());
   });
 
+  it.each(["legacy", "streamlined"] as const)("offers the Hidden-only filter and clears it in %s", presentation => {
+    const root = createRoot(container);
+    const onChange = vi.fn();
+    const onHiddenOnlyChange = vi.fn();
+    const props = { presentation, state: defaultIssueFilterState, onChange, onHiddenOnlyChange };
+    act(() => root.render(<IssueFiltersPopover {...props} activeFilterCount={0} />));
+    const row = [...container.querySelectorAll("label")].find(label => label.textContent === "Hidden tasks only");
+    expect(row?.querySelector("input")?.checked).toBe(false);
+    act(() => row?.querySelector("input")?.click());
+    expect(onHiddenOnlyChange).toHaveBeenLastCalledWith(true);
+    act(() => root.render(<IssueFiltersPopover {...props} hiddenOnly activeFilterCount={1} />));
+    expect([...container.querySelectorAll("label")].find(label => label.textContent === "Hidden tasks only")?.querySelector("input")?.checked).toBe(true);
+    act(() => [...container.querySelectorAll("button")].find(button => button.textContent === "Clear")!.click());
+    expect(onHiddenOnlyChange).toHaveBeenLastCalledWith(false);
+    expect(onChange).toHaveBeenCalledWith(defaultIssueFilterState);
+    act(() => root.unmount());
+  });
+
   it("uses a scrollable popover and a three-column desktop grid", () => {
     const root = createRoot(container);
 

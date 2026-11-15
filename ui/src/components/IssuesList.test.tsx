@@ -146,6 +146,7 @@ vi.mock("./IssueRow", () => ({
     showIdentifier,
     trailingMeta,
     titleSuffix,
+    titleBadge,
   }: {
     issue: Issue;
     desktopMetaLeading?: ReactNode;
@@ -162,6 +163,7 @@ vi.mock("./IssueRow", () => ({
     showIdentifier?: boolean;
     trailingMeta?: ReactNode;
     titleSuffix?: ReactNode;
+    titleBadge?: ReactNode;
   }) => (
     <div
       data-testid="issue-row"
@@ -177,6 +179,7 @@ vi.mock("./IssueRow", () => ({
     >
       <span>{issue.title}</span>
       <span data-testid="issue-row-title-suffix">{titleSuffix}</span>
+      {titleBadge}
       {leadingControl}
       {externalObjectSummary ? (
         <span data-testid="external-object-summary">{externalObjectSummary.total}</span>
@@ -568,6 +571,40 @@ describe("IssuesList", () => {
         expect(byTitle("Hidden row")?.querySelector('[data-slot="hidden-task-badge"]')?.getAttribute("title")).toBe("This task is hidden");
         expect(byTitle("Shown row")?.querySelector('[data-slot="hidden-task-badge"]')).toBeNull();
       });
+    } finally { act(() => root.unmount()); queryClient.clear(); }
+  });
+
+  it.each([true, false])("Hidden shows only hidden rows (including automated tasks) and its empty state (streamlined=%s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    const hidden = createIssue({ id: "hidden", title: "Hidden automated task", createdByAgentId: "agent", hiddenAt: new Date(), parentId: "shown" });
+    const shown = createIssue({ id: "shown", title: "Visible parent" });
+    const props = { viewStateKey: "paperclip:test-hidden-only", agents: [], projects: [], hiddenOnly: true, enableAgentCreatedVisibilityFilter: true, rowPresentation: "task" as const, onUpdateIssue: () => undefined };
+    const { root, queryClient } = renderWithQueryClient(<IssuesList {...props} issues={[shown, hidden]} />, container);
+    try {
+      await waitForAssertion(() => {
+        expect(container.textContent).toContain(hidden.title);
+        expect(container.textContent).not.toContain(shown.title);
+        expect(container.querySelector('[data-slot="hidden-task-badge"]')?.textContent).toBe("Hidden");
+      });
+      await act(() => root.render(<QueryClientProvider client={queryClient}><TooltipProvider><IssuesList {...props} issues={[shown]} /></TooltipProvider></QueryClientProvider>));
+      await waitForAssertion(() => expect(container.textContent).toContain("No hidden tasks."));
+      expect(container.textContent).not.toContain(shown.title);
+    } finally { act(() => root.unmount()); queryClient.clear(); }
+  });
+
+  it.each([true, false])("keeps Hidden scoped in board requests and shows its empty state (streamlined=%s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    const collectionKey = "paperclip:test-hidden-board";
+    localStorage.setItem(taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey }),
+      JSON.stringify({ version: 1, companyId: "company-1", collectionKey, viewState: { viewMode: "board" }, columns: [] }));
+    const { root, queryClient } = renderWithQueryClient(<IssuesList issues={[]} agents={[]} projects={[]}
+      hiddenOnly enableAgentCreatedVisibilityFilter viewStateKey={collectionKey} onUpdateIssue={() => undefined} />, container);
+    try {
+      await waitForAssertion(() => {
+        expect(mockIssuesApi.list).toHaveBeenCalled();
+        expect(container.textContent).toContain("No hidden tasks.");
+      });
+      for (const [, filters] of mockIssuesApi.list.mock.calls) expect(filters).toMatchObject({ hiddenOnly: true, includeAgentCreatedTasks: true });
     } finally { act(() => root.unmount()); queryClient.clear(); }
   });
 

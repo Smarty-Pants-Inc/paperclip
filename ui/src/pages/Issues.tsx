@@ -180,6 +180,7 @@ function OrganizationIssues({
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
   const fetchNextPageInFlightRef = useRef(false);
+  const hiddenOnly = searchParams.get("view") === "hidden";
 
   const urlSearch = searchParams.get("q") ?? "";
   const [searchOverride, setSearchOverride] = useState<{ search: string; locationSearch: string } | null>(null);
@@ -206,7 +207,7 @@ function OrganizationIssues({
     }, { replace: true });
   }, [setSearchParams, syncedSearch]);
   const routineTasksOnly = searchParams.get("originKind") === "routine_execution";
-  const includeAgentCreatedTasks = showAgentCreatedTasks || routineTasksOnly;
+  const includeAgentCreatedTasks = hiddenOnly || showAgentCreatedTasks || routineTasksOnly;
   const originKind = routineTasksOnly ? "routine_execution" : undefined;
   const handleRoutineTasksOnlyChange = useCallback((checked: boolean) => {
     setSearchParams(current => {
@@ -288,6 +289,7 @@ function OrganizationIssues({
       includeAgentCreatedTasks,
       "include-hidden",
       showHiddenTasks,
+      hiddenOnly,
       originKind,
       "infinite",
       issuePageSize,
@@ -302,6 +304,7 @@ function OrganizationIssues({
       includeRoutineExecutions: true,
       includeAgentCreatedTasks,
       includeHidden: showHiddenTasks,
+      hiddenOnly: hiddenOnly || undefined,
       originKind,
       limit: issuePageSize,
       offset: pageParam,
@@ -368,7 +371,9 @@ function OrganizationIssues({
       initialSearch={syncedSearch}
       onSearchChange={handleSearchChange}
       enableAgentCreatedVisibilityFilter
-      enableHiddenVisibilityFilter
+      enableHiddenVisibilityFilter={!hiddenOnly}
+      hiddenOnly={hiddenOnly}
+      onHiddenOnlyChange={toolbarContext ? undefined : checked => setSearchParams({ view: checked ? "hidden" : "all" })}
       routineTasksOnly={routineTasksOnly}
       onRoutineTasksOnlyChange={handleRoutineTasksOnlyChange}
       sort={sort}
