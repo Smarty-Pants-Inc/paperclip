@@ -39,20 +39,28 @@ export function lifecycleErrorDetail(error: unknown): string {
   const seen = new Set<object>();
   let current: unknown = error;
   for (let depth = 0; depth <= 3 && current !== null && (typeof current === "object" || typeof current === "function"); depth++) {
-    const source = current as { cause?: unknown; code?: unknown; message?: unknown; constructor?: { name?: unknown } };
+    const source = current as { cause?: unknown; code?: unknown; status?: unknown; details?: unknown; message?: unknown; constructor?: { name?: unknown } };
     if (seen.has(source)) break;
     seen.add(source);
     const constructorName = typeof source.constructor?.name === "string" ? source.constructor.name : "Error";
     const rawCode = typeof source.code === "string" || typeof source.code === "number" ? source.code : undefined;
-    const code = typeof rawCode === "string"
-      ? /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(rawCode) && !/[a-z0-9]{20,}/i.test(rawCode) && !/(?:sk-|ghp_|gho_|xox)/i.test(rawCode) ? rawCode : undefined
-      : rawCode;
+    const isSafeCode = (value: string) => /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(value)
+      && !/[a-z0-9]{20,}/i.test(value) && !/(?:sk-|ghp_|gho_|xox)/i.test(value);
+    const code = typeof rawCode === "string" ? isSafeCode(rawCode) ? rawCode : undefined : rawCode;
+    const rawDetails = source.details;
+    const errorDetails = rawDetails !== null && typeof rawDetails === "object" && !Array.isArray(rawDetails)
+      ? rawDetails as Record<string, unknown> : undefined;
+    const detailCodeValue = [errorDetails?.code, errorDetails?.failureCode, errorDetails?.reason]
+      .find((value): value is string => typeof value === "string" && isSafeCode(value));
+    const status = Number.isInteger(source.status) && Number(source.status) >= 100 && Number(source.status) <= 599
+      ? Number(source.status) : undefined;
     const message = typeof source.message === "string" ? source.message : "";
     const safeMessage = /^[a-z][a-z0-9_]{2,80}(:[ a-z0-9_.()-]{0,160})?$/.test(message)
       && !/[a-z0-9]{20,}/.test(message)
       && !/(?:sk-|ghp_|gho_|xox)/i.test(message)
       ? redactSensitiveText(message) : "withheld";
-    details.push({ name: constructorName.slice(0, 80), ...(code === undefined ? {} : { code: typeof code === "string" ? code.slice(0, 80) : code }), message: safeMessage });
+    details.push({ name: constructorName.slice(0, 80), ...(code === undefined ? {} : { code: typeof code === "string" ? code.slice(0, 80) : code }),
+      ...(status === undefined ? {} : { status }), ...(detailCodeValue === undefined ? {} : { detailCode: detailCodeValue.slice(0, 80) }), message: safeMessage });
     current = source.cause;
   }
   let serialized = JSON.stringify(details);
