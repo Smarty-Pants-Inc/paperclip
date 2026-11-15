@@ -16282,6 +16282,26 @@ describe("native session bounded recovery", () => {
     });
   });
 
+  it("keeps the original failure log and appends one process-not-running runner line", async () => {
+    const failure = new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+    const logs: string[] = [];
+    state.execute.mockReset().mockRejectedValueOnce(failure);
+    state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+    const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+      update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
+    } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    try {
+      await expect(executePaperclipNativeSession({
+        db: leaseDb(execution, {}, {}, []), execution, runnerInstanceId: "runner",
+        onLog: async (_stream, text) => { logs.push(text); },
+      })).rejects.toBe(failure);
+      expect(logs).toEqual([
+        `[paperclip-runner] native session execution failed: ${failure.message}\n`,
+        "[paperclip-runner] runner process is not running (identity check exit 45); last lines unavailable: runner stderr evidence is missing or unreadable\n",
+      ]);
+    } finally { service.mockRestore(); }
+  });
+
   it.each(["full", "truncated"])("redacts %s identity from native failure writes, logs, and rethrown errors", async (mode) => {
     const privateKeyPem = generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString();
     const keyBody = privateKeyPem.split("\n")[1];
