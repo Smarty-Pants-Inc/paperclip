@@ -281,6 +281,47 @@ describePostgres("heartbeat agent status", () => {
     expect(await reconcile()).toEqual([agentId]);
   });
 
+  it.each([false, true])("settles a handed-off superseded alias, including historical retry metadata (%s)", async staleRetry => {
+    const { companyId, agentId, runId } = await seed("succeeded");
+    const successorRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: successorRunId, companyId, agentId,
+      invocationSource: "automation", status: "succeeded", runtimeMode: "legacy", startedAt: old(), finishedAt: old() });
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/shared-root", executionRoot: "/tmp/shared-root", location: "local",
+      state: "superseded", processStoppedAt: null, nextAttemptAt: staleRetry ? new Date(Date.now() + 60_000) : null,
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, successorRunId,
+        ...(staleRetry ? { baseline: {}, cleanupPending: true } : {}) } });
+    const settled = () => db.select({ id: agents.id }).from(agents)
+      .where(and(eq(agents.id, agentId), settledAgentWorkCondition(live, new Date())));
+    expect(await settled()).toEqual([{ id: agentId }]);
+    expect(await reconcile()).toEqual([agentId]);
+    expect((await agent(agentId)).status).toBe("idle");
+    expect(await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId)))
+      .toEqual([expect.objectContaining({ state: "superseded", processStoppedAt: null,
+        nextAttemptAt: staleRetry ? expect.any(Date) : null })]);
+  });
+
+  it.each([undefined, null, "", "  ", 42])("keeps a superseded copy without a successor identity as work (%s)", async successorRunId => {
+    const { companyId, agentId, runId } = await seed("succeeded");
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/shared-root", executionRoot: "/tmp/shared-root", location: "local",
+      state: "superseded", processStoppedAt: old(), receipt: { successorRunId } });
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+  });
+
+  it.each(["warm_saved", "prepared", "unchanged_turn", "preparing"])("keeps a %s copy as work even with successor metadata", async state => {
+    const { companyId, agentId, runId } = await seed("succeeded");
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/shared-root", executionRoot: "/tmp/shared-root", location: "local",
+      state, processStoppedAt: old(), receipt: { successorRunId: randomUUID() } });
+    expect(await reconcile()).toEqual([]);
+    expect((await agent(agentId)).status).toBe("running");
+  });
+
   it("retains native finalization ownership", async () => {
     const { companyId, runId, issueId } = await seed();
     await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId }).where(eq(heartbeatRuns.id, runId));

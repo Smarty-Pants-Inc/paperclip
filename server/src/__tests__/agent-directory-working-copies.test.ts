@@ -1197,6 +1197,22 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(fresh.localRoot, "late.txt"), "utf8")).toBe("after turn");
   });
 
+  it("retires the predecessor retry at warm handoff without stop proof or releasing the successor's tree", async () => {
+    const first = await run({ warm: true });
+    await copies.checkpointWarm({ companyId, runId: first.runId });
+    await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() + 60_000) })
+      .where(eq(agentInstructionWorkingCopies.runId, first.runId));
+    const successor = await run({ warm: true, reuseRunId: first.runId });
+    expect(await copies.get(companyId, first.runId)).toMatchObject({ state: "superseded",
+      processStoppedAt: null, nextAttemptAt: null, receipt: { successorRunId: successor.runId } });
+    await copies.collectStopped({ companyId, runId: first.runId });
+    await copies.release(companyId, first.runId);
+    expect((await copies.get(companyId, first.runId))?.processStoppedAt).toBeNull();
+    expect(await fs.readFile(path.join(successor.localRoot, entryFile), "utf8")).toBe(initial);
+    expect(JSON.parse(await fs.readFile(path.join(path.dirname(successor.localRoot), "owner.json"), "utf8")).runId)
+      .toBe(successor.runId);
+  });
+
   it("rechecks canonical edits at handoff and releases the writer lock before retirement and fresh restore", async () => {
     const first = await run({ warm: true });
     await copies.checkpointWarm({ companyId, runId: first.runId });

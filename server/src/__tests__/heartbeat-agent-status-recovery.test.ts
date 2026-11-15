@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases,
+import { agentInstructionWorkingCopies, agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases,
   heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -74,6 +74,26 @@ describePostgres("heartbeat recovery of a stranded agent", () => {
       .toEqual([expect.objectContaining({ status: "retained", providerLeaseId: "warm-native-allocation", releasedAt: null })]);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))
       .toEqual([expect.objectContaining({ status: "succeeded" })]);
+  });
+
+  it("reconciles a finished warm handoff through the reaper with the old retry still present", async () => {
+    const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), successorRunId = randomUUID();
+    const old = new Date(Date.now() - 60 * 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Handed-off copy recovery", issuePrefix: "HDOF" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Warm worker", role: "engineer",
+      status: "running", adapterType: "process", runtimeConfig: { heartbeat: { enabled: false } }, updatedAt: old });
+    await db.insert(heartbeatRuns).values([runId, successorRunId].map(id => ({ id, companyId, agentId,
+      status: "succeeded", runtimeMode: "legacy", invocationSource: "automation", startedAt: old, finishedAt: old, updatedAt: old })));
+    await db.insert(agentInstructionWorkingCopies).values({ companyId, agentId, runId,
+      responsibleUserId: "test-user", entryFile: "AGENTS.md", baseHash: "test-hash",
+      localRoot: "/tmp/shared-root", executionRoot: "/tmp/shared-root", location: "local", state: "superseded",
+      processStoppedAt: null, nextAttemptAt: new Date(Date.now() + 60_000),
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, successorRunId } });
+    expect(await heartbeatService(db).reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+    expect(await db.select().from(agents).where(eq(agents.id, agentId)))
+      .toEqual([expect.objectContaining({ status: "idle", lastHeartbeatAt: null })]);
+    expect(await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId)))
+      .toEqual([expect.objectContaining({ state: "superseded", processStoppedAt: null, nextAttemptAt: expect.any(Date) })]);
   });
 
   it("keeps unrelated recovery available when the correction audit fails", async () => {
