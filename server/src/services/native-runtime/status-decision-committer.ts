@@ -2371,8 +2371,17 @@ export async function commitNativeStatusDecision(input: {
       }
       const monitorIsScheduled = issue.monitorNextCheckAt !== null ||
         parseIssueExecutionState(issue.executionState)?.monitor?.status === "scheduled";
+      const nextAssigneeAgentId = returnTo
+        ? returnTo.type === "agent" ? returnTo.agentId ?? null : null
+        : issue.assigneeAgentId ?? null;
+      const nextAssigneeUserId = returnTo
+        ? returnTo.type === "user" ? returnTo.userId ?? null : null
+        : issue.assigneeUserId ?? null;
       const monitorClearReason = monitorIsScheduled
-        ? monitorClearReasonForIssue(input.decision.toStatus, issue.assigneeAgentId, issue.assigneeUserId)
+        ? monitorClearReasonForIssue(input.decision.toStatus, nextAssigneeAgentId, nextAssigneeUserId)
+        : null;
+      const monitorPolicy = monitorClearReason
+        ? normalizeIssueExecutionPolicy(issue.executionPolicy)
         : null;
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
@@ -2380,7 +2389,7 @@ export async function commitNativeStatusDecision(input: {
           ...(reviewStage?.kind === "starts" ? reviewStage.patch : {}),
           ...(monitorClearReason ? buildIssueMonitorClearedPatch({
             issue,
-            policy: normalizeIssueExecutionPolicy(issue.executionPolicy),
+            policy: monitorPolicy,
             clearReason: monitorClearReason,
           }) : {}),
           ...(returnTo ? { assigneeAgentId: returnTo.type === "agent" ? returnTo.agentId : null,
@@ -2397,6 +2406,25 @@ export async function commitNativeStatusDecision(input: {
       );
       if (!projected) throw new NativeStatusRaceError();
       updated = projected;
+      if (monitorClearReason) {
+        const { publication } = await persistActivity(tx as unknown as Db, {
+          companyId: input.companyId,
+          actorType: "system",
+          actorId: "native-status-committer",
+          runId: input.runId,
+          action: "issue.monitor_cleared",
+          entityType: "issue",
+          entityId: issue.id,
+          issueId: input.issueId,
+          details: {
+            identifier: issue.identifier,
+            previousNextCheckAt: issue.monitorNextCheckAt?.toISOString() ?? monitorPolicy?.monitor?.nextCheckAt ?? null,
+            reason: monitorClearReason,
+            notes: monitorPolicy?.monitor?.notes ?? issue.monitorNotes ?? parseIssueExecutionState(issue.executionState)?.monitor?.notes ?? null,
+          },
+        });
+        publications.push(publication);
+      }
       // The route wakes an agent participant when its stage starts; a person
       // acts from the task. This is a workflow wake, not the worker's message.
       const participant = reviewStage?.kind === "starts" ? reviewStage.state.currentParticipant : null;
