@@ -7,7 +7,8 @@ import type { LifecycleAgent, LifecycleStore, LifecycleDriver } from "../applica
 import { startAgentLifecycle } from "../index.js";
 import { createAgentLifecycleEffects } from "../../../services/agent-lifecycle.js";
 import { logger } from "../../../middleware/logger.js";
-import { lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "../application/failure.js";
+import { lifecycleFailureCode, lifecycleFailureMessage, lifecycleVerificationNeedsRetry } from "../application/failure.js";
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 
 const agent: LifecycleAgent = { id: "agent", companyId: "company", lifecycleState: "verifying", lifecycleVersion: 3,
   lifecycleRequiredPluginIds: null, lifecycleError: null,
@@ -80,6 +81,15 @@ describe("lifecycle readiness handoff", () => {
 });
 
 describe("lifecycle failure diagnostics", () => {
+  it("classifies a plugin RPC timeout during host verification as transient", () => {
+    const error = Object.assign(new Error('RPC call "environmentAcquireLease" timed out'), {
+      code: PLUGIN_RPC_ERROR_CODES.TIMEOUT,
+    });
+    expect(lifecycleFailureCode(error)).toBe("PLUGIN_RPC_TIMEOUT");
+    // Transient: the existing automatic retry handles it; it never pauses verification for repair.
+    expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying" }, error)).toBe(false);
+  });
+
   it.each(["ai_connection_required", "harness_auth_failed", "harness_model_unavailable", "harness_command_unavailable", "harness_cwd_invalid", "harness_probe_unexpected_output"])("waits for repair only for a host verification failure: %s", code => {
     const error = { code };
     expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying" }, error)).toBe(true);
