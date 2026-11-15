@@ -6,7 +6,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, agentApiKeys, authUsers, budgetPolicies, companies, companyMemberships,
+import { activityLog, agents, agentApiKeys, agentConfigRevisions, authUsers, budgetPolicies, companies, companyMemberships,
   companySecretBindings, createDb, heartbeatRuns, principalPermissionGrants, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -15,6 +15,8 @@ import { agentRoutes } from "../routes/agents.js";
 import { costRoutes } from "../routes/costs.js";
 import { secretService } from "../services/secrets.js";
 import { configureAgentLifecycle } from "../services/agent-lifecycle.js";
+import { boardAuthService } from "../services/board-auth.js";
+import { parseHeartbeatPolicy } from "../services/heartbeat/timer-policy.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { closeProcessRunAdmission, resetProcessRunAdmissionForTests } from "../services/heartbeat/run-admission.js";
 
@@ -209,6 +211,47 @@ describe("manager report runtime autonomy", () => {
       expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]!.budgetMonthlyCents).toBe(50_000);
     });
   }
+  for (const [actor, target] of [["primary", "lead"], ["lead", "worker"]] as const) {
+    it(`daily cap: ${actor} cannot stop ${target} by setting maxDailyCostCents to zero`, async () => {
+      const f = await seed(); const before = await f.readAgent(f.ids[target]);
+      const response = await f.call("patch", `/agents/${f.ids[target]}`, {
+        name: "must-not-stick", budgetMonthlyCents: 123_456,
+        adapterConfig: { env: { ROW_VAR: "must-not-stick" } },
+        runtimeConfig: { heartbeat: { enabled: false, maxDailyCostCents: 0 } },
+      }, actor);
+      expect(response.status, response.text).toBe(422);
+      expect(response.body.error).toBe("maxDailyCostCents 0 stops the agent; omit the field (or send null) to remove the daily cap");
+      expect(await f.readAgent(f.ids[target])).toEqual(before);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, f.ids[target]))).toEqual([]);
+      expect(await db.select().from(budgetPolicies).where(eq(budgetPolicies.scopeId, f.ids[target]))).toEqual([]);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, f.ids[target]))).toEqual([]);
+    });
+  }
+  for (const amount of [250, null, undefined]) {
+    it(`daily cap: a manager can send ${amount === undefined ? "an absent field" : amount}`, async () => {
+      const f = await seed();
+      await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, maxDailyCostCents: 500 } } }).where(eq(agents.id, f.ids.worker));
+      const heartbeat = { enabled: false, ...(amount === undefined ? {} : { maxDailyCostCents: amount }) };
+      const response = await f.call("patch", `/agents/${f.ids.worker}`, { runtimeConfig: { heartbeat } }, "lead");
+      expect(response.status, response.text).toBe(200);
+      const saved = await f.readAgent(f.ids.worker);
+      expect(saved.runtimeConfig.heartbeat).toEqual(heartbeat);
+      expect(parseHeartbeatPolicy(saved).maxDailyCostCents).toBe(amount ?? null);
+    });
+  }
+  it("daily cap: a board user retains zero, positive, null and absent behavior", async () => {
+    const f = await seed();
+    const key = await boardAuthService(db).createNamedBoardApiKey({ userId: f.userId, name: "Daily cap fixture" });
+    for (const amount of [0, 250, null, undefined]) {
+      const heartbeat = { enabled: false, ...(amount === undefined ? {} : { maxDailyCostCents: amount }) };
+      const response = await request(f.api).patch(`/api/agents/${f.ids.worker}`)
+        .set("Authorization", `Bearer ${key.token}`).send({ runtimeConfig: { heartbeat } });
+      expect(response.status, response.text).toBe(200);
+      const saved = await f.readAgent(f.ids.worker);
+      expect(saved.runtimeConfig.heartbeat).toEqual(heartbeat);
+      expect(parseHeartbeatPolicy(saved).maxDailyCostCents).toBe(amount ?? null);
+    }
+  });
   it("l: retirement is pause then terminate; DELETE never opens for reports", async () => {
     const f = await seed();
     expect((await f.call("delete", `/agents/${f.ids.lead}`)).status).toBe(403);
