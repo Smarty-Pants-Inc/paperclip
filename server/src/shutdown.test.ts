@@ -461,17 +461,22 @@ describe("createPreDrainShutdownBudget", () => {
     }
   });
 
-  it("lets steps after a 15-second restart close finish in the remaining shared budget", async () => {
+  it("lets steps after an 18-second restart close finish in the remaining shared budget", async () => {
     vi.useFakeTimers();
     try {
-      const budget = createPreDrainShutdownBudget({ signal: "SIGTERM", budgetMs: 20_000, log: stubLogger() });
-      const restartClose = budget.run("hot_restart_prepare", () => new Promise<void>(resolve => setTimeout(resolve, 15_000)));
-      await vi.advanceTimersByTimeAsync(15_000);
+      const log = stubLogger();
+      const budget = createPreDrainShutdownBudget({ signal: "SIGTERM", budgetMs: 20_000, log });
+      const restartClose = budget.run("hot_restart_prepare", () => new Promise<void>(resolve => setTimeout(resolve, 18_000)));
+      await vi.advanceTimersByTimeAsync(18_000);
       await expect(restartClose).resolves.toMatchObject({ outcome: "completed" });
 
-      const afterRestart = budget.run("scheduler_idle", () => new Promise<void>(resolve => setTimeout(resolve, 4_000)));
-      await vi.advanceTimersByTimeAsync(4_000);
+      const afterRestart = budget.run("scheduler_idle", () => new Promise<void>(resolve => setTimeout(resolve, 1_000)));
+      await vi.advanceTimersByTimeAsync(1_000);
       await expect(afterRestart).resolves.toMatchObject({ outcome: "completed" });
+      expect(log.info).toHaveBeenCalledWith(
+        expect.objectContaining({ step: "scheduler_idle", timeoutMs: 2_000 }),
+        "shutdown step completed",
+      );
     } finally {
       vi.useRealTimers();
     }
