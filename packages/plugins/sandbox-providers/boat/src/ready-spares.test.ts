@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createReadySpareClaimStore, MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount,
-  readySpareEnvironmentIds, readySpareIdleMinutes, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
+  readySpareDemandTarget, readySpareDemandWindowMinutes, readySpareEnvironmentIds, readySpareIdleMinutes,
+  readySpareMax, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
 } from "./ready-spares.js";
 
 const start = Date.parse("2026-11-15T00:00:00.000Z");
@@ -40,11 +41,21 @@ function operations(records: ReadySpare[] = []) {
 
 describe("Boat ready spare keeper", () => {
   it("has a hard company-config bound and keys create-shaping fields independent of object order", () => {
-    expect(MAX_READY_SPARES).toBe(3);
+    expect(MAX_READY_SPARES).toBe(5);
     expect(readySpareCount({ spares: 1 })).toBe(1);
     expect(readySpareCount({ spares: 4 })).toBe(0);
     expect(readySpareCount({ spares: 1.5 })).toBe(0);
     expect(readySpareCount({})).toBe(0);
+    expect(readySpareMax({})).toBe(3);
+    expect(readySpareMax({ spareMax: 5 })).toBe(5);
+    expect(readySpareMax({ spareMax: 0 })).toBe(3);
+    expect(readySpareDemandWindowMinutes({})).toBe(10);
+    expect(readySpareDemandWindowMinutes({ spareDemandWindowMinutes: 5 })).toBe(5);
+    expect(readySpareDemandWindowMinutes({ spareDemandWindowMinutes: 61 })).toBe(10);
+    expect(readySpareDemandTarget(1, 1, 3)).toBe(2);
+    expect(readySpareDemandTarget(1, 2, 3)).toBe(3);
+    expect(readySpareDemandTarget(1, 8, 3)).toBe(3);
+    expect(readySpareDemandTarget(3, 1, 5)).toBe(3);
     expect(readySpareConfigHash({ type: "small", labels: { b: "2", a: "1" } }))
       .toBe(readySpareConfigHash({ labels: { a: "1", b: "2" }, type: "small" }));
     expect(readySpareConfigHash({ type: "small" })).not.toBe(readySpareConfigHash({ type: "large" }));
@@ -86,6 +97,43 @@ describe("Boat ready spare keeper", () => {
     expect(ops.stop).not.toHaveBeenCalledWith(claimed);
     now += 2_000_000;
     expect(keeper.ready(key)).toHaveLength(1); // expiry is rechecked at claim time
+  });
+
+  it("tracks demand per company/environment and drops it when the rolling window empties", () => {
+    let now = start;
+    const keeper = new ReadySpareKeeper(() => now);
+    expect(keeper.recordDemand(key)).toBe(1);
+    expect(keeper.recordDemand(key)).toBe(2);
+    expect(keeper.demandTarget(key, 1, 3, 10)).toBe(3);
+    expect(keeper.demandCount({ companyId: key.companyId, environmentId: "env-b" }, 10)).toBe(0);
+    now += 10 * 60_000;
+    expect(keeper.demandCount(key, 10)).toBe(0);
+    expect(keeper.demandTarget(key, 1, 3, 10)).toBe(1);
+  });
+
+  it("fills to demand target concurrently and stops the surplus when demand expires", async () => {
+    let now = start;
+    const keeper = new ReadySpareKeeper(() => now, 12);
+    const f = operations();
+    let active = 0, maximum = 0;
+    (f.ops.create as ReturnType<typeof vi.fn>).mockImplementation(async (poolKey: ReadySpareKey) => {
+      active++; maximum = Math.max(maximum, active);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      const created = spare({ id: `bx_parallel_${maximum}_${active}`, key: poolKey,
+        labels: { ...spare().labels, owner: `paperclip:${poolKey.companyId}`, environment: poolKey.environmentId, configHash: poolKey.configHash } });
+      active--;
+      return created;
+    });
+    keeper.recordDemand(key);
+    keeper.recordDemand(key);
+    await keeper.reconcile(key, keeper.demandTarget(key, 1, 3, 10), f.ops);
+    expect(maximum).toBe(3);
+    expect(keeper.ready(key)).toHaveLength(3);
+    now += 10 * 60_000;
+    await keeper.reconcile(key, keeper.demandTarget(key, 1, 3, 10), f.ops);
+    expect(keeper.ready(key)).toHaveLength(1);
+    expect(f.ops.stop).toHaveBeenCalledTimes(2);
+    expect(f.ops).not.toHaveProperty("delete");
   });
 
   it("hands only live warmed spares over and atomically reserves concurrent claims", async () => {
