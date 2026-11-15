@@ -63,6 +63,17 @@ describe("native status authority", () => {
     expect(arbitrate({ assessment: freeText, priorIssueStatus: "in_review", executionStageApprovedByRun: true, governanceGate: { kind: "execution_stage", id: "run" } }))
       .toMatchObject({ toStatus: "in_review", reasonCode: "governed_gate_pending" });
   });
+  it.each(["done", "needs_review", "blocked"] as const)("uses the saved changes request instead of the reviewer's %s report", reportedDisposition => {
+    const result = arbitrate({ priorIssueStatus: "in_review", executionStageChangesRequestedByRun: true,
+      assessment: assessment({ reportedDisposition, objectiveSatisfied: false, hasBlockingRemainingWork: true }) });
+    expect(result).toMatchObject({ statusAction: "in_progress", toStatus: "in_progress", reasonCode: "execution_stage_changes_requested",
+      effects: [{ kind: "release_checkout" }] });
+    expect(arbitrate({ executionStageChangesRequestedByRun: true, governanceGate: { kind: "execution_stage", id: "escalated" } }))
+      .toMatchObject({ statusAction: "in_review", reasonCode: "execution_stage_changes_requested", effects: [{ kind: "release_checkout" }] });
+    expect(arbitrate({ executionStageChangesRequestedByRun: true, terminalState: "failed" }).reasonCode)
+      .not.toBe("execution_stage_changes_requested");
+    expect(arbitrate({ executionStageChangesRequestedByRun: true, workspaceFinalizeStatus: "failed" }).statusAction).toBe("preserve");
+  });
   it("cannot complete an explicitly required quality review from claims or file evidence", () => {
     expect(arbitrate({ completionClaimPolicyAccepted: true, requiredQualityReviewSatisfied: false }))
       .toMatchObject({ toStatus: "in_progress", reasonCode: "required_quality_review_incomplete" });
