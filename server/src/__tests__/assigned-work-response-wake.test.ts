@@ -13,6 +13,7 @@ import { CONTINUATION_CAP_WINDOW_MS, evaluateAssignedWork, type AssignedWorkFact
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
 import { issueService } from "../services/issues.js";
+import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
 import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
@@ -51,7 +52,7 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
     await temporary?.cleanup();
   });
 
-  async function seed(options: { assignmentWake?: boolean; finalize?: boolean; declared?: boolean; beforeFinalize?: (f: {companyId: string; issueId: string}) => Promise<void> } = {}) {
+  async function seed(options: { assignmentWake?: boolean; finalize?: boolean; declared?: boolean; beforeFinalize?: (f: {companyId: string; issueId: string}) => Promise<void>; beforeResult?: (f: { companyId: string; agentId: string; issueId: string; runId: string }) => Promise<void> } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const contractId = randomUUID(), runnerInstanceId = randomUUID();
     const startedAt = new Date(Date.now() - 10_000);
@@ -84,6 +85,7 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
         .where(eq(heartbeatRuns.id, runId));
       return { companyId, agentId, issueId, runId, startedAt };
     }
+    await options.beforeResult?.({ companyId, agentId, issueId, runId });
     const port = new PaperclipControlPlanePort(db, { companyId, agentId, issueId, runId, sessionId: runId,
       completionContractId: contractId, completionContractSha256: contractId, sourceInstanceId: runnerInstanceId,
       controlPlaneSourceInstanceId: `wait-regression-${runId}` });
@@ -143,6 +145,82 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
     expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
       eq(agentWakeupRequests.reason, "issue_continuation_needed")))).toHaveLength(0);
     expect(await sweep.checkIssue(f)).toMatchObject({ outcome: "ok", verdict: { clause: "waiting", reason: "awaiting_person" } });
+  }, 120_000);
+
+  it("an agent's own pending confirmation during its producing run stays asleep for 24 h, then a person answer wakes exactly once", async () => {
+    let interactionId = "";
+    const f = await seed({ finalize: false, beforeResult: async f => {
+      // This is the same service entry point used by the native agent's
+      // request_human_input tool, with the producing agent/run as actor.
+      const interaction = await issueThreadInteractionService(db).create({ id: f.issueId, companyId: f.companyId }, {
+        kind: "request_confirmation", sourceRunId: f.runId, idempotencyKey: `own-question-${f.runId}`,
+        title: "Next step", continuationPolicy: "wake_assignee", resolverPolicy: "human_only",
+        payload: { version: 1, prompt: "May I take the next step?", detailsMarkdown: "",
+          acceptLabel: "Confirm", rejectLabel: "Request changes", rejectRequiresReason: false,
+          supersedeOnUserComment: false },
+      }, { agentId: f.agentId, runId: f.runId, userId: null });
+      expect(interaction).toMatchObject({ status: "pending", createdByAgentId: f.agentId, createdByUserId: null });
+      interactionId = interaction.id;
+    } });
+    await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+    const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, f.runId));
+    // Existing governance wins over a passive response wait: the real pending
+    // confirmation parks the task in review rather than granting an ordinary
+    // in-progress awaiting-person exemption.
+    expect(decision).toMatchObject({ applicationState: "applied", toStatus: "in_review", reasonCode: "governed_response_waiting" });
+    const [assessment] = await db.select().from(workAssessments).where(eq(workAssessments.id, decision.assessmentId));
+    expect(assessment.assessmentJson).toMatchObject({ reportedDisposition: "yielded", continuation: { kind: "response_wake" } });
+    const chronology = await db.execute(sql`select h.started_at::text as run_started_at,
+      t.created_at::text as agent_question_at, r.created_at::text as result_accepted_at,
+      (h.started_at < t.created_at and t.created_at < r.created_at) as question_during_producing_run
+      from heartbeat_runs h join native_run_results r on r.run_id = h.id
+      join issue_thread_interactions t on t.id = ${interactionId}::uuid where h.id = ${f.runId}::uuid`);
+    expect(chronology[0].question_during_producing_run).toBe(true);
+
+    const enqueueWakeup = queue();
+    let clock = clockAfterYield();
+    const end = clock.getTime() + 24 * 60 * 60_000;
+    const sweep = assignedWorkSweep(db, { enqueueWakeup, now: () => clock });
+    let visits = 0;
+    let lastOutcome;
+    while (clock.getTime() <= end) {
+      lastOutcome = await sweep.checkIssue(f);
+      visits++;
+      clock = new Date(clock.getTime() + 15 * 60_000);
+    }
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "queued")))).toHaveLength(0);
+    const [pending] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(pending).toMatchObject({ status: "pending", resolvedByUserId: null, resolvedAt: null });
+
+    const [{ issueRoutes }, { errorHandler }] = await Promise.all([import("../routes/issues.js"), import("../middleware/error-handler.js")]);
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", userId: "local-board", source: "local_implicit", companyIds: [f.companyId], isInstanceAdmin: true };
+      next();
+    });
+    app.use("/api", issueRoutes(db, {} as never));
+    app.use(errorHandler);
+    await request(app).post(`/api/issues/${f.issueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    await vi.waitFor(async () => {
+      expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+        eq(agentWakeupRequests.status, "queued")))).toHaveLength(1);
+    }, { timeout: 10_000 });
+    const [answered] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(answered).toMatchObject({ status: "accepted", resolvedByUserId: "local-board", resolvedByAgentId: null });
+    expect(answered.resolvedAt).toBeInstanceOf(Date);
+    await sweep.checkIssue(f);
+    await sweep.checkIssue(f);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.status, "queued")));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]).toMatchObject({ agentId: f.agentId, reason: "issue_commented" });
+    console.info(JSON.stringify({ ownPendingConfirmation: { chronology, decision: { toStatus: decision.toStatus,
+      reasonCode: decision.reasonCode }, visits, simulatedHours: 24, sweepWakes: enqueueWakeup.mock.calls.length,
+      lastOutcome, personAnswerStatus: answered.status, totalQueuedWakes: wakes.length } }));
   }, 120_000);
 
   it("a newer person comment wakes exactly once through the existing comment route, not the sweep", async () => {
