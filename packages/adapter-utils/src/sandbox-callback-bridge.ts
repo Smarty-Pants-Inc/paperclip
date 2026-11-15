@@ -27,7 +27,7 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
-const DEFAULT_BRIDGE_LIST_WAIT_MS = 7_000;
+const DEFAULT_BRIDGE_LIST_WAIT_MS = 5_000;
 const BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS = 2_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
@@ -706,7 +706,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
             `      break`,
             `    done`,
             `    [ -n "$found_file" ] && break`,
-            `    sleep 0.1`,
+            `    sleep 0.1 2>/dev/null || { sleep 1; wait_checks=$((wait_checks - 9)); }`,
             `    wait_checks=$((wait_checks - 1))`,
             `  done`,
           ] : []),
