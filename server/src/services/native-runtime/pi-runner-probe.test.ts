@@ -40,6 +40,7 @@ vi.mock("./native-session-executor.js", async original => {
 });
 
 import { QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
+import { RemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { probeManagedNativePiRunner } from "./pi-runner-probe.js";
 import { syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
 
@@ -190,6 +191,47 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.syncIn).toHaveBeenCalledTimes(2);
     expect(f.requests.some(request => request.args?.[1]?.includes("command -v paperclip-runnerd"))).toBe(false);
     expect(f.observed.every(observation => !observation.linked && observation.bytes === script)).toBe(true);
+  });
+
+  it.each([true, false])("records runner exit evidence before deleting the probe root (evidence=%s)", async evidenceAvailable => {
+    const f = await fixture("matching");
+    const events: string[] = [];
+    const execute = f.runner.execute.bind(f.runner);
+    f.runner.execute = async request => {
+      if (request.command === "rm") events.push("rm");
+      if (request.args?.[1]?.startsWith("for directory in")) events.push("read-exit-evidence");
+      return execute(request);
+    };
+    mocks.probe.mockImplementation(async options => {
+      if (options.admissionOnly) return { providerDriver: "pi_rpc", effectiveModel: model, helloProbePassed: false,
+        sessionAdmissionPassed: true, piMetadata: { version: "1.5.2" } };
+      const diagnosticsDirectory = mocks.launch.mock.calls.at(-1)![0].diagnosticsDirectory as string;
+      if (evidenceAvailable) {
+        await mkdir(diagnosticsDirectory, { recursive: true });
+        await writeFile(join(diagnosticsDirectory, "runnerd.process-stderr.log"),
+          "runner stopped after fixture failure\nsk-ant-api03-1234567890abcdefghijklmnopqrstuvwx\n");
+      }
+      throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+    });
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("fail");
+    const message = result.checks.at(-1)!.message;
+    if (evidenceAvailable) {
+      expect(message).toContain("runner process is not running (identity check exit 45); last lines:");
+      expect(message).toContain("runner stopped after fixture failure");
+      expect(message).not.toContain("sk-ant-api03-");
+      expect(events.indexOf("read-exit-evidence")).toBeGreaterThanOrEqual(0);
+      expect(events.indexOf("read-exit-evidence")).toBeLessThan(events.indexOf("rm"));
+    } else {
+      expect(message).toContain("runner process is not running (identity check exit 45); last lines unavailable:");
+    }
+  });
+
+  it("does not add runner-exit evidence to a successful check", async () => {
+    const f = await fixture("matching");
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("pass");
+    expect(JSON.stringify(result)).not.toContain("runner process is not running");
   });
 
   it("does not prepare or upload when the platform resolver rejects the binary", async () => {
