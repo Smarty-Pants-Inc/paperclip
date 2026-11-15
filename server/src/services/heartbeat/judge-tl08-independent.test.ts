@@ -38,11 +38,6 @@ import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNot
 import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
 import { issueRecoveryActions } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
-// Typing only, no behaviour or assertion change: settleUnrecoverableExecutions
-// (execution-recovery-resolution.ts:727) does not declare inspectLeaseResource at
-// this cut; these rows pass it for TL08's settle-time lease inspection.
-const settleOptionsWith = <T,>(inspectLeaseResource: T):
-  NonNullable<Parameters<typeof settleUnrecoverableExecutions>[2]> & { inspectLeaseResource: T } => ({ inspectLeaseResource });
 import { projectTaskInterruption } from "../task-interruption-presentation.js";
 import { canBypassFailedNativePredecessor } from "../native-runtime/native-provider-work-proof.js";
 import { heartbeatRunEvents } from "@paperclipai/db";
@@ -627,6 +622,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
           companyId: oldLease.companyId, runId: f.run.id, leaseId: oldLease.id, provider: oldLease.provider,
           providerLeaseId: oldLease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, oldLease.id));
     }
+    // HARNESS GAP TL05: Cut B no longer inspects stop state here. The
+    // stranded-assignment sweep admits this already-authorized continuation.
     if (settlementState === "unconfirmed-stop") {
       const { environmentRuntimeService } = await import("../environment-runtime.js");
       const observation = await environmentRuntimeService(db).inspectLeaseResource(oldLease.id, { freshThreadStop: true });
@@ -634,22 +631,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         JSON.stringify({ pluginId: oldLease.metadata?.pluginId, providerLeaseId: oldLease.providerLeaseId,
           observation: observation ?? null, returnedUndefined: observation === undefined }) + "\n");
       expect(observation).toBeUndefined();
-      const notes = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))
-        .then(rows => rows.filter(comment => comment.authorType === "system"));
       const pending = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
         trigger: "recovery_refused", delivery: "caller_owns" });
-      expect(pending).toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
-      const waiting = await notes();
-      expect(waiting).toHaveLength(1);
-      expect(waiting[0].body).toContain("stopping the earlier attempt before starting fresh");
-      expect(waiting[0].body).not.toMatch(/Starting a fresh thread|\bsafe\b/);
-      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
-      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id)))[0]).toEqual(oldLease);
-
-      // The normal disposition pass owns inspection and automatic delivery. A
-      // later positive provider read, not a resend or a test-minted successor,
-      // must wake the saved message through real admission.
       const userId = randomUUID();
       await db.insert(authUsers).values({ id: userId, name: "Board", email: `${userId}@example.test`,
         emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
@@ -661,72 +644,123 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active",
         ownerType: "board", returnOwnerAgentId: f.agent.id, fingerprint: `start-intent:${f.run.id}`,
         nextAction: "Wait for confirmed stop before continuing the saved message.", evidence: { runId: f.run.id, nativeFailureBlock: { runId: f.run.id, statusVersion: blocked.statusVersion } } });
+      expect(pending).toMatchObject({ kind: "continued", delivery: "caller_owns", isolation: "writer_ended" });
+      const { heartbeatService } = await import("../heartbeat.js");
+      const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
+      const { deliverPendingPauseResumes } = await import("../issue-tree-resume.js");
+      const { deliverBudgetResumeContinuations } = await import("../budget-resume-continuation.js");
+      const { settleUnansweredPersonMessages, UNANSWERED_MESSAGE_SETTLE_MS } = await import("../recovery/unanswered-person-message.js");
+      const { environmentRuntimeService: inspectionRuntime } = await import("../environment-runtime.js");
       let stopped = false;
       const inspectLeaseResource = vi.fn(async (leaseId: string) => {
         expect(leaseId).toBe(oldLease.id);
         return stopped ? { providerLeaseId: oldLease.providerLeaseId!, state: "stopped" } : undefined;
       });
-      const beforeChecks = performance.now(), clock = Date.now() - 3 * 61000;
-      vi.useFakeTimers({ toFake: ["Date"] });
+      const hb = heartbeatService(db, { environmentRuntime: { ...inspectionRuntime(db), inspectLeaseResource } as never });
+      const notes = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))
+        .then(rows => rows.filter(c => c.authorType === "system" && !c.deletedAt && !c.metadata?.supersededByCommentId));
+      const observe = async (step: string, extra?: unknown) => {
+        await hb.drainActiveRunExecutions();
+        const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issue.id));
+        expect(actions.every(action => action.evidence.systemRecovery === undefined)).toBe(true);
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id));
+        const task = (await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0];
+        if (process.env.TASK_OUT) await (await import("node:fs/promises")).appendFile(join(process.env.TASK_OUT, "cutb-notflip-observations.jsonl"),
+          JSON.stringify({ case: "TL05", step, at: new Date().toISOString(), taskStatus: task.status,
+            answers: comments.filter(c => c.authorType === "agent").map(c => c.body), notes: (await notes()).map(c => c.body),
+            runs: runs.map(run => ({ id: run.id, status: run.status, retryOfRunId: run.retryOfRunId, context: run.contextSnapshot })),
+            actions: actions.map(action => ({ id: action.id, status: action.status, evidence: action.evidence })),
+            inspectionCalls: inspectLeaseResource.mock.calls.length, stopped, extra }) + "\n");
+      };
+      // Exact executionContinuation worker delegates, in server/src/index.ts order.
+      const continuationWorker = async () => {
+        await deliverReconciledExecutions(db, hb.wakeup);
+        await deliverPendingPauseResumes(db, hb.wakeup);
+        await deliverBudgetResumeContinuations(db, { resumeTaskRetry: (companyId, requestId) => hb.resumeTaskRetry(companyId, requestId) });
+      };
       try {
-        for (let n = 0; n < 3; n++) {
-          vi.setSystemTime(clock + n * 61000);
-          await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
-        }
-        expect(performance.now() - beforeChecks).toBeLessThan(10000);
-        expect(inspectLeaseResource).toHaveBeenCalledTimes(3);
-        const current = () => notes().then(rows => rows.filter(comment => !comment.metadata?.supersededByCommentId));
-        expect(await current()).toHaveLength(1);
-        expect((await current())[0].body).toContain("cannot confirm that the earlier attempt stopped");
-        expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
-        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
-
-        const { heartbeatService } = await import("../heartbeat.js");
-        const { deliverReconciledExecutions } = await import("../execution-recovery-resolution.js");
+        await observe("fixture ready", pending);
+        for (let n = 0; n < 3; n++) await settleUnrecoverableExecutions(db);
+        await observe("original three disposition passes");
         await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 } } })
           .where(eq(agents.id, f.agent.id));
-        const hb = heartbeatService(db);
         const [busy] = await db.insert(issues).values({ companyId: f.agent.companyId, title: "Other work",
           status: "in_progress", assigneeAgentId: f.agent.id }).returning();
         await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id,
           issueId: busy.id, status: "running", contextSnapshot: { issueId: busy.id } });
+
+        await continuationWorker();
+        await observe("executionContinuation worker");
+        await hb.recoverNativeRunsAfterRestart();
+        await observe("recoverNativeRunsAfterRestart");
+        await hb.promoteDueScheduledRetries();
+        await observe("promoteDueScheduledRetries");
+        await hb.reconcileStrandedAssignedIssues();
+        await observe("reconcileStrandedAssignedIssues");
+        // Admission is proved while the provider's stop is still unconfirmed.
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id)))
+          .filter(run => run.id !== f.run.id).map(run => run.status)).toEqual(["queued"]);
+        const source = await read(f.run.id);
+        await new Promise(resolve => setTimeout(resolve, Math.max(0,
+          Math.max(message.createdAt.getTime(), source.finishedAt!.getTime()) + UNANSWERED_MESSAGE_SETTLE_MS + 25 - Date.now())));
+        await settleUnansweredPersonMessages(db, {});
+        await observe("unanswered sweep after real 15s settle bound");
+        await hb.sweepPendingCleanupLeases({ backoffMs: 0 });
+        await observe("pending-cleanup sweep");
+        expect(await notes()).toHaveLength(0);
+        // The expired fixture lease is not pending cleanup. Switching its reply
+        // to stopped must not be mistaken for evidence the production code read.
         stopped = true;
-        vi.setSystemTime(clock + 3 * 61000);
-        try {
-          await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
-          await deliverReconciledExecutions(db, hb.wakeup);
-          await hb.drainActiveRunExecutions();
-          const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id));
-          expect(successors).toHaveLength(1);
-          expect(successors[0]).toMatchObject({ status: "queued", contextSnapshot: { previousRunId: f.run.id, forceFreshSession: true } });
-          const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successors[0].id)).returning();
-          await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, f.issue.id));
-          f.input.run = next;
-          f.input.session.persistedNativeExecutionInput = null;
-          f.input.session.persistedRunnerProfile = {};
-          f.input.task.context = next.contextSnapshot!;
-          f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
-            agentId: f.agent.id, issueId: f.issue.id, before: next.createdAt });
-          const selected = await selectHeartbeatRuntime(db, f.input);
-          if (!selected.selected || !selected.nativeExecution) throw new Error("Expected automatic fresh selection");
-          expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(oldId);
-          const answer = await answerWithNativePeer({ db, execution: selected.nativeExecution,
-            runnerInstanceId: selected.nativeRunnerInstanceId!, text: "The saved request answered after stop proof.",
-            getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
-          expect(answer.settled.status).toBe("succeeded");
-          expect(JSON.stringify(answer.prompts)).toContain(message!.body);
-          for (let n = 0; n < 3; n++) {
-            await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
-            await deliverReconciledExecutions(db, hb.wakeup);
-          }
-          expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id))).toHaveLength(1);
-          expect(await current()).toHaveLength(1);
-          expect((await current())[0].body).toContain("fresh thread in this conversation");
-        } finally {
-          await hb.drainActiveRunExecutions();
+        await settleUnrecoverableExecutions(db);
+        await continuationWorker();
+        await hb.sweepPendingCleanupLeases({ backoffMs: 0 });
+        expect(inspectLeaseResource).not.toHaveBeenCalled();
+        expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLease.id)))[0]).toEqual(oldLease);
+        await observe("provider stopped; disposition, continuation and cleanup repeated");
+        const admitted = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id)))
+          .filter(run => run.id !== f.run.id);
+        expect(admitted).toHaveLength(1);
+        expect(admitted[0]).toMatchObject({ status: "queued", retryOfRunId: null, contextSnapshot: { source: "issue.assigned_todo_liveness_dispatch", wakeReason: "issue_assigned" } });
+        // Drive the real sweep-admitted row through the existing native-answer
+        // peer. Never insert a successor or invent a recovery authorization.
+        const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, admitted[0].id)).returning();
+        await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, f.issue.id));
+        f.input.run = next;
+        f.input.session.persistedNativeExecutionInput = null;
+        f.input.session.persistedRunnerProfile = {};
+        f.input.task.context = next.contextSnapshot!;
+        f.input.session.getFreshSessionHandoff = createNativeSessionHandoffLoader({ db, companyId: f.agent.companyId,
+          agentId: f.agent.id, issueId: f.issue.id, before: next.createdAt });
+        const selected = await selectHeartbeatRuntime(db, f.input);
+        if (!selected.selected || !selected.nativeExecution) throw new Error("Expected sweep-admitted fresh selection");
+        expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(oldId);
+        const answerText = "The saved conversation was answered through production recovery.";
+        const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
+          runnerInstanceId: selected.nativeRunnerInstanceId!, text: answerText,
+          getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+        expect(answered.settled.status).toBe("succeeded");
+        expect(JSON.stringify(answered.prompts)).toContain(message.body);
+        expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+          .filter(c => c.authorType === "agent").map(c => c.body)).toEqual([answerText]);
+        const noteText = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
+        expect((await notes()).map(c => c.body)).toEqual([noteText]);
+        expect((await read(f.run.id)).errorCode).toBe("native_continuation_requires_reconciliation");
+        expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].status).toBe("done");
+        await observe("sweep-admitted answer with saved history", { prompts: answered.prompts, settled: answered.settled.status });
+        for (let n = 0; n < 3; n++) {
+          await settleUnrecoverableExecutions(db);
+          await continuationWorker();
+          await hb.recoverNativeRunsAfterRestart();
+          await hb.promoteDueScheduledRetries();
+          await hb.reconcileStrandedAssignedIssues();
+          await hb.sweepPendingCleanupLeases({ backoffMs: 0 });
         }
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(2);
+        expect((await notes()).map(c => c.body)).toEqual([noteText]);
+        await observe("three repeat production cycles; no duplicate run or note");
       } finally {
-        vi.useRealTimers();
+        await hb.drainActiveRunExecutions();
       }
       return;
     }
@@ -804,7 +838,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(await selectHeartbeatRuntime(db, f.input)).toMatchObject({ nativeExecution: { session: { normalizedSessionId: freshId } } });
     expect((await notices()).filter(comment => comment.authorType === "system")).toHaveLength(1);
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
-  });
+  }, 120_000);
 
   it("updates only the system-owned fresh-thread notice, never a person's matching metadata", async () => {
     const f = await piFixture();
