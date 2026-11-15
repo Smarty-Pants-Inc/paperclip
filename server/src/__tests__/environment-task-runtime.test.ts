@@ -433,35 +433,30 @@ describe("plugin-provided Runner execution", () => {
     await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: metadataOperation })).rejects.toThrow("not active");
     await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: { kind: "stop" } })).resolves.toMatchObject({ kind: "accepted" });
   });
-  it("gives describe the configured setup budget while preserving its default deadline", async () => {
+  it("uses a matching sandbox provider's top-level setup budget only for describe", async () => {
     vi.useFakeTimers();
     const result = { kind: "description", taskId: "attempt-1", runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
     state.plugin.manifestJson.environmentDrivers[0].sessionHandoffVersion = 1;
-    const value = row(); value.environment!.config.driverConfig = { setupTimeoutSeconds: 180 };
-    const workers = worker(result);
-    workers.call.mockImplementation(async (...args: any[]) => new Promise((resolve, reject) => {
-      setTimeout(() => resolve(result), 95_000);
-      setTimeout(() => reject(new Error("timeout")), args[3]);
-    }));
-    const described = executeEnvironmentTask(database(value).db, workers as never, {
-      companyId: "company", leaseId, operation: { kind: "describe" },
-    });
-    await vi.advanceTimersByTimeAsync(95_000);
-    await expect(described).resolves.toEqual(result);
-    expect((workers.call.mock.calls as unknown as any[][])[0]?.[3]).toBe(180_000);
-
-    const defaults = row();
-    const defaultWorkers = worker(result);
-    defaultWorkers.call.mockImplementation(async (...args: any[]) => new Promise((resolve, reject) => {
-      setTimeout(() => resolve(result), 95_000);
-      setTimeout(() => reject(new Error("timeout")), args[3]);
-    }));
-    const defaultDescription = executeEnvironmentTask(database(defaults).db, defaultWorkers as never, {
-      companyId: "company", leaseId, operation: { kind: "describe" },
-    }).then(value => ({ value }), error => ({ error }));
-    await vi.advanceTimersByTimeAsync(90_000);
-    expect(await defaultDescription).toMatchObject({ error: expect.any(Error) });
-    expect((defaultWorkers.call.mock.calls as unknown as any[][])[0]?.[3]).toBe(90_000);
+    const cases = [
+      { name: "matching provider with budget", config: { provider: "tasks", setupTimeoutSeconds: 180 }, timeout: 180_000, succeeds: true },
+      { name: "matching provider without budget", config: { provider: "tasks" }, timeout: 90_000, succeeds: false },
+      { name: "different provider with budget", config: { provider: "other", setupTimeoutSeconds: 180 }, timeout: 90_000, succeeds: false },
+    ];
+    for (const testCase of cases) {
+      const value = row(); value.environment!.config = testCase.config;
+      const workers = worker(result);
+      workers.call.mockImplementation(async (...args: any[]) => new Promise((resolve, reject) => {
+        setTimeout(() => resolve(result), 95_000);
+        setTimeout(() => reject(new Error("timeout")), args[3]);
+      }));
+      const described = executeEnvironmentTask(database(value).db, workers as never, {
+        companyId: "company", leaseId, operation: { kind: "describe" },
+      }).then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(testCase.succeeds ? 95_000 : 90_000);
+      if (testCase.succeeds) expect(await described, testCase.name).toEqual({ value: result });
+      else expect(await described, testCase.name).toMatchObject({ error: expect.any(Error) });
+      expect((workers.call.mock.calls as unknown as any[][])[0]?.[3], testCase.name).toBe(testCase.timeout);
+    }
     vi.useRealTimers();
   });
   it("keeps the ownership deadline independent of setupTimeoutSeconds", async () => {
