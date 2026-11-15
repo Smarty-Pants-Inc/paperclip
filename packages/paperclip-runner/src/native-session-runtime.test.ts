@@ -6744,12 +6744,26 @@ describe("executeNativeSession recovery", () => {
             replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
           },
         }).catch((error: unknown) => error);
-        expect(failure).toMatchObject({ code: refusalCode });
-        expect(runnerPrepareRefusalCode(failure)).toBe(commandType ? refusalCode : undefined);
+        // D-B2 (deletion toward upstream): the runner no longer turns a recovery result's
+        // controller-authored refusal code into a typed error before upstream's own policy.
+        // Upstream's outcome per branch (observed): a runner-command refusal is the
+        // refresh-required error carrying the refusal as its prepare code; otherwise a
+        // plain native_session_recovery_failed, except that the resume-failure policy first
+        // makes ONE replacement attempt, whose transport fails the same way before any turn.
+        const replacementAttempted = !commandType && providerRecoveryPolicy === "allow_replacement_after_resume_failure";
+        if (commandType) {
+          expect(failure).toMatchObject({ code: "native_runner_refresh_required" });
+          expect(runnerPrepareRefusalCode(failure)).toBe(refusalCode);
+        } else if (replacementAttempted) {
+          expect(failure).toMatchObject({ code: refusalCode, message: "opaque remote read failure" });
+        } else {
+          expect(String((failure as Error)?.message ?? failure)).toMatch(/^native_session_recovery_failed: /);
+          expect((failure as { code?: unknown }).code).toBeUndefined();
+        }
         expect(openRun).not.toHaveBeenCalled();
         expect(completeRun).not.toHaveBeenCalled();
         expect(transport.calls.some(call => ["thread/start", "turn/start"].includes(call.method))).toBe(false);
-        expect(transportFactory).toHaveBeenCalledOnce();
+        expect(transportFactory).toHaveBeenCalledTimes(replacementAttempted ? 2 : 1);
       }
     }
   });
