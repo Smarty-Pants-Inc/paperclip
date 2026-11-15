@@ -52,7 +52,7 @@ import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-pre
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
 import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPending, prepareNativeProviderPackAdmission, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
-import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
+import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 import { verifySnapshotProviderPack } from "./remote-provider-pack-snapshot.js";
 
@@ -15665,7 +15665,8 @@ export async function prepareRemoteProviderPackOnTarget(input: {
     return result.stdout.split(/\r?\n/).map(parseRemoteExecutableCandidate)
       .filter((candidate): candidate is string => candidate !== null);
   };
-  const usePreinstalled = async (snapshot: boolean) => useVerifiedPreinstalledRemoteProviderPack({
+  const usePreinstalled = async (snapshot: boolean, onRejected?: (check: string) => void) => useVerifiedPreinstalledRemoteProviderPack({
+    onRejected,
     candidates: preinstalledProviderPackRoots ??= await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
     verifyAndLink: async (preinstalledProviderPack) => {
       await measureNativeRunnerSpan(
@@ -15695,9 +15696,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         timeoutMs: 10_000,
       }));
       if (linked.exitCode !== 0 || linked.timedOut) {
-        throw new Error(
-          "runner_remote_provider_artifact_incompatible: preinstalled provider pack could not be linked",
-        );
+        throw providerPackIncompatible("link_failed", "preinstalled provider pack could not be linked");
       }
       activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
       await input.onLog?.(
@@ -15714,7 +15713,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
       "provider_pack.verify",
       () => verifyRemoteProviderPack(stagedRemoteProviderPackRoot),
     ),
-    usePreinstalled: () => usePreinstalled(false),
+    usePreinstalled: (onRejected) => usePreinstalled(false, onRejected),
     stageAndVerify: async () => {
       if (!configuredProviderPackRoot) {
         throw new Error("runner_remote_provider_artifact_incompatible: install the matching Paperclip package and Daytona image; the image provider pack did not match the bundled release identity");
@@ -18373,7 +18372,7 @@ async function createRunnerdBackendWithinSessionClaim(
           requireExactIdentity: retainProviderPack || explicitProviderPackSelection,
           requireCurrentOpenCodeProxy: !retainProviderPack
             && runnerEnvironment?.PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS === "1",
-        }));
+        }), { attributes: { target: installation.root === stagedRemoteProviderPackRoot ? "workspace" : "image" } });
         if (!retainProviderPack) providerPackAuthority!.select(manifest);
         expectedProviderPackManifest = manifest;
         activeRemoteProviderPackRoot = installation.root;
