@@ -16192,6 +16192,56 @@ export async function syncRemoteRunnerDirectoryOut(input: {
   }
 }
 
+export async function readRemoteRunnerStateFile(input: {
+  runner: CommandManagedRuntimeRunner;
+  remotePath: string;
+  missingExitCode?: number;
+  recoveryDeadline?: number;
+  stall?: RemoteRunnerPluginStall;
+}): Promise<Record<string, unknown>> {
+  const { runner, remotePath } = input;
+  const escapedPath = remotePath.replaceAll("'", "'\\''");
+  const request = {
+    command: "sh",
+    args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}`],
+    bypassSession: true,
+    timeoutMs: 10_000,
+  };
+  if (runner.syncOut) {
+    const checked = input.recoveryDeadline === undefined
+      ? await runner.execute(request)
+      : await readRemoteRunnerRecoveryProbe({ runner, request, stage: "runner_state",
+          deadline: input.recoveryDeadline, readOnly: true, stall: input.stall });
+    if (checked.exitCode !== 0 || checked.timedOut) {
+      const error = new Error(`runner_remote_state_unavailable: exit=${checked.exitCode} timedOut=${checked.timedOut}${checked.stderr.trim() ? ` ${redactSensitiveText(checked.stderr).trim().slice(-512)}` : ""}`);
+      Object.assign(error, { exitCode: checked.exitCode, timedOut: checked.timedOut });
+      throw error;
+    }
+    const staging = mkdtempSync(join(tmpdir(), "paperclip-native-state-"));
+    try {
+      chmodSync(staging, 0o700);
+      const localPath = join(staging, "state.json");
+      await runner.syncOut([{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
+      chmodSync(localPath, 0o600);
+      return record(JSON.parse(readFileSync(localPath, "utf8")));
+    } finally {
+      rmSync(staging, { recursive: true, force: true });
+    }
+  }
+  logger.warn("session state read via command; output retained by provider");
+  const fallbackRequest = { ...request, args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}; base64 < '${escapedPath}'`] };
+  const result = input.recoveryDeadline === undefined
+    ? await runner.execute(fallbackRequest)
+    : await readRemoteRunnerRecoveryProbe({ runner, request: fallbackRequest, stage: "runner_state",
+        deadline: input.recoveryDeadline, readOnly: true, stall: input.stall });
+  if (result.exitCode !== 0 || result.timedOut) {
+    const error = new Error(`runner_remote_state_unavailable: exit=${result.exitCode} timedOut=${result.timedOut}${result.stderr.trim() ? ` ${redactSensitiveText(result.stderr).trim().slice(-512)}` : ""}`);
+    Object.assign(error, { exitCode: result.exitCode, timedOut: result.timedOut });
+    throw error;
+  }
+  return record(JSON.parse(Buffer.from(result.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
+}
+
 export async function readRemoteRunnerState(input: {
   runner: CommandManagedRuntimeRunner;
   stateDirectory: string;
@@ -16199,32 +16249,15 @@ export async function readRemoteRunnerState(input: {
   stall?: RemoteRunnerPluginStall;
 }): Promise<Record<string, unknown>> {
   const statePath = posix.join(input.stateDirectory, "runner-state.json");
-  const escapedPath = statePath.replaceAll("'", "'\\''");
-  const request = {
-    command: "sh",
-    // Exit 66 only when the file is absent, so a reader can tell "no saved state" from a read failure.
-    args: ["-c", `test -f '${escapedPath}' || exit 66; base64 < '${escapedPath}'`],
-    bypassSession: true,
-    timeoutMs: 10_000,
-  };
-  const result = input.recoveryDeadline === undefined
-    ? await input.runner.execute(request)
-    : await readRemoteRunnerRecoveryProbe({
-        runner: input.runner, request, stage: "runner_state",
-        deadline: input.recoveryDeadline, readOnly: true, stall: input.stall,
-      });
-  if (result.exitCode !== 0 || result.timedOut) {
-    const error = new Error(
-      `runner_remote_state_unavailable: exit=${result.exitCode} timedOut=${result.timedOut}${result.stderr.trim() ? ` ${redactSensitiveText(result.stderr).trim().slice(-512)}` : ""}`,
-    );
-    throw input.recoveryDeadline === undefined ? error : attachRemoteRunnerRecoveryDiagnostic(error,
-      { stage: "runner_state", reason: result.timedOut ? "probe_timeout" : "state_read_failed" });
-  }
   try {
-    return record(JSON.parse(Buffer.from(result.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
+    return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath,
+      recoveryDeadline: input.recoveryDeadline, stall: input.stall });
   } catch (error) {
-    throw input.recoveryDeadline === undefined ? error : attachRemoteRunnerRecoveryDiagnostic(error,
-      { stage: "runner_state", reason: "state_invalid" });
+    if (input.recoveryDeadline === undefined) throw error;
+    const invalid = error instanceof SyntaxError;
+    const timedOut = Boolean((error as { timedOut?: boolean })?.timedOut);
+    throw attachRemoteRunnerRecoveryDiagnostic(error,
+      { stage: "runner_state", reason: invalid ? "state_invalid" : timedOut ? "probe_timeout" : "state_read_failed" });
   }
 }
 
@@ -16236,15 +16269,20 @@ export function remoteRunnerStateNeverConnected(state: Record<string, unknown>):
     && state.pendingTerminalDelivery === null && empty(state.processedCommands);
 }
 
-async function readRemoteRunnerProviderState(input: {
+export async function readRemoteRunnerProviderState(input: {
   runner: CommandManagedRuntimeRunner;
   stateDirectory: string;
   execution: NativeExecutionInput;
 }): Promise<Record<string, unknown>> {
-  const statePath = posix.join(
-    input.stateDirectory,
-    runnerProviderStateFilename(input.execution),
-  );
+  const statePath = posix.join(input.stateDirectory, runnerProviderStateFilename(input.execution));
+  if (input.runner.syncOut) {
+    try {
+      return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath, missingExitCode: 1 });
+    } catch {
+      throw new Error("runner_remote_provider_state_unavailable");
+    }
+  }
+  logger.warn("session state read via command; output retained by provider");
   const escapedPath = statePath.replaceAll("'", "'\\''");
   const result = await input.runner.execute({
     command: "sh",
@@ -16252,14 +16290,8 @@ async function readRemoteRunnerProviderState(input: {
     bypassSession: true,
     timeoutMs: 10_000,
   });
-  if (result.exitCode !== 0 || result.timedOut) {
-    throw new Error("runner_remote_provider_state_unavailable");
-  }
-  return record(
-    JSON.parse(
-      Buffer.from(result.stdout.replace(/\s+/g, ""), "base64").toString("utf8"),
-    ),
-  );
+  if (result.exitCode !== 0 || result.timedOut) throw new Error("runner_remote_provider_state_unavailable");
+  return record(JSON.parse(Buffer.from(result.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
 }
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
@@ -18636,11 +18668,14 @@ async function createRunnerdBackendWithinSessionClaim(
     const escapedProviderState = posix
       .join(remoteStateDirectory, runnerProviderStateFilename(input.execution))
       .replaceAll("'", "'\\''");
+    if (!remoteCommandRunner.syncOut) logger.warn("session state read via command; output retained by provider");
     const inspected = await remoteCommandRunner.execute({
       command: "sh",
       args: [
         "-c",
-        `${requirements.join(" && ")} && test -f '${escapedProviderState}' && base64 < '${escapedRunnerState}'`,
+        remoteCommandRunner.syncOut
+          ? `${requirements.join(" && ")} && test -f '${escapedProviderState}' && test -f '${escapedRunnerState}'`
+          : `${requirements.join(" && ")} && test -f '${escapedProviderState}' && base64 < '${escapedRunnerState}'`,
       ],
       bypassSession: true,
       timeoutMs: 10_000,
@@ -18665,13 +18700,9 @@ async function createRunnerdBackendWithinSessionClaim(
     }
     let runnerState: Record<string, unknown>;
     try {
-      runnerState = record(
-        JSON.parse(
-          Buffer.from(inspected.stdout.replace(/\s+/g, ""), "base64").toString(
-            "utf8",
-          ),
-        ),
-      );
+      runnerState = remoteCommandRunner.syncOut
+        ? await readRemoteRunnerStateFile({ runner: remoteCommandRunner, remotePath: runnerStatePath })
+        : record(JSON.parse(Buffer.from(inspected.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
     } catch {
       throw new Error("runner_harness_state_mismatch: runner_state_invalid_json");
     }
