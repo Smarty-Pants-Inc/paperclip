@@ -58,7 +58,7 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
     let mut client = connect(&socket_path);
     write!(
         client,
-        "POST /runtime-tools/github/credentials HTTP/1.1\r\nHost: paperclip.local\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-github-capability: ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-bridge-generation: run-generation-1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        "POST /runtime-tools/github/credentials HTTP/1.1\r\nHost: paperclip.local\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-github-capability: ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-bridge-generation: run-generation-1\r\nx-unknown-secret: must-be-dropped\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
     )
     .unwrap();
 
@@ -84,17 +84,19 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
             "headers": {
                 "content-type": "application/json",
                 "accept": "application/json",
-                "x-paperclip-bridge-generation": "run-generation-1"
+                "x-paperclip-bridge-generation": "run-generation-1",
+                "x-paperclip-github-capability": "ghp_RFL_SENTINEL_TOKEN"
             },
             "bodyBase64": "e30="
         })
     );
-    assert!(!request
-        .frame()
-        .to_string()
-        .contains("ghp_RFL_SENTINEL_TOKEN"));
+    assert!(!request.frame().to_string().contains("authorization"));
+    assert!(!request.frame().to_string().contains("must-be-dropped"));
     assert_eq!(request.frame().as_object().unwrap().len(), 6);
-    assert!(ingress.try_next_request().is_none(), "only one PRP frame is forwarded");
+    assert!(
+        ingress.try_next_request().is_none(),
+        "only one PRP frame is forwarded"
+    );
 
     request
         .respond(json!({
