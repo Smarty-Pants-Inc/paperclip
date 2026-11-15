@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentLifecycleEffects, lifecycleErrorDetail } from "../../../services/agent-lifecycle.js";
 import { logger } from "../../../middleware/logger.js";
+import { HttpError } from "../../../errors.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -21,6 +22,17 @@ describe("lifecycleErrorDetail", () => {
   ])("withholds unsafe message %s", message => {
     const detail = JSON.parse(lifecycleErrorDetail(new Error(message))) as Array<{ message: string }>;
     expect(detail[0]?.message).toBe("withheld");
+  });
+
+  it("reports safe HttpError status and detail code without exposing its message", () => {
+    const error = new Error("outer", { cause: new HttpError(422, "free text with secret sk-abcdefghijklmnopqrstuvwx", { code: "pi_probe_runner_exited" }) });
+    const detail = JSON.parse(lifecycleErrorDetail(error)) as Array<{ status?: number; detailCode?: string; message: string }>;
+    expect(detail[1]).toMatchObject({ status: 422, detailCode: "pi_probe_runner_exited", message: "withheld" });
+    expect(JSON.stringify(detail)).not.toContain("sk-abcdefghijklmnopqrstuvwx");
+
+    const secretCode = new HttpError(422, "unsafe", { code: "sk-abcdefghijklmnopqrstuvwx" });
+    const secretDetail = JSON.parse(lifecycleErrorDetail(secretCode)) as Array<{ detailCode?: string }>;
+    expect(secretDetail[0]?.detailCode).toBeUndefined();
   });
 
   it("limits cause depth, reports cause code, and bounds serialized detail", () => {
