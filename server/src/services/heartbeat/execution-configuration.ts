@@ -1,7 +1,7 @@
 import { agentHarnessType } from "@paperclipai/shared";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { agentObservabilityService, unavailableAgentObservability, type ResolvedAgentObservability } from "../agent-observability.js";
-import { agentObservabilityLaunch } from "../agent-observability-launch.js";
+import { agentObservabilityKind, agentObservabilityLaunch } from "../agent-observability-launch.js";
 import { withSkillActor } from "../skill-access.js";
 import type { AuthorizationActor } from "../authorization.js";
 import { eq, sql } from "drizzle-orm";
@@ -139,16 +139,14 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     });
   }
   const initialHarness = agentHarnessType(agent.adapterType, sourceWorkspaceConfig);
-  const observabilityKind = (harness: string) => harness === "codex_local" ? "codex" as const
-    : harness === "claude_local" ? "claude" as const
-      : harness === "opencode_local" && agent.adapterType === "paperclip_runner" ? "opencode" as const : undefined;
+  const observabilityKind = (harness: string) => agentObservabilityKind(harness, agent.adapterType);
   const unsupportedObservability = !observabilityKind(initialHarness)
     ? "unsupported_harness" as const : preconfiguredHome && initialHarness === "codex_local" ? "unsupported_home_mode" as const : undefined;
   const observabilitySnapshot: ResolvedAgentObservability = await agentObservabilityService(db).resolve(agent.companyId, { runId: run.id, agentId: agent.id, responsibleUserId, issueId, unavailableReason: unsupportedObservability })
     .catch(() => unavailableAgentObservability(agent.companyId, "configuration_invalid"));
   const identityRedactor = createAgentIdentityRedactor();
   const earlyObservability = unsupportedObservability === undefined && observabilityKind(initialHarness)
-    ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(initialHarness)!, companyId: agent.companyId, agentId: agent.id }) : undefined;
+    ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(initialHarness)!, companyId: agent.companyId, agentId: agent.id, runId: run.id, taskId: issueId }) : undefined;
   identityRedactor.values.push(...observabilitySecretValues(earlyObservability));
   onIdentityRedactorPrepared(identityRedactor);
   // The executor keeps these values in its failure redactor before any later
@@ -465,7 +463,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   identityRedactor.values.push(...createAgentIdentityRedactor(agentIdentity?.privateKeyPem).values);
   const harness = agentHarnessType(agent.adapterType, runtimeConfig);
   const observability = unsupportedObservability !== "unsupported_home_mode" && observabilityKind(harness)
-    ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(harness)!, companyId: agent.companyId, agentId: agent.id }) : undefined;
+    ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(harness)!, companyId: agent.companyId, agentId: agent.id, runId: run.id, taskId: issueId }) : undefined;
   identityRedactor.values.push(...observabilitySecretValues(observability));
   identityRedactor.values.sort((a, b) => b.length - a.length);
   if (observabilitySnapshot.state === "unavailable") {

@@ -1,7 +1,8 @@
 # Company agent observability
 
 Company Settings → General → Agent observability configures one company-owned
-OTLP destination for Paperclip-managed Codex, Claude Code and native OpenCode executions. Export
+OTLP destination for Paperclip-managed Codex, Claude Code, native OpenCode and
+native Pi (`paperclip_runner` / `pi_rpc`) executions. Export
 is disabled by default. Choose Braintrust (US) or a custom HTTP(S) OTLP base URL;
 use your own collector when you need fan-out. Braintrust EU and self-hosted
 installations can use Custom OTLP with their required routing/authentication
@@ -71,6 +72,50 @@ this version: its files remain untouched and execution emits a diagnostic.
 Legacy OpenCode, other harnesses, personal Codex desktop sessions and hosted claude_managed are
 outside this feature.
 
+## Native Pi (fork)
+
+Pi uses the same runner-owned HTTP/JSON trace exporter, selected by launch kind
+`pi` and `PAPERCLIP_OBSERVABILITY_PI`. The ingestion header stays in the runner;
+all reserved observability entries are removed before preparing Pi's child env
+or configuration. Company export remains OFF by default, with the same four
+capture switches (all ON when enabled). This does not configure the Pi plugin.
+
+The image-N event adapter is **our code**: Pi's sink emits `turn.started` and
+per-receipt `usage.reported`, not the exporter's submission/usage layout. It is
+confined to the observability feed; public run receipts do not change. One
+synthetic submission opens each turn; later consumed user messages (including
+steers) append to that prompt with a blank line. No unconsumed input is exported.
+Only available per-receipt `runDelta` contributes usage, never paired cumulative
+usage items. Missing deltas are skipped, not reported as zero-token generations.
+Unknown/pending subagent accounting marks the aggregate incomplete, so it does
+not claim exact run totals. This is not a reconstruction of nested subagent spans.
+
+Pi dual-emits `langfuse.observation.input` / `langfuse.observation.output` beside
+`braintrust.input` / `braintrust.output`: these explicit keys populate Langfuse's
+I/O panes without changing existing consumers. Spans carry native Pi `session.id`
+and Paperclip company, agent, run, task (when available), and turn IDs. Known cost
+also uses `gen_ai.usage.cost`; `costProvenance` distinguishes `provider_reported`
+from `catalog_estimate` (or `mixed` on overflow). Estimates are not billing.
+
+The content limit is **8 KiB UTF-8 per field**, after redaction, as in native
+OpenCode. The Pi session JSONL and its custody copies remain the full record.
+The first 64 tool and 64 usage spans retain detail. ONE overflow span holds the
+remaining measured token/cache/cost sums and tool/usage counts; truncation and
+incomplete accounting are explicit. Summing detailed usage and overflow gives
+known run usage exactly once. Missing costs remain unknown and suppress the
+aggregate's `totals_exact` claim. A body over 1 MiB is split on span boundaries,
+keeping trace and parent IDs; each request is at most 1 MiB. Up to four turn jobs
+are admitted without a turn queue; each streams its chunks sequentially under
+one three-second deadline, so at most four requests are in flight. Saturation or
+receiver failure gives a sanitized diagnostic, not a task failure. Terminal
+receipt delivery never awaits export; session shutdown drains bounded jobs.
+
+`@langfuse/pi-observability-plugin` and its admission remain unchanged and run
+side by side until R7: a real daily task's two traces are judged, with subagent
+session-file custody checked. Plugin removal requires accepted parity or Paul's
+acceptance of named losses (per-call I/O, TTFT, tool arguments, subagent nesting).
+This local projection is not evidence of a rendered Langfuse parity trace.
+
 ## Changes and process lifetime
 
 Paperclip reads settings once when an execution begins preparation. That
@@ -103,7 +148,7 @@ row removes that header. API-key replacement is explicit, and Cancel clears
 entered secrets. Revisions prevent another administrator's edit being silently
 overwritten. Credential values are excluded from task environment manifests,
 run/config snapshots, argv, activity records, recovery configuration and query
-cache data. OpenCode keeps exporter credentials in the runner wrapper and excludes them
+cache data. OpenCode and native Pi keep exporter credentials in the runner wrapper and exclude them
 from its child environment and config. Codex and Claude Code receive headers through their
 process environment, which their tools can inherit or inspect.
 This feature does not isolate export credentials from agent code. Use a credential

@@ -8,6 +8,7 @@ const SECRET_MARKER: &str = "PAPERCLIP_SECRET_ENV_KEYS";
 const RESERVED: &[&str] = &[
     "PAPERCLIP_OBSERVABILITY_CODEX_CONFIG",
     "PAPERCLIP_OBSERVABILITY_OPENCODE",
+    "PAPERCLIP_OBSERVABILITY_PI",
     "CLAUDE_CODE_ENABLE_TELEMETRY",
     "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
     "ENABLE_ENHANCED_TELEMETRY_BETA",
@@ -248,7 +249,8 @@ mod tests {
                 } else {
                     None
                 }
-            }).is_err());
+            })
+            .is_err());
             assert_eq!(command.get_envs().count(), 0);
         }
     }
