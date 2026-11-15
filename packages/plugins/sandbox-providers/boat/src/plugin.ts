@@ -793,7 +793,7 @@ async function wakeCompanySparePools(companyId: string): Promise<void> {
   }
   await Promise.all(work);
 }
-async function maintainReadySpares(): Promise<void> {
+async function maintainReadySpares(reconcile = false): Promise<void> {
   if (shuttingDown || ![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
@@ -806,6 +806,10 @@ async function maintainReadySpares(): Promise<void> {
       const poolId = readySparePoolKey(key);
       return activeByPool.get(poolId) ? knownSparePools.get(poolId)?.operations : undefined;
     });
+    // The periodic timer has no host-derived invocation scope, so it cannot
+    // perform claim-store queries. Scoped health calls and company events do
+    // the full reconciliation; the timer only renews cached warm leases.
+    if (!reconcile) return;
     for (const [poolId, pool] of knownSparePools) {
       if (shuttingDown) return;
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
@@ -936,7 +940,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           await sshCarrier.health(lease); checked++;
         });
       }
-      await maintainReadySpares();
+      await maintainReadySpares(true);
       const totals = acquireOutcomeTotals();
       const status = checked ? `Boat resident status probes passed for ${checked} bound leases (not live Boat qualification).` : "Boat sandbox provider healthy";
       return { status: "ok", message: `${status}; acquire outcomes spare=${totals.spare} cold=${totals.cold}` };
