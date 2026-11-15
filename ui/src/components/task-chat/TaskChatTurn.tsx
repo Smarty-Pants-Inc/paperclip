@@ -134,6 +134,7 @@ export function TaskChatTurn({
           <div className="w-full" data-testid="task-chat-final-response">
             <div
               className="break-words px-1 py-2 text-sm text-foreground"
+              data-conversation-text="final"
               data-testid="task-chat-agent-bubble"
             >
               <MarkdownBody softBreaks linkIssueReferences>
