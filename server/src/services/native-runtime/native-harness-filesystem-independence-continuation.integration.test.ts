@@ -97,11 +97,16 @@ describeEmbeddedPostgres("legacy harness continuation without provider-home file
         expect(recover, String(failure)).toHaveBeenCalledOnce();
         expect(recover.mock.calls[0]![0]).toMatchObject({ providerSessionId: snapshot.providerSessionId, identity: { runId } });
         if (lifecycle === "warm") {
-          // Warm resumes from its own warm checkpoint, which carries no
-          // replacement policy: a failed resume is reported, never replaced.
-          expect(String(failure)).toContain("native_session_recovery_failed");
-          expect(fresh).not.toHaveBeenCalled();
-          observations.push({ providerSessionId: recover.mock.calls[0]![0].providerSessionId, replacementAttempts: 0 });
+          // DECLARED DEVIATION (D-B5) from upstream e3bc4ca7's tested warm intent
+          // ("warm resumes from its own warm checkpoint, which carries no replacement
+          // policy: a failed resume is reported, never replaced"). With D-B5 the warm
+          // rebind derives the durable policy, so on a replaced (newly created) box the
+          // resume-failure policy makes its one replacement attempt and the first
+          // follow-up can answer. Paul chooses upstream's or this behaviour for N+1.
+          const replaced = policy === "allow_replacement_after_resume_failure";
+          expect(String(failure)).toContain(replaced ? "fixture replacement observed before provider turn" : "native_session_recovery_failed");
+          expect(fresh).toHaveBeenCalledTimes(replaced ? 1 : 0);
+          observations.push({ providerSessionId: recover.mock.calls[0]![0].providerSessionId, replacementAttempts: replaced ? 1 : 0 });
           continue;
         }
         expect(recover.mock.calls[0]![0]).toMatchObject({ providerRecoveryPolicy: policy });
