@@ -1116,7 +1116,8 @@ export interface IssueComment {
   issueId: string;
   authorType: IssueCommentAuthorType;
   /** Server-generated receipt provenance; not writable by comment callers. */
-  origin?: "comment" | "fast_response";
+  /** Company-import history is marked at insertion, independently of preserved source timestamps. */
+  origin?: "comment" | "fast_response" | "import";
   fastResponseRequestId?: string | null;
   authorAgentId: string | null;
   authorUserId: string | null;
