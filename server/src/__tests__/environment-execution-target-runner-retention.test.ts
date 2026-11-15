@@ -77,6 +77,14 @@ describe("sandbox Runner exact lease callbacks", () => {
     expect(f.release).toHaveBeenCalledOnce();
   });
 
+  it("S retire-resume maps the shared start denial to unavailable", async () => {
+    const f = await fixture();
+    f.resume.mockRejectedValueOnce(Object.assign(new Error("The source lease cannot start"), { code: "sandbox_lease_start_denied" }));
+    await expect(f.target.runnerLeaseLifecycle!.resumeLease()).resolves.toBe("unavailable");
+    expect(f.resume).toHaveBeenCalledOnce();
+    expect(f.release).not.toHaveBeenCalled();
+  });
+
   it("accepts only typed retained absence, never a timeout or replacement resource", async () => {
     const f = await fixture();
     f.resume.mockRejectedValueOnce(new Error("worker timeout"));

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues } from "@paperclipai/db";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
 import { environmentService } from "../environments.js";
 import { retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { assertAgentRunWriteAllowed, agentRunWritesRevoked } from "../../agent-run-cancellation.js";
+import { loadAgentRunAuthentication } from "../../middleware/agent-run-authentication.js";
 
 const describeDb = recoveryPostgresSupport.supported ? describe : describe.skip;
 
@@ -20,6 +22,7 @@ describeDb("retired native backup source authority", () => {
 
   const manifestSha256 = `sha256:${"b".repeat(64)}`;
   let lastSourceLeaseId = "";
+  let lastRestoreInput: Parameters<typeof retiredSourceAuthorizesNativeBackupRestore>[1];
   const completedAt = new Date("2026-11-05T05:02:50.000Z");
 
   async function fixture(options: { termination?: "destroyed" | "stopped" | null; status?: string; stampSha?: string;
@@ -28,7 +31,8 @@ describeDb("retired native backup source authority", () => {
     stampIdentity?: "wrong_session" | "wrong_runner"; tipStamp?: "different_checkpoint" | "older_matching";
     handoffFault?: "missing_receipt" | "changed_receipt" | "active_predecessor" | "missing_predecessor";
     restoreHold?: "settled" | "no_marker" | "foreign_marker" | "reusable_policy" | "no_stop_receipt" | "dirty_writer";
-    idleWarm?: "retained" | "released" | "run_active" | "export_pending" | "same_target" | "cleanup_in_flight" } = {}) {
+    idleWarm?: "retained" | "released" | "run_active" | "export_pending" | "same_target" | "cleanup_in_flight";
+    expiredStopped?: boolean; recordedAdapter?: string | null; wrongReceipt?: boolean; deferClaim?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), sessionId = randomUUID(), runnerInstanceId = randomUUID();
     const sourceRunId = randomUUID(), currentRunId = randomUUID(), leaseId = randomUUID(), providerLeaseId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Retired source", issuePrefix: `R${companyId.slice(0, 5)}` });
@@ -92,6 +96,14 @@ describeDb("retired native backup source authority", () => {
         schema: "paperclip.native-workspace-sync/v3", state: "prepared", leaseId, providerLeaseId, workspaceId: randomUUID(),
         remoteCwd: "/work", resourceDisposition: "keep_running", descriptorSha256: "a".repeat(64), baselineSha256: "b".repeat(64),
         finalHostSha256: null } } }).where(eq(heartbeatRuns.id, sourceRunId));
+    }
+    if (options.expiredStopped) {
+      Object.assign(sourceLease, { status: "expired", leasePolicy: "reuse_by_environment", releasedAt: new Date() });
+      sourceLease.metadata = { ...sourceLease.metadata, reusableSandboxLease: { version: 1,
+        adapterType: options.recordedAdapter === undefined ? "paperclip_runner" : options.recordedAdapter },
+        remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId, runId: sourceRunId,
+          leaseId: options.wrongReceipt ? randomUUID() : leaseId, provider: "daytona", providerLeaseId,
+          state: "stopped", confirmedAt: new Date().toISOString() } } as typeof sourceLease.metadata;
     }
     lastSourceLeaseId = leaseId;
     if (options.handoffs) {
@@ -158,9 +170,10 @@ describeDb("retired native backup source authority", () => {
       ? sourceRunId : (await db.insert(heartbeatRuns).values({ companyId, agentId, status: "failed", runtimeMode: "native",
         nativeSessionId: sessionId, invocationSource: "automation", triggerDetail: "system" }).returning())[0]!.id,
       agentId, seq: 1, eventType: "session.resumed", createdAt: options.providerEventAt });
-    return retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId, normalizedSessionId: sessionId,
+    lastRestoreInput = { companyId, currentRunId, normalizedSessionId: sessionId,
       manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId: sessionId }, manifestSha256,
-      targetProviderLeaseId: options.idleWarm === "same_target" ? providerLeaseId : randomUUID() });
+      targetProviderLeaseId: options.idleWarm === "same_target" ? providerLeaseId : randomUUID() };
+    return options.deferClaim ? false : retiredSourceAuthorizesNativeBackupRestore(db, lastRestoreInput);
   }
 
   // Recorded production regression SMAA-143: one allocation, 12 owner rows,
@@ -335,6 +348,81 @@ describeDb("retired native backup source authority", () => {
     await expect(fixture(options)).resolves.toBe(false);
     const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
     expect(source!.metadata).toHaveProperty("reusableSandboxLease");
+  });
+
+  // S data-safety boundary: real PostgreSQL ownership and run-write authority.
+  it("S admits expired stopped native custody and leaves the status truthful", async () => {
+    expect(await fixture({ expiredStopped: true })).toBe(true);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    expect(lease).toMatchObject({ status: "expired", metadata: { remoteExecutionTermination: { state: "stopped" },
+      reusableSandboxLeaseSuperseded: { manifestSha256 } } });
+  });
+
+  it.each([
+    { recordedAdapter: null }, { recordedAdapter: "codex_local" }, { wrongReceipt: true },
+    { stampSha: `sha256:${"c".repeat(64)}` }, { idleWarm: "run_active" as const },
+    { idleWarm: "export_pending" as const }, { idleWarm: "cleanup_in_flight" as const },
+    { providerEventAt: new Date(completedAt.getTime() + 60_000) },
+  ])("S keeps every stopped-source proof: %j", async options => {
+    expect(await fixture({ expiredStopped: true, ...options })).toBe(false);
+  });
+
+  it.each([false, true])("S C3 permits only the same target and manifest (expired=%s)", async expiredStopped => {
+    expect(await fixture({ idleWarm: "released", expiredStopped })).toBe(true);
+    const [before] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    expect(await retiredSourceAuthorizesNativeBackupRestore(db, { ...lastRestoreInput,
+      targetProviderLeaseId: randomUUID() })).toBe(false);
+    expect(await retiredSourceAuthorizesNativeBackupRestore(db, { ...lastRestoreInput,
+      manifestSha256: `sha256:${"c".repeat(64)}` })).toBe(false);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId)))[0]).toEqual(before);
+    expect(await retiredSourceAuthorizesNativeBackupRestore(db, lastRestoreInput)).toBe(true);
+  });
+
+  it("S N3 revokes the old run at both transactional and JWT write boundaries", async () => {
+    expect(await fixture({ idleWarm: "released" })).toBe(true);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, lease!.heartbeatRunId!));
+    expect(run!.status).toBe("succeeded");
+    const [authentication] = await loadAgentRunAuthentication(db, { companyId: run!.companyId, agentId: run!.agentId, runId: run!.id });
+    expect(agentRunWritesRevoked(authentication)).toBe(true);
+    await expect(db.transaction(tx => assertAgentRunWriteAllowed(tx as unknown as typeof db, run!.companyId,
+      { agentId: run!.agentId, runId: run!.id }))).rejects.toThrow();
+    const [newRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, lastRestoreInput.currentRunId));
+    expect(agentRunWritesRevoked(newRun)).toBe(false);
+  });
+
+  it("S N3 rolls back source C if source-run revocation cannot commit", async () => {
+    await fixture({ idleWarm: "released", deferClaim: true });
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    await db.execute(sql`create function reject_s_source_revocation() returns trigger language plpgsql as $$
+      begin raise exception 'source revocation rejected'; end $$`);
+    await db.execute(sql.raw(`create trigger reject_s_source_revocation before update on heartbeat_runs
+      for each row when (old.id = '${lease!.heartbeatRunId}') execute function reject_s_source_revocation()`));
+    try {
+      await expect(retiredSourceAuthorizesNativeBackupRestore(db, lastRestoreInput)).rejects.toThrow();
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease!.id)))[0]).toEqual(lease);
+    } finally {
+      await db.execute(sql`drop trigger reject_s_source_revocation on heartbeat_runs`);
+      await db.execute(sql`drop function reject_s_source_revocation()`);
+    }
+  });
+
+  it("S rejects a superseded same-run reacquisition without erasing C", async () => {
+    await fixture({ idleWarm: "released" });
+    const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lastSourceLeaseId));
+    const environmentId = randomUUID(), issueId = randomUUID(), workspaceId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+    await db.insert(issues).values({ id: issueId, companyId: source!.companyId, title: "Same-run restore race" });
+    await db.insert(executionWorkspaces).values({ id: workspaceId, companyId: source!.companyId,
+      sourceIssueId: issueId, mode: "shared_workspace", strategyType: "project_primary", name: "Warm workspace" });
+    await db.update(environmentLeases).set({ environmentId, executionWorkspaceId: workspaceId, issueId })
+      .where(eq(environmentLeases.id, source!.id));
+    await expect(environmentService(db).acquireLease({ companyId: source!.companyId, environmentId,
+      executionWorkspaceId: workspaceId, issueId, heartbeatRunId: source!.heartbeatRunId,
+      leasePolicy: "reuse_by_environment", provider: source!.provider, providerLeaseId: source!.providerLeaseId,
+      metadata: {}, reusesReusableLeaseId: source!.id })).rejects.toThrow("ownership changed");
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, source!.id)))[0]?.metadata)
+      .toEqual(source!.metadata);
   });
 
   it("ignores provider work that finished before the checkpoint", async () => {

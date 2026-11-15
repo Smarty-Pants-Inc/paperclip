@@ -123,6 +123,28 @@ describe("counted ingress attempt floor and lease-expiry fences", () => {
     } finally { await handle.close(); }
   });
 
+  it.each([401, 403, null])("S typed denial ends refresh without cached redial (HTTP %s)", async statusCode => {
+    const dial = vi.fn(() => {
+      if (statusCode === null) return refused();
+      const socket = new Socket();
+      queueMicrotask(() => { socket.emit("unexpected-response", {}, { statusCode, resume: vi.fn() }); socket.close(); });
+      return socket;
+    });
+    transport.create = dial;
+    const ep = endpoint();
+    ep.refresh = vi.fn(async () => { throw Object.assign(new Error("The source lease cannot start"), { code: "sandbox_lease_start_denied" }); });
+    const auth = authority();
+    const handle = connectRunnerPrpIngress({ endpoint: ep, authority: auth, startupDeadlineMs: 5_000, random: () => 0.5 });
+    const result = handle.ready.catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await result).toMatchObject({ code: "runner_connection_lease_expired" });
+      expect(dial).toHaveBeenCalledOnce();
+      expect(ep.refresh).toHaveBeenCalledOnce();
+      expect(auth.attachWireConnection).not.toHaveBeenCalled();
+    } finally { await handle.close(); }
+  });
+
   it.each([401, 403])("does not rotate credentials for a known-expired lease after HTTP %s", async statusCode => {
     transport.create = () => {
       const socket = new Socket();
