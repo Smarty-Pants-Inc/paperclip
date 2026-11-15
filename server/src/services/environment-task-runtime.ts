@@ -1,4 +1,4 @@
-import { isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
+import { isSandboxLeaseStartDeniedError, SandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { pluginTaskResumeRefused, resolvePluginTaskResume } from "./plugin-task-resume.js";
 export { resolvePluginTaskResume } from "./plugin-task-resume.js";
 import { attachSandboxCreation, environmentService } from "./environments.js";
@@ -395,6 +395,7 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
             issueId: lease.issueId, config: driverConfig, runId: identity.runId, creationOperationId: identity.id,
             agentId: run!.agentId, adapterType: "paperclip_runner",
             ...(typeof metadata.runnerTaskRequestedExpiresAt === "string" ? { requestedExpiresAt: metadata.runnerTaskRequestedExpiresAt } : {}) };
+          if (Object.keys(params).some(key => /providerLeaseId|reuse|resume/i.test(key))) throw new SandboxLeaseStartDeniedError();
           if (!context) return workers.call(plugin.id, "environmentAcquireLease", params, 30_000);
           const settled = context.trackWorker();
           let observedResource: Parameters<typeof queueSandboxCreationCleanup>[1] | undefined;
