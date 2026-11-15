@@ -11,6 +11,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
+const http = require('node:http');
 // A PATH shim can capture this launcher's absolute path and call it again.
 // Reject that cycle before resolving another executable or capturing authority.
 if (process.env.PAPERCLIP_GITHUB_OPERATION_ACTIVE) {
@@ -49,6 +50,24 @@ const connectorRepositoryTools = new Map([['create', 'create_repository'], ['new
 function connectorRepositoryTool(args) {
   if (program !== 'gh' || args[0] !== 'repo' || args.includes('--help') || args.includes('-h')) return null;
   return connectorRepositoryTools.get(args[1]) || null;
+}
+function requestUnixSocket(socketPath, requestPath, options) {
+  return new Promise((resolve, reject) => {
+    const request = http.request({ socketPath, path: requestPath, method: options.method,
+      headers: options.headers, signal: options.signal }, response => {
+      const chunks = [];
+      response.on('data', chunk => chunks.push(Buffer.from(chunk)));
+      response.once('error', reject);
+      response.once('end', () => {
+        const body = Buffer.concat(chunks);
+        const bytes = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+        resolve({ status: response.statusCode || 0, ok: (response.statusCode || 0) >= 200 && (response.statusCode || 0) < 300,
+          json: async () => JSON.parse(body.toString('utf8')), arrayBuffer: async () => bytes });
+      });
+    });
+    request.once('error', reject);
+    request.end(options.body);
+  });
 }
 async function main() {
   let env = { ...process.env };
@@ -101,21 +120,26 @@ ${options.brokerFile ? String.raw`
     const askBroker = !isLocalGit(process.argv.slice(2));
     try {
     let response;
-    if (askBroker && base && env.PAPERCLIP_GITHUB_BROKER_TOKEN) {
-      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + '/runtime-tools/github/credentials';
+    if (askBroker && (env.PAPERCLIP_GITHUB_RUNNER_SOCKET || (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN))) {
+      const requestPath = '/runtime-tools/github/credentials';
+      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + requestPath;
       // A slow or restarting control plane must not cost the operation its
       // managed identity, so a failed request is retried before giving up.
       // Busy (409) responses and transport failures keep separate budgets, and
       // the body is read inside the retry so a failed read is retried too.
+      const directRunnerIngress = Boolean(env.PAPERCLIP_GITHUB_RUNNER_SOCKET);
       let transportFailures = 0, conflicts = 0, result;
       for (;;) {
         try {
-          response = await fetch(url, {
-            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+          const requestOptions = {
+            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(directRunnerIngress ? 30000 : 10000),
             headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
               'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
             body: '{}',
-          });
+          };
+          response = env.PAPERCLIP_GITHUB_RUNNER_SOCKET
+            ? await requestUnixSocket(env.PAPERCLIP_GITHUB_RUNNER_SOCKET, requestPath, requestOptions)
+            : await fetch(url, requestOptions);
           if (response.status === 409 && conflicts < 29) {
             conflicts += 1;
             await response.arrayBuffer();
@@ -126,7 +150,7 @@ ${options.brokerFile ? String.raw`
           break;
         } catch (error) {
           transportFailures += 1;
-          if (transportFailures >= 3) throw error;
+          if (transportFailures >= (directRunnerIngress ? 1 : 3)) throw error;
           await new Promise(resolve => setTimeout(resolve, 500 * transportFailures));
         }
       }
@@ -158,6 +182,7 @@ ${options.brokerFile ? String.raw`
     return;
   }
   // Only this invocation and its children inherit the captured credential.
+  delete env.PAPERCLIP_GITHUB_RUNNER_SOCKET;
   env.PAPERCLIP_GITHUB_OPERATION_ACTIVE = '1';
   // Its Git children use the real binary, so steering cannot split a gh operation.
   env.PATH = originalPath.join(path.delimiter);

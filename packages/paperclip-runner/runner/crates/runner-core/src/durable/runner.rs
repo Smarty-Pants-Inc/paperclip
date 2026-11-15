@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::github_access::{self, GitHubAccessIngress, GitHubAccessRequest};
 use super::state::{
     Command, CommandDisposition, DurableState, DurableStateStore, EventPriority,
     PendingTerminalDelivery, PendingWarmRunTransition, StoredCommandResult, StoredOutboxEvent,
@@ -49,6 +51,128 @@ enum CommandLifecycle {
 const TERMINAL_RESULT_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 const HOST_PARK_PREPARATION_BUDGET: Duration = Duration::from_secs(20);
 const CUMULATIVE_ACK_PERSIST_INTERVAL: usize = 16;
+const MAX_PENDING_GITHUB_ACCESS_REQUESTS: usize = 64;
+
+fn github_access_launch_enabled() -> Result<bool, DurableRunnerError> {
+    let transport = match std::env::var("PAPERCLIP_GITHUB_ACCESS_TRANSPORT") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(false),
+        Err(_) => {
+            return Err(DurableRunnerError::invalid(
+                "GitHub access transport flag is not valid UTF-8",
+            ))
+        }
+    };
+    if transport.is_empty() {
+        return Ok(false);
+    }
+    if transport != "runner_ingress" {
+        return Err(DurableRunnerError::invalid(
+            "unsupported GitHub access transport flag",
+        ));
+    }
+    Ok(true)
+}
+
+fn start_github_access_from_launch_flag(
+    enabled: bool,
+) -> Result<Option<GitHubAccessIngress>, DurableRunnerError> {
+    if !enabled {
+        return Ok(None);
+    }
+    let ingress = GitHubAccessIngress::start().map_err(|_| {
+        DurableRunnerError::invalid("failed to start the runner GitHub access listener")
+    })?;
+    ingress.set_available(false);
+    github_access::install_provider_environment(ingress.socket_path()).map_err(|_| {
+        DurableRunnerError::invalid("runner GitHub provider environment could not be installed")
+    })?;
+    Ok(Some(ingress))
+}
+
+fn fail_pending_github_access(pending: &mut HashMap<String, GitHubAccessRequest>, status: u16) {
+    for (request_id, request) in pending.drain() {
+        let _ = request.respond(github_access::error_reply(&request_id, status));
+    }
+}
+
+fn expire_pending_github_access_requests(pending: &mut HashMap<String, GitHubAccessRequest>) {
+    let now = Instant::now();
+    let expired = pending
+        .iter()
+        .filter_map(|(request_id, request)| (request.deadline() <= now).then(|| request_id.clone()))
+        .collect::<Vec<_>>();
+    for request_id in expired {
+        if let Some(request) = pending.remove(&request_id) {
+            let _ = request.respond(github_access::error_reply(&request_id, 503));
+        }
+    }
+}
+
+fn drain_github_access_requests(
+    ingress: Option<&mut GitHubAccessIngress>,
+    pending: &mut HashMap<String, GitHubAccessRequest>,
+    status: u16,
+) {
+    fail_pending_github_access(pending, status);
+    if let Some(ingress) = ingress {
+        ingress.reject_queued(status);
+    }
+}
+
+fn send_github_access_requests(
+    ingress: &mut GitHubAccessIngress,
+    pending: &mut HashMap<String, GitHubAccessRequest>,
+    transport: &mut AuthenticatedTransport,
+    max_frame_bytes: usize,
+) -> Result<(), DurableRunnerError> {
+    while let Some(request) = ingress.try_next_request() {
+        let request_id = request.request_id().to_owned();
+        if request.deadline() <= Instant::now() {
+            let _ = request.respond(github_access::error_reply(&request_id, 503));
+            continue;
+        }
+        let encoded_len = serde_json::to_vec(request.frame())
+            .map_err(|_| DurableRunnerError::invalid("GitHub access request could not be encoded"))?
+            .len();
+        if encoded_len > max_frame_bytes {
+            let _ = request.respond(github_access::error_reply(&request_id, 413));
+            continue;
+        }
+        if pending.len() >= MAX_PENDING_GITHUB_ACCESS_REQUESTS {
+            let _ = request.respond(github_access::error_reply(&request_id, 503));
+            continue;
+        }
+        if pending.contains_key(&request_id) {
+            let _ = request.respond(github_access::error_reply(&request_id, 502));
+            continue;
+        }
+        if let Err(error) = transport.send_json(request.frame()) {
+            let _ = request.respond(github_access::error_reply(&request_id, 503));
+            return Err(error);
+        }
+        pending.insert(request_id, request);
+    }
+    Ok(())
+}
+
+/// Replies are deliberately bare PRP frames, without control identity fields;
+/// the authenticated ingress session, not the frame, supplies run authority.
+/// Unknown IDs are stale replies from a prior binding and are discarded.
+fn complete_github_access_reply(
+    message: &Value,
+    pending: &mut HashMap<String, GitHubAccessRequest>,
+) -> bool {
+    if !github_access::is_reply_frame(message) {
+        return false;
+    }
+    if let Some(request_id) = message.get("requestId").and_then(Value::as_str) {
+        if let Some(request) = pending.remove(request_id) {
+            let _ = request.respond(message.clone());
+        }
+    }
+    true
+}
 
 fn reconnect_delay(base: Duration, max_delay: Duration, attempt: &mut u32) -> Duration {
     let multiplier = 1_u128 << (*attempt).min(5);
@@ -516,6 +640,11 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
     #[cfg(unix)]
     let mut host_control = host_control.map(HostedRunnerControl::new);
     let started = Instant::now();
+    let github_access_enabled = github_access_launch_enabled()?;
+    if github_access_enabled {
+        // The largest allowed HTTP body must fit in its single base64 PRP frame.
+        config.max_frame_bytes = config.max_frame_bytes.max(super::MAX_FRAME_BYTES);
+    }
     config.validate()?;
     if let Some(admission) = config
         .acpx_launch_profile
@@ -543,6 +672,8 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
     {
         return Ok(());
     }
+    let mut github_access = start_github_access_from_launch_flag(github_access_enabled)?;
+    let mut pending_github_access = HashMap::new();
     if recovered {
         // A restarted runner process emits a new event generation (section G).
         state.begin_recovered_generation();
@@ -575,6 +706,12 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
     let mut next_connection_attempt = Instant::now();
 
     'session: loop {
+        if disconnected_since.is_some() {
+            if let Some(ingress) = github_access.as_mut() {
+                ingress.set_available(false);
+                drain_github_access_requests(Some(ingress), &mut pending_github_access, 503);
+            }
+        }
         #[cfg(unix)]
         if let Some(control) = host_control.as_mut() {
             if control.park_id.is_some() {
@@ -697,6 +834,14 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
         if let Some(control) = host_control.as_mut() {
             match process_host_control(control, &mut state, &store, &mut executor, false, None) {
                 Ok(HostAction::Park) => {
+                    if let Some(ingress) = github_access.as_mut() {
+                        ingress.set_available(false);
+                        drain_github_access_requests(
+                            Some(ingress),
+                            &mut pending_github_access,
+                            503,
+                        );
+                    }
                     lease = None;
                     bootstrap_ticket = None;
                     continue 'session;
@@ -764,6 +909,9 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
         authenticated_once = true;
         disconnected_since = None;
         reconnect_attempt = 0;
+        if let Some(ingress) = github_access.as_ref() {
+            ingress.set_available(true);
+        }
         if let Some(next_lease) = welcome.lease {
             lease = Some(next_lease);
             // A bootstrap capability is one-use. It is destroyed only after a
@@ -828,6 +976,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     &mut transport,
                     &state,
                     &connection,
+                    &mut pending_github_access,
                     &transition.receipt,
                 ) {
                     state.record_diagnostic(format!(
@@ -856,6 +1005,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     &config,
                     &next,
                     &connection,
+                    &mut pending_github_access,
                     &transition.command,
                     &transition.result,
                     &mut sent,
@@ -893,6 +1043,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                 &mut transport,
                 &connection,
                 &welcome.pending_commands,
+                &mut pending_github_access,
             );
         }
         state.lifecycle = "ready".to_owned();
@@ -939,6 +1090,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                         &config,
                         next,
                         &connection,
+                        &mut pending_github_access,
                         &command,
                         &result,
                         &mut sent_source_seq,
@@ -972,6 +1124,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     &mut state,
                     &store,
                     &connection,
+                    &mut pending_github_access,
                     &result,
                 ) {
                     return stop_after_terminal_result_delivery_failure(
@@ -1037,6 +1190,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                         state,
                         &store,
                         &connection,
+                        &mut pending_github_access,
                         &mut sent_source_seq,
                     )
                 },
@@ -1063,6 +1217,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
         let mut control_frame_consumed = false;
         let mut quiet_through_source_seq = replayed_through_source_seq;
         loop {
+            expire_pending_github_access_requests(&mut pending_github_access);
             if !config.max_runtime.is_zero() && started.elapsed() >= config.max_runtime {
                 break;
             }
@@ -1129,6 +1284,24 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     ),
                 );
             }
+            if let Some(ingress) = github_access.as_mut() {
+                if let Err(error) = send_github_access_requests(
+                    ingress,
+                    &mut pending_github_access,
+                    &mut transport,
+                    config.max_frame_bytes,
+                ) {
+                    ingress.set_available(false);
+                    drain_github_access_requests(Some(ingress), &mut pending_github_access, 503);
+                    disconnected_since.get_or_insert_with(Instant::now);
+                    state.record_diagnostic(format!(
+                        "GitHub access forwarding disconnected: {error}"
+                    ));
+                    state.reconnect_count = state.reconnect_count.saturating_add(1);
+                    store.save(&state)?;
+                    break;
+                }
+            }
             // Read control before starting another fsynced provider batch.
             // Consuming the last cumulative ACK must not let a new output
             // suffix overtake the stop/suspend already queued behind it.
@@ -1146,6 +1319,14 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                         Ok(HostAction::Park) => {
                             // The private owner now holds the exact idle cut. No
                             // old PRP frame, lease renewal, or provider poll may follow.
+                            if let Some(ingress) = github_access.as_mut() {
+                                ingress.set_available(false);
+                                drain_github_access_requests(
+                                    Some(ingress),
+                                    &mut pending_github_access,
+                                    503,
+                                );
+                            }
                             lease = None;
                             bootstrap_ticket = None;
                             drop(transport);
@@ -1195,6 +1376,9 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     break;
                 }
             };
+            if complete_github_access_reply(&message, &mut pending_github_access) {
+                continue;
+            }
             if let Err(error) = validate_control_identity(&message, &state, Some(&connection)) {
                 disconnected_since.get_or_insert_with(Instant::now);
                 state.record_diagnostic(format!(
@@ -1241,8 +1425,18 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                     )?;
                     #[cfg(unix)]
                     admit_host_claim(host_control.as_ref(), &command, next_authority.as_ref())?;
+                    if next_authority.is_some() {
+                        fail_pending_github_access(&mut pending_github_access, 403);
+                    }
                     let (result, lifecycle) =
                         process_command(&mut state, &store, &config, &mut executor, &command)?;
+                    if lifecycle.durable_state().is_some() {
+                        drain_github_access_requests(
+                            github_access.as_mut(),
+                            &mut pending_github_access,
+                            403,
+                        );
+                    }
                     let next_authority = next_authority.filter(|_| completed_attachment(&result));
                     if let Some(durable_lifecycle) = lifecycle.durable_state() {
                         persist_lifecycle_before_command_delivery(
@@ -1261,6 +1455,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                                 &config,
                                 next,
                                 &connection,
+                                &mut pending_github_access,
                                 &command,
                                 &result,
                                 &mut sent_source_seq,
@@ -1300,6 +1495,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                             &mut state,
                             &store,
                             &connection,
+                            &mut pending_github_access,
                             &result,
                         ) {
                             return stop_after_terminal_result_delivery_failure(
@@ -1359,6 +1555,7 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                                     state,
                                     &store,
                                     &connection,
+                                    &mut pending_github_access,
                                     &mut sent_source_seq,
                                 )
                             },
@@ -1734,6 +1931,7 @@ fn wait_for_terminal_result_ack(
     state: &mut DurableState,
     store: &DurableStateStore,
     connection: &ConnectionMetadata,
+    pending_github_access: &mut HashMap<String, GitHubAccessRequest>,
     result: &StoredCommandResult,
 ) -> Result<(), DurableRunnerError> {
     let deadline = Instant::now() + TERMINAL_RESULT_ACK_TIMEOUT;
@@ -1742,6 +1940,9 @@ fn wait_for_terminal_result_ack(
         let Some(message) = transport.receive_json()? else {
             continue;
         };
+        if complete_github_access_reply(&message, pending_github_access) {
+            continue;
+        }
         validate_control_identity(&message, state, Some(connection))?;
         match message.get("kind").and_then(Value::as_str) {
             Some("command_result_ack") => {
@@ -1815,6 +2016,7 @@ fn wait_for_old_authority_outbox_ack(
     state: &mut DurableState,
     store: &DurableStateStore,
     connection: &ConnectionMetadata,
+    pending_github_access: &mut HashMap<String, GitHubAccessRequest>,
     sent_source_seq: &mut u64,
 ) -> Result<(), DurableRunnerError> {
     send_outbox(
@@ -1835,6 +2037,9 @@ fn wait_for_old_authority_outbox_ack(
         let Some(message) = transport.receive_json()? else {
             continue;
         };
+        if complete_github_access_reply(&message, pending_github_access) {
+            continue;
+        }
         validate_control_identity(&message, state, Some(connection))?;
         match message.get("kind").and_then(Value::as_str) {
             Some("ack") => {
@@ -1897,6 +2102,7 @@ fn confirm_warm_activation(
     transport: &mut AuthenticatedTransport,
     state: &DurableState,
     connection: &ConnectionMetadata,
+    pending_github_access: &mut HashMap<String, GitHubAccessRequest>,
     receipt: &WarmRunTransition,
 ) -> Result<(), DurableRunnerError> {
     transport.send_json(&control_envelope(
@@ -1915,6 +2121,9 @@ fn confirm_warm_activation(
         let Some(message) = transport.receive_json()? else {
             continue;
         };
+        if complete_github_access_reply(&message, pending_github_access) {
+            continue;
+        }
         validate_control_identity(&message, state, Some(connection))?;
         match message.get("kind").and_then(Value::as_str) {
             Some("warm_transition_activated_ack")
@@ -1944,11 +2153,19 @@ fn deliver_warm_attachment(
     config: &DurableRunnerConfig,
     next: &DurableRunnerConfig,
     connection: &ConnectionMetadata,
+    pending_github_access: &mut HashMap<String, GitHubAccessRequest>,
     command: &Command,
     result: &StoredCommandResult,
     sent_source_seq: &mut u64,
 ) -> Result<(), DurableRunnerError> {
-    wait_for_old_authority_outbox_ack(transport, state, store, connection, sent_source_seq)?;
+    wait_for_old_authority_outbox_ack(
+        transport,
+        state,
+        store,
+        connection,
+        pending_github_access,
+        sent_source_seq,
+    )?;
     let receipt = WarmRunTransition::new(
         config,
         next,
@@ -2003,6 +2220,9 @@ fn deliver_warm_attachment(
         let Some(message) = transport.receive_json()? else {
             continue;
         };
+        if complete_github_access_reply(&message, pending_github_access) {
+            continue;
+        }
         validate_control_identity(&message, state, Some(connection))?;
         match message.get("kind").and_then(Value::as_str) {
             Some("command_result_ack")
@@ -2069,6 +2289,7 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
     transport: &mut AuthenticatedTransport,
     connection: &ConnectionMetadata,
     pending_commands: &[Command],
+    pending_github_access: &mut HashMap<String, GitHubAccessRequest>,
 ) -> Result<(), DurableRunnerError> {
     let pending = state.pending_terminal_delivery.clone().ok_or_else(|| {
         DurableRunnerError::invalid("terminal result reconciliation has no durable fence")
@@ -2104,9 +2325,14 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
         if let Err(error) = delivery {
             return stop_after_terminal_result_delivery_failure(state, store, executor, error);
         }
-        if let Err(error) =
-            wait_for_terminal_result_ack(transport, state, store, connection, &result)
-        {
+        if let Err(error) = wait_for_terminal_result_ack(
+            transport,
+            state,
+            store,
+            connection,
+            pending_github_access,
+            &result,
+        ) {
             return stop_after_terminal_result_delivery_failure(state, store, executor, error);
         }
     } else {
@@ -2132,7 +2358,14 @@ fn reconcile_pending_terminal_delivery<E: CommandExecutor>(
         return Err(error);
     }
     finish_terminal_reconciliation(state, store, config, executor, |state| {
-        wait_for_old_authority_outbox_ack(transport, state, store, connection, &mut sent_source_seq)
+        wait_for_old_authority_outbox_ack(
+            transport,
+            state,
+            store,
+            connection,
+            pending_github_access,
+            &mut sent_source_seq,
+        )
     })
 }
 
