@@ -223,29 +223,29 @@ describe("lead budget and permission management inside its current subtree", () 
     }
   }, 60_000);
 
-  it("uses live remaining spend and current policy capacity, and supports a transitive descendant", async () => {
+  it("allows a hirer to set any descendant budget regardless of its own remaining spend or policy capacity", async () => {
     const f = await seed();
     await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.ids.lead,
       provider: "test", model: "test", costCents: 450, occurredAt: new Date() });
     for (const suffix of ["/budgets", ""]) {
-      expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: 551 })).status).toBe(403);
+      expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: 551 })).status).toBe(200);
       const response = await f.patch(f.ids.descendant, suffix, { budgetMonthlyCents: 550 });
       expect(response.status, response.text).toBe(200);
     }
     await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: f.ids.lead,
       amount: 700, metric: "billed_cents", windowKind: "calendar_month_utc", isActive: true });
-    expect((await f.patch(f.ids.worker, "/budgets", { budgetMonthlyCents: 251 })).status).toBe(403);
+    expect((await f.patch(f.ids.worker, "/budgets", { budgetMonthlyCents: 251 })).status).toBe(200);
     expect((await f.patch(f.ids.worker, "/budgets", { budgetMonthlyCents: 250 })).status).toBe(200);
   }, 60_000);
 
-  it("includes held reservations and fractional cents in the remaining-budget cap", async () => {
+  it("does not use held reservations or fractional spend to narrow a hirer's budget-setting authority", async () => {
     const f = await seed();
     await db.insert(costEvents).values({ companyId: f.companyId, agentId: f.ids.lead,
       provider: "test", model: "test", costCents: 450, occurredAt: new Date() });
     await db.insert(budgetReservations).values({ companyId: f.companyId, agentId: f.ids.lead,
       decisionInvocationId: randomUUID(), amountCents: "100.0000001", state: "held" });
     for (const suffix of ["/budgets", ""]) {
-      expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: 450 })).status).toBe(403);
+      expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: 450 })).status).toBe(200);
       const response = await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: 449 });
       expect(response.status, response.text).toBe(200);
     }
@@ -271,7 +271,7 @@ describe("lead budget and permission management inside its current subtree", () 
     expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, f.ids.worker))).toEqual([]);
   }, 60_000);
 
-  it("rejects missing authority, unscoped/escaped delegation and budget disabling or over-allocation", async () => {
+  it("rejects missing authority and escaped permission delegation while allowing any report budget including unlimited", async () => {
     const f = await seed();
     for (const body of [
       { permissionKey: "users:manage_permissions", enabled: true, scope: { subtreeRootAgentId: f.ids.worker } },
@@ -280,11 +280,11 @@ describe("lead budget and permission management inside its current subtree", () 
       { ...grantBody(f.ids.worker), scope: { agentIds: [f.ids.worker, f.ids.outside] } },
     ]) expect((await f.patch(f.ids.worker, "/permission-grants", body)).status).toBe(403);
     for (const suffix of ["/budgets", ""]) {
-      for (const amount of [1001, 0]) expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: amount })).status).toBe(403);
+      for (const amount of [1001, 0]) expect((await f.patch(f.ids.worker, suffix, { budgetMonthlyCents: amount })).status).toBe(200);
     }
     expect((await f.patch(f.ids.worker, "/permissions", { canCreateAgents: true, canAssignTasks: true, authorizationPolicy: { allow: ["*"] } })).status).not.toBe(200);
     await db.delete(principalPermissionGrants).where(and(eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "tasks:assign")));
     expect((await f.patch(f.ids.worker, "/permissions", { canCreateAgents: true, canAssignTasks: true })).status).toBe(403);
-    expect((await readAgent(f.ids.worker)).budgetMonthlyCents).toBe(100);
+    expect((await readAgent(f.ids.worker)).budgetMonthlyCents).toBe(0);
   }, 60_000);
 });

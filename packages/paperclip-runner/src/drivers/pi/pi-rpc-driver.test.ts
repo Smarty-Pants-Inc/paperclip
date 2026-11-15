@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { createCapabilityRunnerdProviderEnvironment } from "../../live/runnerd-codex-transport.js";
+import { configuredEnvironmentProjection } from "../../configured-environment.js";
 import { mapPiRpcRecord, PiRpcDriver } from "./pi-rpc-driver.js";
 import { validatePrpEvent, type PrpEvent } from "../../protocol/replay-contract.js";
 import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
@@ -73,6 +74,26 @@ async function inputProxyFixture() {
   return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
 describe("PiRpcDriver", () => {
+  it("k: runner session and RPC mode win over manager-supplied Pi environment", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-manager-env-"));
+    const runtime = join(root, "copied-runner", "sessions");
+    const transport = new FailureTransport();
+    let launch: { args?: string[]; env?: NodeJS.ProcessEnv } | undefined;
+    const session = await new PiRpcDriver({ runtimeDirectory: runtime, model: "neutral/model", piRpcThinkingLevel: "high",
+      environment: { PI_CODING_AGENT_DIR: join(root, "agent"), PI_CODING_AGENT_SESSION_DIR: "/manager/session-escape", PI_MODE: "interactive" },
+      transportFactory: options => { launch = options; return transport as unknown as PiRpcTransport; },
+    }).openSession({ runId: "manager-env", normalizedSessionId: "manager-env", workingDirectory: root });
+    try {
+      expect(launch!.args!.slice(0, 2)).toEqual(["--mode", "rpc"]);
+      const sessionFlag = launch!.args!.indexOf("--session");
+      expect(sessionFlag).toBeGreaterThan(-1);
+      const sessionPath = launch!.args![sessionFlag + 1]!;
+      expect(sessionPath.startsWith(`${runtime}/`)).toBe(true);
+      expect((await session.snapshot()).sessionFile).toBe(sessionPath);
+      expect(configuredEnvironmentProjection({ PAPERCLIP_PI_RUNTIME_DIR: "/manager/runtime-escape" }).PAPERCLIP_PI_RUNTIME_DIR).toBeUndefined();
+    } finally { await session.close(); }
+    // Retain fixture files for task evidence, rather than removing scratch data.
+  });
   it("drains failed direct-env admission timings without requiring a turn or session close", async () => {
     const f = await failureFixture();
     const request = f.transport.request.bind(f.transport);
