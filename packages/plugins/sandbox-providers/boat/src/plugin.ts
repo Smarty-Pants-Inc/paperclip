@@ -5,7 +5,7 @@ import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
-import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
+import { assertBoatActivityAdmission, BoatLeaseClosingError, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
 import { BoatDuplexChannels, BoatDuplexError, type DuplexLease } from "./duplex.js";
 import { BoatSshCarrier, connectSsh, SSH_RETIRE_ATTEMPTS, type SshRetireWarning } from "./ssh-carrier.js";
 import { acquireRunnerIngress, DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS, effectiveTtlSeconds, ingressScopeKey,
@@ -50,7 +50,7 @@ function parse(raw: Record<string, unknown>): Config {
     ...(typeof raw.boatEnvironment === "string" ? { boatEnvironment: raw.boatEnvironment } : {}),
   };
 }
-type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "parse_error" | "ambiguous_404";
+type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "parse_error" | "ambiguous_404" | "lease_closing";
 /** Never retain provider/transport diagnostics, even as a cause. Only these safe
  * fields may cross the worker boundary; scrub the key from our own stack too. */
 function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory): Error & { httpStatus: number | null; category: RequestErrorCategory } {
@@ -143,7 +143,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     });
     if (responseOptions.requireJson && body === null) throw new Error(category);
     return body;
-  } catch {
+  } catch (error) {
+    if (error instanceof BoatLeaseClosingError) {
+      throw requestError(config, init.method ?? "GET", path, null, "lease_closing");
+    }
     throw requestError(config, init.method ?? "GET", path, httpStatus, category);
   }
 }

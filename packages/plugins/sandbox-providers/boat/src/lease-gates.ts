@@ -19,6 +19,10 @@ function gateStore() {
     end(key: string, gate: Gate) { if (--gate.refCount > 0) return; if (gates.get(key) === gate) gates.delete(key); gate.release(); },
   };
 }
+export class BoatLeaseClosingError extends Error {
+  constructor() { super("Boat sandbox lease is no longer active."); }
+}
+
 const activity = gateStore(), teardown = gateStore();
 const admission = new Map<string, { closed: boolean; revision: number }>();
 const current = new AsyncLocalStorage<{ key: string; revision: number; allowClosed: boolean }>();
@@ -34,11 +38,11 @@ export function assertBoatActivityAdmission(): void {
   const operation = current.getStore();
   if (!operation) return;
   const now = state(operation.key);
-  if (now.revision !== operation.revision || (!operation.allowClosed && now.closed)) throw new Error("Boat sandbox lease is no longer active.");
+  if (now.revision !== operation.revision || (!operation.allowClosed && now.closed)) throw new BoatLeaseClosingError();
 }
 export async function withBoatLeaseActivity<T>(key: string, fn: () => Promise<T>, allowClosed = false): Promise<T> {
   while (true) {
-    if (!allowClosed && state(key).closed) throw new Error("Boat sandbox lease is no longer active.");
+    if (!allowClosed && state(key).closed) throw new BoatLeaseClosingError();
     const stopping = teardown.current(key);
     if (stopping) { await boundedWait(stopping.promise); continue; }
     const gate = activity.begin(key);

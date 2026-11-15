@@ -203,7 +203,7 @@ describe("Boat Runner contract", () => {
     const refused = await plugin.definition.onEnvironmentResumeLease!({ ...owned, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata }).catch(error => error);
     finish(); const execution = await executing;
     expect(refused).toBeInstanceOf(Error); expect(refused.message).toMatch(/settling/);
-    expect(execution).toMatchObject({ category: "request_error", httpStatus: null });
+    expect(execution).toMatchObject({ category: "lease_closing", httpStatus: null });
     expect(f.network.mock.calls.some(([, init]) => String(init?.body).includes("dangerous-command"))).toBe(false);
   });
   it.each([

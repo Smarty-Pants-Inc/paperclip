@@ -82,7 +82,7 @@ describe("Boat provider", () => {
     const receipt = await plugin.definition.onEnvironmentDestroyLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" });
     expect(fetch).toHaveBeenCalledTimes(2); expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(fetch.mock.calls[1][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
   });
-  it("reports a retryable lease_closing error when stop races an outbound file read (RED)", async () => {
+  it("reports a retryable lease_closing error when stop races an outbound file read", async () => {
     let commandStarted!: () => void, finishCommand!: () => void;
     const started = new Promise<void>(resolve => { commandStarted = resolve; });
     const commandGate = new Promise<void>(resolve => { finishCommand = resolve; });
@@ -104,11 +104,7 @@ describe("Boat provider", () => {
     await plugin.definition.onEnvironmentStopLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_race" });
     finishCommand();
     const failure = await read.then(() => null, error => error as Error & { category?: string });
-    // Today's behavior: request() wraps the admission error as a generic request_error.
-    expect(failure).toMatchObject({ category: "request_error" });
-    // Desired contract: callers can distinguish and retry this non-data failure.
-    // This assertion is intentionally RED on cl/plugin-boat-0.1.16.
-    expect(failure).toMatchObject({ category: "lease_closing" });
+    expect(failure).toMatchObject({ category: "lease_closing", httpStatus: null });
     expect(failure?.message).toContain("lease_closing");
     expect(fetch.mock.calls.some(([input]) => String(input).includes("/files/download-url"))).toBe(false);
   });
