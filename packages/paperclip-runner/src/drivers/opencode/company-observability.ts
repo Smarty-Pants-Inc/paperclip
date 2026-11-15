@@ -7,7 +7,20 @@ interface Span { id: string; name: string; start: number; end: number; failed: b
 interface Turn {
   runId: string; turnId: string; traceId: string; root: Span;
   tools: Map<string, Span>; usage: Map<string, Span>; truncated: boolean;
+  overflow?: Span; usageCount: number; toolCount: number; skippedUsage: number;
+  incomplete: boolean; costIncomplete: boolean; totals: Record<string, number>;
 }
+/** Defaults preserve OpenCode's wire contract; other drivers opt into extensions. */
+export interface CompanyObservabilityProfile {
+  flag: string; serviceName: string; scopeName: string; turnSpanName: string; usageSpanName: string;
+  providerToolPrefix: string; overflowSpanName: string;
+  langfuseMapping: boolean; preserveOverflow: boolean; appendUserMessages: boolean;
+}
+const openCodeProfile: CompanyObservabilityProfile = {
+  flag: "PAPERCLIP_OBSERVABILITY_OPENCODE", serviceName: "paperclip-opencode", scopeName: "paperclip.opencode",
+  turnSpanName: "paperclip.opencode.turn", usageSpanName: "opencode.model.usage", providerToolPrefix: "opencode tool",
+  overflowSpanName: "opencode.turn.overflow", langfuseMapping: false, preserveOverflow: false, appendUserMessages: false,
+};
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const finite = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
 const id = () => randomBytes(8).toString("hex");
@@ -44,11 +57,15 @@ function outputText(value: unknown): string {
 export function createOpenCodeCompanyObservability(input: {
   environment: NodeJS.ProcessEnv | undefined; model: string; sensitiveValues: readonly string[];
   managedToolNames?: readonly string[];
+  profile?: Partial<CompanyObservabilityProfile>; sessionId?: string;
   fetch?: typeof globalThis.fetch; onDiagnostic?: (message: string) => void;
 }) {
+  const profile = { ...openCodeProfile, ...input.profile };
   const env = input.environment;
-  if (env?.PAPERCLIP_OBSERVABILITY_OPENCODE !== "1") return undefined;
-  const diagnostic = (reason: string) => input.onDiagnostic?.(`Company observability export unavailable (${reason}).`);
+  if (env?.[profile.flag] !== "1") return undefined;
+  const diagnostic = (reason: string) => {
+    try { input.onDiagnostic?.(`Company observability export unavailable (${reason}).`); } catch { /* Export cannot fail the task. */ }
+  };
   let endpoint: string, headers: Record<string, string>, resource: Attributes;
   try {
     const url = new URL(env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ?? "");
@@ -56,8 +73,8 @@ export function createOpenCodeCompanyObservability(input: {
     endpoint = url.href;
     headers = pairs(env.OTEL_EXPORTER_OTLP_TRACES_HEADERS);
     const supplied = pairs(env.OTEL_RESOURCE_ATTRIBUTES);
-    resource = { "service.name": "paperclip-opencode", ...Object.fromEntries(
-      ["paperclip.company.id", "paperclip.agent.id", "paperclip.observability.revision"]
+    resource = { "service.name": profile.serviceName, ...Object.fromEntries(
+      ["paperclip.company.id", "paperclip.agent.id", "paperclip.observability.revision", "paperclip.run.id", "paperclip.task.id"]
         .filter(key => supplied[key]).map(key => [key, supplied[key]])) };
   } catch { diagnostic("configuration_invalid"); return undefined; }
   const managedTools = new Set(["paperclip_finish", "paperclip_block", ...(input.managedToolNames ?? [])]
@@ -77,6 +94,11 @@ export function createOpenCodeCompanyObservability(input: {
   let current: Turn | undefined;
   let closed = false;
   const makeSpan = (name: string, time: number, values: Attributes): Span => ({ id: id(), name, start: time, end: time, failed: false, attributes: values });
+  const content = (span: Span, direction: "input" | "output", text: string) => {
+    span.attributes[`braintrust.${direction}`] = text;
+    if (profile.langfuseMapping) span.attributes[`langfuse.observation.${direction}`] = text;
+  };
+  const overflow = (turn: Turn, time: number) => turn.overflow ??= makeSpan(profile.overflowSpanName, time, {});
   const finish = (failed: boolean, time: number) => {
     const turn = current;
     current = undefined;
@@ -84,22 +106,63 @@ export function createOpenCodeCompanyObservability(input: {
     turn.root.end = Math.max(turn.root.start, time);
     turn.root.failed = failed;
     turn.root.attributes["paperclip.observability.truncated"] = turn.truncated;
-    const spans = [turn.root, ...turn.tools.values(), ...turn.usage.values()].map(span => ({
+    if (profile.preserveOverflow && (turn.incomplete || turn.costIncomplete || turn.overflow)) {
+      const aggregate = overflow(turn, turn.root.start);
+      aggregate.end = time;
+      if (aggregate.attributes["paperclip.observability.overflow.usage_count"]) {
+        // Reconcile against receipt-order run totals. Independently adding an
+        // overflow subtotal can otherwise change fractional USD rounding.
+        for (const [key, total] of Object.entries(turn.totals)) {
+          const detailed = [...turn.usage.values()].reduce((sum, span) => sum + Number(span.attributes[key] ?? 0), 0);
+          aggregate.attributes[key] = total - detailed;
+        }
+      }
+      Object.assign(aggregate.attributes, {
+        "paperclip.observability.truncated": turn.truncated,
+        "paperclip.observability.incomplete": turn.incomplete,
+        "paperclip.observability.cost_incomplete": turn.costIncomplete,
+        "paperclip.observability.totals_exact": !turn.incomplete && !turn.costIncomplete,
+        "paperclip.observability.usage_count": turn.usageCount,
+        "paperclip.observability.tool_count": turn.toolCount,
+        "paperclip.observability.skipped_usage_count": turn.skippedUsage,
+      });
+    }
+    const turnResource = profile.langfuseMapping ? { ...resource, "paperclip.run.id": turn.runId,
+      ...(input.sessionId ? { "session.id": input.sessionId } : {}) } : resource;
+    const spans = [turn.root, ...turn.tools.values(), ...turn.usage.values(), ...(turn.overflow ? [turn.overflow] : [])].map(span => ({
       traceId: turn.traceId, spanId: span.id, ...(span !== turn.root ? { parentSpanId: turn.root.id } : {}),
       name: span.name, kind: 0, startTimeUnixNano: String(BigInt(Math.trunc(span.start)) * 1_000_000n),
       endTimeUnixNano: String(BigInt(Math.trunc(Math.max(span.start, span.end))) * 1_000_000n),
-      status: { code: span.failed ? 2 : 1 }, attributes: attributes({ ...resource, ...span.attributes,
+      status: { code: span.failed ? 2 : 1 }, attributes: attributes({ ...turnResource, ...span.attributes,
         "paperclip.run.id": turn.runId, "paperclip.turn.id": turn.turnId }),
     }));
-    // One bounded request per terminal turn, no idle worker, retries or durable secret-bearing queue.
+    // Admit at most four terminal-turn jobs, never queue turns. A split turn
+    // streams bounded requests sequentially in its slot under ONE 3s deadline.
+    // Thus splitting cannot increase concurrency or create an idle worker.
     if (pending.size >= 4) { diagnostic("export_busy"); return; }
-    const body = JSON.stringify({ resourceSpans: [{ resource: { attributes: attributes(resource) },
-      scopeSpans: [{ scope: { name: "paperclip.opencode", version: "1" }, spans }] }] });
-    if (Buffer.byteLength(body) > 1_048_576) { diagnostic("export_too_large"); return; }
+    const envelope = (batch: typeof spans) => JSON.stringify({ resourceSpans: [{ resource: { attributes: attributes(turnResource) },
+      scopeSpans: [{ scope: { name: profile.scopeName, version: "1" }, spans: batch }] }] });
+    const body = envelope(spans);
+    if (!profile.preserveOverflow && Buffer.byteLength(body) > 1_048_576) { diagnostic("export_too_large"); return; }
+    function* bodies() {
+      if (!profile.preserveOverflow || Buffer.byteLength(body) <= 1_048_576) { yield body; return; }
+      const overhead = Buffer.byteLength(envelope([]));
+      let batch: typeof spans = [], bytes = overhead;
+      for (const span of spans) {
+        const size = Buffer.byteLength(JSON.stringify(span));
+        if (size + overhead > 1_048_576) throw new Error("export_span_too_large");
+        if (bytes + size + (batch.length ? 1 : 0) > 1_048_576) { yield envelope(batch); batch = []; bytes = overhead; }
+        bytes += size + (batch.length ? 1 : 0); batch.push(span);
+      }
+      if (batch.length) yield envelope(batch);
+    }
     const job = (async () => {
       try {
+        const signal = AbortSignal.timeout(3000);
+        for (const body of bodies()) {
+        signal.throwIfAborted();
         const response = await (input.fetch ?? globalThis.fetch)(endpoint, {
-          method: "POST", redirect: "error", signal: AbortSignal.timeout(3000),
+          method: "POST", redirect: "error", signal,
           headers: { ...headers, "content-type": "application/json", accept: "application/json" }, body,
         });
         const reader = response.body?.getReader();
@@ -120,6 +183,7 @@ export function createOpenCodeCompanyObservability(input: {
             if (!/^\d+$/.test(String(rejected)) || Number(rejected) !== 0) throw new Error("partial_rejection");
           }
         } finally { await reader?.cancel().catch(() => {}); }
+        }
       } catch { diagnostic("export_failed"); }
     })();
     pending.add(job);
@@ -133,25 +197,37 @@ export function createOpenCodeCompanyObservability(input: {
       if (event.eventType === "turn.submitted" && event.turnId) {
         if (current) finish(true, time);
         current = { runId: event.runId, turnId: event.turnId, traceId: randomBytes(16).toString("hex"),
-          root: makeSpan("paperclip.opencode.turn", time, { "gen_ai.operation.name": "invoke_agent", "gen_ai.request.model": input.model }),
-          tools: new Map(), usage: new Map(), truncated: false };
-        if (capture("OTEL_LOG_USER_PROMPTS")) current.root.attributes["braintrust.input"] = clean(record(event.payload).text);
+          root: makeSpan(profile.turnSpanName, time, { "gen_ai.operation.name": "invoke_agent", "gen_ai.request.model": input.model }),
+          tools: new Map(), usage: new Map(), truncated: false, usageCount: 0, toolCount: 0, skippedUsage: 0, incomplete: false, costIncomplete: false, totals: {} };
+        if (capture("OTEL_LOG_USER_PROMPTS")) content(current.root, "input", clean(record(event.payload).text));
       }
       const turn = current;
       if (!turn || event.runId !== turn.runId || event.turnId !== turn.turnId) return;
       const payload = record(event.payload);
       if (event.eventType === "item.completed" && payload.kind === "agentMessage" && capture("OTEL_LOG_ASSISTANT_RESPONSES")) {
-        turn.root.attributes["braintrust.output"] = clean(payload.text);
+        content(turn.root, "output", clean(payload.text));
+      }
+      if (profile.appendUserMessages && event.eventType === "item.completed" && payload.kind === "userMessage" && capture("OTEL_LOG_USER_PROMPTS")) {
+        // Consumption can occur after submission (steers / queued follow-ups).
+        // Append only in this private feed, using the same redaction/UTF-8 cap.
+        const previous = String(turn.root.attributes["braintrust.input"] ?? "");
+        content(turn.root, "input", clean(previous + (previous ? "\n\n" : "") + clean(payload.text)));
+      }
+      if (profile.preserveOverflow && event.eventType === "item.completed" && payload.kind === "usageAccounting") {
+        turn.incomplete ||= payload.incomplete === true;
+        if (payload.skipped === true) turn.skippedUsage++;
       }
       const dynamic = payload.kind === "dynamicToolCall" && ["item.started", "item.completed"].includes(event.eventType);
       const item = record(payload.item);
       const canonicalTool = event.eventType.startsWith("tool.execution.");
+      const toolCompleted = event.eventType === "tool.execution.completed" || (dynamic && event.eventType === "item.completed");
+      if (toolCompleted) turn.toolCount++;
       if ((dynamic || canonicalTool) && event.itemId && capture("OTEL_LOG_TOOL_DETAILS")) {
         const key = `${dynamic ? "dispatch" : "native"}:${event.itemId}`;
         let span = turn.tools.get(key);
         if (!span && turn.tools.size < maxRows) {
           const name = clean(dynamic ? item.name : payload.name, 128);
-          span = makeSpan(`${!dynamic && managedTools.has(String(payload.name)) ? "opencode tool" : "tool"} ${name || "execution"}`, time, {
+          span = makeSpan(`${!dynamic && managedTools.has(String(payload.name)) ? profile.providerToolPrefix : "tool"} ${name || "execution"}`, time, {
             "gen_ai.operation.name": "execute_tool", "gen_ai.tool.name": name,
             "paperclip.tool.source": dynamic ? "dispatch" : "provider" });
           turn.tools.set(key, span);
@@ -160,25 +236,54 @@ export function createOpenCodeCompanyObservability(input: {
           span.end = time; span.failed = dynamic ? item.is_error === true : payload.status === "failed";
           if (capture("OTEL_LOG_TOOL_CONTENT")) {
             if (dynamic && event.eventType === "item.started") {
-              span.attributes["braintrust.input"] = argumentDiagnostics(item.arguments);
+              content(span, "input", argumentDiagnostics(item.arguments));
             } else {
-              span.attributes["braintrust.output"] = clean(dynamic ? outputText(item.result ?? item.error) : payload.output);
+              content(span, "output", clean(dynamic ? outputText(item.result ?? item.error) : payload.output));
             }
             if (!dynamic && payload.outputTruncated === true) turn.truncated = true;
           }
-        } else turn.truncated = true;
+        } else {
+          turn.truncated = true;
+          if (profile.preserveOverflow && toolCompleted) {
+            const values = overflow(turn, time).attributes;
+            const key = "paperclip.observability.overflow.tool_count";
+            values[key] = Number(values[key] ?? 0) + 1;
+          }
+        }
       }
       if (event.eventType === "item.completed" && payload.kind === "usage" && typeof payload.usageMessageId === "string") {
         const key = payload.usageMessageId;
-        if (turn.usage.has(key) || turn.usage.size < maxRows) {
-          const usage = record(payload.usage), cache = record(usage.cache);
-          const values: Attributes = { "gen_ai.operation.name": "chat", "gen_ai.request.model": input.model };
-          for (const [name, value] of Object.entries({ "gen_ai.usage.input_tokens": usage.input, "gen_ai.usage.output_tokens": usage.output,
-            "gen_ai.usage.cache_read.input_tokens": cache.read, "gen_ai.usage.cache_creation.input_tokens": cache.write,
-            "paperclip.cost.usd": usage.costUsd })) if (finite(value)) values[name] = value;
-          const previous = turn.usage.get(key);
-          turn.usage.set(key, { ...makeSpan("opencode.model.usage", previous?.start ?? time, values), id: previous?.id ?? id(), end: time });
-        } else turn.truncated = true;
+        const usage = record(payload.usage), cache = record(usage.cache);
+        const values: Attributes = { "gen_ai.operation.name": "chat", "gen_ai.request.model": input.model };
+        for (const [name, value] of Object.entries({ "gen_ai.usage.input_tokens": usage.input, "gen_ai.usage.output_tokens": usage.output,
+          "gen_ai.usage.cache_read.input_tokens": cache.read, "gen_ai.usage.cache_creation.input_tokens": cache.write,
+          "paperclip.cost.usd": usage.costUsd })) if (finite(value)) values[name] = value;
+        if (profile.langfuseMapping && finite(usage.costUsd)) {
+          values["gen_ai.usage.cost"] = usage.costUsd;
+          if (["provider_reported", "catalog_estimate"].includes(String(payload.costProvenance))) values.costProvenance = String(payload.costProvenance);
+        }
+        if (profile.preserveOverflow) {
+          turn.incomplete ||= payload.accountingComplete === false;
+          turn.costIncomplete ||= !finite(usage.costUsd);
+        }
+        const previous = turn.usage.get(key);
+        if (profile.preserveOverflow) for (const [name, value] of Object.entries(values)) {
+          if (typeof value === "number") turn.totals[name] = (turn.totals[name] ?? 0) + value - Number(previous?.attributes[name] ?? 0);
+        }
+        if (!previous) turn.usageCount++;
+        if (previous || turn.usage.size < maxRows) {
+          turn.usage.set(key, { ...makeSpan(profile.usageSpanName, previous?.start ?? time, values), id: previous?.id ?? id(), end: time });
+        } else {
+          turn.truncated = true;
+          if (profile.preserveOverflow) {
+            // This opt-in consumes immutable per-receipt deltas, not cumulative
+            // snapshots. Keep exact overflow accounting without retaining rows.
+            const aggregate = overflow(turn, time).attributes;
+            const count = "paperclip.observability.overflow.usage_count";
+            aggregate[count] = Number(aggregate[count] ?? 0) + 1;
+            if (values.costProvenance) aggregate.costProvenance = aggregate.costProvenance && aggregate.costProvenance !== values.costProvenance ? "mixed" : values.costProvenance;
+          }
+        }
       }
       if (["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"].includes(event.eventType)) finish(event.eventType !== "turn.completed", time);
     },

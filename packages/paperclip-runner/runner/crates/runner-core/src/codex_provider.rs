@@ -110,6 +110,14 @@ const OPENCODE_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
     "PAPERCLIP_NATIVE_RUNTIME_CONTEXT_PATH",
 ];
 const PI_RPC_PROVIDER_ENVIRONMENT_KEYS: &[&str] = &[
+    "PAPERCLIP_OBSERVABILITY_PI",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_LOG_USER_PROMPTS",
+    "OTEL_LOG_ASSISTANT_RESPONSES",
+    "OTEL_LOG_TOOL_DETAILS",
+    "OTEL_LOG_TOOL_CONTENT",
     "AGENT_HOME",
     "PAPERCLIP_AI_PROVIDER_PROTOCOL",
     "PAPERCLIP_AI_PROVIDER_AUTH",
@@ -7883,7 +7891,13 @@ done
             "OTEL_LOG_TOOL_CONTENT",
         ] {
             assert!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&key), "{key}");
-            assert_eq!(PI_RPC_PROVIDER_ENVIRONMENT_KEYS.iter().filter(|name| **name == key).count(), 1);
+            assert_eq!(
+                PI_RPC_PROVIDER_ENVIRONMENT_KEYS
+                    .iter()
+                    .filter(|name| **name == key)
+                    .count(),
+                1
+            );
         }
         assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&"OTEL_EXPORTER_OTLP_LOGS_HEADERS"));
         assert!(!PI_RPC_PROVIDER_ENVIRONMENT_KEYS.contains(&"OTEL_EXPORTER_OTLP_METRICS_HEADERS"));

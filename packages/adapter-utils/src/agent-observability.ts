@@ -2,7 +2,7 @@ import type { AgentObservabilityCapture } from "@paperclipai/shared";
 
 /** Secret-bearing, controller-owned launch material. Never persist or merge into adapter config. */
 export type ProviderObservabilityLaunch = {
-  kind: "codex" | "claude" | "opencode";
+  kind: "codex" | "claude" | "opencode" | "pi";
   compatibilityKey: string;
   otelConfig?: Record<string, unknown>;
   environment: Readonly<Record<string, string>>;
@@ -17,7 +17,7 @@ export const AGENT_OBSERVABILITY_ENV_KEYS = [
   "OTEL_EXPORTER_OTLP_LOGS_HEADERS", "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
   "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT", "OTEL_EXPORTER_OTLP_TRACES_TIMEOUT",
   "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT", "OTEL_EXPORTER_OTLP_METRICS_HEADERS", "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
-  "PAPERCLIP_OBSERVABILITY_CODEX_CONFIG", "PAPERCLIP_OBSERVABILITY_OPENCODE",
+  "PAPERCLIP_OBSERVABILITY_CODEX_CONFIG", "PAPERCLIP_OBSERVABILITY_OPENCODE", "PAPERCLIP_OBSERVABILITY_PI",
   "OTEL_LOG_USER_PROMPTS", "OTEL_LOG_ASSISTANT_RESPONSES", "OTEL_LOG_TOOL_DETAILS", "OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_RAW_API_BODIES",
 ] as const;
 
@@ -43,12 +43,14 @@ export function observabilitySecretValues(launch: ProviderObservabilityLaunch | 
 }
 
 export function buildProviderObservabilityLaunch(input: {
-  kind: "codex" | "claude" | "opencode"; companyId: string; agentId: string; revision: string | null;
+  kind: "codex" | "claude" | "opencode" | "pi"; companyId: string; agentId: string; revision: string | null;
+  runId?: string; taskId?: string | null;
   compatibilityKey: string; enabled: boolean; capture: AgentObservabilityCapture;
   logsEndpoint?: string; tracesEndpoint?: string; headers?: Readonly<Record<string, string>>;
 }): ProviderObservabilityLaunch {
   const { enabled, capture, kind, compatibilityKey } = input;
-  const attributes = { "paperclip.company.id": input.companyId, "paperclip.agent.id": input.agentId, "paperclip.observability.revision": input.revision ?? "unconfigured" };
+  const attributes = { "paperclip.company.id": input.companyId, "paperclip.agent.id": input.agentId, "paperclip.observability.revision": input.revision ?? "unconfigured",
+    ...(input.runId ? { "paperclip.run.id": input.runId } : {}), ...(input.taskId ? { "paperclip.task.id": input.taskId } : {}) };
   const environment: Record<string, string> = {
     OTEL_EXPORTER_OTLP_LOGS_TIMEOUT: "3000", OTEL_EXPORTER_OTLP_TRACES_TIMEOUT: "3000",
   };
@@ -65,9 +67,9 @@ export function buildProviderObservabilityLaunch(input: {
       span_attributes: enabled ? attributes : {},
     } };
   }
-  if (kind === "opencode") {
-    // The runner owns this exporter. Never pass its credentials to OpenCode or tools.
-    environment.PAPERCLIP_OBSERVABILITY_OPENCODE = enabled ? "1" : "0";
+  if (kind === "opencode" || kind === "pi") {
+    // The runner owns this exporter. Never pass its credentials to the child or tools.
+    environment[kind === "pi" ? "PAPERCLIP_OBSERVABILITY_PI" : "PAPERCLIP_OBSERVABILITY_OPENCODE"] = enabled ? "1" : "0";
     if (enabled) Object.assign(environment, {
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: input.tracesEndpoint,
       OTEL_EXPORTER_OTLP_TRACES_HEADERS: encodeObservabilityHeaders(input.headers ?? {}),

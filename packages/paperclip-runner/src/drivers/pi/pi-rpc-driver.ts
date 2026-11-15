@@ -39,6 +39,9 @@ import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
 import { piToolLimitEntry, piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
+import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
+import { createOpenCodeCompanyObservability } from "../opencode/company-observability.js";
+import { createPiObservabilityEvents, PI_COMPANY_OBSERVABILITY } from "./pi-observability-events.js";
 
 export interface PiRpcDriverOptions {
   /** Proxy/backend integration options currently forwarded by the native factory. */
@@ -203,6 +206,9 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}), ...nodeCompileCacheEnvironment(directory, { enableLocalCache: true }) };
+    // Controller-owned launch material belongs only to the runner's exporter,
+    // never to Pi's env, provider configuration files, callbacks or tools.
+    for (const key of AGENT_OBSERVABILITY_ENV_KEYS) delete environment[key];
     // Capture the runner's original Pi home before selecting the managed home.
     const originalModelsFile = originalPiModelsFile({ ...process.env, ...environment, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR });
     // Environment paths may still name a controller-side copy. Only the
@@ -394,6 +400,7 @@ export class PiRpcDriver implements HarnessDriver {
         authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
       const session = new PiRpcHarnessSession({
         transport: transport!,
+        observabilityEnvironment: this.#options.environment,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
@@ -458,6 +465,7 @@ interface PiResidentState {
 }
 interface PiSessionState {
   transport: PiRpcTransport;
+  observabilityEnvironment?: NodeJS.ProcessEnv;
   runId: string;
   normalizedSessionId: string;
   providerSessionId: string;
@@ -561,6 +569,8 @@ class EventQueue implements AsyncIterable<PrpEvent> {
 
 export class PiRpcHarnessSession implements HarnessSession {
   readonly #transport: PiRpcTransport;
+  readonly #companyObservability: ReturnType<typeof createOpenCodeCompanyObservability>;
+  readonly #piObservabilityEvents = createPiObservabilityEvents();
   #runId: string;
   readonly #normalizedSessionId: string;
   readonly #providerSessionId: string;
@@ -650,6 +660,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? PI_TURN_IDLE_TIMEOUT_MS;
     this.#callbacks?.setActivityListener(() => this.#armTurnIdleTimer());
     this.#abortTimeoutMs = Number.isFinite(state.abortTimeoutMs) ? Math.max(1, Math.min(30_000, state.abortTimeoutMs!)) : 5000;
+    this.#companyObservability = createOpenCodeCompanyObservability({
+      environment: state.observabilityEnvironment, model: state.config.model, sessionId: state.providerSessionId,
+      sensitiveValues: [], profile: PI_COMPANY_OBSERVABILITY, onDiagnostic: message => console.warn(message),
+    });
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
     this.#reportToolDiagnostics(state.initialContext);
@@ -1377,6 +1391,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#owners.clear(); this.#pendingNativeTools.clear();
       this.#activeIdentityCount = 0;
       this.#events.close();
+      // Terminal delivery never waits for export; session shutdown drains the
+      // already bounded jobs only after receipts have been delivered.
+      await this.#companyObservability?.close();
       if (failures.length) throw this.#cleanupFailure ?? new AggregateError(failures, "Pi cleanup failed");
     })();
     try { await this.#closing; }
@@ -1766,6 +1783,11 @@ export class PiRpcHarnessSession implements HarnessSession {
       payload,
       ...(origin.debug === undefined ? {} : { debug: structuredClone(origin.debug) }),
     };
+    if (this.#companyObservability) {
+      try {
+        for (const projected of this.#piObservabilityEvents(event)) this.#companyObservability.observe(projected);
+      } catch { console.warn("Company observability export unavailable (projection_failed)."); }
+    }
     if (!this.#events.push(event)) {
       this.#events.close(new Error("Pi RPC PRP event queue exceeded its limit"));
       void this.close().catch(() => undefined);
