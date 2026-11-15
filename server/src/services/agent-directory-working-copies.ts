@@ -100,50 +100,71 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         if (!await warmReusable(current, input.agentId) || current.location !== (input.target?.kind === "remote" ? `remote:${input.target.environmentId ?? ""}` : "local")) return false;
         const status = await reuseStatus(current, deriveBundleState(agent).entryFile, canonical);
         if (status === "other" || !await input.canRefresh(canonical, current.entryFile)) return false;
+        // Saved metadata proves a checkpoint, not that the live owner has made
+        // no subsequent edits. Read the actual host and require the same root.
+        // An unreadable/dirty copy goes through ordinary retirement collection.
+        const live = await observe(current, input.target, true).catch(() => null);
+        if (!live || live.identity !== current.receipt?.materializationIdentity ||
+            live.digest !== agentDirectoryBaselineDigest(baseline(current))) return false;
         if (status === "reusable") return true;
+        const mirror = current.location === "local" ? live : await observeLocalAgentDirectory(current.localRoot);
         const { snapshot, storageWarning } = await inspectAgentDirectory(canonical, false);
-        const staging = await fs.mkdtemp(path.join(path.dirname(current.localRoot), "refresh-"));
+        // Persist non-collection authority BEFORE any destination mutation. A
+        // crash, partial upload, or failed receipt CAS must never turn transfer
+        // damage into owner edits when retirement invokes ordinary collection.
+        const interrupted = await patch(current, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
+          errorMessage: "Agent-file refresh did not complete. Canonical files were kept; retirement must not save transfer output.", nextAttemptAt: null });
+        if (interrupted.state !== "unavailable" || interrupted.errorCode !== "AGENT_FILES_REFRESH_INCOMPLETE") return false;
+        let runtime: PreparedAdapterExecutionTargetRuntime | undefined;
         try {
-          const replacement = path.join(staging, "live");
-          await fs.cp(canonical, replacement, { recursive: true, preserveTimestamps: true });
-          await fs.rename(current.localRoot, path.join(staging, "previous"));
-          try { await fs.rename(replacement, current.localRoot); }
-          catch (error) { await fs.rename(path.join(staging, "previous"), current.localRoot); throw error; }
-          const values = { baseHash: directorySnapshotSha256(snapshot), receipt: { ...current.receipt,
-            baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: checkpointBaseline(snapshot), storageWarning } };
-          const next = { ...current, ...values };
-          const runtime = input.target?.kind === "remote" ? await transport(next, input.target, false) : undefined;
-          const refreshed = await patch(current, values).catch(async error => { await runtime?.cleanupWorkspaceSnapshot?.(); throw error; });
+          const local = await prepareAdapterExecutionTargetRuntime({ runId: current.runId, target: { kind: "local" },
+            adapterKey: "agent-files-mirror", workspaceLocalDir: canonical, workspaceRemoteDir: current.localRoot, workspaceRefreshGuard: mirror });
+          await local.cleanupWorkspaceSnapshot?.();
+          const values = { state: "warm_saved", errorCode: null, errorMessage: null,
+            baseHash: directorySnapshotSha256(snapshot), receipt: { ...current.receipt,
+              baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: checkpointBaseline(snapshot), storageWarning } };
+          const next = { ...interrupted, ...values };
+          runtime = input.target?.kind === "remote" ? await transport(next, input.target, false, live) : undefined;
+          const refreshed = await patch(interrupted, values);
           if (refreshed.baseHash !== next.baseHash || refreshed.state !== "warm_saved" || refreshed.errorCode || !await owns(refreshed)) {
-            await runtime?.cleanupWorkspaceSnapshot?.();
-            return false;
+            throw new Error("Agent-file refresh ownership changed before commit");
           }
           if (runtime) {
             const previous = transports.get(key(current));
             transports.set(key(current), runtime);
+            runtime = undefined;
             await previous?.cleanupWorkspaceSnapshot?.();
           }
           return true;
-        } finally { await fs.rm(staging, { recursive: true, force: true }); }
+        } catch (error) {
+          await runtime?.cleanupWorkspaceSnapshot?.().catch(() => {});
+          const latest = await get(current.companyId, current.runId);
+          if (latest && await owns(latest)) await patch(latest, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
+            errorMessage: `Agent-file refresh failed; transfer output will not be saved. ${String(error).slice(0, 1024)}`, nextAttemptAt: null });
+          throw error;
+        }
       }), "agent_directory_prepare");
     } catch (error) {
       logger.warn({ err: error, runId: input.runId }, "Warm agent directory refresh failed");
       return false;
     }
   }
-  async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
+  async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean, refreshGuard?: { identity: string; digest: string }) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
     if (target.transport === "ssh") {
       // Reuse SSH's plain directory transfer without its task-workspace suffix
       // or Git-history discovery. The registered root is the exact writable root.
-      if (!recovering) await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude: [".paperclip-runtime"] });
+      if (refreshGuard) {
+        await prepareAdapterExecutionTargetRuntime({ target, runId: row.runId, adapterKey: "agent-files",
+          workspaceLocalDir: row.localRoot, workspaceRemoteDir: row.executionRoot, workspaceRefreshGuard: refreshGuard, syncWorkspace: false });
+      } else if (!recovering) await syncDirectoryToSsh({ spec: target.spec, localDir: row.localRoot, remoteDir: row.executionRoot, exclude: [".paperclip-runtime"] });
       return { target, workspaceRemoteDir: row.executionRoot, runtimeRootDir: null,
         assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null,
         restoreWorkspace: () => restoreWorkspaceFromSshExecution({ spec: target.spec, localDir: row.localRoot,
           remoteDir: row.executionRoot, baselineSnapshot: { ...baseline(row), exclude: [".paperclip-runtime"] }, restoreGitHistory: false }) };
     }
     return prepareAdapterExecutionTargetRuntime({ target, runId: row.runId, adapterKey: "agent-files",
-      workspaceLocalDir: row.localRoot, workspaceRemoteDir: row.executionRoot,
+      workspaceLocalDir: row.localRoot, workspaceRemoteDir: row.executionRoot, workspaceRefreshGuard: refreshGuard,
       // Agent files are an independently observed native directory. Transfer
       // scratch belongs to the host runtime, including the fallback selected
       // while plugin capability discovery is cold after controller restart.
@@ -152,17 +173,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       workspaceBaseline: baseline(row), workspaceGitSnapshot: null, workspaceRepositories: [], workspaceFileMode: "all",
       workspaceExclude: [".paperclip-runtime", ".paperclip-runtime/**"] });
   }
-  async function observe(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function observe(row: Copy, target?: AdapterExecutionTarget | null, refresh = false) {
     if (row.location === "local") {
       // The same bounded program validates aliases on its actual host.
-      return observeLocalAgentDirectory(row.localRoot);
+      return observeLocalAgentDirectory(row.localRoot, refresh);
     }
     if (!target || target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
     const origin = typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : row.runId;
     if (row.executionRoot !== path.posix.join(target.remoteCwd, ".paperclip-runtime", "agent-files", row.agentId, origin)) throw new Error("Agent directory root changed");
     const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
     const result = await runAdapterExecutionTargetShellCommand(row.runId, target,
-      `node -e ${quote(agentDirectoryProbeProgram)} ${quote(row.executionRoot)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 10 });
+      `node -e ${quote(agentDirectoryProbeProgram)} ${quote(row.executionRoot)}${refresh ? " refresh" : ""}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 10 });
     if (result.exitCode !== 0 || result.timedOut || result.stdout.length > 1024) throw new Error("Agent directory observation unavailable");
     const value = JSON.parse(result.stdout);
     if (!value || typeof value.digest !== "string" || !/^[a-f0-9]{64}$/.test(value.digest) || typeof value.identity !== "string") throw new Error("Invalid agent directory observation");
@@ -456,7 +477,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return adopted;
   }
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false): Promise<Copy> {
-    if (!await owns(row) || row.state === "superseded") return row;
+    if (!await owns(row) || row.state === "superseded" || row.errorCode === "AGENT_FILES_REFRESH_INCOMPLETE") return row;
     target ??= transports.get(key(row))?.target;
     if (row.location !== "local" && target?.kind !== "remote") {
       // A missing controller cache is not the remote directory. Retain the
@@ -505,6 +526,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
     if (row.receipt?.retainedByRunId) return row;
     if (!await owns(row) || row.state === "superseded") return row;
+    if (row.errorCode === "AGENT_FILES_REFRESH_INCOMPLETE") {
+      row = await patch(row, { state: "unavailable", processStoppedAt: row.processStoppedAt ?? new Date(), nextAttemptAt: null });
+      await release(row, target);
+      return (await get(row.companyId, row.runId))!;
+    }
     if (row.receipt?.warm === true && !completed.has(row.state)) {
       row = await checkpoint(row, target, true);
       await release(row, target);

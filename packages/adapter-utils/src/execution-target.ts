@@ -1,4 +1,5 @@
 import type { WorkspaceCheckpointMetrics } from "./workspace-checkpoint.js";
+import { directoryRefreshPayload, guardedDirectoryRefreshProgram, type DirectoryRefreshGuard } from "./guarded-directory-refresh.js";
 import fs from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -1549,6 +1550,8 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceRemoteDir?: string;
   /** Sandbox transfer scratch, confined to the lease's reserved runtime tree. */
   runtimeRootDir?: string;
+  /** Refresh an existing physical directory without unguarded provider/tar writes. */
+  workspaceRefreshGuard?: DirectoryRefreshGuard;
   syncWorkspace?: boolean;
   workspaceInboundMode?: WorkspaceInboundMode;
   workspaceSnapshotIsolation?: "worker";
@@ -1589,6 +1592,21 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
   workspaceRestoreRetryDelaysMs?: readonly number[];
 }): Promise<PreparedAdapterExecutionTargetRuntime> {
   const target = input.target ?? { kind: "local" as const };
+  if (input.workspaceRefreshGuard) {
+    const destination = input.workspaceRemoteDir;
+    if (!destination) throw new Error("Guarded refresh requires an exact destination");
+    const payload = await directoryRefreshPayload(input.workspaceLocalDir);
+    const command = ["node", "-e", guardedDirectoryRefreshProgram, destination, JSON.stringify(input.workspaceRefreshGuard)].map(shellQuote).join(" ");
+    const result = await runAdapterExecutionTargetProcess(input.runId, target, "sh", ["-c", command], {
+      cwd: target.kind === "remote" ? target.remoteCwd : path.dirname(destination), env: {}, stdin: payload,
+      timeoutSec: input.timeoutSec ?? 30, graceSec: 1, onLog: async () => {},
+    });
+    if (result.exitCode !== 0 || result.timedOut || result.signal) throw new Error(`Guarded directory refresh refused or failed: ${result.stderr.slice(-1024)}`);
+    // The upload is finished. Build only the existing no-overwrite collector;
+    // never fall through to a provider's destructive inbound staging path.
+    return prepareAdapterExecutionTargetRuntime({ ...input, workspaceRefreshGuard: undefined,
+      workspaceInboundMode: "adopt_remote", syncWorkspace: target.kind === "remote" && target.transport === "sandbox" });
+  }
   if (target.kind === "local") {
     return {
       target,

@@ -16,6 +16,7 @@ export function agentDirectoryBaselineDigest(snapshot: DirectorySnapshot): strin
 export function probeAgentDirectory(
   root: string,
   modules = { fs, path, createHash, platform: process.platform },
+  allowEmptyRuntimeScratch = false,
 ): { digest: string; identity: string } {
   const { fs, path, createHash } = modules;
   const deadline = Date.now() + 5_000;
@@ -54,6 +55,14 @@ export function probeAgentDirectory(
     for (const name of names) {
       checkTime();
       const next = relative ? `${relative}/${name}` : name;
+      // Runtime-context staging can leave this empty reserved directory after
+      // preparation's observation. It is not agent work. Accept only the exact
+      // empty shape, never arbitrary exclusions or runtime/session contents.
+      if (allowEmptyRuntimeScratch && next === ".paperclip-runtime") {
+        const scratch = path.join(root, next), s = fs.lstatSync(scratch, { bigint: true });
+        if (!s.isDirectory() || s.isSymbolicLink() || fs.readdirSync(scratch).length) throw new Error("Unexpected refresh runtime scratch");
+        continue;
+      }
       if (next.length > 512 || name === "." || name === ".." || name.includes("\\") || name.includes("\0")
         || name === ".paperclip-runtime" || next === "promptTemplate.legacy.md") throw new Error("Unsafe agent file path");
       const filename = path.join(root, next);
@@ -111,7 +120,7 @@ export function probeAgentDirectory(
 // function.toString() alone does not carry the controller module's bindings.
 const childNameHelper = `const __name=(target,value)=>Object.defineProperty(target,"name",{value,configurable:true});`;
 
-export const agentDirectoryProbeProgram = `${childNameHelper} const probe=${probeAgentDirectory.toString()}; process.stdout.write(JSON.stringify(probe(process.argv[1], {fs:require('node:fs'),path:require('node:path'),createHash:require('node:crypto').createHash,platform:process.platform})))`;
+export const agentDirectoryProbeProgram = `${childNameHelper} const probe=${probeAgentDirectory.toString()}; process.stdout.write(JSON.stringify(probe(process.argv[1], {fs:require('node:fs'),path:require('node:path'),createHash:require('node:crypto').createHash,platform:process.platform}, process.argv[2] === 'refresh')))`;
 
 /** Retire only the two empty directories created by initial sandbox transfer.
  * Run before provider admission; this is never an exclusion from live probing. */
@@ -155,9 +164,9 @@ export function retireAgentDirectoryTransferScratch(root: string, modules = { fs
 export const agentDirectoryTransferCleanupProgram = `${childNameHelper} const retire=${retireAgentDirectoryTransferScratch.toString()}; retire(process.argv[1], {fs:require('node:fs'),path:require('node:path'),platform:process.platform})`;
 
 /** Bound child: no shell, inherited credentials, or event-loop hashing. */
-export async function observeLocalAgentDirectory(root: string) {
+export async function observeLocalAgentDirectory(root: string, refresh = false) {
   const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
-    childProcess.execFile(process.execPath, ["-e", agentDirectoryProbeProgram, root], {
+    childProcess.execFile(process.execPath, ["-e", agentDirectoryProbeProgram, root, ...(refresh ? ["refresh"] : [])], {
       cwd: root, env: {}, timeout: 10_000, maxBuffer: 1024, killSignal: "SIGKILL", encoding: "utf8",
     }, (error, stdout, stderr) => { if (error) reject(error); else resolve({ stdout, stderr }); });
   });
