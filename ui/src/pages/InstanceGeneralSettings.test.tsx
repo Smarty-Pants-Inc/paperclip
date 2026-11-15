@@ -159,6 +159,19 @@ describe("InstanceGeneralSettings sign-out", () => {
     await vi.waitFor(() => expect(container.textContent).not.toContain("Sign-out request failed"));
   });
 
+  it("offers the agent-created task-list default as a plain toggle row", async () => {
+    await renderPage(SELF_HOSTED_HEALTH);
+    expect(container.textContent).toContain("Show agent-created tasks in task lists by default");
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Toggle showing agent-created tasks in task lists by default"]',
+    );
+    expect(toggle).not.toBeNull();
+    flushSync(() => toggle?.click());
+    await vi.waitFor(() => expect(mockInstanceSettingsApi.updateGeneral.mock.calls[0]?.[0]).toEqual(
+      { taskListsShowAgentCreatedByDefault: true },
+    ));
+  });
+
   it("disables settings changes while sign-out is pending", async () => {
     let resolveSignOut: ((result: { success: boolean }) => void) | undefined;
     mockAuthApi.signOut.mockImplementation(

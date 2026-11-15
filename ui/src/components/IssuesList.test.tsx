@@ -55,6 +55,7 @@ const mockExecutionWorkspacesApi = vi.hoisted(() => ({
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
+  getGeneral: vi.fn(),
 }));
 
 const mockExternalObjectsApi = vi.hoisted(() => ({
@@ -360,6 +361,8 @@ describe("IssuesList", () => {
     mockExecutionWorkspacesApi.list.mockReset();
     mockExecutionWorkspacesApi.listSummaries.mockReset();
     mockInstanceSettingsApi.getExperimental.mockReset();
+    mockInstanceSettingsApi.getGeneral.mockReset();
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ censorUsernameInLogs: false });
     mockExternalObjectsApi.getIssueSummaries.mockReset();
     mockIssuesApi.list.mockResolvedValue([]);
     mockIssuesApi.listAll.mockResolvedValue([]);
@@ -2555,6 +2558,73 @@ describe("IssuesList", () => {
       expect(checkbox instanceof HTMLInputElement ? checkbox.checked : checkbox?.getAttribute("aria-checked") === "true").toBe(false);
     });
     act(() => root.unmount());
+  });
+
+  it("defaults the agent-created filter to the instance setting, keeps an explicit toggle, and clears back to the setting", async () => {
+    mockInstanceSettingsApi.getGeneral.mockResolvedValue({ censorUsernameInLogs: false, taskListsShowAgentCreatedByDefault: true });
+    const collectionKey = "paperclip:test-agent-default";
+    const preferenceKey = taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey });
+    // Written by a build before the setting existed: its false is no choice.
+    localStorage.setItem(preferenceKey, JSON.stringify({
+      version: 1, companyId: "company-1", collectionKey, viewStateSource: "stored", columns: ["id"],
+      viewState: { showAgentCreatedTasks: false, boardCardDensity: "compact" },
+    }));
+    function PreferenceProbe() {
+      return <span data-testid="creation-preference">{String(useShowAgentCreatedTasks("company-1", collectionKey))}</span>;
+    }
+    const manualIssue = createIssue({ id: "issue-manual", identifier: "PAP-20", title: "Person task", createdByUserId: "person", originKind: "manual" });
+    const agentIssue = createIssue({ id: "issue-agent", identifier: "PAP-21", title: "Agent task", createdByAgentId: "agent-1", originKind: "manual" });
+    const { root, queryClient } = renderWithQueryClient(
+      <><PreferenceProbe /><IssuesList
+        issues={[manualIssue, agentIssue]} agents={[]} projects={[]} viewStateKey={collectionKey}
+        enableAgentCreatedVisibilityFilter onUpdateIssue={() => undefined}
+      /></>,
+      container,
+    );
+    const checkboxState = () => {
+      const label = Array.from(document.body.querySelectorAll("label")).find((element) => element.textContent?.includes("Show agent-created tasks"));
+      const checkbox = label?.querySelector("[role='checkbox'], input[type='checkbox']");
+      return checkbox instanceof HTMLInputElement ? checkbox.checked : checkbox?.getAttribute("aria-checked") === "true";
+    };
+    const filterButton = () => Array.from(document.body.querySelectorAll("button")).find((button) =>
+      button.title === "Filter" || button.title.startsWith("Filters:") || button.textContent?.includes("Filters:"));
+    try {
+      await waitForAssertion(() => {
+        expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
+        expect(container.textContent).toContain("Agent task");
+        expect(container.textContent).toContain("Person task");
+      });
+      // On by default is not an active filter.
+      expect(filterButton()?.title).toBe("Filter");
+      await act(async () => { filterButton()!.click(); await Promise.resolve(); });
+      await waitForAssertion(() => expect(checkboxState()).toBe(true));
+
+      await act(async () => {
+        Array.from(document.body.querySelectorAll("label")).find((label) => label.textContent?.includes("Show agent-created tasks"))!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+        await Promise.resolve();
+      });
+      await waitForAssertion(() => {
+        expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("false");
+        expect(container.textContent).not.toContain("Agent task");
+        expect(checkboxState()).toBe(false);
+      });
+      const saved = JSON.parse(localStorage.getItem(preferenceKey)!);
+      expect(saved.viewState).toMatchObject({ showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true, boardCardDensity: "compact" });
+
+      await act(async () => {
+        Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Clear")!.click();
+        await Promise.resolve();
+      });
+      await waitForAssertion(() => {
+        expect(container.querySelector("[data-testid='creation-preference']")?.textContent).toBe("true");
+        expect(container.textContent).toContain("Agent task");
+      });
+      expect(JSON.parse(localStorage.getItem(preferenceKey)!).viewState.showAgentCreatedTasksExplicit).not.toBe(true);
+    } finally {
+      act(() => root.unmount());
+      queryClient.clear();
+    }
   });
 
   it("blurs the search input on Enter without clearing the query", async () => {
