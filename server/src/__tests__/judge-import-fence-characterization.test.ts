@@ -101,6 +101,9 @@ describePg("independent read-only import fence characterization", () => {
     const adapterConfig={...runnerHire.adapterConfig, env:{ HOME:"/tmp/judge-home", PATH:"/usr/bin", TZ:"UTC" }};
     const input=bundle(companyId,[{slug:"legacy-env",adapterType:"paperclip_runner",config:adapterConfig}]);
     input.source.files[".paperclip.yaml"]=input.source.files[".paperclip.yaml"].replace("runner: paperclip", "runner: legacy");
+    const { companySecretBindings } = await import("@paperclipai/db");
+    const before=await snapshot(companyId);
+    const bindingsBefore=await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId,companyId));
     const instance=app(actor);
     const imported=await request(instance).post(`/api/companies/${companyId}/imports/apply`).send(input);
     const hired=await request(instance).post(`/api/companies/${companyId}/agent-hires`).send({...runnerHire,runner:"legacy",name:"legacy-hire",role:"engineer",adapterConfig});
@@ -111,12 +114,15 @@ describePg("independent read-only import fence characterization", () => {
       hireStatus:hired.status, hireBody:hired.body, createStatus:created.status, createBody:created.body,
       persisted:child && {id:child.id,adapterType:child.adapterType,env:child.adapterConfig.env,reportsTo:child.reportsTo}}));
     // Characterization, NOT a claim that the security requirement passes.
-    expect(imported.status).toBe(200);
+    expect(imported.status).toBe(403);
     expect(hired.status).toBe(403);
     expect(created.status).toBe(403);
-    expect(child?.adapterType).toBe("pi_local");
-    expect(child?.adapterConfig.env).toEqual({HOME:{type:"plain",value:"/tmp/judge-home"},PATH:{type:"plain",value:"/usr/bin"},TZ:{type:"plain",value:"UTC"}});
-    expect(child?.reportsTo).toBeNull();
+    expect(imported.body.error).toBe("Agent keys cannot configure host-executed local adapter settings (env).");
+    expect(hired.body.error).toBe(imported.body.error);
+    expect(created.body.error).toBe(imported.body.error);
+    expect(child).toBeUndefined();
+    expect(await snapshot(companyId)).toEqual(before);
+    expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId,companyId))).toEqual(bindingsBefore);
   });
   it("characterizes rule14 explicit LANGFUSE plus TZ hire persistence", async () => {
     const {companyId, actor}=await seed();
