@@ -28,7 +28,6 @@ import {
   NativeRunnerLaunchProfileMismatchError,
   PROVIDER_SIDE_EFFECT_PENDING,
   PROVIDER_STATE_INCOMPATIBLE,
-  runnerRecoveryRefusalCode,
   type HarnessThreadGoal,
 } from "./contracts/harness-driver.js";
 import {
@@ -2639,15 +2638,6 @@ export async function executeNativeSession(
       }
       if (recovery.failureClass === PROVIDER_ATTACH_REFUSED) {
         throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
-      }
-      // These controller-authored restore refusals belong to the server's
-      // proven-stop/fresh-history owner. Never erase the structured code or
-      // bootstrap an unproven replacement under a legacy recovery policy.
-      const recoveryRefusalCode = runnerRecoveryRefusalCode({ code: recovery.recoveryRefusalCode });
-      if (recoveryRefusalCode) {
-        throw Object.assign(new Error(`native_session_recovery_failed: ${recovery.reason ?? "unknown"}`),
-          { code: recoveryRefusalCode, ...(recovery.prepareRefusalCode === recoveryRefusalCode
-            ? { prepareRefusalCode: recovery.prepareRefusalCode } : {}) });
       }
       if (recovery.failureClass === PROVIDER_REFRESH_REQUIRED) {
         throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
