@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveSandboxCallbackBridgePollIntervalMs } from "./execution-target.js";
+import { resolveSandboxCallbackBridgeIdleBackoffMaxMs, resolveSandboxCallbackBridgePollIntervalMs } from "./execution-target.js";
 
 const ENV = "PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS";
 afterEach(() => {
@@ -8,6 +8,13 @@ afterEach(() => {
 });
 
 describe("sandbox callback bridge poll interval configuration", () => {
+  it("defaults idle backoff to 1000ms and caps it at the watchdog-safe maximum", () => {
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(resolveSandboxCallbackBridgeIdleBackoffMaxMs()).toBe(1000);
+    expect(resolveSandboxCallbackBridgeIdleBackoffMaxMs("5000")).toBe(1000);
+    expect(warning).not.toHaveBeenCalled();
+  });
+
   it("uses 100ms when unset and passes a configured 1000ms through", () => {
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     delete process.env[ENV];
