@@ -222,7 +222,13 @@ describe("manager assigns a company AI connection to its own report", () => {
   it("run re-check: an account that is no longer company-shared also fails the next run closed", async () => {
     const f = await seed();
     await proveSavedAndNextRuntime(f, await f.patch(), async () => {
-      await db.update(connectionGrants).set({ kind: "user", subjectUserId: f.userId }).where(eq(connectionGrants.id, f.binding.grantId));
+      await db.update(connectionGrants).set({ kind: "user", subjectUserId: f.userId, isDefault: false }).where(eq(connectionGrants.id, f.binding.grantId));
+    });
+  });
+  it("run re-check: a report moved out of the account's company cannot use the old binding", async () => {
+    const f = await seed(); const other = await seed();
+    await proveSavedAndNextRuntime(f, await f.patch(), async () => {
+      await db.update(agents).set({ companyId: other.companyId, reportsTo: null }).where(eq(agents.id, f.ids.report));
     });
   });
   it("R1b: runtimeSettings converges on the same assignment with expected model/binding", async () => {

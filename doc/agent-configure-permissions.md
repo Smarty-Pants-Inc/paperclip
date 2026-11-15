@@ -115,8 +115,25 @@ by the manager itself under its authenticated responsible user and current
 harness. The report's effective harness/model must also be compatible. The
 normal connection/profile grants, responsible-human ceiling, key/run validity,
 and interaction checks still apply. The company-locked configuration writer
-rechecks the current subtree, grants, account, audience and installs before
-persisting; route admission alone is not authority to write.
+joins the existing grant-audience replacement mutex before taking agent row
+locks, then rechecks the current subtree, grants, account, audience and installs
+before persisting; route admission alone is not authority to write. Audience
+replacement and selection therefore have one transaction order, including the
+runtime-invalidation triggers that lock agent rows.
+
+Existing all-consumer authorization is tried first. The manager-can-resolve
+requirement applies only to the new recipient-only exception, never to an
+assignment that existing unscoped/all-consumer authority already permits. For
+example, an authorized Claude manager may still assign a non-routed OpenAI
+account to its compatible Codex report without using that account itself.
+
+Each new execution reads the report afresh and selects using the report's
+current company and binding, not the assigning manager's identity. The runtime
+selector rechecks that company's account, active/non-archived connection,
+organization grant for a shared binding, current audience and report/company
+install. Selection failure becomes a configuration-incomplete error: it does
+not fall back to another account, a personal default, or the previous binding.
+The assigning manager's later authority is not an execution-time condition.
 
 Personal accounts (even with a company-wide agent install), implicit personal
 defaults, routers, adapter switches and non-company installs do not receive this
