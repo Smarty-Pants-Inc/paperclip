@@ -50,13 +50,15 @@ describe("#20389 gate row: model prefix", () => {
       ...["agents:create", "agents:configure", "agents:read"].map(permissionKey => ({ companyId, principalType: "user" as const, principalId: userId, permissionKey })),
       { companyId, principalType: "agent", principalId: lead, permissionKey: "agents:configure", scope: { subtreeRootAgentId: lead } },
     ]);
+    let runtimeConfig = {};
     if (managed) {
       const account = await aiConnectionService(db).save(companyId, userId, {
         provider: "openai", method: "api_key", name: "Synthetic gateway", ownership: "personal", apiKey: "synthetic-gate-fixture",
         agentIds: [lead, worker], allAgents: false,
         routing: { kind: "gateway", protocol: "responses", baseUrl: "https://gateway.example.test/v1", auth: "bearer", models: [{ id: "gpt-6.1-sol" }] },
       }, "synthetic-gate-fixture");
-      await db.update(agents).set({ runtimeConfig: { aiConnection: { provider: "openai", method: "api_key", mode: "delegated", ...account } } })
+      runtimeConfig = { aiConnection: { provider: "openai", method: "api_key", mode: "delegated", ...account } };
+      await db.update(agents).set({ runtimeConfig })
         .where(and(eq(agents.companyId, companyId)));
     }
     const token = randomUUID();
@@ -65,7 +67,7 @@ describe("#20389 gate row: model prefix", () => {
     api.use("/api", agentRoutes(db)); api.use(errorHandler);
     const call = (method: "post" | "patch", url: string, body: object) => request(api)[method](`/api${url}`).set("Authorization", `Bearer ${token}`).send(body);
     const read = async () => db.select().from(agents).where(eq(agents.companyId, companyId)).orderBy(agents.id);
-    return { companyId, lead, worker, call, read };
+    return { companyId, lead, worker, call, read, runtimeConfig };
   }
   for (const endpoint of ["agents", "agent-hires", "patch"] as const) {
     for (const model of ["cliproxyapi/gpt-6.1-sol", "paperclip/gpt-6.1-sol"]) {
@@ -86,11 +88,20 @@ describe("#20389 gate row: model prefix", () => {
         }
       });
     }
+    it(`${endpoint}: accepted managed catalog model is saved unchanged`, async () => {
+      const f = await fixture(true);
+      const model = "paperclip/gpt-6.1-sol";
+      const response = endpoint === "patch"
+        ? await f.call("patch", `/agents/${f.worker}`, { adapterConfig: config(model) })
+        : await f.call("post", `/companies/${f.companyId}/${endpoint}`, { name: "Hire", role: "engineer", reportsTo: f.lead, adapterType: "paperclip_runner", adapterConfig: config(model), runtimeConfig: f.runtimeConfig });
+      expect(response.status, response.text).toBe(endpoint === "patch" ? 200 : 201);
+      expect((response.body.agent ?? response.body).adapterConfig.model).toBe(model);
+    });
     it(`${endpoint}: authoritative managed model catalog rejects a different unknown provider`, async () => {
       const f = await fixture(true); const before = await f.read();
       const response = endpoint === "patch"
         ? await f.call("patch", `/agents/${f.worker}`, { adapterConfig: config("unknown/gpt-6.1-sol") })
-        : await f.call("post", `/companies/${f.companyId}/${endpoint}`, { name: "Hire", role: "engineer", reportsTo: f.lead, adapterType: "paperclip_runner", adapterConfig: config("unknown/gpt-6.1-sol") });
+        : await f.call("post", `/companies/${f.companyId}/${endpoint}`, { name: "Hire", role: "engineer", reportsTo: f.lead, adapterType: "paperclip_runner", adapterConfig: config("unknown/gpt-6.1-sol"), runtimeConfig: f.runtimeConfig });
       expect(response.status, response.text).toBe(422);
       expect(response.body.error).toContain("paperclip/gpt-6.1-sol");
       expect(await f.read()).toEqual(before);

@@ -1954,6 +1954,14 @@ export function agentRoutes(
       }
       throw error;
     }
+    // These are host CLIProxy aliases, not providers installed by the native
+    // Paperclip Pi pack. Do not save a hire that can only fail at first run.
+    if (profile.provider === "pi_rpc" && /^(cliproxyapi|cliproxyapi-anthropic)\//.test(profile.model)) {
+      const acceptedModel = `paperclip/${profile.model.slice(profile.model.indexOf("/") + 1)}`;
+      throw unprocessable(`Unknown native Pi provider in model "${profile.model}". Select "${acceptedModel}" from the connection's model catalog.`, {
+        code: "pi_rpc_model_provider_unknown",
+      });
+    }
     if (profile.provider === "claude_managed") {
       await managedAgentProfileService(db).requireQualified(
         companyId,
@@ -3288,10 +3296,14 @@ export function agentRoutes(
       throw error;
     });
     if (!selection) return undefined;
-    const routing = validateModelCatalog ? aiConnectionMetadataSchema.parse(selection.connection.config.ai).routing : undefined;
-    if (validateModelCatalog && routing?.models.length && !routing.models.some(model =>
-      aiRoutingModel(routing, agentHarnessType(adapterType, config), model.id) === config.model)) {
-      throw unprocessable("Choose a default model available on the selected connection");
+    const nativePi = adapterType === "paperclip_runner" && config.provider === "pi_rpc";
+    const checkModelCatalog = validateModelCatalog || nativePi;
+    const modelHarness = nativePi ? "pi_runtime" : agentHarnessType(adapterType, config);
+    const routing = checkModelCatalog ? aiConnectionMetadataSchema.parse(selection.connection.config.ai).routing : undefined;
+    if (checkModelCatalog && routing?.models.length && !routing.models.some(model =>
+      aiRoutingModel(routing, modelHarness, model.id) === config.model)) {
+      const acceptedModels = routing.models.map(model => aiRoutingModel(routing, modelHarness, model.id));
+      throw unprocessable(`Choose a default model available on the selected connection: ${acceptedModels.join(", ")}`);
     }
     const testEnvironmentId = probe !== "none" || binding.provider === "github"
       ? await resolveAdapterTestEnvironmentId(companyId, environmentId, binding.provider === "github")
