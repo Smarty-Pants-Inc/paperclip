@@ -104,7 +104,26 @@ hire approval. The approval and the agent change commit together.
 The existing company approval rules still apply.
 
 `pauseAgent`, `resumeAgent`, and `terminateAgent` record the requested change.
-They do not wait for external resource operations.
+They do not wait for external resource operations. A pause, including a budget
+pause, is not retirement. Termination releases the target's execution holds and
+pause reason; it does not change budget policies, limits, spending, or company
+holds. The lifecycle worker must still complete stop and cleanup before
+`lifecycleState` becomes `terminated`.
+
+When terminating a report, ordinary unfinished tasks assigned to it return to
+its assignable immediate reporting manager in the same transaction. This uses normal task
+assignment validation and execution-lock fencing; an assignment failure rolls
+back the command rather than partially retiring the agent. An `in_progress` task
+returns as `todo`. Other statuses and real blockers are preserved: retirement is
+not task completion or proof that a blocker was resolved. Terminal tasks retain
+their historical assignee. Conversation and external-channel tasks retain their
+fixed identity. Root agents have no reporting manager to receive work; an
+unassignable manager (for example, already terminated during company teardown)
+also cannot receive tasks. Those tasks remain under the existing task/recovery
+workflow. Repeated termination does not
+repeat the transfer or its audit record. POST termination and PATCH terminal
+status use the same lifecycle transaction.
+
 `retry` makes a failed step available for another attempt.
 `reconcilePolicyHolds` updates budget and company holds for the specified company.
 The background policy check processes at most 100 eligible agents each minute.
