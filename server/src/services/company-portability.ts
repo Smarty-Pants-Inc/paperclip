@@ -3696,10 +3696,14 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     mode: ImportMode,
     runner?: AgentRunnerChoice,
     defaultEnvironmentId?: string | null,
+    admitResolved?: (resolved: { adapterType: string; adapterConfig: Record<string, unknown> }) => Promise<unknown>,
   ) {
     const resolved = await resolveNewAgentRunnerForCompany(db, companyId, {
       adapterType, adapterConfig, runner, defaultEnvironmentId,
     });
+    // Admit exactly the resolution used below, before adding trusted import
+    // defaults (for example Codex extraArgs) or normalizing secret bindings.
+    await admitResolved?.(resolved);
     adapterConfig = resolved.adapterConfig;
     const effectiveAdapterType = assertKnownImportAdapterType(resolved.adapterType);
     if (mode === "agent_safe" && IMPORT_FORBIDDEN_ADAPTER_TYPES.has(effectiveAdapterType)) {
@@ -5909,16 +5913,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig,
             budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
           }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
-          // Check the runner's resolved adapter before adding trusted import
-          // defaults (for example Codex extraArgs). Those defaults are not a
-          // submitted host command and must not be mistaken for one.
-          const resolvedAdapter = await resolveNewAgentRunnerForCompany(db, targetCompany.id, {
-            adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig, runner,
-            defaultEnvironmentId: existingImportAgent?.defaultEnvironmentId,
-          });
-          await admitAgentActorHire(db, actor, targetCompany, {
-            ...resolvedAdapter, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
-          }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
           const normalizedAdapter = await prepareImportedAgentAdapter(
             targetCompany.id,
             selectedAdapterType,
@@ -5927,6 +5921,9 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             mode,
             runner,
             existingImportAgent?.defaultEnvironmentId,
+            actor.type === "agent" ? resolved => admitAgentActorHire(db, actor, targetCompany, {
+              ...resolved, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
+            }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) }) : undefined,
           );
           const patch = {
             name: planAgent.plannedName,
