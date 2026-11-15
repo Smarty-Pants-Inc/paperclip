@@ -13,6 +13,10 @@ const mockCompaniesApi = vi.hoisted(() => ({
   remove: vi.fn(),
 }));
 const mockOpenOnboarding = vi.hoisted(() => vi.fn());
+const creationPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("../lib/organization-creation", () => ({
+  get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
+}));
 
 vi.mock("../api/companies", () => ({
   companiesApi: mockCompaniesApi,
@@ -73,6 +77,7 @@ describe("Companies page", () => {
   beforeEach(() => {
     container = document.createElement("div");
     document.body.appendChild(container);
+    creationPolicy.hidden = false;
     mockCompaniesApi.stats.mockResolvedValue({});
   });
 
@@ -99,6 +104,24 @@ describe("Companies page", () => {
     await flushReact();
     return root;
   }
+
+  // Data safety: the admin's organization list must not offer accidental creation.
+  it.each([true, false])("creation entry point: hidden=%s", async (hidden) => {
+    creationPolicy.hidden = hidden;
+    const root = await renderPage();
+    try {
+      const button = Array.from(container.querySelectorAll("button"))
+        .find((element) => element.textContent?.includes("New Organization"));
+      expect(Boolean(button)).toBe(!hidden);
+      expect(container.textContent).toContain("Acme Labs");
+      if (button) {
+        act(() => button.click());
+        expect(mockOpenOnboarding).toHaveBeenCalledWith();
+      }
+    } finally {
+      act(() => root.unmount());
+    }
+  });
 
   it("offers the company wizard when self-hosted", async () => {
     const root = await renderPage();
