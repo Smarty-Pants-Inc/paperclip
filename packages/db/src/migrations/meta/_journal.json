@@ -3361,6 +3361,13 @@
       "when": 1794809326881,
       "tag": "0490_backfill_terminated_agent_identity_revocation",
       "breakpoints": true
+    },
+    {
+      "idx": 492,
+      "version": "7",
+      "when": 1794816626614,
+      "tag": "0492_agent_reasoning_display",
+      "breakpoints": true
     }
   ]
 }

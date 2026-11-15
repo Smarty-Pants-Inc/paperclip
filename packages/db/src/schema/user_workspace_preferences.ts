@@ -1,4 +1,4 @@
-import { boolean, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import { boolean, jsonb, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 
 /** One presentation choice per person across companies on this instance.
  * local_trusted instances use their existing local-board principal. */
@@ -9,6 +9,10 @@ export const userWorkspacePreferences = pgTable("user_workspace_preferences", {
   classicWorkspaceEnabled: boolean("classic_workspace_enabled").notNull().default(false),
   /** IANA zone reported by the person's browser, used to read their times and dates. */
   timeZone: text("time_zone"),
+  /** The person's reasoning display per agent id ("fold" | "inline"), set on
+   * the agent's page. Kept here, never in the agent record, so a change is not
+   * an agent-configuration change (#20303). */
+  agentReasoningDisplay: jsonb("agent_reasoning_display").$type<Record<string, "fold" | "inline">>().notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, table => ({
