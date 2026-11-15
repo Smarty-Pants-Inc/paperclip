@@ -15,6 +15,7 @@ const describeDatabase = support.supported ? describe : describe.skip;
 const expectedNewAgentGrantKeys: PermissionKey[] = ([
   "agents:read",
   "agents:configure",
+  "agents:configure-reports-runtime" as PermissionKey,
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",
