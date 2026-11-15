@@ -84,10 +84,11 @@ describe("PiRpcDriver", () => {
       await expect(f.session.startTurn({ message: { role: "user", text: "must not start" } })).rejects.toThrow(/model/);
       await flushFailure();
       const timings = f.events.filter(event => event.payload.code === "provider_performance_spans");
-      expect(timings).toHaveLength(1);
-      expect(timings[0]).toMatchObject({ runId: "run-old" });
-      expect(timings[0]!.turnId).toBeUndefined();
-      expect(timings[0]!.payload.spans).toEqual(expect.arrayContaining([expect.objectContaining({ name: "runner.pi.admission.get_state" })]));
+      expect(timings).toHaveLength(2);
+      expect(timings[0]!.payload.spans).toEqual(expect.arrayContaining([expect.objectContaining({ name: "runner.pi.open.total" })]));
+      expect(timings[1]).toMatchObject({ runId: "run-old" });
+      expect(timings[1]!.turnId).toBeUndefined();
+      expect(timings[1]!.payload.spans).toEqual(expect.arrayContaining([expect.objectContaining({ name: "runner.pi.admission.get_state" })]));
       expect(f.events.some(event => event.eventType === "turn.started")).toBe(false);
       expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }

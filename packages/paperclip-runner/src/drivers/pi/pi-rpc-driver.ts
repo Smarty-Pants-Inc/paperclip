@@ -153,15 +153,51 @@ export class PiRpcDriver implements HarnessDriver {
   }
 
   async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<HarnessSession> {
-    if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
-    if (this.#options.toolSocketPath !== undefined) throw new Error("Pi semantic callbacks require the live guarded host bridge");
-    const cwd = await realpath(input.workingDirectory);
-    if (!(await stat(cwd)).isDirectory()) throw new Error("Pi RPC working directory is not a directory");
-    const directory = await realpath(this.#options.runtimeDirectory).catch(async () => {
-      await mkdir(this.#options.runtimeDirectory, { recursive: true, mode: 0o700 });
-      return realpath(this.#options.runtimeDirectory);
+    const spans: ProviderPerformanceSpan[] = [];
+    const measure: PiOpenMeasure = async (name, work) => {
+      const startedAtMs = Date.now();
+      let outcome: ProviderPerformanceSpan["outcome"] = "failed";
+      try { const result = await work(); outcome = "ok"; return result; }
+      finally {
+        const endedAtMs = Math.max(startedAtMs, Date.now());
+        spans.push({ name, startedAtMs, endedAtMs, outcome });
+        // Content-free fallback also survives failures before a session/event
+        // queue exists. Never let a diagnostic replace the startup result.
+        try { console.error(`pi.open ${name.slice("runner.pi.open.".length)} ${endedAtMs - startedAtMs}ms`); } catch { /* log-only */ }
+      }
+    };
+    let session: PiRpcHarnessSession | undefined;
+    try {
+      session = await measure("runner.pi.open.total", () => this.#openMeasured(input, measure, recovery));
+      return session;
+    } finally {
+      if (session) {
+        try { session.recordOpenTimings(spans, input.runId); } catch { /* log-only */ }
+      } else {
+        // Failed opens have no returned HarnessSession to carry PRP events.
+        // Retain the same bounded diagnostic payload in the runner's stderr.
+        for (const batch of piPerformanceSpanBatches(spans)) {
+          try { console.error(JSON.stringify({ eventType: "harness.diagnostic", runId: input.runId,
+            payload: { code: PROVIDER_PERFORMANCE_DIAGNOSTIC, spans: batch } })); } catch { /* log-only */ }
+        }
+      }
+    }
+  }
+
+  async #openMeasured(input: OpenHarnessSessionInput, measure: PiOpenMeasure,
+    recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<PiRpcHarnessSession> {
+    const { cwd, directory } = await measure("runner.pi.open.workspace", async () => {
+      if (input.signal?.aborted) throw input.signal.reason ?? new Error("Pi RPC session startup aborted");
+      if (this.#options.toolSocketPath !== undefined) throw new Error("Pi semantic callbacks require the live guarded host bridge");
+      const cwd = await realpath(input.workingDirectory);
+      if (!(await stat(cwd)).isDirectory()) throw new Error("Pi RPC working directory is not a directory");
+      const directory = await realpath(this.#options.runtimeDirectory).catch(async () => {
+        await mkdir(this.#options.runtimeDirectory, { recursive: true, mode: 0o700 });
+        return realpath(this.#options.runtimeDirectory);
+      });
+      await chmod(directory, 0o700);
+      return { cwd, directory };
     });
-    await chmod(directory, 0o700);
     const filename = `${safeSessionName(input.normalizedSessionId)}.jsonl`;
     const sessionFile = recovery?.sessionFile ?? join(directory, filename);
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
@@ -191,8 +227,8 @@ export class PiRpcDriver implements HarnessDriver {
       ? environment.PI_CODING_AGENT_DIR ?? join(directory, "agent")
       : piCompanySkillsAgentHome(environment);
     environment.PI_CODING_AGENT_DIR = agentHome;
-    await configurePiNativeMcp(agentHome, environment);
-    await syncPiCompanySkills(agentHome, initialContext.runtimeContext);
+    await measure("runner.pi.open.native_mcp_config", () => configurePiNativeMcp(agentHome, environment));
+    await measure("runner.pi.open.company_skills", () => syncPiCompanySkills(agentHome, initialContext.runtimeContext));
     const runtimeContext = initialContext.runtimeContext as NativeRuntimeContextSnapshot | undefined;
     const agentFiles = runtimeContext?.instructions ? bindAcpxAgentFiles(runtimeContext,
       [directory, agentHome, ...(this.#options.command && isAbsolute(this.#options.command) ? [dirname(this.#options.command)] : [])]) : null;
@@ -201,9 +237,12 @@ export class PiRpcDriver implements HarnessDriver {
       environment.AGENT_HOME = agentFiles.root;
       environment.PAPERCLIP_PI_AGENT_HOME = agentFiles.root;
     }
-    const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
-    const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];
-    await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
+    const { extension, fatalSessionStartExtensionPaths } = await measure("runner.pi.open.extension_resolve", async () => {
+      const extension = await resolveOwnedPiExtension(this.#options.trustedProxyEntrypointUrl ?? import.meta.url);
+      const fatalSessionStartExtensionPaths = [extension, verifiedPiChildBridgePath(pathToFileURL(extension).href)];
+      await writePrivateFile(instructionFile, piHostInstructionSegment(initialContext.instructions, instructionBoundary));
+      return { extension, fatalSessionStartExtensionPaths };
+    });
     args.push("--append-system-prompt", instructionFile, "--extension", extension);
     environment.PAPERCLIP_PI_INSTRUCTIONS_FILE = instructionFile;
     environment.PAPERCLIP_PI_INSTRUCTIONS_BOUNDARY = instructionBoundary;
@@ -221,56 +260,60 @@ export class PiRpcDriver implements HarnessDriver {
       const warn = (message: string) => {
         if (!diagnosed) { diagnosed = true; console.warn(`Pi managed model metadata: ${message}`); }
       };
-      const modelConfiguration = await buildPiManagedModel({ snapshot: await readPiModelsSnapshot(modelsFile),
-        id: this.#options.model.slice("paperclip/".length), api: piManagedProviderApi(environment),
-        originalModelsFile: originalModelsFile === modelsFile ? undefined : originalModelsFile,
-        catalog: await loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment), warn });
-      await configurePiManagedCompaction({ agentHome, originalAgentHome: dirname(originalModelsFile),
-        model: config.model, contextWindow: modelConfiguration.contextWindow });
+      const snapshot = await measure("runner.pi.open.models_snapshot", () => readPiModelsSnapshot(modelsFile));
+      const modelId = this.#options.model.slice("paperclip/".length);
+      const api = piManagedProviderApi(environment);
+      const catalog = await measure("runner.pi.open.model_catalog", () => loadPiBuiltinModelCatalog(this.#options.command ?? "pi", environment));
+      const modelConfiguration = await measure("runner.pi.open.model_resolve", () => buildPiManagedModel({ snapshot,
+        id: modelId, api, originalModelsFile: originalModelsFile === modelsFile ? undefined : originalModelsFile, catalog, warn }));
+      await measure("runner.pi.open.compaction_config", () => configurePiManagedCompaction({ agentHome, originalAgentHome: dirname(originalModelsFile),
+        model: config.model, contextWindow: modelConfiguration.contextWindow }));
       if (credentialMode === "broker") {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
-        const provider = await createPiProviderBinding({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
-        closeProvider = provider.close;
-        bootstrapProvider = provider.provider;
-        let privateDirectory: string | undefined;
-        try {
-          privateDirectory = await realpath(await mkdtemp(join(tmpdir(), "pcpi-")));
-          await chmod(privateDirectory, 0o700);
-          const socketPath = join(privateDirectory, "bind.sock");
-          if (Buffer.byteLength(socketPath) > 103 || Buffer.byteLength(join(privateDirectory, "tool.sock")) > 103) throw new Error("Pi private socket path exceeds Unix limit");
-          const origin = { epoch: 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
-          const context = initialContext;
-          callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
-          const toolSocketPath = join(privateDirectory, "tool.sock");
-          // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
-          await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
-          bootstrapToolsDeferred = provider.provider.api === "openai-completions" && context.tools.length > 0;
-          const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions,
-            tools: bootstrapToolsDeferred ? [] : context.tools, toolSocketPath };
-          if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
-          resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
-            binding: { origin, close: provider.close, initial: true }, toolSocketPath };
-          const { name, ...configuration } = provider.provider;
-          const json = JSON.stringify({ providers: { [name]: configuration } });
-          await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json, warn));
-          const initialJson = JSON.stringify(initial);
-          if (Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error("Pi initial binding exceeds its private frame limit");
-          const initialFile = join(privateDirectory, "initial.json");
-          await writeFile(initialFile, initialJson, { mode: 0o600, flag: "wx" });
-          environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
-          delete environment.PAPERCLIP_PI_BIND_INITIAL;
-          environment.PAPERCLIP_PI_BIND_INITIAL_FILE = initialFile;
-        } catch (error) {
-          await callbacks?.close();
-          await provider.close();
-          if (privateDirectory) await cleanPiPrivateDirectory({ directory: privateDirectory, socketPath: join(privateDirectory, "bind.sock") });
-          throw error;
-        }
+        await measure("runner.pi.open.provider_binding", async () => {
+          const provider = await createPiProviderBinding({ model: this.#options.model!, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
+          closeProvider = provider.close;
+          bootstrapProvider = provider.provider;
+          let privateDirectory: string | undefined;
+          try {
+            privateDirectory = await realpath(await mkdtemp(join(tmpdir(), "pcpi-")));
+            await chmod(privateDirectory, 0o700);
+            const socketPath = join(privateDirectory, "bind.sock");
+            if (Buffer.byteLength(socketPath) > 103 || Buffer.byteLength(join(privateDirectory, "tool.sock")) > 103) throw new Error("Pi private socket path exceeds Unix limit");
+            const origin = { epoch: 1, runId: input.runId, turnId: `pi-turn-${randomUUID()}` };
+            const context = initialContext;
+            callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
+            const toolSocketPath = join(privateDirectory, "tool.sock");
+            // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
+            await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
+            bootstrapToolsDeferred = provider.provider.api === "openai-completions" && context.tools.length > 0;
+            const initial = { schema: 1, sessionId: input.normalizedSessionId, ...origin, model: this.#options.model, thinkingLevel: config.piRpcThinkingLevel, instructions: context.instructions,
+              tools: bootstrapToolsDeferred ? [] : context.tools, toolSocketPath };
+            if (!validateBindingConfig(initial)) throw new Error("Pi initial binding configuration rejected");
+            resident = { directory: privateDirectory, socketPath, environment: { ...environment }, modelConfiguration, epoch: 1, context,
+              binding: { origin, close: provider.close, initial: true }, toolSocketPath };
+            const { name, ...configuration } = provider.provider;
+            const json = JSON.stringify({ providers: { [name]: configuration } });
+            await measure("runner.pi.open.models_json_write", async () => writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), json, warn)));
+            const initialJson = JSON.stringify(initial);
+            if (Buffer.byteLength(initialJson) > PI_BIND_MAX_FRAME_BYTES) throw new Error("Pi initial binding exceeds its private frame limit");
+            const initialFile = join(privateDirectory, "initial.json");
+            await writeFile(initialFile, initialJson, { mode: 0o600, flag: "wx" });
+            environment.PAPERCLIP_PI_BIND_SOCKET = socketPath;
+            delete environment.PAPERCLIP_PI_BIND_INITIAL;
+            environment.PAPERCLIP_PI_BIND_INITIAL_FILE = initialFile;
+          } catch (error) {
+            await callbacks?.close();
+            await provider.close();
+            if (privateDirectory) await cleanPiPrivateDirectory({ directory: privateDirectory, socketPath: join(privateDirectory, "bind.sock") });
+            throw error;
+          }
+        });
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
       } else {
-        const provider = directPiProviderConfiguration({ model: this.#options.model, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
-        await writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json, warn));
+        const provider = await measure("runner.pi.open.provider_binding", async () => directPiProviderConfiguration({ model: this.#options.model!, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration }));
+        await measure("runner.pi.open.models_json_write", async () => writePrivateFile(join(agentHome, "models.json"), await mergedPiModelsJson(join(agentHome, "models.json"), provider.json, warn)));
         for (const key of Object.keys(environment)) if (key.startsWith("PAPERCLIP_AI_PROVIDER_")) delete environment[key];
         environment.PAPERCLIP_AI_PROVIDER_KEY = provider.key;
       }
@@ -288,31 +331,35 @@ export class PiRpcDriver implements HarnessDriver {
     };
     let transport: PiRpcTransport | undefined;
     try {
-      transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
-      // --session loads an existing file too: no saved selection bypasses live
-      // admission. The broker/models.json bootstrap above remains first.
-      const port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
-      // Pi answers RPC only after it has started and loaded its extensions. On
-      // a cold box (lazy snapshot files, no compile cache yet) that alone took
-      // 6.6-12.4 s, so the first request of a NEW process waits for startup
-      // under its own bound; every later admission RPC keeps the short bound.
-      const startupTimeoutMs = this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS;
-      // The transport's own per-request deadline (30 s) must not cut the wait short.
-      const ready = record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
-        startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
+      let port!: PiRpcAdmissionPort;
+      const ready = await measure("runner.pi.open.pi_spawn_to_get_state", async () => {
+        transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
+        // --session loads an existing file too: no saved selection bypasses live
+        // admission. The broker/models.json bootstrap above remains first.
+        port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
+        // Pi answers RPC only after it has started and loaded its extensions. On
+        // a cold box (lazy snapshot files, no compile cache yet) that alone took
+        // 6.6-12.4 s, so the first request of a NEW process waits for startup
+        // under its own bound; every later admission RPC keeps the short bound.
+        const startupTimeoutMs = this.#options.processStartupTimeoutMs ?? PI_PROCESS_STARTUP_TIMEOUT_MS;
+        // The transport's own per-request deadline (30 s) must not cut the wait short.
+        return record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
+          startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
+      });
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
         const live = ready;
         if (live.sessionId !== recovery.snapshot.driverSessionId || live.sessionFile !== sessionFile) throw piSessionFileInvalid();
       }
-      let identity = await admitPiRpcSession(port, config, input.signal);
+      let identity = await measure("runner.pi.open.admission", () => admitPiRpcSession(port, config, input.signal));
       if (resident && bootstrapProvider) {
-        const send = async <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => {
+        const send = <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => measure(
+          request.type === "bind" ? "runner.pi.open.bind_receipt" : `runner.pi.open.${request.type}` as PiOpenPhase, async () => {
           const timeoutMs = this.#options.startupTimeoutMs ?? 5000;
           const receipt = await withAbort(withTimeout((this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out"), input.signal);
           if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
           return receipt;
-        };
+        });
         const inventory = await send({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: input.normalizedSessionId });
         const context = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext,
           undefined, { api: bootstrapProvider.api, nativeToolCount: inventory.nativeTools.length });
@@ -328,7 +375,7 @@ export class PiRpcDriver implements HarnessDriver {
           resident.epoch = origin.epoch;
           resident.binding = { origin, close: resident.binding!.close, initial: true };
           await send({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...origin });
-          identity = await admitPiRpcSession(port, config, input.signal);
+          identity = await measure("runner.pi.open.admission", () => admitPiRpcSession(port, config, input.signal));
           await writePrivateFile(instructionFile, piHostInstructionSegment(context.instructions, instructionBoundary));
         }
         resident.context = initialContext = context;
@@ -336,14 +383,16 @@ export class PiRpcDriver implements HarnessDriver {
       if (recovery && identity.providerSessionId !== recovery.snapshot.driverSessionId) throw piSessionFileInvalid();
       // Discovery is separate from inference. Keep catalog/auth contents private;
       // the receipt exposes only qualified version, provider names and auth shape.
-      const discovery = await withAbort(withTimeout(transport.request("get_available_models"), this.#options.startupTimeoutMs ?? 10_000, "Pi metadata timed out"), input.signal);
-      const models = record(discovery.data).models;
-      if (!Array.isArray(models) || models.length > 100_000) throw new PiNativeAdmissionError("pi_metadata_invalid", "Pi omitted its model/provider metadata.");
-      const providers = [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
+      const providers = await measure("runner.pi.open.available_models", async () => {
+        const discovery = await withAbort(withTimeout(transport!.request("get_available_models"), this.#options.startupTimeoutMs ?? 10_000, "Pi metadata timed out"), input.signal);
+        const models = record(discovery.data).models;
+        if (!Array.isArray(models) || models.length > 100_000) throw new PiNativeAdmissionError("pi_metadata_invalid", "Pi omitted its model/provider metadata.");
+        return [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
+      });
       const piMetadata = { version: "1.5.2", versionSource: "qualified-profile", providers, credentialMode, promptSent: false,
         authShape: { mode: credentialMode, source: usesPiProviderLoopback(config.model, this.#options.environment ?? {}) ? "managed-provider" : "configured-provider" } };
       const session = new PiRpcHarnessSession({
-        transport,
+        transport: transport!,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
@@ -369,7 +418,7 @@ export class PiRpcDriver implements HarnessDriver {
         callbacks,
         bindRequest: this.#options.bindRequest ?? sendPiBindRequest,
       });
-      if (this.#options.deferInitialBinding) await session.releaseInitialBindingForRecovery();
+      if (this.#options.deferInitialBinding) await measure("runner.pi.open.settle", () => session.releaseInitialBindingForRecovery());
       return session;
     } catch (error) {
       await callbacks?.close().catch(() => undefined);
@@ -381,6 +430,9 @@ export class PiRpcDriver implements HarnessDriver {
     }
   }
 }
+
+type PiOpenPhase = Extract<ProviderPerformancePhase, `runner.pi.open.${string}`>;
+type PiOpenMeasure = <T>(name: PiOpenPhase, work: () => Promise<T>) => Promise<T>;
 
 interface PiRunContext {
   baseInstructions: string;
@@ -687,6 +739,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     const result = this.#operation.then(operation);
     this.#operation = result.then(() => undefined, () => undefined);
     return result;
+  }
+
+  /** Startup precedes this session and has no turn. Flush before open returns,
+   * rather than waiting for a prompt that may never arrive. */
+  recordOpenTimings(spans: readonly ProviderPerformanceSpan[], runId: string): void {
+    for (const span of spans) this.#recordTiming(span.name, span.startedAtMs, span.endedAtMs, span.outcome, { runId });
+    this.#flushTimings();
   }
 
   #recordTiming(name: ProviderPerformancePhase, startedAtMs: number, endedAtMs: number,

@@ -359,7 +359,10 @@ describe("resident Pi model binding", () => {
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]!.turnId).toBeUndefined();
     expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
-    expect(f.events.filter(event => event.runId === "run-a" && event.payload.code === "provider_performance_spans")).toHaveLength(1);
+    const initialRunTimings = f.events.filter(event => event.runId === "run-a" && event.payload.code === "provider_performance_spans");
+    expect(initialRunTimings).toHaveLength(2); // Cold open, then the first turn.
+    expect(initialRunTimings[0]!.turnId).toBeUndefined();
+    expect(parseProviderPerformanceSpans(initialRunTimings[0]!.payload, Date.now()).at(-1)?.name).toBe("runner.pi.open.total");
   });
 
   it("retains the failed outer attach timing when admission closes the session before measurement unwinds", async () => {

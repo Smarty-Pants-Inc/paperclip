@@ -141,9 +141,10 @@ it("keeps real Pi 1.5.2 usable after a third-party home session_start exception"
     expect(diagnostics[0].extensionPath).toBe(thirdPartyPath);
     expect(String(diagnostics[0].error)).toHaveLength(2048);
     expect(JSON.stringify(diagnostics[0]).length).toBeLessThan(3300);
-    // One batched runner.pi.* timing diagnostic after start; warm reattach separately reports its pi.request.sent instant.
+    // Cold open flushes before any turn; pre-prompt admission flushes separately
+    // after turn.started. Pi's request instant is a third, provider-side batch.
     expect(sessionDiagnostics.filter(diagnostic => diagnostic.code === "provider_performance_spans"
-      && ((diagnostic as { spans?: Array<{ name?: unknown }> }).spans ?? []).some(span => String(span.name).startsWith("runner.pi.")))).toHaveLength(1);
+      && ((diagnostic as { spans?: Array<{ name?: unknown }> }).spans ?? []).some(span => String(span.name).startsWith("runner.pi.")))).toHaveLength(2);
     const nonTimingDiagnostics = sessionDiagnostics.filter(diagnostic => diagnostic.code !== "provider_performance_spans");
     expect(nonTimingDiagnostics).toHaveLength(1);
     expect(nonTimingDiagnostics[0]).toMatchObject({ code: "pi_extension_startup_failed", event: "session_start", extensionPath: thirdPartyPath, message: diagnostics[0].error });

@@ -67,6 +67,9 @@ it("the driver records effective effort in readback/run events and emits only on
     const diagnostic = (await events.next()).value;
     expect(diagnostic).toMatchObject({ eventType: "harness.diagnostic", payload: { code: "pi_thinking_lowered_by_config", requested: "max", effective: "xhigh" } });
     expect(JSON.stringify(diagnostic.payload).length).toBeLessThan(256);
+    const openTiming = (await events.next()).value;
+    expect(openTiming).toMatchObject({ eventType: "harness.diagnostic", runId: "run", payload: { code: "provider_performance_spans" } });
+    expect(openTiming.turnId).toBeUndefined();
     await session.attachRun!({ runId: "run-2" });
     const admissionTiming = (await events.next()).value;
     expect(admissionTiming).toMatchObject({ eventType: "harness.diagnostic", runId: "run-2", payload: { code: "provider_performance_spans" } });
