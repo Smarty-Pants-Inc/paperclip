@@ -780,8 +780,10 @@ describe("persistent agent directories", () => {
     expect(first.receipt?.storageWarning).toContain("256 MiB");
     expect(await fs.readFile(path.join(first.localRoot, entryFile), "utf8")).toBe(initial);
     const stopped = await copies.collectStopped({ companyId, runId: first.runId });
-    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED" });
-    await expect(fs.stat(first.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", receipt: { cleanupPending: true } });
+    // Oversized bytes prevented the initial authority observation. No legacy
+    // recursive fallback is allowed; the next run still admits agent cleanup.
+    expect((await fs.stat(first.localRoot)).isDirectory()).toBe(true);
     copies = agentInstructionWorkingCopyService(db);
     const cleanup = await run();
     expect(cleanup.state).toBe("prepared");
@@ -915,8 +917,11 @@ describe("persistent agent directories", () => {
         spec: { host: "unused.invalid", port: 22, username: "test", remoteCwd: "/fixture/task", remoteWorkspacePath: "/fixture/task", privateKey: null, knownHosts: null, strictHostKeyChecking: true } } })).rejects.toThrow("Could not exclude");
       const row = (await copies.get(companyId, runId))!;
       expect(row.state).toBe("unavailable");
-      expect(row.receipt?.baseline).toBeUndefined();
-      await expect(fs.stat(path.dirname(row.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
+      expect(row.receipt?.baseline).toBeDefined();
+      expect(row.receipt?.cleanupPending).toBe(true);
+      expect((await fs.stat(path.dirname(row.localRoot))).isDirectory()).toBe(true);
+      expect(await fs.readFile(path.join(row.localRoot, entryFile), "utf8")).toBe(initial);
+      expect(shell).toHaveBeenCalledTimes(1); // exclusion failed; no cleanup RPC
     } finally { shell.mockRestore(); }
   });
 
@@ -937,8 +942,11 @@ describe("persistent agent directories", () => {
     await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, interrupted.runId));
     copies = agentInstructionWorkingCopyService(db);
     await copies.recoverStopped();
-    expect((await copies.get(companyId, interrupted.runId))?.state).toBe("unavailable");
-    await expect(fs.stat(path.dirname(interrupted.localRoot))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await copies.get(companyId, interrupted.runId)).toMatchObject({ state: "unavailable", receipt: { cleanupPending: true } });
+    // Simulating the crash also erased physical authority. Restart must retain
+    // these files, rather than treating a stopped heartbeat as an rm grant.
+    expect((await fs.stat(path.dirname(interrupted.localRoot))).isDirectory()).toBe(true);
+    expect(await fs.readFile(path.join(interrupted.localRoot, entryFile), "utf8")).toBe(initial);
     expect((await fs.stat(active.localRoot)).isDirectory()).toBe(true);
   });
 
@@ -1742,6 +1750,11 @@ describe("persistent agent directories", () => {
       assetDirs: {}, additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null, restoreWorkspace, cleanupWorkspaceSnapshot }));
     try {
       const copy = (await copies.prepare({ ...target(), runId, cwd: home, target: executionTarget }))!;
+      // This test isolates destruction handling, not failed observation. The
+      // mocked remote host supplies a durable cleanup grant explicitly; local
+      // identity remains the real identity recorded during preparation.
+      await db.update(agentInstructionWorkingCopies).set({ receipt: { ...copy.receipt, refreshConfinedCleanup: true,
+        materializationIdentity: "1:2:3", transferCleanupIdentity: "1:2:3" } }).where(eq(agentInstructionWorkingCopies.runId, runId));
       await copies.reportUnavailable(companyId, runId);
       await copies.release(companyId, runId);
       expect(cleanupWorkspaceSnapshot).not.toHaveBeenCalled();
