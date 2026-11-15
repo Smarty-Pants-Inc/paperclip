@@ -476,6 +476,42 @@ export class ReadySpareKeeper {
     }
   }
 
+  /** Timer refreshes only boxes freshly confirmed by Boat as named ready/idle spares. */
+  async refreshDueTimer(ttlSeconds: number, operationSource: (key: ReadySpareKey) => ReadySpareOperations | undefined): Promise<void> {
+    if (this.stopping) return;
+    for (const [poolId, pool] of this.pools) {
+      if (this.stopping) return;
+      const representative = pool[0];
+      if (!representative) { this.pools.delete(poolId); continue; }
+      const operations = operationSource(representative.key);
+      if (!operations) continue;
+      let listed: ReadySpare[];
+      try { listed = await operations.list(); } catch { continue; }
+      for (const spare of [...pool]) {
+        const current = listed.find(item => item.id === spare.id);
+        if (!current || current.name !== `paperclip-spare:ready:${spare.key.configHash}`
+            || (current.state !== "ready" && current.state !== "idle")) {
+          const index = pool.findIndex(item => item.id === spare.id);
+          if (index >= 0) pool.splice(index, 1);
+          continue;
+        }
+        const spareTtl = spare.ttlSeconds ?? ttlSeconds;
+        if (Date.parse(spare.expiresAt) > this.now() + spareTtl * 500) continue;
+        try {
+          const refreshed = await operations.refresh(current, spareTtl);
+          const index = pool.findIndex(item => item.id === spare.id);
+          if (index >= 0) pool[index] = refreshed;
+        } catch {
+          // A failed timer refresh is not proof that this is safe to stop; Boat TTL is the fallback.
+          const index = pool.findIndex(item => item.id === spare.id);
+          if (index >= 0) pool.splice(index, 1);
+        }
+      }
+      if (pool.length) this.pools.set(poolId, pool);
+      else this.pools.delete(poolId);
+    }
+  }
+
   /** Refresh only near-expiry live candidates. Failed refreshes make them unclaimable. */
   async refreshDue(ttlSeconds: number, operationSource: ReadySpareOperations | ((key: ReadySpareKey) => ReadySpareOperations | undefined)): Promise<void> {
     if (this.stopping) return;

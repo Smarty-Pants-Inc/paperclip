@@ -802,10 +802,12 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
       if (shuttingDown) return;
       activeByPool.set(poolId, await companySpareIsActive(pool.key.companyId, pool.idleMinutes));
     }
-    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => {
+    const refreshOperations = (key: ReadySpareKey) => {
       const poolId = readySparePoolKey(key);
       return activeByPool.get(poolId) ? knownSparePools.get(poolId)?.operations : undefined;
-    });
+    };
+    if (reconcile) await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, refreshOperations);
+    else await readySpares.refreshDueTimer(READY_SPARE_TTL_SECONDS, refreshOperations);
     for (const [poolId, pool] of knownSparePools) {
       if (shuttingDown) return;
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
