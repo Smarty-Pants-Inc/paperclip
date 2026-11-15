@@ -6,7 +6,7 @@ import express from "express";
 import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, agentApiKeys, agentConfigRevisions, authUsers, budgetPolicies, companies, companyMemberships,
+import { activityLog, agents, agentApiKeys, agentConfigRevisions, approvals, authUsers, budgetPolicies, companies, companyMemberships,
   companySecretBindings, createDb, heartbeatRuns, principalPermissionGrants, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
@@ -252,6 +252,49 @@ describe("manager report runtime autonomy", () => {
       expect(parseHeartbeatPolicy(saved).maxDailyCostCents).toBe(amount ?? null);
     }
   });
+  for (const [route, requiresApproval] of [["agents", false], ["agent-hires", false], ["agent-hires", true]] as const) {
+    function hireBody(reportsTo: string, amount: number | null | undefined) {
+      return { name: "Daily cap hire", role: "engineer", reportsTo,
+        adapterType: "paperclip_runner", adapterConfig: { provider: "pi_rpc", model: "paperclip/claude-opus-5-5", piRpcThinkingLevel: "high" },
+        runtimeConfig: { heartbeat: { enabled: false, ...(amount === undefined ? {} : { maxDailyCostCents: amount }) } } };
+    }
+    it(`daily cap create: agent ${route} (approval ${requiresApproval}) refuses zero without persisting an agent, hire or approval`, async () => {
+      const f = await seed();
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: requiresApproval }).where(eq(companies.id, f.companyId));
+      const before = await db.select().from(agents).where(eq(agents.companyId, f.companyId)).orderBy(agents.id);
+      const response = await f.call("post", `/companies/${f.companyId}/${route}`, hireBody(f.ids.primary, 0));
+      expect(response.status, response.text).toBe(422);
+      expect(response.body.error).toBe("maxDailyCostCents 0 stops the agent; omit the field (or send null) to remove the daily cap");
+      expect(await db.select().from(agents).where(eq(agents.companyId, f.companyId)).orderBy(agents.id)).toEqual(before);
+      expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual([]);
+    });
+    for (const amount of [250, null, undefined]) {
+      it(`daily cap create: agent ${route} (approval ${requiresApproval}) accepts ${amount === undefined ? "an absent field" : amount}`, async () => {
+        const f = await seed();
+        await db.update(companies).set({ requireBoardApprovalForNewAgents: requiresApproval }).where(eq(companies.id, f.companyId));
+        const response = await f.call("post", `/companies/${f.companyId}/${route}`, hireBody(f.ids.primary, amount));
+        expect(response.status, response.text).toBe(201);
+        const saved = await f.readAgent(response.body.agent?.id ?? response.body.id);
+        expect(saved.runtimeConfig.heartbeat).toEqual({ ...hireBody(f.ids.primary, amount).runtimeConfig.heartbeat, maxConcurrentRuns: 20 });
+        expect(parseHeartbeatPolicy(saved).maxDailyCostCents).toBe(amount ?? null);
+        expect(saved.status).toBe(requiresApproval ? "pending_approval" : "paused");
+        expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toHaveLength(requiresApproval ? 1 : 0);
+      });
+    }
+    it(`daily cap create: board ${route} (approval ${requiresApproval}) retains explicit zero`, async () => {
+      const f = await seed();
+      await db.update(companies).set({ requireBoardApprovalForNewAgents: requiresApproval }).where(eq(companies.id, f.companyId));
+      const key = await boardAuthService(db).createNamedBoardApiKey({ userId: f.userId, name: "Daily cap hire fixture" });
+      const response = await request(f.api).post(`/api/companies/${f.companyId}/${route}`)
+        .set("Authorization", `Bearer ${key.token}`).send(hireBody(f.ids.primary, 0));
+      expect(response.status, response.text).toBe(201);
+      const saved = await f.readAgent(response.body.agent?.id ?? response.body.id);
+      expect(saved.runtimeConfig.heartbeat).toMatchObject({ enabled: false, maxDailyCostCents: 0 });
+      expect(parseHeartbeatPolicy(saved).maxDailyCostCents).toBe(0);
+      expect(saved.status).toBe(requiresApproval ? "pending_approval" : "paused");
+      expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toHaveLength(requiresApproval ? 1 : 0);
+    });
+  }
   it("l: retirement is pause then terminate; DELETE never opens for reports", async () => {
     const f = await seed();
     expect((await f.call("delete", `/agents/${f.ids.lead}`)).status).toBe(403);
