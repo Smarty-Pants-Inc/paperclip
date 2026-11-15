@@ -6,7 +6,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { EntityRow } from "../components/EntityRow";
 import { ProjectTile } from "../components/ProjectTile";
-import { StatusBadge } from "../components/StatusBadge";
+import { ProjectStatusPill } from "../components/ProjectStatusPill";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
 import { ArtifactEmptyGraphic } from "@/components/artifacts/v1/ArtifactEmptyGraphic";
@@ -25,6 +25,26 @@ import { Hexagon } from "lucide-react";
 import { Lock } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { companyProjectsQuery } from "@/lib/company-projects-query";
+
+function countTasks(count: number) {
+  return `${formatNumber(count)} task${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * The work left in a project, in plain words. "All tasks done" when every
+ * task is done, cancelled or hidden; the pill beside it follows the same
+ * tasks. Older servers send only `taskCount`.
+ */
+export function projectTaskCountLabel(project: Pick<Project, "taskCount" | "openTaskCount">) {
+  const total = project.taskCount ?? 0;
+  const open = project.openTaskCount;
+  if (open === undefined) return { label: countTasks(total), title: countTasks(total) };
+  if (total === 0) return { label: "No tasks", title: "No tasks" };
+  const title = `${formatNumber(open)} open of ${countTasks(total)}`;
+  if (open === 0) return { label: "All tasks done", title };
+  if (open === total) return { label: `${formatNumber(open)} open`, title };
+  return { label: `${formatNumber(open)} open of ${formatNumber(total)}`, title };
+}
 
 function compareProjectNames(left: Project, right: Project) {
   const nameDiff = left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
@@ -181,12 +201,26 @@ export function Projects() {
                     const starPending = pending && membershipMutation.variables?.starred !== undefined;
                     const joinLeavePending = pending && membershipMutation.variables?.starred === undefined;
                     const starred = isStarred(membershipsQuery.data, "project", project.id);
+                    const taskCount = projectTaskCountLabel(project);
                     return (
                       <EntityRow
                         key={project.id}
                         leading={<ProjectTile color={project.color ?? null} icon={project.icon ?? null} size="sm" />}
                         title={project.name}
                         subtitle={project.description ?? undefined}
+                        // Below sm the trailing cluster leaves the name column
+                        // too narrow for the count, so the count and the
+                        // description move to a full-width line under the row.
+                        subtitleClassName="hidden truncate sm:block"
+                        secondaryRow={
+                          <p className="truncate text-xs text-muted-foreground">
+                            <span data-testid="project-task-count" title={taskCount.title}>
+                              {taskCount.label}
+                            </span>
+                            {project.description ? ` · ${project.description}` : null}
+                          </p>
+                        }
+                        secondaryRowClassName="mt-0.5 pl-9 sm:hidden"
                         reserveSubtitleSpace
                         to={projectUrl(project)}
                         className={state === "left" ? "group text-foreground/55" : "group"}
@@ -194,10 +228,11 @@ export function Projects() {
                           <div className="flex items-center gap-3">
                             {project.visibility === "private" ? <Lock className="size-4 shrink-0 text-muted-foreground" aria-label="Private project" /> : null}
                             <span
-                              className="hidden text-xs text-muted-foreground tabular-nums sm:inline"
-                              title={`${formatNumber(project.taskCount ?? 0)} task${(project.taskCount ?? 0) === 1 ? "" : "s"}`}
+                              data-testid="project-task-count"
+                              className="hidden whitespace-nowrap text-xs text-muted-foreground tabular-nums sm:inline"
+                              title={taskCount.title}
                             >
-                              {formatNumber(project.taskCount ?? 0)} task{(project.taskCount ?? 0) === 1 ? "" : "s"}
+                              {taskCount.label}
                             </span>
                             {project.budget && (
                               <span className="hidden text-xs text-muted-foreground tabular-nums sm:inline">
@@ -209,7 +244,7 @@ export function Projects() {
                                 {formatDate(project.targetDate)}
                               </span>
                             )}
-                            <StatusBadge status={project.status} />
+                            <ProjectStatusPill project={project} />
                             <MembershipAction
                               state={state}
                               pending={joinLeavePending}
