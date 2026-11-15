@@ -101,6 +101,34 @@ describe("inline reasoning is plain text in the turn", () => {
     expect(Number(plain![1])).toBeLessThanOrEqual(30);
   });
 
+  it("keeps the answer's size inside the Coordinator workspace (Paul's chat)", () => {
+    // The Coordinator workspace sizes progress text one step below the answer
+    // (`.coordinator-workspace [data-conversation-text="progress"]`). Plain
+    // inline reasoning must still read at the answer's size there.
+    const coordinatorRules = indexCss.split("\n")
+      .filter((line) => line.startsWith(".coordinator-workspace [data-conversation-text"))
+      .join("\n");
+    expect(coordinatorRules).toContain('[data-conversation-text="progress"]');
+    const coordinatorStyle = document.createElement("style");
+    coordinatorStyle.textContent = coordinatorRules;
+    // Same cascade order as index.css: the coordinator rules come later.
+    document.head.appendChild(coordinatorStyle);
+    container.className = "coordinator-workspace";
+    try {
+      render(CODEX, true);
+      const plain = container.querySelector<HTMLElement>('[data-reasoning-display="inline"] .task-chat-reasoning-plain')!;
+      expect(plain).not.toBeNull();
+      const answerSize = reasoningLookCss().match(/\.task-chat-reasoning-plain[^{]*\{\s*font-size:\s*([^;]+);/);
+      expect(answerSize, "plain flow declares the answer's size").not.toBeNull();
+      // jsdom may resolve rem to px (root 16px); compare in px.
+      const px = (value: string) => value.trim().endsWith("rem") ? `${parseFloat(value) * 16}px` : value.trim();
+      expect(px(getComputedStyle(plain).fontSize)).toBe(px(answerSize![1]!));
+    } finally {
+      coordinatorStyle.remove();
+      container.className = "";
+    }
+  });
+
   it("leaves folded mode unchanged (bulleted sections)", () => {
     render(CODEX, false);
     expect(container.querySelector('[data-reasoning-display="inline"]')).toBeNull();
