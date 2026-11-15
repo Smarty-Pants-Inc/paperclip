@@ -704,7 +704,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       await db!.update(heartbeatRuns).set({ runnerInstanceId: fixture.native.runnerInstanceId }).where(eq(heartbeatRuns.id, fixture.runId));
       const admission = buildNativeExecutionWithCheckpoint({ previousRun: selected, normalizedSessionId: first.native.normalizedSessionId,
         executionTargetKind: "remote", buildExecution: () => fixture.execution });
-      fixture.execution = admission.execution;
+      // The rebind keeps the admitted execution's schema version (built above).
+      fixture.execution = admission.execution as typeof fixture.execution;
       expect(admission.checkpoint).not.toBeNull();
       await db!.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
         || ${JSON.stringify({ sessionCheckpoint: admission.checkpoint, nativeExecutionInput: fixture.execution })}::jsonb` }).where(eq(heartbeatRuns.id, fixture.runId));
