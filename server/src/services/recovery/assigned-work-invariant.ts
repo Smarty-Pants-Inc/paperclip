@@ -45,6 +45,8 @@ export const WAITING_REASONS = [
   "conversation",
   "awaiting_first_message",
   "board_confirmation",
+  /** An accepted response-wake yield whose next move is new person input. */
+  "awaiting_person",
 ] as const;
 export type WaitingReason = (typeof WAITING_REASONS)[number];
 
@@ -155,6 +157,8 @@ export type AssignedWorkFacts = {
     canRetry: boolean;
   } | null;
   pendingInteractions: number;
+  /** Latest accepted response-wake assessment, not superseded by work or person input. */
+  awaitingPerson?: boolean;
   pendingApprovals: number;
   openBlockers: number;
   /** When the task's most recent blocker was finished, if any. */
@@ -296,6 +300,7 @@ function waitingReason(facts: AssignedWorkFacts, now: Date): WaitingReason | nul
   }
   if (issue.isConversation) return "conversation";
   if (issue.awaitingFirstMessage) return "awaiting_first_message";
+  if (facts.awaitingPerson) return "awaiting_person";
   if (issue.status === "blocked") {
     // A carried source block is an intentional wait, not an unknown local
     // failure to repair. Once local execution exists, its normal owner applies.
