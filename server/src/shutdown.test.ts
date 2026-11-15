@@ -469,8 +469,8 @@ describe("createPreDrainShutdownBudget", () => {
       await vi.advanceTimersByTimeAsync(15_000);
       await expect(restartClose).resolves.toMatchObject({ outcome: "completed" });
 
-      const afterRestart = budget.run("scheduler_idle", () => new Promise<void>(resolve => setTimeout(resolve, 5_000)));
-      await vi.advanceTimersByTimeAsync(5_000);
+      const afterRestart = budget.run("scheduler_idle", () => new Promise<void>(resolve => setTimeout(resolve, 4_000)));
+      await vi.advanceTimersByTimeAsync(4_000);
       await expect(afterRestart).resolves.toMatchObject({ outcome: "completed" });
     } finally {
       vi.useRealTimers();
