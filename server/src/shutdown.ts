@@ -8,6 +8,7 @@ type ShutdownLogger = {
 };
 
 export const PRE_DRAIN_SHUTDOWN_BUDGET_MS = 20_000;
+export const RESTART_WARM_CLOSE_CONCURRENCY = 5;
 
 export type ShutdownStepResult<T> =
   | { outcome: "completed"; value: T; durationMs: number }

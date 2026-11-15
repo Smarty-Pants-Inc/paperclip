@@ -10,6 +10,7 @@ import { NativeSessionDiagnostics, nativeSessionDiagnostics, type NativeDiagnost
 import { recordAgentProviderRateLimits } from "../agent-provider-rate-limits.js";
 import { nativePostResultFailureCategory, type NativePostResultFailureCategory } from "./native-post-result-failure.js";
 import { logger } from "../../middleware/logger.js";
+import { RESTART_WARM_CLOSE_CONCURRENCY } from "../../shutdown.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
 import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
@@ -1160,6 +1161,7 @@ async function warmSandboxDestroyed(db: Db, entry: WarmNativeSession): Promise<b
 export async function closeIdleWarmNativeSessionsForRestart(): Promise<WarmNativeSessionCloseResult> {
   return closeIdleWarmNativeSessions({
     reason: "controller restart",
+    concurrency: RESTART_WARM_CLOSE_CONCURRENCY,
     closeBusyOnRelease: true,
     detachReleased: true,
   });
@@ -1174,6 +1176,7 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 async function closeIdleWarmNativeSessions(input: {
   environmentId?: string;
   reason: string;
+  concurrency?: number;
   closeBusyOnRelease?: boolean;
   detachReleased?: boolean;
   canRetire?: () => boolean;
@@ -1257,7 +1260,7 @@ async function closeIdleWarmNativeSessions(input: {
       if (input.canRetire && !input.canRetire()) return;
     }
   };
-  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, () => closeNext()));
+  await Promise.all(Array.from({ length: Math.min(input.concurrency ?? 1, entries.length) }, () => closeNext()));
   if (failures.length > 0) logger.warn({ reason: input.reason, failures }, "idle warm native sessions did not close");
   return { closed, busy, failed, failures };
 }
