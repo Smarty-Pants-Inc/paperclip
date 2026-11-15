@@ -296,6 +296,7 @@ describe("Boat ready spare", () => {
     expect(warmCommand).toContain("get_state");
     expect(lease.metadata).toHaveProperty("workspaceSentinel");
     expect(f.calls.filter(call => call.method === "DELETE" && call.url.pathname.endsWith("/files"))).toHaveLength(2);
+    expect(f.calls.filter(c => c.method === "DELETE" && !c.url.pathname.endsWith("/files"))).toHaveLength(0);
   });
 
   it.each([
