@@ -482,9 +482,13 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
       executionContextSupported: 1 as const,
       ...(executionContext ? { executionContext } : {}),
     };
+    const setupTimeoutSeconds = driverConfig.setupTimeoutSeconds;
+    const describeTimeout = typeof setupTimeoutSeconds === "number" && Number.isInteger(setupTimeoutSeconds) && setupTimeoutSeconds >= 1
+      ? Math.max(90_000, Math.min(setupTimeoutSeconds, 600) * 1_000) : 90_000;
     const timeout = operation.kind === "copilot_metadata" ? Math.max(1, Math.min(40_000, Number(probe?.expiresAtMs) - Date.now()))
       : executionContext ? Math.max(1, context!.deadlineAtMs - Date.now())
-      : driver.sessionHandoffVersion === 1 && (ownership || operation.kind === "describe") ? 90_000 : 15_000;
+      : driver.sessionHandoffVersion === 1 && ownership ? 90_000
+      : driver.sessionHandoffVersion === 1 && operation.kind === "describe" ? describeTimeout : 15_000;
     const result = await callWorker("environmentTask", params, timeout).catch(error => {
       // The plugin may have applied the saved claim before its reply was lost.
       // Keep the same operation ID; the RPC response below still needs validation.
