@@ -201,6 +201,28 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     expect((await db.select().from(routineRuns).where(eq(routineRuns.id, f.invocationId)))[0]).toEqual(before);
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("done");
   });
+  it.each(["blocked", "in_review"] as const)("handles a scheduled monitor when a native decision moves to %s", async status => {
+    const f = await seed();
+    const nextCheckAt = new Date(Date.now() + 16 * 60_000);
+    await db.update(issues).set({
+      executionPolicy: { stages: [], monitor: { nextCheckAt: nextCheckAt.toISOString(), notes: "Check status", scheduledBy: "assignee" } },
+      executionState: { status: "idle", currentStageId: null, currentStageIndex: null, currentStageType: null,
+        currentParticipant: null, returnAssignee: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        monitor: { status: "scheduled", nextCheckAt: nextCheckAt.toISOString(), lastTriggeredAt: null, attemptCount: 0,
+          notes: "Check status", scheduledBy: "assignee", clearedAt: null, clearReason: null } },
+      monitorNextCheckAt: nextCheckAt, monitorScheduledBy: "assignee",
+    }).where(eq(issues.id, f.issueId));
+
+    await commit(f, status);
+    const [saved] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    if (status === "blocked") {
+      expect(saved).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null,
+        executionState: { monitor: { status: "cleared", clearReason: "invalid_status" } } });
+    } else {
+      expect(saved.monitorNextCheckAt).toEqual(nextCheckAt);
+      expect(saved.executionState).toMatchObject({ monitor: { status: "scheduled", scheduledBy: "assignee" } });
+    }
+  });
   it("settles a publicly dispatched plugin-managed invocation with its supported custom origin", async () => {
     const f = await seed("custom-origin"); await commit(f, "done");
     expect((await db.select().from(routineRuns).where(eq(routineRuns.id, f.invocationId)))[0]).toMatchObject({ linkedIssueId: f.issueId, status: "completed", completedAt: expect.any(Date) });
