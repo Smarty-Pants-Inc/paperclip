@@ -1,133 +1,131 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { beforeAll, describe, expect, it, vi } from "vitest";
-import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { createOpenCodeCompanyObservability } from "../opencode/company-observability.js";
-import { PiRpcDriver } from "./pi-rpc-driver.js";
-import type { PiRpcRecord, PiRpcTransport } from "./pi-rpc-transport.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
+import { assistant, attrs, environment, openPi, sentinel, spans, terminal, tool, user } from "./pi-observability.test-fixture.js";
 
-// RED prerequisite for the native-observability brief, R1. Do not synthesize
-// turn.submitted or rewrite usage receipts to make this contract look compatible.
-// Only the native RPC peer is scripted; admission, projection and #emit are real.
-class ScriptedPiTransport {
-  closed = false;
-  exited = false;
-  pid = null;
-  queue: PiRpcRecord[] = [];
-  wake?: () => void;
-  async request(type: string) {
-    return { data: type === "get_state" ? {
-      sessionId: "native-pi-session", model: { provider: "neutral", id: "model" },
-      thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0,
-    } : type === "set_model" ? { provider: "neutral", id: "model" }
-      : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
-        : type === "get_available_thinking_levels" ? { levels: ["high"] }
-          : type === "prompt" ? { disposition: "started" } : undefined };
-  }
-  send(event: PiRpcRecord) { this.queue.push(event); this.wake?.(); }
-  async *events(): AsyncIterable<PiRpcRecord> {
-    while (!this.closed) {
-      const event = this.queue.shift();
-      if (event) { yield event; continue; }
-      await new Promise<void>(resolve => { this.wake = resolve; });
-    }
-  }
-  async close() { this.closed = this.exited = true; this.wake?.(); }
+let bodies: any[];
+let transport: ReturnType<typeof vi.fn<typeof fetch>>;
+beforeEach(() => {
+  bodies = [];
+  transport = vi.fn<typeof fetch>(async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response("{}"); });
+  vi.stubGlobal("fetch", transport);
+});
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+
+async function run(env = environment) {
+  const pi = await openPi(env);
+  try {
+    await pi.start();
+    pi.peer.send(...assistant("call-1", { tool: "read" }), ...tool("call-1"), ...terminal);
+    await pi.settled();
+    return pi;
+  } finally { await pi.close(); }
 }
 
-const environment = {
-  // Intentionally use the existing exporter's admitted flag, independently of
-  // the not-yet-implemented Pi flag/gate: this isolates the event-contract gap.
-  PAPERCLIP_OBSERVABILITY_OPENCODE: "1",
-  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "https://collector.example/v1/traces",
-  OTEL_RESOURCE_ATTRIBUTES: "paperclip.company.id=company,paperclip.agent.id=agent",
-  OTEL_LOG_USER_PROMPTS: "1", OTEL_LOG_ASSISTANT_RESPONSES: "1",
-  OTEL_LOG_TOOL_DETAILS: "1", OTEL_LOG_TOOL_CONTENT: "1",
-};
-const events: PrpEvent[] = [];
-const bodies: unknown[] = [];
-const transport = vi.fn<typeof fetch>(async (_url, init) => {
-  bodies.push(JSON.parse(String(init?.body)));
-  return new Response("{}");
-});
-
-beforeAll(async () => {
-  const root = await mkdtemp(join(tmpdir(), "pi-observability-contract-"));
-  const peer = new ScriptedPiTransport();
-  const observer = createOpenCodeCompanyObservability({ environment, model: "neutral/model", sensitiveValues: [], fetch: transport })!;
-  const session = await new PiRpcDriver({
-    runtimeDirectory: join(root, "runtime"), model: "neutral/model", piRpcThinkingLevel: "high",
-    environment: { PI_CODING_AGENT_DIR: join(root, "agent") },
-    transportFactory: () => peer as unknown as PiRpcTransport,
-  }).openSession({ runId: "run", normalizedSessionId: "normalized", workingDirectory: root });
-  const drained = (async () => {
-    for await (const event of session.events()) {
-      events.push(event);
-      observer.observe(event); // exact event from Pi's single sink, unchanged
-    }
-  })();
-  try {
-    await session.startTurn({ message: { role: "user", text: "Read the fixture" } });
-    for (const event of [
-      { type: "agent_start" },
-      { type: "message_start", message: { role: "user", id: "user-1", content: [{ type: "text", text: "Read the fixture" }] } },
-      { type: "message_end", message: { role: "user", id: "user-1", content: [{ type: "text", text: "Read the fixture" }] } },
-      { type: "message_start", message: { role: "assistant", responseId: "call-1" } },
-      { type: "message_end", message: {
-        role: "assistant", provider: "neutral", model: "model", responseId: "call-1", stopReason: "stop",
-        content: [{ type: "text", text: "Fixture read" }, { type: "toolCall", id: "tool-1", name: "read", arguments: { path: "fixture.txt" } }],
-        usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 4, totalTokens: 19, cost: { total: 0.125, totalFromProvider: true } },
-      } },
-      { type: "tool_execution_start", toolCallId: "tool-1", toolName: "read", args: { path: "fixture.txt" } },
-      { type: "tool_execution_end", toolCallId: "tool-1", toolName: "read", isError: false, result: { content: [{ type: "text", text: "fixture body" }] } },
-      { type: "agent_end", messages: [] },
-      { type: "agent_settled" },
-    ]) peer.send(event);
-    await vi.waitFor(() => expect(events.some(event => event.eventType === "turn.completed")).toBe(true));
-  } finally {
-    await session.close();
-    await drained;
-    await observer.close();
-    if (process.env.TASK_OUT) {
-      await writeFile(join(process.env.TASK_OUT, "R1-pi-sink-events.json"), `${JSON.stringify(events, null, 2)}\n`);
-      await writeFile(join(process.env.TASK_OUT, "R1-otlp-bodies.json"), `${JSON.stringify(bodies, null, 2)}\n`);
-    }
-    await rm(root, { recursive: true, force: true });
-  }
-});
-
-describe("R1 native Pi / shared observability prerequisites", () => {
-  it("control: the actual driver sink has terminal, tool, assistant and usage receipts", () => {
-    expect(events).toEqual(expect.arrayContaining([
+describe("R1 native Pi / shared observability contract (obs3, revised by Addenda)", () => {
+  it("exports one root/tool/usage request through the real Pi sink and observability-only adapter", async () => {
+    const pi = await run();
+    expect(pi.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ eventType: "turn.started" }),
       expect.objectContaining({ eventType: "turn.completed" }),
       expect.objectContaining({ eventType: "tool.execution.completed" }),
-      expect.objectContaining({ eventType: "item.completed", payload: expect.objectContaining({ kind: "agentMessage" }) }),
       expect.objectContaining({ eventType: "usage.reported", payload: expect.objectContaining({ runDelta: { inputTokens: 10, outputTokens: 2, cacheReadTokens: 3, cacheWriteTokens: 4, providerCostUsd: 0.125 } }) }),
     ]));
-  });
-  it("emits the turn.submitted event required to open the shared exporter's trace", () => {
-    expect(events.map(event => event.eventType)).toContain("turn.submitted");
-  });
-  it("emits the keyed per-message usage contract consumed by the shared exporter", () => {
-    const receipt = events.find(event => event.eventType === "item.completed" && event.payload.kind === "usage");
-    expect(receipt?.payload).toMatchObject({
-      usageMessageId: expect.any(String), usage: { input: 10, output: 2, cache: { read: 3, write: 4 }, costUsd: 0.125 },
-    });
-  });
-  it("exports one root/tool/usage request from the unmodified Pi sink sequence", () => {
     expect(transport).toHaveBeenCalledOnce();
-    expect(bodies[0]).toMatchObject({ resourceSpans: [{ scopeSpans: [{ spans: [
-      expect.objectContaining({ name: "paperclip.opencode.turn" }),
-      expect.objectContaining({ name: "tool read" }),
-      expect.objectContaining({ name: "opencode.model.usage" }),
-    ] }] }] });
+    expect(spans(bodies).map(s => s.name)).toEqual(["paperclip.pi.turn", "tool read", "pi.model.usage"]);
+    if (process.env.TASK_OUT) {
+      await writeFile(join(process.env.TASK_OUT, "R1-pi-sink-events.json"), JSON.stringify(pi.events, null, 2));
+      await writeFile(join(process.env.TASK_OUT, "R3-golden-otlp.json"), JSON.stringify(bodies, null, 2));
+    }
   });
-  it("control: disabled export creates no observer or requests", () => {
-    const disabledTransport = vi.fn<typeof fetch>();
-    const disabled = createOpenCodeCompanyObservability({ environment: { ...environment, PAPERCLIP_OBSERVABILITY_OPENCODE: "0" }, model: "neutral/model", sensitiveValues: [], fetch: disabledTransport });
-    for (const event of events) disabled?.observe(event);
-    expect(disabled).toBeUndefined();
-    expect(disabledTransport).not.toHaveBeenCalled();
+  it("A2.7 containment: subscribers/receipts never see synthetic turn.submitted or rewritten usage", async () => {
+    const pi = await run();
+    expect(pi.events.some(e => e.eventType === "turn.submitted")).toBe(false);
+    const receipt = pi.events.find(e => e.eventType === "item.completed" && e.payload.kind === "usage");
+    expect(receipt?.payload).not.toHaveProperty("usageMessageId");
+    expect(receipt?.payload.usage).toHaveProperty("total.inputTokens", 10);
+    expect(transport).toHaveBeenCalledOnce();
   });
+  it("disabled export: zero requests", async () => {
+    await run({ ...environment, PAPERCLIP_OBSERVABILITY_PI: "0" });
+    expect(transport).not.toHaveBeenCalled();
+  });
+});
+
+it("R2: credentials stay out of Pi child env/argv/config, run receipts and diagnostics", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const pi = await run();
+  expect(JSON.stringify([pi.child, pi.events, warn.mock.calls])).not.toContain(sentinel);
+  for (const key of AGENT_OBSERVABILITY_ENV_KEYS) expect(pi.child.env).not.toHaveProperty(key);
+  expect(transport.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: `Bearer ${sentinel}` });
+});
+it("R3: Langfuse golden mapping includes I/O, native session, provider cost and all Paperclip ids", async () => {
+  await run();
+  const all = spans(bodies);
+  expect(all).toHaveLength(3);
+  for (const span of all) expect(attrs(span)).toMatchObject({ "session.id": "native-pi-session", "paperclip.company.id": "company", "paperclip.agent.id": "agent", "paperclip.run.id": "run", "paperclip.task.id": "task", "paperclip.turn.id": expect.any(String) });
+  expect(attrs(all[0])).toMatchObject({ "braintrust.input": "Read the fixture", "langfuse.observation.input": "Read the fixture", "langfuse.observation.output": "Fixture read" });
+  expect(attrs(all[1])).toHaveProperty("langfuse.observation.output", "fixture body");
+  expect(attrs(all[2])).toMatchObject({ "gen_ai.usage.cost": 0.125, costProvenance: "provider_reported" });
+});
+it.each([
+  ["OTEL_LOG_USER_PROMPTS", "Read the fixture"], ["OTEL_LOG_ASSISTANT_RESPONSES", "Fixture read"],
+  ["OTEL_LOG_TOOL_DETAILS", "tool read"], ["OTEL_LOG_TOOL_CONTENT", "fixture body"],
+])("R4: %s removes only its capture category", async (key, omitted) => {
+  await run({ ...environment, [key]: "0" });
+  const wire = JSON.stringify(bodies);
+  expect(spans(bodies).length).toBeGreaterThan(0);
+  expect(wire).not.toContain(omitted);
+  if (key !== "OTEL_LOG_USER_PROMPTS") expect(wire).toContain("Read the fixture");
+  if (key !== "OTEL_LOG_ASSISTANT_RESPONSES") expect(wire).toContain("Fixture read");
+  if (!["OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_TOOL_DETAILS"].includes(key)) expect(wire).toContain("fixture body");
+});
+it("R4: all four switches off leaves metadata only", async () => {
+  await run({ ...environment, ...Object.fromEntries(["USER_PROMPTS", "ASSISTANT_RESPONSES", "TOOL_DETAILS", "TOOL_CONTENT"].map(k => [`OTEL_LOG_${k}`, "0"])) });
+  expect(spans(bodies)).toHaveLength(2);
+  expect(JSON.stringify(bodies)).not.toMatch(/Read the fixture|Fixture read|fixture body|braintrust\.(input|output)|langfuse\.observation\.(input|output)/);
+});
+it("A2.1: two per-receipt deltas plus cumulative items sum to the final run total exactly once", async () => {
+  const pi = await openPi();
+  try {
+    await pi.start(); pi.peer.send(...assistant("one"), ...assistant("two"), ...terminal); await pi.settled();
+  } finally { await pi.close(); }
+  const cumulative = pi.events.filter(e => e.eventType === "item.completed" && e.payload.kind === "usage").at(-1)?.payload.usage as any;
+  const usage = spans(bodies).filter(s => s.name === "pi.model.usage");
+  expect(usage).toHaveLength(2);
+  expect(usage.reduce((n, s) => n + attrs(s)["gen_ai.usage.input_tokens"], 0)).toBe(cumulative.total.inputTokens);
+  expect(usage.reduce((n, s) => n + attrs(s)["gen_ai.usage.cost"], 0)).toBe(cumulative.providerReportedCostUsd);
+});
+it("A2.6: consumed mid-turn steer joins the prompt with a blank line, redaction and 8 KiB cap", async () => {
+  const pi = await openPi();
+  try {
+    await pi.start("first"); pi.peer.send(...assistant("one"));
+    await vi.waitFor(() => expect(pi.events.some(e => e.eventType === "usage.reported")).toBe(true));
+    const turnId = pi.events.find(e => e.eventType === "turn.started")!.turnId!;
+    const text = `steer ${sentinel} ${"😀".repeat(3000)}`;
+    await pi.session.steer!({ turnId, mode: "steer", message: { role: "user", text } });
+    pi.peer.send(...user("steer", text), ...assistant("two"), ...terminal); await pi.settled();
+  } finally { await pi.close(); }
+  const root = spans(bodies).find(s => s.name === "paperclip.pi.turn");
+  expect(root).toBeDefined();
+  const input = attrs(root)["langfuse.observation.input"];
+  expect(input).toMatch(/^first\n\nsteer \[REDACTED\]/);
+  expect(Buffer.byteLength(input)).toBeLessThanOrEqual(8192);
+  expect(input).not.toContain("\ufffd");
+  expect(attrs(root)["paperclip.observability.truncated"]).toBe(true);
+});
+it("R8: OFF company cannot inherit enabled company export, including reused warm sessions", async () => {
+  const enabled = await openPi();
+  const off = await openPi({ ...environment, PAPERCLIP_OBSERVABILITY_PI: "0", OTEL_RESOURCE_ATTRIBUTES: "paperclip.company.id=client" });
+  try {
+    for (let turn = 1; turn <= 2; turn++) {
+      for (const [label, pi] of [["enabled", enabled], ["client-private", off]] as const) {
+        await pi.start(label); pi.peer.send(...assistant(`${label}-${turn}`), ...terminal); await pi.settled(turn);
+      }
+    }
+    expect(transport).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(bodies)).not.toContain("client-private");
+    expect(spans(bodies).every(s => attrs(s)["paperclip.company.id"] === "company")).toBe(true);
+  } finally { await enabled.close(); await off.close(); }
 });
