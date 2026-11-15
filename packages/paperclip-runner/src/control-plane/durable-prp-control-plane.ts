@@ -295,6 +295,12 @@ export class SemanticToolNotDispatchedError extends Error {
   }
 }
 
+export class SemanticToolHandedOffError extends Error {
+  constructor() {
+    super("semantic_tool_handed_off");
+  }
+}
+
 export interface DurablePrpControlPlaneOptions {
   stateDirectory: string;
   identity: DurableRecoveryIdentity;
@@ -4890,6 +4896,7 @@ export class DurablePrpControlPlane {
             queueResult(outcome.result, outcome.isError === true),
           )
           .catch((error: unknown) => {
+            if (error instanceof SemanticToolHandedOffError) return;
             if (error instanceof SemanticToolNotDispatchedError) {
               queueResult({ error: {
                 code: "semantic_tool_not_dispatched",
