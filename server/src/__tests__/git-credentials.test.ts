@@ -2,8 +2,27 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { companyMemberships, connectionGrantMembers, connectionGrants, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
+import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { agents, companies, companyMemberships, connectionGrantMembers, connectionGrants, createDb, issues, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
+import { githubCredentialsFixture } from "./helpers/github-credentials-fixture.js";
+import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+
+const appFixture = vi.hoisted(() => ({
+  secret: vi.fn(async () => ({ value: "fixture-private-key", latestVersion: 1 })),
+  acquire: vi.fn(async () => ({ token: "fixture-app-token", expiresAt: Date.now() + 3_600_000,
+    github: { userId: "123", login: "fixture[bot]", installationCount: 1, repositoryCount: 1,
+      repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } })),
+}));
+vi.mock("../services/connection-credentials.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/connection-credentials.js")>(),
+  resolveConnectionGrantSecret: appFixture.secret,
+}));
+vi.mock("../services/github-app-client.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/github-app-client.js")>(),
+  createGitHubAppClient: () => ({ acquire: appFixture.acquire }),
+}));
 import * as appCredentials from "../services/github-app-credentials.js";
 import {
   DEFAULT_GITHUB_TOKEN_SECRET_NAMES,
@@ -119,6 +138,85 @@ describe("GitHub App ownership and agent reach", () => {
     }
     grant.status = "revoked";
     expect((await resolveManagedGitHubIdentitySelection(db, "company", { agentId: "a", responsibleUserId: "owner" })).grant).toBeUndefined();
+  });
+});
+
+describe("RF2: person-authored Git work without an agent", () => {
+  let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
+  let db: ReturnType<typeof createDb>;
+  beforeAll(async () => {
+    database = await startEmbeddedPostgresTestDatabase("paperclip-null-agent-");
+    db = createDb(database.connectionString);
+  }, 30_000);
+  afterAll(async () => {
+    await db?.$client.end({ timeout: 1 });
+    await database?.cleanup();
+  }, 60_000);
+  const { grant: seedGrant } = githubCredentialsFixture(() => db);
+
+  async function fixture(kind: "agent" | "user" | "organization", personal: boolean, assigned: boolean) {
+    const input = { companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() };
+    await db.insert(companies).values({ id: input.companyId, name: "RF2", issuePrefix: input.companyId.slice(0, 8) });
+    await db.insert(agents).values({ id: input.agentId, companyId: input.companyId, name: "App agent", role: "engineer", adapterType: "codex_local" });
+    await db.insert(companyMemberships).values({ companyId: input.companyId, principalType: "user", principalId: "owner", status: "active", membershipRole: "member" });
+    // A real issue can have a responsible person but no assigned agent. Do not
+    // manufacture a null-agent heartbeat: heartbeat_runs.agent_id is NOT NULL.
+    await db.insert(issues).values({ id: input.issueId, companyId: input.companyId, title: "Person-authored work",
+      responsibleUserId: "owner", assigneeAgentId: assigned ? input.agentId : null });
+    const app = await seedGrant(input, "owner", kind !== "user");
+    await db.update(toolConnections).set({ credentialPolicy: kind === "agent" ? "per_agent" : kind === "user" ? "per_user" : "shared",
+      config: { sourceTemplateKey: "github", connectionMethodKey: "app-installation", methodConfig: {
+        appId: "1", installationId: "456", repositories: "owner/repo", permissionProfile: "read",
+      } } }).where(eq(toolConnections.id, app.connectionId));
+    await db.update(connectionGrants).set({ kind, subjectAgentId: kind === "agent" ? input.agentId : null,
+      subjectUserId: kind === "user" ? "owner" : null,
+      credentialSecretRefs: [{ configPath: "credentials.privateKey", secretId: app.secretId, versionSelector: "latest" }],
+    }).where(eq(connectionGrants.id, app.id));
+    const own = personal ? await seedGrant(input, "owner") : null;
+    if (own) await db.update(toolConnectionInstalls).set({ targetType: "company", targetId: input.companyId })
+      .where(eq(toolConnectionInstalls.connectionId, own.connectionId));
+    const secrets = { ...buildSecretsFake({}), resolveUserSecretValue: vi.fn(async () => ({ value: "fixture-personal-token",
+      manifestEntry: { configPath: "oauth.access_token", envKey: null, secretId: own?.secretId ?? "", secretKey: "fixture-personal-token",
+        version: 1, provider: "local_encrypted" as const, outcome: "success" as const },
+    })) };
+    const resolveApp = vi.spyOn(appCredentials, "resolveGitHubAppCredential");
+    appFixture.secret.mockClear();
+    appFixture.acquire.mockClear();
+    const create = ((_db, companyId, context) => createGitRemoteAuthProvider(_db, companyId, context, { secrets, env: {} })) as typeof createGitRemoteAuthProvider;
+    const provider = createIssueGitRemoteAuthProvider(db, input.companyId, input.issueId, create);
+    return { input, app, own, secrets, resolveApp, provider };
+  }
+
+  it.each(["agent", "user", "organization"] as const)("(a) null agent uses the person's grant, never an agent-installed %s App", async kind => {
+    const { provider, secrets, resolveApp } = await fixture(kind, true, false);
+    const invocation = await provider("https://github.com/owner/repo.git");
+    expect(invocation?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("fixture-personal-token");
+    expect(invocation?.env.GIT_AUTHOR_NAME).toBe("owner");
+    expect(secrets.resolveUserSecretValue).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ responsibleUserId: "owner" }), expect.any(Object));
+    expect(resolveApp).not.toHaveBeenCalled();
+    expect(appFixture.secret).not.toHaveBeenCalled();
+    expect(appFixture.acquire).not.toHaveBeenCalled();
+    expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent", "user", "organization"] as const)("(b) null agent without a personal grant gets no agent-installed %s App token", async kind => {
+    const { provider, secrets, resolveApp } = await fixture(kind, false, false);
+    await expect(provider("https://github.com/owner/repo.git")).resolves.toBeNull();
+    expect(resolveApp).not.toHaveBeenCalled();
+    expect(appFixture.secret).not.toHaveBeenCalled();
+    expect(appFixture.acquire).not.toHaveBeenCalled();
+    expect(secrets.resolveUserSecretValue).not.toHaveBeenCalled();
+    expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
+  });
+
+  it.each(["agent", "user", "organization"] as const)("(c) assigned agent gets its agent-installed %s App token", async kind => {
+    const { input, app, provider, secrets, resolveApp } = await fixture(kind, false, true);
+    expect((await provider("https://github.com/owner/repo.git"))?.env[GIT_CREDENTIAL_TOKEN_ENV_KEY]).toBe("fixture-app-token");
+    expect(resolveApp).toHaveBeenCalledWith(db, expect.objectContaining({ id: app.connectionId }), expect.objectContaining({ id: app.id }), false, false, input.agentId);
+    expect(appFixture.secret).toHaveBeenCalledTimes(1);
+    expect(appFixture.acquire).toHaveBeenCalledTimes(1);
+    expect(secrets.getByName).not.toHaveBeenCalled();
+    expect(secrets.resolveUserSecretValue).not.toHaveBeenCalled();
   });
 });
 
