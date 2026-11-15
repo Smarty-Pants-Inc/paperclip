@@ -19,6 +19,7 @@ import { registerDeferredReceiptWork } from "./deferred-receipt-work.js";
 import type { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
 import type { DeferredExecutionScope } from "../deferred-execution-notifications.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
+import { withConversationReadState } from "../agent-chat-read-state.js";
 
 type Entry = { id: string; companyId: string; dueAt: number; immediate: boolean };
 type Options = Parameters<typeof registerScopedDeadlineWork<Entry, DeferredExecutionScope>>[1];
@@ -79,7 +80,7 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
     }, () => true);
     const worker = registered.get(DELIVERY_QUEUES.deferredExecutionReceipts)!;
     await worker.beforePass?.();
-    return { company, agent, issue, source, queue, deps, worker };
+    return { company, agent, issue, source, queue, deps, worker, userId };
   }
   type Seed = Awaited<ReturnType<typeof seed>>;
   async function plugin(status: PluginStatus, minutes: number, transition = true) {
@@ -109,7 +110,8 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
     return f.worker.check({ id: r.id, companyId: f.company.id, dueAt: Date.now(), immediate: true });
   }
   async function transitions(p: Plugin) {
-    return db.select().from(pluginLogs).where(and(eq(pluginLogs.pluginId, p.id), sql`${pluginLogs.meta}->>'kind' = 'status_transition'`));
+    return db.select().from(pluginLogs).where(and(eq(pluginLogs.pluginId, p.id), sql`${pluginLogs.meta}->>'kind' = 'status_transition'`))
+      .orderBy(pluginLogs.createdAt);
   }
 
   it.each(["upgrade_pending", "installed"] as const)("a/b: one worker check expires a quiet %s wake entered 31 min ago", async status => {
@@ -156,6 +158,7 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
     const f = await seed(), p = await plugin("upgrade_pending", 5), r = await receipt(f, p);
     await check(f, r);
     await pluginRegistryService(db).updateStatus(p.id, { status: "ready" });
+    expect((await entries(f)).find(e => e.id === r.id)).toMatchObject({ immediate: true });
     await check(f, r);
     expect(await readReceipt(r.id)).toMatchObject({ status: "queued", error: null });
     expect(await queued(f)).toHaveLength(1);
@@ -166,11 +169,47 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({ authorType: "system", authorAgentId: null, authorUserId: null, createdByRunId: null,
-      metadata: { authorizationReason: `plugin_wake_hold_expired:${r.id}` },
+      presentation: { kind: "system_notice" }, metadata: { authorizationReason: `plugin_wake_hold_expired:${r.id}` },
       body: `Follow-up plugin couldn't continue here: it has been waiting 31 min for an admin to approve its update, so its follow-up was stopped. [Plugin settings](/instance/settings/plugins/${p.id})` });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id))).toHaveLength(1);
     expect(await queued(f)).toHaveLength(0);
     expect(f.deps.executeRun).not.toHaveBeenCalled();
+    expect(await withConversationReadState(db, f.company.id, f.userId, [f.issue])).toMatchObject([
+      { isUnreadForMe: false, unreadMessageCount: 0, lastExternalCommentAt: null },
+    ]);
+  });
+  it("f-concurrent: concurrent worker checks commit only one cancellation and notice", async () => {
+    const f = await seed(), p = await plugin("upgrade_pending", 31), r = await receipt(f, p);
+    await Promise.all([check(f, r), check(f, r)]);
+    expect(await readReceipt(r.id)).toMatchObject({ status: "cancelled", error: "plugin_wakeup_hold_expired" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id))).toHaveLength(1);
+  });
+  it("f-guard: a preexisting authorization reason is not inserted again", async () => {
+    const f = await seed(), p = await plugin("upgrade_pending", 31), r = await receipt(f, p);
+    const [existing] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+      authorType: "system", body: "Already recorded",
+      metadata: sql`${JSON.stringify({ authorizationReason: `plugin_wake_hold_expired:${r.id}` })}::jsonb` }).returning();
+    await check(f, r);
+    expect(await readReceipt(r.id)).toMatchObject({ status: "cancelled", error: "plugin_wakeup_hold_expired" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toMatchObject([{ id: existing.id }]);
+  });
+  it("f-rollback: timeout cancellation and its system note roll back together", async () => {
+    const f = await seed(), p = await plugin("upgrade_pending", 31), r = await receipt(f, p);
+    const adapter = createPostgresWakeQueueAdapter(db, {
+      resolveResponsibleUserId: async () => f.userId,
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+    });
+    await expect(adapter.withIssueExecutionLock({ companyId: f.company.id, runId: f.source.id, now: new Date() }, async (_locked, ports) => {
+      await ports.transaction.findNextDeferredWake({ companyId: f.company.id, issueId: f.issue.id });
+      throw new Error("abort release");
+    })).rejects.toThrow("abort release");
+    expect(await readReceipt(r.id)).toMatchObject({ status: "deferred_issue_execution", error: null });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+    await check(f, r);
+    expect(await readReceipt(r.id)).toMatchObject({ status: "cancelled", error: "plugin_wakeup_hold_expired" });
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(1);
   });
   it("g: missing transition backfills the old timestamp and expires", async () => {
     const f = await seed(), p = await plugin("upgrade_pending", 31, false), r = await receipt(f, p);
@@ -190,6 +229,23 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
     expect(await check(f, r)).toMatchObject({ dueAt: expected });
     expect(await readReceipt(r.id)).toMatchObject({ status: "deferred_issue_execution" });
     expect(await transitions(p)).toHaveLength(1);
+  });
+  it("g2-concurrent: concurrent loads backfill exactly once", async () => {
+    const f = await seed(), p = await plugin("installed", 5, false), r = await receipt(f, p);
+    const loads = await Promise.all([entries(f), entries(f)]);
+    for (const rows of loads) expect(rows.find(e => e.id === r.id)).toMatchObject({ dueAt: p.updatedAt.getTime() + 30 * 60_000 });
+    expect(await transitions(p)).toHaveLength(1);
+  });
+  it("latest: use the latest matching transition, not another status or updated_at", async () => {
+    const f = await seed(), p = await plugin("upgrade_pending", 31), r = await receipt(f, p);
+    const latest = new Date(Date.now() - 5 * 60_000);
+    await db.insert(pluginLogs).values([
+      { pluginId: p.id, message: "status → upgrade_pending", meta: { kind: "status_transition", from: "ready", to: p.status }, createdAt: latest },
+      { pluginId: p.id, message: "different status", meta: { kind: "status_transition", from: "installed", to: "ready" }, createdAt: new Date() },
+    ]);
+    await db.update(plugins).set({ updatedAt: new Date() }).where(eq(plugins.id, p.id));
+    expect(await check(f, r)).toMatchObject({ dueAt: latest.getTime() + 30 * 60_000, immediate: false });
+    expect(await readReceipt(r.id)).toMatchObject({ status: "deferred_issue_execution" });
   });
   it("h: updateStatus logs one real transition and none for an unchanged status", async () => {
     const p = await plugin("ready", 0, false), registry = pluginRegistryService(db);
@@ -225,9 +281,26 @@ describe.skipIf(!support.supported)("plugin wake hold deadline", () => {
       { kind: "status_transition", from: "uninstalled", to: "installed" },
     ]);
   });
+  it("writers-concurrent: concurrent same-status writes record only one transition", async () => {
+    const p = await plugin("ready", 0, false), registry = pluginRegistryService(db);
+    await Promise.all([registry.updateStatus(p.id, { status: "upgrade_pending" }), registry.updateStatus(p.id, { status: "upgrade_pending" })]);
+    expect(await transitions(p)).toMatchObject([{ meta: { from: "ready", to: "upgrade_pending" } }]);
+  });
+  it("writers-rollback: a rolled-back change leaves no transition and a failed error-prefix CAS logs nothing", async () => {
+    const p = await plugin("ready", 0, false), registry = pluginRegistryService(db);
+    expect(await registry.updateStatusIf(p.id, { status: "ready", lastErrorPrefix: "missing" }, { status: "upgrade_pending" })).toBeNull();
+    expect(await transitions(p)).toHaveLength(0);
+    await expect(db.transaction(async tx => {
+      await pluginRegistryService(tx as unknown as Db).updateStatus(p.id, { status: "upgrade_pending" });
+      throw new Error("abort status");
+    })).rejects.toThrow("abort status");
+    expect(await registry.getById(p.id)).toMatchObject({ status: "ready" });
+    expect(await transitions(p)).toHaveLength(0);
+  });
   it("disabled: even an old pending plugin uses the unchanged unavailable cancellation without a timeout note", async () => {
     const f = await seed(), p = await plugin("upgrade_pending", 31), r = await receipt(f, p);
     await db.insert(pluginCompanySettings).values({ pluginId: p.id, companyId: f.company.id, enabled: false });
+    expect((await entries(f)).find(e => e.id === r.id)).toMatchObject({ immediate: true });
     await check(f, r);
     expect(await readReceipt(r.id)).toMatchObject({ status: "cancelled", error: "plugin_wakeup_origin_unavailable" });
     expect(await db.select().from(issueComments)).toHaveLength(0);
