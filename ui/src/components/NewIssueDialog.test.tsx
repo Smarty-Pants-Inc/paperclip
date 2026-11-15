@@ -2641,6 +2641,36 @@ describe("NewIssueDialog", () => {
     }
   });
 
+  it("keeps company B's draft when explicitly sending an offline create recovered in company A", async () => {
+    mockIssuesApi.create.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    dialogState.newIssueDefaults = { description: "Offline task in A" };
+    const { root, queryClient } = renderDialog(container);
+    try {
+      await flush();
+      await act(async () => { container.querySelector<HTMLButtonElement>('[aria-label="Create task"]')!.click(); });
+      await waitForAssertion(() => expect(dialogState.openNewIssue).toHaveBeenCalled());
+      const originalKey = mockIssuesApi.create.mock.calls[0][1].idempotencyKey;
+      companyState.selectedCompanyId = "company-b";
+      dialogState.newIssueDefaults = {};
+      act(() => { root.render(<QueryClientProvider client={queryClient}><NewIssueDialog /></QueryClientProvider>); });
+      await flush();
+      const editor = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Describe a task…"]')!;
+      await typeTextareaValue(editor, "New draft in B stays here");
+      expect(container.textContent).toContain("A task you created in Paperclip hasn't been sent yet.");
+      const send = Array.from(container.querySelectorAll("button")).find(item => item.textContent === "Send")!;
+      expect(send).toBeDefined();
+      await act(async () => { send.click(); });
+      await flush();
+      expect(mockIssuesApi.create).toHaveBeenCalledTimes(2);
+      expect(mockIssuesApi.create.mock.calls[1]).toEqual(["company-1", expect.objectContaining({ idempotencyKey: originalKey, description: "Offline task in A" })]);
+      expect(editor.value).toBe("New draft in B stays here");
+      expect(dialogState.closeNewIssue).toHaveBeenCalledOnce(); // Initial Create only.
+    } finally {
+      act(() => root.unmount());
+      companyState.selectedCompanyId = "company-1";
+    }
+  });
+
   it("restores two queued tasks and their separate files after a reload", async () => {
     mockIssuesApi.create.mockImplementationOnce(() => new Promise(() => {}));
     mockIssuesApi.uploadAttachment.mockResolvedValue({});
