@@ -58,12 +58,20 @@ vi.mock("./components/PageLoadTracker", () => ({ PageLoadTracker: () => null }))
 vi.mock("./components/ConnectionStatusBanner", () => ({ ConnectionStatusBanner: () => null }));
 vi.mock("./components/OnboardingWizardVariant", () => ({ OnboardingWizardVariant: () => null }));
 // Exercise App's no-organizations fallback rather than redirecting to the wizard.
-vi.mock("./lib/onboarding-route", async (importOriginal) => ({
-  ...await importOriginal<typeof import("./lib/onboarding-route")>(),
-  shouldRedirectCompanylessRouteToOnboarding: () => false,
-}));
+vi.mock("./lib/onboarding-route", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./lib/onboarding-route")>();
+  return {
+    ...actual,
+    shouldRedirectCompanylessRouteToOnboarding: (params: Parameters<typeof actual.shouldRedirectCompanylessRouteToOnboarding>[0]) =>
+      routeState.suppressRedirect ? false : actual.shouldRedirectCompanylessRouteToOnboarding(params),
+  };
+});
 
-const routeState = vi.hoisted(() => ({ companyPrefix: "PC1" as string | undefined, noCompanies: false }));
+const routeState = vi.hoisted(() => ({
+  companyPrefix: "PC1" as string | undefined,
+  noCompanies: false,
+  suppressRedirect: true,
+}));
 const dialogState = vi.hoisted(() => ({
   onboardingOpen: false,
   onboardingRouteDismissed: true,
@@ -154,6 +162,7 @@ describe("the onboarding launcher's Add Agent button", () => {
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     creationPolicy.hidden = false;
     routeState.noCompanies = false;
+    routeState.suppressRedirect = true;
     routeState.companyPrefix = "PC1";
     dialogState.onboardingOpen = false;
     dialogState.onboardingRouteDismissed = true;
@@ -190,6 +199,23 @@ describe("the onboarding launcher's Add Agent button", () => {
       await act(async () => button.click());
       expect(dialogState.openOnboarding).toHaveBeenCalledWith();
     }
+  });
+
+  it.each(["/", "/companies", "/settings"])("does not redirect an empty account to creation from %s", async (path) => {
+    creationPolicy.hidden = true;
+    routeState.noCompanies = true;
+    routeState.suppressRedirect = false;
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[path]}><App /></MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    expect(container.textContent).toContain("Get started by creating an organization.");
+    expect(container.textContent).not.toContain("Start Onboarding");
+    expect(container.textContent).not.toContain("New Organization");
   });
 
   it.each([true, false])("unmatched onboarding launcher: hidden=%s", async (hidden) => {
