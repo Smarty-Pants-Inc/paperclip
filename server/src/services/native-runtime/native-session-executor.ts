@@ -15928,9 +15928,9 @@ export async function readRemoteRunnerState(input: {
         deadline: input.recoveryDeadline, readOnly: true, stall: input.stall,
       });
   if (result.exitCode !== 0 || result.timedOut) {
-    const error = Object.assign(new Error(
+    const error = new Error(
       `runner_remote_state_unavailable: exit=${result.exitCode} timedOut=${result.timedOut}${result.stderr.trim() ? ` ${redactSensitiveText(result.stderr).trim().slice(-512)}` : ""}`,
-    ), { code: "runner_remote_state_unavailable" });
+    );
     throw input.recoveryDeadline === undefined ? error : attachRemoteRunnerRecoveryDiagnostic(error,
       { stage: "runner_state", reason: result.timedOut ? "probe_timeout" : "state_read_failed" });
   }
