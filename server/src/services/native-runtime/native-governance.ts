@@ -1,5 +1,5 @@
 import { and, eq, inArray, notInArray } from "drizzle-orm";
-import { approvals, issueApprovals, issueComments, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { approvals, issueApprovals, issueComments, issueExecutionDecisions, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { activeIssueInteractionCondition } from "../issue-question-context.js";
 import { isConversation } from "../agent-conversations.js";
 import type { NativeGovernanceGate } from "./status-arbiter.js";
@@ -8,6 +8,28 @@ function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : {};
 }
 
+
+/** A saved stage decision, bound to this run, owns the changes-requested return. */
+export async function executionStageChangesRequestedByRun(
+  db: Db,
+  run: { id: string; companyId: string; agentId: string },
+  issue: { id: string; executionState: unknown },
+): Promise<boolean> {
+  const state = record(issue.executionState);
+  // The round cap keeps a pending stage for a person and retains the prior
+  // outcome in state. Its new decision row still records changes_requested.
+  if (!["changes_requested", "pending"].includes(String(state.status)) ||
+      (state.status === "pending" && record(state.currentParticipant).type !== "user") ||
+      (state.status === "changes_requested" && state.lastDecisionOutcome !== "changes_requested") ||
+      typeof state.lastDecisionId !== "string" || typeof state.currentStageId !== "string") return false;
+  const [decision] = await db.select({ id: issueExecutionDecisions.id }).from(issueExecutionDecisions).where(and(
+    eq(issueExecutionDecisions.id, state.lastDecisionId), eq(issueExecutionDecisions.companyId, run.companyId),
+    eq(issueExecutionDecisions.issueId, issue.id), eq(issueExecutionDecisions.stageId, state.currentStageId),
+    eq(issueExecutionDecisions.outcome, "changes_requested"), eq(issueExecutionDecisions.actorAgentId, run.agentId),
+    eq(issueExecutionDecisions.createdByRunId, run.id),
+  )).limit(1);
+  return Boolean(decision);
+}
 
 export async function lockNativeGovernanceSources(input: { db: Db; companyId: string; issueId: string }): Promise<void> {
   const interactions = await input.db.select({ kind: issueThreadInteractions.kind }).from(issueThreadInteractions)

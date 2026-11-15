@@ -14855,19 +14855,16 @@ export function issueRoutes(
    * reply (nativeConversationReplyResult), not from a runner tool, so a reply
    * that moves the conversation to review still settles without the lock.
    *
-   * The one status-shaped request a run must be able to send is the active
-   * review/approval participant's approval (`status: "done"` with its decision
-   * comment): no runner tool records a stage decision, so refusing it leaves
-   * the stage pending forever. With `allowStageApproval` the guard returns
-   * "defer_final_status" for that request instead of refusing it. The caller
-   * records the decision and keeps the task (and the run's lock) in review;
-   * the run's own paperclip_finish report then sets the final status.
+   * An active review/approval participant can record its decision with a
+   * comment and `done` or `in_progress`. No runner tool records that decision.
+   * With `allowStageDecision`, keep the task and run lock in review until the
+   * native finalizer applies the saved approval or changes-requested return.
    */
   async function assertNativeRunKeepsOwnExecutionLock(
     req: Request,
     issue: { companyId: string; status: string; parentId: string | null; assigneeAgentId: string | null; assigneeUserId: string | null; checkoutRunId: string | null; executionRunId: string | null; conversationAgentId?: string | null; conversationUserId?: string | null; executionState?: unknown },
     requestedStatus: unknown = req.body.status,
-    options: { allowStageApproval?: boolean } = {},
+    options: { allowStageDecision?: boolean } = {},
   ): Promise<"defer_final_status" | undefined> {
     const runId = req.actor.type === "agent" ? req.actor.runId : null;
     if (!runId || !req.actor.agentId || req.actor.agentId !== issue.assigneeAgentId) return;
@@ -14881,7 +14878,7 @@ export function issueRoutes(
     const run = await heartbeat.getRun(runId);
     if (!run || run.runtimeMode !== "native" || run.status !== "running"
       || run.agentId !== req.actor.agentId || run.companyId !== issue.companyId) return;
-    if (options.allowStageApproval && requestedStatus === "done" && issue.status === "in_review" &&
+    if (options.allowStageDecision && (requestedStatus === "done" || requestedStatus === "in_progress") && issue.status === "in_review" &&
         activeExecutionParticipantAgentId(issue) === req.actor.agentId) {
       return "defer_final_status";
     }
@@ -15013,7 +15010,7 @@ export function issueRoutes(
       );
       if (!existing) return;
       if (!(await assertIssueReadAllowed(req, res, existing))) return;
-      const nativeStageApproval = await assertNativeRunKeepsOwnExecutionLock(req, existing, req.body.status, { allowStageApproval: true });
+      const nativeStageDecision = await assertNativeRunKeepsOwnExecutionLock(req, existing, req.body.status, { allowStageDecision: true });
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
       )) {
@@ -15224,10 +15221,10 @@ export function issueRoutes(
         req.body.reviewPolicy !== existing.reviewPolicy;
       const reviewVerdictRequested =
         existing.status === "in_review" &&
-        (updateFields.status === "done" || updateFields.status === "cancelled");
+        (updateFields.status === "done" || updateFields.status === "cancelled" || nativeStageDecision === "defer_final_status");
       const mcpReviewSensitiveMutation = mcpParticipationChange;
       const reviewPolicySensitiveMutationRequested =
-        mcpReviewSensitiveMutation || req.body.reviewPolicy !== undefined ||
+        mcpReviewSensitiveMutation || req.body.reviewPolicy !== undefined || nativeStageDecision === "defer_final_status" ||
         updateFields.status === "done" ||
         updateFields.status === "cancelled";
       if (
@@ -15577,17 +15574,21 @@ export function issueRoutes(
         throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
       }
       Object.assign(updateFields, transition.patch);
-      let deferredNativeStageApproval = false;
-      if (nativeStageApproval === "defer_final_status") {
-        // Only the final stage's approval is deferred. Anything else this
-        // request would do (an intermediate approval that hands the task to the
-        // next participant, or no decision at all) keeps the ordinary refusal.
+      let deferredNativeStageDecision = false;
+      if (nativeStageDecision === "defer_final_status") {
+        // Keep final approval unchanged. A changes request saves the policy's
+        // return path now; the finalizer applies assignment and its wake later.
         const finalApproval = transition.decision?.outcome === "approved" && updateFields.status === "done" &&
           (transition.patch.assigneeAgentId === undefined || transition.patch.assigneeAgentId === existing.assigneeAgentId) &&
           transition.patch.assigneeUserId === undefined;
-        if (!finalApproval) throw nativeRunStatusReportedByFinish(req.body.status);
+        const changesRequested = req.body.status === "in_progress" && transition.decision?.outcome === "changes_requested";
+        if (!finalApproval && !changesRequested) throw nativeRunStatusReportedByFinish(req.body.status);
         delete updateFields.status;
-        deferredNativeStageApproval = true;
+        if (changesRequested) {
+          delete updateFields.assigneeAgentId;
+          delete updateFields.assigneeUserId;
+        }
+        deferredNativeStageDecision = true;
       }
 
       const nextStatus = updateFields.status ?? existing.status;
@@ -16035,13 +16036,13 @@ export function issueRoutes(
         const lockedPolicyChangeRequested =
           req.body.reviewPolicy !== undefined &&
           req.body.reviewPolicy !== lockedExisting.reviewPolicy;
-        // A deferred native approval is still a review verdict even though
+        // A deferred native stage decision is still a review verdict even though
         // its status write is left to the run's finish report.
         const lockedReviewVerdictRequested =
           lockedExisting.status === "in_review" &&
           (updateFields.status === "done" ||
             updateFields.status === "cancelled" ||
-            deferredNativeStageApproval);
+            deferredNativeStageDecision);
         if (
           (lockedReviewVerdictRequested || lockedPolicyChangeRequested) &&
           lockedExisting.reviewPolicy != null &&
@@ -16993,7 +16994,7 @@ export function issueRoutes(
         existing.executionState,
       );
       const nextExecutionState = parseIssueExecutionState(issue.executionState);
-      const executionStageWakeup = buildExecutionStageWakeup({
+      const executionStageWakeup = deferredNativeStageDecision ? null : buildExecutionStageWakeup({
         issueId: issue.id,
         previousState: previousExecutionState,
         nextState: nextExecutionState,
