@@ -9,6 +9,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import * as executionTargetTools from "@paperclipai/adapter-utils/execution-target";
 import * as ssh from "@paperclipai/adapter-utils/ssh";
+import * as directoryProbeTools from "../services/agent-directory-probe.js";
 const execFile = promisify(execFileCallback);
 import os from "node:os";
 import path from "node:path";
@@ -117,7 +118,7 @@ describe("persistent agent directories", () => {
       try {
         await copies.registerDirectoryCleanupWork(worker, () => true, async () => true).ready;
         await expect.poll(() => idleWorkSnapshot().active).toBe(0);
-        const reads = vi.spyOn(db, "select"), removes = vi.spyOn(fs, "rm");
+        const reads = vi.spyOn(db, "select"), removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined");
         await vi.advanceTimersByTimeAsync(120_000);
         expect(reads).not.toHaveBeenCalled(); expect(removes).not.toHaveBeenCalled();
         expect(worker.nextWakeAt()).toBeNull();
@@ -129,7 +130,7 @@ describe("persistent agent directories", () => {
       await db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(),
         nextAttemptAt: new Date(), receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } })
         .where(eq(agentInstructionWorkingCopies.runId, copy.runId));
-      clock(); const worker = coordinator(), removes = vi.spyOn(fs, "rm");
+      clock(); const worker = coordinator(), removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined");
       try {
         await agentInstructionWorkingCopyService(db).registerDirectoryCleanupWork(worker, () => true, async () => true).ready;
         await vi.waitFor(async () => {
@@ -165,9 +166,9 @@ describe("persistent agent directories", () => {
     it("reactivates from real collection, preserves saved files, retries failed cleanup, and becomes quiet", async () => {
       const copy = await run(); await fs.writeFile(path.join(copy.localRoot, "memory.txt"), "saved memory");
       clock(); const worker = coordinator();
-      const remove = fs.rm.bind(fs);
+      const remove = directoryProbeTools.removeLocalAgentDirectoryConfined;
       let failing = true;
-      const removes = vi.spyOn(fs, "rm").mockImplementation(async (file, opts) => {
+      const removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined").mockImplementation(async (file, opts) => {
         if (failing && file === path.dirname(copy.localRoot)) throw new Error("temporary cleanup failure");
         return remove(file, opts);
       });
@@ -218,7 +219,7 @@ describe("persistent agent directories", () => {
       try {
         await copies.registerDirectoryCleanupWork(worker, () => true, async () => true).ready;
         expect(worker.nextWakeAt()).toBe(due.getTime());
-        const removes = vi.spyOn(fs, "rm"); await vi.advanceTimersByTimeAsync(60_000);
+        const removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined"); await vi.advanceTimersByTimeAsync(60_000);
         expect(removes).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(30_000); await released(copy.runId);
       } finally { await worker.stop(); }
@@ -248,8 +249,8 @@ describe("persistent agent directories", () => {
       let release!: () => void, entered!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
       const entry = new Promise<void>(resolve => { entered = resolve; });
-      const remove = fs.rm.bind(fs);
-      const removes = vi.spyOn(fs, "rm").mockImplementation(async (file, opts) => {
+      const remove = directoryProbeTools.removeLocalAgentDirectoryConfined;
+      const removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined").mockImplementation(async (file, opts) => {
         if (file === path.dirname(copy.localRoot)) { entered(); await gate; }
         return remove(file, opts);
       });
@@ -334,8 +335,8 @@ describe("persistent agent directories", () => {
       let release!: () => void, entered!: () => void;
       const gate = new Promise<void>(resolve => { release = resolve; });
       const entry = new Promise<void>(resolve => { entered = resolve; });
-      const remove = fs.rm.bind(fs); let removals = 0;
-      const removes = vi.spyOn(fs, "rm").mockImplementation(async (file, options) => {
+      const remove = directoryProbeTools.removeLocalAgentDirectoryConfined; let removals = 0;
+      const removes = vi.spyOn(directoryProbeTools, "removeLocalAgentDirectoryConfined").mockImplementation(async (file, options) => {
         if (file === path.dirname(copy.localRoot)) { removals += 1; entered(); await gate; }
         return remove(file, options);
       });
@@ -1138,7 +1139,11 @@ describe("persistent agent directories", () => {
     expect(result?.errorCode).toBe("AGENT_FILES_SAVE_FAILED");
     expect(result?.receipt?.storageWarning).toBe(copy.receipt?.storageWarning);
     if (full) expect(result?.receipt?.storageWarning).toContain("Agent storage is full");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    // The new confined cleanup contract retains an unverifiable link rather
+    // than falling back to recursive removal after save refusal.
+    expect((await fs.lstat(copy.localRoot)).isDirectory()).toBe(true);
+    expect((await fs.lstat(path.join(copy.localRoot, "escape"))).isSymbolicLink()).toBe(true);
+    expect(result?.receipt?.cleanupPending).toBe(true);
     await expect(fs.stat(path.join(root, "innocent.txt"))).rejects.toMatchObject({ code: "ENOENT" });
   }, 30_000);
 
