@@ -96,10 +96,18 @@ describe("warm refresh fail-closed authority and no-write proof", () => {
     } finally { a.target.runner!.execute = execute; await f.cleanup(); }
   }, 90000);
 
-  it("retains a genuine late edit detected after earlier transfer writes without publishing mixed bytes", async () => {
+  it.each([false, true])("retains a genuine late edit after partial writes (denialWriteFails=%s)", async denialWriteFails => {
     const { f, a } = await fixture();
     const execute = a.target.runner!.execute;
-    let injected = false;
+    let injected = false, denialAttempted = false;
+    const refresh = denialWriteFails ? agentDirectoryWorkingCopyService(f.db, f.copies.get, async (row, values) => {
+      if (values.receipt?.retirementRequired === true) {
+        denialAttempted = true; throw Error("retention-denial persistence failed");
+      }
+      const [updated] = await f.db.update(agentInstructionWorkingCopies).set(values)
+        .where(eq(agentInstructionWorkingCopies.runId, row.runId)).returning();
+      return updated!;
+    }) : f.copies;
     a.target.runner!.execute = async input => {
       const args = [...(input.args ?? [])];
       if (args[1]?.includes("Descriptor-relative refresh unavailable")) {
@@ -111,18 +119,19 @@ describe("warm refresh fail-closed authority and no-write proof", () => {
       return execute({ ...input, args });
     };
     try {
-      expect(await f.copies.refreshWarm({ companyId: f.companyId, agentId: f.agentId, runId: a.copy.runId,
+      expect(await refresh.refreshWarm({ companyId: f.companyId, agentId: f.agentId, runId: a.copy.runId,
         target: a.target, canRefresh: async () => true })).toBe(false);
       expect(injected).toBe(true);
+      expect(denialAttempted).toBe(denialWriteFails);
       expect(await f.copies.get(f.companyId, a.copy.runId)).toMatchObject({ state: "unavailable",
-        errorCode: "AGENT_FILES_REFRESH_INCOMPLETE", receipt: { retirementRequired: true, refreshCleanupBlocked: true } });
+        errorCode: "AGENT_FILES_REFRESH_INCOMPLETE", receipt: { refreshCleanupBlocked: true } });
       expect(await f.copies.canReuseWarm(f.companyId, f.agentId, a.copy.runId)).toBe("other");
       const restarted = agentInstructionWorkingCopyService(f.db);
       for (let i = 0; i < 2; i++) await restarted.collectStopped({ companyId: f.companyId, runId: a.copy.runId, target: a.target });
       expect(await fs.readFile(path.join(a.copy.executionRoot, "KEEP.md"), "utf8")).toBe("LATE OWNER EDIT\n");
       expect(await fs.readFile(path.join(f.root, "KEEP.md"), "utf8")).toBe("checkpoint bytes\n");
       expect(await fs.readFile(path.join(f.root, "PEER.md"), "utf8")).toBe("peer work\n");
-      console.log(JSON.stringify({ case: "late-edit-after-partial-write", retained: true, published: false }));
+      console.log(JSON.stringify({ case: "late-edit-after-partial-write", denialWriteFails, denialAttempted, retained: true, published: false }));
     } finally { a.target.runner!.execute = execute; await f.cleanup(); }
   }, 90000);
 });

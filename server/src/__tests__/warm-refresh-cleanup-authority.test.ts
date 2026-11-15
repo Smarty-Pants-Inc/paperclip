@@ -50,7 +50,7 @@ describe("default-deny directory cleanup authority", () => {
       }, { execute: async (input: Parameters<EnvironmentRuntimeService["execute"]>[0]) => {
         commands.push(input.command);
         return remote.target.runner!.execute({ command: input.command, args: input.args, cwd: input.cwd, env: input.env, timeoutMs: input.timeoutMs });
-      } } as EnvironmentRuntimeService);
+      } } as unknown as EnvironmentRuntimeService);
       for (let i = 0; i < 2; i++) await restarted.release((await f.copies.get(f.companyId, stopped!.runId))!);
       expect(commands).toEqual([]);
       expect(await fs.readFile(sentinel, "utf8").catch(() => "MISSING")).toBe("OWNER SENTINEL\n");
