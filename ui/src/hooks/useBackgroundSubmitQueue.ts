@@ -51,6 +51,7 @@ export function useBackgroundSubmitQueue<T, R>(options: DurableSubmitOptions<T, 
   const draining = useRef(false);
   const noticedKey = useRef<string | null>(null);
   const noticedRejections = useRef(new Set<string>());
+  const noticedContextChanges = useRef(new Set<string>());
   const active = useRef(true);
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
 
@@ -125,14 +126,32 @@ export function useBackgroundSubmitQueue<T, R>(options: DurableSubmitOptions<T, 
 
   useEffect(() => {
     if (owner === undefined || durable.pending || draining.current) return;
-    const next = queue.find(item => !item.rejection);
+    const next = queue.find(item => !item.rejection && optionsRef.current.canAutoResend?.(item.payload) !== false);
     if (!next) return;
     draining.current = true;
     void durable.submit(next.payload, { idempotencyKey: next.idempotencyKey }).finally(() => {
       draining.current = false;
       if (active.current) setRound(value => value + 1);
     });
-  }, [owner, queue, durable.pending, durable.submit, round]);
+  }, [owner, queue, durable.pending, durable.submit, round, options.canAutoResend]);
+
+  // A failed in-flight create also lives in durable.pending. Include legacy
+  // pending-only records so neither reload nor the retry timer hides the hold.
+  const awaitingConfirmation: QueuedSubmit<T>[] = [
+    ...queue,
+    ...(durable.pending && !queue.some(item => item.idempotencyKey === durable.pending!.idempotencyKey) ? [durable.pending] : []),
+  ].filter(item => options.canAutoResend?.(item.payload) === false);
+  useEffect(() => {
+    const currentKeys = new Set(awaitingConfirmation.map(item => item.idempotencyKey));
+    for (const key of noticedContextChanges.current) {
+      if (!currentKeys.has(key)) noticedContextChanges.current.delete(key);
+    }
+    for (const record of awaitingConfirmation) {
+      if (noticedContextChanges.current.has(record.idempotencyKey)) continue;
+      noticedContextChanges.current.add(record.idempotencyKey);
+      optionsRef.current.onAttention(record, null);
+    }
+  }, [awaitingConfirmation]);
 
   useEffect(() => {
     for (const record of queue) {
@@ -159,5 +178,5 @@ export function useBackgroundSubmitQueue<T, R>(options: DurableSubmitOptions<T, 
     replaceQueue(queueRef.current.filter(item => item.idempotencyKey !== idempotencyKey));
   }, [durable.pending, durable.cancel, replaceQueue]);
 
-  return { ...durable, enqueue, discard, rejected: queue.filter(item => item.rejection) };
+  return { ...durable, enqueue, discard, awaitingConfirmation, rejected: queue.filter(item => item.rejection) };
 }

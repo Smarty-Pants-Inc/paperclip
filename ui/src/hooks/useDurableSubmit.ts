@@ -162,6 +162,8 @@ export interface DurableSubmitOptions<T, R> {
   action?: string;
   /** False for writes the server does not dedupe (see `useAutoResend`). */
   autoResend?: boolean;
+  /** A context change can hold a saved write for explicit confirmation. Manual resends remain available. */
+  canAutoResend?: (payload: T) => boolean;
 }
 
 export interface DurableSubmit<T, R> {
@@ -288,7 +290,7 @@ export function useDurableSubmit<T, R>(options: DurableSubmitOptions<T, R>): Dur
     sourceId,
     active: pending !== null && !sending,
     pendingCount: pending ? 1 : 0,
-    auto: autoResend,
+    auto: autoResend && (!pending || options.canAutoResend?.(pending.payload) !== false),
     resend: async () => {
       const record = pendingRef.current;
       if (!record) return "sent";
