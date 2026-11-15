@@ -80,6 +80,6 @@ export async function openPi(env = environment) {
       return turn;
     },
     async settled(count = 1) { await vi.waitFor(() => expect(events.filter(e => e.eventType === "turn.completed")).toHaveLength(count), { interval: 1 }); },
-    async close() { await session.close(); await drained; await rm(root, { recursive: true, force: true }); },
+    async close() { await session.close({ reason: "test complete" }); await drained; await rm(root, { recursive: true, force: true }); },
   };
 }
