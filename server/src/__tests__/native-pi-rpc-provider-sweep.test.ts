@@ -41,7 +41,9 @@ describe("native Pi sweep contracts", () => {
       OPENROUTER_API_KEY: "ambient-openrouter", PAPERCLIP_AI_PROVIDER_KEY: "ambient-gateway" };
     expect(resolveNativeProviderEnvironment(provider, undefined, host)).toEqual({ PATH: "/host/bin", HOME: "/host/home" });
     const explicit = { PAPERCLIP_AI_PROVIDER_KEY: "explicit-company-binding" };
-    expect(resolveNativeProviderEnvironment(provider, explicit, host)).toBe(explicit);
+    expect(resolveNativeProviderEnvironment(provider, explicit, host)).toEqual({
+      PATH: "/host/bin", HOME: "/host/home", PAPERCLIP_AI_PROVIDER_KEY: "explicit-company-binding",
+    });
   });
   it("merges configured Pi env over safe host defaults without inheriting ambient credentials", () => {
     const host = { PATH: "/x", HOME: "/home/user", SECRET_TOKEN: "ambient-secret" };

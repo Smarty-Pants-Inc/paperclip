@@ -1373,7 +1373,10 @@ export function resolveNativeProviderEnvironment(
   configured: NodeJS.ProcessEnv | undefined,
   host: NodeJS.ProcessEnv = process.env,
 ): NodeJS.ProcessEnv {
-  if (configured !== undefined) return configured;
+  if (configured !== undefined) {
+    if (provider.kind === "pi_rpc") return buildNativeProviderEnvironment(configured, host);
+    return configured;
+  }
   if (provider.kind === "pi_rpc" || (provider.kind === "acpx" && ["pi", "cursor", "copilot", "kimi", "antigravity"].includes(provider.agent))) {
     return buildNativeProviderEnvironment({}, host);
   }
