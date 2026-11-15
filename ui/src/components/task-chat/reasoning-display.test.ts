@@ -36,6 +36,17 @@ describe("reasoning display resolution", () => {
     });
   });
 
+  it("shows Paul's Smarty (paperclip_runner, provider pi_rpc) inline by default; a stored Folded still wins", () => {
+    // The adapter exactly as the app registers it, no override.
+    expect(adapterReasoningDisplay("paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({}, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay(undefined, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({ "agent-2": "fold" }, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({ "agent-1": "fold" }, "agent-1", "paperclip_runner")).toBe("fold");
+    // Other harnesses keep their own default.
+    expect(adapterReasoningDisplay("codex_local")).toBe("fold");
+  });
+
   it("keys the preference by agent: another agent's choice does not apply", () => {
     withAdapterDefault("codex_local", undefined, () => {
       expect(resolveReasoningDisplay({ "agent-2": "inline" }, "agent-1", "codex_local")).toBe("fold");

@@ -59,9 +59,9 @@ afterEach(() => {
 
 const agent = { id: "agent-1", companyId: "company-1", adapterType: "codex_local" };
 
-function render() {
+function render(target: typeof agent = agent) {
   flushSync(() => root.render(
-    <QueryClientProvider client={client}><AgentReasoningDisplaySetting agent={agent} /></QueryClientProvider>,
+    <QueryClientProvider client={client}><AgentReasoningDisplaySetting agent={target} /></QueryClientProvider>,
   ));
 }
 const radio = (name: string) => Array.from(container.querySelectorAll<HTMLButtonElement>('[role="radio"]'))
@@ -90,6 +90,22 @@ describe("Reasoning display on the agent's page", () => {
     } finally {
       registerUIAdapter(original);
     }
+  });
+
+  it("shows Inline as the harness default for a Paperclip Runner (pi_rpc) agent", async () => {
+    render({ ...agent, adapterType: "paperclip_runner" });
+    await loaded();
+    expect(radio("Inline").getAttribute("aria-checked")).toBe("true");
+    expect(radio("Folded").getAttribute("aria-checked")).toBe("false");
+    expect(container.textContent).toContain("Default for this harness: Inline");
+  });
+
+  it("keeps a stored Folded for a Paperclip Runner agent", async () => {
+    api.saved = { "agent-1": "fold" };
+    render({ ...agent, adapterType: "paperclip_runner" });
+    await loaded();
+    expect(radio("Folded").getAttribute("aria-checked")).toBe("true");
+    expect(container.textContent).toContain("Default for this harness: Inline");
   });
 
   it("shows the person's saved choice for this agent", async () => {
