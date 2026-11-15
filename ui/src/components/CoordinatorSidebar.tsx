@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Inbox, Boxes, ChevronRight, CircleCheck, FolderOpen, History, LayoutDashboard, MessageCircle, MoreHorizontal, Network, Pin, PinOff, Plus, Repeat, Search, Settings, SquarePen, Unplug, type LucideIcon } from "lucide-react";
+import { Inbox, Boxes, ChevronRight, CircleCheck, FolderOpen, History, LayoutDashboard, MessageCircle, MoreHorizontal, Network, Pin, PinOff, Plus, Repeat, Search, Settings, SquarePen, Target, Unplug, type LucideIcon } from "lucide-react";
 import type { Agent, Project } from "@paperclipai/shared";
 import { useCoordinatorAttentionCount } from "@/hooks/useCoordinatorAttentionCount";
 import { issuesApi } from "@/api/issues";
@@ -44,6 +44,9 @@ const moreDestinations = [
   { label: "Audit", to: "/activity", icon: History },
   { label: "Settings", to: "/settings", icon: Settings },
 ] as const;
+
+/** More rows that start a new group, drawn with a separator above them. */
+const moreGroupStarts = new Set(["/skills", "/cases"]);
 
 export function buildPinnedNavigationItems(pins: readonly string[], agents: readonly Agent[], destinations: readonly { to: string; label: string; icon: LucideIcon }[]): PinnedNavigationItem[] {
   const keys = new Set(pins);
@@ -114,9 +117,12 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
   });
-  const destinations = useMemo(() => experimental?.enableCases
-    ? [...moreDestinations, { label: "Cases", to: "/cases", icon: Boxes }]
-    : moreDestinations, [experimental?.enableCases]);
+  const destinations = useMemo(() => {
+    const items: { label: string; to: string; icon: LucideIcon }[] = [...moreDestinations];
+    if (experimental?.enableGoalsSidebarLink === true) items.splice(items.findIndex(item => item.to === "/projects") + 1, 0, { label: "Goals", to: "/goals", icon: Target });
+    if (experimental?.enableCases) items.push({ label: "Cases", to: "/cases", icon: Boxes });
+    return items;
+  }, [experimental?.enableCases, experimental?.enableGoalsSidebarLink]);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreContentRef = useRef<HTMLDivElement>(null);
   const orderedPins = useMemo(() => buildPinnedNavigationItems(pinnedNavigation.pins, agents.data ?? [], destinations), [pinnedNavigation.pins, agents.data, destinations]);
@@ -179,7 +185,7 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
               const pinned = pinnedNavigation.pins.includes(to);
               const PinIcon = pinned ? PinOff : Pin;
               return <div key={to}>
-                {index === 6 || index === 10 ? <div role="separator" className="my-1 border-t border-border" /> : null}
+                {index > 0 && moreGroupStarts.has(to) ? <div role="separator" className="my-1 border-t border-border" /> : null}
                 <div className="group/coordinator-more relative flex items-center rounded-sm transition-colors hover:bg-accent">
                   <Link to={to} onClick={() => { setMoreOpen(false); if (isMobile) setSidebarOpen(false); }} className="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1.5 pr-10 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     <Icon className="size-4 shrink-0 text-muted-foreground" />{label}
