@@ -926,6 +926,12 @@ fn provider_performance_spans(params: &Value) -> Vec<Value> {
             | "provider.workspace.snapshot.track" | "provider.workspace.snapshot.patch" | "provider.workspace.snapshot.diff"
             | "provider.workspace.git.discover" | "provider.workspace.git.default_branch"
             | "provider.dependencies.install" | "provider.plugins.initialize"
+            | "runner.pi.open.total" | "runner.pi.open.workspace" | "runner.pi.open.native_mcp_config"
+            | "runner.pi.open.company_skills" | "runner.pi.open.extension_resolve" | "runner.pi.open.models_snapshot"
+            | "runner.pi.open.model_catalog" | "runner.pi.open.model_resolve" | "runner.pi.open.compaction_config"
+            | "runner.pi.open.provider_binding" | "runner.pi.open.models_json_write" | "runner.pi.open.pi_spawn_to_get_state"
+            | "runner.pi.open.admission" | "runner.pi.open.available_models" | "runner.pi.open.tool_inventory"
+            | "runner.pi.open.settle" | "runner.pi.open.bind_receipt" | "runner.pi.open.begin_turn"
             | "runner.pi.attach" | "runner.pi.bind" | "runner.pi.begin_turn" | "runner.pi.interrupt_wait" | "runner.pi.prompt_to_started"
             | "runner.pi.admission.get_state" | "runner.pi.admission.set_model"
             | "runner.pi.admission.get_available_thinking_levels" | "runner.pi.admission.set_thinking_level"
@@ -2829,17 +2835,18 @@ mod tests {
         },{
             "name":"runner.pi.open.native_mcp_config","startedAtMs":1001,"endedAtMs":1005,"outcome":"failed"
         }]);
-        let events = normalize_codex_notification(
-            "paperclip/providerPerformance",
-            &json!({"spans":spans}),
-        );
+        let events =
+            normalize_codex_notification("paperclip/providerPerformance", &json!({"spans":spans}));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "harness.diagnostic");
         assert_eq!(events[0].payload["code"], "provider_performance_spans");
-        assert_eq!(events[0].payload["spans"], json!([
-            {"name":"runner.pi.open.total","startedAtMs":1000.0,"endedAtMs":1010.0,"outcome":"ok"},
-            {"name":"runner.pi.open.native_mcp_config","startedAtMs":1001.0,"endedAtMs":1005.0,"outcome":"failed"}
-        ]));
+        assert_eq!(
+            events[0].payload["spans"],
+            json!([
+                {"name":"runner.pi.open.total","startedAtMs":1000.0,"endedAtMs":1010.0,"outcome":"ok"},
+                {"name":"runner.pi.open.native_mcp_config","startedAtMs":1001.0,"endedAtMs":1005.0,"outcome":"failed"}
+            ])
+        );
     }
 
     #[test]
