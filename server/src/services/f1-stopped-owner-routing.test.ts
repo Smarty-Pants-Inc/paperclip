@@ -13,6 +13,8 @@ import {
   listFreshContinuations, resetBacklogContinuationPacingForTests,
 } from "./fresh-continuation-fallback.js";
 import { settleStoppedRemoteNativeOwner } from "./native-runtime/native-failed-run-owner-release.js";
+import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
+import { FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const refusals = ["runner_harness_state_mismatch: resumed_unavailable",
@@ -81,15 +83,37 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
   async function assertContinued(f: Awaited<ReturnType<typeof fixture>>, holdId: string) {
     const records = await listFreshContinuations(db, { companyId: f.company.id, issueId: f.issue.id });
     expect(records).toHaveLength(1);
-    expect(records[0].evidence).toMatchObject({ freshContinuation: { sourceRunId: f.source.id, previousExecutionGone: true },
+    // follow-Paperclip Cut B R1/R5: exact owner settlement stays; fresh admission records isolation, not physical death.
+    expect(records[0].evidence).toMatchObject({ freshContinuation: { sourceRunId: f.source.id, chainAttempt: 1 },
+      freshContinuationSettlement: { sourceRunId: f.source.id, replay: "none" },
       executionReconciliation: { runId: f.source.id }, continuationDelivery: "pending" });
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, holdId)))[0])
       .toMatchObject({ status: "resolved", outcome: "restored" });
     expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].status).not.toBe("blocked");
     expect(await getExecutionBlocker(db, f.company.id, f.issue.id)).toBeNull();
-    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-    expect(notes.filter(note => !note.metadata?.supersededByCommentId)).toMatchObject([{ authorType: "system", body: expect.stringContaining("Starting a fresh thread") }]);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(2);
+  }
+
+  async function assertSelectedNotice(f: Awaited<ReturnType<typeof fixture>>) {
+    const [record] = await listFreshContinuations(db, { companyId: f.company.id, issueId: f.issue.id });
+    // follow-Paperclip Cut B R2/R5: move the exactly-one started note to actual session selection, not recording.
+    // This is a selection-boundary probe, not a claim to exercise wake dispatch.
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      issueId: f.issue.id, nativeIssueId: f.issue.id, runtimeMode: "native", status: "running", retryOfRunId: f.source.id,
+      contextSnapshot: { issueId: f.issue.id, conversationSessionGeneration: 0, recoveryActionId: record.id,
+        freshContinuationIsolation: record.id } }).returning();
+    const selection = { companyId: f.company.id, agentId: f.agent.id, issueId: f.issue.id, runId: successor.id };
+    const sessionId = await selectFreshContinuationThread(db, selection);
+    expect(sessionId).toBeTruthy();
+    expect(sessionId).not.toBe(f.source.nativeSessionId);
+    expect(await selectFreshContinuationThread(db, selection)).toBe(sessionId);
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    expect(notes.filter(note => !note.metadata?.supersededByCommentId)).toMatchObject([
+      { authorType: "system", body: FRESH_THREAD_STARTED_NOTE,
+        metadata: { authorizationReason: `fresh_provider_thread:${record.id}` } },
+    ]);
+    expect(notes).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.source.id))).toHaveLength(1);
   }
 
   it.each(refusals)("routes the older action to the latest refused follow-up: %s", async refusal => {
@@ -100,6 +124,7 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
     expect((await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.owner.id, trigger: "held_recovery", now: f.now })).kind)
       .toBe("already_continued");
     await assertContinued(f, hold.id);
+    await assertSelectedNotice(f);
   });
 
   it("finds the same obligation when an older release already settled its hold without replay", async () => {
@@ -107,12 +132,14 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
     expect(await heldExecutionsAwaitingFreshContinuation(db, f.now, 10)).toMatchObject([{ id: hold.id }]);
     expect(await continueHeldExecutions(db, f.now)).toMatchObject({ continued: 1 });
     await assertContinued(f, hold.id);
+    await assertSelectedNotice(f);
   });
 
   it("a direct latest-source decision also retires the older hold and its exact Blocked receipt", async () => {
     const f = await fixture(), hold = await stoppedWithOlderHold(f);
     expect((await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.source.id, trigger: "held_recovery" })).kind).toBe("continued");
     await assertContinued(f, hold.id);
+    await assertSelectedNotice(f);
   });
 
   it("does not directly continue the latest source past a board-user decision hold with full physical proof", async () => {
@@ -143,7 +170,8 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
           kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active",
           ownerType: "board", returnOwnerAgentId: f.agent.id, fingerprint: `live-owner:${f.owner.id}`,
           nextAction: "The current step must finish.", evidence: { runId: f.owner.id } });
-        expect((await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.source.id, trigger: "held_recovery" })).kind).toBe("exact_recovery_pending");
+        // follow-Paperclip Cut B R1/R5: the real live owner still excludes a successor; the removed gate no longer labels it pending.
+        expect((await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.source.id, trigger: "held_recovery" })).kind).toBe("successor_exists");
         expect((await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.owner.id, trigger: "held_recovery" })).kind).toBe("not_applicable");
       } else {
         const hold = await stoppedWithOlderHold(f);
@@ -160,9 +188,21 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
       expect(await listFreshContinuations(db, { companyId: f.company.id, issueId: f.issue.id })).toHaveLength(0);
       expect(await getExecutionBlocker(db, f.company.id, f.issue.id)).not.toBeNull();
       if (shape === "unsettled") {
-        const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-        expect(notes).toHaveLength(1);
-        expect(notes[0].body).toContain("current step must finish");
+        // follow-Paperclip Cut B R2/R5: the one started note is owed only after this actual owner settles and selection occurs.
+        await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: f.lease.releasedAt,
+          metadata: { remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: f.company.id,
+            runId: f.owner.id, leaseId: f.lease.id, provider: f.lease.provider, providerLeaseId: f.lease.providerLeaseId,
+            state: "stopped", confirmedAt: f.lease.releasedAt!.toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+        expect(await settleStoppedRemoteNativeOwner(db, f.owner.id, f.now)).toBe(true);
+        const [blocked] = await db.update(issues).set({ status: "blocked", blockedTransitionAt: f.now })
+          .where(eq(issues.id, f.issue.id)).returning();
+        const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issue.id));
+        await db.update(issueRecoveryActions).set({ evidence: { ...hold.evidence,
+          nativeFailureBlock: { runId: f.owner.id, statusVersion: Number(blocked.statusVersion) } } })
+          .where(eq(issueRecoveryActions.id, hold.id));
+        await settleUnrecoverableExecutions(db, f.now);
+        await assertContinued(f, hold.id);
+        await assertSelectedNotice(f);
       }
     });
 });
