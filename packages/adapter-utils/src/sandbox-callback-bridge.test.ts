@@ -2199,6 +2199,60 @@ describe("sandbox callback bridge", () => {
     }));
   });
 
+  it("bounds a requested remote list wait by the Boat command timeout", async () => {
+    const runner = {
+      execute: vi.fn(async (_input: { args?: string[]; timeoutMs?: number }): Promise<RunProcessResult> => ({
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        stdout: "",
+        stderr: "",
+        pid: null,
+        startedAt: new Date().toISOString(),
+      })),
+    };
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd: "/workspace",
+      timeoutMs: 5_000,
+    });
+
+    expect(client.maxListWaitMs).toBe(3_000);
+    await client.listJsonFiles("/workspace/requests", 7_000);
+    const waitCall = runner.execute.mock.calls[0]?.[0];
+    expect(waitCall?.timeoutMs).toBe(5_000);
+    expect(waitCall?.args?.[1]).toContain("wait_checks=30");
+    expect(waitCall?.args?.[1]).toContain("sleep 0.1");
+
+    runner.execute.mockClear();
+    await client.listJsonFiles("/workspace/requests");
+    expect(runner.execute.mock.calls[0]?.[0]?.args?.[1]).not.toContain("sleep 0.1");
+  });
+
+  it("leaves two seconds for each poll iteration after its long-list wait", async () => {
+    vi.useFakeTimers();
+    const queueDir = "/workspace/iteration-bounded-list-wait";
+    const fake = createFakeRemoteBridgeRunner(queueDir);
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createCommandManagedSandboxCallbackBridgeQueueClient({
+        runner: fake.runner,
+        remoteCwd: "/workspace",
+      }),
+      queueDir,
+      iterationTimeoutMs: 5_000,
+      handleRequest: async () => ({ status: 200 }),
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fake.listCommands[0]).toContain("wait_checks=30");
+    } finally {
+      const stopping = worker.stop({ drainTimeoutMs: 1 });
+      await vi.advanceTimersByTimeAsync(5_000);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it("creates the bridge queue directories in one directory-creation exec", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-makedirs-"));
     cleanupDirs.push(rootDir);
