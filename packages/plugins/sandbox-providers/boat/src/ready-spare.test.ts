@@ -580,6 +580,8 @@ describe("Boat ready spare", () => {
     maintenanceTick!();
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(db.query).not.toHaveBeenCalled();
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true);
+    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
 
     inInvocation = true;
     await plugin.definition.onHealth!();
