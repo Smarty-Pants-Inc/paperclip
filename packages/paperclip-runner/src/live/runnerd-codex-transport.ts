@@ -82,6 +82,7 @@ import { RUNNER_PREPARE_REFUSAL_CODES, type RunnerPrepareRefusalCode, NativeRunn
 import {
   DurablePrpControlPlane,
   inspectStagedRunAttachment,
+  SemanticToolHandedOffError,
   SemanticToolNotDispatchedError,
   durableRecoveryInternals,
   inspectWarmRunTransition,
@@ -6823,7 +6824,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
       semanticInputMode: this.#retainsSourceInputs() || this.options.recoveryPurpose === "stop_cleanup" ? "retain_only" : "dispatch",
-      onSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : (call) => this.#handleSemanticToolInput(call),
+      onSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : (call) => this.#dispatchSemanticToolInput(call),
       recoverSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : call => this.#recoverSemanticToolInput(call),
       onCommittedEvent: async (event) => {
         const source = this.#sourceAccountingIdentity();
@@ -7479,7 +7480,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       onAuthenticatedConnection: () => this.#startupSteps?.advance("runner.process.launch", "provider.session.load"),
       get authorityRunId() { return authorityRunId(); },
       semanticInputMode: this.#retainsSourceInputs() || this.options.recoveryPurpose === "stop_cleanup" ? "retain_only" : "dispatch",
-      onSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : (call) => this.#handleSemanticToolInput(call),
+      onSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : (call) => this.#dispatchSemanticToolInput(call),
       recoverSemanticToolInput: this.options.recoveryPurpose === "stop_cleanup" ? undefined : call => this.#recoverSemanticToolInput(call),
       onCommittedEvent: async (event) => {
         const source = this.#sourceAccountingIdentity();
@@ -8084,6 +8085,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     const outcome = await this.options.recoverSemanticToolInput?.(call);
     return outcome ? this.#bindSemanticToolOutcome(call, outcome) : null;
+  }
+
+  async #dispatchSemanticToolInput(call: Parameters<NonNullable<DurablePrpControlPlaneOptions["onSemanticToolInput"]>>[0]) {
+    try {
+      return await this.#handleSemanticToolInput(call);
+    } catch (error) {
+      if (error instanceof SemanticToolNotDispatchedError && this.#controllerDetachedForRestart) throw new SemanticToolHandedOffError();
+      throw error;
+    }
   }
 
   async #handleSemanticToolInput(
