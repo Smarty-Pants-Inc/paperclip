@@ -921,13 +921,24 @@ export const warmRetirementDirectoryWait = { timeoutMs: 300_000, pollMs: 1_000 }
  * An owner whose retirement stayed unproven lives only in its own sandbox,
  * which its successor's attempt left for cleanup. A run on a different sandbox
  * cannot meet that Runner, so it forgets the owner instead of replaying its
- * rejected close. Any other run keeps retrying retirement.
+ * rejected close. A terminal tip's exact stop receipt also proves retirement
+ * on the first follow-up, but only while S's start fence makes it non-startable.
  */
-function forgetUnretiredOwnerOnOtherSandbox(scope: string, entry: WarmNativeSession,
-  target?: AdapterExecutionTarget | null): boolean {
+async function forgetUnretiredOwnerOnOtherSandbox(scope: string, entry: WarmNativeSession,
+  target?: AdapterExecutionTarget | null): Promise<boolean> {
   const next = sandboxProviderLeaseId(target);
-  if (!entry.retirementUnproven || !entry.providerLeaseId || !next || next === entry.providerLeaseId
-    || entry.busy || entry.preparingRunId) return false;
+  if (!entry.providerLeaseId || !next || next === entry.providerLeaseId || entry.busy || entry.preparingRunId) return false;
+  if (!entry.retirementUnproven) {
+    if (!entry.sandboxLeaseDb || !entry.environmentId) return false;
+    const tips = await entry.sandboxLeaseDb.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, entry.companyId), eq(environmentLeases.environmentId, entry.environmentId),
+      eq(environmentLeases.heartbeatRunId, entry.runId), eq(environmentLeases.providerLeaseId, entry.providerLeaseId),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`)).for("share");
+    if (!tips.some(lease => (lease.status === "expired" || Object.hasOwn(lease.metadata ?? {}, "reusableSandboxLeaseSuperseded"))
+      && hasRemoteTerminationReceipt(lease) && (lease.metadata?.remoteExecutionTermination as { state?: unknown })?.state === "stopped")) return false;
+  }
+  if (entry.busy || entry.preparingRunId) return false;
+  if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
   forgetWarmNativeSession(scope, entry);
   return true;
 }
@@ -1015,7 +1026,7 @@ export async function claimWarmNativeInstructionCopy(input: {
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
   if (!entry || !entry.instructionWorkingCopy?.runId || entry.environmentId !== input.environmentId) return null;
-  if (forgetUnretiredOwnerOnOtherSandbox(scope, entry, input.target)) return null;
+  if (await forgetUnretiredOwnerOnOtherSandbox(scope, entry, input.target)) return null;
   if (entry.busy) throw new Error("native_session_supervisor_busy");
   entry.busy = true;
   if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
@@ -1069,7 +1080,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
 }): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
-    if (forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
+    if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
@@ -2445,7 +2456,7 @@ async function retireSupersededWarmNativeSessions(
   for (const [scope, entry] of warmNativeSessions) {
     if (scope === nextSessionScope) continue;
     const logicalOwner = entry.ownerScope === ownerScope;
-    if (logicalOwner && forgetUnretiredOwnerOnOtherSandbox(scope, entry, target)) continue;
+    if (logicalOwner && await forgetUnretiredOwnerOnOtherSandbox(scope, entry, target)) continue;
     const priorIngress = entry.ingressOwner;
     const physicalOwner = ingress && priorIngress && nativeWarmIngressAllocation(priorIngress.ingress) === nativeWarmIngressAllocation(ingress.claim.ingress);
     if (!logicalOwner && !physicalOwner) continue;
@@ -12524,7 +12535,7 @@ async function executePaperclipNativeSessionAttempt(
   };
   if (warmSessionId !== null && warmConfigDigest !== null && canRecoverWarmOwner) {
     const registered = warmNativeSessions.get(warmSessionId);
-    const entry = registered && forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget)
+    const entry = registered && await forgetUnretiredOwnerOnOtherSandbox(warmSessionId, registered, input.runnerExecutionTarget)
       ? undefined : registered;
     if (entry?.released) requireReleasedWarmScope(input, releasedWarmRunner(readWarmNativeEnvelope(input.execution)),
         readRunnerdDurableIdentity(scopedRunnerdStateRoot(input.execution)));
