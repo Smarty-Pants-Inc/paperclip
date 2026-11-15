@@ -65,7 +65,7 @@ test("an offline task stays held after switching companies until explicit Send",
     for (const width of [1440, 390]) {
       await page.setViewportSize({ width, height: width === 390 ? 844 : 1000 });
       await expect(attention).toBeVisible();
-      await expect(page.getByRole("button", { name: "Send", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: `Send to ${a.name}`, exact: true })).toBeVisible();
       await expect(page.getByRole("button", { name: "Discard", exact: true })).toBeVisible();
       const capture = process.env.TASK_OUT
         ? path.join(process.env.TASK_OUT, `r5-attention-${width}.png`)
@@ -73,7 +73,7 @@ test("an offline task stays held after switching companies until explicit Send",
       await page.screenshot({ path: capture, animations: "disabled" });
       await testInfo.attach(`attention-${width}`, { path: capture, contentType: "image/png" });
     }
-    await page.getByRole("button", { name: "Send", exact: true }).click();
+    await page.getByRole("button", { name: `Send to ${a.name}`, exact: true }).click();
     await expect(attention).toBeHidden();
     await expect(draft).toHaveText(draftInB);
     await expect.poll(async () => (await tasksInA()).length).toBe(1);

@@ -2608,7 +2608,7 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
-  it.each(["Send", "Discard"])("offers %s for a queued create in another company without changing the current draft", async (action) => {
+  it.each(["Send to Company A", "Discard"])("offers %s for a queued create in another company without changing the current draft", async (action) => {
     const requestKey = "company-a-original-create-key";
     const storageKey = `paperclip:issue-draft:pending-create:queue:user-1:request:${requestKey}`;
     const payload = { fingerprint: "original", data: { companyId: "company-a", title: "Original task in A" } };
@@ -2626,7 +2626,7 @@ describe("NewIssueDialog", () => {
       expect(button).toBeDefined();
       await act(async () => { button!.click(); });
       await flush();
-      if (action === "Send") {
+      if (action === "Send to Company A") {
         expect(mockIssuesApi.create).toHaveBeenCalledExactlyOnceWith("company-a", {
           title: "Original task in A", idempotencyKey: requestKey,
         });
@@ -2657,7 +2657,7 @@ describe("NewIssueDialog", () => {
       const editor = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Describe a task…"]')!;
       await typeTextareaValue(editor, "New draft in B stays here");
       expect(container.textContent).toContain("A task you created in Paperclip hasn't been sent yet.");
-      const send = Array.from(container.querySelectorAll("button")).find(item => item.textContent === "Send")!;
+      const send = Array.from(container.querySelectorAll("button")).find(item => item.textContent === "Send to Paperclip")!;
       expect(send).toBeDefined();
       await act(async () => { send.click(); });
       await flush();
