@@ -16,6 +16,11 @@ if (!globalThis.crypto?.subtle) {
   vi.stubGlobal("crypto", webcrypto);
 }
 
+const creationPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("../lib/organization-creation", () => ({
+  get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
+}));
+
 const mockCompaniesApi = vi.hoisted(() => ({
   importPreview: vi.fn(),
   importPreviewPackage: vi.fn(),
@@ -275,6 +280,7 @@ describe("CompanyImport", () => {
   let root: Root | null = null;
 
   beforeEach(() => {
+    creationPolicy.hidden = false;
     sessionStorage.clear();
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -317,6 +323,32 @@ describe("CompanyImport", () => {
     document.body.innerHTML = "";
     sessionStorage.clear();
     vi.clearAllMocks();
+  });
+
+  // Data safety: changing the visible options alone must not leave a hidden
+  // new-company default in the import payload.
+  it.each([true, false])("creation target: hidden=%s", async (hidden) => {
+    creationPolicy.hidden = hidden;
+    await renderPage();
+    const target = Array.from(container.querySelectorAll("select"))
+      .find((select) => select.querySelector('option[value="existing"]'))!;
+    expect(target).toBeDefined();
+    expect(Boolean(target.querySelector('option[value="new"]'))).toBe(!hidden);
+    expect(target.value).toBe(hidden ? "existing" : "new");
+    expect(container.textContent?.includes("New organization name")).toBe(!hidden);
+    expect(target.textContent).toContain("Paperclip");
+
+    const input = container.querySelector<HTMLInputElement>('input[placeholder="https://github.com/owner/repo/tree/main/company"]')!;
+    await act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "https://github.com/owner/repo/tree/main/company");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await clickButton((text) => text === "Preview import");
+    expect(mockCompaniesApi.importPreview).toHaveBeenCalledWith(expect.objectContaining({
+      target: hidden
+        ? { mode: "existing_company", companyId: "company-1" }
+        : { mode: "new_company", newCompanyName: null },
+    }));
   });
 
   function findButton(matches: (text: string) => boolean) {
