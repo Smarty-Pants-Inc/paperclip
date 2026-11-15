@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount,
+  createReadySpareClaimStore, MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount,
   readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
 } from "./ready-spares.js";
 
@@ -9,6 +9,17 @@ const key: ReadySpareKey = { companyId: "company-a", environmentId: "env-a", con
 function spare(overrides: Partial<ReadySpare> = {}): ReadySpare {
   const labels = { owner: `paperclip:${key.companyId}`, environment: key.environmentId, purpose: "spare", configHash: key.configHash, expiry: new Date(start + 1_800_000).toISOString() };
   return { id: "bx_abcdefgh", key, state: "running", warmed: true, expiresAt: labels.expiry, name: `paperclip-spare:ready:${key.configHash}`, labels, ...overrides };
+}
+function claimStore() {
+  const rows = new Set<string>();
+  return {
+    reserve: async (candidate: ReadySpare) => {
+      if (rows.has(candidate.id)) return false;
+      rows.add(candidate.id);
+      return true;
+    },
+    hasClaim: async (providerLeaseId: string) => rows.has(providerLeaseId),
+  };
 }
 function operations(records: ReadySpare[] = []) {
   const inventory = [...records];
@@ -68,7 +79,7 @@ describe("Boat ready spare keeper", () => {
   it("hands only live warmed spares over and atomically reserves concurrent claims", async () => {
     let now = start;
     const { ops } = operations([spare()]);
-    const keeper = new ReadySpareKeeper(() => now);
+    const keeper = new ReadySpareKeeper(() => now, undefined, claimStore());
     await keeper.reconcile(key, 1, ops);
     let resolveClaim!: (value: boolean) => void;
     (ops.claim as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise<boolean>(resolve => { resolveClaim = resolve; }));
@@ -82,9 +93,64 @@ describe("Boat ready spare keeper", () => {
     expect(await keeper.claim(key, "late", 1800, ops)).toBeUndefined();
   });
 
+  it("uses a shared database reservation so two worker keepers cannot hand one spare to two runs", async () => {
+    const { ops } = operations([spare()]);
+    const rows = new Map<string, unknown[]>();
+    const statements: string[] = [];
+    const fakeDb = {
+      namespace: "boat_test",
+      execute: async (sql: string, params: unknown[] = []) => {
+        statements.push(sql);
+        const providerLeaseId = String(params[0]);
+        if (rows.has(providerLeaseId)) return { rowCount: 0 };
+        rows.set(providerLeaseId, params);
+        return { rowCount: 1 };
+      },
+      query: async (_sql: string, params: unknown[] = []) => {
+        const providerLeaseId = String(params[0]);
+        return rows.has(providerLeaseId) ? [{ provider_lease_id: providerLeaseId }] : [];
+      },
+    };
+    const claimStore = createReadySpareClaimStore(fakeDb);
+    const firstKeeper = new ReadySpareKeeper(() => start, 12, claimStore);
+    const secondKeeper = new ReadySpareKeeper(() => start, 12, claimStore);
+    await Promise.all([firstKeeper.reconcile(key, 1, ops), secondKeeper.reconcile(key, 1, ops)]);
+
+    const acquire = async (keeper: ReadySpareKeeper, runId: string) =>
+      await keeper.claim(key, runId, 1800, ops) ?? await ops.create(key);
+    const [first, second] = await Promise.all([acquire(firstKeeper, "run-one"), acquire(secondKeeper, "run-two")]);
+    expect([first.id, second.id].filter(id => id === "bx_abcdefgh")).toHaveLength(1);
+    expect(new Set([first.id, second.id]).size).toBe(2);
+    expect(ops.claim).toHaveBeenCalledTimes(1);
+    expect(ops.create).toHaveBeenCalledTimes(1);
+    expect(statements).toHaveLength(2);
+    expect(statements.every(sql => /INSERT INTO boat_test\.boat_spare_claims[\s\S]*ON CONFLICT \(provider_lease_id\) DO NOTHING/.test(sql))).toBe(true);
+    expect(rows.get("bx_abcdefgh")?.slice(1, 5)).toEqual([
+      key.companyId, key.environmentId, rows.get("bx_abcdefgh")?.[3], "run-one",
+    ]);
+    expect(rows.get("bx_abcdefgh")?.[3]).toMatch(/^paperclip-claim:/);
+  });
+
+  it("skips any spare with a persisted claim row after keeper restart", async () => {
+    const alreadyClaimed = spare();
+    const db = {
+      namespace: "boat_test",
+      execute: async () => ({ rowCount: 0 }),
+      query: async (_sql: string, params: unknown[] = []) => String(params[0]) === alreadyClaimed.id
+        ? [{ provider_lease_id: alreadyClaimed.id }] : [],
+    };
+    const { ops } = operations([alreadyClaimed]);
+    const restarted = new ReadySpareKeeper(() => start, 12, createReadySpareClaimStore(db));
+    await restarted.reconcile(key, 1, ops);
+    expect(ops.claim).not.toHaveBeenCalled();
+    expect(ops.stop).not.toHaveBeenCalledWith(alreadyClaimed);
+    expect(ops.create).toHaveBeenCalledTimes(1);
+    expect(restarted.ready(key).map(item => item.id)).toEqual(["bx_created_1"]);
+  });
+
   it("treats an API claim failure as a cache miss so ordinary create can proceed", async () => {
     const { ops } = operations([spare()]);
-    const keeper = new ReadySpareKeeper(() => start);
+    const keeper = new ReadySpareKeeper(() => start, undefined, claimStore());
     await keeper.reconcile(key, 1, ops);
     (ops.claim as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("Boat unavailable"));
     await expect(keeper.claim(key, "run", 1800, ops)).resolves.toBeUndefined();
