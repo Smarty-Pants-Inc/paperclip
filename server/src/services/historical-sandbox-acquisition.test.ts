@@ -124,7 +124,7 @@ describe.skipIf(!support.supported)("historical sandbox acquisition uses the ins
     const pending = await f.read();
     expect(pending.status).toBe("pending_cleanup");
     const intent = readStopOnlyCleanup(pending)!;
-    expect(intent.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
+    expect((intent as { endedLeaseEvidence?: unknown }).endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(pending.metadata?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(runtime.call.mock.calls.map(call => call[1])).toEqual(["environmentInspectLease", "environmentAcquireLease"]);
     const stop = vi.fn(async () => undefined), laterInspect = vi.fn(async () => undefined as unknown);
