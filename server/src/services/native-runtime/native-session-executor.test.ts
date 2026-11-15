@@ -15148,6 +15148,7 @@ describe("native warm session supervision", () => {
         const creation = githubAccess.create.mock.calls.length;
         return {
           env: { PAPERCLIP_GITHUB_BROKER_TOKEN: "stable-session-capability" },
+          transport: "callback_bridge",
           get ready() { return brokerReady && (creation !== 1 || !brokerLost); },
           duplexRequested: creation === 1 ? firstDuplex : secondDuplex,
           activate,
@@ -15471,7 +15472,7 @@ describe("native warm session supervision", () => {
         const portable = path === "portable" || path === "portable-bootstrap";
         const bootstrap = path === "portable-bootstrap";
         const pluginRecovery = portable || path === "legacy-plugin";
-        githubAccess.create.mockReset().mockImplementation(async () => ({ env: {}, ready: true, duplexRequested: false,
+        githubAccess.create.mockReset().mockImplementation(async () => ({ env: {}, ready: true, transport: "callback_bridge", duplexRequested: false,
           activate: githubAccess.activate.mockReset().mockImplementation(() => vi.fn()), stop: githubAccess.stop.mockReset().mockResolvedValue(undefined) }));
         const stateBase = await mkdtemp(join(tmpdir(), "paperclip-runnerd-reuse-key-"));
         const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -19646,7 +19647,7 @@ describe("runnerd provider runtime wiring", () => {
       await githubGate;
       if (failure === "github") throw new Error("github setup failed");
       return { env: { PAPERCLIP_GITHUB_BROKER_TOKEN: "run-owned-capability" }, ready: true,
-        duplexRequested: false, activate, stop };
+        transport: "callback_bridge", duplexRequested: false, activate, stop };
     });
     state.createAssignedMcpTools.mockImplementationOnce(async () => {
       await assignedGate;

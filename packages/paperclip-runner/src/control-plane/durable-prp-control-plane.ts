@@ -62,9 +62,13 @@ const stagedCoreStateSchema = "paperclip.runner.durable.control-plane-state.stag
 const externalCoreStateSchema = "paperclip.runner.external-control-plane-state.v1";
 const transitionCoreStateSchema =
   "paperclip.runner.durable.control-plane-state.warm-transition.v1";
-const maxFrameBytes = 1024 * 1024;
-// Secure frames hex-encode ciphertext. Reserve envelope/tag space as well.
-const maxCommandBytes = Math.floor((maxFrameBytes - 4 * 1024) / 2);
+// The credentials HTTP body limit is encoded as base64 inside the authenticated
+// request and then hex-encoded by the secure PRP envelope. Keep enough room for
+// that bounded frame while leaving durable command payloads at their old cap.
+const maxFrameBytes = 32 * 1024 * 1024;
+const maxCommandBytes = Math.floor((1024 * 1024 - 4 * 1024) / 2);
+const maxGithubAccessInFlight = 64;
+const maxGithubAccessRequestIds = 65_536;
 const maxCommands = 500;
 const maxCommandsAtAttach = 32;
 const maxEventsPerAck = 64;
@@ -1969,6 +1973,12 @@ export interface PrpWireAttachment {
   isAuthenticated(): boolean;
 }
 
+/** Ephemeral request handler for credential-bearing traffic; requests never enter the durable journal. */
+export type RunnerPrpGithubAccessHttpHandler = (
+  frame: Readonly<Record<string, unknown>>,
+  identity: Readonly<DurableRecoveryIdentity>,
+) => Promise<Readonly<Record<string, unknown>>>;
+
 /** Read surface retained for live transports that project durable PRP state. */
 export interface DurablePrpControlPlaneStore {
   readonly path: string;
@@ -2247,6 +2257,9 @@ export class DurablePrpControlPlane {
     expectedRunnerInstanceId: string;
     finish: (matches: boolean) => void;
   }>();
+  #githubAccessHttpHandler: RunnerPrpGithubAccessHttpHandler | null = null;
+  #githubAccessRequestIds = new Set<string>();
+  #githubAccessInFlight = new Set<string>();
 
   constructor(options: DurablePrpControlPlaneOptions) {
     if (
@@ -2325,6 +2338,18 @@ export class DurablePrpControlPlane {
     this.#runnerExitListeners.add(listener);
     return () => {
       this.#runnerExitListeners.delete(listener);
+    };
+  }
+
+  /**
+   * Install the authenticated connection's ephemeral GitHub HTTP request path.
+   * It is deliberately separate from events/commands so credential bytes can
+   * never be checkpointed as PRP state.
+   */
+  setGithubAccessHttpHandler(handler: RunnerPrpGithubAccessHttpHandler): () => void {
+    this.#githubAccessHttpHandler = handler;
+    return () => {
+      if (this.#githubAccessHttpHandler === handler) this.#githubAccessHttpHandler = null;
     };
   }
 
@@ -3286,6 +3311,16 @@ export class DurablePrpControlPlane {
             }
             return;
           }
+          if (decrypted.kind === "github_access.http") {
+            try {
+              this.#store.assertWritable();
+              if (!this.#admitEnvelopeVersion(connection, decrypted) || !this.#admitAuthenticatedFrame(connection)) return;
+              void this.#handleGithubAccessHttp(connection, decrypted).catch(() => connection.close());
+            } catch {
+              connection.close();
+            }
+            return;
+          }
           if (decrypted.kind === "command_result" && this.#answerOnArrival(connection, decrypted)) return;
           frame = { decrypted };
         } else {
@@ -3491,6 +3526,86 @@ export class DurablePrpControlPlane {
     return this.#connectionLeaseFailure === null ? null : { ...this.#connectionLeaseFailure };
   }
 
+  async #handleGithubAccessHttp(
+    connection: AuthorityConnection,
+    envelope: Record<string, unknown>,
+  ): Promise<void> {
+    const requestId = typeof envelope.requestId === "string" ? envelope.requestId : "invalid-request";
+    const failure = (status: number, message: string) => ({
+      requestId,
+      status,
+      headers: { "cache-control": "no-store", "content-type": "application/json" },
+      bodyBase64: Buffer.from(JSON.stringify({ error: message })).toString("base64"),
+    });
+    const sendFailure = (status: number, message: string) => this.#sendJson(connection, {
+      protocol, version: connection.lease?.protocolVersion ?? protocolVersion, ...failure(status, message),
+    });
+    const handler = this.#githubAccessHttpHandler;
+    const identity = connection.identity;
+    const lease = connection.lease;
+    const connectionId = connection.connectionId;
+    if (!identity || !lease || connectionId === null || !this.#admitAuthenticatedFrame(connection)) return;
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(requestId) || requestId === "invalid-request") {
+      sendFailure(403, "GitHub ingress request refused");
+      return;
+    }
+    if (this.#githubAccessRequestIds.has(requestId)) {
+      sendFailure(409, "GitHub ingress request already used");
+      return;
+    }
+    if (this.#githubAccessRequestIds.size >= maxGithubAccessRequestIds) {
+      sendFailure(503, "GitHub ingress request capacity unavailable");
+      return;
+    }
+    this.#githubAccessRequestIds.add(requestId);
+    if (this.#githubAccessInFlight.size >= maxGithubAccessInFlight) {
+      sendFailure(503, "GitHub ingress request capacity unavailable");
+      return;
+    }
+    this.#githubAccessInFlight.add(requestId);
+    const capturedIdentity = structuredClone(identity);
+    const capturedLeaseId = lease.leaseId;
+    const capturedConnectionId = connectionId;
+    let reply: Readonly<Record<string, unknown>>;
+    try {
+      // Protocol/version are the common secure-PRP envelope; the HTTP method
+      // payload itself remains exactly the contract's six-field frame.
+      const requestFrame = { ...envelope };
+      delete requestFrame.protocol;
+      delete requestFrame.version;
+      reply = handler
+        ? await handler(requestFrame, capturedIdentity)
+        : failure(503, "GitHub ingress is unavailable");
+    } catch {
+      reply = failure(503, "GitHub ingress is unavailable");
+    } finally {
+      this.#githubAccessInFlight.delete(requestId);
+    }
+    // A handoff, lease revocation, reconnect, or close while an operation was
+    // pending invalidates its result. In particular, never return credentials
+    // to a connection that no longer owns this exact run identity.
+    if (!this.#connections.has(connection) || connection.connectionId !== capturedConnectionId ||
+        connection.lease?.leaseId !== capturedLeaseId || !this.#admitAuthenticatedFrame(connection) ||
+        canonicalJson(connection.identity) !== canonicalJson(capturedIdentity) ||
+        canonicalJson(this.#store.state.identity) !== canonicalJson(capturedIdentity)) return;
+    const response = reply as Record<string, unknown>;
+    const responseHeaders = response.headers;
+    const validHeaders = typeof responseHeaders === "object" && responseHeaders !== null && !Array.isArray(responseHeaders) &&
+      Object.entries(responseHeaders as Record<string, unknown>).every(([name, value]) =>
+        ["cache-control", "content-type"].includes(name.toLowerCase()) && typeof value === "string" &&
+        !/[\r\n\0]/.test(value));
+    const responseKeys = ["requestId", "status", "headers", "bodyBase64"];
+    if (Object.keys(response).length !== responseKeys.length || responseKeys.some(key => !Object.hasOwn(response, key)) ||
+        response.requestId !== requestId || !Number.isSafeInteger(response.status) ||
+        (response.status as number) < 100 || (response.status as number) > 599 || !validHeaders ||
+        typeof response.bodyBase64 !== "string" || response.bodyBase64.length > 14 * 1024 * 1024 ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(response.bodyBase64)) {
+      sendFailure(503, "GitHub ingress is unavailable");
+      return;
+    }
+    this.#sendJson(connection, { protocol, version: connection.lease.protocolVersion, ...response });
+  }
+
   async #handleDecryptedFrame(
     connection: AuthorityConnection,
     envelope: Record<string, unknown>,
@@ -3511,6 +3626,10 @@ export class DurablePrpControlPlane {
     if (connection.lease === null) return;
     if (kind === "lease_renew") {
       this.#renewLease(connection, envelope);
+      return;
+    }
+    if (kind === "github_access.http") {
+      await this.#handleGithubAccessHttp(connection, envelope);
       return;
     }
     if (kind === "event") {

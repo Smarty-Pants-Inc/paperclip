@@ -8950,6 +8950,14 @@ function needsCoreGitHubAccess(input: Pick<Parameters<typeof executePaperclipNat
   return Boolean(input.managedGitHub && !(target?.kind === "remote" && target.transport === "sandbox" && target.runnerTask));
 }
 
+function runnerIngressGitHubAccessSelected(input: Pick<Parameters<typeof executePaperclipNativeSession>[0],
+  "execution" | "runnerIngressAuthorized" | "runnerExecutionTarget">): boolean {
+  const target = input.runnerExecutionTarget;
+  return input.execution.provider.kind === "pi_rpc" && input.runnerIngressAuthorized === true &&
+    target?.kind === "remote" && target.transport === "sandbox" &&
+    target.effectiveCapabilities?.runnerWebSocketIngress === true;
+}
+
 function pluginTaskConfiguredEnvironment(environment: NodeJS.ProcessEnv | undefined): Record<string, string> {
   return Object.fromEntries(Object.entries(configuredEnvironment(environment)).flatMap(([key, value]) =>
     key !== CONFIGURED_ENVIRONMENT_KEYS && typeof value === "string" ? [[key, value]] : []));
@@ -8970,6 +8978,9 @@ function nativeProcessReuseKey(input: Parameters<typeof executePaperclipNativeSe
     githubAuthenticationMode: environment?.PAPERCLIP_GITHUB_AUTH_MODE ?? null,
     networkAccess: environment?.PAPERCLIP_RUNNER_NETWORK_ACCESS === "enabled",
     coreGitHubAccess: needsCoreGitHubAccess(input),
+    coreGitHubAccessTransport: needsCoreGitHubAccess(input)
+      ? runnerIngressGitHubAccessSelected(input) ? "runner_ingress" : "callback_bridge"
+      : null,
     instructionRoot: input.instructionWorkingCopy?.root ?? null,
   });
 }
@@ -12589,6 +12600,7 @@ async function executePaperclipNativeSessionAttempt(
           && Object.keys(pluginTaskConfiguredEnvironment(input.runnerEnvironment)).length > 0) ||
         Boolean(entry.githubAccess) !== needsCoreGitHubAccess(input) ||
         entry.githubAccess?.ready === false ||
+        (entry.githubAccess !== undefined && entry.githubAccess.transport !== (runnerIngressGitHubAccessSelected(input) ? "runner_ingress" : "callback_bridge")) ||
         (entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget))
       ) {
         await finishStartupContextForFallback();
@@ -12775,6 +12787,7 @@ async function executePaperclipNativeSessionAttempt(
   if (!leaseRenewal) throw new Error("native_session_renewal_owner_missing");
   try {
     const usesPluginTask = input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox" && !!input.runnerExecutionTarget.runnerTask;
+    const runnerIngressGitHubAccessIsSelected = runnerIngressGitHubAccessSelected(input);
     const prepareRunnerEnvironment = async () => {
       if (input.prepareGitHubEnvironment) {
         const environment = await timeController("github_environment", input.prepareGitHubEnvironment);
@@ -12790,7 +12803,15 @@ async function executePaperclipNativeSessionAttempt(
           env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
           resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
           onLog: input.onLog,
+          transport: runnerIngressGitHubAccessIsSelected ? "runner_ingress" : "callback_bridge",
         }));
+        const githubTransport = githubAccess.transport === "runner_ingress" ? "prp" : "bridge";
+        const ingressEligible = input.execution.provider.kind === "pi_rpc" && input.runnerExecutionTarget?.kind === "remote" &&
+          input.runnerExecutionTarget.transport === "sandbox" && input.runnerExecutionTarget.effectiveCapabilities?.runnerWebSocketIngress === true;
+        const fallbackReason = githubTransport === "bridge"
+          ? ingressEligible && input.runnerIngressAuthorized !== true ? "ingress_unready" : "capability_absent"
+          : undefined;
+        await input.onLog?.("stderr", `[paperclip-runner] github_access transport=${githubTransport}${fallbackReason ? ` fallback_reason=${fallbackReason}` : ""}\n`).catch(() => undefined);
         executionContext?.assertOpen();
         releaseGitHubRun = await githubAccess.activate(input.execution.binding);
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
@@ -12831,6 +12852,7 @@ async function executePaperclipNativeSessionAttempt(
       // canonical workspace identity. createRunnerdBackend separately
       // projects remoteCwd into the provider execution boundary.
       execution: input.execution,
+      getRunnerIngressGitHubAccess: () => githubAccess?.transport === "runner_ingress" ? githubAccess : undefined,
       runnerInstanceId: effectiveRunnerInstanceId,
       pluginTaskDescription,
       retainedPluginTaskOwner: existingWarmSession ? pluginTaskSessionOwners.get(existingWarmSession) : undefined,
@@ -17131,6 +17153,8 @@ export async function createRunnerdBackend(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */
   runnerIngressAuthorized?: boolean;
+  /** Deferred until run preparation has selected and activated the native broker. */
+  getRunnerIngressGitHubAccess?: () => NativeGitHubAccess | undefined;
   runnerPublicUrl?: string | null;
   runnerCaBundlePath?: string | null;
   runnerRemoteBinaryPath?: string | null;
@@ -19644,6 +19668,7 @@ async function createRunnerdBackendWithinSessionClaim(
         return current.runId;
       }, detachNativeSessionsForRestart) : undefined,
     binding: input.remoteWarmRecovery ? { ...input.execution.binding, runId: input.remoteWarmRecovery.identity.runId } : input.execution.binding,
+    getRunnerIngressGitHubAccess: input.getRunnerIngressGitHubAccess,
     runnerIngressAuthorized: input.runnerIngressAuthorized, runnerPublicUrl: input.runnerPublicUrl, runnerCaBundlePath: input.runnerCaBundlePath,
     prepareRemote: prepareRetainedRemoteRunner, processStarted: remoteRunnerProcessSpawned, checkpoint: checkpointRemoteRunner,
     // Ordinary warm sessions retain this driver and its ingress callback. Use

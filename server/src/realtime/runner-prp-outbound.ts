@@ -4,15 +4,36 @@ import { logger } from "../middleware/logger.js";
 import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "./ingress-error-summary.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
+import {
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_IN_FLIGHT,
+  DEFAULT_SANDBOX_CALLBACK_BRIDGE_RESPONSE_TIMEOUT_MS,
+} from "@paperclipai/adapter-utils/sandbox-callback-bridge";
 import type {
   DurablePrpControlPlane,
+  DurableRecoveryIdentity,
   PrpWireConnection,
   TransportCloseReason,
 } from "../vendor/paperclip-runner/index.js";
 
 const DEFAULT_STARTUP_DEADLINE_MS = 60_000;
 const DEFAULT_RECOVERY_GRACE_MS = REMOTE_RUNNER_RECONNECT_GRACE_MS;
-const MAX_FRAME_BYTES = 4 * 1024 * 1024;
+// Secure PRP uses hex ciphertext, so a maximum-size base64 HTTP body needs
+// roughly twice its encoded size plus the frame header.
+const MAX_FRAME_BYTES = Math.max(32 * 1024 * 1024,
+  2 * (4 * Math.ceil(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES / 3) + 64 * 1024));
+const GITHUB_ACCESS_KIND = "github_access.http";
+const GITHUB_ACCESS_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
+const GITHUB_ACCESS_HEADER_ALLOWLIST = new Set<string>(DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST);
+const GITHUB_ACCESS_SESSION_REQUEST_LIMIT = 65_536;
+
+type GithubAccessBinding = { companyId: string; agentId: string; issueId: string; runId: string };
+type GithubAccessReply = { requestId: string; status: number; headers: Record<string, string>; bodyBase64: string };
+type GithubAccessHandler = {
+  getSessionBinding(identity: DurableRecoveryIdentity): GithubAccessBinding | null;
+  handleRequest(frame: unknown, binding: GithubAccessBinding): Promise<unknown>;
+};
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const MIN_CONNECT_ATTEMPTS = 3;
 // Explicit sub-handshake budgets remain hard caps; normal startup/recovery
@@ -337,6 +358,121 @@ function socketClosed(wire: WsJsonWireConnection): Promise<void> {
   return new Promise((resolve) => wire.onClose(() => resolve()));
 }
 
+function githubAccessFrameRequestId(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const requestId = (value as Record<string, unknown>).requestId;
+  return typeof requestId === "string" && GITHUB_ACCESS_REQUEST_ID_PATTERN.test(requestId) ? requestId : null;
+}
+
+function githubAccessResponse(requestId: string, status: number, body: unknown): GithubAccessReply {
+  return { requestId, status,
+    headers: { "cache-control": "no-store", "content-type": "application/json" },
+    bodyBase64: Buffer.from(JSON.stringify(body)).toString("base64") };
+}
+
+function validGithubAccessFrame(value: unknown): value is Record<string, unknown> & {
+  kind: typeof GITHUB_ACCESS_KIND; requestId: string; method: string; path: string;
+  headers: Record<string, string>; bodyBase64: string;
+} {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const frame = value as Record<string, unknown>;
+  const keys = ["kind", "requestId", "method", "path", "headers", "bodyBase64"];
+  if (Object.keys(frame).length !== keys.length || keys.some(key => !Object.hasOwn(frame, key)) ||
+      frame.kind !== GITHUB_ACCESS_KIND || githubAccessFrameRequestId(frame) === null ||
+      typeof frame.method !== "string" || frame.method.length > 16 || typeof frame.path !== "string" || frame.path.length > 2048 ||
+      typeof frame.bodyBase64 !== "string" || typeof frame.headers !== "object" || frame.headers === null || Array.isArray(frame.headers)) return false;
+  const headers = frame.headers as Record<string, unknown>;
+  const entries = Object.entries(headers);
+  if (entries.length > 16 || entries.reduce((bytes, [name, header]) => bytes + Buffer.byteLength(name) +
+      (typeof header === "string" ? Buffer.byteLength(header) : 0), 0) > 8192) return false;
+  return entries.every(([name, header]) => GITHUB_ACCESS_HEADER_ALLOWLIST.has(name.toLowerCase()) &&
+    typeof header === "string" && !/[\r\n\0]/.test(header));
+}
+
+function sameGithubAccessBinding(left: GithubAccessBinding, right: GithubAccessBinding | null): boolean {
+  return right !== null && left.companyId === right.companyId && left.agentId === right.agentId &&
+    left.issueId === right.issueId && left.runId === right.runId;
+}
+
+function decodeGithubAccessBody(bodyBase64: string): Buffer | null {
+  if (bodyBase64.length > 4 * Math.ceil(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES / 3) ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(bodyBase64)) return null;
+  const body = Buffer.from(bodyBase64, "base64");
+  return body.length <= DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES && body.toString("base64") === bodyBase64 ? body : null;
+}
+
+function normalizeGithubAccessReply(value: unknown, requestId: string): GithubAccessReply | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const reply = value as Record<string, unknown>;
+  if (!Number.isSafeInteger(reply.status) || (reply.status as number) < 100 || (reply.status as number) > 599 ||
+      typeof reply.headers !== "object" || reply.headers === null || Array.isArray(reply.headers)) return null;
+  const headers: Record<string, string> = {};
+  for (const [name, header] of Object.entries(reply.headers as Record<string, unknown>)) {
+    const normalized = name.toLowerCase();
+    if (["content-type", "cache-control"].includes(normalized) && typeof header === "string" && !/[\r\n\0]/.test(header)) {
+      headers[normalized] = header;
+    }
+  }
+  const rawBody = reply.bodyBase64;
+  let bodyBase64: string;
+  if (typeof rawBody === "string") {
+    if (!decodeGithubAccessBody(rawBody)) return null;
+    bodyBase64 = rawBody;
+  } else if (Buffer.isBuffer(reply.body) || reply.body instanceof Uint8Array) {
+    const body = Buffer.from(reply.body as Uint8Array);
+    if (body.byteLength > DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES) return null;
+    bodyBase64 = body.toString("base64");
+  } else return null;
+  return { requestId, status: reply.status as number, headers, bodyBase64 };
+}
+
+function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
+  const inFlight = new Set<string>();
+  const seen = new Set<string>();
+  return async (value: unknown, identity: DurableRecoveryIdentity): Promise<GithubAccessReply> => {
+    const requestId = githubAccessFrameRequestId(value);
+    if (requestId === null) return githubAccessResponse("invalid-request", 403, { error: "GitHub ingress request refused" });
+    if (seen.has(requestId)) return githubAccessResponse(requestId, 409, { error: "GitHub ingress request already used" });
+    if (seen.size >= GITHUB_ACCESS_SESSION_REQUEST_LIMIT) {
+      return githubAccessResponse(requestId, 503, { error: "GitHub ingress request capacity unavailable" });
+    }
+    seen.add(requestId);
+    if (inFlight.size >= DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_IN_FLIGHT) {
+      return githubAccessResponse(requestId, 503, { error: "GitHub ingress request capacity unavailable" });
+    }
+    if (!validGithubAccessFrame(value)) return githubAccessResponse(requestId, 403, { error: "GitHub ingress request refused" });
+    if (!decodeGithubAccessBody(value.bodyBase64)) return githubAccessResponse(requestId, 413, { error: "GitHub request body exceeds the configured size limit" });
+    const binding = handler.getSessionBinding(identity);
+    if (!binding) return githubAccessResponse(requestId, 403, { error: "No active GitHub run" });
+    inFlight.add(requestId);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const request = Promise.resolve().then(() => handler.handleRequest(value, binding));
+      const result = await Promise.race([
+        request,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(Object.assign(new Error("github_access_response_timeout"), { githubAccessTimeout: true })),
+            DEFAULT_SANDBOX_CALLBACK_BRIDGE_RESPONSE_TIMEOUT_MS);
+          timer.unref?.();
+        }),
+      ]);
+      if (!sameGithubAccessBinding(binding, handler.getSessionBinding(identity))) {
+        return githubAccessResponse(requestId, 403, { error: "GitHub ingress run binding changed" });
+      }
+      return normalizeGithubAccessReply(result, requestId) ??
+        githubAccessResponse(requestId, 503, { error: "GitHub credentials unavailable" });
+    } catch (error) {
+      const timeout = typeof error === "object" && error !== null &&
+        (error as { githubAccessTimeout?: unknown }).githubAccessTimeout === true;
+      return githubAccessResponse(requestId, timeout ? 504 : 503,
+        { error: timeout ? "GitHub credential request timed out" : "GitHub credentials unavailable" });
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      inFlight.delete(requestId);
+    }
+  };
+}
+
 async function waitForPrpReady(input: {
   isAuthenticated: () => boolean;
   wire: WsJsonWireConnection;
@@ -381,6 +517,8 @@ export function connectRunnerPrpIngress(input: {
     state: "connecting" | "authenticated" | "reconnecting" | "failed" | "closed",
     failureCode?: RunnerIngressFailureCode,
   ) => void;
+  /** Ephemeral authenticated PRP request handler; never enters durable event state. */
+  githubAccess?: GithubAccessHandler;
 }): RunnerPrpOutboundHandle {
   const abort = new AbortController();
   const ownedWires = new Set<WsJsonWireConnection>();
@@ -394,6 +532,12 @@ export function connectRunnerPrpIngress(input: {
   let readyReject!: (error: unknown) => void;
   let readySettled = false;
   let stopLiveness = () => {};
+  let unregisterGithubAccessHandler = () => {};
+  if (input.githubAccess) {
+    unregisterGithubAccessHandler = input.authority.setGithubAccessHttpHandler(
+      githubAccessRequestDispatcher(input.githubAccess),
+    );
+  }
   const ready = new Promise<void>((resolve, reject) => {
     readyResolve = resolve;
     readyReject = reject;
@@ -640,6 +784,7 @@ export function connectRunnerPrpIngress(input: {
       abort.abort();
       await Promise.all([...ownedWires].map(closeOwnedWire));
       await loop;
+      unregisterGithubAccessHandler();
       await endpoint.close();
       input.onStateChange?.("closed");
       if (!readySettled) {

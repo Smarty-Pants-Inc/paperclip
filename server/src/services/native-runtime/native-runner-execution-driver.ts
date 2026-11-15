@@ -8,6 +8,7 @@ import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { Db } from "@paperclipai/db";
+import type { NativeGitHubAccess } from "./native-github-access.js";
 import { nativeRunnerCheckpointRegistration } from "./native-runner-checkpoint.js";
 import { readEnvironmentRunnerIngressFailure, type PluginEnvironmentRunnerIngressFailure } from "@paperclipai/plugin-sdk";
 
@@ -26,6 +27,8 @@ export interface NativeRunnerExecutionDriverInput {
   sandboxRetention?: SandboxRunnerRetention;
   binding: Omit<Parameters<typeof registerRunnerPrpAuthority>[0], "authority">;
   runnerIngressAuthorized?: boolean;
+  /** Created by the session supervisor before provider launch; read after preparation. */
+  getRunnerIngressGitHubAccess?: () => NativeGitHubAccess | undefined;
   runnerPublicUrl?: string | null;
   runnerCaBundlePath?: string | null;
   /** Validate and stage environment resources before process dispatch. */
@@ -296,13 +299,27 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           let activation: Promise<void> | null = null;
           let ingress = transport.ingress;
           let released = false;
-          const openRoute = (startupDeadlineMs?: number) => connectRunnerPrpIngress({
-            authority, endpoint: ingress, startupDeadlineMs,
-            onStateChange: (state, failureCode) => {
-              void input.onLog?.("stderr",
-                `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`);
-            },
-          });
+          const openRoute = (startupDeadlineMs?: number) => {
+            const githubAccess = input.getRunnerIngressGitHubAccess?.();
+            return connectRunnerPrpIngress({
+              authority, endpoint: ingress, startupDeadlineMs,
+              ...(githubAccess ? {
+                githubAccess: {
+                  getSessionBinding: identity => {
+                    const currentIdentity = authority.store.state.identity;
+                    const { companyId, agentId, issueId, runId } = input.binding;
+                    if (currentIdentity.runId !== identity.runId || identity.runId !== runId || !agentId || !issueId) return null;
+                    return githubAccess.getSessionBinding({ companyId, agentId, issueId, runId });
+                  },
+                  handleRequest: (frame, binding) => githubAccess.handleRunnerIngressHttpRequest(frame, binding),
+                },
+              } : {}),
+              onStateChange: (state, failureCode) => {
+                void input.onLog?.("stderr",
+                  `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`);
+              },
+            });
+          };
           const closeRoute = async () => {
             released = true;
             if (outbound) await outbound.close();

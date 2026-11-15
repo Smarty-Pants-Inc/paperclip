@@ -183,6 +183,33 @@ describe("shared Runner execution driver", () => {
     expect(transport.connect.mock.results[0].value.close).toHaveBeenCalledOnce();
   });
 
+  it("binds the selected native GitHub broker to the authenticated ingress authority", async () => {
+    const ingress = endpoint();
+    const scopedAuthority = { store: { state: { identity: { runId: binding.runId } } } } as unknown as typeof authority;
+    const access = {
+      getSessionBinding: vi.fn((identity: typeof binding) => identity.runId === binding.runId && identity.companyId === binding.companyId &&
+        identity.agentId === binding.agentId && identity.issueId === binding.issueId ? { ...binding } : null),
+      handleRunnerIngressHttpRequest: vi.fn(async () => ({ requestId: "request-1", status: 200, headers: {}, bodyBase64: "e30=" })),
+    };
+    const driver = createNativeRunnerExecutionDriver({ target: { ...sandbox(), getRunnerIngressEndpoint: async () => ingress } as AdapterExecutionTarget,
+      binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+      getRunnerIngressGitHubAccess: () => access as never });
+    const registration = await driver.controlPlaneRegistration!(scopedAuthority);
+    await registration.activate!();
+    await registration.ready!();
+    const route = transport.connect.mock.calls[0]![0] as { githubAccess?: {
+      getSessionBinding(identity: typeof binding): unknown;
+      handleRequest(frame: unknown, sessionBinding: typeof binding): Promise<unknown>;
+    } };
+    expect(route.githubAccess).toBeDefined();
+    expect(route.githubAccess!.getSessionBinding(binding)).toEqual(binding);
+    expect(route.githubAccess!.getSessionBinding({ ...binding, runId: "foreign-run" })).toBeNull();
+    const frame = { kind: "github_access.http", requestId: "request-1" };
+    await route.githubAccess!.handleRequest(frame, binding);
+    expect(access.handleRunnerIngressHttpRequest).toHaveBeenCalledWith(frame, binding);
+    await registration.release();
+  });
+
   it("does not connect after release while the process readiness gate is pending", async () => {
     const ingress = endpoint();
     let started!: () => void;
