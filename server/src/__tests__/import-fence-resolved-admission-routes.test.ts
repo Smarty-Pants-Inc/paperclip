@@ -33,6 +33,7 @@ type Proposed = {
   slug: string;
   config?: Record<string, unknown>;
   adapterType?: string;
+  reportsToExistingAgentId?: string;
   runtime?: Record<string, unknown>;
   budgetMonthlyCents?: number;
   permissionGrants?: Array<{ permissionKey: string; scope?: Record<string, unknown> | null }>;
@@ -74,7 +75,8 @@ describePg("RFL importfence8 FIX 1 security regressions", () => {
     const files: Record<string, string> = {
       "COMPANY.md": `---\nname: Imported\nincludes:\n${proposed.map(a => `  - agents/${a.slug}/AGENTS.md`).join("\n")}\n---\n`,
       ".paperclip.yaml": stringify({ schema: "paperclip/v1", agents: Object.fromEntries(proposed.map(a => [a.slug, {
-        role: "engineer", adapter: { type: a.adapterType ?? "codex_local",
+        role: "engineer", reportsToExistingAgentId: a.reportsToExistingAgentId,
+        adapter: { type: a.adapterType ?? "codex_local",
           runner: a.adapterType === runnerHire.adapterType ? runnerHire.runner : "legacy", config: a.config ?? {} },
         runtime: a.runtime ?? {}, budgetMonthlyCents: a.budgetMonthlyCents ?? 0,
         permissionGrants: a.permissionGrants ?? [],
@@ -126,5 +128,29 @@ describePg("RFL importfence8 FIX 1 security regressions", () => {
     expect.soft(response.status).toBe(403);
     expect.soft(response.body.error).toBe("Agent keys cannot configure host-executed local adapter settings (env).");
     expect.soft(await snapshot(companyId)).toEqual(before);
+  });
+  it.each(["no-grants", "configure-only", "runtime-only", "both", "outside-subtree"])("import report env authority: %s", async authority => {
+    const { companyId, actor } = await seed();
+    const [outside] = await db.insert(agents).values({ companyId, name: "Outside", role: "engineer", adapterType: "codex_local", adapterConfig: {} }).returning();
+    if (["configure-only", "both", "outside-subtree"].includes(authority)) await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure", scope: { subtreeRootAgentId: actor.agentId! },
+    });
+    if (["runtime-only", "both", "outside-subtree"].includes(authority)) await db.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure-reports-runtime", scope: null,
+    });
+    const before = await snapshot(companyId);
+    const input = bundle(companyId, [{ slug: "env-report", adapterType: "paperclip_runner", config: { ...runnerHire.adapterConfig, env: { TZ: "UTC" } },
+      reportsToExistingAgentId: authority === "outside-subtree" ? outside!.id : actor.agentId }]);
+    const response = await request(app(actor)).post(`/api/companies/${companyId}/imports/apply`).send(input);
+    const allowed = authority === "both";
+    expect(response.status, JSON.stringify(response.body)).toBe(allowed ? 200 : 403);
+    if (allowed) {
+      const child = (await db.select().from(agents).where(eq(agents.companyId, companyId))).find(a => a.name === "env-report");
+      expect(child?.reportsTo).toBe(actor.agentId);
+      expect(child?.adapterConfig.env).toEqual({ TZ: { type: "plain", value: "UTC" } });
+    } else {
+      expect(response.body.error).toBe("Agent keys cannot configure host-executed local adapter settings (env).");
+      expect(await snapshot(companyId)).toEqual(before);
+    }
   });
 });

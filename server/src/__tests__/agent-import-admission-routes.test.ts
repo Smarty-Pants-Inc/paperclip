@@ -33,6 +33,7 @@ type Proposed = {
   slug: string;
   config?: Record<string, unknown>;
   adapterType?: string;
+  reportsToExistingAgentId?: string;
   runtime?: Record<string, unknown>;
   budgetMonthlyCents?: number;
   permissionGrants?: Array<{ permissionKey: string; scope?: Record<string, unknown> | null }>;
@@ -74,7 +75,8 @@ describePg("agent-actor import admission fence", () => {
     const files: Record<string, string> = {
       "COMPANY.md": `---\nname: Imported\nincludes:\n${proposed.map(a => `  - agents/${a.slug}/AGENTS.md`).join("\n")}\n---\n`,
       ".paperclip.yaml": stringify({ schema: "paperclip/v1", agents: Object.fromEntries(proposed.map(a => [a.slug, {
-        role: "engineer", adapter: { type: a.adapterType ?? "codex_local",
+        role: "engineer", reportsToExistingAgentId: a.reportsToExistingAgentId,
+        adapter: { type: a.adapterType ?? "codex_local",
           runner: a.adapterType === runnerHire.adapterType ? runnerHire.runner : "legacy", config: a.config ?? {} },
         runtime: a.runtime ?? {}, budgetMonthlyCents: a.budgetMonthlyCents ?? 0,
         permissionGrants: a.permissionGrants ?? [],
@@ -137,10 +139,19 @@ describePg("agent-actor import admission fence", () => {
     } else if (!allowed) {
       expectedError = `Agent keys cannot configure host-executed local adapter settings (${label.split(" ").at(-1)}).`;
     }
+    // RFL importfence8 FIX 1: positive import env rows are now real reports
+    // with the same explicit configure + runtime grants as live report PATCH.
+    // No assertion/status is relaxed; the unprivileged/root controls live in
+    // import-fence-resolved-admission-routes.test.ts.
+    if (allowed) await db.insert(principalPermissionGrants).values([
+      { companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure", scope: { subtreeRootAgentId: actor.agentId! } },
+      { companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure-reports-runtime", scope: null },
+    ]);
     const instance = app(actor);
     const beforeImport = await snapshot(companyId);
     const imported = await request(instance).post(`/api/companies/${companyId}/imports/apply`)
-      .send(bundle(companyId, [{ slug: "env-import", adapterType: runnerHire.adapterType, config: adapterConfig }]));
+      .send(bundle(companyId, [{ slug: "env-import", adapterType: runnerHire.adapterType, config: adapterConfig,
+        reportsToExistingAgentId: allowed ? actor.agentId : undefined }]));
     const afterImport = await snapshot(companyId);
     const hired = await request(instance).post(`/api/companies/${companyId}/agent-hires`).send({
       ...runnerHire, name: "env-hire", role: "engineer", adapterConfig,

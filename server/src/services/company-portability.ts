@@ -1,6 +1,7 @@
 import { publishActivity, type ActivityPublication } from "./activity-log.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import { admitAgentActorHire, assertAgentActorPermissionGrants } from "./agent-actor-admission.js";
+import { canConfigureReportRuntime, isReportRuntimeEnv, REPORT_ENV_REFUSAL } from "./agent-report-runtime.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { approvalService } from "./approvals.js";
 import { redactEventPayload } from "../redaction.js";
@@ -5917,6 +5918,13 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             runner,
             existingImportAgent?.defaultEnvironmentId,
           );
+          // Runner selection can turn paperclip_runner into a host-executed
+          // *_local adapter. Admit the resolved values as hire/create do, not
+          // only the submitted adapter name. This runs inside the locked import
+          // transaction, before the lifecycle writer can persist the agent.
+          await admitAgentActorHire(db, actor, targetCompany, {
+            ...normalizedAdapter, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
+          }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
           const patch = {
             name: planAgent.plannedName,
             role: manifestAgent.role,
@@ -6073,6 +6081,16 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         if (actor.type === "agent") for (const manifestAgent of plan.selectedAgents) {
           const entry = resultAgents.find(entry => entry.slug === manifestAgent.slug && entry.action !== "skipped");
           if (!entry?.id) continue;
+          // Creation admission can validate submitted env and secret access,
+          // but report authority needs the actual saved target and final tree.
+          // Match the live report-runtime gate; an imported root is not a report.
+          const importedAgent = await agents.getById(entry.id);
+          if (importedAgent?.adapterType === "paperclip_runner"
+            && isReportRuntimeEnv(importedAgent.adapterConfig.env)
+            && Object.keys(importedAgent.adapterConfig.env as Record<string, unknown>).length > 0
+            && !await canConfigureReportRuntime(db, actor, importedAgent)) {
+            throw forbidden(REPORT_ENV_REFUSAL);
+          }
           const grants = importedGrants(manifestAgent, manifestAgent);
           await assertAgentActorPermissionGrants(db, actor, targetCompany.id, grants, entry.id);
           await applyImportedAgentPermissionGrants(targetCompany.id, entry.id, grants, actorUserId ?? null);
