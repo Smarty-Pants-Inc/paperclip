@@ -35,6 +35,7 @@ export type ReadySpare = {
 
 export type ReadySpareOperations = {
   list(): Promise<ReadySpare[]>;
+  get(spare: ReadySpare): Promise<ReadySpare | undefined>;
   create(key: ReadySpareKey): Promise<ReadySpare>;
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
   refresh(spare: ReadySpare, ttlSeconds: number): Promise<ReadySpare>;
@@ -330,16 +331,26 @@ export class ReadySpareKeeper {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
-    if (this.stopping) return;
+    if (this.stopping || (this.inFlightClaims.get(poolId) ?? 0) > 0) return;
     const keep = listed.filter(spare => spare.labels.owner === `paperclip:${key.companyId}`
       && spare.labels.environment === key.environmentId && spare.labels.purpose === "spare"
       && spare.labels.configHash === key.configHash
       && spare.name === `paperclip-spare:ready:${key.configHash}`
       && (spare.state === "ready" || spare.state === "idle"));
-    const selected = keep.slice(0, Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired))));
-    for (const surplus of keep.slice(selected.length)) {
+    const eligible = keep.filter(spare => !this.claiming.has(spare.id));
+    const selected = eligible.slice(0, Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired))));
+    for (const surplus of eligible.slice(selected.length)) {
       if (this.stopping) return;
-      await operations.stop(surplus);
+      let current: ReadySpare | undefined;
+      try { current = await operations.get(surplus); }
+      catch { continue; } // Unknown provider state is never a reason to stop a spare.
+      if (this.stopping) return;
+      if (current?.id !== surplus.id || current.labels.owner !== `paperclip:${key.companyId}`
+        || current.labels.environment !== key.environmentId || current.labels.purpose !== "spare"
+        || current.labels.configHash !== key.configHash
+        || current.name !== `paperclip-spare:ready:${key.configHash}`
+        || (current.state !== "ready" && current.state !== "idle") || this.claiming.has(surplus.id)) continue;
+      await operations.stop(current);
     }
     if (selected.length) this.pools.set(poolId, selected);
     else this.pools.delete(poolId);

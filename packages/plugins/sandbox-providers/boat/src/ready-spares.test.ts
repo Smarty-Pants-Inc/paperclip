@@ -26,6 +26,7 @@ function operations(records: ReadySpare[] = []) {
   const inventory = [...records];
   const ops: ReadySpareOperations = {
     list: vi.fn(async () => [...inventory]),
+    get: vi.fn(async item => inventory.find(candidate => candidate.id === item.id)),
     create: vi.fn(async (poolKey: ReadySpareKey) => {
       const created = spare({ id: `bx_created_${inventory.length}`, key: poolKey,
         name: `paperclip-spare:ready:${poolKey.configHash}`,
@@ -190,6 +191,54 @@ describe("Boat ready spare keeper", () => {
       key.companyId, key.environmentId, rows.get("bx_abcdefgh")?.[3], "run-one",
     ]);
     expect(rows.get("bx_abcdefgh")?.[3]).toMatch(/^paperclip-claim:/);
+  });
+
+  it("does not stop a same-worker claim while its Boat rename is pending", async () => {
+    const candidate = spare({ state: "ready" });
+    const { ops } = operations([candidate]);
+    let resolveClaim!: (value: boolean) => void;
+    (ops.claim as ReturnType<typeof vi.fn>).mockImplementation(() => new Promise<boolean>(resolve => { resolveClaim = resolve; }));
+    const keeper = new ReadySpareKeeper(() => start, 12, claimStore());
+    await keeper.reconcile(key, 1, ops);
+    const claiming = keeper.claim(key, "in-flight", 1800, ops);
+    await vi.waitFor(() => expect(ops.claim).toHaveBeenCalledTimes(1));
+
+    await keeper.reconcileTimer(key, 0, ops);
+    expect(ops.stop).not.toHaveBeenCalledWith(candidate);
+    resolveClaim(true);
+    await claiming;
+  });
+
+  it("re-reads a candidate so another worker's reserved, landed claim is not stopped", async () => {
+    const candidate = spare({ state: "ready" });
+    const { ops } = operations([candidate]);
+    const externalRows = new Set([candidate.id]);
+    const claimedElsewhere = { ...candidate, name: "paperclip-claim:other-worker" };
+    (ops as ReadySpareOperations & { get: (item: ReadySpare) => Promise<ReadySpare> }).get = vi.fn(async () => claimedElsewhere);
+    const db = { namespace: "boat_test", execute: async () => ({ rowCount: 0 }), query: vi.fn(async () => [...externalRows]) };
+    const keeper = new ReadySpareKeeper(() => start, 12, createReadySpareClaimStore(db));
+
+    expect(externalRows.has(candidate.id)).toBe(true); // another worker has reserved it; Boat's rename has landed
+    await keeper.reconcileTimer(key, 0, ops);
+    expect(ops.stop).not.toHaveBeenCalledWith(candidate);
+    expect((ops as ReadySpareOperations & { get: ReturnType<typeof vi.fn> }).get).toHaveBeenCalledWith(candidate);
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  it("re-reads and still stops genuinely surplus ready spares without querying the claim database", async () => {
+    const candidate = spare({ state: "ready" });
+    const extra = spare({ id: "bx_surplus", state: "ready" });
+    const { ops } = operations([candidate, extra]);
+    const current = new Map([[candidate.id, candidate], ["bx_surplus", extra]]);
+    (ops as ReadySpareOperations & { get: (item: ReadySpare) => Promise<ReadySpare> }).get = vi.fn(async item => current.get(item.id)!);
+    const db = { namespace: "boat_test", execute: async () => ({ rowCount: 1 }), query: vi.fn(async () => []) };
+    const keeper = new ReadySpareKeeper(() => start, 12, createReadySpareClaimStore(db));
+
+    await keeper.reconcileTimer(key, 1, ops);
+    expect(((ops as ReadySpareOperations & { get: ReturnType<typeof vi.fn> }).get).mock.calls.map(([item]) => item.id)).toEqual(["bx_surplus"]);
+    expect(ops.stop).toHaveBeenCalledTimes(1);
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_surplus" }));
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("reports a config mismatch when only an old create-hash pool is ready", async () => {

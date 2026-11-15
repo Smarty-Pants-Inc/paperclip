@@ -693,6 +693,14 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare")
         .map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
     },
+    async get(spare) {
+      const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+        method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+      }, false, { requireJson: true });
+      const sandbox = result?.sandbox ?? result;
+      if (sandbox?.id !== spare.id || !sandbox.labels) return undefined;
+      return readySpareFromSandbox(sandbox, ttlSeconds);
+    },
     create: () => createAndWarmSpare(config, key, ttlSeconds, from),
     async claim(spare, name, claimTtlSeconds) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
