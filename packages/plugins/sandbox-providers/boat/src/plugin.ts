@@ -55,6 +55,7 @@ let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
 let shuttingDown = false;
 let boatRateLimitPauseUntil = 0;
+const preparedEnvDirectories = new Map<string, string>();
 const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
 function subscribeCompanyActivity(companyId: string): void {
   if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
@@ -250,11 +251,20 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const deadline = Date.now() + BOAT_CALL_BUDGET_MS;
     const signal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
     const method = (init.method ?? "GET").toUpperCase();
+    const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
     const waitForRateLimitPause = async () => {
-      const remaining = boatRateLimitPauseUntil - Date.now();
+      const pauseUntil = boatRateLimitPauseUntil;
+      const remaining = pauseUntil - Date.now();
       if (remaining <= 0) return;
       const budget = deadline - Date.now();
-      if (budget <= 0 || remaining > budget) throw new Error("http_error");
+      if (budget <= 0 || remaining > budget) {
+        duplexLogger?.warn(`Boat IP rate-limit pause until ${new Date(pauseUntil).toISOString()}, call refused without a request`, {
+          method, route, deadline: new Date(deadline).toISOString(),
+        });
+        const error = new Error("boat_ip_rate_limit_paused") as Error & { code: string };
+        error.code = "boat_ip_rate_limit_paused";
+        throw error;
+      }
       await delay(remaining, undefined, { signal });
     };
     const retryable429Routes: { method: string; pattern: RegExp }[] = [
@@ -294,17 +304,21 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
           if (Number.isFinite(bodyWait) && bodyWait >= 0) retryAfterMs = bodyWait * 1_000;
         }
       }
-      const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
-      duplexLogger?.warn("Boat API 429", {
+      const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
+      if (!isIpLimit) duplexLogger?.warn("Boat API 429", {
         method, route, attempt: `${attempt}/${BOAT_MAX_ATTEMPTS}`, retryAfter: retryAfterText,
         rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
         ...(errorCode ? { code: errorCode } : {}),
       });
       await response.body?.cancel();
-      const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
       const hasRateLimitWait = retryAfter !== null || isIpLimit;
       if (isIpLimit) {
+        retryAfterMs = Math.min(retryAfterMs, 120_000);
         boatRateLimitPauseUntil = Math.max(boatRateLimitPauseUntil, Date.now() + retryAfterMs);
+        duplexLogger?.warn("Boat IP rate-limit pause", {
+          reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(boatRateLimitPauseUntil).toISOString(),
+          retryAfter: retryAfterText, method, route,
+        });
         await waitForRateLimitPause();
       } else if (retryAfter !== null) {
         const remainingMs = deadline - Date.now();
@@ -340,7 +354,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     });
     if (responseOptions.requireJson && body === null) throw new Error(category);
     return body;
-  } catch {
+  } catch (error) {
+    if (error && typeof error === "object" && (error as { code?: unknown }).code === "boat_ip_rate_limit_paused") throw error;
     throw requestError(config, init.method ?? "GET", path, httpStatus, category);
   }
 }
@@ -544,6 +559,23 @@ async function cleanupAcquisition(config: Config, ids: string[], owner: { compan
   }
   if (firstFailed) throw new PluginEnvironmentCreationCleanupError([cause, ...failures],
     `Boat acquire failed and cleanup of ${firstFailed} was not confirmed.`, cleanupIdentity(config, firstFailed, owner, attemptId));
+}
+function privateEnvDirectory(id: string, roots: string[] = []): string | null {
+  const suffix = createHash("sha256").update(id).digest("hex").slice(0, 24);
+  return [`/tmp/paperclip-boat-env-${suffix}`, `/home/user/.paperclip-boat-env-${suffix}`]
+    .find(path => roots.every(root => path !== root && !path.startsWith(root === "/" ? root : `${root}/`))) ?? null;
+}
+async function ensurePrivateEnvDirectory(config: Config, id: string, roots: string[] = []): Promise<string> {
+  const existing = preparedEnvDirectories.get(id);
+  if (existing && roots.every(root => existing !== root && !existing.startsWith(root === "/" ? root : `${root}/`))) return existing;
+  const directory = privateEnvDirectory(id, roots);
+  if (!directory) throw new Error("Boat env file requires a private path outside the workspace.");
+  const qdir = q(directory);
+  const command = `umask 077 && /bin/mkdir -p -m 0700 -- ${qdir} && test ! -L ${qdir} && test -d ${qdir} && test "$(/usr/bin/stat -c %u -- ${qdir})" = "$(/usr/bin/id -u)" && test "$(/usr/bin/stat -c %a -- ${qdir})" = 700`;
+  const result = await runCommand(config, id, command, 30_000);
+  if (result.exitCode !== 0 || result.timedOut) throw new Error("Boat private env directory verification failed");
+  preparedEnvDirectories.set(id, directory);
+  return directory;
 }
 async function runCommand(config: Config, id: string, command: string, timeoutMs: number, cwd?: string, signal?: AbortSignal): Promise<PluginEnvironmentExecuteResult> {
   const timeoutSeconds = Math.max(1, Math.min(600, Math.ceil(timeoutMs / 1000)));
@@ -950,6 +982,8 @@ async function finishAcquisition(
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
     shuttingDown = false;
+    boatRateLimitPauseUntil = 0;
+    preparedEnvDirectories.clear();
     readySpares.start();
     knownSparePools.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
@@ -1331,6 +1365,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const c = parse(params.config); const id = params.providerLeaseId;
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: id });
+    // Lifecycle hooks issue no guest command; leave the now-empty private env directory rather than add one solely for cleanup.
     const receipt = await stopSandbox(c, id);
     runnerIngressGenerationStore.invalidate(ingressScopeKey(params, c, id));
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
@@ -1430,20 +1465,30 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         await request(c, base, { method: "PUT", body: JSON.stringify({ path, content, encoding: "utf8" }) });
       }
     };
+    const roots = [params.cwd, params.lease.metadata?.remoteCwd].filter((p): p is string => typeof p === "string")
+      .map(p => posix.resolve("/home/user", p));
+    let envRecoveryUsed = false;
     try {
       const env = Object.entries(params.env ?? {});
       if (env.length) {
         // Never include values (or names) in Boat's retained command text.
         // Keep files outside BOTH the exec cwd and the recorded copyback root.
-        const roots = [params.cwd, params.lease.metadata?.remoteCwd].filter((p): p is string => typeof p === "string")
-          .map(p => posix.resolve("/home/user", p));
+        const directory = await ensurePrivateEnvDirectory(c, id, roots);
         const uuid = randomUUID();
-        envPath = [`/tmp/paperclip-boat-env-${uuid}.sh`, `/home/user/.paperclip-boat-env-${uuid}.sh`]
-          .find(path => roots.every(root => path !== root && !path.startsWith(root === "/" ? root : `${root}/`))) ?? null;
-        if (!envPath) throw new Error("Boat env file requires a private path outside the workspace.");
-        // Boat's file API has no mode field; chmod before sourcing. Keep secrets
-        // out of retained command text and delete the file after execution.
-        await stage(envPath, env.map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
+        envPath = `${directory}/${uuid}.sh`;
+        if (!roots.every(root => envPath !== root && !envPath!.startsWith(root === "/" ? root : `${root}/`))) throw new Error("Boat env file requires a private path outside the workspace.");
+        // The lease directory is verified private before Boat can write any secret.
+        const envContent = env.map(([k, v]) => `export ${k}=${q(v)}\n`).join("");
+        try { await stage(envPath, envContent, "env"); }
+        catch (error) {
+          if (envRecoveryUsed || !/(?:404|not found|no such file|missing)/i.test(String(error))) throw error;
+          envRecoveryUsed = true;
+          await request(c, `${base}?path=${encodeURIComponent(envPath)}`, { method: "DELETE" }).catch(() => undefined);
+          preparedEnvDirectories.delete(id);
+          const retryDir = await ensurePrivateEnvDirectory(c, id, roots);
+          envPath = `${retryDir}/${randomUUID()}.sh`;
+          await stage(envPath, envContent, "env");
+        }
       }
       if (params.stdin !== undefined) {
         stdinPath = `/tmp/paperclip-stdin-${randomUUID()}`;
@@ -1453,7 +1498,19 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // Absolute cleanup utilities still work when the caller overrides PATH.
       const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && ` : "";
       const wrapped = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-      return await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      let result = await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      if (!envRecoveryUsed && envPath && result.stderr.includes(posix.dirname(envPath)) && /(?:No such file|not found|missing)/i.test(result.stderr)) {
+        envRecoveryUsed = true;
+        preparedEnvDirectories.delete(id);
+        const retryDir = await ensurePrivateEnvDirectory(c, id, roots);
+        const retryPath = `${retryDir}/${randomUUID()}.sh`;
+        await request(c, `${base}?path=${encodeURIComponent(envPath)}`, { method: "DELETE" }).catch(() => undefined);
+        await stage(retryPath, Object.entries(params.env ?? {}).map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
+        envPath = retryPath;
+        const retryWrapper = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
+        result = await runCommand(c, id, retryWrapper, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      }
+      return result;
     } finally {
       for (const path of [envPath, stdinPath]) if (path) await request(c, `${base}?path=${encodeURIComponent(path)}`, { method: "DELETE" }).catch(() => undefined);
     }

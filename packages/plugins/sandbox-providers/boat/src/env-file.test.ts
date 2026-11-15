@@ -1,6 +1,6 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import plugin from "./plugin.js";
@@ -21,11 +21,17 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
   const modes: number[][] = [];
   let uploadPath = "";
   const local = (text: string) => text.replace(/\/tmp\/paperclip-/g, `${root}/paperclip-`).replace(/\/home\/user\/\.paperclip-boat-env-/g, `${root}/home-env-`);
-  const run = (command: string) => spawnSync("/bin/sh", ["-c", local(command)], { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin" } });
+  const run = (command: string) => {
+    const chmod = /\/bin\/chmod 600 -- '([^']+)'/.exec(command);
+    const instrumented = chmod ? command.replace(chmod[0], `${chmod[0]} && /usr/bin/stat -c %a -- '${chmod[1]}' > '${chmod[1]}.mode'`) : command;
+    const result = spawnSync("/bin/sh", ["-c", local(instrumented)], { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin" } });
+    if (chmod && existsSync(local(`${chmod[1]}.mode`))) modes.push([parseInt(readFileSync(local(`${chmod[1]}.mode`), "utf8").trim(), 8)]);
+    return result;
+  };
   const store = (path: string, content: string) => {
     puts.push({ path, content });
     if (path.endsWith(".sh")) modes.push([statSync(dirname(local(path))).mode & 0o777]);
-    mkdirSync(dirname(local(path)), { recursive: true }); writeFileSync(local(path), content);
+    writeFileSync(local(path), content);
     if (failure === "upload") throw new Error("fixture upload lost reply");
   };
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -47,7 +53,7 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
     if (url === `${API}/commands` && init.method === "POST") {
       const body = JSON.parse(String(init.body)); commands.push(body);
       if (!body.command.includes("exec ")) {
-        if (failure === "setup") return json({ exitCode: 1 });
+        if (failure === "setup" && body.command.includes("/bin/chmod 600")) return json({ exitCode: 1 });
         const result = run(body.command); expect(result.status, result.stderr).toBe(0); return json({ exitCode: 0 });
       }
       if (failure === "setup") return json({ exitCode: 1 });
@@ -65,6 +71,7 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
   vi.stubGlobal("fetch", fetch);
   return { root, puts, commands, deletes, modes, fetch, local, envFiles: () => puts.filter(p => p.path.endsWith(".sh")) };
 }
+beforeEach(async () => { await plugin.definition.setup({ logger: { info() {}, warn() {}, error() {}, debug() {} } } as any); });
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("execute environment files", () => {
@@ -81,7 +88,9 @@ describe("execute environment files", () => {
     expect(command.indexOf("/bin/chmod 600")).toBeLessThan(command.indexOf(`. '${path}'`));
     expect(command.indexOf("rm -f --")).toBeLessThan(command.indexOf("exec "));
     expect(command).not.toContain("rmdir --");
-    expect(f.modes).toEqual([[statSync(f.root).mode & 0o777]]);
+    expect(f.modes).toEqual([[0o700], [0o600]]);
+    expect(f.commands[0].command).toContain("/bin/mkdir -p -m 0700");
+    expect(f.envFiles()[0].path).toMatch(/^\/tmp\/paperclip-boat-env-[a-f0-9]{24}\/[^/]+\.sh$/);
     expect(f.deletes).toContain(path); expect(f.deletes).toHaveLength(1);
     expect(existsSync(f.local(path))).toBe(false);
   });
@@ -90,7 +99,7 @@ describe("execute environment files", () => {
     const env = { SECRET_X: "single' dollar$ backtick`\nbackslash\\ space 雪 = end", EMPTY: "", EQ: "a=b=c", PATH: "/nonexistent" };
     const child = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(env))}.map(k=>[k,process.env[k]]))))`;
     // stdin is a non-secret program; the grandchild proves exports, not just shell locals.
-    const stdin = `const fs=require('node:fs');const cp=require('node:child_process');if(fs.readdirSync(${JSON.stringify(f.root)}).some(p=>p.startsWith('paperclip-boat-env-')))process.exit(91);process.stdout.write(cp.execFileSync(process.execPath,['-e',${JSON.stringify(child)}]));`;
+    const stdin = `const fs=require('node:fs');const cp=require('node:child_process');if(fs.readdirSync(${JSON.stringify(f.root)}).some(p=>p.startsWith('paperclip-boat-env-')&&fs.readdirSync(${JSON.stringify(f.root)}+'/'+p).some(q=>q.endsWith('.sh'))))process.exit(91);process.stdout.write(cp.execFileSync(process.execPath,['-e',${JSON.stringify(child)}]));`;
     const result = await plugin.definition.onEnvironmentExecute!({ ...params, command: process.execPath, args: ["-"], stdin, env });
     expect(result.exitCode, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout!)).toEqual(env);

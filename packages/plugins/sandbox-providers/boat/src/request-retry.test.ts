@@ -80,6 +80,24 @@ describe("Boat 429 retry", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  it("caps IP pauses at 120 seconds and logs the pause plus a refused call with a distinct code", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn().mockResolvedValue(response({ code: "IP_RATE_LIMIT_EXCEEDED", retryAfter: 9999 }, 429, { "Retry-After": "9999" }));
+    vi.stubGlobal("fetch", fetch);
+    await expect(plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config, providerLeaseId: id }))
+      .rejects.toMatchObject({ message: "boat_ip_rate_limit_paused", code: "boat_ip_rate_limit_paused" });
+    expect(logger.warn).toHaveBeenCalledWith("Boat IP rate-limit pause", expect.objectContaining({
+      reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(Date.now() + 120_000).toISOString(), retryAfter: "9999",
+      method: "POST", route: "/sandboxes/{sandboxId}/resume",
+    }));
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("Boat IP rate-limit pause until "), expect.objectContaining({
+      method: "POST", route: "/sandboxes/{sandboxId}/resume", deadline: expect.any(String),
+    }));
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    expect(logger.warn).not.toHaveBeenCalledWith("Boat API 429", expect.anything());
+  });
+
   it("honors IP_RATE_LIMIT_EXCEEDED once and pauses other calls in this worker", async () => {
     vi.useFakeTimers();
     const fetch = vi.fn()
