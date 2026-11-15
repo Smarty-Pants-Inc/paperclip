@@ -13,7 +13,7 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
 import { and, eq } from "drizzle-orm";
 import { agents, assets, agentConfigRevisions, agentTaskSessions, agentRuntimeState, type Db } from "@paperclipai/db";
-import { normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
+import { aiRuntimeConnectionBindingSchema, normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { agentRecordQueries, type UpdateAgentOptions, type AgentConfigurationPatch, type AgentConfigurationRecord, isPlainRecord, buildConfigSnapshot,
@@ -25,7 +25,9 @@ import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
 import { assertCanManageSubordinateAgent, assertSubordinateBudgetChange } from "./agent-subtree-management.js";
-import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv, REPORT_ENV_REFUSAL } from "./agent-report-runtime.js";
+import { assertReportEnvSecretAccess, canAssignSharedReportAiConnection, canConfigureReportRuntime, isReportRuntimeEnv, REPORT_ENV_REFUSAL } from "./agent-report-runtime.js";
+import { connectionManagementService } from "./connection-management.js";
+import { ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION } from "./connection-management-policy.js";
 
 export async function lockAgentConfigurationInteractions(tx: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
   const pluginOrigin = currentPluginInteractionOrigin();
@@ -50,6 +52,21 @@ export async function prepareAgentConfiguration(db: Db, existing: AgentConfigura
     if ((data.adapterType ?? existing.adapterType) !== "paperclip_runner" || !isReportRuntimeEnv(env)
       || !await canConfigureReportRuntime(db, options.reportRuntimeActor, existing)) throw forbidden(REPORT_ENV_REFUSAL);
     await assertReportEnvSecretAccess(db, options.reportRuntimeActor, existing, env);
+  }
+  if (options?.reportAiBindingActor) {
+    const runtime = data.runtimeConfig ?? existing.runtimeConfig;
+    const binding = aiRuntimeConnectionBindingSchema.safeParse(isPlainRecord(runtime) ? runtime.aiConnection : undefined).data;
+    if (binding?.mode !== "shared" || !await canAssignSharedReportAiConnection(db, options.reportAiBindingActor, existing, {
+      adapterType: data.adapterType ?? existing.adapterType,
+      adapterConfig: data.adapterConfig ?? existing.adapterConfig, binding,
+    })) throw forbidden("Report AI assignment requires a current Runner report, direct configure authority, the report-runtime grant, and a company-installed shared account");
+    // This db is the company-locked transaction, not the route's authorization
+    // context. Re-read both principals, key/run, grants, audience and installs.
+    await connectionManagementService(db).authorize(options.reportAiBindingActor, "connections:profiles", {
+      type: "connection_management", companyId: existing.companyId, purpose: "ai", targetAgentId: existing.id,
+      connectionId: binding.connectionId,
+      operation: ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION,
+    });
   }
   if (options?.requireSubordinateManagement && options.recordRevision?.createdByAgentId) {
     await assertCanManageSubordinateAgent(db, { type: "agent", agentId: options.recordRevision.createdByAgentId,

@@ -171,7 +171,8 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { assertAgentLifecycleAuthority, assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
-import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv } from "../services/agent-report-runtime.js";
+import { assertReportEnvSecretAccess, canAssignSharedReportAiConnection, canConfigureReportRuntime, isReportRuntimeEnv } from "../services/agent-report-runtime.js";
+import { ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION } from "../services/connection-management-policy.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
 import {
@@ -5660,6 +5661,7 @@ export function agentRoutes(
       }
     }
     let reportRuntimeEnvAuthorized = false;
+    let reportAiBindingAuthorized = false;
     const requestedStatus = patchData.status;
     delete patchData.status;
     if (requestedStatus !== undefined && !["paused", "idle", "terminated"].includes(String(requestedStatus))) throw badRequest("Use an agent lifecycle command to change status");
@@ -5883,10 +5885,13 @@ export function agentRoutes(
       await assertCanConfigureAgentSetup(req, existing);
       const changed = !isDeepStrictEqual(nextAiBinding, existing.runtimeConfig.aiConnection);
       if (changed && req.actor.type === "agent") {
+        reportAiBindingAuthorized = await canAssignSharedReportAiConnection(db, req.actor, existing, {
+          adapterType: requestedAdapterType, adapterConfig: nextAiConfig, binding: nextAiBinding,
+        });
         await connectionManagementService(db).authorize(req.actor, "connections:profiles", {
           type: "connection_management", companyId: existing.companyId, purpose: "ai", targetAgentId: existing.id,
           connectionId: "connectionId" in nextAiBinding ? nextAiBinding.connectionId : undefined,
-          operation: "agent.ai-binding.update",
+          operation: reportAiBindingAuthorized ? ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION : "agent.ai-binding.update",
         });
       }
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
@@ -5937,6 +5942,7 @@ export function agentRoutes(
     const updateOptions = {
       expectedConfigurationRevision,
       ...(reportRuntimeEnvAuthorized ? { reportRuntimeActor: req.actor } : {}),
+      ...(reportAiBindingAuthorized ? { reportAiBindingActor: req.actor } : {}),
       ...(runtimeSettings ? { expectedConfiguration: {
         adapterType: existing.adapterType, adapterConfig: existing.adapterConfig,
         runtimeConfig: existing.runtimeConfig, defaultEnvironmentId: existing.defaultEnvironmentId,

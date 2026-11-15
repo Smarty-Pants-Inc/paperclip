@@ -98,6 +98,34 @@ it enables assignment. Assignment grant writes are scoped to the target's
 subtree. Trust presets and authorization-policy administration stay board-only.
 Agent administrative mutations are attributed to the agent in the activity log.
 
+## Company AI account assignments to Runner reports
+
+A manager with direct, target-scoped `agents:configure` and
+`agents:configure-reports-runtime` may assign an existing company-wide AI account
+to a current strict `paperclip_runner` reporting descendant. Use the existing
+`PATCH /api/agents/:id` with an explicit `runtimeConfig.aiConnection` shared
+binding (`connectionId` and its organization `grantId`), or the `runtimeSettings`
+form with the expected saved model and binding. Account selection does not
+change the model; set a compatible model separately or in `runtimeSettings`.
+
+This recipient-only assignment does not edit the connection, its audience, or
+its installs. The connection must be an AI runtime-auth connection in this
+company, have an organization grant and a company-target install, and be usable
+by the manager itself under its authenticated responsible user and current
+harness. The report's effective harness/model must also be compatible. The
+normal connection/profile grants, responsible-human ceiling, key/run validity,
+and interaction checks still apply. The company-locked configuration writer
+rechecks the current subtree, grants, account, audience and installs before
+persisting; route admission alone is not authority to write.
+
+Personal accounts (even with a company-wide agent install), implicit personal
+defaults, routers, adapter switches and non-company installs do not receive this
+new assignment admission. Their existing configuration/management paths remain
+unchanged, including existing board and explicitly unscoped configuration
+authority. The report-runtime grant never extends that new admission to self,
+peers, ancestors or other reporting subtrees. Revoking the report-runtime grant
+removes the recipient-only exception without broadening `agents:configure`.
+
 ## Runner report environments
 
 The company-scoped `agents:configure-reports-runtime` grant permits an agent to

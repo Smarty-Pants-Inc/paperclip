@@ -123,7 +123,7 @@ describe("manager assigns a company AI connection to its own report", () => {
       adapterType: saved.adapterType, config: saved.adapterConfig, binding: saved.runtimeConfig.aiConnection as AiConnectionBinding });
     try {
       expect(runtime.attribution).toMatchObject({ connectionId: f.binding.connectionId, grantId: f.binding.grantId, provider: "openai", responsibleUserId: f.userId });
-      expect(runtime.config.model).toBe(saved.adapterConfig.model);
+      expect(runtime.config).toMatchObject({ model: saved.adapterConfig.model });
     } finally { await runtime.cleanup(); }
     // Assignment changes no connection/grant/install ownership or access.
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.binding.connectionId)))
