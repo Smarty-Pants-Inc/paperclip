@@ -1034,6 +1034,7 @@ export const PERMISSION_KEYS = [
   "agents:create",
   "agents:read",
   "agents:configure",
+  "agents:configure-reports-runtime",
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",

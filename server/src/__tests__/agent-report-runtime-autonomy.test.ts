@@ -7,7 +7,8 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, budgetPolicies, companies, companyMemberships,
-  companySecretBindings, createDb, principalPermissionGrants, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  companySecretBindings, createDb, heartbeatRuns, principalPermissionGrants, projects, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -24,9 +25,11 @@ describe("manager report runtime autonomy", () => {
   let db: ReturnType<typeof createDb>;
   const previousHome = process.env.PAPERCLIP_HOME;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
+  const previousJwtSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   beforeAll(async () => {
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "report-runtime-"));
     process.env.PAPERCLIP_HOME = home;
+    process.env.PAPERCLIP_AGENT_JWT_SECRET = "report-runtime-synthetic-jwt-fixture";
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(home, "fixture-master.key");
     database = await startEmbeddedPostgresTestDatabase("report-runtime-");
     db = createDb(database.connectionString);
@@ -37,6 +40,7 @@ describe("manager report runtime autonomy", () => {
     resetProcessRunAdmissionForTests();
     if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
     if (previousKeyFile === undefined) delete process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE; else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
+    if (previousJwtSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = previousJwtSecret;
   });
   async function seed() {
     const companyId = randomUUID(), userId = randomUUID();
@@ -72,7 +76,7 @@ describe("manager report runtime autonomy", () => {
       request(api)[method](`/api${url}`).set("Authorization", `Bearer ${tokens[actor]}`).send(body);
     const patchEnv = (id: string, env: object) => call("patch", `/agents/${id}`, { adapterConfig: { env } });
     const readAgent = async (id: string) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
-    return { ids, companyId, userId, call, patchEnv, readAgent };
+    return { ids, companyId, userId, call, patchEnv, readAgent, api };
   }
   const refusal = "Agent keys cannot configure host-executed local adapter settings (env).";
 
@@ -90,8 +94,9 @@ describe("manager report runtime autonomy", () => {
     expect((await svc.resolveAdapterConfigForRuntime(f.companyId, { env: { ROW_DEMO_TOKEN: binding } }, { consumerType: "agent", consumerId: f.ids.primary })).secretKeys.has("ROW_DEMO_TOKEN")).toBe(true);
     const response = await f.patchEnv(f.ids.lead, { ROW_DEMO_TOKEN: binding });
     expect(response.status, response.text).toBe(200);
-    expect((await f.readAgent(f.ids.lead)).adapterConfig.env).toEqual({ ROW_DEMO_TOKEN: binding });
-    expect((await f.call("get", `/agents/${f.ids.lead}`)).body.adapterConfig.env.ROW_DEMO_TOKEN).toEqual(binding);
+    const normalizedBinding = { ...binding, projectionClass: "unclassified", projectionAllowlistKey: null };
+    expect((await f.readAgent(f.ids.lead)).adapterConfig.env).toEqual({ ROW_DEMO_TOKEN: normalizedBinding });
+    expect((await f.call("get", `/agents/${f.ids.lead}`)).body.adapterConfig.env.ROW_DEMO_TOKEN).toEqual(normalizedBinding);
     expect(await db.select().from(companySecretBindings).where(and(eq(companySecretBindings.targetId, f.ids.lead), eq(companySecretBindings.secretId, secret.id))))
       .toEqual([expect.objectContaining({ configPath: "env.ROW_DEMO_TOKEN" })]);
   });
@@ -106,6 +111,29 @@ describe("manager report runtime autonomy", () => {
     expect(await f.readAgent(f.ids.lead)).toEqual(before);
     expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, f.ids.lead))).toEqual([]);
   });
+  for (const inherited of [true, false]) {
+    it(`b/c run-bound: a project secret ${inherited ? "in" : "outside"} the current run manifest`, async () => {
+      const f = await seed(); const svc = secretService(db); const runId = randomUUID();
+      const projectId = randomUUID();
+      await db.insert(projects).values({ id: projectId, companyId: f.companyId, name: "Runtime manifest project" });
+      const secret = await svc.create(f.companyId, { name: "inherited-fixture", provider: "local_encrypted", value: "synthetic-inherited-value" });
+      const binding = await svc.createBinding({ companyId: f.companyId, secretId: secret.id, targetType: "project", targetId: projectId, configPath: "env.INHERITED_TOKEN" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.ids.primary, responsibleUserId: f.userId,
+        status: "running", contextSnapshot: { paperclipSecrets: { manifest: inherited ? [{ bindingId: binding.id }] : [] } } });
+      const token = createLocalAgentJwt(f.ids.primary, f.companyId, "paperclip_runner", runId, f.userId)!;
+      const response = await request(f.api).patch(`/api/agents/${f.ids.lead}`).set("Authorization", `Bearer ${token}`)
+        .send({ adapterConfig: { env: { INHERITED_TOKEN: { type: "secret_ref", secretId: secret.id, version: "latest" } } } });
+      expect(response.status, response.text).toBe(inherited ? 200 : 403);
+      if (!inherited) { expect(response.body.error).toContain(secret.id); expect((await f.readAgent(f.ids.lead)).adapterConfig.env).toBeUndefined(); }
+      else {
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runId));
+        const stopped = await request(f.api).patch(`/api/agents/${f.ids.worker}`).set("Authorization", `Bearer ${token}`)
+          .send({ adapterConfig: { env: { INHERITED_TOKEN: { type: "secret_ref", secretId: secret.id, version: "latest" } } } });
+        expect(stopped.status, stopped.text).toBe(403);
+        expect((await f.readAgent(f.ids.worker)).adapterConfig.env).toBeUndefined();
+      }
+    });
+  }
   it("d: the same plain env update is allowed two reporting levels down", async () => {
     const f = await seed(); const response = await f.patchEnv(f.ids.worker, { ROW_VAR: "grand-report" });
     expect(response.status, response.text).toBe(200);
@@ -119,7 +147,7 @@ describe("manager report runtime autonomy", () => {
       expect(await f.readAgent(f.ids[target])).toEqual(before);
     });
   }
-  for (const key of ["command", "args", "extraArgs", "cwd", "filesystemSandboxCommand"] as const) {
+  for (const key of ["command", "hermesCommand", "args", "extraArgs", "cwd", "filesystemSandboxCommand"] as const) {
     it(`g: ${key} remains refused even together with runner report env`, async () => {
       const f = await seed(); const before = await f.readAgent(f.ids.lead);
       const response = await f.call("patch", `/agents/${f.ids.lead}`, { adapterConfig: { [key]: key === "args" || key === "extraArgs" ? ["--unsafe"] : "/tmp/unsafe", env: { ROW_VAR: "no" } } });

@@ -107,6 +107,8 @@ curl -sS "$PAPERCLIP_API_URL/llms/agent-icons.txt" \
 - `desiredSkills` from the company skill library when this role needs installed skills on day one
 - if any `desiredSkills` or adapter settings expand browser access, external-system reach, filesystem scope, or secret-handling capability, justify each one in the hire comment
 - adapter and runtime config aligned to this environment
+- secrets go in as `secret_ref`, never as a plain value; a manager may PATCH plain env and company-secret references on an existing `paperclip_runner` report only with `agents:configure-reports-runtime` plus direct configuration authority over its current subtree, and only for secrets the manager itself can resolve
+- plain env reads are redacted: send known values, never copy a redacted GET placeholder back into a PATCH; local adapters and host command settings retain their existing restrictions
 - leave timer heartbeats off by default; only set `runtimeConfig.heartbeat.enabled=true` with an `intervalSec` when the role genuinely needs scheduled recurring work or the user explicitly asked for it
 - if the role may handle private advisories or sensitive disclosures, confirm a confidential workflow exists first (dedicated skill or documented manual process)
 - capabilities

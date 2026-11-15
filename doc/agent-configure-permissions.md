@@ -98,18 +98,52 @@ it enables assignment. Assignment grant writes are scoped to the target's
 subtree. Trust presets and authorization-policy administration stay board-only.
 Agent administrative mutations are attributed to the agent in the activity log.
 
+## Runner report environments
+
+The company-scoped `agents:configure-reports-runtime` grant permits an agent to
+PATCH plain environment values and company `secret_ref` bindings on existing
+`paperclip_runner` reports. It is on by default for standard agents, and is
+independently revocable through the existing permission-grants API. Revoking it
+for the company's agents switches this exception off; grant removal is not
+reconciled back on. It never substitutes for direct `agents:configure` authority
+and the current strict reporting-subtree check: self, peers and unrelated agents
+keep the existing refusal. Both decisions are rechecked under the writer's
+company reporting-tree lock.
+
+A referenced secret must also pass the caller's existing own-run secret binding
+and version admission; a run-bound caller additionally needs a currently running
+run and a direct or inherited runtime-manifest binding. A refusal names the
+secret ID, never its value. **Secrets go in as `secret_ref`, never as a plain
+value.** Plain values are stored unencrypted and read back redacted; send known
+values rather than copying redacted GET placeholders back into a PATCH.
+
+This exception does not open creation, hiring, rollback, `*_local` environment
+settings, or host execution keys (`command`, `hermesCommand`, `args`, `extraArgs`,
+`cwd`, `filesystemSandboxCommand`). Existing narrow provider-credential paths
+remain unchanged. The Pi runner retains ownership of its `--session` and
+`--mode` arguments; `PAPERCLIP_PI_RUNTIME_DIR` is not an eligible configured env
+key. Retire a report through the existing pause, then terminate routes, not DELETE.
+
 ## Descendant budgets and instruction paths
 
 Both `PATCH /agents/:id/budgets` and a `budgetMonthlyCents` field in
 `PATCH /agents/:id` accept the same direct descendant-management authority.
-The new amount must be positive and no greater than the caller's remaining
-monthly billed budget. The budget engine's exact ledger, live exposure and held
-reservations count toward that remaining amount. A saved active monthly policy
-takes precedence over the legacy amount. A caller without a finite positive
-allowance cannot delegate a budget. Zero disables enforcement, so agents cannot
-use zero as a delegated allowance. Board budget behavior is unchanged. These
-are bounded budget settings, not a transfer/reservation of money between agents.
-Self-budget fields are rejected even when they echo the current amount.
+The new amount may be any nonnegative integer, including zero (unlimited for
+that scope). It is not capped by the caller's remaining allowance: setting a
+policy does not spend or transfer money. Company budget enforcement remains
+the overall cap. The `POST /companies/:companyId/budgets/policies` agent-scope
+alias follows the same rule. Self-budget fields are rejected even when they
+echo the current amount.
+
+The policy POST also accepts project budgets when `project.leadAgentId` is the
+caller or a current strict reporting descendant it can directly configure. An
+unrelated project's policy stays forbidden. Both company-budget aliases (the
+policy POST and `PATCH /companies/:companyId/budgets`) admit only a primary
+agent: `reportsTo` is null, irrespective of role or title. Other agents are
+refused. Send `principalRequestUrl` with the task/comment link for the principal's
+ask. The existing `budget.policy_upserted` activity details retain that link;
+without one the change still succeeds and records `no principal request linked`.
+Budget incidents remain board-only. Board behavior is unchanged.
 
 `PATCH /agents/:id/instructions-path` uses the same direct descendant check.
 Agents may set only known instruction-path keys (`instructionsFilePath` and
@@ -117,12 +151,11 @@ Agents may set only known instruction-path keys (`instructionsFilePath` and
 adapter field. The existing external-filesystem instance-admin restriction stays
 in place: agents can point to managed instruction files, not arbitrary host
 paths. Board behavior and generic adapter-config protections are unchanged.
-API-key management, company budgets and budget-policy/incident administration
-are not delegated by these changes.
+API-key management and budget-incident administration remain board-only.
 
 ## Concurrent reporting-tree changes
 
-Descendant budget, permission, instruction-path and lifecycle writes recheck
+Runner report environment, budget policy, descendant permission, instruction-path and lifecycle writes recheck
 management authority inside their writer transaction, after acquiring the same
 company-row accounting lock as `reportsTo` updates. Moving an intermediate
 manager therefore cannot race a stale descendant check. The lock order is

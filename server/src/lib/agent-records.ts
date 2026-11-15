@@ -10,6 +10,7 @@ import { conflict, notFound, unprocessable } from "../errors.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
 import { builtInAgentMarkersEqual, readBuiltInAgentMarker } from "./built-in-agent-metadata.js";
+import type { AuthorizationActor } from "../services/authorization.js";
 
 export function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -75,6 +76,8 @@ export interface ClaudeLoginContext {
 
 export interface UpdateAgentOptions {
   requireSubordinateManagement?: boolean;
+  /** Server-derived actor, reauthorized inside the company-locked writer. */
+  reportRuntimeActor?: AuthorizationActor;
   expectedConfigurationRevision?: string;
   expectedConfiguration?: Pick<AgentConfigurationRecord, "adapterType" | "adapterConfig" | "runtimeConfig" | "defaultEnvironmentId">;
   recordRevision?: RevisionMetadata;

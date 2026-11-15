@@ -15,7 +15,7 @@ import { and, eq } from "drizzle-orm";
 import { agents, assets, agentConfigRevisions, agentTaskSessions, agentRuntimeState, type Db } from "@paperclipai/db";
 import { normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { agentRecordQueries, type UpdateAgentOptions, type AgentConfigurationPatch, type AgentConfigurationRecord, isPlainRecord, buildConfigSnapshot,
   hasConfigPatchFields, changedPendingApprovalConfigFields, diffConfigSnapshot, jsonEqual } from "../lib/agent-records.js";
 import { CEO_HIRING_DENIAL_KEY, ceoHiringDenial, normalizeAgentPermissions } from "../lib/agent-permissions.js";
@@ -25,6 +25,7 @@ import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
 import { assertCanManageSubordinateAgent, assertSubordinateBudgetChange } from "./agent-subtree-management.js";
+import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv, REPORT_ENV_REFUSAL } from "./agent-report-runtime.js";
 
 export async function lockAgentConfigurationInteractions(tx: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions) {
   const pluginOrigin = currentPluginInteractionOrigin();
@@ -41,6 +42,12 @@ export async function lockAgentConfigurationInteractions(tx: Db, id: string, dat
 }
 
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
+  if (options?.reportRuntimeActor) {
+    const env = isPlainRecord(data.adapterConfig) ? data.adapterConfig.env : undefined;
+    if ((data.adapterType ?? existing.adapterType) !== "paperclip_runner" || !isReportRuntimeEnv(env)
+      || !await canConfigureReportRuntime(db, options.reportRuntimeActor, existing)) throw forbidden(REPORT_ENV_REFUSAL);
+    await assertReportEnvSecretAccess(db, options.reportRuntimeActor, existing, env);
+  }
   if (options?.requireSubordinateManagement && options.recordRevision?.createdByAgentId) {
     await assertCanManageSubordinateAgent(db, { type: "agent", agentId: options.recordRevision.createdByAgentId,
       companyId: existing.companyId }, existing);

@@ -8,6 +8,7 @@ import {
 } from "../constants.js";
 
 export const upsertBudgetPolicySchema = z.object({
+  principalRequestUrl: z.string().trim().max(4096).optional(),
   scopeType: z.enum(BUDGET_SCOPE_TYPES),
   scopeId: z.string().guid(),
   metric: z.enum(BUDGET_METRICS).optional().default("billed_cents"),

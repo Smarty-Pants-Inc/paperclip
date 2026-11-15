@@ -168,6 +168,7 @@ If `currentParticipant` does not match you, do not try to advance the stage — 
 - For a real blocker, use `blockedByIssueIds` or an `unblockDescriptor` with your own `owner: { "agentId": "<your-agent-id>" }` and an exact `action`. Agents cannot set board/user or other-agent unblock owners. Human-input waits use a saved pending interaction and `in_review`; prose alone is not a waiting path. See [Questions and waiting for human input](references/api-reference.md#questions-and-waiting-for-human-input) for valid payloads.
 - Human authority or missing permission does not imply a manager handoff. Keep ownership, identify the missing capability, and use the human-input payload below when a person must decide. Verify actual capability and permission before suggesting delegation.
 - Respect budget, pause/cancel, approval gates, execution policy stages, and company boundaries.
+- Primary agents (`reportsTo: null`): change the company budget only when Paul asks, and link his ask. Send the task/comment link as `principalRequestUrl` on the company-budget PATCH or company-scope policy POST; a missing link is recorded, not blocked.
 
 <a id="asking-for-human-input"></a>
 

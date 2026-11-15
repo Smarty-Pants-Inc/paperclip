@@ -171,6 +171,7 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { assertAgentLifecycleAuthority, assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
+import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv } from "../services/agent-report-runtime.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
 import {
@@ -2726,12 +2727,14 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     allowPlainCredentials = false,
     harnessConfig = adapterConfig,
+    allowReportEnv = false,
   ) {
     if (req.actor.type !== "agent" || (!adapterType.endsWith("_local") && adapterType !== "paperclip_runner")) return;
     const harness = agentHarnessType(adapterType, harnessConfig);
     const changedKeys = LOCAL_ADAPTER_HOST_COMMAND_KEYS.filter((key) =>
       adapterConfig[key] !== undefined &&
-      (key !== "env" || !containsOnlyLocalAdapterCredentialRefs(harness, adapterConfig.env, allowPlainCredentials)),
+      (key !== "env" || (!(allowReportEnv && adapterType === "paperclip_runner")
+        && !containsOnlyLocalAdapterCredentialRefs(harness, adapterConfig.env, allowPlainCredentials))),
     );
     if (changedKeys.length === 0) return;
     throw forbidden(
@@ -5624,7 +5627,7 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    // Budget aliases share the same delegated authority and remaining-budget cap.
+    // Budget aliases share the same current-subtree management authority.
     if (hasOwn(req.body as object, "budgetMonthlyCents")) {
       if (req.actor.type === "agent") await assertSubordinateBudgetChange(db, req.actor, existing, req.body.budgetMonthlyCents);
       else if (req.body.budgetMonthlyCents !== existing.budgetMonthlyCents) assertBoard(req, agentBudgetPage(existing.id));
@@ -5656,6 +5659,7 @@ export function agentRoutes(
         }
       }
     }
+    let reportRuntimeEnvAuthorized = false;
     const requestedStatus = patchData.status;
     delete patchData.status;
     if (requestedStatus !== undefined && !["paused", "idle", "terminated"].includes(String(requestedStatus))) throw badRequest("Use an agent lifecycle command to change status");
@@ -5793,13 +5797,19 @@ export function agentRoutes(
       if (req.actor.type === "agent" && rawEffectiveAdapterConfig.homeMode !== existingAdapterConfig.homeMode)
         throw forbidden("Only an operator can configure Runner homeMode.");
       if (changingAdapterType || requestedAdapterConfig) {
+        const hostCommandPatch = changingAdapterType ? rawEffectiveAdapterConfig : (requestedAdapterConfig ?? {});
+        reportRuntimeEnvAuthorized = requestedAdapterType === "paperclip_runner"
+          && isReportRuntimeEnv(hostCommandPatch.env)
+          && await canConfigureReportRuntime(db, req.actor, existing);
         assertNoAgentLocalAdapterHostCommandMutation(
           req,
           requestedAdapterType,
-          changingAdapterType ? rawEffectiveAdapterConfig : (requestedAdapterConfig ?? {}),
+          hostCommandPatch,
           false,
           rawEffectiveAdapterConfig,
+          reportRuntimeEnvAuthorized,
         );
+        if (reportRuntimeEnvAuthorized) await assertReportEnvSecretAccess(db, req.actor, existing, hostCommandPatch.env);
       }
       const existingRunnerProvider =
         existing.adapterType === "paperclip_runner"
@@ -5926,6 +5936,7 @@ export function agentRoutes(
     const actor = getActorInfo(req);
     const updateOptions = {
       expectedConfigurationRevision,
+      ...(reportRuntimeEnvAuthorized ? { reportRuntimeActor: req.actor } : {}),
       ...(runtimeSettings ? { expectedConfiguration: {
         adapterType: existing.adapterType, adapterConfig: existing.adapterConfig,
         runtimeConfig: existing.runtimeConfig, defaultEnvironmentId: existing.defaultEnvironmentId,
