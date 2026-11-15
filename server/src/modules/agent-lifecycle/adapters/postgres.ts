@@ -153,6 +153,9 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     if (company.status === "archived") holds.push("company_archived");
     if (company.status === "paused") holds.push("company_paused");
   }
+  // Holds control resumable work, not retirement. Keep policy/accounting rows;
+  // only the terminal agent's obsolete execution holds are released.
+  if (command === "terminate") holds = [];
   if (command === "pause") holds = [...new Set([...holds, reason])];
   if (command === "resume") holds = holds.filter(hold => reason === "user" ? ["budget", "company_archived", "company_paused"].includes(hold) : hold !== reason);
   const blockingHolds = holds.filter(hold => hold !== "setup" || !["preparing", "verifying"].includes(agent.lifecycleState));

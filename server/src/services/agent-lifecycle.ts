@@ -6,12 +6,13 @@ import { notifyDeferredExecutionEligibility } from "./deferred-execution-notific
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyNativeReviewResponse } from "./native-review-response-notifications.js";
-import { isAgentStatusInvokable } from "@paperclipai/shared";
+import { getAgentWorkEligibility, isAgentStatusInvokable } from "@paperclipai/shared";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { logger } from "../middleware/logger.js";
-import { agents, companies, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { agents, companies, issues, chatConversations, type Db } from "@paperclipai/db";
+import { and, eq, inArray, isNull, notExists } from "drizzle-orm";
+import { issueService } from "./issues.js";
 import { persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
@@ -98,6 +99,35 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     async beforeStatusChange(tx, companyId, agentId, before, after) {
       await notifyAttentionRetentionWork(tx, { companyId });
       if (before !== after) {
+        if (after === "terminated") {
+          const companyAgents = await tx.select().from(agents).where(eq(agents.companyId, companyId));
+          const retiring = companyAgents.find(agent => agent.id === agentId);
+          const manager = companyAgents.find(agent => agent.id === retiring?.reportsTo);
+          // A company teardown may already have terminated the manager. Keep
+          // normal recovery ownership in that case, never prevent cleanup.
+          if (manager && getAgentWorkEligibility({ agent: manager, agents: companyAgents }).assignable) {
+            // Use ordinary task assignment, including its eligibility, visibility,
+            // receipt and execution-lock fencing. Never rewrite terminal history
+            // or the fixed identity of a conversation/channel-bound task.
+            const unfinished = await tx.select().from(issues).where(and(
+              eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId),
+              inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+              isNull(issues.conversationAgentId),
+              notExists(tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
+                eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issues.id),
+              ))),
+            )).orderBy(issues.id).for("update");
+            for (const issue of unfinished) {
+              await issueService(tx).update(issue.id, {
+                companyGuard: companyId, assigneeAgentId: manager.id, assigneeUserId: null,
+                ...(issue.status === "in_progress" ? { status: "todo" } : {}),
+              }, tx, [], []);
+              await persistActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
+                action: "issue.reassigned", entityType: "issue", entityId: issue.id,
+                details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } });
+            }
+          }
+        }
         await notifyStrandedAgentStatus(tx, { companyId, agentId });
         await notifyRunDispatch(tx, { companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId });
