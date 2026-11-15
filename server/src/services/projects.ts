@@ -27,6 +27,7 @@ import {
   normalizeProjectUrlKey,
   type BudgetWindowKind,
   type ProjectBudgetSummary,
+  type ProjectDerivedStatus,
   type ProjectDiscoverySummary,
   type ProjectCodebase,
   type ProjectExecutionWorkspacePolicy,
@@ -160,6 +161,8 @@ interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy" |
   primaryWorkspace: ProjectWorkspace | null;
   managedByPlugin: ProjectManagedByPlugin | null;
   taskCount?: number;
+  openTaskCount?: number;
+  derivedStatus?: ProjectDerivedStatus;
   budget?: ProjectBudgetSummary | null;
 }
 
@@ -418,8 +421,37 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
   });
 }
 
-type TaskCountRow = { projectId: string | null; count: number };
+type TaskCountRow = { projectId: string | null; count: number; openCount?: number; begunCount?: number };
 type ProjectBudgetRow = { scopeId: string; amount: number; windowKind: string };
+
+/**
+ * The project's pill, from its tasks (the stored `projects.status` is not
+ * read). `begunTaskCount` counts non-hidden tasks that have begun: moved past
+ * backlog/todo (in progress, in review, blocked or done), or started at least
+ * once (`startedAt`, stamped the first time a task goes in progress), or with
+ * a run attached.
+ */
+export function deriveProjectStatus(counts: {
+  taskCount: number;
+  openTaskCount: number;
+  begunTaskCount: number;
+}): ProjectDerivedStatus {
+  if (counts.taskCount <= 0) return "not_started";
+  if (counts.openTaskCount <= 0) return "done";
+  return counts.begunTaskCount > 0 ? "in_progress" : "not_started";
+}
+
+/**
+ * Aggregate columns for one project's tasks (chats excluded by the caller's
+ * where clause): every task, the open ones (not done, not cancelled, not
+ * hidden) and the begun ones (see {@link deriveProjectStatus}).
+ */
+const taskCountColumns = {
+  projectId: issues.projectId,
+  count: sql<number>`count(*)::int`,
+  openCount: sql<number>`count(*) filter (where ${issues.status} not in ('done', 'cancelled') and ${issues.hiddenAt} is null)::int`,
+  begunCount: sql<number>`count(*) filter (where ${issues.hiddenAt} is null and (${issues.status} in ('in_progress', 'in_review', 'blocked', 'done') or ${issues.startedAt} is not null or ${issues.executionRunId} is not null or ${issues.checkoutRunId} is not null))::int`,
+};
 
 /**
  * Build the per-project task-count and budget lookups from the aggregate query
@@ -428,8 +460,18 @@ type ProjectBudgetRow = { scopeId: string; amount: number; windowKind: string };
  */
 export function buildProjectListMetricMaps(taskCountRows: TaskCountRow[], budgetRows: ProjectBudgetRow[]) {
   const taskCountByProjectId = new Map<string, number>();
+  const openTaskCountByProjectId = new Map<string, number>();
+  const derivedStatusByProjectId = new Map<string, ProjectDerivedStatus>();
   for (const row of taskCountRows) {
-    if (row.projectId) taskCountByProjectId.set(row.projectId, Number(row.count) || 0);
+    if (!row.projectId) continue;
+    const taskCount = Number(row.count) || 0;
+    const openTaskCount = Number(row.openCount) || 0;
+    taskCountByProjectId.set(row.projectId, taskCount);
+    openTaskCountByProjectId.set(row.projectId, openTaskCount);
+    derivedStatusByProjectId.set(
+      row.projectId,
+      deriveProjectStatus({ taskCount, openTaskCount, begunTaskCount: Number(row.begunCount) || 0 }),
+    );
   }
 
   const budgetByProjectId = new Map<string, ProjectBudgetSummary>();
@@ -442,13 +484,18 @@ export function buildProjectListMetricMaps(taskCountRows: TaskCountRow[], budget
     }
   }
 
-  return { taskCountByProjectId, budgetByProjectId };
+  return { taskCountByProjectId, openTaskCountByProjectId, derivedStatusByProjectId, budgetByProjectId };
 }
 
 /**
  * Attach lightweight list-only metrics (task count + budget) to a set of
  * projects using two aggregate queries (no N+1). Used by the projects list
  * view (IA Phase 4 — PAP-60).
+ *
+ * `taskCount` is every non-chat task. `openTaskCount` is the work still left:
+ * not done, not cancelled and not hidden, so a project whose tasks are all
+ * finished reads finished in the list. `derivedStatus` is the project's pill
+ * from the same counts ({@link deriveProjectStatus}).
  */
 async function attachListMetrics(
   db: Db,
@@ -461,10 +508,7 @@ async function attachListMetrics(
 
   const [taskCountRows, budgetRows] = await Promise.all([
     db
-      .select({
-        projectId: issues.projectId,
-        count: sql<number>`count(*)::int`,
-      })
+      .select(taskCountColumns)
       .from(issues)
       .where(and(eq(issues.companyId, companyId), inArray(issues.projectId, projectIds), isNull(issues.conversationAgentId)))
       .groupBy(issues.projectId),
@@ -486,7 +530,7 @@ async function attachListMetrics(
       ),
   ]);
 
-  const { taskCountByProjectId, budgetByProjectId } = buildProjectListMetricMaps(
+  const { taskCountByProjectId, openTaskCountByProjectId, derivedStatusByProjectId, budgetByProjectId } = buildProjectListMetricMaps(
     taskCountRows,
     budgetRows,
   );
@@ -494,8 +538,23 @@ async function attachListMetrics(
   return rows.map((row) => ({
     ...row,
     taskCount: taskCountByProjectId.get(row.id) ?? 0,
+    openTaskCount: openTaskCountByProjectId.get(row.id) ?? 0,
+    derivedStatus: derivedStatusByProjectId.get(row.id) ?? "not_started",
     budget: budgetByProjectId.get(row.id) ?? null,
   }));
+}
+
+/**
+ * The project's pill for one project, from the same aggregate the list uses,
+ * so the list and the project's own page agree.
+ */
+async function readProjectDerivedStatus(db: Db, project: { id: string; companyId: string }): Promise<ProjectDerivedStatus> {
+  const taskCountRows = await db
+    .select(taskCountColumns)
+    .from(issues)
+    .where(and(eq(issues.companyId, project.companyId), eq(issues.projectId, project.id), isNull(issues.conversationAgentId)))
+    .groupBy(issues.projectId);
+  return buildProjectListMetricMaps(taskCountRows, []).derivedStatusByProjectId.get(project.id) ?? "not_started";
 }
 
 /** Sync the project_goals join table for a single project. */
@@ -773,6 +832,9 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     },
 
     getById: getProjectById,
+
+    /** The project's pill, derived from its tasks; see {@link deriveProjectStatus}. */
+    getDerivedStatus: (project: { id: string; companyId: string }) => readProjectDerivedStatus(db, project),
 
     resolveManagedProject: async (input: {
       companyId: string;

@@ -249,6 +249,24 @@ describe("ProjectDetail", () => {
     await act(() => queryClient.clear());
   });
 
+  it.each([
+    ["in_progress", "In progress"],
+    ["done", "Done"],
+    ["not_started", "Not started"],
+  ] as const)("shows the pill derived from the tasks in the header (%s)", async (derivedStatus, label) => {
+    mockLocation.pathname = "/projects/project-1/issues";
+    mockProjectsApi.get.mockResolvedValue(project({ status: "cancelled", derivedStatus }));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(() => root!.render(<QueryClientProvider client={queryClient}><ProjectDetail /></QueryClientProvider>));
+    await settle();
+
+    const pill = container.querySelector<HTMLElement>("[data-testid='project-status-pill']");
+    expect(pill?.textContent).toBe(label);
+    expect(container.textContent).not.toContain("cancelled");
+    await act(() => queryClient.clear());
+  });
+
   it("refreshes cached task audiences when visibility is saved through the field autosave path", async () => {
     mockLocation.pathname = "/projects/project-1/configuration";
     mockProjectsApi.update.mockResolvedValue(project({ visibility: "open" }));
