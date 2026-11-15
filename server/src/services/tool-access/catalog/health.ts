@@ -97,7 +97,7 @@ export function createConnectionHealth(db: Db, { now, audit, getConnectionRow, d
         await remoteTools(connection, {
           ...projectedConnectionHeaders(connection),
           Authorization: `Bearer ${credential.token}`,
-        }, actor);
+        }, actor, undefined, unavailableServices, { live: true });
       } else if (
         config.sourceTemplateKey === "github" &&
         oauth.connectorProfile === "github.code"
