@@ -56,8 +56,10 @@ describePostgres("bundled image registration in PostgreSQL", () => {
 
   function runtime() {
     const output: string[] = [];
+    const worker = { status: "running" as const };
     const services = {
       workerManager: {
+        getWorker: vi.fn((_id: string) => worker),
         startWorker: vi.fn(async (_id: string, options: { entrypointPath: string }) => { output.push(execFileSync(process.execPath, [options.entrypointPath, "--source"], { encoding: "utf8" })); }),
         call: vi.fn(async () => ({})),
       },

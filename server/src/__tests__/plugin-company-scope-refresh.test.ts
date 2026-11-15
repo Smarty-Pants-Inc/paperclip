@@ -177,6 +177,7 @@ describe("plugin company authorization across hosts sharing Postgres", () => {
     let workerOptions: WorkerStartOptions | undefined;
     const services = {
       workerManager: {
+        getWorker: vi.fn<ReturnType<typeof createPluginWorkerManager>["getWorker"]>(() => undefined),
         startWorker: vi.fn(async (_id: string, start: WorkerStartOptions) => { workerOptions = start; }),
         call: vi.fn(async () => ({})), stopWorker: vi.fn(), stopAll: vi.fn(),
       },
