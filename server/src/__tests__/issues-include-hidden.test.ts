@@ -64,20 +64,39 @@ describeEmbeddedPostgres("issue list includeHidden", () => {
     expect((await svc.list(companyId, { includeHidden: true })).map((issue) => issue.id).sort()).toEqual([ids.visible, ids.hidden].sort());
   });
 
-  it("keeps hidden tasks out of search, the inbox and unread counts even when includeHidden=true", async () => {
+  it("returns only hidden non-harness tasks when hiddenOnly=true, before pagination, in every projection", async () => {
+    const { companyId, actor, ids, hiddenAt } = await seed();
+    const app = routeApp(ctx.db, actor, issueRoutes);
+    const path = `/api/companies/${companyId}/issues`;
+    for (const view of ["", "&view=compact", "&view=index"]) {
+      for (const include of ["", "&includeHidden=true"]) {
+        const response = await request(app).get(`${path}?hiddenOnly=true&limit=1${view}${include}`).expect(200);
+        expect(idsOf(response.body)).toEqual([ids.hidden]);
+        expect(new Date(response.body[0].hiddenAt).toISOString()).toBe(hiddenAt.toISOString());
+        expect((await request(app).get(`${path}?hiddenOnly=true&limit=1&offset=1${view}${include}`).expect(200)).body).toEqual([]);
+      }
+      expect(idsOf((await request(app).get(`${path}?hiddenOnly=false${view}`).expect(200)).body)).toEqual([ids.visible]);
+    }
+    for (const value of ["maybe", "1", "true&hiddenOnly=false"]) {
+      await request(app).get(`${path}?hiddenOnly=${value}`).expect(400);
+    }
+    expect((await issueService(ctx.db).list(companyId, { hiddenOnly: true })).map(issue => issue.id)).toEqual([ids.hidden]);
+  });
+
+  it.each(["includeHidden", "hiddenOnly"])("keeps hidden tasks out of search, the inbox and unread counts even when %s=true", async (visibility) => {
     const { companyId, userId, actor, ids } = await seed();
     const app = routeApp(ctx.db, actor, issueRoutes);
     const path = `/api/companies/${companyId}/issues`;
 
     // Search: the hidden title matches, but search keeps excluding hidden tasks.
     for (const view of ["", "&view=compact", "&view=index"]) {
-      const search = await request(app).get(`${path}?q=Quarterly&includeHidden=true${view}`).expect(200);
+      const search = await request(app).get(`${path}?q=Quarterly&${visibility}=true${view}`).expect(200);
       expect(idsOf(search.body)).toEqual([ids.visible]);
     }
 
     // Inbox and unread lists.
     for (const filter of ["touchedByUserId=me", "touchedByUserId=me&inboxArchivedByUserId=me", "unreadForUserId=me"]) {
-      const inbox = await request(app).get(`${path}?${filter}&includeHidden=true`).expect(200);
+      const inbox = await request(app).get(`${path}?${filter}&${visibility}=true`).expect(200);
       expect(idsOf(inbox.body), filter).toEqual([ids.visible]);
     }
 

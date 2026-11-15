@@ -178,6 +178,34 @@ describe("Coordinator tasks using the proposed table", () => {
     await vi.waitFor(() => expect(host.querySelector('[data-task-id="manual-task"]')).toBeNull());
   });
 
+  it("opens Hidden from the view control, persists the URL, and lists only hidden tasks", async () => {
+    const shown = createIssue({ id: "shown", companyId: "company", parentId: null, hiddenAt: null });
+    const hidden = createIssue({ id: "hidden", companyId: "company", parentId: null, hiddenAt: new Date() });
+    mocks.list.mockImplementation(async (_company, filters) => filters.hiddenOnly ? [hidden] : [shown]);
+    await mount("/issues?view=all");
+    const button = [...host.querySelectorAll("button")].find(button => button.textContent === "Hidden");
+    expect(button).toBeDefined();
+    flushSync(() => button!.click());
+    await vi.waitFor(() => expect(host.querySelector('[data-task-id="hidden"]')).not.toBeNull());
+    expect(host.querySelector('[data-task-id="shown"]')).toBeNull();
+    expect(host.querySelector("output")?.textContent).toContain("view=hidden");
+    expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ hiddenOnly: true, offset: 0 });
+    expect(localStorage.getItem(taskListViewStorageKey("coordinator", "person"))).toBe("hidden");
+  });
+
+  it("shows the Hidden empty state", async () => {
+    mocks.list.mockResolvedValue([]);
+    await mount("/issues?view=hidden");
+    expect(host.textContent).toContain("No hidden tasks.");
+  });
+
+  it("does not send hiddenOnly with a search", async () => {
+    mocks.list.mockResolvedValue([]);
+    await mount("/issues?view=hidden&q=report");
+    expect(mocks.list.mock.lastCall?.[1].hiddenOnly).toBeUndefined();
+    expect(mocks.list.mock.lastCall?.[1].q).toBe("report");
+  });
+
   it("adds hidden tasks to All tasks only after Show hidden tasks, kept in the URL, and never to Mine or search", async () => {
     const shown = createIssue({ id: "shown-task", companyId: "company", parentId: null, title: "Shown report", hiddenAt: null });
     const hidden = createIssue({ id: "hidden-task", companyId: "company", parentId: null, title: "Hidden report", hiddenAt: new Date("2026-11-15T05:00:00Z") });
