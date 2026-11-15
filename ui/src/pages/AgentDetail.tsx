@@ -142,6 +142,7 @@ import { AgentAllowedConnectors } from "./agent-detail/AgentAllowedConnectors";
 import { AgentAuditTab } from "./AgentAuditTab";
 import { AgentDirectReports } from "./agent-detail/AgentDirectReports";
 import { instructionFileDateLabel } from "./agent-detail/instruction-file-date";
+import { AgentReasoningDisplaySetting } from "./agent-detail/AgentReasoningDisplaySetting";
 import { AgentConfigSaveBar } from "./agent-detail/AgentConfigSaveBar";
 import { markdownFileName } from "./agent-detail/markdown-file-name";
 import { AgentReportingManager } from "./agent-detail/AgentReportingManager";
@@ -1117,6 +1118,8 @@ export function AgentDetail() {
             hidePromptTemplate
             hideInstructionsFile
           />
+          {/* Display-only and personal: saved apart from the agent's configuration. */}
+          <AgentReasoningDisplaySetting agent={agent} className="mt-(--agent-detail-module-gap)" />
         </div>
       )}
 

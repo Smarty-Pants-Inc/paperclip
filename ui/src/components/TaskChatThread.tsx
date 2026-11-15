@@ -80,7 +80,8 @@ import {
   reconcileSegmentRuntimeRequests,
   type SettledTurnMergeMeta,
 } from "@/components/task-chat/transcript-adapter";
-import { adapterReasoningDisplay } from "@/components/task-chat/reasoning-display";
+import { resolveReasoningDisplay } from "@/components/task-chat/reasoning-display";
+import { useAgentReasoningDisplayPreferences } from "@/hooks/useAgentReasoningDisplay";
 import { TaskChatDescriptionBubble } from "@/components/task-chat/TaskChatDescriptionBubble";
 import {
   TaskChatLiveRunPill,
@@ -527,8 +528,9 @@ function durableInputLabel(
  */
 export function TaskChatThread(props: TaskChatThreadProps) {
   const coordinatorEnabled = useCoordinatorPresentation();
-  // Each run's reasoning display is its adapter's declared default
-  // (reasoning-display.ts). No per-chat switch and no per-browser choice.
+  // The person's reasoning display per agent, chosen on the agent's page;
+  // resolved per run against the run adapter's default. No per-chat switch.
+  const reasoningPreferences = useAgentReasoningDisplayPreferences();
   const { status: connectionStatus } = useConnectivity();
   const { enabled: streamlinedPreference } = useStreamlinedUiEnabled();
   const streamlinedUiEnabled = coordinatorEnabled || streamlinedPreference;
@@ -2205,7 +2207,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
           failures: projectedSegments[segmentIndex]?.mcpStartupFailures ?? [],
           rest: partitionRunHealthItems(timelineItemsBySegment[segmentIndex] ?? []).rest,
         };
-        const runReasoningDisplay = adapterReasoningDisplay(source.adapterType);
+        const runReasoningDisplay = resolveReasoningDisplay(reasoningPreferences, meta?.agentId, source.adapterType);
         const children = settledRunChildren(runHealth.rest, runReasoningDisplay);
         // A compaction-only run is fully shown by its divider.
         if (children.length === 0 && !finalResponse && (!sourceIsPaperclipRunner || compactionMarkers.length > 0)) {
@@ -2312,7 +2314,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
               ? paperclipRunnerTimelineItems(parsed)
               : parsed,
           );
-          const liveRunReasoningDisplay = adapterReasoningDisplay(liveRun.adapterType);
+          const liveRunReasoningDisplay = resolveReasoningDisplay(reasoningPreferences, liveRun.agentId, liveRun.adapterType);
           const children = settledRunChildren(runHealth.rest, liveRunReasoningDisplay);
           if (children.length === 0 && runHealth.failures.length === 0) continue;
           const turnId = `${liveRun.id}:turn:${segmentIndex}`;
@@ -2443,6 +2445,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     agentMap,
     currentUserId,
     userLabelMap,
+    reasoningPreferences,
   ]);
 
   // Hand off once the settled turn or its reply comment is in the thread; a
@@ -2528,7 +2531,13 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     : undefined;
   const paperclipRunnerTail = isNativePaperclipRunnerRun(tailRunSource);
   // One resolved value for whichever renderer draws the live tail.
-  const tailReasoningDisplay = adapterReasoningDisplay(tailRunSource?.adapterType);
+  const tailReasoningDisplay = resolveReasoningDisplay(
+    reasoningPreferences,
+    tailRunId
+      ? (liveRuns?.find((run) => run.id === tailRunId)?.agentId ?? linkedRunMetaById.get(tailRunId)?.agentId)
+      : null,
+    tailRunSource?.adapterType,
+  );
   const paperclipRunnerTailAwaitingContinuation = Boolean(
     paperclipRunnerTail &&
     (acceptedSemanticResultDisposition(
