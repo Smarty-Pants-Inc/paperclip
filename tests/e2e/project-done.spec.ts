@@ -12,6 +12,11 @@ function projectRow(page: Page, name: string) {
   return page.getByRole("link").filter({ hasText: name });
 }
 
+// The project page's task list has settled, so the capture shows the tasks.
+async function tasksLoaded(page: Page) {
+  await expect(page.getByRole("status", { name: "Loading tasks" })).toHaveCount(0, { timeout: 15_000 });
+}
+
 async function noHorizontalOverflow(page: Page) {
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 }
@@ -52,6 +57,8 @@ for (const viewport of VIEWPORTS) {
     await capture("notstarted");
     await page.goto(detailUrl);
     await expect(detailPill).toHaveText("Not started");
+    await tasksLoaded(page);
+    await noHorizontalOverflow(page);
     await capture("detail-notstarted");
 
     // One task in progress: In progress.
@@ -69,6 +76,9 @@ for (const viewport of VIEWPORTS) {
     await capture("inprogress");
     await page.goto(detailUrl);
     await expect(detailPill).toHaveText("In progress");
+    await expect(page.getByText("Write the plan").first()).toBeVisible();
+    await tasksLoaded(page);
+    await noHorizontalOverflow(page);
     await capture("detail-inprogress");
 
     // Cancel it: Done, and the row reads All tasks done.
@@ -83,6 +93,8 @@ for (const viewport of VIEWPORTS) {
     await capture("done");
     await page.goto(detailUrl);
     await expect(detailPill).toHaveText("Done");
+    await tasksLoaded(page);
+    await noHorizontalOverflow(page);
     await capture("detail-done");
 
     // The stored status is untouched; nothing wrote it.
