@@ -340,7 +340,13 @@ as agent creation and hiring. Host-executed adapter settings such as `command`,
 `args`, and `cwd` remain operator-only. For `paperclip_runner`, environment strings
 and `plain` bindings are allowed (including credential-shaped values); a
 `secret_ref` requires a secret the calling agent can resolve. This is the live
-report-runtime environment rule, not a separate plaintext classifier.
+report-runtime environment rule, not a separate plaintext classifier. Import
+admission checks the adapter again after runner selection, before trusted import
+defaults or persistence. A `paperclip_runner` environment also requires the
+caller's current `agents:configure` authority over the final strict reporting
+descendant and `agents:configure-reports-runtime` grant. An imported root is not
+a report; a missing grant, invalid reporting link, or refusal rolls back the
+whole import. This final-tree check does not change creation/hiring env policy.
 
 A package permission grant above the caller's delegation authority fails with a
 422 naming the grant. Only unknown permission keys are stripped, with each key

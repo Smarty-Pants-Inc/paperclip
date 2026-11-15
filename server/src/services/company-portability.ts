@@ -5913,6 +5913,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig,
             budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
           }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
+          const admissionCompany = targetCompany;
           const normalizedAdapter = await prepareImportedAgentAdapter(
             targetCompany.id,
             selectedAdapterType,
@@ -5921,7 +5922,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             mode,
             runner,
             existingImportAgent?.defaultEnvironmentId,
-            actor.type === "agent" ? resolved => admitAgentActorHire(db, actor, targetCompany, {
+            actor.type === "agent" ? resolved => admitAgentActorHire(db, actor, admissionCompany, {
               ...resolved, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
             }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) }) : undefined,
           );
