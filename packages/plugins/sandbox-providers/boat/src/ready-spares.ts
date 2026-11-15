@@ -325,6 +325,26 @@ export class ReadySpareKeeper {
     }
   }
 
+  /** Boat-only timer pass: retire eligible ready spares without consulting claim storage or refilling. */
+  async reconcileTimer(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+    if (this.stopping) return;
+    const poolId = readySparePoolKey(key);
+    const listed = await operations.list();
+    if (this.stopping) return;
+    const keep = listed.filter(spare => spare.labels.owner === `paperclip:${key.companyId}`
+      && spare.labels.environment === key.environmentId && spare.labels.purpose === "spare"
+      && spare.labels.configHash === key.configHash
+      && spare.name === `paperclip-spare:ready:${key.configHash}`
+      && (spare.state === "ready" || spare.state === "idle"));
+    const selected = keep.slice(0, Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired))));
+    for (const surplus of keep.slice(selected.length)) {
+      if (this.stopping) return;
+      await operations.stop(surplus);
+    }
+    if (selected.length) this.pools.set(poolId, selected);
+    else this.pools.delete(poolId);
+  }
+
   /** Re-discover, adopt healthy owned spares, stop stale owned spares, then fill to N. */
   async reconcile(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
     if (this.stopping) return;

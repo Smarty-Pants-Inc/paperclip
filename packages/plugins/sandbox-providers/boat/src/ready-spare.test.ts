@@ -573,6 +573,7 @@ describe("Boat ready spare", () => {
     await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
     await new Promise(resolve => setTimeout(resolve, 20));
     db.query.mockClear();
+    for (const spare of f.inventory.filter(item => item.labels.purpose === "spare")) spare.state = "idle";
     now += 61 * 60_000;
     inInvocation = false;
 
@@ -584,9 +585,63 @@ describe("Boat ready spare", () => {
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
 
     inInvocation = true;
-    await plugin.definition.onHealth!();
+    await emitActivity("issue.created", company);
     expect(db.query).toHaveBeenCalledWith(expect.stringContaining("SELECT provider_lease_id"), expect.any(Array));
     setInterval.mockRestore();
+  });
+
+  it("decays demand on the timer without claim-store queries", async () => {
+    const env = "environment-timer-demand-decay", company = "company-timer-demand-decay";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let maintenanceTick: (() => void) | undefined;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, delay?: number) => {
+      if (delay === 15_000) maintenanceTick = callback as () => void;
+      return 1 as unknown as ReturnType<typeof globalThis.setInterval>;
+    }) as typeof globalThis.setInterval);
+    const db = fakeDatabase();
+    const f = fixture();
+    await setup(1, [env], 60, db, 3, 10, company);
+    await acquire("run-timer-demand-one", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.state === "running")).toHaveLength(1), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await acquire("run-timer-demand-two", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.state === "running")).toHaveLength(2), { timeout: 2_000 });
+    await acquire("run-timer-demand-three", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.state === "running")).toHaveLength(3), { timeout: 2_000 });
+    await plugin.definition.onHealth!(); // settle any scoped reconcile before measuring the timer pass
+    for (const spare of f.inventory.filter(item => item.labels.purpose === "spare")) spare.state = "idle";
+    db.query.mockClear();
+    now += 11 * 60_000;
+    maintenanceTick!();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(db.query).not.toHaveBeenCalled();
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toHaveLength(2);
+    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+  });
+
+  it("timer does not stop claim-named or non-ready Boat boxes", async () => {
+    const env = "environment-timer-identity", company = "company-timer-identity";
+    let maintenanceTick: (() => void) | undefined;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, delay?: number) => {
+      if (delay === 15_000) maintenanceTick = callback as () => void;
+      return 1 as unknown as ReturnType<typeof globalThis.setInterval>;
+    }) as typeof globalThis.setInterval);
+    const db = fakeDatabase();
+    const f = fixture();
+    await setup(1, [env], 60, db, 3, 10, company);
+    await acquire("run-timer-identity", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true), { timeout: 2_000 });
+    const spare = f.inventory.find(item => item.labels.purpose === "spare")!;
+    spare.state = "idle";
+    const claim = { ...spare, id: "bx_claim_timer", name: "paperclip-claim:other-worker", state: "idle" };
+    const nonReady = { ...spare, id: "bx_not_ready_timer", name: spare.name, state: "stopped" };
+    f.inventory.push(claim, nonReady);
+    db.query.mockClear();
+    maintenanceTick!();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(f.calls.some(call => call.method === "POST" && ["bx_claim_timer", "bx_not_ready_timer"].some(id => call.url.pathname.endsWith(`/${id}/stop`)))).toBe(false);
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("refreshes a spare TTL while active but stops refreshing once idle", async () => {

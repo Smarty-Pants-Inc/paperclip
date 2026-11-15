@@ -806,14 +806,17 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
       const poolId = readySparePoolKey(key);
       return activeByPool.get(poolId) ? knownSparePools.get(poolId)?.operations : undefined;
     });
-    // The periodic timer has no host-derived invocation scope, so it cannot
-    // perform claim-store queries. Scoped health calls and company events do
-    // the full reconciliation; the timer only renews cached warm leases.
-    if (!reconcile) return;
     for (const [poolId, pool] of knownSparePools) {
       if (shuttingDown) return;
       pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
       const active = activeByPool.get(poolId) === true;
+      if (!reconcile) {
+        // The unscoped timer can use Boat's inventory/name token, but must not
+        // query the claim store or refill. Retire only listed ready spares.
+        await readySpares.reconcileTimer(pool.key, active ? pool.desired : 0, pool.operations);
+        pool.idleStopped = !active;
+        continue;
+      }
       if (!active) {
         if (!pool.idleStopped) {
           await readySpares.reconcile(pool.key, 0, pool.operations);
