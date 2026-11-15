@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, documentRevisions, executionWorkspaces, executionWorkspaceRepositories, heartbeatRuns, issueExecutionDecisions, issues, issueThreadInteractions, issueTreeHolds, issueDocuments } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, completionContracts, createDb, documentRevisions, executionWorkspaces, executionWorkspaceRepositories, heartbeatRuns, issueComments, issueExecutionDecisions, issues, issueThreadInteractions, issueTreeHolds, issueDocuments, statusDecisions } from "@paperclipai/db";
 import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { documentService } from "../documents.js";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
-import { executionStageApprovedByRun } from "./native-run-finalizer.js";
+import { executionStageApprovedByRun, finalizeNativeRun } from "./native-run-finalizer.js";
+import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../../vendor/paperclip-runner/testing.js";
+import { executionStageChangesRequestedByRun } from "./native-governance.js";
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 
 const done: PrpStructuredRunResult = {
@@ -136,6 +139,67 @@ describe("native final-response feedback", () => {
     expect(await executionStageApprovedByRun(db, run, { id: value.issueId, executionState: { ...completed, status: "pending" } })).toBe(false);
     expect(await executionStageApprovedByRun(db, run, { id: value.issueId, executionState: { ...completed, lastDecisionOutcome: "changes_requested" } })).toBe(false);
     expect(await executionStageApprovedByRun(db, run, { id: value.issueId, executionState: { ...completed, lastDecisionId: randomUUID() } })).toBe(false);
+  });
+  it("binds request-changes authority to this run, agent, company, issue and saved decision", async () => {
+    const value = await fixture(), stageId = randomUUID(), decisionId = randomUUID();
+    const run = { id: value.runId, companyId: value.companyId, agentId: value.agentId };
+    const state = { status: "changes_requested", currentStageId: stageId, lastDecisionId: decisionId,
+      lastDecisionOutcome: "changes_requested", returnAssignee: { type: "agent", agentId: randomUUID() } };
+    await db.insert(issueExecutionDecisions).values({ id: decisionId, companyId: value.companyId, issueId: value.issueId, stageId, stageType: "review",
+      actorAgentId: value.agentId, outcome: "changes_requested", body: "Reviewer decision: request changes - X", createdByRunId: value.runId });
+    const issue = { id: value.issueId, executionState: state };
+    expect(await executionStageChangesRequestedByRun(db, run, issue)).toBe(true);
+    for (const changed of [{ ...run, id: randomUUID() }, { ...run, agentId: randomUUID() }, { ...run, companyId: randomUUID() }]) {
+      expect(await executionStageChangesRequestedByRun(db, changed, issue)).toBe(false);
+    }
+    expect(await executionStageChangesRequestedByRun(db, run, { ...issue, id: randomUUID() })).toBe(false);
+    for (const changed of [{ ...state, lastDecisionId: randomUUID() }, { ...state, lastDecisionOutcome: "approved" }, { ...state, status: "completed" }]) {
+      expect(await executionStageChangesRequestedByRun(db, run, { ...issue, executionState: changed })).toBe(false);
+    }
+    await db.update(issues).set({ status: "in_review", executionState: state }).where(eq(issues.id, value.issueId));
+    await expect(nativeCompletionFeedback(db, value.runId, done)).resolves.toContain("report accepted");
+  });
+  it("finishes a saved changes request by returning to the writer with one wake and its visible comment", async () => {
+    const value = await fixture(), writerId = randomUUID(), stageId = randomUUID(), decisionId = randomUUID();
+    await db.insert(agents).values({ id: writerId, companyId: value.companyId, name: "Writer", adapterType: "paperclip_runner", status: "active" });
+    const comment = "Reviewer decision: request changes - annotate all public Python test methods.";
+    const state = { status: "changes_requested", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: { type: "agent", agentId: value.agentId }, returnAssignee: { type: "agent", agentId: writerId },
+      completedStageIds: [], lastDecisionId: decisionId, lastDecisionOutcome: "changes_requested", changesRequestedCount: 1 };
+    await db.update(issues).set({ status: "in_review", checkoutRunId: value.runId, executionState: state,
+      executionPolicy: { mode: "normal", commentRequired: true, stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
+        participants: [{ id: randomUUID(), type: "agent", agentId: value.agentId }] }] } }).where(eq(issues.id, value.issueId));
+    await db.insert(issueExecutionDecisions).values({ id: decisionId, companyId: value.companyId, issueId: value.issueId, stageId, stageType: "review",
+      actorAgentId: value.agentId, outcome: "changes_requested", body: comment, createdByRunId: value.runId });
+    await db.insert(issueComments).values({ companyId: value.companyId, issueId: value.issueId, authorAgentId: value.agentId,
+      createdByRunId: value.runId, body: comment });
+    const contractId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID(), contractSha256 = `contract-${value.runId}`;
+    await db.insert(completionContracts).values({ id: contractId, companyId: value.companyId, issueId: value.issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: { revision: "standalone-v1", objective: "Review the document",
+        criteria: [{ id: "objective", requirement: "Review the document" }] }, canonicalSha256: contractSha256,
+      createdByActorType: "system", createdByActorId: "test" });
+    await db.update(heartbeatRuns).set({ completionContractId: contractId, completionContractSha256: contractSha256,
+      nativeSessionId: sessionId, runnerInstanceId: runnerId }).where(eq(heartbeatRuns.id, value.runId));
+    const { companyId, agentId, issueId, runId } = value;
+    const port = new PaperclipControlPlanePort(db, { companyId, agentId, issueId, runId, sessionId, completionContractId: contractId,
+      completionContractSha256: contractSha256, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: randomUUID() });
+    await port.openRun({ identity: { companyId, agentId, issueId, runId, sessionId }, backendKind: "mock", sourceInstanceId: runnerId });
+    // Even a clean done report is not an approval: the saved changes decision owns the return.
+    await port.completeRun({ result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL, callerResultId: randomUUID() });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
+    await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
+    const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(task).toMatchObject({ status: "in_progress", assigneeAgentId: writerId, assigneeUserId: null, executionRunId: null, checkoutRunId: null });
+    expect(task?.executionState).toMatchObject(state);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakes).toEqual([expect.objectContaining({ agentId: writerId, reason: "execution_changes_requested", status: "queued" })]);
+    expect(wakes[0]?.payload).toMatchObject({ _paperclipWakeContext: { executionStage: { wakeRole: "executor",
+      returnAssignee: { type: "agent", agentId: writerId }, allowedActions: ["address_changes", "resubmit"] } } });
+    const decisions = await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, issueId));
+    expect(decisions.map(row => row.reasonCode)).toEqual(["execution_stage_changes_requested"]);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toEqual([expect.objectContaining({ body: comment, createdByRunId: runId })]);
   });
   it("rejects a duplicate approval report for the exact pending tool-action card", async () => {
     const value = await fixture(), interactionId = randomUUID();
