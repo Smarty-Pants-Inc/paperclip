@@ -18566,10 +18566,7 @@ async function createRunnerdBackendWithinSessionClaim(
     const updated = await writeEnvironmentCleanup(input.db, tx => tx
       .update(environmentLeases)
       .set({
-        metadata: {
-          ...(leaseRow.metadata ?? {}),
-          nativeHarnessBackup: stamp,
-        },
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
         updatedAt: new Date(),
       })
       .where(eq(environmentLeases.id, leaseId))

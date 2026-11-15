@@ -15,7 +15,8 @@ export function loadAgentRunAuthentication(db: Db, input: {
       'executionCancellation', jsonb_build_object(
         'state', ${heartbeatRuns.resultJson}->'executionCancellation'->'state'
       ),
-      'freshContinuationSupersededAt', ${heartbeatRuns.resultJson}->'freshContinuationSupersededAt'
+      'freshContinuationSupersededAt', ${heartbeatRuns.resultJson}->'freshContinuationSupersededAt',
+      'sandboxBackupSourceSupersededAt', ${heartbeatRuns.resultJson}->'sandboxBackupSourceSupersededAt'
     )`,
     contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
       'conversationMode', ${heartbeatRuns.contextSnapshot}->'conversationMode'

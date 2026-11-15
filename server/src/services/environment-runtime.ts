@@ -2,7 +2,7 @@ import { environmentConfigRevision } from "./environment-config-revision.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
-import { RetainedSandboxAbsentError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
+import { RetainedSandboxAbsentError, SandboxLeaseStartDeniedError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
@@ -3512,7 +3512,8 @@ function createSandboxEnvironmentDriver(
       cleanupStatus === "success" ? "expired" : "pending_cleanup",
       {
         ...(input.lease.status === "pending_cleanup" && typeof metadata.pendingCleanupAttemptId === "string"
-          ? { expectedPendingCleanupAttemptId: metadata.pendingCleanupAttemptId } : {}),
+          ? { expectedPendingCleanupAttemptId: metadata.pendingCleanupAttemptId }
+          : { expectedSnapshot: { status: input.lease.status, metadata: input.lease.metadata } }),
         failureReason: input.failureReason,
         cleanupStatus,
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
@@ -4108,6 +4109,35 @@ export function environmentRuntimeService(
     orphanCleanupSpoolDir?: string;
   } = {},
 ) {
+  // One dispatch fence shared by sandbox/plugin drivers AND the task runtime.
+  // Stop/inspect/release remain available; a late start already past this read
+  // cannot claim the source lease, whose ownership writers separately fence C.
+  const workers = options.pluginWorkerManager;
+  if (workers) options = { ...options, pluginWorkerManager: { ...workers,
+    call: async (pluginId, method, params, ...args) => {
+      const scope = params as { companyId?: string; providerLeaseId?: string | null;
+        lease?: { providerLeaseId?: string | null }; operation?: { kind?: string } };
+      const providerLeaseId = scope.providerLeaseId ?? scope.lease?.providerLeaseId;
+      const starts = ["environmentAcquireLease", "environmentResumeLease", "environmentRunnerIngressEndpoint",
+        "environmentRealizeWorkspace", "environmentExecute", "environmentSyncIn", "environmentSyncOut"].includes(method)
+        || (method === "environmentTask" && !["status", "stop", "complete", "release", "credentials", "read_state", "read_file", "archive_state"].includes(scope.operation?.kind ?? ""));
+      try {
+        if (starts && scope.companyId && providerLeaseId) {
+          const tips = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
+            .from(environmentLeases).where(and(eq(environmentLeases.companyId, scope.companyId),
+              eq(environmentLeases.providerLeaseId, providerLeaseId),
+              sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`));
+          if (tips.some(tip => tip.status === "expired" || Object.hasOwn(tip.metadata ?? {}, "reusableSandboxLeaseSuperseded"))) {
+            throw new SandboxLeaseStartDeniedError();
+          }
+        }
+      } catch (error) {
+        args[2]?.(); // No RPC was sent: settle the caller's tracked worker slot.
+        throw error;
+      }
+      return workers.call(pluginId, method, params, ...args);
+    },
+  } };
   const environmentsSvc = environmentService(db);
   let orphanRecoveryFlush: Promise<{ recovered: number; pending: number }> | null = null;
   const drivers = new Map<string, EnvironmentRuntimeDriver>();

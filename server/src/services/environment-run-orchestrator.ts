@@ -1,4 +1,4 @@
-import { RetainedSandboxAbsentError } from "./retained-sandbox-absent-error.js";
+import { RetainedSandboxAbsentError, isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { freshWorkspaceSchema } from "@paperclipai/plugin-sdk";
 import { prepareRemoteWorkspace, readRemoteWorkspaceAuthority, remoteWorkspaceRepositoryPath } from "./remote-workspaces.js";
 /**
@@ -428,7 +428,7 @@ export function environmentRunOrchestrator(
         }).catch((error: unknown) => {
           // Confirmed provider absence is a named lease mismatch; other
           // failures (for example a transient refusal) keep their own error.
-          if (error instanceof RetainedSandboxAbsentError) throw remoteRecoveryLeaseMismatch("environment_resume", "lease_expired");
+          if (error instanceof RetainedSandboxAbsentError || isSandboxLeaseStartDeniedError(error)) throw remoteRecoveryLeaseMismatch("environment_resume", "lease_expired");
           throw error;
         });
         if (!resumed) throw remoteRecoveryLeaseMismatch("environment_resume", "lease");

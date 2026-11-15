@@ -1716,6 +1716,7 @@ export function environmentService(db: Db) {
                         "released",
                         "retained",
                       ]),
+                      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableSandboxLeaseSuperseded')`,
                     ),
                   )
                   .returning()
@@ -1750,6 +1751,7 @@ export function environmentService(db: Db) {
       status: Extract<EnvironmentLeaseStatus, "released" | "expired" | "failed" | "retained" | "pending_cleanup"> = "released",
       options?: {
         expectedPendingCleanupAttemptId?: string;
+        expectedSnapshot?: { status: EnvironmentLeaseStatus; metadata: Record<string, unknown> | null };
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
@@ -1775,6 +1777,8 @@ export function environmentService(db: Db) {
         const condition = and(eq(environmentLeases.id, id), options?.expectedPendingCleanupAttemptId
           ? and(eq(environmentLeases.status, "pending_cleanup"),
               sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${options.expectedPendingCleanupAttemptId}`)
+          : undefined, options?.expectedSnapshot ? and(eq(environmentLeases.status, options.expectedSnapshot.status),
+            sql`${environmentLeases.metadata} is not distinct from ${options.expectedSnapshot.metadata === null ? null : JSON.stringify(options.expectedSnapshot.metadata)}::jsonb`)
           : undefined);
         const [previous] = await tx.select({ companyId: environmentLeases.companyId, issueId: environmentLeases.issueId,
           heartbeatRunId: environmentLeases.heartbeatRunId, status: environmentLeases.status,
