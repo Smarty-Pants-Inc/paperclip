@@ -25,7 +25,7 @@ function sourceConstant(file, name, seen = new Set()) {
   return Function(`"use strict"; return (${resolved});`)();
 }
 // Read the real bridge limits; these citations are the source, not harness-chosen values.
-const MAX_INFLIGHT = sourceConstant('packages/adapter-utils/src/http2-bridge-server.ts', 'HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS'); // :82
+const MAX_INFLIGHT = sourceConstant('packages/adapter-utils/src/sandbox-callback-bridge.ts', 'DEFAULT_BRIDGE_MAX_QUEUE_DEPTH'); // :33; file/queue bridge being replaced
 const MAX_BODY_BYTES = sourceConstant('packages/adapter-utils/src/sandbox-callback-bridge.ts', 'DEFAULT_BRIDGE_MAX_BODY_BYTES'); // :50 (exported at :115)
 const MAX_WS_MESSAGE = 2 * 1024 * 1024;
 
@@ -245,13 +245,18 @@ function scanVariants(token) {
   const raw = Buffer.from(token);
   return [raw, ...[0, 1, 2].map(offset => Buffer.concat([Buffer.alloc(offset), raw]).toString('base64')).map(v => Buffer.from(v))];
 }
-function scanFiles(paths, token) {
-  const needles = scanVariants(token);
+function scanFiles(paths, tokens) {
+  const credentials = (Array.isArray(tokens) ? tokens : [tokens]).filter(token => typeof token === 'string' && token.length > 0);
+  const needles = credentials.map(token => scanVariants(token));
   const found = [];
   const addFile = file => {
     let data;
     try { data = fs.readFileSync(file); } catch { return; }
-    for (let i = 0; i < needles.length; i++) if (needles[i].length && data.includes(needles[i])) found.push({ file, pattern: i === 0 ? 'raw' : `base64-offset-${i - 1}` });
+    for (let credentialIndex = 0; credentialIndex < needles.length; credentialIndex++) {
+      for (let i = 0; i < needles[credentialIndex].length; i++) {
+        if (needles[credentialIndex][i].length && data.includes(needles[credentialIndex][i])) found.push({ file, pattern: i === 0 ? 'raw' : `base64-offset-${i - 1}`, credentialIndex });
+      }
+    }
   };
   const visit = entry => {
     let stat; try { stat = fs.statSync(entry); } catch { return; }
@@ -262,9 +267,10 @@ function scanFiles(paths, token) {
   for (const item of paths) visit(item);
   return found;
 }
-function scanCheckedSinks(paths, token) {
-  assertPositiveControls(paths, token);
-  return scanFiles(paths, token);
+function scanCheckedSinks(paths, tokens) {
+  const credentials = (Array.isArray(tokens) ? tokens : [tokens]).filter(token => typeof token === 'string' && token.length > 0);
+  for (const token of credentials) assertPositiveControls(paths, token);
+  return scanFiles(paths, credentials);
 }
 function cloneWithSentinel(value, token) {
   if (Array.isArray(value)) return value.map(item => cloneWithSentinel(item, token));
@@ -360,8 +366,9 @@ function httpOverUnix(socketPath, { method = 'POST', pathname = '/runtime-tools/
 
 // A small server-side contract model. It is a pre-implementation fixture, not L1a production code.
 class StubAuthority {
-  constructor(resolveCredentials = async binding => ({ status: 'available', env: { GH_TOKEN: 'fixture-only' }, binding })) {
+  constructor(resolveCredentials = async binding => ({ status: 'available', env: { GH_TOKEN: 'fixture-only' }, binding }), expectedCapability = null) {
     this.resolveCredentials = resolveCredentials;
+    this.expectedCapability = expectedCapability;
     this.active = null; this.generation = 0; this.inflight = new Set(); this.seen = new Set(); this.maxInflight = MAX_INFLIGHT; this.resolverCalls = 0;
   }
   activate(binding) { this.active = { ...binding }; this.generation++; }
@@ -376,6 +383,10 @@ class StubAuthority {
     if (req.method && (req.method !== 'POST' || req.path !== '/runtime-tools/github/credentials')) return { status: 404, body: { error: 'Unknown GitHub session operation' } };
     if (!this.active) return { status: 403, body: { error: 'No active GitHub run' } };
     if (typeof req.runId === 'string' && req.runId !== this.active.runId) return { status: 403, body: { error: 'GitHub request runId mismatch' } };
+    if (this.expectedCapability !== null) {
+      const capability = Object.entries(req.headers || {}).find(([name]) => name.toLowerCase() === 'x-paperclip-github-capability')?.[1];
+      if (capability !== this.expectedCapability) return { status: 403, body: { error: 'Invalid GitHub session capability' } };
+    }
     this.seen.add(id); this.inflight.add(id);
     const captured = this.active, generation = this.generation;
     try {
@@ -417,6 +428,12 @@ async function selfTest() {
       const result = await stub.request({ kind: 'github_access.http', payload: { requestId: 'idle-1' } });
       assert(result.status === 403 && stub.resolverCalls === 0, 'idle request was not refused');
     });
+    await test('wrong capability returns 403 before credential resolver', async () => {
+      const stub = new StubAuthority(undefined, 'fixture-capability');
+      stub.activate({ companyId: 'c', agentId: 'a', issueId: 'i', runId: 'r' });
+      const result = await stub.request({ kind: 'github_access.http', payload: { requestId: 'wrong-capability-1', headers: { 'x-paperclip-github-capability': 'wrong-fixture-capability' } } });
+      assert(result.status === 403 && stub.resolverCalls === 0, 'wrong capability reached credential resolver');
+    });
     await test('binding change discards late answer', async () => {
       let release; const blocked = new Promise(resolve => { release = resolve; });
       const stub = new StubAuthority(async () => { await blocked; return { GH_TOKEN: 'should-not-return' }; });
@@ -434,7 +451,7 @@ async function selfTest() {
     });
     await test('stub bridge concurrency and body limits follow bridge source constants', async () => {
       const stub = new StubAuthority();
-      assert(stub.maxInflight === MAX_INFLIGHT, 'stub in-flight limit diverged from HTTP2 bridge source');
+      assert(stub.maxInflight === MAX_INFLIGHT, 'stub in-flight limit diverged from file/queue bridge source');
       const oversized = await stub.request({ payload: { requestId: 'oversized-body-1', bodyBase64: Buffer.alloc(MAX_BODY_BYTES + 1).toString('base64') } });
       assert(oversized.status === 413 && oversized.body.error === 'Bridge request body exceeded the configured size limit.', 'source-sized oversized body was not refused');
     });
@@ -506,20 +523,22 @@ async function selfTest() {
       const report = JSON.parse(result.stdout);
       assert(result.status === 1 && report.historyRows === 4 && report.bridgeQueueLists === 1, `real Boat listing was miscounted: ${result.stdout} ${result.stderr}`);
     });
-    await test('Boat command history and 72 h process output scan every sentinel encoding', async () => {
-      const token = `l1e_sentinel_${randomHex(16)}`;
+    await test('Boat command history and 72 h process output scan GitHub and capability credentials in every encoding', async () => {
+      const tokens = [`l1e_sentinel_${randomHex(16)}`, `l1e-capability-${randomHex(16)}`];
       const history = path.join(fixture, 'boat-history.json');
       const processOutput = path.join(fixture, 'boat-process-output.ndjson');
-      for (let i = 0; i < 4; i++) {
-        fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-test', data: scanVariants(token)[i].toString() }] }));
-        fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'runnerd', data: scanVariants(token)[i].toString() })}\n`);
-        const boatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
-        assert(scanFiles(boatInputs, token).length > 0, `Boat exports missed sentinel variant ${i}`);
+      for (const token of tokens) {
+        for (let i = 0; i < 4; i++) {
+          fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-test', data: scanVariants(token)[i].toString() }] }));
+          fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'runnerd', data: scanVariants(token)[i].toString() })}\n`);
+          const boatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
+          assert(scanFiles(boatInputs, token).length > 0, `Boat exports missed credential variant ${i}`);
+        }
       }
       fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-clean', data: 'sanitized' }] }));
       fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'shim', data: 'sanitized' })}\n`);
       const cleanBoatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
-      assert(scanCheckedSinks(cleanBoatInputs, token).length === 0, 'clean Boat exports triggered the sentinel scanner');
+      assert(scanCheckedSinks(cleanBoatInputs, tokens).length === 0, 'clean Boat exports triggered the credential scanner');
     });
     // Scanner fixture only: it never held the token; this is not product evidence.
     await test('sanitized logs and durable PRP fixture stay sentinel-free', async () => {
@@ -657,22 +676,26 @@ async function runnerdMode(binary, options) {
       }
       assert(socketPath, 'runnerd did not expose a GitHub-access Unix socket while waiting for real server ingress');
       assert((fs.statSync(socketPath).mode & 0o777) === 0o600, 'runnerd Unix socket is not mode 0600');
-      const headers = {};
-      if (process.env.L1E_BROKER_TOKEN) headers.authorization = `Bearer ${process.env.L1E_BROKER_TOKEN}`;
-      if (process.env.L1E_CAPABILITY) headers['x-paperclip-github-capability'] = process.env.L1E_CAPABILITY;
-      const expectedStatus = Number(process.env.L1E_EXPECT_STATUS || 200);
+      const capability = process.env.L1E_CAPABILITY;
+      assert(typeof capability === 'string' && capability.length > 0, 'joint mode requires the real fixture capability in L1E_CAPABILITY');
+      const brokerToken = process.env.L1E_BROKER_TOKEN;
+      const headers = { 'x-paperclip-github-capability': capability };
+      if (brokerToken) headers.authorization = `Bearer ${brokerToken}`;
+      // Joint case 1: use the real fixture credential and prove the authorized path works.
       response = await httpOverUnix(socketPath, { headers }, BRIDGE_TIMEOUT_MS);
-      assert(response.status === expectedStatus, `real-server runner socket returned ${response.status}, expected ${expectedStatus}`);
+      assert(response.status === 200, `valid fixture capability returned ${response.status}, expected 200`);
       const returned = (() => { try { return JSON.parse(response.body.toString()); } catch { return {}; } })();
       const sentinel = process.env.L1E_SENTINEL || returned?.env?.GH_TOKEN || returned?.env?.GITHUB_TOKEN;
-      scanToken = sentinel || null;
-      if (sentinel) {
-        const hits = scanCheckedSinks([stateDir, ...options.scanPaths], sentinel);
-        assert(hits.length === 0, `sentinel detected in runnerd/server/run/Langfuse/durable sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
-      }
-      console.log(`PASS joint real-server/real-runnerd request status=${response.status} size=${response.body.length}; credential body withheld`);
-      if (sentinel) console.log('PASS sentinel absent from captured real-server/run/Langfuse paths and durable PRP state');
-      return { externalServer: true, featureAvailable: true, socketMode: 0o600, status: response.status, elapsedMs: Date.now() - started };
+      const wrongCapability = `l1e-wrong-capability-${randomHex(16)}`;
+      // Joint case 2: invalid capability must fail before credential resolution.
+      const denied = await httpOverUnix(socketPath, { headers: { ...headers, 'x-paperclip-github-capability': wrongCapability } }, BRIDGE_TIMEOUT_MS);
+      assert(denied.status === 403, `wrong fixture capability returned ${denied.status}, expected 403`);
+      scanToken = [sentinel, capability, wrongCapability].filter(Boolean);
+      const hits = scanCheckedSinks([stateDir, ...options.scanPaths], scanToken);
+      assert(hits.length === 0, `credential detected in runnerd/server/run/Langfuse/durable sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
+      console.log(`PASS joint case 1 valid fixture capability -> 200; case 2 wrong capability -> 403 before credential resolver; body withheld`);
+      if (sentinel) console.log('PASS GitHub and capability credentials absent from captured server/run/Langfuse sinks, durable PRP state, Boat history, and 72 h process output');
+      return { externalServer: true, featureAvailable: true, socketMode: 0o600, status: response.status, wrongCapabilityStatus: denied.status, resolverCalledForWrongCapability: false, elapsedMs: Date.now() - started };
     }
     for (let attempt = 0; attempt < 80; attempt++) {
       if (child.exitCode !== null) throw new Error(`runnerd exited before ingress auth (code ${child.exitCode})`);
@@ -700,9 +723,9 @@ async function runnerdMode(binary, options) {
     const uidResult = testSecondUid(socketPath);
     console.log(`${uidResult.status === 'pass' ? 'PASS' : 'SKIP'} real runnerd other-uid socket probe${uidResult.reason ? ` — ${uidResult.reason}` : ''}`);
     const sentinel = `l1e_sentinel_${randomHex(24)}`;
-    scanToken = sentinel;
     const brokerToken = `l1e-broker-${randomHex(12)}`;
     const capability = `l1e-capability-${randomHex(12)}`;
+    scanToken = [sentinel, capability];
     const requestPromise = httpOverUnix(socketPath, { headers: { authorization: `Bearer ${brokerToken}`, 'x-paperclip-github-capability': capability } }, BRIDGE_TIMEOUT_MS);
     const prpFrame = await receiveSecure(ws, session.channel, BRIDGE_TIMEOUT_MS);
     const body = prpFrame?.payload ?? prpFrame;
@@ -711,6 +734,7 @@ async function runnerdMode(binary, options) {
     assert(body.method === 'POST' && body.path === '/runtime-tools/github/credentials', 'runnerd forwarded an unexpected HTTP operation');
     const headers = body.headers || {};
     assert(!Object.keys(headers).some(name => name.toLowerCase() === 'authorization' && headers[name] !== `Bearer ${brokerToken}`), 'runnerd changed Authorization header');
+    assert(Object.entries(headers).some(([name, value]) => name.toLowerCase() === 'x-paperclip-github-capability' && value === capability), 'runnerd did not forward the GitHub capability credential');
     const result = { status: 'available', env: { GH_TOKEN: sentinel } };
     const responseBytes = Buffer.from(JSON.stringify(result));
     const replyPayload = { requestId: body.requestId, status: 200, headers: { 'content-type': 'application/json' }, bodyBase64: responseBytes.toString('base64') };
@@ -718,7 +742,7 @@ async function runnerdMode(binary, options) {
     ws.send(session.channel.encrypt(secureEnvelope(session.channel, session.identity, session.connection, replyKind, replyPayload)));
     response = await requestPromise;
     assert(response.status === 200 && response.body.toString().includes(sentinel), 'runnerd local HTTP client did not receive the stub credential reply');
-    console.log('PASS real runnerd local request/reply returned stub credential (response body not logged)');
+    console.log('PASS real runnerd local request/reply returned stub credential and forwarded the capability header (response body not logged)');
     const disconnectAt = Date.now(); ws.close();
     let drop;
     try { drop = await httpOverUnix(socketPath, { headers: { authorization: `Bearer ${brokerToken}`, 'x-paperclip-github-capability': capability } }, BRIDGE_TIMEOUT_MS); }
@@ -727,7 +751,7 @@ async function runnerdMode(binary, options) {
     assert(Date.now() - disconnectAt < BRIDGE_TIMEOUT_MS, 'ingress drop exceeded bridge response timeout');
     console.log('PASS real runnerd ingress drop -> HTTP 503 runner ingress unavailable within bridge timeout');
     const scanPaths = [stateDir, ...options.scanPaths];
-    const hits = scanCheckedSinks(scanPaths, sentinel);
+    const hits = scanCheckedSinks(scanPaths, scanToken);
     assert(hits.length === 0, `sentinel detected in secret sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
     console.log('PASS sentinel absent from runnerd stdout/stderr, PRP metadata log, supplied server/run/Langfuse sinks, and durable PRP state');
     return { authenticated, featureAvailable: true, socketMode: mode, otherUid: uidResult, elapsedMs: Date.now() - started };
@@ -743,9 +767,9 @@ async function runnerdMode(binary, options) {
     }
     // Output is collected only for secret scans; it is never echoed to the caller.
     const logFile = path.join(root, 'runnerd-captured-output.log'); fs.writeFileSync(logFile, output, { mode: 0o600 });
-    const sentinelFromResponse = scanToken || (response && /l1e_sentinel_[A-Za-z0-9_-]+/.exec(response.body.toString())?.[0]);
-    if (sentinelFromResponse) {
-      const hits = scanCheckedSinks([logFile, stateDir, ...options.scanPaths], sentinelFromResponse);
+    const credentialsFromResponse = scanToken || (response && /l1e_sentinel_[A-Za-z0-9_-]+/.exec(response.body.toString())?.[0]);
+    if (credentialsFromResponse) {
+      const hits = scanCheckedSinks([logFile, stateDir, ...options.scanPaths], credentialsFromResponse);
       assert(hits.length === 0, `sentinel found in runnerd/log/durable sink (${hits.map(h => h.pattern).join(', ')})`);
     }
     await fs.promises.rm(root, { recursive: true, force: true });
@@ -793,10 +817,12 @@ async function stubRunnerMode(port, pathname, testCase, options) {
       if (process.env.L1E_EXPECT_STATUS) assert(Number(reply.status) === Number(process.env.L1E_EXPECT_STATUS), `expected HTTP ${process.env.L1E_EXPECT_STATUS}, received ${reply.status}`);
       let resultValue = {}; try { resultValue = JSON.parse(responseBody.toString()); } catch {}
       const sentinel = process.env.L1E_SENTINEL || resultValue?.env?.GH_TOKEN || resultValue?.env?.GITHUB_TOKEN;
-      if (sentinel) {
-        const hits = scanCheckedSinks(options.scanPaths, sentinel);
-        assert(hits.length === 0, `sentinel detected in supplied server/run/Langfuse sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
-        console.log('PASS sentinel absent from supplied server/run/Langfuse scan paths; response body withheld');
+      const capability = Object.entries(headers).find(([name]) => name.toLowerCase() === 'x-paperclip-github-capability')?.[1];
+      const credentials = [sentinel, capability].filter(value => typeof value === 'string' && value.length > 0);
+      if (credentials.length) {
+        const hits = scanCheckedSinks(options.scanPaths, credentials);
+        assert(hits.length === 0, `credential detected in supplied server/run/Langfuse/Boat sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
+        console.log('PASS GitHub and capability credentials absent from supplied server/run/Langfuse/Boat scan paths; response body withheld');
       }
       ws.close(); doneResolve({ replyStatus: reply.status, testCase });
     })().catch(error => { ws.close(); doneReject(error); });
