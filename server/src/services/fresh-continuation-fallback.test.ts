@@ -5,7 +5,7 @@ import { once } from "node:events";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, sql, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agentWakeupRequests, agents, approvals, authUsers, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns, issueApprovals, issueRecoveryActions, issueThreadInteractions,
@@ -33,12 +33,14 @@ import { SERVER_RESTART_RETRY_MAX_ATTEMPTS, SERVER_RESTART_RETRY_WINDOW_MS } fro
 import { FRESH_CONTINUATION_WINDOW_MS } from "./fresh-continuation-fallback.js";
 import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { createSystemRecovery } from "./system-recovery-state.js";
-import { requestTaskRetry } from "./task-retry.js";
+import { requestTaskRetry, taskRetryMutationAllowed } from "./task-retry.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 import { NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
 import { freshContinuationChain } from "./fresh-continuation-chain.js";
-import { settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
-import { writeFreshThreadNotice, FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
+import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
+import { selectFreshContinuationThread } from "./native-runtime/pi-conversation-record.js";
+import { prepareSupersededWarmSandboxStop } from "./sandbox-stop-and-retain.js";
 import { createReusableLeaseHandoff } from "./environment-lease-handoff.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -149,6 +151,26 @@ suite("fresh-continuation fallback", () => {
     return next[0]!;
   }
 
+  /** A failed native thread whose saved identity can be linked at selection. */
+  async function unfinishedThread(seed: Seed) {
+    const f = await unfinishedRun(seed);
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
+    return f;
+  }
+
+  /** The note is owed at actual thread selection, not fallback recording. */
+  async function selectFreshSuccessor(f: { issueId: string; runId: string }) {
+    const next = await expectOneFreshSuccessor(f);
+    await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId })
+      .where(eq(heartbeatRuns.id, next.id));
+    const input = { companyId, agentId, issueId: f.issueId, runId: next.id };
+    const selected = await selectFreshContinuationThread(db, input);
+    expect(selected).toEqual(expect.any(String));
+    expect(await selectFreshContinuationThread(db, input)).toBe(selected);
+    expect(await successors(f.runId)).toHaveLength(1);
+    return next;
+  }
+
   // RFL 12:36Z regression probes. Keep reasons: executor exclusion is a data
   // safety boundary; these reproduce the recorded D10 failure paths.
   it.each(["queued", "succeeded", "older_answer"])("RFL F1 checks %s before any stop or note", async shape => {
@@ -164,12 +186,13 @@ suite("fresh-continuation fallback", () => {
       provider: "boat", providerLeaseId: `rfl-f1-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
     const result = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
     if (shape === "older_answer") {
-      // RFL class 5: the earlier step did not carry this refused follow-up.
-      expect(result).toMatchObject({ kind: "exact_recovery_pending" });
+      // follow-Paperclip Cut B R1/R2/R5: an earlier answer does not block this follow-up or request a stop; selection owns its note.
+      expect(result).toMatchObject({ kind: "continued" });
       expect(await successors(f.runId)).toHaveLength(0);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
+      await selectFreshSuccessor(f);
       expect(currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))))
-        .toMatchObject([{ body: expect.stringContaining("stopping the earlier attempt") }]);
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0].status).toBe("pending_cleanup");
+        .toMatchObject([{ body: FRESH_THREAD_STARTED_NOTE }]);
     } else {
       expect(result).toMatchObject({ kind: "successor_exists" });
       expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
@@ -178,48 +201,40 @@ suite("fresh-continuation fallback", () => {
     }
   });
 
-  it("RFL extra legacy code-only rows still require physical stop, never generic isolation", async () => {
+  it("RFL extra legacy code-only rows use the ordinary fallback without physical stop", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_continuation_requires_reconciliation",
       error: "native_controller_recovery_unsupported:metadata_format" });
-    await db.insert(environmentLeases).values({ companyId, issueId: f.issueId, heartbeatRunId: f.runId,
-      provider: "boat", providerLeaseId: `legacy-d10-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } });
-    for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
-      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
-        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
-    }
-    expect(await successors(f.runId)).toHaveLength(0);
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
-      .not.toHaveProperty("freshContinuation");
-  });
-
-  it.each(["no_lease", "local", "no_provider_id"])("RFL F2 nothing to stop ends and delivers (%s)", async shape => {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
-    if (shape !== "no_lease") await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId,
-      issueId: f.issueId, provider: shape === "local" ? "local" : "boat", providerLeaseId: null, status: "released" });
-    if (shape === "no_provider_id") {
-      // RFL class 6: local ps cannot prove an unidentified remote allocation gone.
-      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-        .toMatchObject({ kind: "exact_recovery_pending" });
-      expect(await successors(f.runId)).toHaveLength(0);
-      const notes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toMatch(/cannot confirm.*stopped/);
-      expect(notes[0].body).toContain("Retry");
-      expect(await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
-        observedRunId: f.runId, idempotencyKey: randomUUID() })).toMatchObject({ accepted: true });
-      expect(await successors(f.runId)).toHaveLength(0);
-      return;
-    }
+    const [lease] = await db.insert(environmentLeases).values({ companyId, issueId: f.issueId, heartbeatRunId: f.runId,
+      provider: "boat", providerLeaseId: `legacy-d10-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
+    // follow-Paperclip Cut B R1/R5: diagnostic-only refusals no longer require stop proof or rearm cleanup.
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
       .toMatchObject({ kind: "continued" });
-    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(notes).toHaveLength(1);
-    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now: new Date(Date.now() + 30 * 24 * 3600_000) }))
+      .toMatchObject({ kind: "already_continued" });
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     await expectOneFreshSuccessor(f);
   });
 
+  it.each(["no_lease", "local", "no_provider_id"])("RFL F2 nothing to stop ends and delivers (%s)", async shape => {
+    const f = await unfinishedThread({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    if (shape !== "no_lease") await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId,
+      issueId: f.issueId, provider: shape === "local" ? "local" : "boat", providerLeaseId: null, status: "released" });
+    // follow-Paperclip Cut B R1/R2: missing stop proof permits ordinary fallback; the one note moves to selection.
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    expect(await successors(f.runId)).toHaveLength(0);
+    if (shape === "no_provider_id") expect(await requestTaskRetry({ db, companyId, issueId: f.issueId,
+      actorId: userId, actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey: randomUUID() }))
+      .toMatchObject({ accepted: true });
+    await selectFreshSuccessor(f);
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+  });
+
   it.each(["missing_allocation", "foreign_launch", "process_read_failed"])("RFL round5 F2-end truthful end and working Retry (%s)", async shape => {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
+    const f = await unfinishedThread({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const [lease] = shape === "missing_allocation" ? await db.insert(environmentLeases).values({ companyId,
       heartbeatRunId: f.runId, issueId: f.issueId, provider: "boat", providerLeaseId: null,
       status: "released", metadata: { pluginId: "fixture-boat" } }).returning() : [];
@@ -230,57 +245,45 @@ suite("fresh-continuation fallback", () => {
     await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     try {
       if (shape === "process_read_failed") vi.stubEnv("PATH", root);
-      for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
-        expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
-          .toMatchObject({ kind: "exact_recovery_pending" });
-        const task = await issue(f.issueId);
-        expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
-          assigneeAgentId: task.assigneeAgentId, projectId: task.projectId }))
-          .toMatchObject({ state: "failed", canRetry: true, retryWait: { reason: "previous_execution_stop_unconfirmed" } });
-      }
-      const currentNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
-        .filter(note => !note.metadata?.supersededByCommentId);
-      expect(currentNotes).toHaveLength(1);
-      expect(currentNotes[0].body).toMatch(/cannot confirm.*stopped/i);
-      expect(currentNotes[0].body).toContain("Retry");
-      expect(currentNotes[0].body).not.toMatch(/I'm stopping|will start automatically/i);
+      // follow-Paperclip Cut B R1/R2/R8: ordinary continuation replaces the stop wait; keep one note at selection.
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "continued" });
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now: new Date(Date.now() + 30 * 24 * 3600_000) }))
+        .toMatchObject({ kind: "already_continued" });
+      const task = await issue(f.issueId);
+      expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
+        assigneeAgentId: task.assigneeAgentId, projectId: task.projectId }))
+        .toMatchObject({ state: "working", canRetry: false });
       const click = () => requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
         observedRunId: f.runId, idempotencyKey: randomUUID() });
       expect(await click()).toMatchObject({ accepted: true, stale: false });
       expect(await successors(f.runId)).toHaveLength(0);
       expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
-        .not.toHaveProperty("freshContinuation");
-      // Repair evidence, not a timeout or click, grants fresh-thread authority.
+        .toHaveProperty("freshContinuation");
+      if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
       vi.unstubAllEnvs();
-      if (lease || shape === "foreign_launch") {
-        const [bound] = lease ? await db.update(environmentLeases).set({ providerLeaseId: `repaired-${randomUUID()}` })
-          .where(eq(environmentLeases.id, lease.id)).returning() : await db.insert(environmentLeases).values({ companyId,
-            heartbeatRunId: f.runId, issueId: f.issueId, provider: "boat", providerLeaseId: `found-${randomUUID()}`,
-            status: "released", metadata: { pluginId: "fixture-boat" } }).returning();
-        const now = new Date();
-        await db.update(environmentLeases).set({ status: "released", releasedAt: now, cleanupStatus: "success",
-          metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
-            companyId, runId: f.runId, leaseId: bound.id, provider: "boat", providerLeaseId: bound.providerLeaseId,
-            state: "destroyed", confirmedAt: now.toISOString() } } }).where(eq(environmentLeases.id, bound.id));
-      }
       const key = randomUUID();
       const repairedClick = () => requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
         observedRunId: f.runId, idempotencyKey: key });
       expect(await repairedClick()).toMatchObject({ accepted: true });
       expect(await repairedClick()).toMatchObject({ accepted: true });
-      await expectOneFreshSuccessor(f);
+      await selectFreshSuccessor(f);
+      const currentNotes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
+      expect(currentNotes).toHaveLength(1);
+      expect(currentNotes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
       const receipts = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
         eq(agentWakeupRequests.reason, "task_retry")));
       expect(receipts.every(receipt => receipt.status === "coalesced")).toBe(true);
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 
-  it("RFL round5 F2-end Retry re-arms the existing stop owner, never admits without its receipt", async () => {
+  it("RFL round5 F2-end ordinary Retry does not re-arm the existing stop owner", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
       provider: "boat", providerLeaseId: `retry-stop-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
+    // follow-Paperclip Cut B R1/R3/R5: Retry joins the ordinary continuation and never rearms stop-only cleanup.
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending" });
+      .toMatchObject({ kind: "continued" });
     const [pending] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     const metadata: Record<string, unknown> = { ...pending.metadata, pendingCleanupRetryAttempts: 5, pendingCleanupRetryCapWarned: true,
       pendingCleanupRetryAfterMs: Date.now() + 3600_000 };
@@ -288,7 +291,7 @@ suite("fresh-continuation fallback", () => {
     await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
     const task = await issue(f.issueId);
     expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
-      assigneeAgentId: task.assigneeAgentId, projectId: task.projectId })).toMatchObject({ state: "failed", canRetry: true });
+      assigneeAgentId: task.assigneeAgentId, projectId: task.projectId })).toMatchObject({ state: "working", canRetry: false });
     const retryInput = { db, companyId, issueId: f.issueId, actorId: userId, actorSource: "local_implicit",
       observedRunId: f.runId, idempotencyKey: randomUUID() };
     // An automatic restart hook cannot renew a deliberately exhausted budget.
@@ -297,35 +300,51 @@ suite("fresh-continuation fallback", () => {
       .toMatchObject({ pendingCleanupRetryAttempts: 5 });
     expect(await requestTaskRetry({ ...retryInput, idempotencyKey: randomUUID() })).toMatchObject({ accepted: true });
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0])
-      .toMatchObject({ providerLeaseId: lease.providerLeaseId, status: "pending_cleanup", metadata: {
-        sandboxStopAndRetain: metadata.sandboxStopAndRetain, pendingCleanupAttemptId: metadata.pendingCleanupAttemptId,
-        pendingCleanupRetryAttempts: 0, pendingCleanupRetryAfterMs: 0, pendingCleanupRetryCapWarned: false } });
+      .toMatchObject({ providerLeaseId: lease.providerLeaseId, status: "retained", metadata });
     expect(await successors(f.runId)).toHaveLength(0);
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
-      .not.toHaveProperty("freshContinuation");
+      .toHaveProperty("freshContinuation");
+    await expectOneFreshSuccessor(f);
   });
 
   it("RFL round5 F2-end Retry refuses a principal without task access before touching cleanup", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
       provider: "boat", providerLeaseId: `no-access-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
-    await expect(requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: randomUUID(),
-      observedRunId: f.runId, idempotencyKey: randomUUID() })).rejects.toMatchObject({ status: 403 });
+    // follow-Paperclip Cut B R3 (RFL 08:06Z ruling (a)): the removed typed Retry branch (task-retry.ts, D10) refused
+    // here with 403. As upstream, access is refused at the route (issue-agent-mutation-ownership-routes.test.ts
+    // "admits ordinary Retry only for a board actor with task mutation permission") and again at delivery
+    // (task-retry.ts taskRetryMutationAllowed). The access hard line moves; it does not vanish.
+    const actorId = randomUUID();
+    expect(await taskRetryMutationAllowed(db, { companyId, issueId: f.issueId, actorId, actorSource: "session" })).toBe(false);
+    await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId,
+      observedRunId: f.runId, idempotencyKey: randomUUID() }).catch(() => undefined);
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
-    expect(await successors(f.runId)).toHaveLength(0);
+    await deliver();
+    // No run is ever created from that principal's wake.
+    const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.requestedByActorId, actorId)));
+    expect(wakes.filter(wake => wake.runId !== null)).toEqual([]);
+    const fromWakes = wakes.length ? await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.wakeupRequestId, wakes.map(wake => wake.id)))) : [];
+    expect(fromWakes).toEqual([]);
   });
 
-  it("RFL F2 an unbound local owner with a recorded live process is not an empty owner set", async () => {
+  it("RFL F2 an unbound local process is not stop proof, but permits isolated continuation", async () => {
     const f = await unfinishedRun({ runtime: "legacy", errorCode: "runner_remote_state_unavailable" });
     await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.runId));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // follow-Paperclip Cut B R1/R5: the retained proof reader still rejects an unbound PID; fallback does not demand its proof.
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      .toMatchObject({ kind: "continued", isolation: "fresh_isolated_workspace" });
     expect(await successors(f.runId)).toHaveLength(0);
+    await expectOneFreshSuccessor(f);
   });
 
   // Keep: executor exclusion/data safety, RFL's refused-predecessor catch.
-  it.each([true, false])("RFL round4 F6 proves the earlier owner's process, not the dead contender (nativeIssueId=%s)", async nativeIssue => {
+  it.each([true, false])("RFL round4 F6 checks earlier-process settlement proof without gating fresh admission (nativeIssueId=%s)", async nativeIssue => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID();
     const dead = spawnSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" });
@@ -336,12 +355,15 @@ suite("fresh-continuation fallback", () => {
       nativeIssueId: nativeIssue ? f.issueId : null, nativeSessionId: sessionId,
       runtimeMode: "native", status: "failed", processPid: process.pid,
       createdAt: new Date(source.createdAt.getTime() - 1000), finishedAt: source.finishedAt });
+    // follow-Paperclip Cut B R1/R5: earlier-process proof stays false at settlement, not a veto on a fresh continuation.
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      .toMatchObject({ kind: "continued" });
     expect(await successors(f.runId)).toHaveLength(0);
+    await expectOneFreshSuccessor(f);
   });
 
-  it.each(["refused", "earlier"])("RFL round4 F2-positive absent process and lease rows with a live %s runner still wait", async which => {
+  it.each(["refused", "earlier"])("RFL round4 F2-positive live %s runner fails stop proof without vetoing fresh continuation", async which => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     let ownerId = f.runId;
     if (which === "earlier") {
@@ -356,15 +378,21 @@ suite("fresh-continuation fallback", () => {
       { stdio: ["ignore", "pipe", "pipe"] });
     try {
       await once(child.stdout!, "data");
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      // follow-Paperclip Cut B R1/R5: positive process-table proof is retained for settlement, not fresh admission.
+      expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
       expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+        .toMatchObject({ kind: "continued" });
       expect(await successors(f.runId)).toHaveLength(0);
     } finally {
       const exited = once(child, "exit"); child.kill(); await exited;
     }
     // The same positive process-table read now proves no local owner exists.
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: true });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: "already_continued" });
+    await expectOneFreshSuccessor(f);
   });
 
   it("RFL round4 F2-positive a failed process-table read is not an empty owner set", async () => {
@@ -373,9 +401,14 @@ suite("fresh-continuation fallback", () => {
     await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     try {
       vi.stubEnv("PATH", root);
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      // follow-Paperclip Cut B R1/R5: a failed process read is not death proof, but fresh continuation no longer requires death.
+      expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
       expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-        .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+        .toMatchObject({ kind: "continued" });
       expect(await successors(f.runId)).toHaveLength(0);
+      vi.unstubAllEnvs();
+      await expectOneFreshSuccessor(f);
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 
@@ -384,16 +417,22 @@ suite("fresh-continuation fallback", () => {
     await db.insert(heartbeatRunEvents).values({ companyId, runId: f.runId, agentId,
       seq: 1, eventType: "native.process_start_requested", stream: "system", level: "info",
       message: "Prior launch requested", payload: { targetKind: shape === "remote" ? "remote" : "local", hostname: "another-host" } });
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // follow-Paperclip Cut B R1/R5: missing remote/foreign launch proof still fails settlement, not the ordinary fallback.
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
+      .toMatchObject({ kind: "continued" });
     expect(await successors(f.runId)).toHaveLength(0);
+    await expectOneFreshSuccessor(f);
   });
 
   it.each(["native_runner_refresh_required", "runner_remote_state_unavailable", "native_runner_launch_profile_mismatch"])(
     "RFL round4 F9 final wording distinguishes skill refresh from generic refusal (%s)", async code => {
-      const f = await unfinishedRun({ runtime: "native", errorCode: code });
+      const f = await unfinishedThread({ runtime: "native", errorCode: code });
       expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
         .toMatchObject({ kind: "continued" });
+      // follow-Paperclip Cut B R2: preserve the exactly-one wording assertion at actual thread selection.
+      await selectFreshSuccessor(f);
       const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
       expect(notes).toHaveLength(1);
       if (code === "native_runner_refresh_required") {
@@ -405,7 +444,7 @@ suite("fresh-continuation fallback", () => {
       }
     });
 
-  it.each(["missing-allocation", "failed-process-read", "bound-remote"])("D10 cold restore backup_without_reusable_lease uses positive stop proof (%s)", async shape => {
+  it.each(["missing-allocation", "failed-process-read", "bound-remote"])("D10 cold restore backup_without_reusable_lease continues without positive stop proof (%s)", async shape => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_harness_state_mismatch: backup_without_reusable_lease",
       error: "runner_harness_state_mismatch: backup_without_reusable_lease" });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
@@ -417,72 +456,55 @@ suite("fresh-continuation fallback", () => {
     await writeFile(join(root, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
     try {
       if (shape === "failed-process-read") vi.stubEnv("PATH", root);
-      for (const now of [new Date(), new Date(Date.now() + 30 * 24 * 3600_000)]) {
-        expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now }))
-          .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
-        expect(await successors(f.runId)).toHaveLength(0);
-      }
-      const before = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-      expect(before).toHaveLength(1);
-      const held = before[0];
-      expect(held.body).toMatch(shape === "bound-remote" ? /stopping the earlier attempt/ : /cannot confirm.*stopped/i);
-      if (shape !== "bound-remote") {
-        expect(held.body).toContain("Retry");
-        const task = await issue(f.issueId);
-        expect(await taskInterruptionPresentation(db, { id: task.id, companyId, status: task.status,
-          assigneeAgentId: task.assigneeAgentId, projectId: task.projectId })).toMatchObject({ state: "failed", canRetry: true });
-      }
-      vi.unstubAllEnvs();
-      if (lease) {
-        const stoppedAt = new Date();
-        const providerLeaseId = lease.providerLeaseId ?? `found-cold-restore-${randomUUID()}`;
-        await db.update(environmentLeases).set({ providerLeaseId, status: "released", releasedAt: stoppedAt, cleanupStatus: "success",
-          metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
-            companyId, runId: f.runId, leaseId: lease.id, provider: "boat", providerLeaseId,
-            state: "stopped", confirmedAt: stoppedAt.toISOString() } } }).where(eq(environmentLeases.id, lease.id));
-      }
-      // This is a positive process-table read or an identity-bound remote stop
-      // receipt; merely removing the missing record would not supply proof.
+      const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      // follow-Paperclip Cut B R1/R2/R5: cold-restore refusal uses the fallback without stop repair; the one note belongs to selection.
+      expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
       expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
         .toMatchObject({ kind: "continued" });
-      await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
+      expect(await successors(f.runId)).toHaveLength(0);
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now: new Date(Date.now() + 30 * 24 * 3600_000) }))
+        .toMatchObject({ kind: "already_continued" });
+      vi.unstubAllEnvs();
+      await selectFreshSuccessor(f);
+      const before = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(before).toHaveLength(1);
+      expect(before[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+        .toMatchObject({ kind: "already_continued" });
       const after = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-      const current = after.filter(note => note.deletedAt === null && !note.metadata?.supersededByCommentId);
-      expect(current).toHaveLength(1);
-      expect(current[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-      expect(after.find(note => note.id === held.id)).toMatchObject({ body: held.body, deletedAt: null,
-        metadata: { ...held.metadata, supersededByCommentId: current[0].id } });
-      await expectOneFreshSuccessor(f);
+      expect(currentNotices(after, before)).toHaveLength(1);
+      if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 
   it("RFL F3 appends changed notes, supersedes without rewriting another owner's note, and is idempotent", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID();
-    const [run] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId));
     const [held] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
       body: "The prior owner is held.", metadata: { version: 1, authorizationReason: `native_prior_owner_held:${sessionId}`,
         sections: [{ rows: [{ type: "text", text: "Original held notice" }] }] } }).returning();
-    for (const body of [FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STARTED_NOTE, FRESH_THREAD_STARTED_NOTE])
-      await db.transaction(tx => writeFreshThreadNotice(tx as unknown as typeof db, run, f.issueId, body));
+    // follow-Paperclip Cut B R2/R5: remove the gate's intermediate note, but keep append-only history and one current note at selection.
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    await selectFreshSuccessor(f);
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(notes).toHaveLength(3);
+    expect(notes).toHaveLength(2);
     expect(notes.find(note => note.id === held.id)).toMatchObject({ body: held.body,
       metadata: { authorizationReason: held.metadata!.authorizationReason, supersededByCommentId: expect.any(String) } });
     expect(notes.filter(note => !note.metadata?.supersededByCommentId).map(note => note.body))
       .toEqual([FRESH_THREAD_STARTED_NOTE]);
-    expect(notes.find(note => note.body === FRESH_THREAD_STOPPING_NOTE)?.metadata)
-      .toMatchObject({ supersededByCommentId: notes.find(note => note.body === FRESH_THREAD_STARTED_NOTE)!.id });
+    expect(currentNotices(notes, [held])).toHaveLength(1);
   });
 
   it.each([
-    ["runner_remote_state_unavailable", undefined, "environment"],
-    ["native_controller_recovery_missing_evidence:snapshot_binding", undefined, "saved"],
-    ["native_controller_recovery_unsupported:metadata_format", undefined, "saved"],
-    ["native_runner_refresh_required", "provider_live_descendants", "configuration"],
-    ["native_runner_refresh_required", "provider_active_goal", "configuration"],
-    ["native_runner_launch_profile_mismatch", "provider_launch_profile_mismatch", "configuration"],
-  ])("RFL F4 turn-wait wording is true for %s / %s", async (code, prepareRefusalCode, expected) => {
+    ["runner_remote_state_unavailable", undefined],
+    ["native_controller_recovery_missing_evidence:snapshot_binding", undefined],
+    ["native_controller_recovery_unsupported:metadata_format", undefined],
+    ["native_runner_refresh_required", "provider_live_descendants"],
+    ["native_runner_refresh_required", "provider_active_goal"],
+    ["native_runner_launch_profile_mismatch", "provider_launch_profile_mismatch"],
+  ])("RFL F4 preserves the actual live owner for %s / %s", async (code, prepareRefusalCode) => {
     const f = await unfinishedRun({ runtime: "native", errorCode: code });
     const sessionId = randomUUID();
     const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId,
@@ -490,14 +512,16 @@ suite("fresh-continuation fallback", () => {
       .where(eq(heartbeatRuns.id, f.runId)).returning();
     await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, nativeIssueId: f.issueId,
       nativeSessionId: sessionId, status: "running", createdAt: new Date(source.createdAt.getTime() - 1000) });
+    // follow-Paperclip Cut B R1/R5: the ordinary actual-owner guard replaces the gate's turn-wait narration.
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "active_provider_turn" });
-    const [note] = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(note.body).toContain(expected);
-    expect(note.body).not.toMatch(/skill change/i);
+      .toMatchObject({ kind: "successor_exists" });
+    expect(await successors(f.runId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    expect((await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId), eq(heartbeatRuns.status, "running")))))
+      .toHaveLength(1);
   });
 
-  it("RFL F7 real cleanup dispatch produces stop proof then one fresh wake across a reuse chain", async () => {
+  it("RFL F7 retained cleanup owns stop-and-keep independently of one fresh wake across a reuse chain", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "runner_remote_state_unavailable" });
     const sessionId = randomUUID(), predecessorId = randomUUID();
     const [source] = await db.update(heartbeatRuns).set({ nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, f.runId)).returning();
@@ -516,9 +540,15 @@ suite("fresh-continuation fallback", () => {
       .where(eq(environmentLeases.id, predecessor.id));
     await db.update(environmentLeases).set({ metadata: { ...common.metadata, reusableLeasePredecessor: handoff } })
       .where(eq(environmentLeases.id, tip.id));
+    const [historical] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, predecessor.id));
+    const [retained] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, tip.id));
+    // follow-Paperclip Cut B R1/R5: fallback does not dispatch stop; retained cleanup still independently owns stop-and-keep.
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending" });
-    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, predecessor.id)))[0].status).toBe("expired");
+      .toMatchObject({ kind: "continued" });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, predecessor.id)))[0]).toEqual(historical);
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, tip.id)))[0]).toEqual(retained);
+    // The retained warm box's real stop-only owner (warm expiry / Cut A stop-and-keep), not the removed gate.
+    expect(await prepareSupersededWarmSandboxStop(db, retained, { reason: "sandbox_source_changed" })).not.toBeNull();
     // Fake only the external provider boundary. The real sweep claims cleanup,
     // consumes this provider response, binds/persists proof, and emits its work
     // notifications; no test writes remoteExecutionTermination metadata.
@@ -535,8 +565,9 @@ suite("fresh-continuation fallback", () => {
     expect(rows.find(row => row.id === predecessor.id)).toMatchObject({ status: "expired", cleanupStatus: "success" });
     expect(rows.find(row => row.id === tip.id)).toMatchObject({ status: "released", cleanupStatus: "success",
       metadata: { remoteExecutionTermination: { state: "stopped", leaseId: tip.id, runId: f.runId } } });
+    expect(rows.find(row => row.id === predecessor.id)).toEqual(historical);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "continued" });
+      .toMatchObject({ kind: "already_continued" });
     await expectOneFreshSuccessor(f);
     await db.delete(environmentLeases).where(eq(environmentLeases.environmentId, environment.id));
     await db.delete(environments).where(eq(environments.id, environment.id));
@@ -547,7 +578,7 @@ suite("fresh-continuation fallback", () => {
     "native_controller_recovery_unsupported:metadata_format",
   ].flatMap(code => ["void-release", "stopping", "foreign-run", "foreign-lease", "bad-time", "live-peer"]
     .map(shape => [code, shape] as const)))(
-    "impossible reconciliation %s never treats %s as proof, regardless of time", async (errorCode, shape) => {
+    "impossible reconciliation %s preserves invalid %s proof while continuing once", async (errorCode, shape) => {
     const f = await unfinishedRun({ runtime: "native", errorCode });
     await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, f.runId));
     const acquiredAt = new Date(Date.now() - 120_000), releasedAt = new Date();
@@ -566,26 +597,25 @@ suite("fresh-continuation fallback", () => {
         providerLeaseId: lease.providerLeaseId, status: "active" }).returning();
       peerId = peer.id;
     }
-    for (const now of [new Date(), new Date(Date.now() + 24 * 3600_000)]) expect(await ensureFreshContinuation(db, {
-      companyId, runId: f.runId, trigger: "held_recovery", now })).toMatchObject({ kind: "exact_recovery_pending" });
+    const beforeLeases = await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, f.issueId));
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    // follow-Paperclip Cut B R1/R2/R5: invalid receipts stay invalid and immutable at settlement; fresh admission needs no physical-stop upgrade.
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now: new Date(Date.now() + 24 * 3600_000) }))
+      .toMatchObject({ kind: "already_continued" });
+    await selectFreshSuccessor(f);
     const beforeNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(beforeNotes).toMatchObject([{ authorType: "system", body: expect.stringContaining(shape === "live-peer" || shape === "bad-time"
-      ? "cannot confirm that the earlier attempt stopped" : "stopping the earlier attempt before starting fresh") }]);
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0].evidence)
-      .not.toHaveProperty("freshContinuation");
-    if (peerId) await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, peerId));
-    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
-      metadata: { pluginId: "fixture-boat", remoteExecutionTermination: receipt } }).where(eq(environmentLeases.id, lease.id));
-    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+    expect(beforeNotes).toHaveLength(1);
+    expect(beforeNotes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "already_continued" });
     const allNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
-    expect(allNotes).toHaveLength(2);
-    const notes = currentNotices(allNotes, beforeNotes);
-    expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("fresh thread in this conversation");
-    // Exercise the real delivery owner and heartbeat admission, not only a
-    // continuation record. It queues exactly one fresh-history successor
-    // without a person's Retry or a new message after stop proof lands.
-    await expectOneFreshSuccessor(f);
+    expect(allNotes).toHaveLength(1);
+    expect(currentNotices(allNotes, beforeNotes)).toHaveLength(1);
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, f.issueId))).toEqual(beforeLeases);
+    if (peerId) expect(beforeLeases.find(row => row.id === peerId)).toMatchObject({ status: "active" });
   });
 
   // The five most frequent endings on staging (2026-11-12): each left the task
@@ -684,39 +714,47 @@ suite("fresh-continuation fallback", () => {
       evidence: { runId: run.id, nativeFailureBlock: { runId: run.id, statusVersion: Number(task!.statusVersion) } } });
   }
 
-  // RFL class 2: demonstrate BOTH the physical-stop negative and the positive.
-  async function confirmClass2Stop(f: { runId: string; issueId: string }) {
+  // follow-Paperclip Cut B R1/R5: preserve the unproven retained source, not the removed stop-before-fresh upgrade.
+  async function retainClass2Source(f: { runId: string; issueId: string }) {
     const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: f.runId, issueId: f.issueId,
       provider: "boat", providerLeaseId: `class2-${randomUUID()}`, status: "retained", metadata: { pluginId: "fixture-boat" } }).returning();
-    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending" });
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(await readFreshThreadStopProof(db, source, f.issueId)).toMatchObject({ gone: false });
     expect(await successors(f.runId)).toHaveLength(0);
-    const at = new Date();
-    await db.update(environmentLeases).set({ status: "released", releasedAt: at, cleanupStatus: "success", metadata: {
-      pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId,
-        runId: f.runId, leaseId: lease.id, provider: "boat", providerLeaseId: lease.providerLeaseId,
-        state: "stopped", confirmedAt: at.toISOString() } } }).where(eq(environmentLeases.id, lease.id));
+    return lease;
   }
 
   it.each([
     "native_controller_recovery_unsupported:metadata_format",
     "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled",
-  ])("never re-fires the real fallback after a terminal continuation refusal: %s", async error => {
+  ])("continues a terminal continuation refusal once within the chain cap: %s", async error => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await settleUnrecoverableExecutions(db);
     const next = await expectOneFreshSuccessor(f);
+    await db.update(heartbeatRuns).set({ nativeSessionId: randomUUID() }).where(eq(heartbeatRuns.id, next.id));
     await refuseContinuation(next, error);
     const d10 = error === "native_controller_recovery_unsupported:metadata_format";
-    if (d10) await confirmClass2Stop({ runId: next.id, issueId: f.issueId });
-    else await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
+    const lease = d10 ? await retainClass2Source({ runId: next.id, issueId: f.issueId }) : null;
+    if (!d10) await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system",
       body: NATIVE_CONTINUATION_REFUSED_ACTION });
     const before = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     // Exercise the actual sweep and delivery, repeatedly, not a classifier mock.
     for (let pass = 0; pass < 3; pass++) {
       await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver();
     }
-    expect(await successors(next.id)).toHaveLength(d10 ? 1 : 0);
+    // follow-Paperclip Cut B R1/R4: neither typed refusal nor historical prose permanently vetoes the second bounded attempt.
+    const following = await successors(next.id);
+    expect(following).toHaveLength(1);
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(before.length);
+    if (d10) {
+      await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: f.issueId })
+        .where(eq(heartbeatRuns.id, following[0].id));
+      const input = { companyId, agentId, issueId: f.issueId, runId: following[0].id };
+      const selected = await selectFreshContinuationThread(db, input);
+      expect(selected).toEqual(expect.any(String));
+      expect(await selectFreshContinuationThread(db, input)).toBe(selected);
+    }
+    if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     const notes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toBe(d10 ? FRESH_THREAD_STARTED_NOTE : NATIVE_CONTINUATION_REFUSED_ACTION);
@@ -818,48 +856,52 @@ suite("fresh-continuation fallback", () => {
   it.each([
     ["native_controller_recovery_unsupported:metadata_format", "native_controller_recovery_unsupported"],
     ["runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled", "runner_state_identity_mismatch"],
-  ])("the real notice owner generates one terminal new-task note for a fallback preparation refusal: %s", async (error, code) => {
+  ])("the real notice owner generates one bound note after two fallback preparation refusals: %s", async (error, code) => {
     const f = await unansweredChat();
     await settleUnrecoverableExecutions(db);
     const next = await expectOneFreshSuccessor(f);
     await refuseContinuation(next, error); await finishFailedWake(next);
-    const d10 = error === "native_controller_recovery_unsupported:metadata_format";
-    if (d10) await confirmClass2Stop({ runId: next.id, issueId: f.issueId });
+    const lease = error === "native_controller_recovery_unsupported:metadata_format"
+      ? await retainClass2Source({ runId: next.id, issueId: f.issueId }) : null;
+    // follow-Paperclip Cut B R1/R8: both refusal families get the remaining attempt; K=2 leaves one truthful message-bound note.
+    await sweepFallback();
+    const following = await successors(next.id);
+    expect(following).toHaveLength(1);
+    const last = following[0];
+    await refuseContinuation(last, error); await finishFailedWake(last);
     for (let pass = 0; pass < 3; pass++) {
       await sweepFallback();
       await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
     }
-    expect(await successors(next.id)).toHaveLength(d10 ? 1 : 0);
+    expect(await successors(last.id)).toHaveLength(0);
+    if (lease) expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     const notices = currentNotices(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))));
     expect(notices).toHaveLength(1);
-    if (d10) {
-      expect(notices[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-      expect(notices[0].body).not.toMatch(/assign.*new task/i);
-      return;
-    }
-    expect(notices[0]!.body).toBe(NATIVE_CONTINUATION_REFUSED_ACTION);
-    expect(notices[0]!.body).not.toMatch(/sending it again is safe/i);
-    expect(notices[0]!.metadata).toMatchObject({ sourceRunId: next.id, authorizationReason: `unanswered_message:${f.messageId}`,
+    expect(notices[0]!.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
+    expect(notices[0]!.body).not.toMatch(/sending it again is safe|assign.*new task/i);
+    expect(notices[0]!.metadata).toMatchObject({ sourceRunId: last.id, authorizationReason: `unanswered_message:${f.messageId}`,
       recoveryResponsibility: "user" });
     const rows = notices[0]!.metadata!.sections!.flatMap(section => section.rows);
     expect(rows).toContainEqual({ type: "key_value", label: "Failure code", value: code });
-    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Assign this agent a new task to continue." });
+    expect(rows).toContainEqual({ type: "key_value", label: "Next action", value: "Send a new message to try again." });
   }, 60_000);
 
-  it("invalidates an older pending terminal fallback before it can occupy an agent slot", async () => {
-    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+  it("delivers an older pending terminal fallback once without upgrading physical-stop proof", async () => {
+    const f = await unfinishedThread({ runtime: "native", errorCode: "native_session_interrupted" });
     await settleUnrecoverableExecutions(db);
-    // Shape left by the previous release: pending before the permanent refusal
-    // was understood by the fallback. Do not create a new note or a queued run.
+    // follow-Paperclip Cut B R1/R2/R4: old pending settlements are valid without the removed typed stop-proof upgrade.
     await db.update(heartbeatRuns).set({ error: "native_controller_recovery_unsupported:metadata_format" })
       .where(eq(heartbeatRuns.id, f.runId));
-    await confirmClass2Stop(f);
+    const lease = await retainClass2Source(f);
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
       .toMatchObject({ kind: "already_continued" });
-    await deliver();
+    await selectFreshSuccessor(f);
     expect(await successors(f.runId)).toHaveLength(1);
-    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!)))[0]!.evidence)
-      .toMatchObject({ continuationDelivery: "delivered", freshContinuation: { previousExecutionGone: true } });
+    const [record] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
+    expect(record.evidence).toMatchObject({ continuationDelivery: "delivered",
+      freshContinuation: { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: f.runId } });
+    expect(record.evidence.freshContinuation).not.toHaveProperty("previousExecutionGone");
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     const notes = currentNotices(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)));
     expect(notes).toHaveLength(1);
     expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
