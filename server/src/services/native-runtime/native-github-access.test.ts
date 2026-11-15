@@ -249,6 +249,30 @@ it("does not release an in-flight credential after its run has been replaced", a
   expect(response.status).toBe(403);
   expect(await response.text()).not.toContain("must-not-escape");
 });
+it("keeps the callback bridge as the default unless ingress is explicitly selected", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "native-github-default-bridge-"));
+  const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
+    stdout: input.args?.[1]?.includes("printf")
+      ? "\0/usr/bin:/bin\0"
+      : `${Array.from({ length: 9 }, () => JSON.stringify({ uploaded: false })).join("\n")}\n`,
+    stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString(),
+  }));
+  const startBridge = vi.fn(async () => ({ env: { PAPERCLIP_API_URL: "http://bridge", PAPERCLIP_API_KEY: "bridge-capability" },
+    stop: vi.fn(async () => {}) }));
+  let access: NativeGitHubAccess | undefined;
+  try {
+    access = await createNativeGitHubAccess({ scope, cwd: root, env: { PATH: process.env.PATH },
+      target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root, runner: { execute }, streamRunLogs: false,
+        effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
+      resolveCredentials: async () => ({ status: "available", env: {} }) }, startBridge as never);
+    expect(access.transport).toBe("callback_bridge");
+    expect(startBridge).toHaveBeenCalledOnce();
+  } finally {
+    await access?.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it("selects runner-ingress GitHub access without starting or polling the callback bridge", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "native-github-ingress-"));
   const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
@@ -266,14 +290,35 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
         runner: { execute }, streamRunLogs: false,
         effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
       resolveCredentials: async () => ({ status: "available", env: { GH_TOKEN: "server-sentinel" } }),
+      transport: "runner_ingress",
     }, startBridge as never);
     expect(access.ready).toBe(true);
     expect(startBridge).not.toHaveBeenCalled();
     expect(execute.mock.calls.some(([call]) => (call.args ?? []).join(" ").includes("paperclip-bridge/queue"))).toBe(false);
     expect(access.env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT).toBe("runner_ingress");
     expect(access.env.PAPERCLIP_GITHUB_BROKER_URL).toBe("");
-    expect(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("");
-    expect(typeof (access as unknown as { handleRunnerIngressHttpRequest?: unknown }).handleRunnerIngressHttpRequest).toBe("function");
+    expect(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toMatch(/^[a-f0-9]{64}$/);
+    expect(access.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN).toBe(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
+    expect(JSON.stringify(access.env)).not.toContain("server-sentinel");
+    const frame = { kind: "github_access.http" as const, requestId: "ingress-request-1", method: "POST",
+      path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json",
+        "x-paperclip-github-capability": access.env.PAPERCLIP_GITHUB_BROKER_TOKEN! }, bodyBase64: "e30=" };
+    const idle = await access.handleRunnerIngressHttpRequest(frame, run("ingress-run"));
+    expect(idle.status).toBe(403);
+    const release = await access.activate(run("ingress-run"));
+    expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-forged-run", runId: "other-run" },
+      run("ingress-run"))).status).toBe(403);
+    expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-auth-header",
+      headers: { authorization: "Bearer forged" } }, run("ingress-run"))).status).toBe(403);
+    expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-wrong-capability",
+      headers: { "x-paperclip-github-capability": "forged-capability" } }, run("ingress-run"))).status).toBe(403);
+    const reply = await access.handleRunnerIngressHttpRequest(frame, run("ingress-run"));
+    expect(reply).toMatchObject({ requestId: "ingress-request-1", status: 200 });
+    expect(JSON.parse(Buffer.from(reply.bodyBase64, "base64").toString())).toEqual({
+      status: "available", env: { GH_TOKEN: "server-sentinel" },
+    });
+    expect(typeof access.handleRunnerIngressHttpRequest).toBe("function");
+    await release();
   } finally {
     await access?.stop();
     await rm(root, { recursive: true, force: true });

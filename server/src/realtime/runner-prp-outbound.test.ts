@@ -59,9 +59,18 @@ async function startGithubAccessIngressHarness(githubAccess: unknown) {
     websocketUrl: "wss://preview.invalid/api/runner/v1/connect/github-access",
     secretHeaders: [], generation: "github-access", refresh: async () => endpoint, close: async () => {},
   };
+  let githubHandler: ((frame: unknown, identity: { companyId: string; agentId: string; issueId: string; runId: string }) => Promise<unknown>) | null = null;
+  const identity = { companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" };
   const authority = {
+    setGithubAccessHttpHandler(handler: typeof githubHandler) {
+      githubHandler = handler;
+      return () => { if (githubHandler === handler) githubHandler = null; };
+    },
     attachWireConnection(wire: WsJsonWireConnection) {
-      wire.onJson(() => {});
+      wire.onJson(value => {
+        if (typeof value !== "object" || value === null || (value as { kind?: unknown }).kind !== "github_access.http" || !githubHandler) return;
+        void githubHandler(value, identity).then(reply => wire.sendJson(reply));
+      });
       return { isAuthenticated: () => true };
     },
   };
