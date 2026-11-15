@@ -144,6 +144,8 @@ describe("Boat ready spare", () => {
       type: "object",
       properties: {
         spares: { type: "integer", minimum: 0, maximum: 3, default: 0 },
+        spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
+        spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true },
       },
     });
   });
