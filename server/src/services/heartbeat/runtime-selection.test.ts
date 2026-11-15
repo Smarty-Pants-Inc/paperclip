@@ -48,6 +48,7 @@ import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } f
 import { createSystemRecovery } from "../system-recovery-state.js";
 import { getExecutionBlocker } from "../execution-blocker.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
+import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -111,7 +112,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   }
   // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
   // contract, then into the durable fresh-history owner, without prose authority.
-  it("RFL round4 F2 row5 remote state read failure reaches the designed-end gate through actual recovery", async () => {
+  it("RFL round4 F2 row5 remote state read failure ends at upstream's plain recovery failure (D-B1 + D-B2)", async () => {
     const { input, run, issue, agent } = await fixture();
     const selected = await selectHeartbeatRuntime(db, input);
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected native selection");
@@ -191,7 +192,10 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const beforeLease = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0];
     const beforeNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
-    expect(await readFreshContinuationSessionBoundary(db, current, f.issue.id)).toBeNull();
+    // follow-Paperclip Cut B R2: isolation authorizes an unadmitted boundary without physical-stop proof; admitted identity stays immutable.
+    const unconfirmedBoundary = await readFreshContinuationSessionBoundary(db, current, f.issue.id);
+    if (admitted) expect(unconfirmedBoundary).toBeNull();
+    else expect(unconfirmedBoundary).toMatchObject({ recoveryActionId: continued.recoveryActionId, sourceRunId: f.run.id, sourceSessionId: oldId });
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(beforeLease);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(beforeNotes);
     const confirmedAt = new Date().toISOString();
@@ -481,21 +485,14 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
     const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
       trigger: "recovery_refused", delivery: "caller_owns" });
-    if (settlementState === "unconfirmed-stop") {
-      // RFL class 3: a reserved code inside the legacy envelope is strict.
-      expect(continued).toMatchObject({ kind: "exact_recovery_pending" });
-      const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
-        .filter(comment => comment.authorType === "system");
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toContain("stopping the earlier attempt before starting fresh");
-      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
-      return;
-    }
+    // follow-Paperclip Cut B R1/R2: an unconfirmed stop also reaches the same recorded boundary and actual answer below.
     expect(continued.kind).toBe("continued");
     if (continued.kind !== "continued") throw new Error(JSON.stringify(continued));
     const settlementNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(comment => comment.authorType === "system");
-    expect(settlementNotes).toHaveLength(1);
+    // follow-Paperclip Cut B R2: recording is not selection; keep the exactly-one-note check at the actual mint below.
+    expect(settlementNotes).toHaveLength(0);
+    expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(1);
     // A terminal, unadmitted probe checks the old thread's refusal without
     // prebinding the actual fresh attempt to that old provider identity.
     const [probe] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
@@ -544,8 +541,9 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(await selected.getNativeFreshSessionHandoff?.()).toContain(message!.body);
     const notices = () => db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     expect((await notices()).filter(comment => comment.authorType === "system")).toMatchObject([{
-      body: expect.stringContaining("fresh thread in this conversation"),
-      metadata: { authorizationReason: `fresh_provider_thread_pending:${oldId}` },
+      // follow-Paperclip Cut B R2: selection owns the one note, keyed by the durable recovery action, not a stopping notice.
+      body: FRESH_THREAD_STARTED_NOTE,
+      metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` },
     }]);
     expect((await notices()).find(comment => comment.id === message!.id)?.body).toBe("Finish this in the saved conversation.");
     expect((await read(run!.id)).runnerProfileJson).toMatchObject({ piConversation: {
@@ -601,7 +599,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     "launch-profile", "codex-launch-profile", "generic-prepare", "codex-generic-prepare", "cold-restore", "codex-cold-restore",
     "codex-backup-without-lease", "codex-retained-binding", "codex-seed-a", "codex-seed-a-unconfirmed", "codex-seed-a-adopted",
     "codex-tl08", "codex-tl08-unconfirmed", "codex-tl08-retained", "codex-tl08-retained-unconfirmed"] as const)(
-    "designed end answers from history with one note and no Retry (%s)", async shape => {
+    "fresh continuation answers from history with one note and ordinary Retry projection (%s)", async shape => {
     const scenario = shape.replace(/^codex-/, "");
     const tl08 = scenario.startsWith("tl08");
     const tl08Retained = scenario.startsWith("tl08-retained");
@@ -751,16 +749,20 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
     if (waiting) {
       await settleUnrecoverableExecutions(db);
-      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
-      // Elapsed time is never a stop predicate, even beyond the old fallback bound.
+      // follow-Paperclip Cut B R1/R5: split real live-owner exclusion from the removed physical-stop wait.
+      const records = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
+      expect(records).toHaveLength(activeRunId ? 0 : 1);
       expect(await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
-        trigger: "held_recovery", now: new Date(Date.now() + 3600_000) })).toMatchObject({ kind: "exact_recovery_pending" });
+        trigger: "held_recovery", now: new Date(Date.now() + 3600_000) }))
+        .toMatchObject({ kind: activeRunId ? "successor_exists" : "already_continued" });
+      // follow-Paperclip Cut B R2: the removed gate writes no waiting note; exactly one started note is still required after selection.
       const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toContain(scenario === "active-turn" ? "The working configuration has changed." : "stopping the earlier attempt before starting fresh");
-      if (scenario === "active-turn") expect(notes[0].body).not.toContain("skill change");
-      if (activeRunId) await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
-      await confirmStop();
+      expect(notes).toHaveLength(0);
+      if (activeRunId) {
+        expect((await read(activeRunId)).status).toBe("running");
+        await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
+      }
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
     }
     let heldCommentId: string | undefined;
     if (scenario === "held-notice") {
@@ -771,14 +773,15 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       expect(await readUnsupersededHeldConversationNotice(db, { companyId: f.agent.companyId, issueId: f.issue.id })).not.toBeNull();
     }
     const beforeNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
-    // The existing disposition owner runs again when cleanup/turn completion
-    // signals it. No Retry, new message, or time advance supplies authority.
+    // The existing disposition owner records one continuation. A live owner's
+    // completion still matters; physical-stop proof is no longer admission.
     await settleUnrecoverableExecutions(db);
     const records = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
     expect(records).toHaveLength(1);
     const action = records[0];
     const projected = projectTaskInterruption(f.issue, { run: await read(f.run.id), action, paused: false, approval: false });
-    expect(projected).toMatchObject({ state: "working", canRetry: false, nextRetryAt: null });
+    // follow-Paperclip Cut B R8: without freshContinuation projection input, typed errors no longer override ordinary Retry presentation.
+    expect(projected).toMatchObject({ state: "failed", canRetry: true, nextRetryAt: null });
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
       status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000), contextSnapshot: { issueId: f.issue.id,
         previousRunId: f.run.id, recoveryActionId: action.id, forceFreshSession: true,
@@ -819,7 +822,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       const unchanged = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
         .filter(c => c.authorType === "system");
       expect(unchanged).toHaveLength(allNotes.length);
-      if (waiting) expect(allNotes.filter(c => c.metadata?.supersededByCommentId === notes[0].id)).toHaveLength(1);
+      // follow-Paperclip Cut B R2: there is no gate-owned waiting note to supersede; the one selected-thread note stands alone.
+      if (waiting) expect(allNotes.filter(c => c.metadata?.supersededByCommentId === notes[0].id)).toHaveLength(0);
     }
     if (heldCommentId) {
       expect(notes[0].id).not.toBe(heldCommentId);
