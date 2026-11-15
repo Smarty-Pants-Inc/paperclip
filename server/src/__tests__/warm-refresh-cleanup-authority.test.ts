@@ -1,10 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { agentInstructionWorkingCopies } from "@paperclipai/db";
 import { warmAgentFilesRefreshFixture } from "./helpers/warm-agent-files-refresh.js";
-import { agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 
 // The absence of an authority record must be a denial, not permission to use
@@ -27,6 +26,10 @@ describe("default-deny directory cleanup authority", () => {
         errorCode: "AGENT_FILES_REFRESH_INCOMPLETE", receipt: { ...receipt, cleanupPending: true } })
         .where(eq(agentInstructionWorkingCopies.runId, copy.runId)).returning();
       const commands: string[] = [];
+      // A new service object alone still shares the module-level transport map.
+      // Reload the module to exercise the actual no-cache restart branch.
+      vi.resetModules();
+      const { agentDirectoryWorkingCopyService } = await import("../services/agent-directory-working-copies.js");
       const restarted = agentDirectoryWorkingCopyService(f.db, f.copies.get, async (row, values) => {
         const [updated] = await f.db.update(agentInstructionWorkingCopies).set(values)
           .where(eq(agentInstructionWorkingCopies.runId, row.runId)).returning();
