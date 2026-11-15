@@ -46,6 +46,18 @@ it.each([false, true])("R5/H2: 200 calls/tools, split bodies, exact known deltas
       cacheRead: sum("gen_ai.usage.cache_read.input_tokens"), cacheWrite: sum("gen_ai.usage.cache_creation.input_tokens"), cost: sum("gen_ai.usage.cost") },
   }, null, 2));
 });
+it("H2: fractional USD overflow reconciles to the projector's run total, not a differently rounded subtotal", async () => {
+  const bodies: any[] = [];
+  vi.stubGlobal("fetch", async (_url: unknown, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return new Response("{}"); });
+  const pi = await openPi();
+  try {
+    await pi.start();
+    for (let i = 0; i < 200; i++) pi.peer.send(...assistant(`fraction-${i}`, { usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 4, cost: { total: 0.1, totalFromProvider: true } } }));
+    pi.peer.send(...terminal); await pi.settled();
+  } finally { await pi.close(); }
+  const total = (pi.events.filter(e => e.eventType === "item.completed" && e.payload.kind === "usage").at(-1)?.payload.usage as any).providerReportedCostUsd;
+  expect(spans(bodies).reduce((n, s) => n + (attrs(s)["gen_ai.usage.cost"] ?? 0), 0)).toBe(total);
+});
 it("A2.3/4: missing delta is not a zero-token generation and marks the aggregate incomplete", async () => {
   const bodies: any[] = [];
   vi.stubGlobal("fetch", async (_url: unknown, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return new Response("{}"); });
