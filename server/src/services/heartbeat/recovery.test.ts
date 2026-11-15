@@ -217,33 +217,41 @@ describePostgres("heartbeat recovery module ownership", () => {
     const run = await seedRun(), deps = callbacks(db);
     const environmentId = randomUUID(), leaseId = randomUUID();
     const oldBootId = randomUUID();
-    await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
-    await db.update(heartbeatRuns).set({ scopeKind: "issue", controllerBootId: oldBootId, controllerLeaseExpiresAt: new Date(0),
-      executionStage: "preparing" }).where(eq(heartbeatRuns.id, run.id));
-    if (state !== "reassigned") await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, run.issueId!));
-    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "plugin", config: {} });
-    await db.insert(environmentLeases).values({ id: leaseId, companyId: run.companyId, environmentId, heartbeatRunId: run.id,
-      issueId: run.issueId, provider: "plugin:fixture:tasks", providerLeaseId: "portable-task", status: "active",
-      metadata: { agentId: run.agentId, driver: "plugin", runnerTaskLease: true, portableTaskPreviousLeaseId: randomUUID(),
-        ...(state === "dispatched" ? { runnerTaskDispatched: true } : {}) } });
-    if (state === "ambiguous") await db.insert(environmentLeases).values({ companyId: run.companyId, environmentId,
-      heartbeatRunId: run.id, issueId: run.issueId, provider: "plugin:fixture:tasks", providerLeaseId: "competing-task", status: "active" });
-    const scope = { companyId: run.companyId, runId: run.id };
-    const recovery = createHeartbeatRecovery(db, deps);
-    await Promise.all([recovery.recoverActiveExecutions(scope), recovery.recoverActiveExecutions(scope)]);
-    if (state === "unlaunched") {
-      expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(run.id, { portablePreparationLeaseId: leaseId });
-      expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
-      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
-      expect(current).toMatchObject({ status: "running", controllerBootId: legacyControllerBootId, executionStage: "preparing" });
-      expect(current.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
-      expect((await db.select().from(issues).where(eq(issues.id, run.issueId!)))[0].executionRunId).toBe(run.id);
-      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]).toMatchObject({
-        status: "active", providerLeaseId: "portable-task", heartbeatRunId: run.id,
-      });
-    } else {
-      expect(deps.executeRun).not.toHaveBeenCalled();
-      expect(deps.setRunStatusFromLive).toHaveBeenCalledOnce();
+    try {
+      await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
+      await db.update(heartbeatRuns).set({ scopeKind: "issue", controllerBootId: oldBootId, controllerLeaseExpiresAt: new Date(0),
+        executionStage: "preparing" }).where(eq(heartbeatRuns.id, run.id));
+      if (state !== "reassigned") await db.update(issues).set({ executionRunId: run.id }).where(eq(issues.id, run.issueId!));
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "plugin", config: {} });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId: run.companyId, environmentId, heartbeatRunId: run.id,
+        issueId: run.issueId, provider: "plugin:fixture:tasks", providerLeaseId: "portable-task", status: "active",
+        metadata: { agentId: run.agentId, driver: "plugin", runnerTaskLease: true, portableTaskPreviousLeaseId: randomUUID(),
+          ...(state === "dispatched" ? { runnerTaskDispatched: true } : {}) } });
+      if (state === "ambiguous") await db.insert(environmentLeases).values({ companyId: run.companyId, environmentId,
+        heartbeatRunId: run.id, issueId: run.issueId, provider: "plugin:fixture:tasks", providerLeaseId: "competing-task", status: "active" });
+      const scope = { companyId: run.companyId, runId: run.id };
+      const recovery = createHeartbeatRecovery(db, deps);
+      await Promise.all([recovery.recoverActiveExecutions(scope), recovery.recoverActiveExecutions(scope)]);
+      if (state === "unlaunched") {
+        expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(run.id, { portablePreparationLeaseId: leaseId });
+        expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+        const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(current).toMatchObject({ status: "running", controllerBootId: legacyControllerBootId, executionStage: "preparing" });
+        expect(current.controllerLeaseExpiresAt!.getTime()).toBeGreaterThan(Date.now());
+        expect((await db.select().from(issues).where(eq(issues.id, run.issueId!)))[0].executionRunId).toBe(run.id);
+        expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]).toMatchObject({
+          status: "active", providerLeaseId: "portable-task", heartbeatRunId: run.id,
+        });
+      } else {
+        expect(deps.executeRun).not.toHaveBeenCalled();
+        expect(deps.setRunStatusFromLive).toHaveBeenCalledOnce();
+      }
+    } finally {
+      await Promise.all([...deps.activeRunExecutionPromises]);
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, run.issueId!));
+      await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, run.id));
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      await db.delete(environments).where(eq(environments.id, environmentId));
     }
   });
 
@@ -1269,12 +1277,16 @@ describePostgres("heartbeat recovery module ownership", () => {
     const first = createHeartbeatRecovery(db, deps);
     const second = createHeartbeatRecovery(db, deps);
     deps.activeRunExecutions.add(run.id);
-    expect(await first.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
-    expect(await second.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
-    expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
-    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("running");
-    await Promise.all([...deps.activeRunExecutionPromises]);
-    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    try {
+      expect(await first.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(await second.reapOrphanedRuns()).toEqual({ reaped: 0, runIds: [] });
+      expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("running");
+    } finally {
+      await Promise.all([...deps.activeRunExecutionPromises]);
+      deps.activeRunExecutions.delete(run.id);
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    }
   });
 
   it("settles persisted native results before claiming restart authority and tracks the exact execution", async () => {
