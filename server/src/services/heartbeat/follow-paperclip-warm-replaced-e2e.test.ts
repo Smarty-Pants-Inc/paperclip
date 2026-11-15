@@ -241,7 +241,7 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       issueId, agentId, adapterType: "paperclip_runner", heartbeatRunId: id, persistedExecutionWorkspace: null,
       warmRunnerIdleTimeoutMs: 300_000 });
     const original = await acquire(runId);
-    const target = (lease: typeof original.lease, outcome: "created" | "reused" = "created"): AdapterSandboxExecutionTarget => ({
+    const target = (lease: typeof original.lease): AdapterSandboxExecutionTarget => ({
       kind: "remote", transport: "sandbox",
       environmentId: environment.id, leaseId: lease.id, providerKey: provider, remoteCwd: String(lease.metadata?.remoteCwd),
       runner: boxes.get(lease.providerLeaseId!)!, reusableLeaseConfigured: true,
@@ -249,7 +249,7 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
         persistentProcessSessions: false, independentControlCommands: true, incrementalSessionOutput: false,
         concurrentSyncOperations: false, duplexCommandStream: false, runnerWebSocketIngress: false },
       runnerLifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 },
-      sandboxLeaseAcquisition: { outcome, providerLeaseId: lease.providerLeaseId! } });
+      sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: lease.providerLeaseId! } });
     const input: HeartbeatRuntimeSelectionInput = {
       run: opening, agent,
       nativeRuntimeResolution: resolveHeartbeatNativeRuntimeMode({ persisted: opening, enabled: true, runtimeConfig: {},
@@ -274,7 +274,7 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
     const writeResult = (execution: Execution, summary: string, disposition: "done" | "yielded" = "done") => writeFile(resultFile, JSON.stringify({
       schema: "paperclip.run_result.v1", reportedWorkDisposition: disposition, summary,
       completionClaim: { contractRevision: execution.completionContract.contract.revision, objectiveSatisfied: disposition === "done",
-        criteria: execution.completionContract.contract.criteria.map(c => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [] })),
+        criteria: execution.completionContract.contract.criteria.map((c: { id: string }) => ({ criterionId: c.id, status: "satisfied", evidenceRefs: [] })),
         remainingWork: disposition === "done" ? [] : [{ description: "Wait for the person's next message.", blocksCompletion: true }] },
       ...(disposition === "yielded" ? { continuation: { kind: "response_wake", summary: "Resume after the person's next message.",
         idempotencyKey: `response-wake-${runId}` } } : {}),
