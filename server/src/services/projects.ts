@@ -160,6 +160,7 @@ interface ProjectWithGoals extends Omit<ProjectRow, "executionWorkspacePolicy" |
   primaryWorkspace: ProjectWorkspace | null;
   managedByPlugin: ProjectManagedByPlugin | null;
   taskCount?: number;
+  openTaskCount?: number;
   budget?: ProjectBudgetSummary | null;
 }
 
@@ -418,7 +419,7 @@ async function attachWorkspaces(db: Db, rows: ProjectWithGoals[]): Promise<Proje
   });
 }
 
-type TaskCountRow = { projectId: string | null; count: number };
+type TaskCountRow = { projectId: string | null; count: number; openCount?: number };
 type ProjectBudgetRow = { scopeId: string; amount: number; windowKind: string };
 
 /**
@@ -428,8 +429,11 @@ type ProjectBudgetRow = { scopeId: string; amount: number; windowKind: string };
  */
 export function buildProjectListMetricMaps(taskCountRows: TaskCountRow[], budgetRows: ProjectBudgetRow[]) {
   const taskCountByProjectId = new Map<string, number>();
+  const openTaskCountByProjectId = new Map<string, number>();
   for (const row of taskCountRows) {
-    if (row.projectId) taskCountByProjectId.set(row.projectId, Number(row.count) || 0);
+    if (!row.projectId) continue;
+    taskCountByProjectId.set(row.projectId, Number(row.count) || 0);
+    openTaskCountByProjectId.set(row.projectId, Number(row.openCount) || 0);
   }
 
   const budgetByProjectId = new Map<string, ProjectBudgetSummary>();
@@ -442,13 +446,17 @@ export function buildProjectListMetricMaps(taskCountRows: TaskCountRow[], budget
     }
   }
 
-  return { taskCountByProjectId, budgetByProjectId };
+  return { taskCountByProjectId, openTaskCountByProjectId, budgetByProjectId };
 }
 
 /**
  * Attach lightweight list-only metrics (task count + budget) to a set of
  * projects using two aggregate queries (no N+1). Used by the projects list
  * view (IA Phase 4 — PAP-60).
+ *
+ * `taskCount` is every non-chat task. `openTaskCount` is the work still left:
+ * not done, not cancelled and not hidden, so a project whose tasks are all
+ * finished reads finished in the list.
  */
 async function attachListMetrics(
   db: Db,
@@ -464,6 +472,7 @@ async function attachListMetrics(
       .select({
         projectId: issues.projectId,
         count: sql<number>`count(*)::int`,
+        openCount: sql<number>`count(*) filter (where ${issues.status} not in ('done', 'cancelled') and ${issues.hiddenAt} is null)::int`,
       })
       .from(issues)
       .where(and(eq(issues.companyId, companyId), inArray(issues.projectId, projectIds), isNull(issues.conversationAgentId)))
@@ -486,7 +495,7 @@ async function attachListMetrics(
       ),
   ]);
 
-  const { taskCountByProjectId, budgetByProjectId } = buildProjectListMetricMaps(
+  const { taskCountByProjectId, openTaskCountByProjectId, budgetByProjectId } = buildProjectListMetricMaps(
     taskCountRows,
     budgetRows,
   );
@@ -494,6 +503,7 @@ async function attachListMetrics(
   return rows.map((row) => ({
     ...row,
     taskCount: taskCountByProjectId.get(row.id) ?? 0,
+    openTaskCount: openTaskCountByProjectId.get(row.id) ?? 0,
     budget: budgetByProjectId.get(row.id) ?? null,
   }));
 }

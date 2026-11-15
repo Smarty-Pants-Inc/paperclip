@@ -8519,6 +8519,7 @@ export function issueRoutes(
       primaryWorkspace: compactIssueProjectWorkspace(project.primaryWorkspace),
       managedByPlugin: project.managedByPlugin ?? null,
       taskCount: project.taskCount,
+      openTaskCount: project.openTaskCount,
       budget: project.budget,
       archivedAt: project.archivedAt,
       createdAt: project.createdAt,

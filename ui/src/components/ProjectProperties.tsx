@@ -5,7 +5,7 @@ import { useWorkspaceIsolationControls } from "@/hooks/useWorkspaceIsolationCont
 import { useState, type ReactNode } from "react";
 import { Link } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { Project, SharedWorkspaceConcurrency } from "@paperclipai/shared";
+import { PROJECT_STATUSES, type Project, type ProjectStatus, type SharedWorkspaceConcurrency } from "@paperclipai/shared";
 import { ProjectGitAuthorization } from "./ProjectGitAuthorization";
 import { ProjectRepositories } from "./ProjectRepositories";
 import { cn, formatDate } from "../lib/utils";
@@ -58,6 +58,14 @@ export type ProjectConfigFieldKey =
   | "execution_workspace_provision_command"
   | "execution_workspace_runtime_provision_command"
   | "execution_workspace_teardown_command";
+
+const PROJECT_STATUS_LABELS: Record<ProjectStatus, string> = {
+  backlog: "Backlog",
+  planned: "Planned",
+  in_progress: "In progress",
+  completed: "Completed",
+  cancelled: "Cancelled",
+};
 
 const SHARED_WORKSPACE_CONCURRENCY_OPTIONS: {
   value: SharedWorkspaceConcurrency;
@@ -483,6 +491,21 @@ export function ProjectProperties({ project, repositories, onUpdate, onFieldUpda
               {project.description?.trim() || "No description"}
             </p>
           )}
+        </PropertyRow>
+        <PropertyRow label={<FieldLabel label="Status" state={fieldState("status")} />}>
+          <NativeSelect
+            aria-label="Status"
+            data-testid="project-status"
+            value={project.status}
+            disabled={!onUpdate && !onFieldUpdate}
+            onChange={(event) => commitField("status", { status: event.target.value })}
+          >
+            {PROJECT_STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {PROJECT_STATUS_LABELS[status]}
+              </option>
+            ))}
+          </NativeSelect>
         </PropertyRow>
         <PropertyRow label={<FieldLabel label="Visibility" state={fieldState("visibility")} />} alignStart>
           <div className="space-y-2">

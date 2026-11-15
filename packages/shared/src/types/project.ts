@@ -169,6 +169,12 @@ export interface Project {
    */
   taskCount?: number;
   /**
+   * Number of open tasks in the project: not done, not cancelled and not
+   * hidden. Populated by the projects list endpoint; omitted on
+   * single-project payloads.
+   */
+  openTaskCount?: number;
+  /**
    * Active budget for the project, when set. Populated by the projects list
    * endpoint (IA Phase 4 — PAP-60); omitted on single-project payloads.
    */
