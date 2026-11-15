@@ -923,7 +923,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
         } catch (error) { await this.#fenceFailure(error); throw error; }
       }
-      const turn: PiTurnState = { ...origin, projector: createPiEventProjector(origin), lastText: "", hasToolCalls: false, agentEnded: false, failed: false, settled: false };
+      const turn: PiTurnState = { ...origin, projector: createPiEventProjector({ ...origin, includeThinking: true }), lastText: "", hasToolCalls: false, agentEnded: false, failed: false, settled: false };
       this.#activeTurn = turn;
       this.#streamTurn = null;
       this.#emit("turn.started", { status: "inProgress", context: this.#effectiveContext() }, turn);
@@ -1508,7 +1508,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           // A fresh projector preserves canonical item IDs without retaining
           // old arguments/text/usage. Only terminal outputs may cross this path.
           try {
-            const projector = createPiEventProjector(pending);
+            const projector = createPiEventProjector({ ...pending, includeThinking: true });
             for (const mapped of projector.project({ ...event, toolName: pending.toolName, args: undefined })) {
               if (["item.completed", "item.failed", "tool.execution.completed"].includes(mapped.eventType)) this.#emit(mapped.eventType, mapped.payload, mapped, mapped.itemId);
             }
