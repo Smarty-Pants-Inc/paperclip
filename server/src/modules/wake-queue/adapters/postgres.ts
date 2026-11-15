@@ -1,3 +1,4 @@
+import { PLUGIN_WAKE_HOLD_MS, readPluginWakeHold } from "../../../services/plugin-status-transitions.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
@@ -30,8 +31,6 @@ import {
   activityLog,
   agentWakeupRequests,
   agents,
-  plugins,
-  pluginCompanySettings,
   chatActions,
   heartbeatRuns,
   issueComments,
@@ -294,18 +293,38 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           context.pluginId === pluginId && context.pluginKey === pluginKey &&
           row.requestedByActorType === "system" && row.requestedByActorId === pluginId;
         if (pluginWake) {
-          const [plugin] = await tx.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status })
-            .from(plugins).where(sql`${plugins.id}::text = ${pluginId}`);
-          const [companySetting] = plugin ? await tx.select({ enabled: pluginCompanySettings.enabled })
-            .from(pluginCompanySettings).where(and(eq(pluginCompanySettings.pluginId, plugin.id),
-              eq(pluginCompanySettings.companyId, companyId))) : [];
-          // A plugin mid-install or awaiting upgrade approval keeps its wake for a later release.
-          if (plugin?.pluginKey === pluginKey && (plugin.status === "installed" || plugin.status === "upgrade_pending") &&
-              companySetting?.enabled !== false) {
-            locallyExcludedWakeIds.push(row.id);
+          const hold = await readPluginWakeHold(tx, pluginId, companyId);
+          const plugin = hold?.plugin;
+          if (plugin?.pluginKey === pluginKey && hold?.start) {
+            const now = new Date();
+            if (hold.start.getTime() + PLUGIN_WAKE_HOLD_MS > now.getTime()) {
+              locallyExcludedWakeIds.push(row.id);
+              continue;
+            }
+            const [cancelled] = await tx.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_hold_expired",
+              finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),
+              eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)))
+              .returning({ id: agentWakeupRequests.id });
+            if (cancelled) {
+              const authorizationReason = `plugin_wake_hold_expired:${row.id}`;
+              const minutes = Math.floor((now.getTime() - hold.start.getTime()) / 60_000);
+              const name = plugin.manifestJson.displayName?.trim() || plugin.pluginKey;
+              const body = `${name} couldn't continue here: it has been waiting ${minutes} min for an admin to approve its update, so its follow-up was stopped. [Plugin settings](/instance/settings/plugins/${plugin.id})`;
+              await notifyStatusCardIssueChange(tx, companyId);
+              // Persist a system notice, not a user/agent answer. Direct insertion
+              // does not call the comment route's issue_commented wake producer.
+              await tx.execute(sql`insert into ${issueComments}
+                (company_id, issue_id, author_type, body, presentation, metadata)
+                select ${companyId}::uuid, ${issueId}::uuid, 'system', ${body},
+                  ${JSON.stringify({ kind: "system_notice", tone: "warning", title: "Plugin follow-up stopped", density: "compact" })}::jsonb,
+                  ${JSON.stringify({ authorizationReason })}::jsonb
+                where not exists (select 1 from ${issueComments}
+                  where ${issueComments.companyId} = ${companyId} and ${issueComments.issueId} = ${issueId}
+                    and ${issueComments.metadata}->>'authorizationReason' = ${authorizationReason})`);
+            }
             continue;
           }
-          if (plugin?.pluginKey !== pluginKey || plugin.status !== "ready" || companySetting?.enabled === false) {
+          if (plugin?.pluginKey !== pluginKey || plugin.status !== "ready" || hold?.enabled === false) {
             const now = new Date();
             await tx.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
               finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),

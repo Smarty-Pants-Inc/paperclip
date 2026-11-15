@@ -1,3 +1,4 @@
+import { PLUGIN_WAKE_HOLD_MS, readPluginWakeHold } from "../plugin-status-transitions.js";
 import { PersistedExecutionWaitRefusal } from "../deferred-execution-wait.js";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, type Db } from "@paperclipai/db";
@@ -60,7 +61,7 @@ export function registerDeferredReceiptWork(
         const operatorRetry = sql`coalesce(${agentWakeupRequests.reason}, '') = 'task_retry'
           and coalesce(${agentWakeupRequests.requestedByActorType}, '') = 'user'`;
         const columns = { id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
-          status: agentWakeupRequests.status, updatedAt: agentWakeupRequests.updatedAt,
+          status: agentWakeupRequests.status, updatedAt: agentWakeupRequests.updatedAt, payload: agentWakeupRequests.payload,
           claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
           operatorRetry: sql<boolean>`${operatorRetry}`,
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
@@ -86,6 +87,7 @@ export function registerDeferredReceiptWork(
               sql`jsonb_typeof(${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}') = 'array'
                 and ${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
               sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+              sql`${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'`,
               dependencyResolvedWakePayloadSql,
               assignmentWakePayloadSql,
               sql`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId}
@@ -103,15 +105,22 @@ export function registerDeferredReceiptWork(
         const complete = rows.length < 100;
         if (complete) cursors.delete(key); else cursors.set(key, rows.at(-1)!.id);
         const now = Date.now();
-        return { rows: [...prioritized, ...rows].map(row => {
-          const deadline = kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
+        const entries: Entry[] = [];
+        for (const row of [...prioritized, ...rows]) {
+          const pluginWake = kind === "deferred" && row.payload?.mutation === "plugin_wakeup";
+          const hold = pluginWake && typeof row.payload?.pluginId === "string"
+            ? await readPluginWakeHold(db, row.payload.pluginId, row.companyId) : null;
+          const deadline = pluginWake ? (hold?.start ? hold.start.getTime() + PLUGIN_WAKE_HOLD_MS : null)
+            : kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
             : kind === "native" && row.error ? row.updatedAt.getTime() + 30_000
             : kind === "deferred" && row.delayed && !row.interruptedLegacy ? row.updatedAt.getTime() + 30_000
             : null;
           const immediate = deadline === null || deadline <= now;
-          return { id: row.id, companyId: row.companyId, dueAt: immediate ? now : deadline, immediate,
-            operatorRetry: kind === "deferred" && row.operatorRetry };
-        }), complete };
+          entries.push({ id: row.id, companyId: row.companyId,
+            dueAt: pluginWake && deadline !== null ? deadline : immediate ? now : deadline!, immediate,
+            operatorRetry: kind === "deferred" && row.operatorRetry });
+        }
+        return { rows: entries, complete };
       },
       check: async entry => {
         if (!enabled) return null;
@@ -125,7 +134,12 @@ export function registerDeferredReceiptWork(
           }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
             eq(agentWakeupRequests.id, entry.id)));
           if (!current) return null;
-          const due = kind === "native" && current.status === "claimed" && current.claimedAt
+          const pluginWake = kind === "deferred" && current.status === "deferred_issue_execution"
+            && current.payload?.mutation === "plugin_wakeup";
+          const hold = pluginWake && typeof current.payload?.pluginId === "string"
+            ? await readPluginWakeHold(db, current.payload.pluginId, entry.companyId) : null;
+          const due = pluginWake ? (hold?.start ? hold.start.getTime() + PLUGIN_WAKE_HOLD_MS : null)
+            : kind === "native" && current.status === "claimed" && current.claimedAt
             ? current.claimedAt.getTime() + 60_000
             : kind === "native" && current.status === "queued" && current.error ? current.updatedAt.getTime() + 30_000
               : kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy

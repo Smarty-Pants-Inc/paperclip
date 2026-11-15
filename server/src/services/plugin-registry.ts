@@ -1,7 +1,8 @@
 import { notifyExternalObjectRefresh } from "./external-object-refresh-notifications.js";
 import { isDeepStrictEqual } from "node:util";
 import { writePluginJobChange } from "./plugin-job-work-notifications.js";
-import { asc, eq, isNull, ne, sql, and } from "drizzle-orm";
+import { asc, eq, isNull, ne, sql, and, type SQL } from "drizzle-orm";
+import { recordPluginStatusTransition } from "./plugin-status-transitions.js";
 import type { Db } from "@paperclipai/db";
 import {
   plugins,
@@ -97,6 +98,19 @@ export function pluginRegistryService(db: Db) {
     });
   }
 
+  // All updates that can carry a lifecycle status serialize on the plugin row.
+  // Read `from` under that lock, not from the caller's earlier snapshot.
+  async function updatePluginRow(database: Pick<Db, "select" | "update" | "insert">, id: string,
+    data: Partial<typeof plugins.$inferInsert>, condition?: SQL) {
+    const [before] = await database.select({ status: plugins.status }).from(plugins)
+      .where(eq(plugins.id, id)).for("update");
+    if (!before) return null;
+    const [updated] = await database.update(plugins).set(data)
+      .where(and(eq(plugins.id, id), condition)).returning();
+    if (updated) await recordPluginStatusTransition(database, id, before.status, updated.status);
+    return updated ?? null;
+  }
+
   async function nextInstallOrder(): Promise<number> {
     const result = await db
       .select({ maxOrder: sql<number>`coalesce(max(${plugins.installOrder}), 0)` })
@@ -164,43 +178,42 @@ export function pluginRegistryService(db: Db) {
 
         // Reinstall after soft-delete: reactivate the existing row so plugin-scoped
         // data and references remain stable across uninstall/reinstall cycles.
-        return db
-          .update(plugins)
-          .set({
-            packageName: input.packageName,
-            packagePath: options.idempotent ? existing.packagePath : input.packagePath ?? null,
-            version: manifest.version,
-            apiVersion: manifest.apiVersion,
-            categories: manifest.categories,
-            manifestJson: manifest,
-            status: "installed" as PluginStatus,
-            lastError: null,
-            updatedAt: new Date(),
-          })
-          .where(eq(plugins.id, existing.id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        return db.transaction(tx => updatePluginRow(tx, existing.id, {
+          packageName: input.packageName,
+          packagePath: options.idempotent ? existing.packagePath : input.packagePath ?? null,
+          version: manifest.version,
+          apiVersion: manifest.apiVersion,
+          categories: manifest.categories,
+          manifestJson: manifest,
+          status: "installed" as PluginStatus,
+          lastError: null,
+          updatedAt: new Date(),
+        }));
       }
 
       const installOrder = await nextInstallOrder();
 
       try {
-        const insertion = db
-          .insert(plugins)
-          .values({
-            pluginKey: manifest.id,
-            packageName: input.packageName,
-            version: manifest.version,
-            apiVersion: manifest.apiVersion,
-            categories: manifest.categories,
-            manifestJson: manifest,
-            status: "installed" as PluginStatus,
-            installOrder,
-            packagePath: input.packagePath ?? null,
-          });
-        const rows = await (options.idempotent
-          ? insertion.onConflictDoNothing({ target: plugins.pluginKey })
-          : insertion).returning();
+        const rows = await db.transaction(async tx => {
+          const insertion = tx
+            .insert(plugins)
+            .values({
+              pluginKey: manifest.id,
+              packageName: input.packageName,
+              version: manifest.version,
+              apiVersion: manifest.apiVersion,
+              categories: manifest.categories,
+              manifestJson: manifest,
+              status: "installed" as PluginStatus,
+              installOrder,
+              packagePath: input.packagePath ?? null,
+            });
+          const rows = await (options.idempotent
+            ? insertion.onConflictDoNothing({ target: plugins.pluginKey })
+            : insertion).returning();
+          if (rows[0]) await recordPluginStatusTransition(tx, rows[0].id, null, rows[0].status);
+          return rows;
+        });
         if (rows[0]) return rows[0];
         const concurrent = await getByKey(manifest.id);
         if (concurrent && concurrent.status !== "uninstalled" && sameBundledPluginRegistration(concurrent, input.packageName, manifest)) return concurrent;
@@ -250,12 +263,7 @@ export function pluginRegistryService(db: Db) {
 
       const workspaceProviderChanged = data.manifest !== undefined
         && !isDeepStrictEqual(plugin.manifestJson.workspaceProvider, data.manifest.workspaceProvider);
-      return writeWorkspaceProviderChange(workspaceProviderChanged, database => database
-        .update(plugins)
-        .set(setClause)
-        .where(eq(plugins.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null));
+      return writeWorkspaceProviderChange(workspaceProviderChanged, database => updatePluginRow(database, id, setClause));
     },
 
     // ----- Status ---------------------------------------------------------
@@ -267,16 +275,9 @@ export function pluginRegistryService(db: Db) {
 
       const workspaceProviderActivated = Boolean(plugin.manifestJson.workspaceProvider)
         && plugin.status !== "ready" && input.status === "ready";
-      return writeWorkspaceProviderChange(workspaceProviderActivated, database => database
-        .update(plugins)
-        .set({
-          status: input.status,
-          lastError: input.lastError ?? null,
-          updatedAt: new Date(),
-        })
-        .where(eq(plugins.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null));
+      return writeWorkspaceProviderChange(workspaceProviderActivated, database => updatePluginRow(database, id, {
+        status: input.status, lastError: input.lastError ?? null, updatedAt: new Date(),
+      }));
     },
 
     /**
@@ -289,14 +290,11 @@ export function pluginRegistryService(db: Db) {
       if (!plugin || plugin.status !== expected.status) return null;
       const workspaceProviderActivated = Boolean(plugin.manifestJson.workspaceProvider)
         && plugin.status !== "ready" && input.status === "ready";
-      return writeWorkspaceProviderChange(workspaceProviderActivated, database => database
-        .update(plugins)
-        .set({ status: input.status, lastError: input.lastError ?? null, updatedAt: new Date() })
-        .where(and(eq(plugins.id, id), eq(plugins.status, expected.status as typeof plugin.status),
+      return writeWorkspaceProviderChange(workspaceProviderActivated, database => updatePluginRow(database, id,
+        { status: input.status, lastError: input.lastError ?? null, updatedAt: new Date() },
+        and(eq(plugins.status, expected.status as typeof plugin.status),
           expected.lastErrorPrefix === undefined ? undefined
-            : sql`starts_with(${plugins.lastError}, ${expected.lastErrorPrefix})`))
-        .returning()
-        .then((rows) => rows[0] ?? null));
+            : sql`starts_with(${plugins.lastError}, ${expected.lastErrorPrefix})`)));
     },
 
     // ----- Uninstall / Remove --------------------------------------------
@@ -324,15 +322,7 @@ export function pluginRegistryService(db: Db) {
         }
 
         // Soft delete – mark as uninstalled
-        return db
-          .update(plugins)
-          .set({
-            status: "uninstalled" as PluginStatus,
-            updatedAt: new Date(),
-          })
-          .where(eq(plugins.id, id))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        return updatePluginRow(db, id, { status: "uninstalled", updatedAt: new Date() });
       });
     },
 
