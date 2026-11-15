@@ -536,10 +536,11 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
   });
   describe("issue monitor deadline lifecycle", () => {
     let coordinator: ReturnType<typeof createDeliveryWorkCoordinator> | undefined;
+    let workers: ReturnType<typeof registerScheduledWork> | undefined;
     let draining = false;
     const errors: unknown[] = [];
     beforeEach(() => {
-      draining = false; errors.length = 0;
+      draining = false; errors.length = 0; workers = undefined;
       vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
       vi.setSystemTime(now);
     });
@@ -552,7 +553,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
     async function start(f: { scheduler: Pick<ReturnType<typeof createHeartbeatScheduling>, "tickIssueMonitors" | "nextIssueMonitorAt"> }) {
       coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining,
         canReconcile: () => true, onError: error => errors.push(error) });
-      const workers = registerScheduledWork(coordinator, { retryMs: 30_000, canRun: () => !draining,
+      workers = registerScheduledWork(coordinator, { retryMs: 30_000, canRun: () => !draining,
         tickAgentTimers: async () => {}, nextAgentTimerAt: async () => null, tickRoutines: async () => {}, nextRoutineRunAt: async () => null,
         tickIssueMonitors: signal => f.scheduler.tickIssueMonitors(new Date(), () => !draining && !signal.aborted),
         nextIssueMonitorAt: () => f.scheduler.nextIssueMonitorAt(),
@@ -561,20 +562,22 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       return workers;
     }
     async function advance(milliseconds: number) {
-
-
       for (let remaining = milliseconds; remaining > 0; remaining -= 1000) {
         await vi.advanceTimersByTimeAsync(Math.min(1000, remaining));
         await realDelay(5);
       }
     }
     async function quiet() {
-
-      await advance(31_000);
-      if (!draining) await vi.waitFor(() => {
+      // A cleared issue (or the gap between two passes) is not a reconciled
+      // worker. Drive its clock while awaiting that state, including the dirty
+      // generation produced by the previous pass's own claim/clear writes.
+      if (!draining) await vi.waitFor(async () => {
+        await advance(31_000);
+        expect(workers!.monitors.reconciliationSnapshot().reconciled).toBe(true);
         expect(idleWorkSnapshot().active).toBe(0);
         expect(coordinator!.nextWakeAt()).toBeNull();
       }, { timeout: 5000 });
+      else await advance(31_000);
       const select = vi.spyOn(db, "select"), execute = vi.spyOn(db, "execute"), transaction = vi.spyOn(db, "transaction");
       try {
         await advance(120_000);
@@ -854,6 +857,11 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
         } else await createAgentLifecycle(db).pauseAgent(f.agent.id, "manual");
         releaseResume();
         await worker.process(f.agent.id);
+        // process() can join an already scheduled worker. Await the committed
+        // lifecycle projection, not just the command or driver promise.
+        await vi.waitFor(async () => expect((await db.select().from(agents).where(eq(agents.id, f.agent.id)))[0])
+          .toMatchObject(action === "resume" ? { status: "idle", lifecycleState: "ready", lifecycleHolds: [] }
+            : { status: "paused", lifecycleState: "paused", lifecycleHolds: ["import", "manual"] }));
         await advance(31_000);
         await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
         const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));

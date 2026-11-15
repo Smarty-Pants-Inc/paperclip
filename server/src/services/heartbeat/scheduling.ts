@@ -36,6 +36,7 @@ import {
   asc,
   getTableColumns,
   gte,
+  type SQLWrapper,
 } from "drizzle-orm";
 import { RECOVERY_ORIGIN_KINDS } from "../recovery/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -76,6 +77,18 @@ export interface HeartbeatSchedulingDependencies
   issuesSvc: Pick<ReturnType<typeof issueService>, "listReviewAttention" | "create">;
   scheduleBoundedRetryForRun: ReturnType<typeof createHeartbeatRetries>["scheduleBoundedRetryForRun"];
   getSchedulingSuppression: (fresh?: boolean) => Promise<{ suppressed: boolean }>;
+}
+
+// One SQL expression owns pause disposition for dispatch reads and guarded
+// deadline/claim eligibility. Keep compatibility status separate from intent:
+// inherited holds and unfinished Stop can outlive a committed Resume.
+export function retainedIssueMonitorPause(row: {
+  companyStatus: SQLWrapper; status: SQLWrapper; lifecycleState: SQLWrapper; holds: SQLWrapper;
+}) {
+  const holds = sql`coalesce(${row.holds}, '[]'::jsonb)`;
+  return sql<boolean>`(${row.companyStatus} = 'paused' or (${row.status} = 'paused' and (
+    (${holds} <> '[]'::jsonb and ${holds} <@ '["company_paused", "import"]'::jsonb)
+    or (${holds} = '[]'::jsonb and ${row.lifecycleState} in ('pausing', 'resuming')))))`;
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -641,16 +654,18 @@ export function createHeartbeatScheduling(
   }
 
   async function readIssueMonitorPause(companyId: string, agentId: string) {
-    const [row] = await db.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-      pauseReason: agents.pauseReason, holds: agents.lifecycleHolds, companyStatus: companies.status })
+    const [row] = await db.select({ name: agents.name, status: agents.status,
+      holds: agents.lifecycleHolds, companyStatus: companies.status,
+      retained: retainedIssueMonitorPause({ companyStatus: companies.status, status: agents.status,
+        lifecycleState: agents.lifecycleState, holds: agents.lifecycleHolds }) })
       .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
     return {
-      companyPaused: row?.companyStatus === "paused",
-      resuming: row?.status === "paused" && row.lifecycleState === "resuming" && row.holds.length === 0,
+      retained: row?.retained ?? false,
       paused: row?.status === "paused",
-      importOnly: row?.companyStatus === "active" && row.status === "paused" && row.pauseReason === "import"
-        && row.holds.every(hold => hold === "import"),
+      reason: row?.companyStatus === "paused" ? "company_paused"
+        : row?.holds.includes("company_paused") ? "company_paused"
+        : row?.holds.includes("import") ? "import_paused" : "agent_resuming",
       name: row?.name ?? null,
     };
   }
@@ -763,8 +778,8 @@ export function createHeartbeatScheduling(
       : {};
 
     const pause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-    if ((pause.companyPaused || pause.importOnly || pause.resuming) && input.clearOnClientError) {
-      const reason = pause.companyPaused ? "company_paused" : pause.resuming ? "agent_resuming" : "import_paused";
+    if (pause.retained && input.clearOnClientError) {
+      const reason = pause.reason;
       await releaseIssueMonitorWithDiagnostic(claimed, input, {
         action: "issue.monitor_deferred", reason,
       });
@@ -940,8 +955,8 @@ export function createHeartbeatScheduling(
           // Pause may have arrived after the preflight read but before queue
           // admission. Company pause retains upstream intent, as does import.
           const currentPause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-          if (currentPause.companyPaused || currentPause.importOnly || currentPause.resuming) {
-            const reason = currentPause.companyPaused ? "company_paused" : currentPause.resuming ? "agent_resuming" : "import_paused";
+          if (currentPause.retained) {
+            const reason = currentPause.reason;
             await releaseIssueMonitorWithDiagnostic(claimed, input, {
               action: "issue.monitor_deferred", reason,
             });
@@ -972,16 +987,15 @@ export function createHeartbeatScheduling(
   }
 
   function noRetainedPausedMonitorAssignee() {
-    // Import holds and the paused projection while Resume finishes are not
-    // runnable deadlines. Lifecycle changes notify this queue; never hot-loop.
+    // Retained pauses have no runnable deadline. Reuse the dispatch expression
+    // verbatim, including in the guarded UPDATE (which has no outer company join).
     return sql`not exists (select 1 from ${agents} monitor_agent
+      inner join ${companies} monitor_company on monitor_company.id = monitor_agent.company_id
       where monitor_agent.id = ${issues.assigneeAgentId}
         and monitor_agent.company_id = ${issues.companyId}
-        and monitor_agent.status = 'paused'
-        and ((monitor_agent.pause_reason = 'import'
-          and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) <@ '["import"]'::jsonb)
-          or (monitor_agent.lifecycle_state = 'resuming'
-            and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) = '[]'::jsonb)))`;
+        and ${retainedIssueMonitorPause({ companyStatus: sql`monitor_company.status`,
+          status: sql`monitor_agent.status`, lifecycleState: sql`monitor_agent.lifecycle_state`,
+          holds: sql`monitor_agent.lifecycle_holds` })})`;
   }
 
   async function triggerIssueMonitor(
