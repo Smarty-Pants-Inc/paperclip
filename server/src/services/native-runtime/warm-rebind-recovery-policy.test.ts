@@ -236,6 +236,10 @@ describe("D-B5 RFL warm/durable recovery policy equality", () => {
     // RED on S1: received undefined; durable supplies a defined policy. D-B5
     // supplies the same policy here, including governed wait only without refresh.
     expect(warm?.providerRecoveryPolicy).toBe(durable!.providerRecoveryPolicy);
+    // D-B6 KEEP control (RFL 10:40Z, row 3): this executor call records no new box
+    // (no sandboxLeaseAcquisition 'created' on a remote sandbox target), so the warm
+    // rebind keeps the prior run's cursor. D-B6 resets it only on a known new box.
+    expect(warm?.cursor, "no recorded new allocation: the prior cursor is kept").toBe(checkpoint.cursor);
   });
 });
 
