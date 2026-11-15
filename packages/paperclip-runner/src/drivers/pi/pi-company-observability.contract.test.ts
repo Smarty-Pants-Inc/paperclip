@@ -2,6 +2,7 @@ import { readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
+import { configuredEnvironmentProjection } from "../../configured-environment.js";
 import { assistant, attrs, environment, openPi, sentinel, spans, terminal, tool, user } from "./pi-observability.test-fixture.js";
 
 let bodies: any[];
@@ -73,6 +74,90 @@ it("R2: credentials stay out of Pi child env/argv/config, run receipts and diagn
     expect(transport.mock.calls[0]?.[1]?.headers).toMatchObject({ authorization: `Bearer ${sentinel}` });
   } finally { await pi.close(); }
 });
+describe("F-1: configured and runtime credentials never enter OTLP bodies", () => {
+  // These ordinary variable/argument names deliberately bypass name-based
+  // scrubbing: the runner must protect the configured secret VALUES.
+  const resultSecret = 'f1-result-9c1e-"quoted"\\path\nsecond-line';
+  const answerSecret = "f1-answer-7d2b-independent";
+  const taskEnvironment = configuredEnvironmentProjection({ RESULT_VALUE: resultSecret, ANSWER_VALUE: answerSecret }, ["RESULT_VALUE", "ANSWER_VALUE"]);
+  const identity = "-----BEGIN PRIVATE KEY-----\nidentity-f1-first-line\nidentity-f1-second-line\n-----END PRIVATE KEY-----";
+  const provider = "f1-provider-6e3a-credential";
+  const escaped = (value: string) => JSON.stringify(value).slice(1, -1);
+  async function assertWire(label: string, secrets: string[], expected: string) {
+    expect(transport).toHaveBeenCalled();
+    for (const body of bodies) {
+      const wire = JSON.stringify(body);
+      for (const secret of secrets) {
+        expect(wire, `${label}: raw value`).not.toContain(secret);
+        expect(wire, `${label}: serialized value`).not.toContain(escaped(secret));
+      }
+    }
+    expect(JSON.stringify(bodies)).toContain(expected);
+    expect(JSON.stringify(bodies)).toContain("[REDACTED]");
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `F1-${label}-otlp.json`), JSON.stringify(bodies, null, 2));
+  }
+  it.each([false, true])("(a) redacts a configured task secret echoed by a TOOL RESULT (escaped=%s)", async jsonEscaped => {
+    const pi = await openPi({ ...environment, ...taskEnvironment });
+    try {
+      await pi.start();
+      pi.peer.send(...assistant("result", { tool: "read" }), ...tool("result", "read", `safe result ${jsonEscaped ? escaped(resultSecret) : resultSecret}`), ...terminal);
+      await pi.settled();
+    } finally { await pi.close(); }
+    await assertWire(`result-${jsonEscaped}`, [resultSecret, escaped(resultSecret)], "safe result");
+  });
+  it("(b) redacts a SECOND configured task secret echoed in the assistant ANSWER", async () => {
+    const pi = await openPi({ ...environment, ...taskEnvironment });
+    try {
+      await pi.start(); pi.peer.send(...assistant("answer", { text: `safe answer ${answerSecret}` }), ...terminal); await pi.settled();
+    } finally { await pi.close(); }
+    await assertWire("answer", [answerSecret], "safe answer");
+  });
+  it.each([
+    ["identity-raw", identity], ["identity-escaped", escaped(identity)], ["identity-line", "identity-f1-second-line"], ["provider", provider],
+  ])("redacts %s appearing in TOOL ARGS and projected bash command names", async (label, value) => {
+    const pi = await openPi({ ...environment, PAPERCLIP_AGENT_PRIVATE_KEY: identity, OPENROUTER_API_KEY: provider });
+    const args = { command: `echo ${value}` };
+    try {
+      await pi.start(); pi.peer.send(...assistant(label, { tool: "bash", args }), ...tool(label, "bash", "safe tool output", args), ...terminal); await pi.settled();
+      expect(pi.events.some(e => e.eventType === "tool.execution.started" && e.payload.name === args.command)).toBe(true);
+    } finally { await pi.close(); }
+    await assertWire(label, [value, "identity-f1-first-line", "identity-f1-second-line", provider], "safe tool output");
+  });
+  it("redacts prompt content, managed provider keys, assigned MCP and runner API credentials", async () => {
+    const values = { PAPERCLIP_AI_PROVIDER_KEY: "f1-managed-provider-28ab", PAPERCLIP_NATIVE_MCP_TOKEN: "f1-assigned-mcp-54cd", PAPERCLIP_API_KEY: "f1-runner-api-76ef" };
+    const pi = await openPi({ ...environment, ...taskEnvironment, ...values,
+      PAPERCLIP_NATIVE_MCP_NAME: "fixture", PAPERCLIP_NATIVE_MCP_URL: "https://mcp.example/rpc" });
+    try {
+      await pi.start(`safe prompt ${answerSecret} ${Object.values(values).join(" ")}`);
+      pi.peer.send(...assistant("prompt"), ...terminal); await pi.settled();
+    } finally { await pi.close(); }
+    await assertWire("prompt", [answerSecret, ...Object.values(values)], "safe prompt");
+  });
+  it("redacts generated bind/tool socket capabilities and broker auth on initial AND warm bindings", async () => {
+    const pi = await openPi({ ...environment, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1",
+      PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: provider }, { model: "paperclip/model" });
+    const secrets: string[] = [provider];
+    try {
+      const initial = JSON.parse(await readFile(pi.child.env!.PAPERCLIP_PI_BIND_INITIAL_FILE!, "utf8"));
+      const models = JSON.parse(await readFile(join(pi.root, "agent", "models.json"), "utf8"));
+      secrets.push(pi.child.env!.PAPERCLIP_PI_BIND_SOCKET!, initial.toolSocketPath, models.providers.paperclip.apiKey);
+      for (let turn = 1; turn <= 2; turn++) {
+        await pi.start();
+        if (turn === 2) {
+          const binding = pi.bindings.findLast(b => b.type === "bind");
+          expect(binding?.type).toBe("bind");
+          if (binding?.type === "bind") {
+            expect(binding.provider.apiKey).not.toBe(models.providers.paperclip.apiKey);
+            secrets.push(binding.provider.apiKey);
+          }
+        }
+        pi.peer.send(...assistant(`binding-${turn}`, { text: `safe binding ${secrets.join(" ")}` }), ...terminal); await pi.settled(turn);
+      }
+    } finally { await pi.close(); }
+    expect(transport).toHaveBeenCalledTimes(2);
+    await assertWire("bindings", secrets, "safe binding");
+  });
+});
 it("R3: Langfuse golden mapping includes I/O, native session, provider cost and all Paperclip ids", async () => {
   await run();
   const all = spans(bodies);
@@ -111,17 +196,25 @@ it("A2.1: two per-receipt deltas plus cumulative items sum to the final run tota
   expect(usage.reduce((n, s) => n + attrs(s)["gen_ai.usage.cost"], 0)).toBe(cumulative.providerReportedCostUsd);
 });
 it("A2.6: consumed mid-turn steer joins the prompt with a blank line, redaction and 8 KiB cap", async () => {
-  const pi = await openPi();
+  const turnStart = new Date("2026-11-15T12:00:00.000Z");
+  let now = turnStart;
+  const pi = await openPi(environment, { now: () => now });
   try {
     await pi.start("first"); pi.peer.send(...assistant("one"));
     await vi.waitFor(() => expect(pi.events.some(e => e.eventType === "usage.reported")).toBe(true));
     const turnId = pi.events.find(e => e.eventType === "turn.started")!.turnId!;
+    now = new Date(turnStart.getTime() + 5000);
     const text = `steer ${sentinel} ${"😀".repeat(3000)}`;
     await pi.session.steer!({ turnId, mode: "steer", message: { role: "user", text } });
     pi.peer.send(...user("steer", text), ...assistant("two"), ...terminal); await pi.settled();
   } finally { await pi.close(); }
   const root = spans(bodies).find(s => s.name === "paperclip.pi.turn");
   expect(root).toBeDefined();
+  const started = pi.events.find(e => e.eventType === "turn.started")!;
+  expect(started.emittedAt).toBe(turnStart.toISOString());
+  expect(root.startTimeUnixNano).toBe(String(BigInt(turnStart.getTime()) * 1_000_000n));
+  expect(attrs(root)["paperclip.turn.id"]).toBe(started.turnId);
+  expect(pi.events.filter(e => e.eventType === "turn.started")).toHaveLength(1);
   const input = attrs(root)["langfuse.observation.input"];
   expect(input).toMatch(/^first\n\nsteer \[REDACTED\]/);
   expect(Buffer.byteLength(input)).toBeLessThanOrEqual(8192);
