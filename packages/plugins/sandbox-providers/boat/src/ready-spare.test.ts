@@ -9,6 +9,7 @@ const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false,
 const companyId = "company-spare-test";
 const environmentId = "environment-spare-test";
 const eventHandlers = new Map<string, (event: any) => Promise<void>>();
+const eventRegistrations: Array<{ name: string; filter?: Record<string, unknown> }> = [];
 const persistedState = new Map<string, unknown>();
 let inferredEnvironmentId: string | undefined;
 let explicitEnvironmentIds: string[] | undefined;
@@ -107,7 +108,13 @@ async function setup(spares: number, environmentIds?: string[], idleMinutes = 60
       spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes })) },
     logger,
     db,
-    events: { on: vi.fn((name: string, handler: (event: any) => Promise<void>) => { eventHandlers.set(name, handler); return () => eventHandlers.delete(name); }) },
+    events: { on: vi.fn((name: string, filterOrHandler: Record<string, unknown> | ((event: any) => Promise<void>), maybeHandler?: (event: any) => Promise<void>) => {
+      const filter = typeof filterOrHandler === "function" ? undefined : filterOrHandler;
+      const handler = typeof filterOrHandler === "function" ? filterOrHandler : maybeHandler!;
+      eventRegistrations.push({ name, filter });
+      eventHandlers.set(name, handler);
+      return () => eventHandlers.delete(name);
+    }) },
     state: {
       get: vi.fn(async (key: { scopeId?: string; stateKey: string }) => persistedState.get(`${key.scopeId}:${key.stateKey}`) ?? null),
       set: vi.fn(async (key: { scopeId?: string; stateKey: string }, value: unknown) => { persistedState.set(`${key.scopeId}:${key.stateKey}`, value); }),
@@ -132,6 +139,7 @@ function companyActivityState(company: string): any {
 afterEach(async () => {
   await plugin.definition.onShutdown?.();
   eventHandlers.clear();
+  eventRegistrations.length = 0;
   persistedState.clear();
   inferredEnvironmentId = undefined;
   explicitEnvironmentIds = undefined;
@@ -561,6 +569,14 @@ describe("Boat ready spare", () => {
     expect(f.calls.filter(call => call.method === "PATCH" && call.url.pathname.endsWith(`/${spare.id}`) && call.body?.ttlSeconds === 1800)).toHaveLength(idleTtlPatches);
     expect(f.inventory.find(item => item.id === spare.id)?.state).toBe("archived");
     expect(idleTtlPatches).toBe(ttlPatches);
+  });
+
+  it("registers activity subscriptions with the company's invocation scope", async () => {
+    await setup(0);
+    await plugin.definition.onConfigChanged!({ spares: 0 }, { companyId } as any);
+
+    expect(eventRegistrations.length).toBeGreaterThan(0);
+    expect(eventRegistrations.every(registration => registration.filter?.companyId === companyId)).toBe(true);
   });
 
   it("subscribes to company activity events and validates environment, idle, and count settings", async () => {
