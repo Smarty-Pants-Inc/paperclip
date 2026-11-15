@@ -1,3 +1,4 @@
+import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
 
@@ -26,7 +27,7 @@ const reasons = {
   invalid_lifecycle_result: "A required plugin returned an invalid result. Check the plugin's status in Settings. Paperclip will retry automatically.",
 } as const;
 
-const transientCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "40001", "40P01", "53300", "57P01"]);
+const transientCodes = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "PLUGIN_RPC_TIMEOUT", "40001", "40P01", "53300", "57P01"]);
 const configurationFailures = new Set([
   "ai_connection_required", "harness_auth_failed", "harness_model_unavailable",
   "harness_command_unavailable", "harness_cwd_invalid", "harness_probe_unexpected_output",
@@ -43,7 +44,9 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   const selectionFailure = readAiConnectionConfigurationFailure(error);
   if (selectionFailure) return selectionFailure;
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
-  return [candidate?.code, candidate?.cause?.code].find((code): code is string =>
+  const codes = [candidate?.code, candidate?.cause?.code];
+  if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
+  return codes.find((code): code is string =>
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
 }
 
