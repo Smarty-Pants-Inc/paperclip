@@ -133,7 +133,8 @@ describe("manager assigns a company AI connection to its own report", () => {
     return { operations, restore: () => spy.mockRestore() };
   }
 
-  async function proveSavedAndNextRuntime(f: Awaited<ReturnType<typeof seed>>, response: request.Response) {
+  async function proveSavedAndNextRuntime(f: Awaited<ReturnType<typeof seed>>, response: request.Response,
+    beforeNextRun?: () => Promise<void>) {
     // Keep the exact pre-fix failure visible in RED, then require the fixed outcome.
     if (response.status === 403) {
       expect(response.body.error).toBe(denyScope);
@@ -145,15 +146,16 @@ describe("manager assigns a company AI connection to its own report", () => {
     const fresh = await f.call("get", f.ids.report);
     expect(fresh.status, fresh.text).toBe(200);
     expect(fresh.body.runtimeConfig.aiConnection).toEqual(f.binding);
-    const saved = await f.read();
-    expect(saved.runtimeConfig.aiConnection).toEqual(f.binding);
+    expect((await f.read()).runtimeConfig.aiConnection).toEqual(f.binding);
+    await beforeNextRun?.();
+    const saved = await f.read(); // A new execution reads the report afresh.
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: saved.id,
       responsibleUserId: f.userId, status: "running", runtimeMode: "native", contextSnapshot: {} }).returning();
     let acquired: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
     const appendRunEvent = vi.fn(async () => {});
     const busy = vi.fn();
     try {
-      const prepared = await prepareHeartbeatExecutionConfiguration(db, {
+      const preparation = prepareHeartbeatExecutionConfiguration(db, {
         run, agent: saved,
         task: { issueId: null, context: {}, responsibleUserId: f.userId, acceptedPlanContinuationWake: false,
           acceptedPlanWakeRoutingDecision: null, taskProjectContext: null, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
@@ -165,6 +167,17 @@ describe("manager assigns a company AI connection to its own report", () => {
         services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent, finalizeAiConnectionBusyDeferral: busy },
         onFailureSecretsResolved: () => {}, onManagedAiRuntimeAcquired: runtime => { acquired = runtime; }, onIdentityRedactorPrepared: () => {},
       });
+      if (beforeNextRun) {
+        await expect(preparation).rejects.toMatchObject({ name: "ConfigurationIncompleteFailure", code: "configuration_incomplete",
+          resultJson: { configurationIncomplete: { reason: "ai_connection_unavailable", agentId: saved.id } } });
+        expect(acquired).toBeUndefined();
+        expect(busy).not.toHaveBeenCalled(); // Unavailable is not a busy deferral.
+        const [failedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(failedRun!.contextSnapshot?.aiConnection).toBeUndefined();
+        expect((await f.read()).runtimeConfig.aiConnection).toEqual(f.binding); // No saved-binding fallback either.
+        return;
+      }
+      const prepared = await preparation;
       expect(prepared.prepared).toBe(true); expect(busy).not.toHaveBeenCalled();
       if (!prepared.prepared) throw new Error("Fresh run unexpectedly deferred");
       expect(prepared.runtimeConfig).toMatchObject({ model, provider: "pi_rpc" });
@@ -192,6 +205,25 @@ describe("manager assigns a company AI connection to its own report", () => {
       expect(observed.operations).toEqual(["agent.ai-binding.update", "agent.ai-binding.assign-shared-report", "agent.ai-binding.assign-shared-report"]);
     } finally { observed.restore(); }
     expect((await f.read()).adapterConfig.model).toBe(model);
+  });
+  it("run re-check RED: archiving the assigned account makes the report's next run fail closed without fallback", async () => {
+    const f = await seed();
+    // Both a second OpenAI account and the old Anthropic binding remain usable.
+    // A failure must not silently select either of those healthy alternatives.
+    const alternative = await f.account();
+    for (const binding of [alternative, f.oldBinding]) {
+      await expect(aiConnectionService(db).select({ companyId: f.companyId, userId: f.userId, agentId: f.ids.report,
+        adapterType: "paperclip_runner", runnerProvider: "pi_rpc", model: oldModel, binding })).resolves.toBeTruthy();
+    }
+    await proveSavedAndNextRuntime(f, await f.patch(), async () => {
+      await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, f.binding.connectionId));
+    });
+  });
+  it("run re-check: an account that is no longer company-shared also fails the next run closed", async () => {
+    const f = await seed();
+    await proveSavedAndNextRuntime(f, await f.patch(), async () => {
+      await db.update(connectionGrants).set({ kind: "user", subjectUserId: f.userId }).where(eq(connectionGrants.id, f.binding.grantId));
+    });
   });
   it("R1b: runtimeSettings converges on the same assignment with expected model/binding", async () => {
     const f = await seed();
