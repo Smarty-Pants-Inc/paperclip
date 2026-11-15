@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 import { FoldVertical, Loader2 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { cn, COST_FIGURES_HIDDEN } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { timeAgo } from "@/lib/timeAgo";
 import { formatContextTokens } from "@/lib/context-tokens";
@@ -159,7 +159,7 @@ export function ContextUsageCard({ usage, compact }: { usage: ContextUsage; comp
               muted
             />
           ) : null}
-          {usage.costUsd != null ? <Row label="Cost" value={`$${usage.costUsd.toFixed(2)}`} /> : null}
+          {usage.costUsd != null ? <Row label="Cost" value={COST_FIGURES_HIDDEN ? "—" : `$${usage.costUsd.toFixed(2)}`} /> : null}
           {usage.compactions ? <Row label="Compactions" value={String(usage.compactions)} muted /> : null}
         </dl>
       ) : null}

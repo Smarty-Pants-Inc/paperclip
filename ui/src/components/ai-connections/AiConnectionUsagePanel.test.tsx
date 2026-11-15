@@ -60,8 +60,8 @@ it("does not round almost-exhausted usage up to an exhausted allowance", async (
   render(); click();
   await vi.waitFor(() => expect(host.textContent).toContain("99.99999% used"));
   expect(host.textContent).not.toContain("0.00001% remaining");
-  expect(host.textContent).toContain("$0.0000001 left");
-  expect(host.textContent).toContain("$0.00001");
+  expect(host.textContent).toContain("— left");
+  expect(host.textContent).toContain("— cap");
   expect(host.textContent).not.toContain("Limit reached");
 });
 it("explains unsupported methods and disables checks for a revoked grant", () => {

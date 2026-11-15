@@ -41,7 +41,7 @@ describe("subscription costs", () => {
   }
   it("labels the monthly estimate and counts cached input exactly once", async () => {
     await render(fixture());
-    expect(container.textContent).toContain("$100.00/month");
+    expect(container.textContent).toContain("—/month");
     expect(container.textContent).toContain("Estimated");
     expect(container.textContent).toContain("150 in · 10 out");
     expect(container.textContent).toContain("50 input cached");
@@ -57,7 +57,7 @@ describe("subscription costs", () => {
     expect(container.textContent).not.toContain("$0.00");
     expect(container.textContent).not.toContain("private raw error");
     await render(fixture(), new Error("private raw error"));
-    expect(container.textContent).toContain("$100.00/month");
+    expect(container.textContent).toContain("—/month");
     expect(container.textContent).toContain("last loaded");
   });
   it("does not describe legacy subscription usage with no identified account as free", async () => {
@@ -74,7 +74,7 @@ describe("subscription costs", () => {
     report.accounts[0].identityVerified = false; report.accounts[0].price.source = "user";
     report.monthlyTotals[0].estimatedCount = 0;
     await render(report);
-    expect(container.textContent).toContain("$100.00/month");
+    expect(container.textContent).toContain("—/month");
     expect(container.textContent).toContain("1 unconfirmed account identity");
   });
   it("saves an annual price with the expected revision and selected currency", async () => {

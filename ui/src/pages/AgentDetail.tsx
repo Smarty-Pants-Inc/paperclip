@@ -73,7 +73,7 @@ import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallo
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal, hasUnavailableProviderAccounting, supportsRawProviderTrace } from "../lib/utils";
-import { cn } from "../lib/utils";
+import { cn, COST_FIGURES_HIDDEN } from "../lib/utils";
 import { RunRetryDetails } from "../components/RunRetryDetails";
 import { Button } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
@@ -2870,7 +2870,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
         <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
           {metrics.usageUnavailable && <span>Usage and cost unavailable</span>}
           {metrics.totalTokens !== null && metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
-          {metrics.cost !== null && metrics.cost > 0 && <span>${metrics.cost.toFixed(3)}</span>}
+          {metrics.cost !== null && metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
         </div>
       )}
     </Link>
@@ -2987,7 +2987,7 @@ export function RunAccountingMetrics({ run }: { run: HeartbeatRun }) {
     ["Input", metrics.input === null ? "Unavailable" : formatTokens(metrics.input)],
     ["Output", metrics.output === null ? "Unavailable" : formatTokens(metrics.output)],
     ["Cached", metrics.cached === null ? "Unavailable" : formatTokens(metrics.cached)],
-    ["Cost", metrics.cost === null ? "Unavailable" : metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"],
+    ["Cost", COST_FIGURES_HIDDEN ? "—" : metrics.cost === null ? "Unavailable" : metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"],
   ];
   return (
     <div className="border-t sm:border-t-0 sm:border-l border-border p-4 grid grid-cols-2 gap-x-4 sm:gap-x-8 gap-y-3 content-center tabular-nums">

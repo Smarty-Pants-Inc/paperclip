@@ -1,4 +1,5 @@
 import type { StatusCardRefreshPolicy, StatusCardUpdate } from "@paperclipai/shared";
+import { COST_FIGURES_HIDDEN } from "../../lib/utils";
 
 /** "1.1k tok" / "940 tok" — compact token count for footers and chips. */
 export function formatTokens(tokens: number | null | undefined): string | null {
@@ -13,6 +14,7 @@ export function formatTokens(tokens: number | null | undefined): string | null {
  */
 export function formatCents(cents: number | null | undefined): string | null {
   if (cents === null || cents === undefined) return null;
+  if (COST_FIGURES_HIDDEN) return "—";
   const dollars = cents / 100;
   if (dollars === 0) return "$0.00";
   if (dollars < 0.1) return `$${dollars.toFixed(3)}`;
