@@ -641,16 +641,19 @@ export function createHeartbeatScheduling(
   }
 
   async function readIssueMonitorPause(companyId: string, agentId: string) {
-    const [row] = await db.select({ name: agents.name, status: agents.status, lifecycleState: agents.lifecycleState,
-      pauseReason: agents.pauseReason, holds: agents.lifecycleHolds, companyStatus: companies.status })
+    const [row] = await db.select({ name: agents.name, status: agents.status,
+      holds: agents.lifecycleHolds, companyStatus: companies.status })
       .from(agents).innerJoin(companies, eq(companies.id, agents.companyId))
       .where(and(eq(agents.id, agentId), eq(agents.companyId, companyId)));
     return {
       companyPaused: row?.companyStatus === "paused",
-      resuming: row?.status === "paused" && row.lifecycleState === "resuming" && row.holds.length === 0,
-      paused: row?.status === "paused",
-      importOnly: row?.companyStatus === "active" && row.status === "paused" && row.pauseReason === "import"
-        && row.holds.every(hold => hold === "import"),
+      // Compatibility status is a projection, not pause intent. A committed
+      // Resume can leave pausing/paused/resuming behind until the worker runs;
+      // inherited company holds can likewise outlive the company Resume.
+      retainedPaused: row?.status === "paused" && !row.holds.includes("manual"),
+      manualPaused: row?.status === "paused" && row.holds.includes("manual"),
+      reason: row?.companyStatus === "paused" ? "company_paused"
+        : row?.holds.includes("import") ? "import_paused" : "agent_resuming",
       name: row?.name ?? null,
     };
   }
@@ -763,14 +766,14 @@ export function createHeartbeatScheduling(
       : {};
 
     const pause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-    if ((pause.companyPaused || pause.importOnly || pause.resuming) && input.clearOnClientError) {
-      const reason = pause.companyPaused ? "company_paused" : pause.resuming ? "agent_resuming" : "import_paused";
+    if ((pause.companyPaused || pause.retainedPaused) && input.clearOnClientError) {
+      const reason = pause.reason;
       await releaseIssueMonitorWithDiagnostic(claimed, input, {
         action: "issue.monitor_deferred", reason,
       });
       return { outcome: "skipped" as const, reason };
     }
-    if (pause.paused && input.clearOnClientError) {
+    if (pause.manualPaused && input.clearOnClientError) {
       return clearSkippedIssueMonitor(claimed, input, policy, "Agent is paused", pause.name);
     }
 
@@ -940,15 +943,15 @@ export function createHeartbeatScheduling(
           // Pause may have arrived after the preflight read but before queue
           // admission. Company pause retains upstream intent, as does import.
           const currentPause = await readIssueMonitorPause(claimed.companyId, targetAgentId);
-          if (currentPause.companyPaused || currentPause.importOnly || currentPause.resuming) {
-            const reason = currentPause.companyPaused ? "company_paused" : currentPause.resuming ? "agent_resuming" : "import_paused";
+          if (currentPause.companyPaused || currentPause.retainedPaused) {
+            const reason = currentPause.reason;
             await releaseIssueMonitorWithDiagnostic(claimed, input, {
               action: "issue.monitor_deferred", reason,
             });
             return { outcome: "skipped" as const, reason };
           }
           return clearSkippedIssueMonitor(claimed, input, policy, err.message,
-            currentPause.paused ? currentPause.name : null);
+            currentPause.manualPaused ? currentPause.name : null);
         }
       }
       await releaseIssueMonitorWithDiagnostic(claimed, input, {
@@ -972,16 +975,14 @@ export function createHeartbeatScheduling(
   }
 
   function noRetainedPausedMonitorAssignee() {
-    // Import holds and the paused projection while Resume finishes are not
-    // runnable deadlines. Lifecycle changes notify this queue; never hot-loop.
+    // Match readIssueMonitorPause: only an explicit manual hold makes a
+    // paused projection a clearable deadline. Lifecycle changes notify this
+    // queue when retained company/import/Resume projections become eligible.
     return sql`not exists (select 1 from ${agents} monitor_agent
       where monitor_agent.id = ${issues.assigneeAgentId}
         and monitor_agent.company_id = ${issues.companyId}
         and monitor_agent.status = 'paused'
-        and ((monitor_agent.pause_reason = 'import'
-          and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) <@ '["import"]'::jsonb)
-          or (monitor_agent.lifecycle_state = 'resuming'
-            and coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) = '[]'::jsonb)))`;
+        and not (coalesce(monitor_agent.lifecycle_holds, '[]'::jsonb) @> '["manual"]'::jsonb))`;
   }
 
   async function triggerIssueMonitor(
