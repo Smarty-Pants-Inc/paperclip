@@ -7,6 +7,7 @@ import { issueService } from "./issues.js";
 import { RECOVERED_WORK_RETRY_MESSAGE } from "./workspace-recovery-receipt.js";
 // Upstream ef2a49b6 shows its own deadline message for an active deadline action.
 import { EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
+import { EXECUTION_DEADLINE_NOTICE_BODY, readUnsupersededExecutionDeadlineNotice } from "./execution-deadline-notice.js";
 
 // SMAA-1444: the saved files were copied back and verified, so the hold itself
 // would release to Retry. Stand in for that verified repair receipt.
@@ -17,13 +18,11 @@ vi.mock("./workspace-recovery-receipt.js", async importOriginal => ({
 
 const cause = "execution_finalization_deadline_exceeded";
 // The notice exactly as execution-control-reconciliation commits it with the deadline failure.
-const deadlineNotice = "Paperclip could not resume or finish this reply before its execution deadline. "
-  + "Open the failed run for details. Before retrying, verify that the previous execution has stopped "
-  + "and reconcile any uncertain action.";
+const deadlineNotice = EXECUTION_DEADLINE_NOTICE_BODY;
 const recoveredRetry = RECOVERED_WORK_RETRY_MESSAGE;
 
 const support = await getEmbeddedPostgresTestSupport();
-describe.skipIf(!support.supported)("execution blocker follows a standing execution-deadline notice (SMAA-1444)", () => {
+describe.skipIf(!support.supported)("execution blocker is independent of standing execution-deadline notices (SMAA-1444)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => {
@@ -66,41 +65,46 @@ describe.skipIf(!support.supported)("execution blocker follows a standing execut
     await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: later.id, phase: "committed" });
   }
 
-  it("does not offer Retry over the deadline notice once saved work is recovered; a later committed success clears it", async () => {
+  // follow-Paperclip Cut B R4: a deadline notice cannot veto Retry after verified workspace recovery.
+  it("offers Retry from recovered work while the deadline notice remains output; a later committed success clears it", async () => {
     const f = await deadlineFailure(true);
-    // Without the notice the recovered hold offers Retry (the existing contract).
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true, nextAction: recoveredRetry });
     await postDeadlineNotice(f);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
-    expect(blocker).toMatchObject({ runId: f.run.id, cause, canRetry: false, canContinue: false,
+    expect(blocker).toMatchObject({ runId: f.run.id, cause, canRetry: true, canContinue: false,
       workspaceRecovery: { status: "recovered" } });
-    // One consistent message: the notice's own guidance, not an invitation to retry.
-    expect(blocker!.nextAction).toBe(deadlineNotice);
-    expect(blocker!.nextAction).not.toMatch(/Retry or send a message/);
-    // A later committed success on the task supersedes the notice.
+    expect(blocker!.nextAction).toBe(recoveredRetry);
+    expect(await readUnsupersededExecutionDeadlineNotice(db, f)).toMatchObject({ body: deadlineNotice });
+    // A later committed success on the task supersedes the output notice, not Retry eligibility.
     await committedSuccess(f);
+    expect(await readUnsupersededExecutionDeadlineNotice(db, f)).toBeNull();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true, nextAction: recoveredRetry });
   });
 
-  it("does not name Retry as the person's control while the deadline notice stands", async () => {
+  // follow-Paperclip Cut B R4: Retry remains the person's control even while deadline output stands.
+  it("names Retry as the person's control while the deadline notice stands", async () => {
     const f = await deadlineFailure(false);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true,
       nextAction: `${EXECUTION_FINALIZATION_DEADLINE_MESSAGE} ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
     await postDeadlineNotice(f);
     const blocker = await getExecutionBlocker(db, f.companyId, f.issueId);
-    expect(blocker).toMatchObject({ canRetry: false, canContinue: false, nextAction: deadlineNotice });
-    expect(blocker!.nextAction).not.toContain(EXECUTION_BLOCKER_PERSON_RETRY_ACTION);
+    expect(blocker).toMatchObject({ canRetry: true, canContinue: false,
+      nextAction: `${EXECUTION_FINALIZATION_DEADLINE_MESSAGE} ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
+    expect(blocker!.nextAction).toContain(EXECUTION_BLOCKER_PERSON_RETRY_ACTION);
     await committedSuccess(f);
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true,
       nextAction: `${EXECUTION_FINALIZATION_DEADLINE_MESSAGE} ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}` });
   });
 
-  it("an earlier success does not clear a later deadline notice, and another task's notice does not apply", async () => {
+  // follow-Paperclip Cut B R4: notice supersession and task scoping remain output-only, never Retry policy.
+  it("an earlier success does not clear later deadline output, and neither that task nor another loses Retry", async () => {
     const f = await deadlineFailure(true);
     await committedSuccess(f);
     await postDeadlineNotice(f);
-    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: false, nextAction: deadlineNotice });
+    expect(await readUnsupersededExecutionDeadlineNotice(db, f)).toMatchObject({ body: deadlineNotice });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ canRetry: true, nextAction: recoveredRetry });
     const other = await deadlineFailure(true);
+    expect(await readUnsupersededExecutionDeadlineNotice(db, other)).toBeNull();
     expect(await getExecutionBlocker(db, other.companyId, other.issueId)).toMatchObject({ canRetry: true, nextAction: recoveredRetry });
   });
 });
