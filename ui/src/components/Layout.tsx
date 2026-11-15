@@ -1,4 +1,5 @@
 import { CoordinatorPresentation } from "./coordinator/CoordinatorPresentation";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { CoordinatorChatReferencesProvider } from "./coordinator/CoordinatorChatReferences";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import { useBrowserTimeZoneSync } from "@/hooks/useBrowserTimeZoneSync";
@@ -280,7 +281,7 @@ export function Layout({ sidebarSections }: { sidebarSections?: ReactNode }) {
   }, [companyPrefix, contextualSurface, location.pathname]);
 
   useEffect(() => {
-    if (companiesLoading || onboardingTriggered.current) return;
+    if (ORGANIZATION_CREATION_HIDDEN || companiesLoading || onboardingTriggered.current) return;
     if (health?.deploymentMode === "authenticated") return;
     // Cloud provisions the single company for a stack, and POST /companies is a
     // 403 floor there — auto-opening the wizard could only dead-end.

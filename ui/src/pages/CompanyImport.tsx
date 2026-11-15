@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type {
   AgentRunnerChoice,
@@ -948,7 +949,9 @@ export function CompanyImport() {
   } | null>(null);
 
   // Target state
-  const [targetMode, setTargetMode] = useState<"existing" | "new">("new");
+  const [targetMode, setTargetMode] = useState<"existing" | "new">(
+    ORGANIZATION_CREATION_HIDDEN ? "existing" : "new",
+  );
   const [newCompanyName, setNewCompanyName] = useState("");
 
   // Preview state
@@ -2092,7 +2095,10 @@ export function CompanyImport() {
           </Field>
         )}
 
-        <Field label="Target" hint="Import into this organization or create a new one.">
+        <Field
+          label="Target"
+          hint={ORGANIZATION_CREATION_HIDDEN ? "Import into this organization." : "Import into this organization or create a new one."}
+        >
           <select
             className="w-full rounded-md border border-border bg-transparent px-2.5 py-1.5 text-sm outline-none"
             value={targetMode}
@@ -2102,14 +2108,14 @@ export function CompanyImport() {
               resetImportFlowState();
             }}
           >
-            <option value="new">Create new organization</option>
+            {!ORGANIZATION_CREATION_HIDDEN && <option value="new">Create new organization</option>}
             <option value="existing">
               Existing company: {selectedCompany?.name}
             </option>
           </select>
         </Field>
 
-        {targetMode === "new" && (
+        {!ORGANIZATION_CREATION_HIDDEN && targetMode === "new" && (
           <Field
             label="New organization name"
             hint="Optional override. Leave blank to use the package name."

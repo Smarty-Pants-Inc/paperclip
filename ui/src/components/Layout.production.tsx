@@ -1,4 +1,5 @@
 import { useDesignSandbox } from "@/context/DesignSandboxContext";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { DesignSandboxSidebar } from "./DesignSandboxSidebar";
 import { BoardDialogs } from "./BoardDialogs";
 import { ChatSetupSidebarProvider } from "@/context/ChatSetupSidebarContext";
@@ -266,7 +267,7 @@ export function Layout() {
   }, [forceRailCollapsed, setForceCollapsed]);
 
   useEffect(() => {
-    if (companiesLoading || onboardingTriggered.current) return;
+    if (ORGANIZATION_CREATION_HIDDEN || companiesLoading || onboardingTriggered.current) return;
     if (health?.deploymentMode === "authenticated") return;
     // Cloud provisions the single company for a stack, and POST /companies is a
     // 403 floor there — auto-opening the wizard could only dead-end.
