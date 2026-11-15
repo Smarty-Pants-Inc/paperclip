@@ -222,6 +222,13 @@ function parseFiniteNumberLike(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+export function assertAgentDailyCostCap(runtimeConfig: unknown, actorAgentId: string | null | undefined): void {
+  const heartbeat = isPlainRecord(runtimeConfig) ? runtimeConfig.heartbeat : undefined;
+  if (actorAgentId && isPlainRecord(heartbeat) && heartbeat.maxDailyCostCents === 0) {
+    throw unprocessable("maxDailyCostCents 0 stops the agent; omit the field (or send null) to remove the daily cap");
+  }
+}
+
 export function normalizeRuntimeConfigForNewAgent(runtimeConfig: unknown): Record<string, unknown> {
   const normalizedRuntimeConfig = isPlainRecord(runtimeConfig) ? { ...runtimeConfig } : {};
   const heartbeat = isPlainRecord(normalizedRuntimeConfig.heartbeat)
