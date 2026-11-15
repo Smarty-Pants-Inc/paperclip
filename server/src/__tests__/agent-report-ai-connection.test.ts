@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentApiKeys, agentConfigRevisions, authUsers, companies, companyMemberships,
   connectionGrants, createDb, heartbeatRuns, principalPermissionGrants, toolConnections, toolConnectionInstalls,
@@ -290,7 +290,56 @@ describe("manager assigns a company AI connection to its own report", () => {
       expect(observed.operations).toEqual(["agent.ai-binding.update"]);
     } finally { observed.restore(); }
   });
-  for (const race of ["reparent", "runtime-grant", "configure-grant", "account-grant", "audience", "install", "key"] as const) {
+  it("FIX 4: audience replacement overlapping the writer is serialized before selection", async () => {
+    const f = await seed(); const before = await f.read();
+    const audienceLocked = Promise.withResolvers<void>();
+    const releaseAudience = Promise.withResolvers<void>();
+    const writerLockAttempted = Promise.withResolvers<void>();
+    // Hold the real audience-replacement transaction before its mutation. HTTP
+    // admission can still read the old audience; the writer must wait and re-read.
+    const audienceDb = new Proxy(db, { get(target, key, receiver) {
+      if (key !== "transaction") return Reflect.get(target, key, receiver);
+      return (work: Parameters<typeof target.transaction>[0]) => target.transaction(async tx => {
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"paperclip.connection_grant_audience:" + f.binding.grantId}, 0))`);
+        audienceLocked.resolve();
+        await releaseAudience.promise;
+        return work(tx);
+      });
+    } });
+    const replacing = toolAccessService(audienceDb).replaceConnectionGrantMembers(f.binding.connectionId, f.binding.grantId,
+      [f.otherUserId], { actorType: "user", actorId: f.userId });
+    await audienceLocked.promise;
+    const original = configuration.prepareAgentConfiguration;
+    const seam = vi.spyOn(configuration, "prepareAgentConfiguration").mockImplementationOnce(async (tx, ...args) => {
+      const observed = new Proxy(tx, { get(target, key, receiver) {
+        if (key !== "execute") return Reflect.get(target, key, receiver);
+        return (...query: Parameters<typeof target.execute>) => {
+          writerLockAttempted.resolve();
+          return target.execute(...query);
+        };
+      } });
+      return original(observed, ...args);
+    });
+    let pending: Promise<request.Response> | undefined;
+    try {
+      pending = f.patch().then(response => response);
+      // Pre-fix the response wins (200 after stale selection). With the fix,
+      // the writer reaches the audience mutex and waits for replacement commit.
+      await Promise.race([pending, writerLockAttempted.promise]);
+      releaseAudience.resolve();
+      await replacing;
+      const response = await pending;
+      expect(response.status, response.text).toBe(403);
+      expect(response.body.error).toBe("This credential is not shared with the responsible user");
+      expect(await f.read()).toEqual(before);
+      expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, f.ids.report))).toEqual([]);
+    } finally {
+      releaseAudience.resolve();
+      await Promise.allSettled([replacing, ...(pending ? [pending] : [])]);
+      seam.mockRestore();
+    }
+  });
+  for (const race of ["reparent", "runtime-grant", "configure-grant", "account-grant", "audience", "install", "key", "archive"] as const) {
     it(`R6: ${race} changes after route admission are refused by the locked writer`, async () => {
       const f = await seed(); const before = await f.read(); let reachedWriter = false, changedAuthority = false;
       f.beforeWrite(async () => {
@@ -300,6 +349,7 @@ describe("manager assigns a company AI connection to its own report", () => {
         if (race === "audience") await toolAccessService(db).replaceConnectionGrantMembers(f.binding.connectionId, f.binding.grantId, [f.otherUserId], { actorType: "user", actorId: f.userId });
         if (race === "install") await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.binding.connectionId));
         if (race === "key") await db.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.id, f.key.id));
+        if (race === "archive") await db.update(toolConnections).set({ status: "archived" }).where(eq(toolConnections.id, f.binding.connectionId));
         changedAuthority = true;
       });
       const original = configuration.prepareAgentConfiguration;
