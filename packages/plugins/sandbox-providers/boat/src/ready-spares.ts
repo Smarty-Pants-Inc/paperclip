@@ -32,6 +32,40 @@ export type ReadySpareOperations = {
   allowCreate?(): Promise<boolean>;
 };
 
+export type ReadySpareClaimStore = {
+  reserve(spare: ReadySpare, claimToken: string, runId: string): Promise<boolean>;
+  hasClaim(providerLeaseId: string): Promise<boolean>;
+};
+
+export type ReadySpareClaimDatabase = {
+  namespace: string;
+  execute(sql: string, params?: unknown[]): Promise<{ rowCount: number }>;
+  query(sql: string, params?: unknown[]): Promise<unknown[]>;
+};
+
+/** Build the cross-worker claim store on the plugin's restricted database namespace. */
+export function createReadySpareClaimStore(db: ReadySpareClaimDatabase): ReadySpareClaimStore {
+  if (!/^[a-z][a-z0-9_]*$/.test(db.namespace)) throw new Error("Boat plugin database namespace is invalid");
+  const table = `${db.namespace}.boat_spare_claims`;
+  return {
+    async reserve(spare, claimToken, runId) {
+      const result = await db.execute(
+        `INSERT INTO ${table} (provider_lease_id, company_id, environment_id, claim_token, run_id, claimed_at)\n` +
+        "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (provider_lease_id) DO NOTHING",
+        [spare.id, spare.key.companyId, spare.key.environmentId, claimToken, runId, new Date().toISOString()],
+      );
+      return result.rowCount === 1;
+    },
+    async hasClaim(providerLeaseId) {
+      const rows = await db.query(
+        `SELECT provider_lease_id FROM ${table} WHERE provider_lease_id = $1 LIMIT 1`,
+        [providerLeaseId],
+      );
+      return rows.length > 0;
+    },
+  };
+}
+
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
   if (value !== null && typeof value === "object") {
@@ -87,11 +121,23 @@ export class ReadySpareKeeper {
   private readonly claiming = new Set<string>();
   private readonly recentCreates = new Map<string, Map<string, number>>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
+  private stopping = false;
 
   constructor(
     private readonly now: () => number = () => Date.now(),
     private readonly maxCreatesPerHour = MAX_READY_SPARE_CREATES_PER_HOUR,
+    private claimStore?: ReadySpareClaimStore,
   ) {}
+
+  setClaimStore(claimStore: ReadySpareClaimStore | undefined): void { this.claimStore = claimStore; }
+  start(): void { this.stopping = false; }
+  stop(): void { this.stopping = true; }
+  reset(): void {
+    this.stop();
+    this.claimStore = undefined;
+    this.pools.clear(); this.inFlightCreates.clear(); this.reconciling.clear(); this.activeDesired.clear();
+    this.pendingReconciliations.clear(); this.adopting.clear(); this.claiming.clear(); this.recentCreates.clear(); this.failures.clear();
+  }
 
   ready(key: ReadySpareKey): readonly ReadySpare[] {
     return [...(this.pools.get(readySparePoolKey(key)) ?? [])];
@@ -109,6 +155,7 @@ export class ReadySpareKeeper {
 
   /** Load durable labeled inventory into the fast claim index without creating anything. */
   async adopt(key: ReadySpareKey, operations: ReadySpareOperations): Promise<void> {
+    if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     if ((this.pools.get(poolId) ?? []).some(item => readyAndHealthy(item, key, this.now()))) return;
     const active = this.adopting.get(poolId);
@@ -124,8 +171,13 @@ export class ReadySpareKeeper {
     const listed = await operations.list();
     const keep: ReadySpare[] = [];
     for (const spare of listed) {
+      if (this.stopping) return;
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
       if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
+      if (this.claimStore) {
+        try { if (await this.claimStore.hasClaim(spare.id)) continue; }
+        catch { continue; } // Unknown claim state is reserved, never adopted or retired.
+      }
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else await operations.stop(spare);
     }
@@ -139,7 +191,9 @@ export class ReadySpareKeeper {
    * concurrent acquires cannot reserve the same ID. Errors are a cache miss:
    * callers can immediately take the ordinary create path.
    */
-  async claim(key: ReadySpareKey, attemptId: string, ttlSeconds: number, operations: ReadySpareOperations): Promise<ReadySpare | undefined> {
+  async claim(key: ReadySpareKey, attemptId: string, ttlSeconds: number, operations: ReadySpareOperations, runId = attemptId): Promise<ReadySpare | undefined> {
+    const claimStore = this.claimStore;
+    if (this.stopping || !claimStore) return undefined;
     const poolId = readySparePoolKey(key);
     const pool = this.pools.get(poolId) ?? [];
     const now = this.now();
@@ -148,8 +202,10 @@ export class ReadySpareKeeper {
     const [spare] = pool.splice(index, 1);
     this.claiming.add(spare.id);
     try {
-      const claimed = await operations.claim(spare, `paperclip-claim:${attemptId}`, ttlSeconds);
-      return claimed ? spare : undefined;
+      const claimToken = `paperclip-claim:${attemptId}`;
+      if (!await claimStore.reserve(spare, claimToken, runId) || this.stopping) return undefined;
+      const claimed = await operations.claim(spare, claimToken, ttlSeconds);
+      return claimed && !this.stopping ? spare : undefined;
     } catch {
       return undefined;
     } finally {
@@ -161,6 +217,7 @@ export class ReadySpareKeeper {
 
   /** Re-discover, adopt healthy owned spares, stop stale owned spares, then fill to N. */
   async reconcile(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+    if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const boundedDesired = Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired)));
     const active = this.reconciling.get(poolId);
@@ -193,8 +250,10 @@ export class ReadySpareKeeper {
   }
 
   private async reconcileOnce(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+    if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
+    if (this.stopping) return;
     const keep: ReadySpare[] = [];
     const toStop: ReadySpare[] = [];
     for (const spare of listed) {
@@ -202,10 +261,18 @@ export class ReadySpareKeeper {
       // An in-flight local claim may not have reached Boat's durable marker yet.
       // Never race a reconcile into stopping or re-adopting it.
       if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
+      if (this.claimStore) {
+        try { if (await this.claimStore.hasClaim(spare.id)) continue; }
+        catch { continue; } // Unknown claim state is reserved, never adopted or retired.
+      }
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else toStop.push(spare);
     }
-    for (const stale of toStop) await operations.stop(stale);
+    for (const stale of toStop) {
+      if (this.stopping) return;
+      await operations.stop(stale);
+    }
+    if (this.stopping) return;
 
     // Preserve any concurrently warming local candidates which are not yet in
     // the provider list's eventual-consistency window.
@@ -217,7 +284,7 @@ export class ReadySpareKeeper {
     for (const surplus of keep.slice(desired)) await operations.stop(surplus);
     if (selected.length) this.pools.set(poolId, selected);
     else this.pools.delete(poolId);
-    if (desired === 0) return;
+    if (desired === 0 || this.stopping) return;
 
     const missing = Math.max(0, desired - selected.length - (this.inFlightCreates.get(poolId) ?? 0));
     if (missing === 0) return;
@@ -230,7 +297,7 @@ export class ReadySpareKeeper {
     this.inFlightCreates.set(poolId, (this.inFlightCreates.get(poolId) ?? 0) + 1);
     try {
       for (let i = 0; i < missing; i++) {
-        if (this.now() < (this.failures.get(poolId)?.retryAt ?? 0)) break;
+        if (this.stopping || this.now() < (this.failures.get(poolId)?.retryAt ?? 0)) break;
         const current = this.pools.get(poolId) ?? [];
         if (current.length >= desired) break;
         const recent = this.recentCreates.get(key.companyId) ?? new Map<string, number>();
@@ -242,10 +309,12 @@ export class ReadySpareKeeper {
         if (operations.allowCreate) {
           let allowed = false;
           try { allowed = await operations.allowCreate(); } catch { allowed = false; }
-          if (!allowed) { recent.delete(reservation); break; }
+          if (!allowed || this.stopping) { recent.delete(reservation); break; }
         }
+        if (this.stopping) { recent.delete(reservation); break; }
         try {
           const spare = await operations.create(key);
+          if (this.stopping) { await operations.stop(spare); break; }
           if (readyAndHealthy(spare, key, this.now())) {
             const next = this.pools.get(poolId) ?? [];
             if (!next.some(item => item.id === spare.id)) next.push(spare);
@@ -272,7 +341,9 @@ export class ReadySpareKeeper {
 
   /** Refresh only near-expiry live candidates. Failed refreshes make them unclaimable. */
   async refreshDue(ttlSeconds: number, operationSource: ReadySpareOperations | ((key: ReadySpareKey) => ReadySpareOperations | undefined)): Promise<void> {
+    if (this.stopping) return;
     for (const [poolId, pool] of this.pools) {
+      if (this.stopping) return;
       const representative = pool[0];
       if (!representative) { this.pools.delete(poolId); continue; }
       const operations = typeof operationSource === "function" ? operationSource(representative.key) : operationSource;

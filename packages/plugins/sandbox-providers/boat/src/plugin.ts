@@ -3,8 +3,8 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
-import { ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySparePoolKey,
-  type ReadySpare, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
+import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySparePoolKey,
+  type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -30,8 +30,11 @@ const idleActivity = new BoatIdleActivity();
 const readySpares = new ReadySpareKeeper();
 const knownSparePools = new Map<string, { key: ReadySpareKey; ttlSeconds: number; desired: number; operations: ReadySpareOperations }>();
 let pluginContext: PluginContext | undefined;
+let spareClaimStore: ReadySpareClaimStore | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
+let shuttingDown = false;
+const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
@@ -532,8 +535,13 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
       }, false, { requireJson: true });
-      const sandbox = result?.sandbox ?? result;
-      if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || (sandbox.name && sandbox.name !== name)) return false;
+      const patched = result?.sandbox ?? result;
+      if (patched?.id !== spare.id || !["ready", "idle", "running"].includes(patched.state) || (patched.name && patched.name !== name)) return false;
+      const observed = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+        method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+      }, false, { requireJson: true });
+      const sandbox = observed?.sandbox ?? observed;
+      if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || sandbox.name !== name) return false;
       spare.name = name;
       spare.state = sandbox.state;
       spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
@@ -568,7 +576,28 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     },
   };
 }
+function clearSpareRefreshTimerIfIdle(): void {
+  if ([...knownSparePools.values()].some(pool => pool.desired > 0)) return;
+  if (spareRefreshTimer) clearInterval(spareRefreshTimer);
+  spareRefreshTimer = undefined;
+}
+function ensureSpareRefreshTimer(): void {
+  if (spareRefreshTimer || shuttingDown) return;
+  spareRefreshTimer = setInterval(() => { void maintainReadySpares().catch(() => undefined); }, 15_000);
+  spareRefreshTimer.unref?.();
+}
 function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSeconds: number, operations: ReadySpareOperations): void {
+  if (shuttingDown) return;
+  if (desired <= 0) {
+    for (const pool of knownSparePools.values()) {
+      if (pool.key.companyId !== key.companyId || pool.key.environmentId !== key.environmentId || pool.desired <= 0) continue;
+      pool.desired = 0;
+      void readySpares.reconcile(pool.key, 0, pool.operations).catch(() => undefined);
+    }
+    clearSpareRefreshTimerIfIdle();
+    return;
+  }
+  ensureSpareRefreshTimer();
   const poolId = readySparePoolKey(key);
   for (const [oldPoolId, oldPool] of knownSparePools) {
     if (oldPool.key.companyId !== key.companyId || oldPool.key.environmentId !== key.environmentId
@@ -588,11 +617,16 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
   });
 }
 async function maintainReadySpares(): Promise<void> {
+  if (shuttingDown || ![...knownSparePools.values()].some(pool => pool.desired > 0)) return;
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
-    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => knownSparePools.get(readySparePoolKey(key))?.operations);
+    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => {
+      const pool = knownSparePools.get(readySparePoolKey(key));
+      return pool?.desired ? pool.operations : undefined;
+    });
     for (const pool of knownSparePools.values()) {
-      if (pool.desired !== readySpares.ready(pool.key).length) await readySpares.reconcile(pool.key, pool.desired, pool.operations);
+      if (shuttingDown) return;
+      if (pool.desired > 0 && pool.desired !== readySpares.ready(pool.key).length) await readySpares.reconcile(pool.key, pool.desired, pool.operations);
     }
   })();
   spareMaintenanceWork = work;
@@ -647,10 +681,18 @@ async function finishAcquisition(
 
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
+    shuttingDown = false;
+    readySpares.start();
+    knownSparePools.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
+    try {
+      spareClaimStore = ctx.db?.namespace && /^[a-z][a-z0-9_]*$/.test(ctx.db.namespace)
+        ? createReadySpareClaimStore(ctx.db)
+        : undefined;
+    } catch { spareClaimStore = undefined; }
+    readySpares.setClaimStore(spareClaimStore);
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
-    spareRefreshTimer = setInterval(() => { void maintainReadySpares().catch(() => undefined); }, 15_000);
-    spareRefreshTimer.unref?.();
+    spareRefreshTimer = undefined;
     ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight");
   },
   multiCompanyConfig: true,
@@ -664,6 +706,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     for (const pool of knownSparePools.values()) {
       if (pool.key.companyId === companyId) queueSpareReconciliation(pool.key, desired, pool.ttlSeconds, pool.operations);
     }
+    clearSpareRefreshTimerIfIdle();
   },
   onDuplexChannelOpen: params => duplexChannels.open(params),
   onDuplexChannelWrite: params => duplexChannels.write(params),
@@ -683,15 +726,27 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } catch { return { status: "error", message: "Boat SSH guardian status probe failed." }; }
   },
   async onShutdown() {
+    shuttingDown = true;
+    readySpares.stop();
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
     try {
-      if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
-      await readySpares.drain();
+      try {
+        await Promise.allSettled([...inFlightAcquisitions]);
+        if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
+        await readySpares.drain();
+      } finally {
+        try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
+      }
     } finally {
-      try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
+      readySpares.reset();
+      knownSparePools.clear();
+      spareClaimStore = undefined;
+      duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
+      // The host process exits after this hook. Clearing the transition flag
+      // also lets in-process worker harnesses start their next simulated worker.
+      shuttingDown = false;
     }
-    duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
   },
   async onIdleDrain() { return idleActivity.present() || duplexChannels.present() || readySpares.present() ? "present" : "none"; },
   async onEnvironmentValidateConfig(params: PluginEnvironmentValidateConfigParams): Promise<PluginEnvironmentValidationResult> {
@@ -726,7 +781,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     try { const result = await request(parse(params.config), "/limits"); return { ok: true, summary: "Boat API reachable.", metadata: { provider: "boat", limits: result } }; }
     catch (e) { return { ok: false, summary: "Boat API probe failed.", metadata: { provider: "boat", error: e instanceof Error ? e.message : String(e) } }; }
   },
-  async onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
+  onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
+    if (shuttingDown) return Promise.reject(new Error("Boat provider is shutting down"));
+    const work = (async (): Promise<PluginEnvironmentLease> => {
     const c = parse(params.config);
     const snapshotError = snapshotConfigError(params.config);
     if (snapshotError) throw new Error(snapshotError);
@@ -756,7 +813,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     const spareHash = readySpareHash(c, ttl, from, snapshot ?? pinnedIdentity);
     const spareKey: ReadySpareKey = { companyId: params.companyId, environmentId: params.environmentId, configHash: spareHash };
-    const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
+    const spareOperations = hasSpareSetting && spareClaimStore ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
     let id: string | undefined;
     let claimedSpare: ReadySpare | undefined;
     let claimName: string | null = null;
@@ -770,7 +827,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       if (spareOperations && desiredSpares > 0) {
         const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${encodeURIComponent(attemptId)}`;
-        claimedSpare = await readySpares.claim(spareKey, claimAttempt, ttl, spareOperations);
+        claimedSpare = await readySpares.claim(spareKey, claimAttempt, ttl, spareOperations, params.runId ?? "unknown");
+        if (shuttingDown) throw new Error("Boat provider is shutting down");
         if (claimedSpare) {
           id = claimedSpare.id;
           claimName = `paperclip-claim:${claimAttempt}`;
@@ -782,10 +840,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           return await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
         }
       }
+      if (shuttingDown) throw new Error("Boat provider is shutting down");
       if (spareOperations) {
         if (adoptionTask) void adoptionTask.then(() => queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations));
         else queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
       }
+      if (shuttingDown) throw new Error("Boat provider is shutting down");
       const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
       const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
       id = sb.id;
@@ -794,6 +854,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
       return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
     } catch (e) {
+      if (shuttingDown && !id) throw e;
       // A lost reply can still have allocated: recover exact IDs before teardown.
       // If lookup is unavailable, the durable creation label remains inspectable.
       const ids = id ? [id] : await acquisitionMatches(c, attemptId, params);
@@ -807,6 +868,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       await cleanupAcquisition(c, ids, params, attemptId, e);
       throw e;
     }
+    })();
+    inFlightAcquisitions.add(work);
+    return work.finally(() => { inFlightAcquisitions.delete(work); });
   },
   async onEnvironmentInspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation> {
     const c = parse(params.config);

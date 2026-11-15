@@ -8,7 +8,12 @@ const manifest: PaperclipPluginManifestV1 = {
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
   categories: ["automation"],
-  capabilities: ["environment.drivers.register"],
+  capabilities: [
+    "environment.drivers.register",
+    "database.namespace.migrate",
+    "database.namespace.read",
+    "database.namespace.write",
+  ],
   instanceConfigSchema: {
     type: "object",
     properties: {
@@ -16,6 +21,10 @@ const manifest: PaperclipPluginManifestV1 = {
     },
   },
   entrypoints: { worker: "./dist/worker.js" },
+  database: {
+    namespaceSlug: "boat_sandbox_provider",
+    migrationsDir: "migrations",
+  },
   environmentDrivers: [{
     driverKey: "boat",
     kind: "sandbox_provider",
