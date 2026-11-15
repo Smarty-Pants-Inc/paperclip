@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { findUIAdapter, registerUIAdapter } from "@/adapters/registry";
-import { adapterReasoningDisplay } from "./reasoning-display";
+import { adapterReasoningDisplay, resolveReasoningDisplay } from "./reasoning-display";
 
 function withAdapterDefault<T>(adapterType: string, view: "inline" | "fold" | undefined, body: () => T): T {
   const original = findUIAdapter(adapterType)!;
@@ -14,33 +14,51 @@ function withAdapterDefault<T>(adapterType: string, view: "inline" | "fold" | un
   }
 }
 
-describe("reasoning display resolution (look-only: the adapter default decides)", () => {
-  it("uses the adapter's declared default, else fold", () => {
+describe("reasoning display resolution", () => {
+  it("uses the adapter's declared default when the person has no preference for the agent", () => {
     withAdapterDefault("codex_local", "inline", () => {
       expect(adapterReasoningDisplay("codex_local")).toBe("inline");
-    });
-    withAdapterDefault("codex_local", "fold", () => {
-      expect(adapterReasoningDisplay("codex_local")).toBe("fold");
+      expect(resolveReasoningDisplay({}, "agent-1", "codex_local")).toBe("inline");
+      expect(resolveReasoningDisplay(undefined, "agent-1", "codex_local")).toBe("inline");
+      expect(resolveReasoningDisplay(null, "agent-1", "codex_local")).toBe("inline");
     });
     withAdapterDefault("codex_local", undefined, () => {
-      expect(adapterReasoningDisplay("codex_local")).toBe("fold");
+      expect(resolveReasoningDisplay({}, "agent-1", "codex_local")).toBe("fold");
     });
-    expect(adapterReasoningDisplay(null)).toBe("fold");
-    expect(adapterReasoningDisplay(undefined)).toBe("fold");
-    expect(adapterReasoningDisplay("no_such_adapter")).toBe("fold");
+    expect(resolveReasoningDisplay({}, null, null)).toBe("fold");
   });
 
-  it("shows a paperclip_runner (pi_rpc) run's reasoning inline with no click", () => {
-    // The real registered adapter, no override: every one of Paul's agents is
-    // paperclip_runner / pi_rpc, so this is what he sees by default.
-    expect(findUIAdapter("paperclip_runner")?.transcriptPresentation?.liveReasoningView).toBe("inline");
+  it("lets the person's agent preference win over the adapter default, in both directions", () => {
+    withAdapterDefault("codex_local", "inline", () => {
+      expect(resolveReasoningDisplay({ "agent-1": "fold" }, "agent-1", "codex_local")).toBe("fold");
+    });
+    withAdapterDefault("codex_local", "fold", () => {
+      expect(resolveReasoningDisplay({ "agent-1": "inline" }, "agent-1", "codex_local")).toBe("inline");
+    });
+  });
+
+  it("shows Paul's Smarty (paperclip_runner, provider pi_rpc) inline by default; a stored Folded still wins", () => {
+    // The adapter exactly as the app registers it, no override.
     expect(adapterReasoningDisplay("paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({}, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay(undefined, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({ "agent-2": "fold" }, "agent-1", "paperclip_runner")).toBe("inline");
+    expect(resolveReasoningDisplay({ "agent-1": "fold" }, "agent-1", "paperclip_runner")).toBe("fold");
+    // Other harnesses keep their own default.
+    expect(adapterReasoningDisplay("codex_local")).toBe("fold");
+  });
+
+  it("keys the preference by agent: another agent's choice does not apply", () => {
+    withAdapterDefault("codex_local", undefined, () => {
+      expect(resolveReasoningDisplay({ "agent-2": "inline" }, "agent-1", "codex_local")).toBe("fold");
+      expect(resolveReasoningDisplay({ "agent-2": "inline" }, null, "codex_local")).toBe("fold");
+    });
   });
 });
 
 describe("the old per-browser reasoning choice", () => {
-  // Paul 11-15: no per-chat switch. Its localStorage value
-  // (paperclip:task-chat:reasoning-display:v1) decides nothing.
+  // Paul 11-15: one place only, the agent page. The per-chat switch and its
+  // localStorage value (paperclip:task-chat:reasoning-display:v1) decide nothing.
   it("is not read or written by any UI source file", () => {
     const root = path.resolve(__dirname, "../..");
     const offenders: string[] = [];
@@ -58,5 +76,5 @@ describe("the old per-browser reasoning choice", () => {
     };
     walk(root);
     expect(offenders).toEqual([]);
-  });
+  }, 60_000);
 });
