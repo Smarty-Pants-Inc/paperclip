@@ -12,6 +12,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { GoalProperties } from "../components/GoalProperties";
 import { GoalTree } from "../components/GoalTree";
 import { StatusBadge } from "../components/StatusBadge";
+import { ProjectStatusPill } from "../components/ProjectStatusPill";
 import { InlineEditor } from "../components/InlineEditor";
 import { EntityRow } from "../components/EntityRow";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -215,7 +216,7 @@ export function GoalDetail() {
                   title={project.name}
                   subtitle={project.description ?? undefined}
                   to={projectUrl(project)}
-                  trailing={<StatusBadge status={project.status} />}
+                  trailing={<ProjectStatusPill project={project} />}
                 />
               ))}
             </div>

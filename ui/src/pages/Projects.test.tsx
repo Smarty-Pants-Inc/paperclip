@@ -216,7 +216,8 @@ describe("Projects", () => {
     expect(content.indexOf("Alpha")).toBeLessThan(content.indexOf("Charlie"));
     expect(content.indexOf("Charlie")).toBeLessThan(content.indexOf("Other Projects"));
     expect(content.indexOf("Other Projects")).toBeLessThan(content.indexOf("Bravo"));
-    expect(content).toContain("in progress");
+    // The pill follows the tasks (derivedStatus); the stored status is not shown.
+    expect(content).not.toContain("in progress");
   });
 
   it("searches projects and clears back to the grouped list", async () => {
@@ -243,6 +244,64 @@ describe("Projects", () => {
     expect(content.indexOf("My Projects")).toBeLessThan(content.indexOf("Charlie"));
     expect(content.indexOf("Charlie")).toBeLessThan(content.indexOf("Alpha"));
     expect(content.indexOf("Alpha")).toBeLessThan(content.indexOf("Other Projects"));
+  });
+
+  function taskCountText(projectName: string) {
+    const link = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find((element) =>
+      element.textContent?.includes(projectName),
+    );
+    return link?.querySelector<HTMLElement>("[data-testid='project-task-count']") ?? null;
+  }
+
+  it("shows open tasks, open of total, and All tasks done on the project rows", async () => {
+    mockProjectsApi.list.mockResolvedValue([
+      makeProject({ id: "project-a", urlKey: "alpha", name: "Alpha", taskCount: 3, openTaskCount: 3 }),
+      makeProject({ id: "project-b", urlKey: "bravo", name: "Bravo", taskCount: 5, openTaskCount: 2 }),
+      makeProject({ id: "project-c", urlKey: "charlie", name: "Charlie", taskCount: 1, openTaskCount: 0 }),
+      makeProject({ id: "project-d", urlKey: "delta", name: "Delta", taskCount: 0, openTaskCount: 0 }),
+    ]);
+    await renderProjects();
+
+    expect(taskCountText("Alpha")?.textContent).toBe("3 open");
+    expect(taskCountText("Alpha")?.title).toBe("3 open of 3 tasks");
+    expect(taskCountText("Bravo")?.textContent).toBe("2 open of 5");
+    expect(taskCountText("Bravo")?.title).toBe("2 open of 5 tasks");
+    expect(taskCountText("Charlie")?.textContent).toBe("All tasks done");
+    expect(taskCountText("Charlie")?.title).toBe("0 open of 1 task");
+    expect(taskCountText("Delta")?.textContent).toBe("No tasks");
+  });
+
+  function pillText(projectName: string) {
+    const link = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find((element) =>
+      element.textContent?.includes(projectName),
+    );
+    return link?.querySelector<HTMLElement>("[data-testid='project-status-pill']")?.textContent ?? null;
+  }
+
+  it("shows the pill derived from the tasks, not the stored status", async () => {
+    mockProjectsApi.list.mockResolvedValue([
+      makeProject({ id: "project-a", urlKey: "alpha", name: "Alpha", status: "backlog", taskCount: 3, openTaskCount: 1, derivedStatus: "in_progress" }),
+      makeProject({ id: "project-b", urlKey: "bravo", name: "Bravo", status: "in_progress", taskCount: 1, openTaskCount: 0, derivedStatus: "done" }),
+      makeProject({ id: "project-c", urlKey: "charlie", name: "Charlie", status: "completed", taskCount: 0, openTaskCount: 0, derivedStatus: "not_started" }),
+    ]);
+    await renderProjects();
+
+    expect(pillText("Alpha")).toBe("In progress");
+    expect(pillText("Bravo")).toBe("Done");
+    expect(taskCountText("Bravo")?.textContent).toBe("All tasks done");
+    expect(pillText("Charlie")).toBe("Not started");
+    // The stored status is no longer what the pill shows.
+    expect(container.textContent).not.toContain("backlog");
+    expect(container.textContent).not.toContain("completed");
+  });
+
+  it("falls back to the total task count when the server sends no open count", async () => {
+    mockProjectsApi.list.mockResolvedValue([
+      makeProject({ id: "project-a", urlKey: "alpha", name: "Alpha", taskCount: 2 }),
+    ]);
+    await renderProjects();
+
+    expect(taskCountText("Alpha")?.textContent).toBe("2 tasks");
   });
 
   it("reserves description line height for projects without descriptions", async () => {
