@@ -38,6 +38,11 @@ import { materializePiSessionRecoveryNotice, readUnsupersededHeldConversationNot
 import { ensureFreshContinuation, listFreshContinuations } from "../fresh-continuation-fallback.js";
 import { issueRecoveryActions } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+// Typing only, no behaviour or assertion change: settleUnrecoverableExecutions
+// (execution-recovery-resolution.ts:727) does not declare inspectLeaseResource at
+// this cut; these rows pass it for TL08's settle-time lease inspection.
+const settleOptionsWith = <T,>(inspectLeaseResource: T):
+  NonNullable<Parameters<typeof settleUnrecoverableExecutions>[2]> & { inspectLeaseResource: T } => ({ inspectLeaseResource });
 import { projectTaskInterruption } from "../task-interruption-presentation.js";
 import { canBypassFailedNativePredecessor } from "../native-runtime/native-provider-work-proof.js";
 import { heartbeatRunEvents } from "@paperclipai/db";
@@ -592,7 +597,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       try {
         for (let n = 0; n < 3; n++) {
           vi.setSystemTime(clock + n * 61000);
-          await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+          await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
         }
         expect(performance.now() - beforeChecks).toBeLessThan(10000);
         expect(inspectLeaseResource).toHaveBeenCalledTimes(3);
@@ -614,7 +619,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         stopped = true;
         vi.setSystemTime(clock + 3 * 61000);
         try {
-          await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+          await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
           await deliverReconciledExecutions(db, hb.wakeup);
           await hb.drainActiveRunExecutions();
           const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id));
@@ -637,7 +642,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
           expect(answer.settled.status).toBe("succeeded");
           expect(JSON.stringify(answer.prompts)).toContain(message!.body);
           for (let n = 0; n < 3; n++) {
-            await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+            await settleUnrecoverableExecutions(db, new Date(), settleOptionsWith(inspectLeaseResource));
             await deliverReconciledExecutions(db, hb.wakeup);
           }
           expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, f.run.id))).toHaveLength(1);

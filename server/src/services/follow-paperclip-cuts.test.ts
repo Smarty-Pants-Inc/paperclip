@@ -308,7 +308,7 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
         expect(next[0]!.contextSnapshot).toMatchObject({ wakeCommentIds: [f.messageId] });
         await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
         expect.soft(await currentSystemNotes(f.issueId), `no thread note while continuation ${attempt} is owed`).toHaveLength(0);
-        source = next[0]!.id;
+        source = next[0]!.id as typeof source;
         await failContinuation(source, f.issueId);
       }
       const endedAt = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source)))[0]!.finishedAt!;
