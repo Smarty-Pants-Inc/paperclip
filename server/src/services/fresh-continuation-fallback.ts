@@ -1094,7 +1094,12 @@ function interruptionEligibility(input: { now: Date; companyId: SQL; issueId: SQ
   const systemRetriedSource = sql`(${continuationCauseIsSystemOwnedSql("source")}
     and coalesce(source.context_snapshot->>'wakeReason', '') <> 'task_retry' and not coalesce(source.context_snapshot ? 'explicitUserContinuation', false)
     and exists (select 1 from ${heartbeatRuns} held where ${refusedLater} and ${recoveryRunSql("held")}))`;
-  const recent = source(sql`(${continuesAutomaticallySql("source")} or ${systemRetriedSource})
+  // Closed preparation refusals remain interruption sources after an owner is
+  // settled, even without recovery wake metadata. This only discovers backlog
+  // work; fresh-thread admission still requires its physical-stop proof.
+  const knownInterruptionSource = sql`(${continuationCauseIsSystemOwnedSql("source")}
+    and source.error_code in (${sql.join(BACKLOG_CONTINUATION_SOURCE_CODES.map(code => sql`${code}`), sql`, `)}))`;
+  const recent = source(sql`(${continuesAutomaticallySql("source")} or ${systemRetriedSource} or ${knownInterruptionSource})
     and greatest(source.finished_at, (select max(held.finished_at) from ${heartbeatRuns} held where ${refusedLater})) > ${since}`);
   return { recent, personAsked };
 }
