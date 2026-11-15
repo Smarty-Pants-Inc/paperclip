@@ -34,7 +34,8 @@ import { PROVIDER_PERFORMANCE_ENV } from "../../contracts/provider-performance.j
 import { annotateOmittedProviderText, parseOpenCodeSseFrames } from "./sse-frames.js";
 import { githubCredentialEnvironment } from "../../github-credential-environment.js";
 import { configuredOpenCodeEnvironment } from "./environment.js";
-import { CONFIGURED_ENVIRONMENT_KEYS, SECRET_ENVIRONMENT_KEYS, configuredSecretEnvironment } from "../../configured-environment.js";
+import { configuredSecretEnvironment } from "../../configured-environment.js";
+import { driverSensitiveValues } from "../sensitive-values.js";
 import { prepareOpenCodeOutputCustody, redactOpenCodeModelRequest } from "./output-custody.js";
 
 import {
@@ -2698,21 +2699,13 @@ async function startRuntime(input: {
   const assignedMcp = nativeMcpLaunchBinding(
     input.options.environment ?? process.env,
   );
-  const identityKey = input.options.environment?.PAPERCLIP_AGENT_PRIVATE_KEY;
-  const identityValues = identityKey ? [identityKey, JSON.stringify(identityKey).slice(1, -1),
-    ...identityKey.split(/\r?\n/).filter(line => line && !line.startsWith("-----"))] : [];
   const providerEnvironment = input.options.environment ?? process.env;
-  const sensitiveValues = [
-    ...identityValues,
-    ...Object.entries(taskEnvironment).flatMap(([key, value]) =>
-      key !== CONFIGURED_ENVIRONMENT_KEYS && key !== SECRET_ENVIRONMENT_KEYS && value ? [value, JSON.stringify(value).slice(1, -1)] : []),
-    password,
-    authHeader,
-    bridge.secret,
-    assignedMcp?.token,
-    providerEnvironment.OPENROUTER_API_KEY,
-    providerEnvironment.PAPERCLIP_AI_PROVIDER_KEY,
-  ].filter((value): value is string => Boolean(value));
+  const sensitiveValues = driverSensitiveValues({
+    identityKey: input.options.environment?.PAPERCLIP_AGENT_PRIVATE_KEY,
+    taskEnvironment,
+    values: [password, authHeader, bridge.secret, assignedMcp?.token,
+      providerEnvironment.OPENROUTER_API_KEY, providerEnvironment.PAPERCLIP_AI_PROVIDER_KEY],
+  });
   input.trace?.addSensitiveValues(sensitiveValues);
   // Configured secrets must never reach OpenCode's captured tool output, its
   // session store, or the model. Prepared before launch; a launch that cannot

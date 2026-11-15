@@ -21,7 +21,7 @@ async function fixture(overrides: Partial<ConstructorParameters<typeof PiRpcHarn
   await writeFile(instructionFile, "instructions");
   const transport = { pid: 42, exited: true, async *events() {}, close: vi.fn(async () => {}) };
   const session = new PiRpcHarnessSession({
-    transport: transport as unknown as PiRpcTransport, runId: "run", normalizedSessionId: "session",
+    transport: transport as unknown as PiRpcTransport, sensitiveValues: [], runId: "run", normalizedSessionId: "session",
     providerSessionId: "native", sessionFile: join(root, "saved.jsonl"), workingDirectory: root,
     runnerInstanceId: "runner", now: () => new Date(), agentHome: root, instructionFile, instructionBoundary: "host",
     config: { provider: "pi_rpc", model: "neutral/model", piRpcThinkingLevel: "off" },

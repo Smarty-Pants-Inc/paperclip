@@ -80,6 +80,16 @@ all reserved observability entries are removed before preparing Pi's child env
 or configuration. Company export remains OFF by default, with the same four
 capture switches (all ON when enabled). This does not configure the Pi plugin.
 
+Before export, Pi protects the configured task-environment values, agent private
+identity key, admitted provider and runner credentials, assigned-MCP token, and
+private bind/tool socket paths. The same list builder used by OpenCode includes
+literal, JSON-escaped and multiline/PEM-body forms. Initial and rotated provider
+broker capabilities join the live redaction list before binding; retired values
+remain protected if a later turn echoes them. Redaction precedes field truncation
+and covers captured prompts, answers, tool output and projected command names.
+This protects known launch/runtime values, not arbitrary secrets discovered in
+files or transformed into unrecognized encodings; choose capture settings accordingly.
+
 The image-N event adapter is **our code**: Pi's sink emits `turn.started` and
 per-receipt `usage.reported`, not the exporter's submission/usage layout. It is
 confined to the observability feed; public run receipts do not change. One
