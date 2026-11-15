@@ -191,6 +191,16 @@ describe("Boat ready spare keeper", () => {
     expect(rows.get("bx_abcdefgh")?.[3]).toMatch(/^paperclip-claim:/);
   });
 
+  it("reports a config mismatch when only an old create-hash pool is ready", async () => {
+    const oldKey = { ...key, configHash: "old-config-hash" };
+    const old = spare({ key: oldKey, labels: { ...spare().labels, configHash: oldKey.configHash },
+      name: `paperclip-spare:ready:${oldKey.configHash}` });
+    const { ops } = operations([old]);
+    const keeper = new ReadySpareKeeper(() => start, 12, claimStore());
+    await keeper.reconcile(oldKey, 1, ops);
+    await expect(keeper.claimWithOutcome(key, "new-config-attempt", 1800, ops)).resolves.toEqual({ outcome: "cold", reason: "config_mismatch" });
+  });
+
   it("skips any spare with a persisted claim row after keeper restart", async () => {
     const alreadyClaimed = spare();
     const db = {
