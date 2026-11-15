@@ -24,7 +24,7 @@ import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt,
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { PgDialect } from "drizzle-orm/pg-core";
-import type { SQL } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
 import {
   access,
   chmod,
@@ -144,6 +144,9 @@ import type { StorageProvider } from "../../storage/types.js";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import { createObjectRunLogStore } from "../object-run-log-store.js";
 import * as offLoopFileWork from "./off-loop-file-work.js";
+import * as executionTargetTools from "@paperclipai/adapter-utils/execution-target";
+import * as runtimeContextService from "./runtime-context.js";
+import { warmAgentFilesRefreshFixture } from "../../__tests__/helpers/warm-agent-files-refresh.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
@@ -12618,6 +12621,82 @@ describe("native warm session supervision", () => {
       expect(f.copy.collectStopped).not.toHaveBeenCalled();
       expect(secondCopy.collectStopped).toHaveBeenCalledOnce();
     });
+
+    it.each(["NOTES", "entry", "skill", "not-warm-saved", "environment", "target", "transfer-failure"] as const)("refreshes a canonical-only warm change safely: %s", async change => {
+      const f = await warmAgentFilesRefreshFixture();
+      let reservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
+      const transfer = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime");
+      try {
+        const a = await f.prepare("session-a"), b = await f.prepare("session-b");
+        expect(a.context.skills).toHaveLength(1);
+        const sessionA = { close: vi.fn(async () => undefined) }, sessionB = { close: vi.fn(async () => undefined) };
+        const executionFor = (prepared: typeof a, name: string) => ({ ...execution,
+          binding: { ...execution.binding, companyId: f.companyId, agentId: f.agentId, runId: prepared.copy.runId, executionWorkspaceId: name },
+          session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+          runtimeContext: prepared.context,
+        });
+        const first = executionFor(a, "refresh-session-a"), other = executionFor(b, "refresh-session-b");
+        const copyFor = (copy: typeof a.copy, target: typeof a.target) => ({ runId: copy.runId, root: copy.executionRoot,
+          checkpointWarm: async () => (await f.copies.checkpointWarm({ companyId: f.companyId, runId: copy.runId, target }))?.state === "warm_saved",
+          collectStopped: async () => { await f.copies.collectStopped({ companyId: f.companyId, runId: copy.runId, target }); },
+          hasChanges: async () => false,
+        });
+        state.execute.mockReset().mockImplementationOnce(async options => { await options.onSession?.(sessionA); return result; });
+        await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "refresh-a", runnerExecutionTarget: a.target,
+          instructionWorkingCopy: copyFor(a.copy, a.target) });
+        state.execute.mockImplementationOnce(async options => {
+          await writeFile(join(b.copy.executionRoot, change === "entry" ? "AGENTS.md" : change === "skill" ? "skills/reviewer/SKILL.md" : "NOTES.md"), "Saved by the other warm session\n");
+          await options.onSession?.(sessionB); return result;
+        });
+        await executePaperclipNativeSession({ db: leaseDb(other), execution: other, runnerInstanceId: "refresh-b", runnerExecutionTarget: b.target,
+          instructionWorkingCopy: copyFor(b.copy, b.target) });
+        expect(sessionA.close).not.toHaveBeenCalled();
+        expect(sessionB.close).not.toHaveBeenCalled();
+        expect((await f.copies.get(f.companyId, b.copy.runId))?.state).toBe("warm_saved");
+        if (change === "not-warm-saved") await f.db.update(agentInstructionWorkingCopies).set({ state: "prepared" }).where(eq(agentInstructionWorkingCopies.runId, a.copy.runId));
+        const runId = await f.nextRun();
+        transfer.mockClear();
+        if (change === "transfer-failure") transfer.mockRejectedValueOnce(new Error("refresh transfer failed"));
+        const refresh = vi.fn(async (runtimeContext: typeof a.context) => f.copies.refreshWarm({ companyId: f.companyId, agentId: f.agentId,
+          runId: a.copy.runId, target: a.target, canRefresh: (canonicalRoot, entryFile) => runtimeContextService.canRefreshNativeAgentFiles({
+            runtimeContext, canonicalRoot, entryFile, runtimeConfig: f.runtimeConfig, runtimeSkillEntries: f.runtimeSkillEntries, adapterType: f.agent.adapterType,
+          }) }));
+        reservation = await reserveWarmNativeInstructionDirectory({ companyId: f.companyId, agentId: f.agentId, previousRunId: a.copy.runId, runId,
+          target: change === "environment" ? { ...a.target, environmentId: randomUUID() } : change === "target" ? { ...a.target, remoteCwd: join(f.home, "another-target") } : a.target,
+          canReuse: () => f.copies.canReuseWarm(f.companyId, f.agentId, a.copy.runId), refresh });
+        if (change !== "NOTES") {
+          expect(reservation).toBeNull();
+          expect(sessionA.close).toHaveBeenCalledOnce();
+          expect(sessionB.close).not.toHaveBeenCalled();
+          if (["not-warm-saved", "environment", "target", "entry"].includes(change)) expect(refresh).not.toHaveBeenCalled();
+          return;
+        }
+        expect(reservation).not.toBeNull();
+        expect(sessionA.close).not.toHaveBeenCalled();
+        expect(refresh).toHaveBeenCalledOnce();
+        const refreshTransfers = transfer.mock.calls.filter(([input]) => input.adapterKey === "agent-files" && input.syncWorkspace && !input.workspaceInboundMode);
+        expect(refreshTransfers).toHaveLength(1);
+        expect(await readFile(join(a.copy.executionRoot, "NOTES.md"), "utf8")).toBe("Saved by the other warm session\n");
+        expect(await readFile(join(a.copy.localRoot, "NOTES.md"), "utf8")).toBe("Saved by the other warm session\n");
+        const refreshed = (await f.copies.get(f.companyId, a.copy.runId))!;
+        expect(refreshed.baseHash).not.toBe(a.copy.baseHash);
+        const successor = (await f.copies.prepare({ companyId: f.companyId, agentId: f.agentId, runId, cwd: f.home,
+          target: a.target, warm: true, reuseRunId: a.copy.runId }))!;
+        const nextCopy = copyFor(successor, a.target);
+        reservation!.adopt(successor.executionRoot, nextCopy.collectStopped);
+        state.execute.mockImplementationOnce(async options => { expect(options.existingSession).toBe(sessionA); await options.onSession?.(sessionA); return result; });
+        await executePaperclipNativeSession({ db: leaseDb({ ...first, binding: { ...first.binding, runId } }),
+          execution: { ...first, binding: { ...first.binding, runId } }, runnerInstanceId: "refresh-a", runnerExecutionTarget: a.target, instructionWorkingCopy: nextCopy });
+        await reservation!.release();
+        expect(sessionA.close).not.toHaveBeenCalled();
+        expect((await f.copies.get(f.companyId, runId))?.receipt?.checkpointState).toBe("unchanged");
+      } finally {
+        transfer.mockRestore();
+        await reservation?.release();
+        await closeIdleWarmNativeSessionsForRestart();
+        await f.cleanup();
+      }
+    }, 90_000);
 
     it("stops before collecting when a checkpoint cannot stabilize", async () => {
       const f = await start("managed-fallback", false);
