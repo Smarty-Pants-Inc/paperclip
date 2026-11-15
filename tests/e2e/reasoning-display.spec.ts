@@ -345,8 +345,10 @@ async function piNativeEvents(runId: string, startedAt: number) {
       seq: index + 1, eventType: event.eventType, stream: "system", level: "info", sourceInstanceId: "pi-runner",
       sourceEventId, sourceSeq: index + 1, protocolSchemaVersion: 1, createdAt: new Date(emittedAt),
       payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId, sourceSeq: index + 1,
-        sourceInstanceId: "pi-runner", sourceKind: "runner", priority: 1, runId, normalizedSessionId: `pi-session-${runId}`,
-        emittedAt, ...event } },
+        sourceInstanceId: "pi-runner", sourceKind: "runner", priority: 1, normalizedSessionId: `pi-session-${runId}`,
+        // Captured tool events carry runId: "pi-capture". The generated run
+        // owns this envelope, just as it owns the heartbeatRunEvents row.
+        emittedAt, ...event, runId } },
     };
   });
 }
@@ -372,6 +374,7 @@ async function seedPiChat(request: APIRequestContext) {
   const runId = randomUUID();
   const startedAt = Date.now() - 60_000;
   const events = await piNativeEvents(runId, startedAt);
+  expect(events.every((event) => event.payload.prpEvent.runId === runId)).toBe(true);
   await db.insert(heartbeatRuns).values({
     id: runId, companyId: company.id, agentId: agent!.id, issueId: issue.id, nativeIssueId: issue.id,
     invocationSource: "assignment", status: "succeeded", runtimeMode: "native", nativePhase: "committed",
@@ -442,6 +445,16 @@ test("reasoning display: Paul's Smarty (paperclip_runner, pi_rpc) shows reasonin
         for (const left of block.lineLefts) expect(Math.abs(left - geometry.answerLeft!), JSON.stringify(geometry)).toBeLessThanOrEqual(0.5);
       }
       await capture(page, `pi-default-${viewport.name}-${theme}`);
+      // Tool activity may be folded, but it must survive native projection.
+      const command = page.getByText("printf 'pi-native-tool-ok\\n'", { exact: false }).first();
+      if (!(await command.isVisible())) {
+        await page.getByRole("button", { name: /^Ran (?:a |\\d+ )?commands?$/ }).click();
+      }
+      await expect(command).toBeVisible();
+      if (viewport.name === "1440" && theme === "dark") {
+        await command.scrollIntoViewIfNeeded();
+        await capture(page, "pi-toolrow-1440-dark");
+      }
       await context.close();
     }
     if (SHOTS) await writeFile(path.join(SHOTS, "pi-default-measured.json"), JSON.stringify(report, null, 2));
