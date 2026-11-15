@@ -121,7 +121,7 @@ function compatibleInstallation<T extends ProviderPackIdentity>(
   return structuredClone(actual);
 }
 
-export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, memoScope, onMemoHit }: {
+export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({ runner, cwd, packRoot, manifest, installation, provider, requireExactIdentity = false, requireCurrentOpenCodeProxy = false, memoScope, onMemoHit, acceptProvenance = false }: {
   runner: CommandManagedRuntimeRunner;
   cwd: string;
   packRoot: string;
@@ -132,6 +132,7 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   requireCurrentOpenCodeProxy?: boolean;
   memoScope?: string;
   onMemoHit?: (startedAtMs: number, endedAtMs: number) => Promise<void>;
+  acceptProvenance?: boolean;
 }): Promise<T> {
   const nativePi = manifest.payload.nativeProviders?.pi_rpc;
   if (provider?.kind === "pi_rpc" && !nativePi) {
@@ -147,9 +148,9 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   if (memoScope) {
     return verifyWithRemoteProviderPackMemo({ runner, cwd, packRoot, scope: memoScope, onMemoHit,
       expectedIdentity: createHash("sha256").update(canonicalProviderPackJson({ manifest, provider,
-        requireExactIdentity, requireCurrentOpenCodeProxy })).digest("hex") },
+        requireExactIdentity, requireCurrentOpenCodeProxy, ...(acceptProvenance ? { acceptProvenance } : {}) })).digest("hex") },
     resolvedRoot => verifyRemoteProviderPack({ runner, cwd, packRoot: resolvedRoot, manifest, provider,
-      requireExactIdentity, requireCurrentOpenCodeProxy }));
+      requireExactIdentity, requireCurrentOpenCodeProxy, acceptProvenance }));
   }
   const expected = Buffer.from(
     canonicalProviderPackJson(manifest),
@@ -170,7 +171,10 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const canonical=(v)=>Array.isArray(v)?'['+v.map(canonical).join(',')+']':v&&typeof v==='object'?'{'+Object.keys(v).sort().map(k=>JSON.stringify(k)+':'+canonical(v[k])).join(',')+'}':JSON.stringify(v)",
     "let manifest;try{manifest=JSON.parse(actual)}catch{fail('manifest_invalid','provider pack manifest invalid')}",
     "const differing=(a,b)=>[...new Set([...Object.keys(a||{}),...Object.keys(b||{})])].sort().filter(k=>canonical((a||{})[k])!==canonical((b||{})[k]))",
-    "if(canonical(manifest)!==expected){const wanted=JSON.parse(expected);const keys=differing(manifest,wanted).flatMap(k=>k==='payload'?differing(manifest.payload,wanted.payload):k==='digest'?[]:[k]);fail('manifest_mismatch:'+keys.join(',').slice(0,90),'manifest mismatch')}",
+    "const provenance=process.argv[3]==='provenance'",
+    "const content=(m)=>{const c=JSON.parse(JSON.stringify(m??null))??{};delete c.digest;if(c.payload&&typeof c.payload==='object'){delete c.payload.runnerSourceRevision;delete c.payload.runnerInputsDigest}return canonical(c)}",
+    "const sealed=manifest?.digest==='sha256:'+crypto.createHash('sha256').update(canonical(manifest?.payload)).digest('hex')",
+    "if(canonical(manifest)!==expected&&!(provenance&&sealed&&content(manifest)===content(JSON.parse(expected)))){const wanted=JSON.parse(expected);const keys=differing(manifest,wanted).flatMap(k=>k==='payload'?differing(manifest.payload,wanted.payload):k==='digest'?[]:[k]);fail('manifest_mismatch:'+keys.join(',').slice(0,90),'manifest mismatch')}",
     "const hash=(p)=>{try{return 'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(path.join(root,p))).digest('hex')}catch{return 'unreadable'}}",
     "const walk=(treeRoot)=>{const digest=crypto.createHash('sha256');const visit=(directory,prefix='')=>{for(const entry of fs.readdirSync(directory,{withFileTypes:true}).sort((a,b)=>a.name<b.name?-1:a.name>b.name?1:0)){const relative=prefix?prefix+'/'+entry.name:entry.name;const absolute=path.join(directory,entry.name);if(entry.isDirectory()){digest.update('directory\\0'+relative+'\\n');visit(absolute,relative)}else if(entry.isFile()){digest.update('file\\0'+relative+'\\0'+'sha256:'+crypto.createHash('sha256').update(fs.readFileSync(absolute)).digest('hex')+'\\n')}else if(entry.isSymbolicLink()){digest.update('symlink\\0'+relative+'\\0'+fs.readlinkSync(absolute)+'\\n')}else throw new Error('unsupported dist entry '+relative)}};visit(treeRoot);return 'sha256:'+digest.digest('hex')}",
     "const tree=(treeRoot)=>{try{return walk(treeRoot)}catch{return 'unreadable'}}",
@@ -187,14 +191,16 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
     "const packageVersion=(pkg)=>{try{return JSON.parse(fs.readFileSync(path.join(root,'node_modules',...pkg.split('/'),'package.json'),'utf8')).version}catch{return null}}",
     "const expectedPackages={acpx:manifest.payload.pins.acpx,'@agentclientprotocol/claude-agent-acp':manifest.payload.pins.claudeAcp,'@agentclientprotocol/codex-acp':manifest.payload.pins.codexAcp,'opencode-ai':manifest.payload.pins.opencode}",
     "for(const [pkg,version] of Object.entries(expectedPackages))if(packageVersion(pkg)!==version)fail('package_version:'+pkg,pkg+' version mismatch')",
+    "if(provenance)process.stdout.write('\\npaperclip-pack-manifest='+Buffer.from(canonical(manifest)).toString('base64')+'\\n')",
   ].join(";");
-  await withProviderPackCheck("pack", () => runRemoteProviderVerification(() => runner.execute({
+  const verified = await withProviderPackCheck("pack", () => runRemoteProviderVerification(() => runner.execute({
     command: providerNodeCommand,
-    args: ["-e", verifyScript, packRoot, expected],
+    args: ["-e", verifyScript, packRoot, expected, ...(acceptProvenance ? ["provenance"] : [])],
     cwd: cwd,
     bypassSession: true,
     timeoutMs: 120_000,
   }), "provider pack verification"));
+  const selected = acceptProvenance ? sameContentManifest(manifest, verified.stdout) : manifest;
   const opencodeCommand = posix.join(
     packRoot,
     manifest.payload.artifacts.opencodeCommand.path,
@@ -211,5 +217,27 @@ export async function verifyRemoteProviderPack<T extends ProviderPackIdentity>({
   ) {
     throw providerPackIncompatible("opencode_version", "OpenCode version mismatch");
   }
-  return structuredClone(manifest);
+  return structuredClone(selected);
+}
+
+const PROVENANCE_FIELDS = ["runnerSourceRevision", "runnerInputsDigest"] as const;
+
+export function providerPackContent(manifest: ProviderPackIdentity): string {
+  const payload: Record<string, unknown> = { ...manifest.payload };
+  for (const field of PROVENANCE_FIELDS) delete payload[field];
+  return canonicalProviderPackJson({ schema: manifest.schema, payload });
+}
+
+function sameContentManifest<T extends ProviderPackIdentity>(expected: T, stdout: string): T {
+  const encoded = /paperclip-pack-manifest=([A-Za-z0-9+/=]{1,200000})/.exec(stdout)?.[1];
+  let installed: T | null = null;
+  try { installed = encoded ? JSON.parse(Buffer.from(encoded, "base64").toString("utf8")) as T : null; } catch {}
+  if (!installed?.payload || installed.schema !== expected.schema
+    || installed.digest !== `sha256:${createHash("sha256").update(canonicalProviderPackJson(installed.payload)).digest("hex")}`
+    || providerPackContent(installed) !== providerPackContent(expected)
+    || !/^[0-9a-f]{40}(?:-dirty)?$/.test(installed.payload.runnerSourceRevision)
+    || (installed.payload.runnerInputsDigest !== undefined && !/^[0-9a-f]{64}$/.test(installed.payload.runnerInputsDigest))) {
+    throw providerPackIncompatible("installed_manifest_invalid", "installed provider pack identity is invalid");
+  }
+  return installed;
 }
