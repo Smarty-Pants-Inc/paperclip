@@ -78,6 +78,8 @@ export interface UpdateAgentOptions {
   requireSubordinateManagement?: boolean;
   /** Server-derived actor, reauthorized inside the company-locked writer. */
   reportRuntimeActor?: AuthorizationActor;
+  /** Separate from env admission: a binding-only PATCH has no env mutation. */
+  reportAiBindingActor?: AuthorizationActor;
   expectedConfigurationRevision?: string;
   expectedConfiguration?: Pick<AgentConfigurationRecord, "adapterType" | "adapterConfig" | "runtimeConfig" | "defaultEnvironmentId">;
   recordRevision?: RevisionMetadata;

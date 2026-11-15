@@ -17,10 +17,14 @@ export function isConnectionManagementAction(action: string): action is Connecti
   return Object.hasOwn(CONNECTION_MANAGEMENT_PERMISSIONS, action);
 }
 
+/** Server-selected only after shared-report admission, never from request input. */
+export const ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION = "agent.ai-binding.assign-shared-report";
+
 /** Assignment writes change only named recipients, not the shared resource or
  * its other consumers. Keep the operation allowlist exact. */
 export function isToolAssignmentOperation(operation: string): boolean {
-  return operation === "PUT /tool-connections/:connectionId/installs"
+  return operation === ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION
+    || operation === "PUT /tool-connections/:connectionId/installs"
     || operation === "POST /companies/:companyId/tools/profiles/:profileId/bind"
     || operation === "POST /companies/:companyId/tools/profiles/:profileId/unbind";
 }

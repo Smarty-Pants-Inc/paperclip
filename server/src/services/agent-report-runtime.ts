@@ -1,10 +1,11 @@
-import { companySecretBindings, type Db } from "@paperclipai/db";
-import { envBindingSchema } from "@paperclipai/shared";
+import { agents, companySecretBindings, connectionGrants, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
+import { aiRuntimeConnectionBindingSchema, envBindingSchema } from "@paperclipai/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { forbidden, HttpError } from "../errors.js";
 import { assertCanManageSubordinateAgent } from "./agent-subtree-management.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { secretService } from "./secrets.js";
+import { aiConnectionService } from "./ai-connections.js";
 
 type Target = { id: string; companyId: string; adapterType: string };
 export const REPORT_RUNTIME_PERMISSION = "agents:configure-reports-runtime" as const;
@@ -26,6 +27,42 @@ export async function canConfigureReportRuntime(db: Db, actor: AuthorizationActo
     scope: { targetAgentId: target.id },
   });
   return decision.allowed;
+}
+
+/** Classify only an existing company-owned account assignment to a current
+ * Runner report. Other selections keep their existing management path. An actor
+ * grants only what it can resolve, under its authenticated responsible user. */
+export async function canAssignSharedReportAiConnection(
+  db: Db, actor: AuthorizationActor, target: Target,
+  next: { adapterType: string; adapterConfig: Record<string, unknown>; binding: unknown },
+): Promise<boolean> {
+  const binding = aiRuntimeConnectionBindingSchema.safeParse(next.binding).data;
+  if (next.adapterType !== target.adapterType || binding?.mode !== "shared"
+    || !await canConfigureReportRuntime(db, actor, target)) return false;
+  const [account] = await db.select({ connection: toolConnections, grant: connectionGrants })
+    .from(toolConnections).innerJoin(connectionGrants, and(
+      eq(connectionGrants.connectionId, toolConnections.id), eq(connectionGrants.companyId, toolConnections.companyId),
+    )).where(and(eq(toolConnections.companyId, target.companyId), eq(toolConnections.id, binding.connectionId),
+      eq(connectionGrants.id, binding.grantId), eq(connectionGrants.kind, "organization"),
+      eq(toolConnections.connectionPurpose, "ai"), eq(toolConnections.transport, "runtime_auth"))).limit(1);
+  if (!account) return false;
+  const [install] = await db.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+    eq(toolConnectionInstalls.companyId, target.companyId), eq(toolConnectionInstalls.connectionId, binding.connectionId),
+    eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, target.companyId),
+  )).limit(1);
+  if (!install) return false;
+  if (!actor.agentId || !actor.onBehalfOfUserId) throw forbidden("Report AI assignment requires the manager's responsible user");
+  const [manager] = await db.select().from(agents).where(and(eq(agents.companyId, target.companyId), eq(agents.id, actor.agentId))).limit(1);
+  if (!manager) throw forbidden("The manager is no longer available in this company");
+  const selector = aiConnectionService(db);
+  const select = (agentId: string, adapterType: string, config: Record<string, unknown>) => selector.select({
+    companyId: target.companyId, userId: actor.onBehalfOfUserId!, agentId, adapterType, binding,
+    model: config.model, runnerProvider: config.provider, acpxAgent: config.acpxAgent,
+  });
+  // No uninstalled-account allowances, borrowed owner identity, or credential reads.
+  await select(manager.id, manager.adapterType, manager.adapterConfig);
+  await select(target.id, next.adapterType, next.adapterConfig);
+  return true;
 }
 
 /** The new exception covers plain and company-secret bindings only. Other
