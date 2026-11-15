@@ -48,12 +48,23 @@ const SPARE_ACTIVITY_NAMESPACE = "boat-ready-spares";
 const SPARE_ACTIVITY_STATE_KEY = "company-activity";
 const SPARE_ACQUIRE_OUTCOMES_STATE_KEY = "acquire-outcomes";
 let activityUnsubscribers: Array<() => void> = [];
+const activitySubscriptionCompanies = new Set<string>();
 let pluginContext: PluginContext | undefined;
 let spareClaimStore: ReadySpareClaimStore | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
 let shuttingDown = false;
 const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
+function subscribeCompanyActivity(companyId: string): void {
+  if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
+  for (const eventType of SPARE_ACTIVITY_EVENTS) {
+    activityUnsubscribers.push(pluginContext.events.on(eventType, { companyId }, async event => {
+      if (event.companyId !== companyId) return;
+      await recordCompanySpareActivity(companyId, false, true);
+    }));
+  }
+  activitySubscriptionCompanies.add(companyId);
+}
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
@@ -871,14 +882,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
-    if (ctx.events?.on) {
-      for (const eventType of SPARE_ACTIVITY_EVENTS) {
-        activityUnsubscribers.push(ctx.events.on(eventType, async event => {
-          if (!event.companyId) return;
-          await recordCompanySpareActivity(event.companyId, false, true);
-        }));
-      }
-    }
+    activitySubscriptionCompanies.clear();
     try {
       spareClaimStore = ctx.db?.namespace && /^[a-z][a-z0-9_]*$/.test(ctx.db.namespace)
         ? createReadySpareClaimStore(ctx.db)
@@ -896,6 +900,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     // the source for Boat credentials and create-shaping fields.
     const companyId = context?.companyId;
     if (!companyId) return;
+    subscribeCompanyActivity(companyId);
     const configuredCount = readySpareCount(newConfig);
     const environments = readySpareEnvironmentIds(newConfig);
     const spareMax = readySpareMax(newConfig);
@@ -945,6 +950,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.stop();
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
+    activitySubscriptionCompanies.clear();
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
     try {

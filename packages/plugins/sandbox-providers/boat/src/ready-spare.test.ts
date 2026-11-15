@@ -99,7 +99,7 @@ function fakeDatabase() {
     }),
   };
 }
-async function setup(spares: number, environmentIds?: string[], idleMinutes = 60, db = fakeDatabase(), spareMax = 3, spareDemandWindowMinutes = 10) {
+async function setup(spares: number, environmentIds?: string[], idleMinutes = 60, db = fakeDatabase(), spareMax = 3, spareDemandWindowMinutes = 10, subscriptionCompany = companyId) {
   explicitEnvironmentIds = environmentIds;
   inferredEnvironmentId = undefined;
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
@@ -120,6 +120,8 @@ async function setup(spares: number, environmentIds?: string[], idleMinutes = 60
       set: vi.fn(async (key: { scopeId?: string; stateKey: string }, value: unknown) => { persistedState.set(`${key.scopeId}:${key.stateKey}`, value); }),
     },
   } as any);
+  await plugin.definition.onConfigChanged!({ spares, spareMax, spareDemandWindowMinutes,
+    spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes }, { companyId: subscriptionCompany } as any);
   return logger;
 }
 function acquire(runId: string, config: Record<string, unknown> = baseConfig, env = environmentId, company = companyId) {
@@ -462,7 +464,7 @@ describe("Boat ready spare", () => {
     let now = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = fixture();
-    await setup(1, [env], 60);
+    await setup(1, [env], 60, fakeDatabase(), 3, 10, company);
     await acquire("run-idle-seed", baseConfig, env, company);
     await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true), { timeout: 2_000 });
     await new Promise(resolve => setTimeout(resolve, 20));
@@ -510,7 +512,7 @@ describe("Boat ready spare", () => {
     let now = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => now);
     const f = fixture();
-    await setup(1, [env], 60);
+    await setup(1, [env], 60, fakeDatabase(), 3, 10, company);
     await acquire("run-company-filter", baseConfig, env, company);
     await vi.waitFor(() => expect(f.inventory.some(item => item.labels.owner === `paperclip:${company}` && item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
     now += 60 * 60_000 + 1;
@@ -573,7 +575,6 @@ describe("Boat ready spare", () => {
 
   it("registers activity subscriptions with the company's invocation scope", async () => {
     await setup(0);
-    await plugin.definition.onConfigChanged!({ spares: 0 }, { companyId } as any);
 
     expect(eventRegistrations.length).toBeGreaterThan(0);
     expect(eventRegistrations.every(registration => registration.filter?.companyId === companyId)).toBe(true);
