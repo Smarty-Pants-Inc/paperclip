@@ -6839,8 +6839,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // Host preparation is the existing verified-backup-first owner. If it
       // finds any runner state, do not reset it or guess its outcome here.
       await this.options.prepareExternalRunnerState?.();
-      if (existsSync(resolve(this.#root, "runner", "runner-state.json"))
-        || await this.options.readRunnerState?.()) throw error;
+      if (existsSync(resolve(this.#root, "runner", "runner-state.json"))) throw error;
+      // The external reader reports a box with no saved Runner state as the
+      // definite absence (exit 66), not as an empty result. Only a governed wait
+      // treats that as "none": its upstream fresh start carries no history, while
+      // the plain policy's replacement session carries the task-history handoff.
+      const externalState = await this.options.readRunnerState?.().catch((readError: unknown) => {
+        if (this.options.providerRecoveryPolicy === "allow_replacement_after_governed_wait" && readError instanceof Error
+          && /^runner_remote_state_unavailable: exit=66 timedOut=false(?:\s|$)/.test(readError.message)) return undefined;
+        throw readError;
+      });
+      if (externalState) throw error;
       this.#piColdResumeThreadId = prior.driverSessionId;
       this.#checkpointProviderIdentityExpectation = {
         driverSessionId: prior.driverSessionId, providerSessionId: prior.providerSessionId,
