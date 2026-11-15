@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, agentWakeupRequests, companies, completionContracts, createDb, heartbeatRuns,
@@ -13,6 +13,8 @@ import { CONTINUATION_CAP_WINDOW_MS, evaluateAssignedWork, type AssignedWorkFact
 import { PaperclipControlPlanePort } from "../services/native-runtime/paperclip-control-plane-port.js";
 import { finalizeNativeRun } from "../services/native-runtime/native-run-finalizer.js";
 import { issueService } from "../services/issues.js";
+import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { settleUnansweredPersonMessage } from "../services/recovery/unanswered-person-message.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
 // Only the execution boundary is controlled. The comment route, persisted wake,
@@ -49,7 +51,7 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
     await temporary?.cleanup();
   });
 
-  async function seed(options: { assignmentWake?: boolean; finalize?: boolean; declared?: boolean } = {}) {
+  async function seed(options: { assignmentWake?: boolean; finalize?: boolean; declared?: boolean; beforeFinalize?: (f: {companyId: string; issueId: string}) => Promise<void> } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
     const contractId = randomUUID(), runnerInstanceId = randomUUID();
     const startedAt = new Date(Date.now() - 10_000);
@@ -94,6 +96,7 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
     terminal: { schema: "paperclip.prp.terminal.v1", runTerminalState: "succeeded", turnTerminalState: "completed", reportedWorkDisposition: "yielded" } });
     const [accepted] = await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId, runId));
     expect(accepted.schemaStatus).toBe("accepted");
+    await options.beforeFinalize?.({ companyId, issueId });
     if (options.finalize !== false) {
       await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
       const [decision] = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId));
@@ -116,6 +119,13 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
   }
 
   function clockAfterYield() { return new Date(Date.now() + 5 * 60_000); }
+
+  async function answerState(f: { companyId: string; issueId: string }, id: string) {
+    const [row] = await db.select({ answered: answeredPersonMessageSql({ id: sql`${issueComments.id}`,
+      companyId: sql`${issueComments.companyId}`, issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }) })
+      .from(issueComments).where(eq(issueComments.id, id));
+    return row.answered;
+  }
 
   it.each([false, true])("TES-89: an answered accepted response_wake creates zero sweep wakes across a full cap window (assignment=%s)", async assignmentWake => {
     const f = await seed({ assignmentWake });
@@ -234,6 +244,49 @@ describePostgres("ordinary assigned tasks awaiting a person's next response", ()
     expect(await assignedWorkSweep(db, { enqueueWakeup, now: clockAfterYield }).checkIssue(f))
       .toMatchObject({ outcome: "ok", verdict: { reason: "awaiting_person" } });
     expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("judge: a confirmation answer between result acceptance and assessment revokes the wait", async () => {
+    let interactionId = "";
+    const f = await seed({ assignmentWake: true, beforeFinalize: async f => {
+      const [row] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+        kind: "request_confirmation", status: "answered", idempotencyKey: randomUUID(),
+        payload: { version: 1, prompt: "Approve the next step?" }, resolvedByUserId: "local-board",
+        createdAt: new Date(Date.now() - 60_000), resolvedAt: new Date() }).returning();
+      interactionId = row.id;
+    } });
+    const enqueueWakeup = queue();
+    const result = await assignedWorkSweep(db, { enqueueWakeup, now: clockAfterYield }).checkIssue(f);
+    const chronology = await db.execute(sql`select r.created_at::text as result_accepted_at,
+      greatest(t.created_at,t.updated_at,t.resolved_at)::text as confirmation_answer_at, a.created_at::text as assessment_at,
+      (r.created_at < greatest(t.created_at,t.updated_at,t.resolved_at) and greatest(t.created_at,t.updated_at,t.resolved_at) < a.created_at) as answer_between_acceptance_and_assessment
+      from native_run_results r join work_assessments a on a.result_id = r.id
+      join issue_thread_interactions t on t.id = ${interactionId}::uuid where r.run_id = ${f.runId}::uuid`);
+    console.info(JSON.stringify({ judgeInteractionDuringFinalize: { result, attempts: enqueueWakeup.mock.calls.length, chronology } }));
+    expect(result).toMatchObject({ outcome: "repaired" });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("judge: an unanswered message arriving after the answer but before finalization must not be swallowed", async () => {
+    let freshId = "";
+    const f = await seed({ assignmentWake: true, beforeFinalize: async f => {
+      const [row] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: "local-board", body: "Actually, next do AMBER." }).returning();
+      freshId = row.id;
+    } });
+    expect(await answerState(f, freshId)).toBe(false);
+    const notice = await settleUnansweredPersonMessage(db, { ...f, now: clockAfterYield() });
+    expect(notice).toMatchObject({ kind: "noticed", code: "no_run" });
+    const enqueueWakeup = queue();
+    const result = await assignedWorkSweep(db, { enqueueWakeup, now: clockAfterYield }).checkIssue(f);
+    const chronology = await db.execute(sql`select r.schema_status, r.created_at::text as result_accepted_at,
+      c.created_at::text as new_person_message_at, a.created_at::text as assessment_at,
+      (r.created_at < c.created_at and c.created_at < a.created_at) as message_between_acceptance_and_assessment
+      from native_run_results r join work_assessments a on a.result_id = r.id
+      join issue_comments c on c.id = ${freshId}::uuid where r.run_id = ${f.runId}::uuid`);
+    console.info(JSON.stringify({ judgeDuringFinalize: { result, attempts: enqueueWakeup.mock.calls.length, notice, chronology } }));
+    expect(result).toMatchObject({ outcome: "repaired" });
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
   });
 
   it("a lost run owner is still recovered after an accepted response wait", async () => {
