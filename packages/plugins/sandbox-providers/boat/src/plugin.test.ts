@@ -52,15 +52,14 @@ describe("Boat provider", () => {
     expect(fetch.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
     vi.useRealTimers();
   });
-  it("creates one private lease directory then uses three requests for execute-with-env", async () => {
+  it("creates one private lease directory and stages once for execute-with-env", async () => {
     const fetch = vi.fn(async (_url: string, init: RequestInit) => response(init.method === "POST" ? { exitCode: 0, stdout: "ok", stderr: "" } : { success: true })); vi.stubGlobal("fetch", fetch);
     await plugin.definition.onEnvironmentExecute?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg,
       lease: { providerLeaseId: "bx_1" }, command: "true", args: [], env: { BOAT_SECRET: "sensitive-value" }, timeoutMs: 5000 });
-    expect(fetch).toHaveBeenCalledTimes(4);
-    expect(fetch.mock.calls.map(([, init]) => init.method)).toEqual(["POST", "PUT", "POST", "DELETE"]);
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(fetch.mock.calls.map(([, init]) => init.method)).toEqual(["POST", "PUT", "POST"]);
     const setupCommand = JSON.parse(String(fetch.mock.calls[0][1]?.body)).command as string;
     expect(setupCommand).toContain("/bin/mkdir -p -m 0700"); expect(setupCommand).toContain("test ! -L");
-    expect(String(fetch.mock.calls[3][0])).toMatch(/^https:\/\/boat\.dev\/api\/v1\/sandboxes\/bx_1\/files\?path=%2Ftmp%2Fpaperclip-boat-env-.*\.sh$/);
     const command = JSON.parse(String(fetch.mock.calls[2][1]?.body)).command as string;
     expect(command).toContain("/bin/chmod 600"); expect(command).not.toContain("sensitive-value"); expect(command).not.toContain("BOAT_SECRET");
     expect(String(fetch.mock.calls[1][1]?.body)).toContain("sensitive-value");
@@ -74,7 +73,7 @@ describe("Boat provider", () => {
     expect(staged.some(file => file.content === "export FOO='a'\"'\"'b'\n")).toBe(true);
     const cmd = fetch.mock.calls.filter(([, init]) => init.method === "POST").map(([, init]) => JSON.parse(String(init.body)).command).at(-1);
     expect(cmd).toContain("cd '/tmp/my dir'"); expect(cmd).not.toContain("FOO="); expect(cmd).toContain("'printf' 'a'\"'\"'b'"); expect(cmd).toContain("< '/tmp/paperclip-stdin-");
-    expect(fetch.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(2);
+    expect(fetch.mock.calls.filter(([, init]) => init.method === "DELETE")).toHaveLength(1);
   });
   it("caps the synchronous timeout at 600 seconds and preserves provider timeout results", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ exitCode: null, timedOut: true, stdout: "partial", stderr: "timeout" })); vi.stubGlobal("fetch", fetch);

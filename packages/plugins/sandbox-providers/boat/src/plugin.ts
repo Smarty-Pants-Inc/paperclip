@@ -56,6 +56,16 @@ let spareMaintenanceWork: Promise<void> | undefined;
 let shuttingDown = false;
 let boatRateLimitPauseUntil = 0;
 const preparedEnvDirectories = new Map<string, string>();
+const preparedEnvFiles = new Map<string, Map<string, string>>();
+const envExecutionTails = new Map<string, Promise<void>>();
+async function lockEnvExecution(id: string): Promise<() => void> {
+  const previous = envExecutionTails.get(id) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  envExecutionTails.set(id, current);
+  await previous;
+  return () => { release(); if (envExecutionTails.get(id) === current) envExecutionTails.delete(id); };
+}
 const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
 function subscribeCompanyActivity(companyId: string): void {
   if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
@@ -563,8 +573,8 @@ async function cleanupAcquisition(config: Config, ids: string[], owner: { compan
 }
 function privateEnvDirectory(id: string, roots: string[] = []): string | null {
   const suffix = createHash("sha256").update(id).digest("hex").slice(0, 24);
-  return [`/tmp/paperclip-boat-env-${suffix}`, `/home/user/.paperclip-boat-env-${suffix}`]
-    .find(path => roots.every(root => path !== root && !path.startsWith(root === "/" ? root : `${root}/`))) ?? null;
+  const path = `/tmp/paperclip-boat-env-${suffix}`;
+  return roots.every(root => path !== root && !path.startsWith(root === "/" ? root : `${root}/`)) ? path : null;
 }
 async function ensurePrivateEnvDirectory(config: Config, id: string, roots: string[] = []): Promise<string> {
   const existing = preparedEnvDirectories.get(id);
@@ -577,6 +587,17 @@ async function ensurePrivateEnvDirectory(config: Config, id: string, roots: stri
   if (result.exitCode !== 0 || result.timedOut) throw new Error("Boat private env directory verification failed");
   preparedEnvDirectories.set(id, directory);
   return directory;
+}
+async function deleteEnvFiles(config: Config, id: string): Promise<void> {
+  const hadEnvState = preparedEnvFiles.has(id) || preparedEnvDirectories.has(id);
+  preparedEnvFiles.delete(id);
+  preparedEnvDirectories.delete(id);
+  if (!hadEnvState) return;
+  try {
+    await request(config, `/sandboxes/${encodeURIComponent(id)}/files?path=${encodeURIComponent(`/tmp/paperclip-boat-env-${createHash("sha256").update(id).digest("hex").slice(0, 24)}`)}&recursive=true`, { method: "DELETE" });
+  } catch {
+    duplexLogger?.warn("Boat private env directory cleanup failed", { providerLeaseId: id });
+  }
 }
 async function runCommand(config: Config, id: string, command: string, timeoutMs: number, cwd?: string, signal?: AbortSignal): Promise<PluginEnvironmentExecuteResult> {
   const timeoutSeconds = Math.max(1, Math.min(600, Math.ceil(timeoutMs / 1000)));
@@ -792,6 +813,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return outcome;
     },
     async claim(spare, name, claimTtlSeconds) {
+      await deleteEnvFiles(config, spare.id);
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
       }, false, { requireJson: true });
@@ -987,6 +1009,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     shuttingDown = false;
     boatRateLimitPauseUntil = 0;
     preparedEnvDirectories.clear();
+    preparedEnvFiles.clear();
+    envExecutionTails.clear();
     readySpares.start();
     knownSparePools.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
@@ -1283,7 +1307,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
     await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config), id = params.providerLeaseId;
-    preparedEnvDirectories.delete(id);
+    await deleteEnvFiles(c, id);
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     await sshCarrier.invalidate({ ...params, providerLeaseId: id });
     const metadata = params.leaseMetadata;
@@ -1367,7 +1391,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     await recordCompanySpareActivity(params.companyId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config); const id = params.providerLeaseId;
-    preparedEnvDirectories.delete(id);
+    await deleteEnvFiles(c, id);
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: id });
     // Lifecycle hooks issue no guest command; leave the now-empty private env directory rather than add one solely for cleanup.
@@ -1378,7 +1402,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentStopLease(params: PluginEnvironmentReleaseLeaseParams) {
     if (!params.providerLeaseId) throw new Error("Boat stop requires an exact providerLeaseId");
     const c = parse(params.config);
-    preparedEnvDirectories.delete(params.providerLeaseId);
+    await deleteEnvFiles(c, params.providerLeaseId);
     await duplexChannels.suspend({ ...params, providerLeaseId: params.providerLeaseId });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: params.providerLeaseId });
     const receipt = await stopSandbox(c, params.providerLeaseId);
@@ -1388,7 +1412,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentDestroyLease(params: PluginEnvironmentDestroyLeaseParams) {
     if (!params.providerLeaseId) return;
     const c = parse(params.config);
-    preparedEnvDirectories.delete(params.providerLeaseId);
+    await deleteEnvFiles(c, params.providerLeaseId);
     if (params.leaseMetadata?.failedCreateCleanup !== undefined) {
       const cleanup = readEnvironmentCreationCleanupError({ data: { schema: "paperclip/environment-creation-cleanup/v1", cleanup: params.leaseMetadata.failedCreateCleanup } });
       if (!cleanup || cleanup.companyId !== params.companyId || cleanup.environmentId !== params.environmentId ||
@@ -1458,6 +1482,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentExecute(params: PluginEnvironmentExecuteParams): Promise<PluginEnvironmentExecuteResult> {
     const id = params.lease.providerLeaseId; if (!id) return { exitCode: 1, timedOut: false, stdout: "", stderr: "No Boat lease ID available." };
     const c = parse(params.config); validEnv(params.env);
+    const unlock = await lockEnvExecution(id);
     let stdinPath: string | null = null, envPath: string | null = null;
     const base = `/sandboxes/${encodeURIComponent(id)}/files`;
     const stage = async (path: string, content: string, kind: "stdin" | "env") => {
@@ -1477,24 +1502,20 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     let envRecoveryUsed = false;
     try {
       const env = Object.entries(params.env ?? {});
+      let envHash: string | undefined;
       if (env.length) {
-        // Never include values (or names) in Boat's retained command text.
-        // Keep files outside BOTH the exec cwd and the recorded copyback root.
-        const directory = await ensurePrivateEnvDirectory(c, id, roots);
-        const uuid = randomUUID();
-        envPath = `${directory}/${uuid}.sh`;
-        if (!roots.every(root => envPath !== root && !envPath!.startsWith(root === "/" ? root : `${root}/`))) throw new Error("Boat env file requires a private path outside the workspace.");
-        // The lease directory is verified private before Boat can write any secret.
         const envContent = env.map(([k, v]) => `export ${k}=${q(v)}\n`).join("");
-        try { await stage(envPath, envContent, "env"); }
-        catch (error) {
-          if (envRecoveryUsed || !/(?:404|not found|no such file|missing)/i.test(String(error))) throw error;
-          envRecoveryUsed = true;
-          await request(c, `${base}?path=${encodeURIComponent(envPath)}`, { method: "DELETE" }).catch(() => undefined);
-          preparedEnvDirectories.delete(id);
-          const retryDir = await ensurePrivateEnvDirectory(c, id, roots);
-          envPath = `${retryDir}/${randomUUID()}.sh`;
+        envHash = createHash("sha256").update(envContent).digest("hex");
+        const directory = await ensurePrivateEnvDirectory(c, id, roots);
+        const files = preparedEnvFiles.get(id) ?? new Map<string, string>();
+        preparedEnvFiles.set(id, files);
+        envPath = files.get(envHash) ?? null;
+        if (!envPath) {
+          envPath = `${directory}/env-${randomUUID()}.sh`;
+          if (!roots.every(root => envPath !== root && !envPath!.startsWith(root === "/" ? root : `${root}/`))) throw new Error("Boat env file requires a private path outside the workspace.");
           await stage(envPath, envContent, "env");
+          files.clear();
+          files.set(envHash, envPath);
         }
       }
       if (params.stdin !== undefined) {
@@ -1502,24 +1523,29 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         await stage(stdinPath, params.stdin, "stdin");
       }
       const invocation = [q(params.command), ...(params.args ?? []).map(q)].join(" ");
-      // Absolute cleanup utilities still work when the caller overrides PATH.
-      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && ` : "";
-      const wrapped = `${params.cwd ? (envPath ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : `cd ${q(params.cwd)} && `) : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-      let result = await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+      const envPrelude = (path: string) => {
+        const directory = posix.dirname(path), name = posix.basename(path);
+        return `umask 077 && test -O ${q(path)} && test ! -L ${q(path)} && /bin/chmod 600 -- ${q(path)} && . ${q(path)} && /usr/bin/find ${q(directory)} -maxdepth 1 -name 'env-*.sh' ! -name ${q(name)} -delete || exit 197 && `;
+      };
+      const wrap = (path: string | null) => `${params.cwd ? (path ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : `cd ${q(params.cwd)} && `) : ""}${path ? envPrelude(path) : ""}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
+      let result = await runCommand(c, id, wrap(envPath), params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
       if (!envRecoveryUsed && envPath && result.exitCode === 197) {
         envRecoveryUsed = true;
+        preparedEnvFiles.delete(id);
         preparedEnvDirectories.delete(id);
         const retryDir = await ensurePrivateEnvDirectory(c, id, roots);
-        const retryPath = `${retryDir}/${randomUUID()}.sh`;
-        await request(c, `${base}?path=${encodeURIComponent(envPath)}`, { method: "DELETE" }).catch(() => undefined);
-        await stage(retryPath, Object.entries(params.env ?? {}).map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
+        const retryPath = `${retryDir}/env-${randomUUID()}.sh`;
+        const envContent = env.map(([k, v]) => `export ${k}=${q(v)}\n`).join("");
+        await stage(retryPath, envContent, "env");
+        const files = new Map<string, string>([[envHash!, retryPath]]);
+        preparedEnvFiles.set(id, files);
         envPath = retryPath;
-        const retryWrapper = `${params.cwd ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : ""}umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
-        result = await runCommand(c, id, retryWrapper, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
+        result = await runCommand(c, id, wrap(envPath), params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
       }
       return result;
     } finally {
-      for (const path of [envPath, stdinPath]) if (path) await request(c, `${base}?path=${encodeURIComponent(path)}`, { method: "DELETE" }).catch(() => undefined);
+      if (stdinPath) await request(c, `${base}?path=${encodeURIComponent(stdinPath)}`, { method: "DELETE" }).catch(() => undefined);
+      unlock();
     }
   },
 }, leaseActivityKey), idleActivity));

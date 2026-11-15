@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -36,6 +37,8 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
   };
   const fetch = vi.fn(async (input: string | URL | Request, init: RequestInit = {}) => {
     const url = String(input);
+    if (url === `${API}/stop` && init.method === "POST") return json({ operation: { id: "stop_test", status: "pending" } });
+    if (url === API && (init.method ?? "GET") === "GET") return json({ sandbox: { id: "bx_test", state: "archived" } });
     if (url === `${API}/files` && init.method === "PUT") {
       const body = JSON.parse(String(init.body)); expect(body.encoding).toBe("utf8"); store(body.path, body.content); return json({ success: true });
     }
@@ -75,24 +78,55 @@ beforeEach(async () => { await plugin.definition.setup({ logger: { info() {}, wa
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("execute environment files", () => {
-  it("keeps values AND names out of every commands POST; sources then removes the file before exec", async () => {
+  it("RED env-once: same env reuses one random file with no per-execute DELETE", async () => {
+    const f = fixture();
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
+    expect(f.envFiles()).toHaveLength(1);
+    expect(f.deletes.filter(path => path.endsWith(".sh"))).toHaveLength(0);
+    expect(f.commands.filter(body => body.command.includes("exec "))).toHaveLength(2);
+  });
+  it("RED env-once concurrency: concurrent distinct envs on one lease source only their own version", async () => {
+    const f = fixture(undefined, true);
+    const execute = (value: string) => plugin.definition.onEnvironmentExecute!({ ...params, command: "/bin/sh", args: ["-c", "printf '%s' \"$SECRET_X\""], env: { SECRET_X: value } });
+    const [first, second] = await Promise.all([execute("version-one"), execute("version-two")]);
+    expect(first.stdout).toBe("version-one"); expect(second.stdout).toBe("version-two");
+    expect(f.envFiles()).toHaveLength(2); expect(f.envFiles()[0].path).not.toBe(f.envFiles()[1].path);
+    expect(existsSync(f.local(f.envFiles()[0].path))).toBe(false); expect(existsSync(f.local(f.envFiles()[1].path))).toBe(true);
+  });
+  it("RED env-once rotation: next execute uses a new random file and removes the old one", async () => {
+    const f = fixture(undefined, true);
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: "old-value" } });
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: "new-value" } });
+    expect(f.envFiles()).toHaveLength(2);
+    expect(f.envFiles()[1].path).not.toBe(f.envFiles()[0].path);
+    expect(f.commands.at(-1).command).toContain("find ");
+    expect(f.deletes.filter(path => path.endsWith(".sh"))).toHaveLength(0);
+    expect(existsSync(f.local(f.envFiles()[0].path))).toBe(false);
+    expect(existsSync(f.local(f.envFiles()[1].path))).toBe(true);
+  });
+  it("keeps values AND names out of every commands POST; sources persistent file before exec", async () => {
     const f = fixture(undefined, true);
     expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 0 });
     for (const body of f.commands) { expect(JSON.stringify(body)).not.toContain(sentinel); expect(body.command).not.toContain("SECRET_X"); }
     expect(f.envFiles()).toHaveLength(1);
     const path = f.envFiles()[0].path;
     expect(f.envFiles()[0].content).toBe(`export SECRET_X='${sentinel}'\n`);
-    for (const body of f.commands) { expect(JSON.stringify(body)).not.toContain(sentinel); expect(body.command).not.toContain("SECRET_X"); }
+    for (const body of f.commands) { expect(JSON.stringify(body)).not.toContain(sentinel); expect(body.command).not.toContain("SECRET_X");
+      expect(body.command).not.toContain(createHash("sha256").update(`export SECRET_X='${sentinel}'\n`).digest("hex")); }
     const command = f.commands.at(-1).command;
     expect(command).toContain(`. '${path}'`);
+    expect(command).toContain("test -O "); expect(command).toContain("test ! -L ");
+    expect(command.indexOf("test -O ")).toBeLessThan(command.indexOf("exec "));
+    expect(command.indexOf("test ! -L ")).toBeLessThan(command.indexOf("exec "));
     expect(command.indexOf("/bin/chmod 600")).toBeLessThan(command.indexOf(`. '${path}'`));
-    expect(command.indexOf("rm -f --")).toBeLessThan(command.indexOf("exec "));
-    expect(command).not.toContain("rmdir --");
+    expect(command).toContain("/usr/bin/find");
+    expect(command).not.toContain("rm -f --");
     expect(f.modes).toEqual([[0o700], [0o600]]);
     expect(f.commands[0].command).toContain("/bin/mkdir -p -m 0700");
-    expect(f.envFiles()[0].path).toMatch(/^\/tmp\/paperclip-boat-env-[a-f0-9]{24}\/[^/]+\.sh$/);
-    expect(f.deletes).toContain(path); expect(f.deletes).toHaveLength(1);
-    expect(existsSync(f.local(path))).toBe(false);
+    expect(f.envFiles()[0].path).toMatch(/^\/tmp\/paperclip-boat-env-[a-f0-9]{24}\/env-[0-9a-f-]+\.sh$/);
+    expect(f.deletes).toHaveLength(0);
+    expect(existsSync(f.local(path))).toBe(true);
   });
   it("re-verifies the directory and retries only the explicit exit 197 signal", async () => {
     const f = fixture(); const original = f.fetch.getMockImplementation()!; let first = true;
@@ -107,7 +141,7 @@ describe("execute environment files", () => {
     expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(2);
     expect(f.commands.at(-2).command).toContain("|| exit 197");
     expect(f.fetch.mock.calls.filter(([input, init]) => String(input) === `${API}/commands` && init?.method === "POST").map(([, init]) => JSON.parse(String(init!.body)).command).at(-1)).toContain("|| exit 197");
-    expect(f.deletes).toHaveLength(2);
+    expect(f.envFiles()).toHaveLength(2);
   });
   it("does not retry an ordinary nonzero result based on stderr text", async () => {
     const f = fixture(); const original = f.fetch.getMockImplementation()!;
@@ -138,25 +172,26 @@ describe("execute environment files", () => {
     const lastVerify = f.fetch.mock.calls.findLastIndex(([input, init]) => String(input) === `${API}/commands` && init?.method === "POST" && JSON.parse(String(init.body)).command.includes("/bin/mkdir -p -m 0700"));
     expect(lastVerify).toBeLessThan(lastPut);
   });
-  it("real /bin/sh preserves bytes and exports to a child; temp file is gone at process start", async () => {
+  it("real /bin/sh preserves bytes and exports to a child using the persistent env file", async () => {
     const f = fixture(undefined, true);
     const env = { SECRET_X: "single' dollar$ backtick`\nbackslash\\ space 雪 = end", EMPTY: "", EQ: "a=b=c", PATH: "/nonexistent" };
     const child = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(env))}.map(k=>[k,process.env[k]]))))`;
     // stdin is a non-secret program; the grandchild proves exports, not just shell locals.
-    const stdin = `const fs=require('node:fs');const cp=require('node:child_process');if(fs.readdirSync(${JSON.stringify(f.root)}).some(p=>p.startsWith('paperclip-boat-env-')&&fs.readdirSync(${JSON.stringify(f.root)}+'/'+p).some(q=>q.endsWith('.sh'))))process.exit(91);process.stdout.write(cp.execFileSync(process.execPath,['-e',${JSON.stringify(child)}]));`;
+    const stdin = `const cp=require('node:child_process');process.stdout.write(cp.execFileSync(process.execPath,['-e',${JSON.stringify(child)}]));`;
     const result = await plugin.definition.onEnvironmentExecute!({ ...params, command: process.execPath, args: ["-"], stdin, env });
     expect(result.exitCode, result.stderr).toBe(0);
     expect(JSON.parse(result.stdout!)).toEqual(env);
     for (const [key, value] of Object.entries(env)) expect(Buffer.from(JSON.parse(result.stdout!)[key]).equals(Buffer.from(value))).toBe(true);
     for (const body of f.commands) expect(body.command).not.toContain(env.SECRET_X);
   });
-  it("isolates unique files outside the workspace, including a /tmp workspace", async () => {
+  it("reuses one file outside a workspace and rejects a /tmp workspace that cannot exclude it", async () => {
     const f = fixture();
-    for (const cwd of ["/home/user/workspace", "/home/user/workspace", "/tmp"]) {
+    for (const cwd of ["/home/user/workspace", "/home/user/workspace"]) {
       await plugin.definition.onEnvironmentExecute!({ ...params, cwd, lease: { ...params.lease, metadata: { remoteCwd: cwd } }, env: { SECRET_X: sentinel } });
       const path = f.envFiles().at(-1)!.path; expect(path.startsWith(`${cwd}/`)).toBe(false);
     }
-    expect(new Set(f.envFiles().map(p => p.path)).size).toBe(3);
+    await expect(plugin.definition.onEnvironmentExecute!({ ...params, cwd: "/tmp", lease: { ...params.lease, metadata: { remoteCwd: "/tmp" } }, env: { SECRET_X: sentinel } })).rejects.toThrow(/private path/);
+    expect(new Set(f.envFiles().map(p => p.path)).size).toBe(1);
   });
   for (const env of [undefined, {}]) it(`empty env (${JSON.stringify(env)}): no file, command unchanged`, async () => {
     const f = fixture(); await plugin.definition.onEnvironmentExecute!({ ...params, command: "printf", args: ["a'b"], cwd: "/work space", env });
@@ -166,17 +201,18 @@ describe("execute environment files", () => {
     const f = fixture(undefined, true);
     const result = await plugin.definition.onEnvironmentExecute!({ ...params, command: "/bin/sh", args: ["-s"], env: { SECRET_X: sentinel }, stdin: 'printf "%s" "$SECRET_X"' });
     expect(result).toMatchObject({ exitCode: 0, stdout: sentinel }); expect(f.puts).toHaveLength(2);
-    for (const p of f.puts) { expect(f.deletes).toContain(p.path); expect(existsSync(f.local(p.path))).toBe(false); }
+    expect(f.deletes).toContain(f.puts.find(p => !p.path.endsWith(".sh"))!.path);
+    expect(f.deletes.filter(path => path.endsWith(".sh"))).toHaveLength(0);
     for (const body of f.commands) expect(body.command).not.toContain(sentinel);
   });
-  for (const failure of ["nonzero", "throw", "timeout", "request-timeout", "upload", "setup", "poll-timeout"] as const) it(`${failure}: backup DELETE removes the file`, async () => {
+  for (const failure of ["nonzero", "throw", "timeout", "request-timeout", "upload", "setup", "poll-timeout"] as const) it(`${failure}: env file remains until lifecycle cleanup`, async () => {
     const f = fixture(failure);
     const call = plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
     if (["throw", "request-timeout", "upload"].includes(failure)) await expect(call).rejects.toThrow();
     else expect(await call).toMatchObject(failure === "nonzero" ? { exitCode: 7 } : failure === "setup" ? { exitCode: 1 } : { timedOut: true });
-    const path = f.envFiles()[0]?.path ?? f.deletes.find(p => p.endsWith(".sh"));
-    expect(path).toBeTruthy(); expect(f.deletes).toContain(path);
-    expect(existsSync(f.local(path!))).toBe(false);
+    const path = f.envFiles()[0]?.path;
+    expect(path).toBeTruthy(); expect(f.deletes).not.toContain(path);
+    expect(existsSync(f.local(path!))).toBe(true);
     if (failure === "poll-timeout") expect(f.fetch.mock.calls.some(([u, i]) => String(u).endsWith("/commands/proc1") && i?.method === "DELETE")).toBe(true);
   });
   it("detached command and result polling use the same secret-free wrapper", async () => {
@@ -189,7 +225,7 @@ describe("execute environment files", () => {
     });
     expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel }, timeoutMs: 900_000 })).toMatchObject({ stdout: "done", exitCode: 0 });
     expect(f.commands.at(-1)).toMatchObject({ detached: true, timeoutSeconds: 600 });
-    expect(f.envFiles()).toHaveLength(1); expect(f.deletes).toContain(f.envFiles()[0].path);
+    expect(f.envFiles()).toHaveLength(1); expect(f.deletes).toHaveLength(0);
     for (const body of f.commands) expect(JSON.stringify(body)).not.toContain(sentinel);
   });
   it("large UTF-8 env uses signed upload and never Boat authorization at the upload host", async () => {
@@ -203,8 +239,8 @@ describe("execute environment files", () => {
     const f = fixture(undefined, true);
     const result = await plugin.definition.onEnvironmentExecute!({ ...params, cwd: join(f.root, "missing"), env: { SECRET_X: sentinel } });
     expect(result.exitCode).not.toBe(0); expect(f.envFiles()).toHaveLength(1);
-    const path = f.envFiles()[0].path; expect(f.deletes).toContain(path);
-    expect(existsSync(f.local(path))).toBe(false);
+    const path = f.envFiles()[0].path; expect(f.deletes).not.toContain(path);
+    expect(existsSync(f.local(path))).toBe(true);
   });
   it("cleanup errors do not replace the command result", async () => {
     const f = fixture(undefined, true), original = f.fetch.getMockImplementation()!;
@@ -213,9 +249,19 @@ describe("execute environment files", () => {
       return original(input, init);
     });
     expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 0 });
-    expect(f.envFiles()).toHaveLength(1); expect(existsSync(f.local(f.envFiles()[0].path))).toBe(false);
+    expect(f.envFiles()).toHaveLength(1); expect(existsSync(f.local(f.envFiles()[0].path))).toBe(true);
   });
   for (const key of ["BAD-NAME", "X;echo bad", "1BAD", "A\nB"]) it(`refuses invalid key ${JSON.stringify(key)} before requests`, async () => {
     const f = fixture(); await expect(plugin.definition.onEnvironmentExecute!({ ...params, env: { [key]: sentinel } })).rejects.toThrow("Invalid environment variable"); expect(f.fetch).not.toHaveBeenCalled();
+  });
+  it("release recursively deletes env files before stopping", async () => {
+    const f = fixture();
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
+    const oldPath = f.envFiles()[0].path;
+    await plugin.definition.onEnvironmentReleaseLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: { apiKey: "boat_test", duplexCarrier: "off" }, providerLeaseId: "bx_test" });
+    const rmIndex = f.fetch.mock.calls.findIndex(([url, init]) => init?.method === "DELETE" && String(url).includes("recursive=true"));
+    const stopIndex = f.fetch.mock.calls.findIndex(([url, init]) => String(url) === `${API}/stop` && init?.method === "POST");
+    expect(rmIndex).toBeGreaterThanOrEqual(0); expect(rmIndex).toBeLessThan(stopIndex);
+    expect(existsSync(f.local(oldPath))).toBe(false);
   });
 });

@@ -295,7 +295,7 @@ describe("Boat ready spare", () => {
     expect(warmCommand).toContain("HOME: process.env.HOME, PATH: process.env.PATH");
     expect(warmCommand).toContain("get_state");
     expect(lease.metadata).toHaveProperty("workspaceSentinel");
-    expect(f.calls.filter(call => call.method === "DELETE" && call.url.pathname.endsWith("/files"))).toHaveLength(2);
+    expect(f.calls.filter(call => call.method === "DELETE" && call.url.pathname.endsWith("/files"))).toHaveLength(1);
   });
 
   it.each([
