@@ -1,5 +1,7 @@
 import { createServer } from "node:http";
 import { once } from "node:events";
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { assistant, attrs, environment, openPi, sentinel, spans, terminal, tool } from "./pi-observability.test-fixture.js";
 
@@ -38,6 +40,11 @@ it.each([false, true])("R5/H2: 200 calls/tools, split bodies, exact known deltas
   expect(sum("gen_ai.usage.cache_creation.input_tokens")).toBe(cumulative.total.cacheWriteTokens);
   expect(sum("gen_ai.usage.cost")).toBe(cumulative.providerReportedCostUsd);
   expect(cumulative.runDeltaComplete).toBe(!subagent);
+  if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `R5-subagent-${subagent}.json`), JSON.stringify({
+    requestBytes: bodies.map(body => Buffer.byteLength(JSON.stringify(body))), spans: all.length,
+    aggregate: attrs(aggregate[0]), cumulative, exported: { input: sum("gen_ai.usage.input_tokens"), output: sum("gen_ai.usage.output_tokens"),
+      cacheRead: sum("gen_ai.usage.cache_read.input_tokens"), cacheWrite: sum("gen_ai.usage.cache_creation.input_tokens"), cost: sum("gen_ai.usage.cost") },
+  }, null, 2));
 });
 it("A2.3/4: missing delta is not a zero-token generation and marks the aggregate incomplete", async () => {
   const bodies: any[] = [];
@@ -65,6 +72,7 @@ it("A2.5: estimated cost is explicitly catalog_estimate, never provider billing"
 it.each(["hang", "500", "dns"])("R6: %s receiver cannot change outcome or block terminal delivery; diagnostic is sanitized", async fault => {
   const warnings = vi.spyOn(console, "warn").mockImplementation(() => {});
   let requests = 0, active = 0, peak = 0;
+  const settleMs: number[] = [];
   const server = createServer((_req, res) => {
     requests++; active++; peak = Math.max(peak, active);
     res.once("close", () => active--);
@@ -78,8 +86,11 @@ it.each(["hang", "500", "dns"])("R6: %s receiver cannot change outcome or block 
     const turns = fault === "hang" ? 5 : 1;
     for (let i = 1; i <= turns; i++) {
       await pi.start();
+      pi.peer.send(...assistant(`fault-${i}`));
+      await vi.waitFor(() => expect(pi.events.filter(e => e.eventType === "usage.reported")).toHaveLength(i), { interval: 1 });
       const start = performance.now(); pi.peer.send(...terminal); await pi.settled(i);
-      expect(performance.now() - start).toBeLessThan(50);
+      settleMs.push(performance.now() - start);
+      expect(settleMs.at(-1)).toBeLessThan(50);
       if (fault === "hang" && i <= 4) await vi.waitFor(() => expect(requests).toBe(i), { interval: 1 });
     }
     await pi.close();
@@ -87,6 +98,8 @@ it.each(["hang", "500", "dns"])("R6: %s receiver cannot change outcome or block 
     if (fault === "hang") { expect(requests).toBe(4); expect(peak).toBeLessThanOrEqual(4); }
     expect(warnings).toHaveBeenCalledWith("Company observability export unavailable (export_failed).");
     expect(JSON.stringify(warnings.mock.calls)).not.toContain(sentinel);
+    if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `R6-${fault}.json`), JSON.stringify({ fault, requests, peak, settleMs,
+      completed: pi.events.filter(e => e.eventType === "turn.completed").length, diagnostics: warnings.mock.calls }, null, 2));
   } finally {
     await pi.close(); server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve()));
   }
