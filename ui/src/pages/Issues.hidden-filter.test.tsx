@@ -27,6 +27,24 @@ vi.mock("../components/IssuesList", () => ({ IssuesList: (props: { issues: Issue
 
 afterEach(() => { localStorage.clear(); vi.clearAllMocks(); });
 
+it("opens the classic Hidden view with a hidden-only request and list presentation", async () => {
+  mocks.list.mockImplementation(async (_company, filters) => filters.hiddenOnly
+    ? [{ id: "hidden-task", hiddenAt: "2026-11-15T05:00:00.000Z" }]
+    : [{ id: "shown-task" }]);
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const host = document.createElement("div"); document.body.append(host);
+  const root = createRoot(host);
+  try {
+    flushSync(() => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/issues?view=hidden"]}><Issues /></MemoryRouter></QueryClientProvider>));
+    await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe("hidden-task"));
+    expect(mocks.list.mock.lastCall?.[1]).toMatchObject({ hiddenOnly: true, offset: 0 });
+    expect(mocks.listProps.mock.lastCall?.[0].hiddenOnly).toBe(true);
+    expect(mocks.listProps.mock.lastCall?.[0].searchFilters?.hiddenOnly).toBeUndefined();
+  } finally {
+    flushSync(() => root.unmount()); client.clear(); host.remove();
+  }
+});
+
 it("asks the server for hidden tasks only after Show hidden tasks is turned on, and never for search", async () => {
   mocks.list.mockImplementation(async (_company, filters) => filters.includeHidden
     ? [{ id: "shown-task" }, { id: "hidden-task", hiddenAt: "2026-11-15T05:00:00.000Z" }]
