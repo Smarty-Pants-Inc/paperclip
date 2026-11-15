@@ -6,7 +6,7 @@ This is a test-only harness for the L1e contract. It contains no server/runner i
 2. **Stub runner + real server/core** (`--stub-runner`): listens for the server's outbound WSS/WebSocket connection, sends an authenticated runner hello, verifies the server challenge, completes PRP auth, sends a synthetic `github_access.http` request, and validates its correlated reply. Point the server integration fixture's Boat preview/private URL at this listener. The request body and GitHub credential are synthetic/test-only; output is metadata-only.
 3. **Joint real server + real runnerd** (`--runnerd --external-server`): starts runnerd without a stub peer, prints its WSS target, waits for the configured real server/Boat test fixture to connect and for runnerd's private Unix socket, then makes one local request through the full route. Use only a gate-owned test identity and test credentials.
 
-The PRP harness uses Node built-ins only. The exact bridge response timeout is taken from `packages/adapter-utils/src/sandbox-callback-bridge.ts:30` (30 seconds). The generated GitHub sentinel is held in memory and is never printed. The scanner checks raw bytes and base64 encodings at offsets 0, 1 and 2. Give `--scan-path` every server log, PRP span/frame-log export, run log, Langfuse export and Boat process-output artifact that the gate collected; durable PRP state is scanned automatically in runnerd modes.
+The PRP harness uses Node built-ins only. The exact bridge response timeout is taken from `packages/adapter-utils/src/sandbox-callback-bridge.ts:30` (30 seconds). The generated GitHub sentinel is held in memory and is never printed. The scanner checks raw bytes and base64 encodings at offsets 0, 1 and 2. Give `--scan-path` every server log, PRP span/frame-log export, run log and Langfuse export; pass Boat exports explicitly with `--history-file` and `--process-output-file`. Those inputs accept JSON or NDJSON and are scanned alongside `--scan-path`; durable PRP state is scanned automatically in runnerd modes. Boat documents command-history JSON (`commands`) and command logs (`data`) at [command-history.md](https://docs.boat.dev/long-running-tasks/command-history.md#read-the-history) lines 43–50; its process-output records are retained for 72 hours (same doc lines 17–18, 91–100).
 
 ## Build and run on base `5b0145ab4`
 
@@ -20,7 +20,7 @@ node packages/paperclip-runner/tests/l1-gh-ingress/ingress-harness.mjs \
   --runnerd packages/paperclip-runner/runner/target/debug/paperclip-runnerd
 ```
 
-`--self-test` runs deterministic *contract-fixture* cases, including foreign-run refusal, idle-session refusal, binding-generation discard, request-ID replay rejection, private socket permissions, bounded named ingress-drop response and sentinel scanning. Those validate the harness fixtures only; they are not evidence that the production halves pass. The real-runnerd mode proves PRP mutual authentication against the stub peer. On the base snapshot, runnerd has no GitHub-access Unix socket, so the implementation-specific RFL rows are reported as blocked/skipped rather than claimed as passes. Re-run after L1b lands; those rows will execute automatically when the configured `PAPERCLIP_GITHUB_RUNNER_SOCKET` or a socket below runnerd's state directory is present.
+`--self-test` runs deterministic *contract-fixture* cases, including foreign-run refusal, idle-session refusal, binding-generation discard, request-ID replay rejection, private socket permissions, out-of-allow-list refusal with `Unknown GitHub session operation`, bridge-sourced inflight/body limits, bounded named ingress-drop response, and raw plus all three base64 sentinel scans across synthetic Boat history/process-output exports (including clean exports). The sanitized logs case proves the SCANNER only (its fixture never held the token), not product evidence. Those validate harness fixtures only; they are not evidence that the production halves pass. The real-runnerd mode proves PRP mutual authentication against the stub peer. On the base snapshot, runnerd has no GitHub-access Unix socket, so the implementation-specific RFL rows are reported as blocked/skipped rather than claimed as passes. Re-run after L1b lands; those rows will execute automatically when the configured `PAPERCLIP_GITHUB_RUNNER_SOCKET` or a socket below runnerd's state directory is present.
 
 ### Server-lane (L1a) integration with stub runner
 
@@ -44,7 +44,9 @@ node packages/paperclip-runner/tests/l1-gh-ingress/ingress-harness.mjs \
   --scan-path /path/to/server.log \
   --scan-path /path/to/prp-spans.jsonl \
   --scan-path /path/to/run.log \
-  --scan-path /path/to/langfuse-export.json
+  --scan-path /path/to/langfuse-export.json \
+  --history-file /path/to/boat-command-history.json \
+  --process-output-file /path/to/boat-process-output-72h.ndjson
 ```
 
 The harness starts a disposable runnerd, authenticates with a synthetic bootstrap ticket, then waits for its Unix socket. On an implementation build it sets `PAPERCLIP_GITHUB_RUNNER_SOCKET` to a private path (override with `L1E_SOCKET_PATH`), sends the current HTTP credentials endpoint over that socket, replies through encrypted `github_access.http`, verifies HTTP body delivery, and then drops the PRP connection to check the named 503 deadline. The runnerd socket must be 0600. A second-UID probe uses `setpriv` and UID 65534 when possible; it reports an explicit skip if the private `$TMPDIR` parent prevents reaching the socket, or if host policy denies switching to a second UID.

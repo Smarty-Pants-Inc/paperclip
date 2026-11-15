@@ -12,6 +12,21 @@ import { spawn, spawnSync } from 'node:child_process';
 const PROTOCOL = 'paperclip.runner';
 const SECURE_SCHEMA = 'paperclip.runner.secure-frame.v1';
 const BRIDGE_TIMEOUT_MS = 30_000; // packages/adapter-utils/src/sandbox-callback-bridge.ts:30
+const BRIDGE_SOURCE_ROOT = process.cwd();
+function sourceConstant(file, name, seen = new Set()) {
+  const source = fs.readFileSync(path.join(BRIDGE_SOURCE_ROOT, file), 'utf8');
+  const match = source.match(new RegExp(`(?:export\\s+)?const\\s+${name}\\s*=\\s*([^;]+);`));
+  assert(match, `could not read ${name} from ${file}`);
+  assert(!seen.has(name), `cyclic source constant: ${name}`); seen.add(name);
+  const expression = match[1].trim();
+  assert(/^[\w\s+*()]+$/.test(expression), `unsupported source expression for ${name}`);
+  const resolved = expression.replace(/\b[A-Za-z_$][\w$]*\b/g, identifier => String(sourceConstant(file, identifier, seen)));
+  assert(/^[\d\s+*()]+$/.test(resolved), `unsupported resolved expression for ${name}`);
+  return Function(`"use strict"; return (${resolved});`)();
+}
+// Read the real bridge limits; these citations are the source, not harness-chosen values.
+const MAX_INFLIGHT = sourceConstant('packages/adapter-utils/src/http2-bridge-server.ts', 'HTTP2_BRIDGE_MAX_CONCURRENT_STREAMS'); // :82
+const MAX_BODY_BYTES = sourceConstant('packages/adapter-utils/src/sandbox-callback-bridge.ts', 'DEFAULT_BRIDGE_MAX_BODY_BYTES'); // :50 (exported at :115)
 const MAX_WS_MESSAGE = 2 * 1024 * 1024;
 
 function assert(condition, message) { if (!condition) throw new Error(message); }
@@ -276,7 +291,7 @@ function httpOverUnix(socketPath, { method = 'POST', pathname = '/runtime-tools/
 class StubAuthority {
   constructor(resolveCredentials = async binding => ({ status: 'available', env: { GH_TOKEN: 'fixture-only' }, binding })) {
     this.resolveCredentials = resolveCredentials;
-    this.active = null; this.generation = 0; this.inflight = new Set(); this.seen = new Set(); this.maxInflight = 8; this.resolverCalls = 0;
+    this.active = null; this.generation = 0; this.inflight = new Set(); this.seen = new Set(); this.maxInflight = MAX_INFLIGHT; this.resolverCalls = 0;
   }
   activate(binding) { this.active = { ...binding }; this.generation++; }
   deactivate() { this.active = null; this.generation++; }
@@ -284,7 +299,10 @@ class StubAuthority {
     const req = frame?.payload ?? frame;
     const id = req?.requestId;
     if (typeof id !== 'string' || !id || this.seen.has(id) || this.inflight.has(id)) return { status: 409, body: { error: 'duplicate or invalid requestId' } };
+    if (req.bodyBase64 && Buffer.from(req.bodyBase64, 'base64').length > MAX_BODY_BYTES) return { status: 413, body: { error: 'Bridge request body exceeded the configured size limit.' } };
     if (this.inflight.size >= this.maxInflight) return { status: 429, body: { error: 'too many in-flight requests' } };
+    // Native GitHub access refuses all but POST /runtime-tools/github/credentials (native-github-access.ts:57-59).
+    if (req.method && (req.method !== 'POST' || req.path !== '/runtime-tools/github/credentials')) return { status: 404, body: { error: 'Unknown GitHub session operation' } };
     if (!this.active) return { status: 403, body: { error: 'No active GitHub run' } };
     if (typeof req.runId === 'string' && req.runId !== this.active.runId) return { status: 403, body: { error: 'GitHub request runId mismatch' } };
     this.seen.add(id); this.inflight.add(id);
@@ -338,6 +356,17 @@ async function selfTest() {
       const result = await pending;
       assert(result.discarded && result.replySent === false, 'late resolver result escaped old binding');
     });
+    await test('outside GitHub bridge allow-list is refused by named operation error', async () => {
+      const stub = new StubAuthority(); stub.activate({ companyId: 'c', agentId: 'a', issueId: 'i', runId: 'r' });
+      const result = await stub.request({ kind: 'github_access.http', payload: { requestId: 'outside-route-1', method: 'GET', path: '/api/companies' } });
+      assert(result.status === 404 && result.body.error === 'Unknown GitHub session operation' && stub.resolverCalls === 0, 'outside-allow-list request was not refused with the named operation error');
+    });
+    await test('stub bridge concurrency and body limits follow bridge source constants', async () => {
+      const stub = new StubAuthority();
+      assert(stub.maxInflight === MAX_INFLIGHT, 'stub in-flight limit diverged from HTTP2 bridge source');
+      const oversized = await stub.request({ payload: { requestId: 'oversized-body-1', bodyBase64: Buffer.alloc(MAX_BODY_BYTES + 1).toString('base64') } });
+      assert(oversized.status === 413 && oversized.body.error === 'Bridge request body exceeded the configured size limit.', 'source-sized oversized body was not refused');
+    });
     await test('duplicate request IDs are rejected', async () => {
       const stub = new StubAuthority(); stub.activate({ companyId: 'c', agentId: 'a', issueId: 'i', runId: 'r' });
       const frame = { kind: 'github_access.http', payload: { requestId: 'unique-1' } };
@@ -377,6 +406,22 @@ async function selfTest() {
         assert(scanFiles([sample], token).length > 0, `scanner missed sentinel variant ${i}`);
       }
     });
+    await test('Boat command history and 72 h process output scan every sentinel encoding', async () => {
+      const token = `l1e_sentinel_${randomHex(16)}`;
+      const history = path.join(fixture, 'boat-history.json');
+      const processOutput = path.join(fixture, 'boat-process-output.ndjson');
+      for (let i = 0; i < 4; i++) {
+        fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-test', data: scanVariants(token)[i].toString() }] }));
+        fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'runnerd', data: scanVariants(token)[i].toString() })}\n`);
+        const boatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
+        assert(scanFiles(boatInputs, token).length > 0, `Boat exports missed sentinel variant ${i}`);
+      }
+      fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-clean', data: 'sanitized' }] }));
+      fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'shim', data: 'sanitized' })}\n`);
+      const cleanBoatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
+      assert(scanFiles(cleanBoatInputs, token).length === 0, 'clean Boat exports triggered the sentinel scanner');
+    });
+    // Scanner fixture only: it never held the token; this is not product evidence.
     await test('sanitized logs and durable PRP fixture stay sentinel-free', async () => {
       const token = `l1e_sentinel_${randomHex(16)}`;
       const logs = path.join(fixture, 'logs'); const durable = path.join(fixture, 'durable');
@@ -664,7 +709,7 @@ async function stubRunnerMode(port, pathname, testCase, options) {
 }
 
 function parseArgs(argv) {
-  const result = { scanPaths: [], socketWaitMs: 8000 };
+  const result = { scanPaths: [], historyFiles: [], processOutputFiles: [], socketWaitMs: 8000 };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--self-test') result.selfTest = true;
@@ -672,6 +717,8 @@ function parseArgs(argv) {
     else if (arg === '--socket-wait-ms') result.socketWaitMs = Number(argv[++i]);
     else if (arg === '--external-server') result.externalServer = true;
     else if (arg === '--scan-path') result.scanPaths.push(argv[++i]);
+    else if (arg === '--history-file') result.historyFiles.push(argv[++i]);
+    else if (arg === '--process-output-file') result.processOutputFiles.push(argv[++i]);
     else if (arg === '--stub-runner') result.stubRunner = true;
     else if (arg === '--port') result.port = argv[++i];
     else if (arg === '--path') result.pathname = argv[++i];
@@ -680,8 +727,21 @@ function parseArgs(argv) {
   }
   return result;
 }
+function scanInputs(options) {
+  // Boat command-history returns a JSON command list (docs: command-history.md:43-50); process records retain output for 72 h (docs: :17-18, :91-100).
+  const files = [...options.historyFiles, ...options.processOutputFiles];
+  for (const file of files) {
+    const text = fs.readFileSync(file, 'utf8');
+    const nonempty = text.split(/\r?\n/).filter(line => line.trim());
+    assert(nonempty.length > 0, `Boat export is empty: ${file}`);
+    try { JSON.parse(text); }
+    catch { for (const line of nonempty) { try { JSON.parse(line); } catch { throw new Error(`invalid JSON/NDJSON Boat export: ${file}`); } } }
+  }
+  return [...options.scanPaths, ...files];
+}
 async function main() {
   const options = parseArgs(process.argv.slice(2));
+  options.scanPaths = scanInputs(options);
   if (options.selfTest) { await selfTest(); return; }
   if (options.runnerd) { await runnerdMode(path.resolve(options.runnerd), options); return; }
   if (options.stubRunner) { await stubRunnerMode(options.port, options.pathname || `/api/runner/v1/connect/${process.env.L1E_RUN_ID || 'l1e-stub-run'}`, options.testCase || process.env.L1E_CASE || 'happy', options); return; }
