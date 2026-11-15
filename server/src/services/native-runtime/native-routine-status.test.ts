@@ -66,7 +66,7 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "arbitrating", resultId });
     return { issueId, invocationId, runId, assessmentId, priorStatusVersion: priorIssue.statusVersion, priorDecisionId: priorIssue.lastStatusDecisionId };
   }
-  async function commit(f: Awaited<ReturnType<typeof seed>>, status: "done" | "blocked" | "cancelled" | "in_progress", executor: Db = db) {
+  async function commit(f: Awaited<ReturnType<typeof seed>>, status: "done" | "blocked" | "cancelled" | "in_progress" | "in_review", executor: Db = db) {
     const decision: NativeStatusDecision = { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
       reasonCode: "routine_status_test", unblockDescriptor: null, effects: [] };
     return commitNativeStatusDecision({ db: executor, companyId, issueId: f.issueId, runId: f.runId, assessmentId: f.assessmentId,

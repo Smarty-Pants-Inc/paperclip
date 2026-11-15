@@ -75,7 +75,7 @@ import {
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
 import { directParentReportDisabledForIssue } from "../direct-parent-report.js";
-import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, parseIssueExecutionState } from "../issue-execution-policy.js";
+import { buildIssueMonitorClearedPatch, COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, monitorClearReasonForIssue, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -2369,10 +2369,20 @@ export async function commitNativeStatusDecision(input: {
           !await executionStageChangesRequestedByRun(tx as unknown as Db, { id: input.runId, companyId: input.companyId, agentId: originRun.agentId }, issue))) {
         throw new NativeStatusRaceError();
       }
+      const monitorIsScheduled = issue.monitorNextCheckAt !== null ||
+        parseIssueExecutionState(issue.executionState)?.monitor?.status === "scheduled";
+      const monitorClearReason = monitorIsScheduled
+        ? monitorClearReasonForIssue(input.decision.toStatus, issue.assigneeAgentId, issue.assigneeUserId)
+        : null;
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
           ...(reviewStage?.kind === "starts" ? reviewStage.patch : {}),
+          ...(monitorClearReason ? buildIssueMonitorClearedPatch({
+            issue,
+            policy: normalizeIssueExecutionPolicy(issue.executionPolicy),
+            clearReason: monitorClearReason,
+          }) : {}),
           ...(returnTo ? { assigneeAgentId: returnTo.type === "agent" ? returnTo.agentId : null,
             assigneeUserId: returnTo.type === "user" ? returnTo.userId : null } : {}),
           status: input.decision.toStatus,
