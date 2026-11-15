@@ -111,7 +111,7 @@ describePg("RFL importfence8 FIX 2 agent-reachable creators", () => {
     const pluginId = randomUUID();
     const manifest: PaperclipPluginManifestV1 = { id: `paperclip.creator-admission-${method}`, apiVersion: 1, version: "0.1.0", displayName: "Creator admission", description: "Fixture", author: "Paperclip", categories: ["automation"], capabilities: ["agents.managed"], entrypoints: { worker: "./worker.js" }, agents: [{ agentKey: "worker", displayName: "Plugin worker", role: "engineer", adapterType: "gemini_local", adapterConfig: { command }, budgetMonthlyCents: 0 }] };
     await db.insert(plugins).values({ id: pluginId, pluginKey: manifest.id, packageName: "@paperclipai/creator-admission-fixture", version: manifest.version, apiVersion: 1, categories: manifest.categories, manifestJson: manifest, status: "ready", installOrder: 1 });
-    const services = buildHostServices(db, pluginId, manifest.id, { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never, undefined, { manifest });
+    const services = buildHostServices(db, pluginId, manifest.id, { forPlugin: () => ({ emit: async () => {}, subscribe: () => {}, clear: () => {} }) } as never, undefined, { manifest });
     try {
       const before = await snapshot(companyId);
       let error: unknown;
