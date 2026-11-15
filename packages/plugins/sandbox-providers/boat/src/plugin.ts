@@ -653,7 +653,7 @@ function readySpareFromSandbox(sandbox: any, ttlSeconds: number): ReadySpare {
     providerObservation: sandbox as Record<string, unknown>,
   };
 }
-async function createAndWarmSpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
+async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
   const expiry = new Date(Date.now() + ttlSeconds * 1000).toISOString();
   const labels = { ...config.labels, owner: `paperclip:${key.companyId}`, purpose: "spare", expiry,
     environment: key.environmentId, configHash: key.configHash };
@@ -667,16 +667,13 @@ async function createAndWarmSpare(config: Config, key: ReadySpareKey, ttlSeconds
   try {
     const ready = await waitReady(config, sandbox.id);
     const setup = config.setupScript === undefined ? ready : await waitSetup(config, sandbox.id);
-    const warmCommand = `printf '{"type":"get_state","id":"1"}\\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session >/dev/null`;
-    const warmed = await runCommand(config, sandbox.id, warmCommand, 25_000);
-    if (warmed.exitCode !== 0 || warmed.timedOut) throw new Error("Boat spare Pi warm-up did not complete successfully");
     const name = `paperclip-spare:ready:${key.configHash}`;
     const updated = await request(config, `/sandboxes/${encodeURIComponent(sandbox.id)}`, {
       method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ name, ttlSeconds }),
     }, false, { requireJson: true });
     const warmedSandbox = updated?.sandbox ?? updated;
     if (warmedSandbox?.id !== sandbox.id || !["ready", "idle", "running"].includes(warmedSandbox.state)) {
-      throw new Error("Boat spare was not running after Pi warm-up");
+      throw new Error("Boat spare was not running after setup");
     }
     const observation = { ...setup, ...warmedSandbox, id: sandbox.id, name };
     return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
@@ -702,6 +699,39 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return readySpareFromSandbox(sandbox, ttlSeconds);
     },
     create: () => createAndWarmSpare(config, key, ttlSeconds, from),
+    async warmUp(spare) {
+      const startedAt = new Date().toISOString();
+      const started = Date.now();
+      const node = "/opt/paperclip-runner/provider-pack/node_modules/node/bin/node";
+      const cli = "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js";
+      const wrapper = [
+        "const { spawn } = require('node:child_process');",
+        `const child = spawn(${JSON.stringify(node)}, [${JSON.stringify(cli)}, '--mode', 'rpc', '--no-session'], { env: { PI_CODING_AGENT_DIR: '/home/user/.pi/agent', HOME: process.env.HOME, PATH: process.env.PATH }, stdio: ['pipe', 'pipe', 'ignore'] });`,
+        "let firstLine = false; let done = false; let timedOut = false;",
+        "const timer = setTimeout(() => { if (!done) { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 500).unref(); } }, 24000);",
+        "child.stdout.on('data', chunk => { if (!firstLine && (firstLine = chunk.toString().includes('\\n'))) child.stdin.end(); });",
+        "child.on('error', () => { done = true; clearTimeout(timer); process.exitCode = 1; });",
+        "child.on('exit', (code, signal) => { done = true; clearTimeout(timer); if (timedOut) process.exitCode = 124; else if (!firstLine || signal || code !== 0) process.exitCode = code || 1; });",
+        "child.stdin.write('{\\\"type\\\":\\\"get_state\\\",\\\"id\\\":\\\"1\\\"}\\n');",
+      ].join(" ");
+      const command = `if [ ! -x ${q(node)} ] || [ ! -f ${q(cli)} ]; then printf '__PI_WARMUP_MISSING_PACK__'; exit 0; fi; ${q(node)} -e ${q(wrapper)}`;
+      let outcome: "completed" | "missing_pack" | "failed" | "timeout" = "failed";
+      try {
+        const result = await runCommand(config, spare.id, command, 25_000);
+        if (result.stdout.includes("__PI_WARMUP_MISSING_PACK__")) outcome = "missing_pack";
+        else if (result.timedOut || result.exitCode === 124) outcome = "timeout";
+        else if (result.exitCode === 0) outcome = "completed";
+        else outcome = "failed";
+      } catch {
+        outcome = "failed";
+      }
+      const finishedAt = new Date().toISOString();
+      const details = { spareId: spare.id, warmupStartedAt: startedAt, warmupFinishedAt: finishedAt,
+        warmupMs: Date.now() - started, warmupOutcome: outcome };
+      if (outcome === "completed" || outcome === "missing_pack") duplexLogger?.info("Boat spare Pi warm-up", details);
+      else duplexLogger?.warn("Boat spare Pi warm-up", details);
+      return outcome;
+    },
     async claim(spare, name, claimTtlSeconds) {
       const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
         method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),

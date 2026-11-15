@@ -34,7 +34,7 @@ function inventorySpare(options: { hash?: string; environment?: string; company?
     providerObservation: { id: options.id ?? "bx_warm_0001", state: options.state ?? "running", name: options.warmed === false ? `paperclip-spare:warming:${configHash}` : `paperclip-spare:ready:${configHash}`, labels, team: { id: "team-spare-test" } },
   };
 }
-function fixture(initial: ReadySpare[] = [], warmExitCode = 0) {
+function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = false) {
   const inventory = initial.map(item => ({ ...(item.providerObservation ?? {}), id: item.id, state: item.state, name: item.name, labels: { ...item.labels }, archiveAfter: item.expiresAt, createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), team: { id: "team-spare-test" } }));
   const calls: Array<{ method: string; url: URL; body?: any }> = [];
   const fetch = vi.fn(async (input: any, init: any = {}) => {
@@ -65,7 +65,7 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0) {
       if (body.ttlSeconds) sb.archiveAfter = new Date(Date.now() + body.ttlSeconds * 1000).toISOString();
       return response({ sandbox: sb });
     }
-    if (method === "POST" && /^\/sandboxes\/[^/]+\/commands$/.test(route)) return response({ exitCode: warmExitCode, timedOut: false, stdout: "{}\n", stderr: "" });
+    if (method === "POST" && /^\/sandboxes\/[^/]+\/commands$/.test(route)) return response({ exitCode: warmExitCode, timedOut: warmTimedOut, stdout: "{}\n", stderr: "" });
     if (method === "POST" && /^\/sandboxes\/[^/]+\/resume$/.test(route)) {
       const id = route.split("/").at(-2)!;
       const sb = inventory.find(item => item.id === id) ?? { id, state: "running", labels: {}, team: { id: "team-spare-test" } };
@@ -200,7 +200,7 @@ describe("Boat ready spare", () => {
     }] });
   });
 
-  it("records refill_in_flight while a replacement is still warming", async () => {
+  it("keeps a ready spare claimable while its best-effort Pi warm-up is still running", async () => {
     const env = "environment-outcome-refilling", company = "company-outcome-refilling";
     const f = fixture();
     let releaseWarmup!: () => void;
@@ -210,7 +210,7 @@ describe("Boat ready spare", () => {
     vi.stubGlobal("fetch", async (input: any, init: any = {}) => {
       const url = new URL(String(input));
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
-      if (url.pathname.endsWith("/commands") && String(body?.command ?? "").includes("PI_CODING_AGENT_DIR=/home/user/.pi/agent")) {
+      if (url.pathname.endsWith("/commands") && String(body?.command ?? "").includes("--no-session")) {
         signalWarmup();
         await warmupGate;
       }
@@ -220,15 +220,9 @@ describe("Boat ready spare", () => {
     await acquire("run-outcome-refill-start", baseConfig, env, company);
     try {
       await warmupEntered;
-      await acquire("run-outcome-refill-during", baseConfig, env, company);
-      const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
-      expect(lines.map(([message]) => message)).toEqual([
-        `[boat] acquire outcome=cold reason=no_ready_spare env=${env}`,
-        `[boat] acquire outcome=cold reason=refill_in_flight env=${env}`,
-      ]);
-      expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
-        environmentId: env, spare: 0, cold: 2, reasons: { no_ready_spare: 1, refill_in_flight: 1 },
-      }] });
+      expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true);
+      expect(f.calls.some(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toBe(false);
+      expect(logger.warn).not.toHaveBeenCalledWith("Boat ready spare reconciliation failed", expect.anything());
     } finally { releaseWarmup(); }
   });
 
@@ -276,11 +270,17 @@ describe("Boat ready spare", () => {
     expect(lease.providerLeaseId).toBe(spareBeforeClaim.id);
     expect(lease.metadata).toMatchObject({ providerClaimName: "paperclip-claim:run-claim:attempt-run-claim", providerLabels: spareBeforeClaim.labels, boatOrgId: "team-spare-test", sandboxId: spareBeforeClaim.id, resumedLease: false });
     expect(f.calls.filter(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/commands`)).toHaveLength(1);
     expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "run")).toHaveLength(normalCreatesBeforeClaim);
     await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare").length).toBeGreaterThan(1), { timeout: 2_000 });
     const warmCommand = f.calls.find(call => call.method === "POST" && call.url.pathname.endsWith("/commands"))?.body.command as string;
-    expect(warmCommand).toContain("PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session");
-    expect(warmCommand).toContain("printf '{\"type\":\"get_state\",\"id\":\"1\"}\\n'");
+    expect(warmCommand).toContain("/opt/paperclip-runner/provider-pack/node_modules/node/bin/node");
+    expect(warmCommand).toContain("/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js");
+    expect(warmCommand).toContain("--no-session");
+    expect(warmCommand).toContain("PI_CODING_AGENT_DIR:");
+    expect(warmCommand).toContain("/home/user/.pi/agent");
+    expect(warmCommand).toContain("HOME: process.env.HOME, PATH: process.env.PATH");
+    expect(warmCommand).toContain("get_state");
     expect(lease.metadata).toHaveProperty("workspaceSentinel");
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
   });
@@ -412,15 +412,37 @@ describe("Boat ready spare", () => {
     expect(Date.now() - started).toBeLessThan(500);
   });
 
-  it("stops a spare whose Pi warm-up fails and never makes it claimable", async () => {
-    const env = "environment-warm-failure", company = "company-warm-failure";
-    const f = fixture([], 1);
-    await setup(1);
-    const cold = await acquire("run-warm-failure", baseConfig, env, company);
+  it("skips a missing Pi pack, logs it once, and keeps the spare ready", async () => {
+    const env = "environment-missing-pack", company = "company-missing-pack";
+    const f = fixture();
+    const realFetch = f.fetch;
+    vi.stubGlobal("fetch", async (input: any, init: any = {}) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/commands")) return response({ exitCode: 0, timedOut: false, stdout: "__PI_WARMUP_MISSING_PACK__", stderr: "" });
+      return realFetch(input, init);
+    });
+    const logger = await setup(1, [env]);
+    await acquire("run-missing-pack", baseConfig, env, company);
+    await vi.waitFor(() => expect(logger.info).toHaveBeenCalledWith("Boat spare Pi warm-up", expect.objectContaining({ warmupOutcome: "missing_pack" })), { timeout: 2_000 });
+    expect(logger.info.mock.calls.filter(([message]) => message === "Boat spare Pi warm-up")).toHaveLength(1);
+    expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true);
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(false);
+  });
+
+  it.each([["failure", 1, false, "failed"], ["timeout", 0, true, "timeout"]] as const)(
+    "keeps a spare claimable and logs when its best-effort Pi warm-up ends in %s", async (label, warmExitCode, warmTimedOut, outcome) => {
+    const env = `environment-warm-${label}`, company = `company-warm-${label}`;
+    const f = fixture([], warmExitCode, warmTimedOut);
+    const logger = await setup(1);
+    const cold = await acquire(`run-warm-${label}`, baseConfig, env, company);
     expect(cold.providerLeaseId).toMatch(/^bx_run_/);
-    await vi.waitFor(() => expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true), { timeout: 2_000 });
-    expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(false);
-    expect(f.calls.some(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toBe(false);
+    await vi.waitFor(() => expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/commands"))).toBe(true), { timeout: 2_000 });
+    const spare = f.inventory.find(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"));
+    expect(spare).toBeDefined();
+    await vi.waitFor(() => expect(logger.warn).toHaveBeenCalledWith("Boat spare Pi warm-up", expect.objectContaining({ spareId: spare!.id, warmupOutcome: outcome })), { timeout: 2_000 });
+    const claimed = await acquire(`run-after-warm-${label}`, baseConfig, env, company);
+    expect(claimed.providerLeaseId).toBe(spare!.id);
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(false);
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
   });
 
