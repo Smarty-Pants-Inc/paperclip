@@ -2608,6 +2608,39 @@ describe("NewIssueDialog", () => {
     act(() => root.unmount());
   });
 
+  it.each(["Send", "Discard"])("offers %s for a queued create in another company without changing the current draft", async (action) => {
+    const requestKey = "company-a-original-create-key";
+    const storageKey = `paperclip:issue-draft:pending-create:queue:user-1:request:${requestKey}`;
+    const payload = { fingerprint: "original", data: { companyId: "company-a", title: "Original task in A" } };
+    localStorage.setItem(storageKey, JSON.stringify({ payload, idempotencyKey: requestKey, createdAt: 1 }));
+    companyState.companies.push({ id: "company-a", name: "Company A", status: "active", issuePrefix: "COA" });
+    dialogState.newIssueDefaults = { description: "Keep my company B draft" };
+    const { root } = renderDialog(container);
+    try {
+      await flush();
+      expect(mockIssuesApi.create).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("A task you created in Company A hasn't been sent yet.");
+      const editor = container.querySelector<HTMLTextAreaElement>('textarea[aria-label="Describe a task…"]')!;
+      expect(editor.value).toBe("Keep my company B draft");
+      const button = Array.from(container.querySelectorAll("button")).find(item => item.textContent === action);
+      expect(button).toBeDefined();
+      await act(async () => { button!.click(); });
+      await flush();
+      if (action === "Send") {
+        expect(mockIssuesApi.create).toHaveBeenCalledExactlyOnceWith("company-a", {
+          title: "Original task in A", idempotencyKey: requestKey,
+        });
+      } else expect(mockIssuesApi.create).not.toHaveBeenCalled();
+      expect(localStorage.getItem(storageKey)).toBeNull();
+      expect(container.textContent).not.toContain("hasn't been sent yet");
+      expect(editor.value).toBe("Keep my company B draft");
+      expect(dialogState.closeNewIssue).not.toHaveBeenCalled();
+    } finally {
+      act(() => root.unmount());
+      companyState.companies.pop();
+    }
+  });
+
   it("restores two queued tasks and their separate files after a reload", async () => {
     mockIssuesApi.create.mockImplementationOnce(() => new Promise(() => {}));
     mockIssuesApi.uploadAttachment.mockResolvedValue({});

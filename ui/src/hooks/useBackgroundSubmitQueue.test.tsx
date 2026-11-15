@@ -4,13 +4,13 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { ConnectivityProvider, createConnectivityStore } from "@/lib/connectivity";
-import { pendingSendKeyFor } from "@/lib/pending-send";
+import { pendingSendKeyFor, writePendingSend, type PendingSend } from "@/lib/pending-send";
 import { DETACHED_DRAFT_OWNER } from "./useDraftOwner";
 import { useBackgroundSubmitQueue } from "./useBackgroundSubmitQueue";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-type Payload = { body: string };
+type Payload = { body: string; companyId?: string };
 const isPayload = (value: unknown): value is Payload =>
   !!value && typeof value === "object" && typeof (value as Payload).body === "string";
 const KEY = "test:background-send";
@@ -24,9 +24,13 @@ afterEach(() => {
   for (const store of stores) store.dispose();
   stores.length = 0;
   document.body.innerHTML = "";
+  vi.useRealTimers();
 });
 
-function mountTab(send: (payload: Payload, key: string) => Promise<string>) {
+function mountTab(send: (payload: Payload, key: string) => Promise<string>, options: {
+  companyId?: string;
+  onAttention?: (record: PendingSend<Payload>, error: unknown) => void;
+} = {}) {
   const container = document.createElement("div");
   document.body.appendChild(container);
   const root = createRoot(container);
@@ -35,15 +39,119 @@ function mountTab(send: (payload: Payload, key: string) => Promise<string>) {
   stores.push(store);
   let current!: ReturnType<typeof useBackgroundSubmitQueue<Payload, string>>;
   function Harness() {
-    current = useBackgroundSubmitQueue({ sourceId: `tab-${stores.indexOf(store)}`, storageKey: KEY, isPayload, send, onAttention: () => {} });
+    current = useBackgroundSubmitQueue({
+      sourceId: `tab-${stores.indexOf(store)}`, storageKey: KEY, isPayload, send,
+      canAutoResend: payload => !options.companyId || payload.companyId === options.companyId,
+      onAttention: options.onAttention ?? (() => {}),
+    });
     return null;
   }
   act(() => root.render(<ConnectivityProvider store={store}><Harness /></ConnectivityProvider>));
   return {
     get queue() { return current; },
+    selectCompany(companyId: string) {
+      options.companyId = companyId;
+      act(() => root.render(<ConnectivityProvider store={store}><Harness /></ConnectivityProvider>));
+    },
     unmount() { act(() => root.unmount()); roots.delete(root); },
   };
 }
+
+const queuedCreate = {
+  payload: { body: "Task submitted in A", companyId: "company-a" },
+  idempotencyKey: "original-create-key",
+  createdAt: 1,
+};
+const queueStorageKey = pendingSendKeyFor(`${KEY}:queue`, DETACHED_DRAFT_OWNER);
+const requestStorageKey = `${queueStorageKey}:request:${queuedCreate.idempotencyKey}`;
+function seedQueuedCreate() {
+  localStorage.setItem(requestStorageKey, JSON.stringify(queuedCreate));
+}
+
+it("holds a company A create in company B, raises attention, and sends explicitly with the original key", async () => {
+  seedQueuedCreate();
+  const send = vi.fn().mockResolvedValue("saved");
+  const onAttention = vi.fn();
+  let tab!: ReturnType<typeof mountTab>;
+  await act(async () => { tab = mountTab(send, { companyId: "company-b", onAttention }); });
+  expect(send).not.toHaveBeenCalled();
+  expect(onAttention).toHaveBeenCalledExactlyOnceWith(queuedCreate, null);
+  expect(JSON.parse(localStorage.getItem(requestStorageKey)!)).toEqual(queuedCreate);
+  await act(async () => { await tab.queue.submit(queuedCreate.payload, { idempotencyKey: queuedCreate.idempotencyKey }); });
+  expect(send).toHaveBeenCalledExactlyOnceWith(queuedCreate.payload, queuedCreate.idempotencyKey);
+  expect(localStorage.getItem(requestStorageKey)).toBeNull();
+});
+
+it("discards a different-company create without sending, including after reload", async () => {
+  seedQueuedCreate();
+  const send = vi.fn().mockResolvedValue("saved");
+  const onAttention = vi.fn();
+  let tab!: ReturnType<typeof mountTab>;
+  await act(async () => { tab = mountTab(send, { companyId: "company-b", onAttention }); });
+  expect(send).not.toHaveBeenCalled();
+  expect(onAttention).toHaveBeenCalledExactlyOnceWith(queuedCreate, null);
+  await act(async () => { tab.queue.discard(queuedCreate.idempotencyKey); });
+  expect(localStorage.getItem(requestStorageKey)).toBeNull();
+  tab.unmount();
+  await act(async () => { mountTab(send, { companyId: "company-a" }); });
+  expect(send).not.toHaveBeenCalled();
+});
+
+it("still automatically resends a same-company create with its original key, regardless of age", async () => {
+  seedQueuedCreate();
+  const send = vi.fn().mockResolvedValue("saved");
+  const onAttention = vi.fn();
+  await act(async () => { mountTab(send, { companyId: "company-a", onAttention }); });
+  expect(send).toHaveBeenCalledExactlyOnceWith(queuedCreate.payload, queuedCreate.idempotencyKey);
+  expect(onAttention).not.toHaveBeenCalled();
+  expect(localStorage.getItem(requestStorageKey)).toBeNull();
+});
+
+it("does not let a held create block later same-company queued creates", async () => {
+  seedQueuedCreate();
+  const send = vi.fn().mockResolvedValue("saved");
+  const onAttention = vi.fn();
+  let tab!: ReturnType<typeof mountTab>;
+  await act(async () => { tab = mountTab(send, { companyId: "company-b", onAttention }); });
+  const payload = { body: "Task submitted in B", companyId: "company-b" };
+  await act(async () => { tab.queue.enqueue(payload, "company-b-create-key"); });
+  expect(send).toHaveBeenCalledExactlyOnceWith(payload, "company-b-create-key");
+  expect(onAttention).toHaveBeenCalledExactlyOnceWith(queuedCreate, null);
+  expect(localStorage.getItem(requestStorageKey)).not.toBeNull();
+  await act(async () => { tab.selectCompany("company-a"); });
+  expect(send).toHaveBeenLastCalledWith(queuedCreate.payload, queuedCreate.idempotencyKey);
+});
+
+it("does not bypass company attention through a restored durable retry timer", async () => {
+  vi.useFakeTimers();
+  seedQueuedCreate();
+  writePendingSend(pendingSendKeyFor(KEY, DETACHED_DRAFT_OWNER), queuedCreate);
+  const send = vi.fn().mockResolvedValue("saved");
+  const onAttention = vi.fn();
+  let tab!: ReturnType<typeof mountTab>;
+  await act(async () => { tab = mountTab(send, { companyId: "company-b", onAttention }); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(send).not.toHaveBeenCalled();
+  expect(onAttention).toHaveBeenCalledExactlyOnceWith(queuedCreate, null);
+  await act(async () => { tab.queue.resendNow(); });
+  expect(send).toHaveBeenCalledExactlyOnceWith(queuedCreate.payload, queuedCreate.idempotencyKey);
+  expect(localStorage.getItem(requestStorageKey)).toBeNull();
+});
+
+it("stops automatic retries when the selected company changes after an offline create", async () => {
+  vi.useFakeTimers();
+  const send = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+  const onAttention = vi.fn();
+  const tab = mountTab(send, { companyId: "company-a", onAttention });
+  await act(async () => { tab.queue.enqueue(queuedCreate.payload, queuedCreate.idempotencyKey); });
+  expect(send).toHaveBeenCalledOnce();
+  onAttention.mockClear();
+  await act(async () => { tab.selectCompany("company-b"); });
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(send).toHaveBeenCalledOnce();
+  expect(onAttention).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ idempotencyKey: queuedCreate.idempotencyKey }), null);
+  expect(localStorage.getItem(requestStorageKey)).not.toBeNull();
+});
 
 it("retains another tab's queued tasks through submission, completion, and reload", async () => {
   const firstSend = vi.fn<(payload: Payload, key: string) => Promise<string>>().mockImplementation(() => new Promise(() => {}));
