@@ -43,6 +43,21 @@ describe("native Pi sweep contracts", () => {
     const explicit = { PAPERCLIP_AI_PROVIDER_KEY: "explicit-company-binding" };
     expect(resolveNativeProviderEnvironment(provider, explicit, host)).toBe(explicit);
   });
+  it("merges configured Pi env over safe host defaults without inheriting ambient credentials", () => {
+    const host = { PATH: "/x", HOME: "/home/user", SECRET_TOKEN: "ambient-secret" };
+    expect(resolveNativeProviderEnvironment(provider, { TZ: "UTC" }, host)).toEqual({
+      PATH: "/x", HOME: "/home/user", TZ: "UTC",
+    });
+    expect(resolveNativeProviderEnvironment(provider, { HOME: "/configured/home", TZ: "UTC" }, host)).toEqual({
+      PATH: "/x", HOME: "/configured/home", TZ: "UTC",
+    });
+  });
+  it("leaves configured environments for non-Pi providers unchanged", () => {
+    const configured = { TZ: "UTC" };
+    expect(resolveNativeProviderEnvironment({ kind: "codex", model: "gpt-5.6-sol" }, configured, {
+      PATH: "/x", HOME: "/home/user",
+    })).toBe(configured);
+  });
   it("routes a Pi pool member and its own thinking key without implicit Codex or ACPX", () => {
     expect(poolMemberRuntimeConfig(member, "paperclip_runner")).toEqual({ config: {
       provider: "pi_rpc", model: provider.model, piRpcThinkingLevel: "xhigh",
