@@ -31,7 +31,12 @@ export type ReadySpare = {
   name: string;
   labels: Record<string, string>;
   providerObservation?: Record<string, unknown>;
+  createdAt?: string;
 };
+
+export class ReadySpareCreateArchivedError extends Error {
+  constructor(readonly spareId: string) { super(`Boat spare ${spareId} was archived during concurrent reconciliation`); }
+}
 
 export type ReadySpareOperations = {
   list(): Promise<ReadySpare[]>;
@@ -316,7 +321,8 @@ export class ReadySpareKeeper {
   }
 
   /** Boat-only timer pass: retire eligible ready spares without consulting claim storage or refilling. */
-  async reconcileTimer(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+  async reconcileTimer(key: ReadySpareKey, desired: number, operations: ReadySpareOperations,
+    isCompanyActive: (spare: ReadySpare) => Promise<boolean> = async () => false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
@@ -339,6 +345,7 @@ export class ReadySpareKeeper {
         || current.labels.configHash !== key.configHash
         || current.name !== `paperclip-spare:ready:${key.configHash}`
         || (current.state !== "ready" && current.state !== "idle") || this.claiming.has(surplus.id)) continue;
+      if (await isCompanyActive(current)) continue;
       await operations.stop(current);
     }
     if (selected.length) this.pools.set(poolId, selected);
@@ -470,6 +477,7 @@ export class ReadySpareKeeper {
           this.pools.set(poolId, next);
           if (operations.warmUp) void operations.warmUp(spare).catch(() => undefined);
         } catch (error) {
+          if (error instanceof ReadySpareCreateArchivedError) return;
           // The start attempt counts against the hourly cap even when Boat or
           // warm-up fails; exponential backoff prevents immediate retry loops.
           const count = (this.failures.get(poolId)?.count ?? 0) + 1;

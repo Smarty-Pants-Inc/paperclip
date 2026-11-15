@@ -3,7 +3,7 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
-import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
+import { createReadySpareClaimStore, ReadySpareCreateArchivedError, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
   readySpareEnvironmentIds, readySpareIdleMinutes, readySpareMax, readySparePoolKey,
   type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
@@ -709,6 +709,7 @@ function readySpareFromSandbox(sandbox: any, ttlSeconds: number): ReadySpare {
   return {
     id: sandbox.id, key, state: typeof sandbox.state === "string" ? sandbox.state : "unknown",
     warmed: name === `paperclip-spare:ready:${key.configHash}`, expiresAt, ttlSeconds, name, labels,
+    ...(typeof sandbox.createdAt === "string" ? { createdAt: sandbox.createdAt } : {}),
     providerObservation: sandbox as Record<string, unknown>,
   };
 }
@@ -738,6 +739,10 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
     return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
   } catch (error) {
     try { await stopSandbox(config, sandbox.id); } catch { /* Boat-side TTL remains the crash-safe stop. */ }
+    if (error instanceof Error && error.message === `Boat sandbox ${sandbox.id} entered archived`) {
+      duplexLogger?.warn("Boat ready spare was archived during concurrent idle stop", { providerLeaseId: sandbox.id });
+      throw new ReadySpareCreateArchivedError(sandbox.id);
+    }
     throw error;
   }
 }
@@ -912,7 +917,8 @@ async function maintainReadySpares(reconcile = false): Promise<void> {
       if (!reconcile) {
         // The unscoped timer can use Boat's inventory/name token, but must not
         // query the claim store or refill. Retire only listed ready spares.
-        await readySpares.reconcileTimer(pool.key, active ? pool.desired : 0, pool.operations);
+        await readySpares.reconcileTimer(pool.key, active ? pool.desired : 0, pool.operations,
+          async () => !active && await companySpareIsActive(pool.key.companyId, pool.idleMinutes));
         pool.idleStopped = !active;
         continue;
       }
