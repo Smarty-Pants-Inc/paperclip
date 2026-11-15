@@ -357,7 +357,8 @@ describe("sandbox callback bridge", () => {
     });
     try {
       await vi.advanceTimersByTimeAsync(60_000);
-      expect.soft(fake.listCommands.length).toBeLessThanOrEqual(10);
+      // At a 5s list wait, the 60s window allows 60/5 + 1 boundary lists.
+      expect.soft(fake.listCommands.length).toBeLessThanOrEqual(60 / 5 + 1);
       expect(workerErrors).toEqual([]);
     } finally {
       const stopping = worker.stop({ drainTimeoutMs: 1 });
@@ -2287,6 +2288,49 @@ describe("sandbox callback bridge", () => {
     runner.execute.mockClear();
     await client.listJsonFiles("/workspace/requests");
     expect(runner.execute.mock.calls[0]?.[0]?.args?.[1]).not.toContain("sleep 0.1");
+  });
+
+  it("bounds integer-only sleep fallback duration and invocation count", async () => {
+    const remoteCwd = await mkdtemp(path.join(os.tmpdir(), "bridge-integer-sleep-"));
+    cleanupDirs.push(remoteCwd);
+    await mkdir(path.join(remoteCwd, "requests"), { recursive: true });
+    const sleepDir = await mkdtemp(path.join(os.tmpdir(), "bridge-integer-sleep-bin-"));
+    cleanupDirs.push(sleepDir);
+    const sleepLog = path.join(sleepDir, "sleep.log");
+    await writeFile(path.join(sleepDir, "sleep"), [
+      "#!/bin/sh",
+      'printf \'%s\\n\' "$*" >> "$PAPERCLIP_TEST_SLEEP_LOG"',
+      '[ "$1" != "0.1" ] || exit 1',
+      'exec /bin/sleep "$@"',
+      "",
+    ].join("\n"), { mode: 0o755 });
+
+    const baseRunner = createExecRunner();
+    const runner = {
+      execute: (input: Parameters<typeof baseRunner.execute>[0]) => baseRunner.execute({
+        ...input,
+        env: {
+          ...input.env,
+          PATH: `${sleepDir}:${process.env.PATH ?? ""}`,
+          PAPERCLIP_TEST_SLEEP_LOG: sleepLog,
+        },
+      }),
+    };
+    const client = createCommandManagedSandboxCallbackBridgeQueueClient({
+      runner,
+      remoteCwd,
+      shellCommand: "sh",
+      timeoutMs: 3_500,
+    });
+    const startedAt = Date.now();
+    expect(await client.listJsonFiles(path.posix.join(remoteCwd, "requests"), 5_000)).toEqual([]);
+    const elapsedMs = Date.now() - startedAt;
+    const sleepCalls = (await readFile(sleepLog, "utf8")).trim().split(/\r?\n/);
+
+    // The requested wait clamps to 1.5s; integer-only fallback may overshoot by <1s.
+    expect(elapsedMs).toBeLessThanOrEqual(2_500);
+    expect(sleepCalls.filter((call) => call === "1").length).toBeGreaterThan(0);
+    expect(sleepCalls.length).toBeLessThanOrEqual(4);
   });
 
   it("leaves two seconds for each poll iteration after its long-list wait", async () => {
