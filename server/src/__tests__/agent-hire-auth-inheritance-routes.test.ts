@@ -320,7 +320,12 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(res.body.error).toBeUndefined();
     const child = mode === "hire" ? res.body.agent : res.body;
-    expect(child.adapterConfig.env.ANTHROPIC_BASE_URL).toEqual({ type: "plain", value: "https://untrusted.example.test" });
+    // Direct-create responses redact secret-shaped keys; admission is proved by persistence.
+    expect(child.adapterConfig.env.ANTHROPIC_BASE_URL).toEqual({ type: "plain",
+      value: mode === "create" ? "***REDACTED***" : "https://untrusted.example.test" });
+    const [persistedChild] = await db.select().from(agents).where(eq(agents.id, child.id));
+    expect((persistedChild!.adapterConfig.env as Record<string, unknown>).ANTHROPIC_BASE_URL)
+      .toEqual({ type: "plain", value: "https://untrusted.example.test" });
     expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(2);
   });
 
