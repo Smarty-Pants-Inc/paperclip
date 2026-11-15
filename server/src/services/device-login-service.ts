@@ -36,6 +36,7 @@ import {
 } from "@paperclipai/adapter-utils/login-pty-transport";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { buildLoginLeaseAcquireArgs, loginLeaseBoundsDeadline } from "./adapter-login-lease.js";
+import { SandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { environmentService } from "./environments.js";
 import { runDescriptorBoundAuthRead } from "./device-login-credential-read.js";
 import {
@@ -1612,8 +1613,9 @@ export function createWorkerBoundLoginPtyOpener(
     validateLoginSessionHome(binding.sessionHome);
     // The opener argument is the runner's fixed command string. It confers no
     // command authority, so the opener ignores it and returns a host-bound opener.
-    return (_command: string) =>
-      deps.workerManager.openLoginPtySession(pluginId, {
+    return (_command: string) => {
+      if (binding.providerLeaseId !== binding.lease.providerLeaseId) throw new SandboxLeaseStartDeniedError();
+      return deps.workerManager.openLoginPtySession(pluginId, {
         driverKey,
         companyId: binding.companyId,
         environmentId: binding.environmentId,
@@ -1622,6 +1624,7 @@ export function createWorkerBoundLoginPtyOpener(
         sessionHome: binding.sessionHome,
         expiresAt: binding.expiresAt,
       });
+    };
   };
 }
 

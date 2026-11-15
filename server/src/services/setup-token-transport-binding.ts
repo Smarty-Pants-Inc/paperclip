@@ -38,6 +38,7 @@ import { secretService } from "./secrets.js";
 import type { environmentService } from "./environments.js";
 import type { environmentRuntimeService } from "./environment-runtime.js";
 import { buildLoginLeaseAcquireArgs, loginLeaseBoundsDeadline } from "./adapter-login-lease.js";
+import { SandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import type { Db } from "@paperclipai/db";
 import {
   createLoginPtyTransport,
@@ -367,6 +368,7 @@ export interface ProductionSetupTokenSandboxProviderDeps {
     scope: SetupTokenSessionScope;
     environmentId: string;
     leaseId: string;
+    acquiredProviderLeaseId: string | null;
   }) => Promise<LoginPtySessionOpener>;
   /** A non-leaking status sink. It receives only fixed status lines. */
   log?: (line: string) => void;
@@ -465,6 +467,7 @@ export function createProductionSetupTokenSandboxProvider(
           scope,
           environmentId: scope.environmentId,
           leaseId,
+          acquiredProviderLeaseId: leaseRecord.lease.providerLeaseId,
         });
         return { leaseId, openPtySession };
       } catch (err) {
@@ -603,7 +606,7 @@ export function createWorkerBoundLoginPtyOpener(
   deps: WorkerBoundLoginPtyOpenerDeps,
 ): NonNullable<ProductionSetupTokenSandboxProviderDeps["openLivePtySession"]> {
   const log = deps.log ?? (() => {});
-  return async ({ scope, environmentId, leaseId }) => {
+  return async ({ scope, environmentId, leaseId, acquiredProviderLeaseId }) => {
     const lease = await deps.environments.getLeaseById(leaseId);
     const providerLeaseId =
       typeof lease?.providerLeaseId === "string" && lease.providerLeaseId.length > 0
@@ -636,6 +639,7 @@ export function createWorkerBoundLoginPtyOpener(
       // shape before the host sends the worker RPC.
       const sessionHome = deriveLoginSessionHome(randomUUID());
       validateLoginSessionHome(sessionHome);
+      if (providerLeaseId !== acquiredProviderLeaseId) throw new SandboxLeaseStartDeniedError();
       return deps.workerManager.openLoginPtySession(pluginId, {
         driverKey,
         companyId: scope.companyId,

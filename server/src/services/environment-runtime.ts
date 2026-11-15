@@ -1370,6 +1370,16 @@ function adaptDuplexChannelHostSession(
   };
 }
 
+async function assertLeaseStartable(db: Db, companyId: string, providerLeaseId: string) {
+  const tips = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
+    .from(environmentLeases).where(and(eq(environmentLeases.companyId, companyId),
+      eq(environmentLeases.providerLeaseId, providerLeaseId),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`)).for("share");
+  if (tips.some(tip => tip.status === "expired" || Object.hasOwn(tip.metadata ?? {}, "reusableSandboxLeaseSuperseded"))) {
+    throw new SandboxLeaseStartDeniedError();
+  }
+}
+
 function createSandboxEnvironmentDriver(
   db: Db,
   options: {
@@ -3127,6 +3137,7 @@ function createSandboxEnvironmentDriver(
           "Sandbox duplex channel needs a plugin id, a provider key, and a provider lease id on the lease.",
         );
       }
+      await assertLeaseStartable(db, input.lease.companyId, providerLeaseId);
       const worker = pluginWorkerManager.getWorker(pluginId);
       if (!worker) {
         throw new Error(`Plugin worker "${pluginId}" is not running for the duplex channel.`);
@@ -4122,15 +4133,7 @@ export function environmentRuntimeService(
         "environmentRealizeWorkspace", "environmentExecute", "environmentSyncIn", "environmentSyncOut"].includes(method)
         || (method === "environmentTask" && !["status", "stop", "complete", "release", "credentials", "read_state", "read_file", "archive_state"].includes(scope.operation?.kind ?? ""));
       try {
-        if (starts && scope.companyId && providerLeaseId) {
-          const tips = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
-            .from(environmentLeases).where(and(eq(environmentLeases.companyId, scope.companyId),
-              eq(environmentLeases.providerLeaseId, providerLeaseId),
-              sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`));
-          if (tips.some(tip => tip.status === "expired" || Object.hasOwn(tip.metadata ?? {}, "reusableSandboxLeaseSuperseded"))) {
-            throw new SandboxLeaseStartDeniedError();
-          }
-        }
+        if (starts && scope.companyId && providerLeaseId) await assertLeaseStartable(db, scope.companyId, providerLeaseId);
       } catch (error) {
         args[2]?.(); // No RPC was sent: settle the caller's tracked worker slot.
         throw error;
