@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { MemoryRouter, Outlet } from "react-router-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -47,7 +48,22 @@ vi.hoisted(() => {
   }
 });
 
-const routeState = vi.hoisted(() => ({ companyPrefix: "PC1" as string | undefined }));
+const creationPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("./lib/organization-creation", () => ({
+  get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
+}));
+vi.mock("./components/CloudAccessGate", () => ({ CloudAccessGate: () => <Outlet /> }));
+vi.mock("./components/ShellConfigurationGate", () => ({ ShellConfigurationGate: () => <Outlet /> }));
+vi.mock("./components/PageLoadTracker", () => ({ PageLoadTracker: () => null }));
+vi.mock("./components/ConnectionStatusBanner", () => ({ ConnectionStatusBanner: () => null }));
+vi.mock("./components/OnboardingWizardVariant", () => ({ OnboardingWizardVariant: () => null }));
+// Exercise App's no-organizations fallback rather than redirecting to the wizard.
+vi.mock("./lib/onboarding-route", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./lib/onboarding-route")>(),
+  shouldRedirectCompanylessRouteToOnboarding: () => false,
+}));
+
+const routeState = vi.hoisted(() => ({ companyPrefix: "PC1" as string | undefined, noCompanies: false }));
 const dialogState = vi.hoisted(() => ({
   onboardingOpen: false,
   onboardingRouteDismissed: true,
@@ -66,7 +82,7 @@ vi.mock("@/lib/router", async () => {
 
 vi.mock("./context/CompanyContext", () => ({
   useCompany: () => ({
-    companies: [{ id: "company-1", name: "Acme", issuePrefix: "PC1" }],
+    companies: routeState.noCompanies ? [] : [{ id: "company-1", name: "Acme", issuePrefix: "PC1" }],
     selectedCompanyId: "company-1",
     loading: false,
     error: null,
@@ -83,7 +99,7 @@ vi.mock("./context/DialogContext", () => ({
 
 vi.mock("./api/goals", () => ({ goalsApi: mockGoalsApi }));
 
-const { OnboardingRoutePage } = await import("./App");
+const { App, OnboardingRoutePage } = await import("./App");
 
 const COMPANY_GOAL = {
   id: "goal-1",
@@ -136,6 +152,8 @@ describe("the onboarding launcher's Add Agent button", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    creationPolicy.hidden = false;
+    routeState.noCompanies = false;
     routeState.companyPrefix = "PC1";
     dialogState.onboardingOpen = false;
     dialogState.onboardingRouteDismissed = true;
@@ -149,6 +167,48 @@ describe("the onboarding launcher's Add Agent button", () => {
     container.remove();
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  // Data safety: cover both the empty account screen and the dismissed wizard's
+  // secondary launcher, without changing onboarding for an existing company.
+  it.each([true, false])("no-organizations creation entry point: hidden=%s", async (hidden) => {
+    creationPolicy.hidden = hidden;
+    routeState.noCompanies = true;
+    root = createRoot(container);
+    await act(async () => {
+      root!.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/companies"]}><App /></MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    expect(container.textContent).toContain("Get started by creating an organization.");
+    const button = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent?.includes("New Organization"));
+    expect(Boolean(button)).toBe(!hidden);
+    if (button) {
+      await act(async () => button.click());
+      expect(dialogState.openOnboarding).toHaveBeenCalledWith();
+    }
+  });
+
+  it.each([true, false])("unmatched onboarding launcher: hidden=%s", async (hidden) => {
+    creationPolicy.hidden = hidden;
+    routeState.companyPrefix = "NOPE";
+    await render();
+    const start = [...container.querySelectorAll("button")]
+      .find((b) => b.textContent?.includes("Start Onboarding"));
+    expect(Boolean(start)).toBe(!hidden);
+  });
+
+  it("keeps Add Agent available while organization creation is hidden", async () => {
+    creationPolicy.hidden = true;
+    await render();
+    await act(async () => addAgentButton().click());
+    expect(dialogState.openOnboarding).toHaveBeenCalledWith({
+      initialStep: ONBOARDING_AGENT_STEP,
+      companyId: "company-1",
+    });
   });
 
   it("opens on the agent step for a company that already has its mission", async () => {
