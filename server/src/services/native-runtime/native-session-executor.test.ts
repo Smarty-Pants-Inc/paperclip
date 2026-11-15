@@ -3553,7 +3553,9 @@ describe("remote provider pack manifest", () => {
           piCommandSha256: digest, piProxyPath: "/opt/paperclip-runner/provider-pack/dist/cli/pi-rpc-app-server-proxy.cjs",
           piProxySha256: digest,
         });
-        expect(transport.environment?.PI_CODING_AGENT_DIR).toMatch(/^\/workspace\/\.paperclip-runtime\/paperclip-runner\/.+\/pi-agent$/);
+        // Remote Pi keeps the image's default directory unless the operator
+        // explicitly configures an absolute override (covered by task-session rows).
+        expect(transport.environment?.PI_CODING_AGENT_DIR).toBeUndefined();
         expect(state.createBackend.mock.calls.at(-1)![0].provider).toMatchObject({
           kind: "pi_rpc", model: "paperclip/selected-model-exactly", piRpcThinkingLevel,
         });
