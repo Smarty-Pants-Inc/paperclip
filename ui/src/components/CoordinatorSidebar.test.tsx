@@ -11,7 +11,7 @@ import { queryKeys } from "@/lib/queryKeys";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
-  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, agents: [] as Agent[] }));
+  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, enableGoalsSidebarLink: undefined as boolean | undefined, agents: [] as Agent[] }));
 vi.mock("@/hooks/useAgentChatNavigation", () => ({ useAgentChatNavigation: () => ({
   companyId: "company", userId: fixture.userId, agents: { data: fixture.agents }, chats: { data: fixture.chats }, session: { isSuccess: true },
 }) }));
@@ -25,7 +25,7 @@ vi.mock("@/lib/issueDetailCache", async (importOriginal) => ({
 vi.mock("@/context/DialogContext", () => ({ useDialogActions: () => ({ openNewIssue: fixture.openNewIssue }) }));
 vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ collapsed: fixture.collapsed, peeking: false, isMobile: false, setSidebarOpen: vi.fn() }) }));
 vi.mock("@/api/attention", () => ({ attentionApi: { list: fixture.attention, summary: fixture.summary } }));
-vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases }) } }));
+vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases, enableGoalsSidebarLink: fixture.enableGoalsSidebarLink }) } }));
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => fixture.projects } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
@@ -51,7 +51,7 @@ function summary(items: AttentionItem[]) {
 let root: Root, container: HTMLDivElement, client: QueryClient;
 beforeEach(() => {
   vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues";
-  fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.agents = [];
+  fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.enableGoalsSidebarLink = undefined; fixture.agents = [];
   fixture.summary.mockResolvedValue(summary([pending("question"), pending("review")]));
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -193,6 +193,37 @@ describe("Coordinator pinned pages", () => {
     await renderSidebar();
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="More workspace pages"]')!.click());
     expect(document.querySelector('a[href="/cases"]') !== null).toBe(enabled);
+  });
+  const moreLinks = () => [...document.querySelectorAll<HTMLAnchorElement>('[data-slot="popover-content"] a')].map(link => link.textContent);
+  it.each([true, false, undefined])("keeps Goals in More, after Projects, only when the Goals sidebar link is enabled (%s)", async enabled => {
+    fixture.enableGoalsSidebarLink = enabled;
+    await renderSidebar();
+    await click("More workspace pages");
+    const goals = document.querySelector('[data-slot="popover-content"] a[href="/goals"]');
+    expect(goals !== null).toBe(enabled === true);
+    expect(moreLinks().slice(0, 4)).toEqual(enabled === true ? ["Search", "Dashboard", "Projects", "Goals"] : ["Search", "Dashboard", "Projects", "Routines"]);
+    if (enabled === true) expect(goals!.textContent).toBe("Goals");
+  });
+  it.each([false, true])("keeps the More separators before Skills and Cases when Goals is %s", async goals => {
+    fixture.enableGoalsSidebarLink = goals; fixture.enableCases = true;
+    await renderSidebar();
+    await click("More workspace pages");
+    const nextLabels = [...document.querySelectorAll('[data-slot="popover-content"] [role="separator"]')]
+      .map(separator => separator.parentElement!.querySelector("a")!.textContent);
+    expect(nextLabels).toEqual(["Skills", "Cases"]);
+  });
+  it("pins Goals from More like the other pages, and hides a saved Goals pin while the link is off", async () => {
+    fixture.enableGoalsSidebarLink = true;
+    await renderSidebar();
+    expect(pinnedPage("/goals")).toBeNull();
+    await click("More workspace pages");
+    await click("Pin Goals");
+    expect(pinnedPage("/goals")?.textContent).toBe("Goals");
+    expect(JSON.parse(localStorage.getItem("paperclip.coordinator.pinned-nav.v1:reviewer")!)).toEqual(["/goals"]);
+    fixture.enableGoalsSidebarLink = false;
+    await act(async () => root.unmount()); root = createRoot(container); client.clear();
+    await renderSidebar();
+    expect(pinnedPage("/goals")).toBeNull();
   });
   it("announces unread chat totals in expanded and collapsed navigation", async () => {
     fixture.chats = [{ isUnreadForMe: true }, { isUnreadForMe: false }, { isUnreadForMe: true }];
