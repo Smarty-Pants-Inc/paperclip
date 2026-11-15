@@ -185,7 +185,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
       sql`${issueThreadInteractions.issueId}::text`, issueThreadInteractions.createdAt);
 
     const [activeRuns, latestRuns, wakes, chatWakes, nativePending, handoffs, goals, interactions, approvalRows,
-      blockerRows, resolvedBlockerRows, childRows, actionMap, agentRows, companyRows, onboardingRows, blockActivity, interruptions] = await Promise.all([
+      blockerRows, resolvedBlockerRows, childRows, actionMap, agentRows, companyRows, onboardingRows, blockActivity, interruptions,
+      personWaits] = await Promise.all([
       database.select(runColumns).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
         inArray(heartbeatRuns.status, NON_TERMINAL_RUN_STATUSES), sql`${runIssue} = any(${idParam})`)),
       // The newest run per task, read through the (company, issueId, created) index.
@@ -278,6 +279,41 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         ) latest`) : [],
       taskInterruptionPresentations(database, companyId, issueRows.map(issue => ({ id: issue.id, companyId: issue.companyId,
         status: issue.status, assigneeAgentId: issue.assigneeAgentId, projectId: issue.projectId }))),
+      // Native arbitration already accepted this person's wait. Read only the
+      // latest assessment, bound to the still-current applied decision; prose
+      // or a result that never committed cannot grant a waiting exemption.
+      database.execute<{ issueId: string; runId: string }>(sql`
+        select requested.id as "issueId", assessment.run_id as "runId"
+        from unnest(${idParam}) as requested(id)
+        cross join lateral (
+          select a.* from work_assessments a
+          where a.company_id = ${companyId} and a.issue_id = requested.id::uuid
+          order by a.created_at desc, a.id desc limit 1
+        ) assessment
+        inner join status_decisions decision on decision.company_id = assessment.company_id
+          and decision.issue_id = assessment.issue_id and decision.run_id = assessment.run_id
+          and decision.assessment_id = assessment.id and decision.application_state = 'applied'
+          and decision.reason_code in ('board_response_waiting', 'response_wake_waiting_for_input')
+        inner join issues task on task.company_id = assessment.company_id and task.id = assessment.issue_id
+          and task.last_status_decision_id = decision.id and task.status = decision.to_status
+          and task.status_version = assessment.prior_status_version + 1
+        inner join native_run_finalizations finalization on finalization.company_id = assessment.company_id
+          and finalization.issue_id = assessment.issue_id and finalization.run_id = assessment.run_id
+          and finalization.assessment_id = assessment.id and finalization.decision_id = decision.id
+          and finalization.result_id = assessment.result_id and finalization.phase = 'committed'
+        inner join native_run_results result on result.company_id = assessment.company_id
+          and result.issue_id = assessment.issue_id and result.run_id = assessment.run_id
+          and result.id = assessment.result_id and result.schema_status = 'accepted'
+        where assessment.assessment_json->>'reportedDisposition' = 'yielded'
+          and assessment.assessment_json#>>'{continuation,kind}' = 'response_wake'
+          and not exists (select 1 from issue_comments comment
+            where comment.company_id = assessment.company_id and comment.issue_id = assessment.issue_id
+              and comment.author_type = 'user' and comment.created_by_run_id is null and comment.deleted_at is null
+              and greatest(comment.created_at, comment.updated_at) > assessment.created_at)
+          and not exists (select 1 from issue_thread_interactions interaction
+            where interaction.company_id = assessment.company_id and interaction.issue_id = assessment.issue_id
+              and greatest(interaction.created_at, interaction.updated_at, interaction.resolved_at) > assessment.created_at)
+      `),
     ]);
 
     const rowsOf = <T>(value: unknown): T[] => Array.isArray(value) ? value as T[] : ((value as { rows?: T[] })?.rows ?? []);
@@ -333,6 +369,7 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const childCounts = counts(childRows.map(row => ({ issueId: row.parentId, count: row.count })));
     const onboardingIds = new Set(onboardingRows.map(row => row.id));
     const latestByIssue = new Map(rowsOf<RunRow>(latestRuns).map(row => [row.issueId, row]));
+    const personWaitByIssue = new Map(rowsOf<{ issueId: string; runId: string }>(personWaits).map(row => [row.issueId, row.runId]));
     const blockActivityByIssue = new Map(rowsOf<{ issueId: string; actorType: string; actorId: string; agentId: string | null; details: unknown }>(blockActivity)
       .map(row => [row.issueId, row]));
 
@@ -388,6 +425,8 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         interruption: interruption ? { responsibility: interruption.responsibility, state: interruption.state,
           userAction: interruption.userAction, nextRetryAt: interruption.nextRetryAt, canRetry: interruption.canRetry } : null,
         pendingInteractions: interactionCounts.get(issue.id) ?? 0,
+        awaitingPerson: latest?.runtimeMode === "native" && latest.status === "succeeded"
+          && latest.agentId === issue.assigneeAgentId && personWaitByIssue.get(issue.id) === latest.id,
         pendingApprovals: approvalCounts.get(issue.id) ?? 0,
         openBlockers: blockerCounts.get(issue.id) ?? 0,
         lastBlockerResolvedAt: resolvedBlockerAt.get(issue.id) ?? null,
