@@ -1827,6 +1827,39 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
   color: inherit;
 }
 
+/* reasoning-look:start
+   Reasoning reads as the agent thinking aloud, set apart from its reply: every
+   reasoning line is italic and a step quieter than the answer (Paul 11-15).
+   Bodies use the muted tier (AA on the chat and inline-block surfaces in both
+   themes); headlines sit between it and the reply colour so they still lead.
+   The tokens are declared on the text itself so a scoped theme (the
+   Coordinator workspace) resolves them against its own colours. */
+.task-chat-reasoning-headline,
+.paperclip-markdown.task-chat-reasoning-markdown {
+  --task-chat-reasoning-foreground: var(--muted-foreground);
+  --task-chat-reasoning-headline-foreground: color-mix(in oklab, var(--foreground) 72%, var(--muted-foreground));
+  font-style: italic;
+}
+
+.task-chat-reasoning-headline {
+  color: var(--task-chat-reasoning-headline-foreground);
+}
+
+.paperclip-markdown.task-chat-reasoning-markdown {
+  color: var(--task-chat-reasoning-foreground);
+}
+
+.paperclip-markdown.task-chat-reasoning-markdown :is(strong, b) {
+  color: var(--task-chat-reasoning-headline-foreground);
+}
+
+/* Emphasis inside italic text flips back to upright so it still stands out;
+   code stays upright so identifiers read exactly. */
+.paperclip-markdown.task-chat-reasoning-markdown :is(em, code) {
+  font-style: normal;
+}
+/* reasoning-look:end */
+
 .task-chat-expanded-line-wrap,
 .task-chat-reasoning-headline,
 .paperclip-markdown.task-chat-reasoning-markdown,

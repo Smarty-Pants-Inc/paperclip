@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Brain, ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { TaskChatThinkingItem } from "./task-chat-model";
-import { flattenSelfTalk, readReasoningDisplay } from "./transcript-adapter";
+import { flattenSelfTalk } from "./transcript-adapter";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 import { latestReasoningHeadline } from "./reasoning-summary";
 import { useTaskChatShimmer } from "./TaskChatShimmer";
@@ -12,7 +12,7 @@ export function TaskChatThinking({
   item,
   defaultOpen,
   rowClassName,
-  inline = item.inline ?? readReasoningDisplay() === "inline",
+  inline = item.inline ?? false,
   active = Boolean(item.streaming),
 }: {
   item: TaskChatThinkingItem;

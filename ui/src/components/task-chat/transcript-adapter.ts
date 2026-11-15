@@ -6,6 +6,7 @@
  * only showing a response after the turn settles.
  */
 import { foldApprovedAutoReviews } from "./fold-auto-reviews";
+import type { ReasoningDisplay } from "./reasoning-display";
 import { isFatalProviderError, isStatusNotice, isStatusNoticePayload, statusNoticeCategory } from "./status-notice-presentation";
 import type { TranscriptEntry } from "@/adapters";
 import { formatContextTokens } from "@/lib/context-tokens";
@@ -1319,7 +1320,7 @@ export function transcriptToTaskChatItems(
  */
 export function settledRunChildren(
   parsed: readonly TaskChatItem[],
-  reasoningDisplay: ReasoningDisplay = readReasoningDisplay(),
+  reasoningDisplay: ReasoningDisplay = "fold",
 ): TaskChatTurnChildItem[] {
   // A finished run's compactions render as thread dividers (see
   // settledCompactionMarkers), not inside its collapsed turn.
@@ -2057,27 +2058,14 @@ function subagentsFromDelegation(
   });
 }
 
-export type ReasoningDisplay = "fold" | "inline";
-export const REASONING_DISPLAY_STORAGE_KEY = "paperclip:task-chat:reasoning-display:v1";
-
-export function readReasoningDisplayOverride(): ReasoningDisplay | null {
-  if (typeof window === "undefined") return null;
-  try {
-    const stored = window.localStorage.getItem(REASONING_DISPLAY_STORAGE_KEY);
-    return stored === "inline" || stored === "fold" ? stored : null;
-  } catch {
-    return null;
-  }
-}
-
-export function readReasoningDisplay(defaultDisplay: ReasoningDisplay = "fold"): ReasoningDisplay {
-  return readReasoningDisplayOverride() ?? defaultDisplay;
-}
+// Resolved per run by reasoning-display.ts (the person's agent preference,
+// else the adapter default). Callers that do not pass one get "fold".
+export type { ReasoningDisplay } from "./reasoning-display";
 
 export function buildTurnTimelineRows(
   parsed: readonly TaskChatItem[],
   running: boolean,
-  reasoningDisplay: ReasoningDisplay = readReasoningDisplay(),
+  reasoningDisplay: ReasoningDisplay = "fold",
 ): TaskChatTurnChildItem[] {
   const rows: TaskChatTurnChildItem[] = [];
   let current: TaskChatActivityPhaseItem | null = null;

@@ -5,6 +5,7 @@ import path from "node:path";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ThemeProvider } from "@/context/ThemeContext";
 import { TaskChatReasoningSummary } from "./TaskChatReasoningSummary";
 
 // The reasoning look lives in index.css on the existing hooks
@@ -37,7 +38,7 @@ afterEach(() => {
 function render(text: string) {
   style.textContent = reasoningLookCss();
   document.head.appendChild(style);
-  flushSync(() => root.render(<TaskChatReasoningSummary text={text} />));
+  flushSync(() => root.render(<ThemeProvider><TaskChatReasoningSummary text={text} /></ThemeProvider>));
 }
 
 describe("reasoning text look", () => {
