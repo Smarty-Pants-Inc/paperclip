@@ -1,4 +1,5 @@
 import { useCallback, useMemo, useState } from "react";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { useQuery } from "@tanstack/react-query";
 import {
   Check,
@@ -227,7 +228,7 @@ function BuiltinCompanyMenu({ open: controlledOpen, onOpenChange }: SidebarCompa
   }
 
   function addCompany() {
-    if (companyCreationManaged) return;
+    if (ORGANIZATION_CREATION_HIDDEN || companyCreationManaged) return;
     setOpen(false);
     if (isMobile) setSidebarOpen(false);
     // Skip the front-door "how would you like to get started?" choice and land
@@ -357,7 +358,7 @@ function BuiltinCompanyMenu({ open: controlledOpen, onOpenChange }: SidebarCompa
           ) : null}
         </div>
         <div className="flex flex-col gap-0.5 border-t border-border px-2.5 pb-2.5 pt-2">
-          {!companyCreationManaged && (
+          {!ORGANIZATION_CREATION_HIDDEN && !companyCreationManaged && (
             <DropdownMenuItem
               onClick={addCompany}
               className={ORGANIZATION_ACTION_CLASS}
