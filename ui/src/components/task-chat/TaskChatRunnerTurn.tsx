@@ -203,10 +203,9 @@ export function TaskChatRunnerTurn({
   /** The task thread keeps a shared header across native and legacy discovery. */
   showHeader?: boolean;
   /**
-   * The thread's resolved reasoning display for this run: the person's
-   * choice (kept in memory even when saving it fails), else the run adapter's
+   * The thread's resolved reasoning display for this run: the run adapter's
    * `transcriptPresentation.liveReasoningView`. Omitted only by hosts without
-   * that resolution, which keep the saved device choice.
+   * that resolution, which fold.
    */
   reasoningDisplay?: ReasoningDisplay;
   onRuntimeRequestDecision?: (
