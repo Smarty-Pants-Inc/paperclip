@@ -21,6 +21,10 @@ const mockAuthApi = vi.hoisted(() => ({
 }));
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockOpenOnboarding = vi.hoisted(() => vi.fn());
+const creationPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("@/lib/organization-creation", () => ({
+  get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
+}));
 const mockSetSelectedCompanyId = vi.hoisted(() => vi.fn());
 const mockSetSidebarOpen = vi.hoisted(() => vi.fn());
 const mockLocation = vi.hoisted(() => ({ pathname: "/PAP/dashboard" }));
@@ -157,6 +161,7 @@ describe("SidebarCompanyMenu", () => {
       orderedIds: ["company-1", "company-2", "company-3"],
       updatedAt: null,
     });
+    creationPolicy.hidden = false;
     mockLocation.pathname = "/PAP/dashboard";
     mockCompanyState.companies = null;
     mockCompanyState.companyListUnavailable = false;
@@ -574,6 +579,31 @@ describe("SidebarCompanyMenu", () => {
     act(() => {
       root.unmount();
     });
+  });
+
+  // Data safety: accidental organization creation must be unavailable in both shells,
+  // independent of the viewer's admin role. Keep the false-policy rollback covered.
+  it.each([
+    [false, true], [false, false], [true, true], [true, false],
+  ])("creation entry point: production=%s hidden=%s", async (production, hidden) => {
+    creationPolicy.hidden = hidden;
+    const { root } = renderMenu({ production });
+    try {
+      await flushReact();
+      await openMenu(`Open Acme Labs ${production ? "company" : "organization"} switcher`);
+      const item = Array.from(document.body.querySelectorAll('[role="menuitem"]'))
+        .find((element) => element.textContent?.includes("Create organization"));
+      expect(Boolean(item)).toBe(!hidden);
+      expect(document.body.textContent).toContain("Strata");
+      if (item) {
+        act(() => item.dispatchEvent(new MouseEvent("click", { bubbles: true })));
+        expect(mockOpenOnboarding).toHaveBeenCalledWith({ initialStep: 1 });
+      } else {
+        expect(mockOpenOnboarding).not.toHaveBeenCalled();
+      }
+    } finally {
+      act(() => root.unmount());
+    }
   });
 
   describe("in Paperclip Cloud", () => {
