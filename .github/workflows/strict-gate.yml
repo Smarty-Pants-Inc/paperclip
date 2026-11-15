@@ -25,9 +25,8 @@ jobs:
       provider_pack_digest: ${{ steps.digests.outputs.provider_pack_digest }}
       server_dist_sha256: ${{ steps.digests.outputs.server_dist_sha256 }}
     env:
-      GATE_OUT: ${{ runner.temp }}/strict-gate/out
-      GATE_TMP: ${{ runner.temp }}/strict-gate/tmp
-      CARGO_TARGET_DIR: ${{ runner.temp }}/strict-gate/cargo-target
+      SOURCE_SHA: ${{ inputs.sha }}
+      BASE_SHA: ${{ inputs.base_sha }}
       PAPERCLIP_PI_GATE_INCLUDE_STOP: "0"
       PAPERCLIP_PI_E2E_CONTINUING_STRICT: "1"
       PAPERCLIP_PI_E2E_PROTOCOL: messages
@@ -39,6 +38,13 @@ jobs:
       PAPERCLIP_PI_E2E_EXPECT_FINISH_RED: "0"
 
     steps:
+      # The runner context is not available in job-level env, so the paths are set here.
+      - name: Set gate paths
+        run: |
+          echo "GATE_OUT=$RUNNER_TEMP/strict-gate/out" >> "$GITHUB_ENV"
+          echo "GATE_TMP=$RUNNER_TEMP/strict-gate/tmp" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$RUNNER_TEMP/strict-gate/cargo-target" >> "$GITHUB_ENV"
+
       - name: Checkout requested source
         uses: actions/checkout@v4
         with:
@@ -103,13 +109,10 @@ jobs:
           PAPERCLIP_PI_GATE_LOCK: ${{ runner.temp }}/strict-gate/out/build-and-gate.lock
           PAPERCLIP_PI_E2E_HOME_FIXTURE: ${{ runner.temp }}/strict-gate/out/pi-home-fixture
           TMPDIR: ${{ runner.temp }}/strict-gate/tmp
-        run: bash scripts/pi-rpc-full-server-gate.sh '${{ inputs.sha }}' candidate
+        run: bash scripts/pi-rpc-full-server-gate.sh "$SOURCE_SHA" candidate
 
       - name: Compare server typecheck diagnostics with base
         shell: bash
-        env:
-          SOURCE_SHA: ${{ inputs.sha }}
-          BASE_SHA: ${{ inputs.base_sha }}
         run: |
           set -euo pipefail
           mkdir -p "$GATE_OUT/typecheck"
