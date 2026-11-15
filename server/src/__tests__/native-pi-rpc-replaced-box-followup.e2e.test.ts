@@ -60,7 +60,7 @@ import { materializeAsset } from "../services/native-runtime/runtime-context.js"
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { HELD_PREDECESSOR_NOTICE } from "../services/native-runtime/held-predecessor-notice-text.js";
-import { FRESH_THREAD_STARTED_NOTE, FRESH_THREAD_STOPPING_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
+import { FRESH_THREAD_STARTED_NOTE } from "../services/native-runtime/fresh-thread-stop-gate.js";
 
 const enabled = process.env.PAPERCLIP_PI_LEASE_E2E === "1";
 const WARM_IDLE_MS = 300_000;
@@ -906,7 +906,11 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         expect(requests.filter(request => request.runId === next.runId)[0], "G1 history PRESENT in the model request").toMatchObject({ containsFact: true });
         expect(notes, "G1 preserved history needs no system notice").toHaveLength(0);
       }
-      expect(notes.filter(note => note.body.includes(FRESH_THREAD_STOPPING_NOTE))).toHaveLength(0);
+      // Cut B deletes the stopping note (FRESH_THREAD_STOPPING_NOTE is gone). RFL 16:07Z: pin the
+      // route's EXACT system-note set instead, so any stray note fails, a reintroduced stopping note
+      // included: G1 none; G2 exactly the missing-file note.
+      expect(notes.map(note => note.body), "the route's exact system-note set").toEqual(scenario.piConversationFile === "absent"
+        ? ["My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one."] : []);
       expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toHaveLength(0);
     } else if (sameBoxCold) {
       // SB KEEP-GREEN TARGET: same normalized conversation, no replay and no
@@ -961,6 +965,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(followupRequests).toHaveLength(1);
       expect(followupRequests[0]).toMatchObject({ containsFact: true, handoffHasFact: true, reply: `RECALLED_${fact}` });
       expect(notes.length).toBeLessThanOrEqual(1);
+      // RFL 16:07Z exact set: the plain row (history handed over) writes no system note at all.
+      expect(notes.map(note => note.body), "plain row: the route's exact system-note set").toEqual([]);
       expect(notes.filter(note => note.body.includes(HELD_PREDECESSOR_NOTICE)), "no held notice on the answered path").toHaveLength(0);
       expect(notes.some(note => String(record(note.metadata).authorizationReason ?? "").startsWith("native_prior_owner_held:"))).toBe(false);
       const persistedEvidence = JSON.stringify({ resultJson: persisted?.resultJson, runnerProfileJson: persisted?.runnerProfileJson, events });
