@@ -1,8 +1,8 @@
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agentWakeupRequests, agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issueRelations, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, pluginManagedResources, plugins, routineRuns, routines, statusDecisionEffects, statusDecisions, workAssessments } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, agents, companies, completionContracts, createDb, heartbeatRuns, issueComments, issueRelations, issueThreadInteractions, issues, nativeRunFinalizations, nativeRunResults, pluginManagedResources, plugins, routineRuns, routines, statusDecisionEffects, statusDecisions, workAssessments } from "@paperclipai/db";
 import type { Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { routineService } from "../routines.js";
@@ -215,12 +215,21 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
 
     await commit(f, status);
     const [saved] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const clearEvents = await db.select().from(activityLog).where(and(
+      eq(activityLog.action, "issue.monitor_cleared"),
+      eq(activityLog.entityType, "issue"),
+      eq(activityLog.entityId, f.issueId),
+    ));
     if (status === "blocked") {
       expect(saved).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null,
         executionState: { monitor: { status: "cleared", clearReason: "invalid_status" } } });
+      expect(clearEvents).toHaveLength(1);
+      expect(clearEvents[0]).toMatchObject({ actorType: "system", actorId: "native-status-committer", runId: f.runId,
+        details: { reason: "invalid_status", previousNextCheckAt: nextCheckAt.toISOString(), notes: "Check status" } });
     } else {
       expect(saved.monitorNextCheckAt).toEqual(nextCheckAt);
       expect(saved.executionState).toMatchObject({ monitor: { status: "scheduled", scheduledBy: "assignee" } });
+      expect(clearEvents).toHaveLength(0);
     }
   });
   it("settles a publicly dispatched plugin-managed invocation with its supported custom origin", async () => {
