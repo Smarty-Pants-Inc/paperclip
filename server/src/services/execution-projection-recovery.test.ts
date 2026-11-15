@@ -5,7 +5,7 @@ import { agents, companies, createDb, heartbeatRuns, issueRecoveryActions, issue
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
-import { writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
+import { readUnsupersededHeldConversationNotice, writePiSessionHistoryLossNotice } from "./native-runtime/pi-session-recovery-notice.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("persisted stopped-workspace projection", () => {
@@ -82,16 +82,14 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     const projections = await executionProjectionsForRuns(db, companyId, [runId]);
     expect(projections.get(runId)).toMatchObject({ phase: "recovery_needed", label: "Stopped",
       nextAction: "Saved work recovered. Send a message to continue.", permittedActions: ["inspect_run"] });
-    // The same recovered files on a run whose conversation was refused: the
-    // run ledger reads the run error, and a new message is not offered.
+    // follow-Paperclip Cut B R4: saved-work projection no longer treats refusal text as authority.
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "native_continuation_requires_reconciliation",
       error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" }).where(eq(heartbeatRuns.id, runId));
     const refused = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
     expect(refused).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
     expect(refused?.nextAction).not.toMatch(/send a message to continue/i);
-    expect(refused?.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
-    // A run from after the fix carries no refusal code; the held
-    // conversation's durable notice says it, read in the same batch.
+    expect(refused?.nextAction).toBe("Saved work recovered.");
+    // The output notice remains readable, but cannot override the projection.
     const sessionId = randomUUID();
     await db.update(heartbeatRuns).set({ error: "Fixture failure", nativeSessionId: sessionId }).where(eq(heartbeatRuns.id, runId));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
@@ -99,7 +97,8 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
     await db.transaction(tx => writePiSessionHistoryLossNotice(db, tx, { companyId, issueId, runId, agentId,
       authorizationReason: `native_prior_owner_held:${sessionId}`, body: HELD_PREDECESSOR_NOTICE }));
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)).toMatchObject({
-      phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: HELD_PREDECESSOR_NOTICE });
+      phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"], nextAction: "Saved work recovered." });
+    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toMatchObject({ body: HELD_PREDECESSOR_NOTICE });
     // A committed success on another conversation (a new task) does not clear it;
     // one on the same conversation does.
     const succeed = async (nativeSessionId: string) => {
@@ -109,12 +108,14 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
       await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId: later, phase: "committed" });
     };
     await succeed(randomUUID());
-    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction).toBe("Saved work recovered.");
+    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).not.toBeNull();
     await succeed(sessionId);
+    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
     expect((await executionProjectionsForRuns(db, companyId, [runId])).get(runId)?.nextAction)
       .toBe("Saved work recovered.");
   });
-  it("shows the notice text, without Retry, for a successor refused behind a succeeded owner that wrote no notice", async () => {
+  it("projects recovered files for a refused successor without inventing a standing notice", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sessionId = randomUUID();
     const ownerId = randomUUID(), runId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Refused successor", issuePrefix: companyId.slice(0, 8) });
@@ -144,8 +145,10 @@ describe.skipIf(!support.supported)("persisted stopped-workspace projection", ()
           stage: "saving_receipts", attempt: 1, attemptLimit: 6, retryable: true, requestIds: [] },
       } });
     const projected = (await executionProjectionsForRuns(db, companyId, [runId])).get(runId);
+    // follow-Paperclip Cut B R4: a refusal cannot synthesize a notice or a projection veto.
     expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
-      nextAction: HELD_PREDECESSOR_NOTICE });
+      nextAction: "Saved work recovered." });
+    expect(await readUnsupersededHeldConversationNotice(db, { companyId, issueId })).toBeNull();
     expect(projected?.permittedActions).not.toContain("retry");
   });
 
