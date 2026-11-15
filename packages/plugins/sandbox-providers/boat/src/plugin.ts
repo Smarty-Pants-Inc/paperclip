@@ -501,7 +501,7 @@ async function createAndWarmSpare(config: Config, key: ReadySpareKey, ttlSeconds
   try {
     const ready = await waitReady(config, sandbox.id);
     const setup = config.setupScript === undefined ? ready : await waitSetup(config, sandbox.id);
-    const warmCommand = `printf '{"type":"get_state","id":"1"}\\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session | head -1 >/dev/null`;
+    const warmCommand = `printf '{"type":"get_state","id":"1"}\\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session >/dev/null`;
     const warmed = await runCommand(config, sandbox.id, warmCommand, 25_000);
     if (warmed.exitCode !== 0 || warmed.timedOut) throw new Error("Boat spare Pi warm-up did not complete successfully");
     const name = `paperclip-spare:ready:${key.configHash}`;
