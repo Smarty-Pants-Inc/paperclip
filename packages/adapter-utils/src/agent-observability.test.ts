@@ -114,6 +114,22 @@ it.each([true, false])("preserves refreshed Codex credentials across repeated an
   }
 });
 
+it("R1/R3/R8: Pi launch is opt-in, carries run/task identity, and OFF clears old credentials", () => {
+  const launch = buildProviderObservabilityLaunch({ ...input, kind: "pi", runId: "run", taskId: "task,=日本" });
+  expect(launch.environment).toMatchObject({ PAPERCLIP_OBSERVABILITY_PI: "1", OTEL_LOG_USER_PROMPTS: "1", OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: input.tracesEndpoint });
+  const resource = Object.fromEntries(launch.environment.OTEL_RESOURCE_ATTRIBUTES.split(",").map(entry => {
+    const i = entry.indexOf("="); return [entry.slice(0, i), decodeURIComponent(entry.slice(i + 1))];
+  }));
+  expect(resource).toMatchObject({ "paperclip.company.id": "company", "paperclip.agent.id": "agent", "paperclip.run.id": "run", "paperclip.task.id": "task,=日本" });
+  expect(launch.environment).not.toHaveProperty("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT");
+  const disabled = buildProviderObservabilityLaunch({ ...input, kind: "pi", enabled: false });
+  const env = { ...launch.environment };
+  applyObservabilityEnvironment(env, disabled);
+  expect(env).toHaveProperty("PAPERCLIP_OBSERVABILITY_PI", "0");
+  expect(env).not.toHaveProperty("OTEL_EXPORTER_OTLP_TRACES_HEADERS");
+  expect(observabilitySecretValues(launch)).toContain(input.headers.authorization);
+});
+
 it("keeps OpenCode export opt-in and credentials out of ordinary task environment projections", () => {
   const launch = buildProviderObservabilityLaunch({ ...input, kind: "opencode" });
   expect(launch.environment).toMatchObject({ PAPERCLIP_OBSERVABILITY_OPENCODE: "1", OTEL_LOG_USER_PROMPTS: "1", OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: input.tracesEndpoint });
