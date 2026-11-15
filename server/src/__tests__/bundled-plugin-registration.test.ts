@@ -152,9 +152,11 @@ describePostgres("bundled image registration in PostgreSQL", () => {
       expect(current.services.workerManager.startWorker).toHaveBeenCalledWith(row.id, expect.objectContaining({
         entrypointPath: path.join(image.packageRoot, "dist", "worker.js"), config: {}, proactiveCompanyScopes: [companyA!.id, companyB!.id].sort(),
       }));
+      const revisionA = (await registry.getConfig(row.id, companyA!.id))!.updatedAt.getTime();
+      const revisionB = (await registry.getConfig(row.id, companyB!.id))!.updatedAt.getTime();
       expect(current.services.workerManager.call.mock.calls).toEqual(expect.arrayContaining([
-        [row.id, "configChanged", { companyId: companyA!.id, revision: expect.any(Number), config: { token: "only-A" } }],
-        [row.id, "configChanged", { companyId: companyB!.id, revision: expect.any(Number), config: { token: "only-B" } }],
+        [row.id, "configChanged", { companyId: companyA!.id, revision: revisionA, config: { token: "only-A" } }],
+        [row.id, "configChanged", { companyId: companyB!.id, revision: revisionB, config: { token: "only-B" } }],
       ]));
       expect(current.services.workerManager.call).toHaveBeenCalledTimes(2);
       expect(await registry.getConfig(row.id, unconfigured!.id)).toBeNull();
