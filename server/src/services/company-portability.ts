@@ -5909,6 +5909,16 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig,
             budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
           }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
+          // Check the runner's resolved adapter before adding trusted import
+          // defaults (for example Codex extraArgs). Those defaults are not a
+          // submitted host command and must not be mistaken for one.
+          const resolvedAdapter = await resolveNewAgentRunnerForCompany(db, targetCompany.id, {
+            adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig, runner,
+            defaultEnvironmentId: existingImportAgent?.defaultEnvironmentId,
+          });
+          await admitAgentActorHire(db, actor, targetCompany, {
+            ...resolvedAdapter, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
+          }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
           const normalizedAdapter = await prepareImportedAgentAdapter(
             targetCompany.id,
             selectedAdapterType,
@@ -5918,13 +5928,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             runner,
             existingImportAgent?.defaultEnvironmentId,
           );
-          // Runner selection can turn paperclip_runner into a host-executed
-          // *_local adapter. Admit the resolved values as hire/create do, not
-          // only the submitted adapter name. This runs inside the locked import
-          // transaction, before the lifecycle writer can persist the agent.
-          await admitAgentActorHire(db, actor, targetCompany, {
-            ...normalizedAdapter, budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
-          }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
           const patch = {
             name: planAgent.plannedName,
             role: manifestAgent.role,

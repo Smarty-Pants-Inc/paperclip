@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import {
-  activityLog, agents, approvals, budgetPolicies, companies, companySecrets,
+  activityLog, agents, approvals, budgetPolicies, companies, companyMemberships, companySecrets,
   createDb, principalPermissionGrants,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -143,6 +143,7 @@ describePg("agent-actor import admission fence", () => {
     // with the same explicit configure + runtime grants as live report PATCH.
     // No assertion/status is relaxed; the unprivileged/root controls live in
     // import-fence-resolved-admission-routes.test.ts.
+    if (allowed) await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: actor.agentId!, membershipRole: "member", status: "active" });
     if (allowed) await db.insert(principalPermissionGrants).values([
       { companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure", scope: { subtreeRootAgentId: actor.agentId! } },
       { companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure-reports-runtime", scope: null },

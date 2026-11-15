@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { stringify } from "yaml";
 import {
-  activityLog, agents, approvals, budgetPolicies, companies, companySecrets,
+  activityLog, agents, approvals, budgetPolicies, companies, companyMemberships, companySecrets,
   createDb, principalPermissionGrants,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -131,6 +131,7 @@ describePg("RFL importfence8 FIX 1 security regressions", () => {
   });
   it.each(["no-grants", "configure-only", "runtime-only", "both", "outside-subtree"])("import report env authority: %s", async authority => {
     const { companyId, actor } = await seed();
+    await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: actor.agentId!, membershipRole: "member", status: "active" });
     const [outside] = await db.insert(agents).values({ companyId, name: "Outside", role: "engineer", adapterType: "codex_local", adapterConfig: {} }).returning();
     if (["configure-only", "both", "outside-subtree"].includes(authority)) await db.insert(principalPermissionGrants).values({
       companyId, principalType: "agent", principalId: actor.agentId!, permissionKey: "agents:configure", scope: { subtreeRootAgentId: actor.agentId! },
