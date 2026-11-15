@@ -8503,6 +8503,26 @@ type LeaseCoordinator = {
   resultId: string | null;
 };
 
+// S stamp SET contract: one JSONB key/value, with only the existing update timestamp.
+function expectKeyOnlyBackupStamp(values: Record<string, unknown>, input: {
+  backupRoot: string; stateDirectory: string; normalizedSessionId: string; runnerInstanceId: string;
+  sourceProviderLeaseId: string; authorizedProviderLeaseId: string;
+}) {
+  expect(Object.keys(values).sort()).toEqual(["metadata", "updatedAt"]);
+  expect(values.updatedAt).toBeInstanceOf(Date);
+  const query = new PgDialect().sqlToQuery(values.metadata as SQL);
+  expect(query.sql).toBe('coalesce("environment_leases"."metadata", \'{}\'::jsonb) || $1::jsonb');
+  const manifestBytes = readFileSync(join(input.backupRoot, "manifest.json"));
+  expect(query.params).toHaveLength(1);
+  expect(JSON.parse(query.params[0] as string)).toEqual({ nativeHarnessBackup: {
+    schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: input.normalizedSessionId,
+    runnerInstanceId: input.runnerInstanceId, sessionScopeSha256: basename(input.stateDirectory),
+    sourceProviderLeaseId: input.sourceProviderLeaseId, authorizedProviderLeaseId: input.authorizedProviderLeaseId,
+    manifestSha256: `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`,
+    completedAt: JSON.parse(manifestBytes.toString("utf8")).completedAt,
+  } });
+}
+
 function leaseDb(
   boundExecution: NativeExecutionInput = execution,
   coordinatorOverrides: Partial<LeaseCoordinator> = {},
@@ -23437,9 +23457,13 @@ describe("runnerd provider runtime wiring", () => {
           reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "newer-box" },
           nativeHarnessBackup: { normalizedSessionId: current.session.normalizedSessionId,
             runnerInstanceId, sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created" } });
-      } else expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
-        values: expect.objectContaining({ metadata: expect.anything() }),
-      })]);
+      } else {
+        const writes = updates.filter(update => update.table === environmentLeases);
+        expect(writes).toHaveLength(1);
+        expectKeyOnlyBackupStamp(writes[0]!.values, { backupRoot, stateDirectory: options.stateDirectory!,
+          normalizedSessionId: current.session.normalizedSessionId!, runnerInstanceId,
+          sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created" });
+      }
     } else {
       const refusal = await options.prepareExternalRunnerState().catch((error: unknown) => error);
       expect(refusal).toBeInstanceOf(Error);
@@ -23600,16 +23624,17 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
+      const stampWrite = updates.filter(update => update.table === environmentLeases).at(-1)!;
+      expectKeyOnlyBackupStamp(stampWrite.values, { backupRoot, stateDirectory: options.stateDirectory!,
+        normalizedSessionId: current.session.normalizedSessionId!, runnerInstanceId,
+        sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created" });
       expect(updates.filter(update => update.table === environmentLeases)).toEqual([
         // The idle source is claimed first: its reuse scope moves into a superseded
         // receipt, so it is never resumed with the older state again.
         ...(idleWarm ? [expect.objectContaining({ values: expect.objectContaining({
           metadata: expect.not.objectContaining({ reusableSandboxLease: expect.anything() }) }) })] : []),
-        expect.objectContaining({
-          values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-            normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
-            authorizedProviderLeaseId: "sandbox-created" }) } }),
-        })]);
+        { table: environmentLeases, values: { metadata: stampWrite.values.metadata, updatedAt: expect.any(Date) } },
+      ]);
       if (idleWarm) expect(updates.filter(update => update.table === environmentLeases)[0]!.values.metadata).toEqual(
         expect.objectContaining({ reusableSandboxLeaseSuperseded: expect.objectContaining({
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
