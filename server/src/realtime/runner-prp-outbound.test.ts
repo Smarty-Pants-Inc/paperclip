@@ -50,6 +50,30 @@ function openingSocket(socket = new FakeSocket()): FakeSocket {
   return socket;
 }
 
+async function startGithubAccessIngressHarness(githubAccess: unknown) {
+  const previousCreate = sockets.create;
+  const socket = new FakeSocket();
+  sockets.create = () => openingSocket(socket);
+  const endpoint = {
+    kind: "authenticated_websocket" as const,
+    websocketUrl: "wss://preview.invalid/api/runner/v1/connect/github-access",
+    secretHeaders: [], generation: "github-access", refresh: async () => endpoint, close: async () => {},
+  };
+  const authority = {
+    attachWireConnection(wire: WsJsonWireConnection) {
+      wire.onJson(() => {});
+      return { isAuthenticated: () => true };
+    },
+  };
+  const handle = connectRunnerPrpIngress({
+    authority: authority as unknown as DurablePrpControlPlane,
+    endpoint, startupDeadlineMs: 1_000,
+    githubAccess,
+  } as unknown as Parameters<typeof connectRunnerPrpIngress>[0]);
+  await handle.ready;
+  return { socket, handle, restore: () => { sockets.create = previousCreate; } };
+}
+
 sockets.create = () => openingSocket();
 
 describe("runner provider-ingress WebSocket wire", () => {
@@ -936,6 +960,67 @@ describe("runner provider-ingress WebSocket wire", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("refuses a github_access.http frame that names another run", async () => {
+    const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
+    const harness = await startGithubAccessIngressHarness({
+      getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" }),
+      handleRequest,
+    });
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: "request-run-forgery", method: "POST",
+        path: "/runtime-tools/github/credentials", headers: {}, bodyBase64: "e30=", runId: "run-b",
+      })), false);
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      const reply = JSON.parse(harness.socket.send.mock.calls[0]![0] as string) as { status: number; bodyBase64: string };
+      expect(reply).toMatchObject({ requestId: "request-run-forgery", status: 403 });
+      expect(Buffer.from(reply.bodyBase64, "base64").toString()).not.toContain("credential");
+      expect(handleRequest).not.toHaveBeenCalled();
+    } finally { await harness.handle.close(); harness.restore(); }
+  });
+
+  it("refuses an idle-session github_access.http request", async () => {
+    const handleRequest = vi.fn(async () => ({ status: 403, headers: { "content-type": "application/json" }, body: Buffer.from('{"error":"No active GitHub run"}') }));
+    const harness = await startGithubAccessIngressHarness({
+      getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "idle-run" }),
+      handleRequest,
+    });
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: "request-idle", method: "POST",
+        path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=",
+      })), false);
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      expect(JSON.parse(harness.socket.send.mock.calls[0]![0] as string)).toMatchObject({ requestId: "request-idle", status: 403 });
+      expect(handleRequest).toHaveBeenCalledOnce();
+    } finally { await harness.handle.close(); harness.restore(); }
+  });
+
+  it("discards a github_access.http reply when the ingress run binding changes", async () => {
+    const sentinel = "server-sentinel-token-never-log";
+    let binding: Record<string, string> = { companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" };
+    let complete!: (response: { status: number; headers: Record<string, string>; body: Buffer }) => void;
+    const handleRequest = vi.fn(() => new Promise<{ status: number; headers: Record<string, string>; body: Buffer }>(resolve => { complete = resolve; }));
+    const harness = await startGithubAccessIngressHarness({ getSessionBinding: () => binding, handleRequest });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: "request-binding-change", method: "POST",
+        path: "/runtime-tools/github/credentials", headers: {}, bodyBase64: "e30=",
+      })), false);
+      await vi.waitFor(() => expect(handleRequest).toHaveBeenCalledOnce(), { timeout: 200 });
+      binding = { ...binding, runId: "run-b" };
+      complete({ status: 200, headers: {}, body: Buffer.from(sentinel) });
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      const serialized = harness.socket.send.mock.calls.map(([value]) => String(value)).join("\\n");
+      const reply = JSON.parse(harness.socket.send.mock.calls[0]![0] as string) as { status: number; bodyBase64: string };
+      expect(reply).toMatchObject({ requestId: "request-binding-change", status: 403 });
+      expect(Buffer.from(reply.bodyBase64, "base64").toString()).not.toContain(sentinel);
+      expect(JSON.stringify(warn.mock.calls)).not.toContain(sentinel);
+      expect(serialized).not.toContain(sentinel);
+    } finally { warn.mockRestore(); await harness.handle.close(); harness.restore(); }
   });
 
   it("pings a healthy peer before any deadline, even with an interval longer than the timeout", () => {

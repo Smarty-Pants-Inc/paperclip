@@ -249,6 +249,37 @@ it("does not release an in-flight credential after its run has been replaced", a
   expect(response.status).toBe(403);
   expect(await response.text()).not.toContain("must-not-escape");
 });
+it("selects runner-ingress GitHub access without starting or polling the callback bridge", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "native-github-ingress-"));
+  const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
+    stdout: input.args?.[1]?.includes("printf")
+      ? "\0/usr/bin:/bin\0"
+      : `${Array.from({ length: 9 }, () => JSON.stringify({ uploaded: false })).join("\n")}\n`,
+    stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString(),
+  }));
+  const startBridge = vi.fn(async () => null);
+  let access: NativeGitHubAccess | undefined;
+  try {
+    access = await createNativeGitHubAccess({
+      scope, cwd: root, env: { PATH: process.env.PATH },
+      target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root,
+        runner: { execute }, streamRunLogs: false,
+        effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
+      resolveCredentials: async () => ({ status: "available", env: { GH_TOKEN: "server-sentinel" } }),
+    }, startBridge as never);
+    expect(access.ready).toBe(true);
+    expect(startBridge).not.toHaveBeenCalled();
+    expect(execute.mock.calls.some(([call]) => (call.args ?? []).join(" ").includes("paperclip-bridge/queue"))).toBe(false);
+    expect(access.env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT).toBe("runner_ingress");
+    expect(access.env.PAPERCLIP_GITHUB_BROKER_URL).toBe("");
+    expect(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("");
+    expect(typeof (access as unknown as { handleRunnerIngressHttpRequest?: unknown }).handleRunnerIngressHttpRequest).toBe("function");
+  } finally {
+    await access?.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it.each([403, 409, 500])("preserves denial/steering without leaking errors (%s)", async (status) => {
   const b = await broker(vi.fn(async () => { throw Object.assign(new Error("secret-value"), { status }); }));
   await b.activate(run("a"));
