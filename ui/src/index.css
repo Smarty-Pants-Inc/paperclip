@@ -1861,8 +1861,11 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
 /* Inline reasoning is plain text in the turn (Paul 11-15 05:49Z): no box,
    indent or bullet; the answer's size, line height and paragraph spacing, set
    apart only by the italic and the muted tone. Its headline is the same italic
-   muted text, at most a touch less muted than the body. */
-.task-chat-reasoning-plain {
+   muted text, at most a touch less muted than the body. The Coordinator
+   workspace sizes progress text one step below the answer; the second
+   selector keeps plain reasoning at the answer's size there too. */
+.task-chat-reasoning-plain,
+.coordinator-workspace .task-chat-reasoning-plain[data-conversation-text] {
   font-size: 0.9375rem;
   line-height: 1.6;
 }
