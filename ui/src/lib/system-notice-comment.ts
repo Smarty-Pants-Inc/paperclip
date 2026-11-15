@@ -33,6 +33,17 @@ function mapMetadataRow(
     case "code":
       return { kind: "code", label: metadataRowText(row, "Code"), value: row.code };
     case "key_value":
+      // Keep the server's waiting-notice marker intact; translate only its person-facing view.
+      if (row.label === "Waiting code") {
+        switch (row.value) {
+          case "waiting_to_start":
+            return { kind: "text", label: "Waiting on", value: "Waiting to start" };
+          case "agent_paused":
+            return { kind: "text", label: "Waiting on", value: "Agent paused" };
+          default:
+            return null;
+        }
+      }
       return { kind: "text", label: row.label, value: row.value };
     case "issue_link": {
       const identifier = row.identifier ?? null;
