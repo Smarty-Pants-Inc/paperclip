@@ -45,7 +45,7 @@ the enforced current deadline.
 Every successfully ready spare gets one throwaway Pi RPC warm-up, exactly:
 
 ```sh
-printf '{"type":"get_state","id":"1"}\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session | head -1 >/dev/null
+printf '{"type":"get_state","id":"1"}\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session >/dev/null
 ```
 
 The `--no-session` flag prevents this probe from writing a Pi conversation
