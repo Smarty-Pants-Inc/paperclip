@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type APIResponse, type Browser, type Page } from "@playwright/test";
-import { closeRegisteredClients, createDb, heartbeatRuns, issueComments } from "../../packages/db/src/index.ts";
+import { eq } from "../../server/node_modules/drizzle-orm/index.js";
+import {
+  agents, closeRegisteredClients, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues,
+} from "../../packages/db/src/index.ts";
 
 // Reasoning display, end to end on the real server and its own database:
 // a saved run whose transcript holds real Codex reasoning items, shown
@@ -82,9 +85,9 @@ async function seedChat(request: APIRequestContext) {
   return { company, agent, issue, runId, close: () => closeRegisteredClients(url) };
 }
 
-async function openChat(page: Page, prefix: string, identifier: string) {
+async function openChat(page: Page, prefix: string, identifier: string, reply = REPLY) {
   await page.goto(`/${prefix}/issues/${identifier}`);
-  await expect(page.getByText(REPLY, { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(reply, { exact: false }).first()).toBeVisible({ timeout: 30_000 });
   // A saved compact reply loads its run transcript on request.
   const more = page.getByRole("button", { name: "More run output", exact: true });
   if (await more.isVisible().catch(() => false)) await more.click();
@@ -137,7 +140,7 @@ async function reasoningContrast(page: Page) {
  * Inline reasoning is plain text in the turn: no box around it and its text
  * starts at the same left edge as the answer text.
  */
-async function plainGeometry(page: Page) {
+async function plainGeometry(page: Page, reply = REPLY) {
   return page.evaluate((reply) => {
     const blocks = Array.from(document.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
     const answer = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="task-chat-agent-bubble"] p'))
@@ -164,7 +167,7 @@ async function plainGeometry(page: Page) {
       }),
       answerFontSize: answer ? getComputedStyle(answer).fontSize : null,
     };
-  }, REPLY);
+  }, reply);
 }
 
 async function capture(page: Page, name: string) {
@@ -286,6 +289,177 @@ test("reasoning display: inline reasoning look and the agent-page preference tha
     await phoneSetting.scrollIntoViewIfNeeded();
     await capture(phonePage, "agent-page-setting-inline-390");
     await phone.close();
+  } finally {
+    await request.patch(`/api/companies/${chat.company.id}`, { data: { status: "archived" } }).catch(() => undefined);
+    await chat.close();
+  }
+});
+
+// Paul's Smarty: a Paperclip Runner agent on provider pi_rpc, a native run
+// whose stored events have the shape the Pi event projector writes
+// (reasoning blocks on channel "detail", a real captured bash tool from the
+// pi_rpc 1.5.2 golden, the final agentMessage and a run.terminal receipt), and
+// NO stored reasoning preference. Its reasoning shows inline by default.
+const PI_REASONING = [
+  "The person wants reasoning visible without a click. Before changing anything I check which harness this agent runs on.",
+  "It is Paperclip Runner on pi_rpc, so the default changes in one place. A stored Folded on the agent page still wins.",
+];
+const PI_REPLY = "Your Smarty now shows its reasoning inline by default.";
+
+type PiEvent = { eventType: string; itemId?: string; turnId?: string; payload: Record<string, unknown> };
+
+async function piNativeEvents(runId: string, startedAt: number) {
+  const piBaseline = JSON.parse(await readFile(
+    path.resolve(import.meta.dirname, "../../packages/paperclip-runner/test-fixtures/pi-rpc/baseline-1.5.2.normalized.json"), "utf8"));
+  const turnId = "turn-1";
+  const reasoning = (message: number, value: string): PiEvent[] => {
+    const itemId = `${turnId}:pi-message:${message}:block:0`;
+    const half = Math.floor(value.length / 2);
+    return [
+      { eventType: "item.started", turnId, itemId, payload: { kind: "reasoning", channel: "detail", text: "" } },
+      { eventType: "item.delta", turnId, itemId, payload: { kind: "reasoning", channel: "detail", text: value.slice(0, half) } },
+      { eventType: "item.delta", turnId, itemId, payload: { kind: "reasoning", channel: "detail", text: value.slice(half) } },
+      { eventType: "item.completed", turnId, itemId, payload: { kind: "reasoning", channel: "detail", text: value } },
+    ];
+  };
+  // The captured bash tool call of the pi_rpc golden (turn 2), moved into this turn.
+  const tool = (piBaseline as PiEvent[])
+    .filter((event) => event.turnId === "turn-2" && event.itemId?.includes(":pi-tool:"))
+    .map((event) => JSON.parse(JSON.stringify(event).replaceAll("turn-2:", `${turnId}:`)) as PiEvent)
+    .map((event) => ({ ...event, turnId }));
+  const answerId = `${turnId}:pi-message:2:block:1`;
+  const events: PiEvent[] = [
+    ...reasoning(1, PI_REASONING[0]!),
+    ...tool,
+    ...reasoning(2, PI_REASONING[1]!),
+    { eventType: "item.started", turnId, itemId: answerId, payload: { kind: "agentMessage", channel: "unknown", text: "" } },
+    { eventType: "item.delta", turnId, itemId: answerId, payload: { kind: "agentMessage", channel: "unknown", text: PI_REPLY } },
+    { eventType: "item.completed", turnId, itemId: answerId, payload: { kind: "agentMessage", channel: "final", text: PI_REPLY } },
+    { eventType: "run.terminal", turnId, payload: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed",
+      runTerminalState: "succeeded", reportedWorkDisposition: "done" } },
+  ];
+  return events.map((event, index) => {
+    const emittedAt = new Date(startedAt + (index + 1) * 200).toISOString();
+    const sourceEventId = `pi-${index + 1}`;
+    return {
+      seq: index + 1, eventType: event.eventType, stream: "system", level: "info", sourceInstanceId: "pi-runner",
+      sourceEventId, sourceSeq: index + 1, protocolSchemaVersion: 1, createdAt: new Date(emittedAt),
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId, sourceSeq: index + 1,
+        sourceInstanceId: "pi-runner", sourceKind: "runner", priority: 1, runId, normalizedSessionId: `pi-session-${runId}`,
+        emittedAt, ...event } },
+    };
+  });
+}
+
+async function seedPiChat(request: APIRequestContext) {
+  const url = await databaseUrl();
+  const db = createDb(url);
+  const company = await json(await request.post("/api/companies", { data: { name: `Pi reasoning default ${Date.now()}` } }));
+  // Seeded directly so fixture setup never launches a provider.
+  const [agent] = await db.insert(agents).values({
+    id: randomUUID(), companyId: company.id, name: "Smarty", role: "engineer", status: "idle", lifecycleState: "ready",
+    adapterType: "paperclip_runner",
+    adapterConfig: { provider: "pi_rpc", model: "neutral/vendor-model-not-in-bundled-catalog",
+      instructionsBundleMode: "managed", instructionsEntryFile: "AGENTS.md" },
+    runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+  }).returning();
+  const issue = await json(await request.post(`/api/companies/${company.id}/issues`, { data: {
+    title: "Show my Smarty's reasoning without a click", description: "Reasoning should be visible by default.",
+    status: "backlog",
+  } }));
+  // Assign only after creation so the API never admits a fixture run.
+  await db.update(issues).set({ assigneeAgentId: agent!.id }).where(eq(issues.id, issue.id));
+  const runId = randomUUID();
+  const startedAt = Date.now() - 60_000;
+  const events = await piNativeEvents(runId, startedAt);
+  await db.insert(heartbeatRuns).values({
+    id: runId, companyId: company.id, agentId: agent!.id, issueId: issue.id, nativeIssueId: issue.id,
+    invocationSource: "assignment", status: "succeeded", runtimeMode: "native", nativePhase: "committed",
+    startedAt: new Date(startedAt), finishedAt: new Date(startedAt + 9_000), contextSnapshot: { issueId: issue.id },
+  });
+  await db.insert(heartbeatRunEvents).values(events.map((event) => ({
+    ...event, companyId: company.id, agentId: agent!.id, runId,
+  })));
+  await db.insert(issueComments).values({
+    companyId: company.id, issueId: issue.id, authorType: "agent", authorAgentId: agent!.id, body: PI_REPLY,
+    createdByRunId: runId, createdAt: new Date(startedAt + 8_000),
+  });
+  return { company, agent: agent!, issue, runId, close: () => closeRegisteredClients(url) };
+}
+
+test("reasoning display: Paul's Smarty (paperclip_runner, pi_rpc) shows reasoning inline with no stored choice", async ({ browser, request }) => {
+  test.skip(MODE === "before", "after-only");
+  test.setTimeout(240_000);
+  const chat = await seedPiChat(request);
+  try {
+    // No stored choice for this agent anywhere.
+    const mine = await json(await request.get("/api/workspace-preferences/me"));
+    expect(mine.agentReasoningDisplay?.[chat.agent.id]).toBeUndefined();
+    const runs = await json(await request.get(`/api/issues/${chat.issue.id}/runs`));
+    expect(runs.map((run: { runId: string; runtimeMode: string; adapterType: string }) => [run.runId, run.runtimeMode, run.adapterType]))
+      .toEqual([[chat.runId, "native", "paperclip_runner"]]);
+
+    const report: Record<string, unknown> = {};
+    for (const [viewport, theme] of [
+      [{ name: "1440", width: 1440, height: 1000 }, "dark"],
+      [{ name: "390", width: 390, height: 844 }, "dark"],
+      [{ name: "1440", width: 1440, height: 1000 }, "light"],
+    ] as const) {
+      const context = await browser.newContext({ viewport, colorScheme: theme });
+      await context.addInitScript((value) => window.localStorage.setItem("paperclip.theme", value), theme);
+      const page = await context.newPage();
+      // A cold load of a finished run keeps its saved activity behind the
+      // page's "More run output" history control (same as the Codex case above).
+      await openChat(page, chat.company.issuePrefix, chat.issue.identifier, PI_REPLY);
+      const inline = page.locator('[data-reasoning-display="inline"]');
+      await expect(inline).toHaveCount(2, { timeout: 30_000 });
+      await expect(inline.nth(0)).toContainText(PI_REASONING[0]!);
+      await expect(inline.nth(1)).toContainText(PI_REASONING[1]!);
+      // Inline, not the fold: no click needed, no disclosure row or preview.
+      await expect(page.getByTestId("task-chat-thinking-preview")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /^(Expand|Collapse) reasoning/ })).toHaveCount(0);
+      for (const block of await inline.all()) {
+        await expect(block).toBeVisible();
+        expect(await block.evaluate((node) => Boolean(node.closest('[data-expanded="false"], [hidden], [inert], .tc-turn-fold')))).toBe(false);
+        await expect(block.getByTestId("task-chat-reasoning-plain")).toHaveCount(1);
+      }
+      await scrollToReasoning(page);
+      const measured = await reasoningContrast(page);
+      expect(measured.length).toBeGreaterThanOrEqual(2);
+      for (const line of measured) {
+        expect(line.fontStyle, JSON.stringify(line)).toBe("italic");
+        expect(line.contrast, JSON.stringify(line)).toBeGreaterThanOrEqual(4.5);
+      }
+      const geometry = await plainGeometry(page, PI_REPLY);
+      report[`${viewport.name}-${theme}`] = { contrast: measured, geometry };
+      expect(geometry.answerLeft, JSON.stringify(geometry)).not.toBeNull();
+      for (const block of geometry.blocks) {
+        expect(block.border, JSON.stringify(block)).toBe("0px 0px");
+        expect(block.background, JSON.stringify(block)).toBe("rgba(0, 0, 0, 0)");
+        expect(block.paddingBlock, JSON.stringify(block)).toBe("0px 0px");
+        expect(block.bullets, JSON.stringify(block)).toBe(0);
+        expect(block.fontSize, JSON.stringify(block)).toBe(geometry.answerFontSize);
+        for (const left of block.lineLefts) expect(Math.abs(left - geometry.answerLeft!), JSON.stringify(geometry)).toBeLessThanOrEqual(0.5);
+      }
+      await capture(page, `pi-default-${viewport.name}-${theme}`);
+      await context.close();
+    }
+    if (SHOTS) await writeFile(path.join(SHOTS, "pi-default-measured.json"), JSON.stringify(report, null, 2));
+
+    // The agent page shows the harness default as Inline, with Inline selected.
+    const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
+    const page = await context.newPage();
+    await page.goto(`/${chat.company.issuePrefix}/agents/${chat.agent.urlKey ?? chat.agent.id}/runtime`);
+    const setting = page.getByTestId("agent-display-settings");
+    await expect(setting).toBeVisible({ timeout: 30_000 });
+    await expect(setting).toContainText("Default for this harness: Inline");
+    await expect(setting.getByRole("radio", { name: "Inline" })).toHaveAttribute("aria-checked", "true");
+    await expect(setting.getByRole("radio", { name: "Folded" })).toHaveAttribute("aria-checked", "false");
+    await setting.scrollIntoViewIfNeeded();
+    await capture(page, "pi-default-agent-page-1440");
+    await context.close();
+    // Looking changed nothing: still no stored choice.
+    expect((await json(await request.get("/api/workspace-preferences/me"))).agentReasoningDisplay?.[chat.agent.id]).toBeUndefined();
   } finally {
     await request.patch(`/api/companies/${chat.company.id}`, { data: { status: "archived" } }).catch(() => undefined);
     await chat.close();
