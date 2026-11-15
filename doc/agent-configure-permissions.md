@@ -165,6 +165,12 @@ key. Retire a report through the existing pause, then terminate routes, not DELE
 
 ## Descendant budgets and instruction paths
 
+A zero heartbeat `maxDailyCostCents` stops an agent; it does not remove its daily
+cap. Agent-authored configuration updates, direct agent creation and hire
+requests reject this value with 422 before saving the agent or hire approval.
+Omit the field or send null to remove the daily cap; positive values remain
+valid. Board users retain the existing ability to set an explicit zero.
+
 Both `PATCH /agents/:id/budgets` and a `budgetMonthlyCents` field in
 `PATCH /agents/:id` accept the same direct descendant-management authority.
 The new amount may be any nonnegative integer, including zero (unlimited for

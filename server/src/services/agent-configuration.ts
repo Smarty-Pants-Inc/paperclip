@@ -17,7 +17,7 @@ import { normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/share
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { agentRecordQueries, type UpdateAgentOptions, type AgentConfigurationPatch, type AgentConfigurationRecord, isPlainRecord, buildConfigSnapshot,
-  hasConfigPatchFields, changedPendingApprovalConfigFields, diffConfigSnapshot, jsonEqual } from "../lib/agent-records.js";
+  hasConfigPatchFields, changedPendingApprovalConfigFields, diffConfigSnapshot, jsonEqual, assertAgentDailyCostCap } from "../lib/agent-records.js";
 import { CEO_HIRING_DENIAL_KEY, ceoHiringDenial, normalizeAgentPermissions } from "../lib/agent-permissions.js";
 import type { ActivityPublication } from "../types/activity-publication.js";
 import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
@@ -44,10 +44,7 @@ export async function lockAgentConfigurationInteractions(tx: Db, id: string, dat
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
   // Unlike monthly budgets, a zero heartbeat cost cap stops the agent rather
   // than removing its limit. Keep the board's explicit zero-cap behavior.
-  const heartbeat = data.runtimeConfig?.heartbeat;
-  if (options?.recordRevision?.createdByAgentId && isPlainRecord(heartbeat) && heartbeat.maxDailyCostCents === 0) {
-    throw unprocessable("maxDailyCostCents 0 stops the agent; omit the field (or send null) to remove the daily cap");
-  }
+  assertAgentDailyCostCap(data.runtimeConfig, options?.recordRevision?.createdByAgentId);
   if (options?.reportRuntimeActor) {
     const env = isPlainRecord(data.adapterConfig) ? data.adapterConfig.env : undefined;
     if ((data.adapterType ?? existing.adapterType) !== "paperclip_runner" || !isReportRuntimeEnv(env)

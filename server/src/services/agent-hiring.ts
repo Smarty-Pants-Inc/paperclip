@@ -9,7 +9,7 @@ import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-util
 import { agents, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { unprocessable } from "../errors.js";
-import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent,
+import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent, assertAgentDailyCostCap,
   deduplicateAgentName, type CreateAgentData, type CreateAgentOptions, type AgentConfigurationPatch, type AgentHireRecord } from "../lib/agent-records.js";
 import { CEO_HIRING_DENIAL_KEY, normalizeAgentPermissions, permissionsImplyLowTrust, NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS,
   newStandardAgentGrantScope } from "../lib/agent-permissions.js";
@@ -23,6 +23,7 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { assertProviderApiPlacementPolicy, isProviderApiSetupDraft, resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 
 export async function prepareAgentHire(db: Db, companyId: string, input: CreateAgentData, options?: CreateAgentOptions): Promise<CreateAgentData> {
+  assertAgentDailyCostCap(input.runtimeConfig, options?.createdByAgentId);
   assertNoInitialAgentInteractionPermissions(input.permissions);
   await assertAgentInteraction(db, { companyId, actorAgentId: options?.createdByAgentId, actorCompanyId: options?.createdByAgentCompanyId,
     operation: "mention", texts: [JSON.stringify(input), ...(options?.interactionTexts ?? [])], lock: "update" });
