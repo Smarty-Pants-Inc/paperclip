@@ -12328,8 +12328,14 @@ describe("native warm session supervision", () => {
       const claiming = claimWarmNativeInstructionCopy({ priorExecution: first, companyId: first.binding.companyId, agentId: first.binding.agentId,
         executionWorkspaceId: first.binding.executionWorkspaceId, workspace: first.workspace, environmentId: identity,
         runId: current.runId, preparationKey: current.preparationKey, forceRetirement: scenario === "reset", adopt });
-      if (["unavailable", "auth", "wrong-capability", "retirement-failure"].includes(scenario)) {
-        await expect(claiming).rejects.toThrow(({ unavailable: "handoff_unavailable", auth: "authorization denied",
+      if (scenario === "unavailable") {
+        // RFL-authorized 00:35Z: upstream #21504 awaits retirement, then returns
+        // null. The original execution remains the only owner ever started.
+        await expect(claiming).resolves.toBeNull();
+        expect(session.close).toHaveBeenCalledOnce();
+        expect(state.execute).toHaveBeenCalledOnce();
+      } else if (["auth", "wrong-capability", "retirement-failure"].includes(scenario)) {
+        await expect(claiming).rejects.toThrow(({ auth: "authorization denied",
           "wrong-capability": "handoff_mismatch", "retirement-failure": "stop unconfirmed" } as Record<string, string>)[scenario]);
       } else expect(await claiming).toBeNull();
       expect(priorCopy.hasChanges).not.toHaveBeenCalled();
