@@ -10,6 +10,7 @@ import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidanc
 import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { supportsNativeWarmFiles } from "../native-runtime/native-warm-capability.js";
+import { canRefreshNativeAgentFiles, type buildNativeRuntimeContext } from "../native-runtime/runtime-context.js";
 import type { HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { EffectiveRunSessionConfigMetadata } from "./workspaces.js";
@@ -62,6 +63,7 @@ interface InstructionWorkingCopyInput {
   readRun: () => Selection["run"];
   agent: Selection["agent"];
   context: Selection["task"]["context"];
+  runtimeSkillEntries?: Parameters<typeof buildNativeRuntimeContext>[0]["runtimeSkillEntries"];
   session: {
     taskSession: { lastRunId: string | null } | null;
     taskSessionForRun: { lastRunId: string | null } | null;
@@ -149,6 +151,11 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
             previousRunId: taskSessionForRun.lastRunId, runId: readRun().id, target: executionTarget,
             observabilityCompatibilityKey: input.observabilityCompatibilityKey,
             canReuse: () => instructionCopies.canReuseWarm(agent.companyId, agent.id, taskSessionForRun!.lastRunId!),
+            refresh: runtimeContext => input.runtimeSkillEntries ? instructionCopies.refreshWarm({ companyId: agent.companyId, agentId: agent.id,
+              runId: taskSessionForRun!.lastRunId!, target: executionTarget,
+              canRefresh: (canonicalRoot, entryFile) => canRefreshNativeAgentFiles({ runtimeContext, canonicalRoot, entryFile,
+                runtimeConfig, runtimeSkillEntries: input.runtimeSkillEntries!, adapterType: agent.adapterType }),
+            }) : Promise.resolve(false),
           });
         }
         if (!warmFiles && nativeRuntimeResolution.kind === "native" && priorWorkingCopy.kind === "agent_files" && taskSession) {

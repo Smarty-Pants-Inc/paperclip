@@ -3,6 +3,7 @@ import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-cop
 import { AGENT_FILES_CONTRACT } from "../agent-file-store.js";
 import { AgentDirectoryReuseInvalidatedError } from "../agent-directory-working-copies.js";
 import { resolveHeartbeatNativeLifecyclePolicy } from "./native-lifecycle.js";
+import * as runtimeContext from "../native-runtime/runtime-context.js";
 
 const native = vi.hoisted(() => ({ reserve: vi.fn(), claim: vi.fn() }));
 vi.mock("../native-runtime/index.js", async importOriginal => ({
@@ -25,13 +26,14 @@ function fixture(executionTarget: Input["workspace"]["executionTarget"] = null, 
     prepare: vi.fn<Input["instructionCopies"]["prepare"]>().mockResolvedValue(copy),
     collectStopped: vi.fn<Input["instructionCopies"]["collectStopped"]>().mockResolvedValue({ ...copy, state: "saved" }),
     checkpointWarm: vi.fn<Input["instructionCopies"]["checkpointWarm"]>().mockResolvedValue({ ...copy, state: "warm_saved", receipt: { ...copy.receipt, checkpointState: "unchanged" } }),
-    hasChanges: vi.fn().mockResolvedValue(false), canReuseWarm: vi.fn().mockResolvedValue(true),
+    hasChanges: vi.fn().mockResolvedValue(false), canReuseWarm: vi.fn().mockResolvedValue("reusable"),
+    refreshWarm: vi.fn<Input["instructionCopies"]["refreshWarm"]>().mockImplementation(input => input.canRefresh("/canonical", "AGENTS.md")),
     reportRetirementUnconfirmed: vi.fn().mockResolvedValue(null),
   };
   const appendRunEvent = vi.fn().mockResolvedValue(undefined);
   const context = { paperclipWorkspace: { agentHome: "/canonical" } } as Record<string, unknown>;
   const controller = createHeartbeatInstructionWorkingCopy({
-    db: {} as Input["db"], instructionCopies: copies as unknown as Input["instructionCopies"],
+    db: {} as Input["db"], instructionCopies: copies as unknown as Input["instructionCopies"], runtimeSkillEntries: [],
     readRun: () => run,
     agent: { id: "agent", companyId: "company", adapterType: acpxAgent ? "paperclip_runner" : "codex_local", adapterConfig: { lifecycleMode: "warm", ...(acpxAgent ? { provider: "acpx", acpxAgent } : {}) }, runtimeConfig: {} } as unknown as Input["agent"],
     context,
@@ -139,6 +141,21 @@ describe("instruction working-copy extraction boundary", () => {
     expect(f.controller.nativeInstructionReservation).toBeNull();
     expect(config).toMatchObject({ retained: true, instructionsFilePath: "/workspace/copy/AGENTS.md" });
     expect(f.controller.instructionCopy).toBe(f.copy);
+  });
+
+  it("binds canonical refresh to the live owner's context and the current run's skill selection", async () => {
+    const guard = vi.spyOn(runtimeContext, "canRefreshNativeAgentFiles").mockResolvedValue(true);
+    try {
+      const f = fixture();
+      const config = await f.controller.prepare(f.prepare);
+      const reservation = native.reserve.mock.calls[0]![0];
+      const live = { aggregateDigest: "loaded-context" };
+      expect(await reservation.canReuse()).toBe("reusable");
+      expect(await reservation.refresh(live)).toBe(true);
+      expect(f.copies.refreshWarm).toHaveBeenCalledWith(expect.objectContaining({ companyId: "company", agentId: "agent", runId: "previous-run", target: null }));
+      expect(guard).toHaveBeenCalledWith({ runtimeContext: live, canonicalRoot: "/canonical", entryFile: "AGENTS.md",
+        runtimeConfig: config, runtimeSkillEntries: [], adapterType: "codex_local" });
+    } finally { guard.mockRestore(); }
   });
 
   it("reads the current run row and receipt during stopped collection and warm checkpoints", async () => {

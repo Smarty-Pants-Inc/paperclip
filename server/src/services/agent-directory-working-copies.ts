@@ -23,6 +23,7 @@ import { logger } from "../middleware/logger.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
 type Copy = typeof copies.$inferSelect;
+export type AgentDirectoryReuseStatus = "reusable" | "canonical_advanced" | "other";
 function adoptionAuthority(row: Copy) {
   const { updatedAt: _updatedAt, nextAttemptAt: _nextAttemptAt, ...authority } = row;
   return authority;
@@ -72,13 +73,63 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.receipt?.warm !== true) return true;
     return await fs.readFile(ownerFile(row), "utf8").then(s => JSON.parse(s).runId === row.runId).catch(error => error.code === "ENOENT" && row.processStoppedAt !== null);
   }
-  async function canReuse(companyId: string, agentId: string, runId: string) {
-    const row = await get(companyId, runId);
-    if (!row || row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
+  async function warmReusable(row: Copy, agentId: string) {
+    if (row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
     const entry = baseline(row).entries.get(row.entryFile);
-    if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return false;
-    return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) =>
-      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+    return entry?.kind === "file" && entry.hash === row.receipt?.sessionEntryHash;
+  }
+  async function reuseStatus(row: Copy, entryFile: string, root: string): Promise<AgentDirectoryReuseStatus> {
+    if (row.entryFile !== entryFile) return "other";
+    const snapshot = checkpointSnapshot(await cachedAgentFileManifest(root));
+    const entry = snapshot.entries.get(entryFile);
+    if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return "other";
+    return directorySnapshotSha256(snapshot) === row.baseHash ? "reusable" : "canonical_advanced";
+  }
+  async function canReuse(companyId: string, agentId: string, runId: string): Promise<AgentDirectoryReuseStatus> {
+    const row = await get(companyId, runId);
+    if (!row || !await warmReusable(row, agentId)) return "other";
+    return store.locked(companyId, agentId, actor(row), false, async (_tx, agent, root) =>
+      reuseStatus(row, deriveBundleState(agent).entryFile, root));
+  }
+  async function refreshWarm(input: { companyId: string; agentId: string; runId: string; target?: AdapterExecutionTarget | null;
+    canRefresh: (canonicalRoot: string, entryFile: string) => Promise<boolean> }): Promise<boolean> {
+    const row = await get(input.companyId, input.runId);
+    if (!row) return false;
+    try {
+      return await serial(row, current => store.locked(input.companyId, input.agentId, actor(current), false, async (_tx, agent, canonical) => {
+        if (!await warmReusable(current, input.agentId) || current.location !== (input.target?.kind === "remote" ? `remote:${input.target.environmentId ?? ""}` : "local")) return false;
+        const status = await reuseStatus(current, deriveBundleState(agent).entryFile, canonical);
+        if (status === "other" || !await input.canRefresh(canonical, current.entryFile)) return false;
+        if (status === "reusable") return true;
+        const { snapshot, storageWarning } = await inspectAgentDirectory(canonical, false);
+        const staging = await fs.mkdtemp(path.join(path.dirname(current.localRoot), "refresh-"));
+        try {
+          const replacement = path.join(staging, "live");
+          await fs.cp(canonical, replacement, { recursive: true, preserveTimestamps: true });
+          await fs.rename(current.localRoot, path.join(staging, "previous"));
+          try { await fs.rename(replacement, current.localRoot); }
+          catch (error) { await fs.rename(path.join(staging, "previous"), current.localRoot); throw error; }
+          const values = { baseHash: directorySnapshotSha256(snapshot), receipt: { ...current.receipt,
+            baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: checkpointBaseline(snapshot), storageWarning } };
+          const next = { ...current, ...values };
+          const runtime = input.target?.kind === "remote" ? await transport(next, input.target, false) : undefined;
+          const refreshed = await patch(current, values).catch(async error => { await runtime?.cleanupWorkspaceSnapshot?.(); throw error; });
+          if (refreshed.baseHash !== next.baseHash || refreshed.state !== "warm_saved" || refreshed.errorCode || !await owns(refreshed)) {
+            await runtime?.cleanupWorkspaceSnapshot?.();
+            return false;
+          }
+          if (runtime) {
+            const previous = transports.get(key(current));
+            transports.set(key(current), runtime);
+            await previous?.cleanupWorkspaceSnapshot?.();
+          }
+          return true;
+        } finally { await fs.rm(staging, { recursive: true, force: true }); }
+      }), "agent_directory_prepare");
+    } catch (error) {
+      logger.warn({ err: error, runId: input.runId }, "Warm agent directory refresh failed");
+      return false;
+    }
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
@@ -667,7 +718,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
     }));
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, refreshWarm, recoverUnavailable,
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint"),
     collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => collectStopped(current, target), "agent_directory_collect"),

@@ -1179,7 +1179,7 @@ describe("persistent agent directories", () => {
       await copies.release(companyId, copy.runId);
       expect(await fs.stat(copy.localRoot)).toBeTruthy();
       if (turn < 3) {
-        expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+        expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe("reusable");
         copy = await run({ warm: true, reuseRunId: copy.runId });
         expect(copy.executionRoot).toBe(original.executionRoot);
         await copies.collectStopped({ companyId, runId: original.runId });
@@ -1200,7 +1200,7 @@ describe("persistent agent directories", () => {
   it("rechecks canonical edits at handoff and releases the writer lock before retirement and fresh restore", async () => {
     const first = await run({ warm: true });
     await copies.checkpointWarm({ companyId, runId: first.runId });
-    expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe(true);
+    expect(await copies.canReuseWarm(companyId, agentId, first.runId)).toBe("reusable");
     await agentFileStore(db).write({ ...target(), path: "editor.txt", bytes: Buffer.from("new canonical content"), baseHash: null }, board());
 
     const runId = randomUUID();
@@ -1241,7 +1241,7 @@ describe("persistent agent directories", () => {
     const copy = await run({ warm: true });
     await fs.writeFile(path.join(copy.localRoot, entryFile), "# New loaded policy\n");
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.state).toBe("warm_saved");
-    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(false);
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe("other");
     await copies.collectStopped({ companyId, runId: copy.runId });
     const fresh = await run({ warm: true });
     expect(fresh.executionRoot).not.toBe(copy.executionRoot);
@@ -1252,7 +1252,7 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(copy.localRoot, "mine.txt"), "from run");
     await agentFileStore(db).write({ ...target(), path: "board.txt", bytes: Buffer.from("from board"), baseHash: null }, board());
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.state).toBe("warm_saved");
-    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(false);
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe("canonical_advanced");
     expect(await fs.readFile(path.join(root, "board.txt"), "utf8")).toBe("from board");
     expect(await fs.readFile(path.join(root, "mine.txt"), "utf8")).toBe("from run");
     await copies.collectStopped({ companyId, runId: copy.runId });
@@ -1264,7 +1264,7 @@ describe("persistent agent directories", () => {
     expect(failed?.state).toBe("prepared");
     expect(failed?.errorCode).toBe("AGENT_FILES_CHECKPOINT_UNSTABLE");
     expect(failed?.processStoppedAt).toBeNull();
-    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(false);
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe("other");
     await fs.rm(path.join(copy.localRoot, "escape"));
     expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
@@ -1286,7 +1286,7 @@ describe("persistent agent directories", () => {
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId));
     await db.update(companyMemberships).set({ membershipRole: "member" }).where(eq(companyMemberships.companyId, companyId));
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.errorCode).toBe("AGENT_FILES_CHECKPOINT_UNSTABLE");
-    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(false);
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe("other");
     expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unavailable");
   });
   it("reclaims a warm remote owner after verified sandbox destruction without claiming unsaved tail bytes", async () => {

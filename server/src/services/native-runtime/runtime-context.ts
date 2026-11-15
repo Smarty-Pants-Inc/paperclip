@@ -35,6 +35,7 @@ import { agentInstructionRevisionService } from "../agent-instruction-revisions.
 import { toolAccessService } from "../tool-access.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
 import { rehydratePreservedRuntimeSkill } from "./runtime-skill-preservation.js";
+import { readInstructionBytes } from "../agent-instruction-files.js";
 
 const MAX_ASSET_FILES = 10_000;
 const MAX_ASSET_BYTES = 64 * 1024 * 1024;
@@ -391,6 +392,25 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
   };
   const assignmentDigest = sha256(JSON.stringify(assignment));
   return { assignmentSetId: `sha256:${assignmentDigest}`, digest: assignmentDigest, bindingId: assignment.connections.length ? `native-mcp:${input.runId}` : null };
+}
+
+export async function canRefreshNativeAgentFiles(input: { runtimeContext: NativeRuntimeContextSnapshot; canonicalRoot: string; entryFile: string;
+  runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; adapterType?: string | null }): Promise<boolean> {
+  const content = await readInstructionBytes(input.canonicalRoot, input.entryFile);
+  if (!content) return false;
+  const skills = input.runtimeConfig.homeMode === "preconfigured" ? []
+    : await materializeSelectedSkills(input.runtimeConfig, input.runtimeSkillEntries, input.adapterType === "paperclip_runner");
+  const snapshot = {
+    prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },
+    instructions: { entryPath: input.entryFile, bundle: { ...input.runtimeContext.instructions.bundle,
+      digest: singleFileAssetDigest(input.entryFile, content) } },
+    skills,
+    mcp: input.runtimeContext.mcp,
+    ...(input.runtimeConfig.paperclipConnectionInstructions ? {
+      connectionInstructions: input.runtimeConfig.paperclipConnectionInstructions as { text: string; digest: string },
+    } : {}),
+  };
+  return canonicalNativeRuntimeContextDigest(snapshot) === input.runtimeContext.aggregateDigest;
 }
 
 export async function buildNativeRuntimeContext(input: { db: Db; agent: RuntimeAgent; runId: string; runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; instructionWorkingCopy?: { rootPath: string; entryPath: string; kind?: "agent_files" } }): Promise<NativeRuntimeContextSnapshot> {

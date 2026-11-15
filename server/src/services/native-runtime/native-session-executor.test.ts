@@ -12622,18 +12622,23 @@ describe("native warm session supervision", () => {
       expect(secondCopy.collectStopped).toHaveBeenCalledOnce();
     });
 
-    it.each(["NOTES", "entry", "skill", "not-warm-saved", "environment", "target", "transfer-failure"] as const)("refreshes a canonical-only warm change safely: %s", async change => {
+    it.each(["NOTES", "entry", "skill", "not-warm-saved", "environment", "target", "transfer-failure", "unowned", "copy-error", "prompt", "missing-context", "observability", "digest-error", "close-requested"] as const)("refreshes a canonical-only warm change safely: %s", async change => {
       const f = await warmAgentFilesRefreshFixture();
       let reservation: Awaited<ReturnType<typeof reserveWarmNativeInstructionDirectory>> = null;
       const transfer = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime");
       try {
         const a = await f.prepare("session-a"), b = await f.prepare("session-b");
         expect(a.context.skills).toHaveLength(1);
+        if (change === "prompt") {
+          const text = `${a.context.prompt.text}\nPreviously loaded prompt`;
+          a.context.prompt = { ...a.context.prompt, text, digest: createHash("sha256").update(text).digest("hex") };
+          a.context.aggregateDigest = canonicalNativeRuntimeContextDigest(a.context);
+        }
         const sessionA = { close: vi.fn(async () => undefined) }, sessionB = { close: vi.fn(async () => undefined) };
         const executionFor = (prepared: typeof a, name: string) => ({ ...execution,
           binding: { ...execution.binding, companyId: f.companyId, agentId: f.agentId, runId: prepared.copy.runId, executionWorkspaceId: name },
           session: { ...execution.session, normalizedSessionId: name, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
-          runtimeContext: prepared.context,
+          ...(change === "missing-context" ? {} : { runtimeContext: prepared.context }),
         });
         const first = executionFor(a, "refresh-session-a"), other = executionFor(b, "refresh-session-b");
         const copyFor = (copy: typeof a.copy, target: typeof a.target) => ({ runId: copy.runId, root: copy.executionRoot,
@@ -12654,21 +12659,32 @@ describe("native warm session supervision", () => {
         expect(sessionB.close).not.toHaveBeenCalled();
         expect((await f.copies.get(f.companyId, b.copy.runId))?.state).toBe("warm_saved");
         if (change === "not-warm-saved") await f.db.update(agentInstructionWorkingCopies).set({ state: "prepared" }).where(eq(agentInstructionWorkingCopies.runId, a.copy.runId));
+        if (change === "copy-error") await f.db.update(agentInstructionWorkingCopies).set({ errorCode: "checkpoint_failed" }).where(eq(agentInstructionWorkingCopies.runId, a.copy.runId));
+        if (change === "unowned") await writeFile(join(a.copy.localRoot, "..", "owner.json"), JSON.stringify({ runId: "another-owner" }));
+        if (change === "digest-error") f.runtimeSkillEntries[0]!.source = join(f.home, "missing-skill-source");
         const runId = await f.nextRun();
         transfer.mockClear();
         if (change === "transfer-failure") transfer.mockRejectedValueOnce(new Error("refresh transfer failed"));
-        const refresh = vi.fn(async (runtimeContext: typeof a.context) => f.copies.refreshWarm({ companyId: f.companyId, agentId: f.agentId,
-          runId: a.copy.runId, target: a.target, canRefresh: (canonicalRoot, entryFile) => runtimeContextService.canRefreshNativeAgentFiles({
-            runtimeContext, canonicalRoot, entryFile, runtimeConfig: f.runtimeConfig, runtimeSkillEntries: f.runtimeSkillEntries, adapterType: f.agent.adapterType,
-          }) }));
+        const refresh = vi.fn(async (runtimeContext: typeof a.context) => {
+          if (change === "close-requested") await closeIdleWarmNativeSessionsForRestart();
+          return f.copies.refreshWarm({ companyId: f.companyId, agentId: f.agentId,
+            runId: a.copy.runId, target: a.target, canRefresh: (canonicalRoot, entryFile) => runtimeContextService.canRefreshNativeAgentFiles({
+              runtimeContext, canonicalRoot, entryFile, runtimeConfig: f.runtimeConfig, runtimeSkillEntries: f.runtimeSkillEntries, adapterType: f.agent.adapterType,
+            }) });
+        });
         reservation = await reserveWarmNativeInstructionDirectory({ companyId: f.companyId, agentId: f.agentId, previousRunId: a.copy.runId, runId,
           target: change === "environment" ? { ...a.target, environmentId: randomUUID() } : change === "target" ? { ...a.target, remoteCwd: join(f.home, "another-target") } : a.target,
+          observabilityCompatibilityKey: change === "observability" ? "changed" : undefined,
           canReuse: () => f.copies.canReuseWarm(f.companyId, f.agentId, a.copy.runId), refresh });
         if (change !== "NOTES") {
           expect(reservation).toBeNull();
           expect(sessionA.close).toHaveBeenCalledOnce();
-          expect(sessionB.close).not.toHaveBeenCalled();
-          if (["not-warm-saved", "environment", "target", "entry"].includes(change)) expect(refresh).not.toHaveBeenCalled();
+          if (change !== "close-requested") expect(sessionB.close).not.toHaveBeenCalled();
+          if (change === "transfer-failure") {
+            expect((await f.copies.get(f.companyId, a.copy.runId))?.baseHash).toBe(a.copy.baseHash);
+            expect(await readFile(join(f.root, "NOTES.md"), "utf8")).toBe("Saved by the other warm session\n");
+          }
+          if (["not-warm-saved", "environment", "target", "entry", "unowned", "copy-error", "missing-context", "observability"].includes(change)) expect(refresh).not.toHaveBeenCalled();
           return;
         }
         expect(reservation).not.toBeNull();

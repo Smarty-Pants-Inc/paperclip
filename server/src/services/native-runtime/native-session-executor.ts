@@ -71,7 +71,7 @@ import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type Sand
 import { findNativeFailedBeforeProviderTurn, NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE, NativeFailedBeforeProviderTurnError } from "./failed-before-provider-turn.js";
 import { findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementDirectoryBusyError, NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import { retireSandboxRunnerPortHolders } from "./sandbox-runner-port-holders.js";
-import { AgentDirectoryOperationBusyError } from "../agent-directory-working-copies.js";
+import { AgentDirectoryOperationBusyError, type AgentDirectoryReuseStatus } from "../agent-directory-working-copies.js";
 import { agentDirectoryBusyRetryDelayMs } from "../heartbeat/agent-directory-busy.js";
 import { NativeExecutionContext } from "./native-execution-context.js";
 import { NativeStartupCleanupPendingError, clearNativeStartupContext } from "./native-startup-cleanup.js";
@@ -757,6 +757,7 @@ type WarmNativeSession = {
   instructionPreparationRunId?: string;
   agentId: string;
   instructionCopy?: { runId: string; root?: string; targetIdentity: string; collectStopped: () => Promise<void> };
+  runtimeContext?: NativeRuntimeContextSnapshot;
   preparingRunId?: string;
   githubAccess?: NativeGitHubAccess;
   session: NativeSession;
@@ -1065,7 +1066,8 @@ function instructionTargetIdentity(target?: AdapterExecutionTarget | null): stri
 export async function reserveWarmNativeInstructionDirectory(input: {
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
-  canReuse: () => Promise<boolean>;
+  canReuse: () => Promise<AgentDirectoryReuseStatus | boolean>;
+  refresh?: (runtimeContext: NativeRuntimeContextSnapshot) => Promise<boolean>;
 }): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
@@ -1087,7 +1089,13 @@ export async function reserveWarmNativeInstructionDirectory(input: {
     };
     let reusable = false;
     const targetProven = input.target?.kind !== "remote" || input.target.transport !== "sandbox" || Boolean(input.target.sandboxLeaseAcquisition?.providerLeaseId);
-    try { reusable = targetProven && entry.observabilityCompatibilityKey === input.observabilityCompatibilityKey && !entry.closeOnReleaseReason && entry.instructionCopy.targetIdentity === instructionTargetIdentity(input.target) && await input.canReuse(); }
+    try {
+      if (targetProven && entry.observabilityCompatibilityKey === input.observabilityCompatibilityKey && !entry.closeOnReleaseReason && entry.instructionCopy.targetIdentity === instructionTargetIdentity(input.target)) {
+        const status = await input.canReuse();
+        reusable = status === true || status === "reusable";
+        if (status === "canonical_advanced" && entry.runtimeContext && input.refresh) reusable = await input.refresh(entry.runtimeContext) && !entry.closeOnReleaseReason;
+      }
+    }
     finally {
       if (!reusable) {
         await retire("managed agent files changed or environment replaced");
@@ -13274,10 +13282,13 @@ async function executePaperclipNativeSessionAttempt(
                     lastActivityAt: new Date().toISOString(),
                   });
                 const owner = warmNativeSessions.get(warmSessionId);
-                if (owner && input.instructionWorkingCopy?.runId && input.instructionWorkingCopy.checkpointWarm) owner.instructionCopy = {
-                  runId: input.instructionWorkingCopy.runId, root: input.instructionWorkingCopy.root, targetIdentity: instructionTargetIdentity(input.runnerExecutionTarget),
-                  collectStopped: input.instructionWorkingCopy.collectStopped,
-                };
+                if (owner && input.instructionWorkingCopy?.runId && input.instructionWorkingCopy.checkpointWarm) {
+                  owner.runtimeContext = "runtimeContext" in input.execution ? input.execution.runtimeContext : undefined;
+                  owner.instructionCopy = {
+                    runId: input.instructionWorkingCopy.runId, root: input.instructionWorkingCopy.root, targetIdentity: instructionTargetIdentity(input.runnerExecutionTarget),
+                    collectStopped: input.instructionWorkingCopy.collectStopped,
+                  };
+                }
               } else if (!session && warmSessionId !== null) {
                 const existing = warmNativeSessions.get(warmSessionId);
                 // onSession(null) quarantines a transport that can no longer

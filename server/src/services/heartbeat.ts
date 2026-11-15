@@ -3040,7 +3040,7 @@ export function heartbeatService(
       } = preparedWorkspace;
       const preparedInstructions = instructionWorkingCopy = createHeartbeatInstructionWorkingCopy({
         observabilityCompatibilityKey: observability?.compatibilityKey,
-        db, instructionCopies, readRun: () => run!, agent, context,
+        db, instructionCopies, readRun: () => run!, agent, context, runtimeSkillEntries,
         session: { taskSession, taskSessionForRun, sessionConfigMetadata },
         workspace: { executionTarget, executionWorkspace, persistedExecutionWorkspace },
         appendRunEvent,
