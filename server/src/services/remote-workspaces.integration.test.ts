@@ -187,6 +187,7 @@ suite("remote workspace lifecycle with real Postgres and independent filesystem 
     await expect(runtime.resumeRunLease({ ...input, requestedCwd: `${storedCwd}/wrong` }))
       .rejects.toThrow("requestedCwd != stored remoteCwd");
     const resumed = await runtime.resumeRunLease(input);
+    if (!resumed) throw new Error("Provider did not confirm the retained lease");
     expect(call.mock.calls.at(-1)![2]).toMatchObject({ requestedCwd: storedCwd, leaseMetadata: { remoteCwd: storedCwd } });
     return { ...remote, remoteCwd: resumed.metadata!.remoteCwd as string };
   }
@@ -228,7 +229,8 @@ suite("remote workspace lifecycle with real Postgres and independent filesystem 
         .resolves.toEqual({ remoteCwd: prepared.remoteRoot });
       const rebound = rebindNativeSessionCheckpoint({ previousRun: { id: ids.run, companyId: ids.company,
         agentId: ids.agent, nativeSessionId: native.normalizedSessionId, runnerProfileJson: profile }, executionTargetKind: "remote",
-        currentExecution: { ...execution, binding: { ...execution.binding, runId }, workspace: { ...execution.workspace, cwd: current.remoteRoot } } });
+        currentExecution: parseNativeExecutionInput({ ...execution, binding: { ...execution.binding, runId },
+          workspace: { ...execution.workspace, cwd: current.remoteRoot } }) });
       expect(rebound).toMatchObject({ sessionId: checkpoint.sessionId, providerSessionId: checkpoint.providerSessionId,
         identity: { sessionId: native.normalizedSessionId, runId } });
       expect(JSON.parse(await fs.readFile(sessionFile, "utf8"))).toEqual(checkpoint);

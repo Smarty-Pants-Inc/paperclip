@@ -384,6 +384,24 @@ function publishedWorkspaceDirectory(workspace: Workspace & Pick<typeof executio
   return directory;
 }
 
+/** An echoing provider may resume at this workspace's old allocation, not the
+ * sandbox base. Only peel trailing allocation pairs named by this workspace's
+ * published root or the server's exact workspace/epoch/lease naming scheme.
+ * This is solely a NEW-allocation join base; existing lease/session cwd stays put. */
+function workspaceAllocationBase(remoteCwd: string, workspace: Parameters<typeof publishedWorkspaceDirectory>[0],
+  authority: RemoteWorkspaceAuthority) {
+  if (!path.posix.isAbsolute(remoteCwd) || path.posix.normalize(remoteCwd) !== remoteCwd || remoteCwd.endsWith("/")) return remoteCwd;
+  const published = publishedWorkspaceDirectory(workspace, authority);
+  let base = remoteCwd;
+  while (path.posix.basename(path.posix.dirname(base)) === ".paperclip-workspaces") {
+    const directory = path.posix.basename(base);
+    const suffix = directory.startsWith(`${workspace.id}-`) ? directory.slice(workspace.id.length) : "";
+    if (directory !== published && !/^-[1-9][0-9]*-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(suffix)) break;
+    base = path.posix.dirname(path.posix.dirname(base));
+  }
+  return base;
+}
+
 /**
  * Whether the root at `remoteRoot` on this lease's sandbox is this workspace's
  * own earlier allocation whose last use ended in a completed final save. A
@@ -440,7 +458,7 @@ export async function prepareRemoteWorkspace(input: {
   const migration = input.workspace.metadata?.nativeWorkspaceMigration
     ? await readNativeWorkspaceMigration(input.db, input.workspace) : null;
   if (migration && migration.remoteCwd !== target.remoteCwd) throw new Error("native_workspace_migration_target_changed");
-  const remoteRoot = sameAllocation ? initial.location!.remoteCwd : migration?.remoteCwd ?? path.posix.join(target.remoteCwd, ".paperclip-workspaces",
+  const remoteRoot = sameAllocation ? initial.location!.remoteCwd : migration?.remoteCwd ?? path.posix.join(workspaceAllocationBase(target.remoteCwd, input.workspace, initial), ".paperclip-workspaces",
     publishedWorkspaceDirectory(input.workspace, initial) ?? `${input.workspace.id}-${initial.epoch}-${input.lease.id}`);
   const preparationIdentity = createHash("sha256").update(JSON.stringify([input.workspace.companyId, input.workspace.id,
     input.runId, initial.epoch, input.lease.id, input.lease.providerLeaseId, remoteRoot, initial.source])).digest("hex");
