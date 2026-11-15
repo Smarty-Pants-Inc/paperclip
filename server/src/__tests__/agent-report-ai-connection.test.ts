@@ -7,14 +7,18 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, agentApiKeys, agentConfigRevisions, authUsers, companies, companyMemberships,
-  connectionGrants, createDb, principalPermissionGrants, toolConnections, toolConnectionInstalls,
+  connectionGrants, createDb, heartbeatRuns, principalPermissionGrants, toolConnections, toolConnectionInstalls,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
 import { aiConnectionService } from "../services/ai-connections.js";
-import { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
+import type { prepareManagedAiRuntime } from "../services/ai-connection-runtime.js";
+import { prepareHeartbeatExecutionConfiguration } from "../services/heartbeat/execution-configuration.js";
+import { companySkillService } from "../services/company-skills.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { secretService } from "../services/secrets.js";
 import { toolAccessService } from "../services/tool-access.js";
 import * as configuration from "../services/agent-configuration.js";
 import * as connectionManagement from "../services/connection-management.js";
@@ -55,7 +59,7 @@ describe("manager assigns a company AI connection to its own report", () => {
     for (const name of ["root", "outside", "lead", "report", "local"] as const) {
       await db.insert(agents).values({ id: ids[name], companyId, name, role: "engineer", status: "idle", lifecycleState: "ready",
         adapterType: name === "local" ? "pi_local" : "paperclip_runner",
-        adapterConfig: name === "local" ? {} : { provider: "pi_rpc", model: oldModel, piRpcThinkingLevel: "high" },
+        adapterConfig: name === "local" ? {} : { provider: "pi_rpc", model: oldModel, piRpcThinkingLevel: "high", githubAuthenticationMode: "agent_env" },
         reportsTo: name === "report" || name === "local" ? ids.lead : name === "lead" ? ids.root : null,
         runtimeConfig: { heartbeat: { enabled: false } } });
     }
@@ -71,8 +75,19 @@ describe("manager assigns a company AI connection to its own report", () => {
     const token = randomUUID();
     const [key] = await db.insert(agentApiKeys).values({ companyId, agentId: ids.lead, name: "lead fixture", responsibleUserId: userId,
       keyHash: createHash("sha256").update(token).digest("hex") }).returning();
-    const api = express(); api.use(express.json()); api.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
-    api.use("/api", agentRoutes(db)); api.use(errorHandler);
+    // Schedule committed authority changes after HTTP admission, immediately
+    // before the lifecycle writer opens its company-locked transaction.
+    let beforeWrite: (() => Promise<void>) | undefined;
+    const routeDb = new Proxy(db, { get(target, key, receiver) {
+      if (key !== "transaction") return Reflect.get(target, key, receiver);
+      return async (...args: Parameters<typeof target.transaction>) => {
+        const change = beforeWrite; beforeWrite = undefined;
+        await change?.();
+        return target.transaction(...args);
+      };
+    } });
+    const api = express(); api.use(express.json()); api.use(actorMiddleware(routeDb, { deploymentMode: "authenticated" }));
+    api.use("/api", agentRoutes(routeDb)); api.use(errorHandler);
     const call = (method: "patch" | "get", id: string, body: object = {}) =>
       request(api)[method](`/api/agents/${id}`).set("Authorization", `Bearer ${token}`).send(body);
     const read = async (id = ids.report) => (await db.select().from(agents).where(eq(agents.id, id)))[0]!;
@@ -93,7 +108,8 @@ describe("manager assigns a company AI connection to its own report", () => {
     const patch = (target = ids.report, selected: object = binding) => call("patch", target, { runtimeConfig: { heartbeat: { enabled: false }, aiConnection: selected } });
     const revoke = (permissionKey: string) => db.delete(principalPermissionGrants).where(and(eq(principalPermissionGrants.companyId, companyId),
       eq(principalPermissionGrants.principalId, ids.lead), eq(principalPermissionGrants.permissionKey, permissionKey)));
-    return { companyId, userId, otherUserId, ids, key: key!, call, read, account, binding, oldBinding, patch, revoke };
+    return { companyId, userId, otherUserId, ids, key: key!, call, read, account, binding, oldBinding, patch, revoke,
+      beforeWrite: (change: () => Promise<void>) => { beforeWrite = change; } };
   }
 
   function observeBindingAuthorization() {
@@ -111,7 +127,11 @@ describe("manager assigns a company AI connection to its own report", () => {
 
   async function proveSavedAndNextRuntime(f: Awaited<ReturnType<typeof seed>>, response: request.Response) {
     // Keep the exact pre-fix failure visible in RED, then require the fixed outcome.
-    if (response.status === 403) expect(response.body.error).toBe(denyScope);
+    if (response.status === 403) {
+      expect(response.body.error).toBe(denyScope);
+      expect((await f.read()).runtimeConfig.aiConnection).toEqual(f.oldBinding);
+      expect((await f.call("get", f.ids.report)).body.runtimeConfig.aiConnection).toEqual(f.oldBinding);
+    }
     expect(response.status, response.text).toBe(200);
     expect(response.body.runtimeConfig.aiConnection).toEqual(f.binding);
     const fresh = await f.call("get", f.ids.report);
@@ -119,21 +139,50 @@ describe("manager assigns a company AI connection to its own report", () => {
     expect(fresh.body.runtimeConfig.aiConnection).toEqual(f.binding);
     const saved = await f.read();
     expect(saved.runtimeConfig.aiConnection).toEqual(f.binding);
-    const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: saved.id, responsibleUserId: f.userId,
-      adapterType: saved.adapterType, config: saved.adapterConfig, binding: saved.runtimeConfig.aiConnection as AiConnectionBinding });
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: saved.id,
+      responsibleUserId: f.userId, status: "running", runtimeMode: "native", contextSnapshot: {} }).returning();
+    let acquired: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
+    const appendRunEvent = vi.fn(async () => {});
+    const busy = vi.fn();
     try {
-      expect(runtime.attribution).toMatchObject({ connectionId: f.binding.connectionId, grantId: f.binding.grantId, provider: "openai", responsibleUserId: f.userId });
-      expect(runtime.config).toMatchObject({ model: saved.adapterConfig.model });
-    } finally { await runtime.cleanup(); }
+      const prepared = await prepareHeartbeatExecutionConfiguration(db, {
+        run, agent: saved,
+        task: { issueId: null, context: {}, responsibleUserId: f.userId, acceptedPlanContinuationWake: false,
+          acceptedPlanWakeRoutingDecision: null, taskProjectContext: null, routineEnvContext: { routineId: null, env: null, responsibleUserId: null } },
+        config: { sourceWorkspaceConfig: saved.adapterConfig, aiBinding: saved.runtimeConfig.aiConnection as AiConnectionBinding },
+        policy: { trustPreset: { kind: "standard", preset: "standard", boundary: null, sourcePresets: {} },
+          useIsolatedTaskDirectory: false, explicitTaskDirectory: false, requestedExecutionWorkspaceMode: "shared_workspace" },
+        environment: { selectedEnvironmentId: null, selectedEnvironmentForConfig: null,
+          resolvedInstanceSettings: await instanceSettingsService(db).get(), persistedNativeExecutionInput: null },
+        services: { secretsSvc: secretService(db), companySkills: companySkillService(db), appendRunEvent, finalizeAiConnectionBusyDeferral: busy },
+        onFailureSecretsResolved: () => {}, onManagedAiRuntimeAcquired: runtime => { acquired = runtime; }, onIdentityRedactorPrepared: () => {},
+      });
+      expect(prepared.prepared).toBe(true); expect(busy).not.toHaveBeenCalled();
+      if (!prepared.prepared) throw new Error("Fresh run unexpectedly deferred");
+      expect(prepared.runtimeConfig).toMatchObject({ model, provider: "pi_rpc" });
+      expect(prepared.useHostGitHub).toBe(false); // No ambient credentials enter this local proof.
+      expect(acquired?.attribution).toMatchObject({ connectionId: f.binding.connectionId, grantId: f.binding.grantId, provider: "openai", responsibleUserId: f.userId });
+      const [freshRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(freshRun!.contextSnapshot?.aiConnection).toMatchObject({ connectionId: f.binding.connectionId,
+        grantId: f.binding.grantId, provider: "openai", responsibleUserId: f.userId });
+    } finally {
+      await acquired?.cleanup();
+      // Preparation only: no Runner/provider request is launched in this fixture.
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
+    }
     // Assignment changes no connection/grant/install ownership or access.
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.binding.connectionId)))
       .toEqual([expect.objectContaining({ targetType: "company", targetId: f.companyId })]);
   }
 
-  it("R1: #20724 runtimeConfig binding PATCH persists and resolves on fresh managed execution preparation", async () => {
+  it("R1: #20724 runtimeConfig binding PATCH persists and the next execution preparation records the chosen AI account", async () => {
     const f = await seed();
     expect((await f.call("patch", f.ids.report, { adapterConfig: { model } })).status).toBe(200);
-    await proveSavedAndNextRuntime(f, await f.patch());
+    const observed = observeBindingAuthorization();
+    try {
+      await proveSavedAndNextRuntime(f, await f.patch());
+      expect(observed.operations).toEqual(["agent.ai-binding.assign-shared-report", "agent.ai-binding.assign-shared-report"]);
+    } finally { observed.restore(); }
     expect((await f.read()).adapterConfig.model).toBe(model);
   });
   it("R1b: runtimeSettings converges on the same assignment with expected model/binding", async () => {
@@ -192,7 +241,8 @@ describe("manager assigns a company AI connection to its own report", () => {
     await expect(aiConnectionService(db).select({ companyId: f.companyId, userId: f.userId, agentId: f.ids.lead,
       adapterType: "paperclip_runner", runnerProvider: "pi_rpc", model: oldModel, binding: f.binding })).rejects.toMatchObject({ status: 403 });
     const response = await f.patch();
-    expect(response.status, response.text).toBe(403); expect(response.body.error).toBeTruthy(); expect(await f.read()).toEqual(before);
+    expect(response.status, response.text).toBe(403); expect(response.body.error).toBe("This credential is not shared with the responsible user");
+    expect(await f.read()).toEqual(before);
   });
   it("R5: router bindings retain the existing all-consumer refusal", async () => {
     const f = await seed(); const before = await f.read();
@@ -215,25 +265,31 @@ describe("manager assigns a company AI connection to its own report", () => {
       expect(observed.operations).toEqual(["agent.ai-binding.update"]);
     } finally { observed.restore(); }
   });
-  for (const race of ["reparent", "runtime-grant", "configure-grant", "audience", "install", "key"] as const) {
+  for (const race of ["reparent", "runtime-grant", "configure-grant", "account-grant", "audience", "install", "key"] as const) {
     it(`R6: ${race} changes after route admission are refused by the locked writer`, async () => {
-      const f = await seed(); const before = await f.read(); let reachedWriter = false;
+      const f = await seed(); const before = await f.read(); let reachedWriter = false, changedAuthority = false;
+      f.beforeWrite(async () => {
+        if (race === "reparent") await db.update(agents).set({ reportsTo: f.ids.outside }).where(eq(agents.id, f.ids.report));
+        if (race === "runtime-grant" || race === "configure-grant") await f.revoke(race === "runtime-grant" ? "agents:configure-reports-runtime" : "agents:configure");
+        if (race === "account-grant") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, f.binding.grantId));
+        if (race === "audience") await toolAccessService(db).replaceConnectionGrantMembers(f.binding.connectionId, f.binding.grantId, [f.otherUserId], { actorType: "user", actorId: f.userId });
+        if (race === "install") await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.binding.connectionId));
+        if (race === "key") await db.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.id, f.key.id));
+        changedAuthority = true;
+      });
       const original = configuration.prepareAgentConfiguration;
-      const seam = vi.spyOn(configuration, "prepareAgentConfiguration").mockImplementationOnce(async (tx, existing, data, options) => {
+      const seam = vi.spyOn(configuration, "prepareAgentConfiguration").mockImplementationOnce(async (...args) => {
         reachedWriter = true;
-        if (race === "reparent") await tx.update(agents).set({ reportsTo: f.ids.outside }).where(eq(agents.id, f.ids.report));
-        if (race === "runtime-grant" || race === "configure-grant") await tx.delete(principalPermissionGrants).where(and(
-          eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, race === "runtime-grant" ? "agents:configure-reports-runtime" : "agents:configure")));
-        if (race === "audience") await tx.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, f.binding.grantId));
-        if (race === "install") await tx.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, f.binding.connectionId));
-        if (race === "key") await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.id, f.key.id));
-        return original(tx, existing, data, options);
+        return original(...args);
       });
       try {
         const response = await f.patch();
-        expect(reachedWriter, response.text).toBe(true);
+        expect(changedAuthority, response.text).toBe(true); expect(reachedWriter, response.text).toBe(true);
         expect([403, 422], response.text).toContain(response.status);
-        expect(response.body.error).toBeTruthy(); expect(await f.read()).toEqual(before);
+        expect(response.body.error).toBeTruthy();
+        const saved = await f.read();
+        expect(saved.runtimeConfig).toEqual(before.runtimeConfig); expect(saved.adapterConfig).toEqual(before.adapterConfig);
+        expect(saved.reportsTo).toBe(race === "reparent" ? f.ids.outside : before.reportsTo);
         expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, f.ids.report))).toEqual([]);
       } finally { seam.mockRestore(); }
     });
