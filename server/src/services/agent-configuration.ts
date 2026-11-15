@@ -42,6 +42,12 @@ export async function lockAgentConfigurationInteractions(tx: Db, id: string, dat
 }
 
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
+  // Unlike monthly budgets, a zero heartbeat cost cap stops the agent rather
+  // than removing its limit. Keep the board's explicit zero-cap behavior.
+  const heartbeat = data.runtimeConfig?.heartbeat;
+  if (options?.recordRevision?.createdByAgentId && isPlainRecord(heartbeat) && heartbeat.maxDailyCostCents === 0) {
+    throw unprocessable("maxDailyCostCents 0 stops the agent; omit the field (or send null) to remove the daily cap");
+  }
   if (options?.reportRuntimeActor) {
     const env = isPlainRecord(data.adapterConfig) ? data.adapterConfig.env : undefined;
     if ((data.adapterType ?? existing.adapterType) !== "paperclip_runner" || !isReportRuntimeEnv(env)
