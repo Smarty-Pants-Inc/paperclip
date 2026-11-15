@@ -109,7 +109,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     return { input, issue, run, agent };
   }
   // TEST-ONLY Cut B: pin note bytes independently of the production constants.
-  const cutBStartedNote = FRESH_THREAD_STARTED_NOTE;
+  const cutBStartedNote = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 
   // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
   // contract, then into the durable fresh-history owner, without prose authority.
