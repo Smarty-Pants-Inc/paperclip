@@ -415,12 +415,20 @@ it.skipIf(process.platform !== "linux" || !pi)("FINAL AUTHORITY PROOF: real runn
         // Pi assigns the actual provider-started turn its own native ID; it need
         // not equal INITIAL's preallocated authority seed. The callback below
         // must retain this exact observed turn ID.
-        proof.bootstrap = { preallocatedTurnId: initial.turnId, observedTurnId: turnId, epoch: initial.epoch, privateIpcObservation: "delegated driver-bind evidence; no proxy IPC tracing API" };
+        const bootstrap = { preallocatedTurnId: initial.turnId, observedTurnId: turnId, epoch: initial.epoch, runId: initial.runId, privateIpcObservation: "delegated driver-bind evidence; no proxy IPC tracing API" };
+        expect(bootstrap.epoch, "bootstrap turn must retain INITIAL epoch").toBe(initial.epoch);
+        expect(bootstrap.runId, "bootstrap turn must retain INITIAL run").toBe(initial.runId);
+        proof.bootstrap = bootstrap;
       }
       const first = await readUntil(event => event.params.turnId === turnId && event.method === "item/agentMessage/delta");
       const firstAt = performance.now();
       await readUntil(event => event.params.turnId === turnId && event.method === "turn/completed");
       if (turn === 1) {
+        const bootstrapStarts = notifications.filter(event => event.method === "turn/started");
+        expect(bootstrapStarts, "bootstrap turn 1 must produce exactly one provider turn-start; a replacement bind/begin would start another").toHaveLength(1);
+        expect(bootstrapStarts[0]!.params.turnId).toBe(turnId);
+        expect(initial.epoch, "bootstrap turn must retain INITIAL epoch").toBe(1);
+        expect(initial.runId, "bootstrap turn must retain INITIAL run").toBe(run1);
         expect(String((await within("run1 semantic result at real model", faux.firstResult)).content)).toContain("accepted-under-run-1");
         expect(effects).toEqual({ total: 1, first: 1, second: 0 });
         const original = semanticCalls[0]!;
@@ -440,7 +448,12 @@ it.skipIf(process.platform !== "linux" || !pi)("FINAL AUTHORITY PROOF: real runn
       sessions.push(String(record(read.thread).sessionId));
       facadeThreadIds.push(String(record(read.thread).id));
       nativeSessions.push(nativeSessionId(root));
-      turns.push({ turn, runId: run1, turnId: first.params.turnId, pi: pids.at(-1), nativePiSessionId: nativeSessions.at(-1), sentToFirstModelEventMs: firstAt - sentAt, sentToCompletedMs: performance.now() - sentAt });
+      const turnEvidence = { turn, runId: turn === 1 ? initial.runId : run1, ...(turn === 1 ? { epoch: initial.epoch } : {}), turnId: first.params.turnId, pi: pids.at(-1), nativePiSessionId: nativeSessions.at(-1), sentToFirstModelEventMs: firstAt - sentAt, sentToCompletedMs: performance.now() - sentAt };
+      turns.push(turnEvidence);
+      if (turn === 1) {
+        expect(turnEvidence.epoch, "bootstrap turn evidence epoch must equal INITIAL").toBe(initial.epoch);
+        expect(turnEvidence.runId, "bootstrap turn evidence run must equal INITIAL").toBe(initial.runId);
+      }
     }
     proof.phase = "run2-attach";
     expect(transport.attachRun, "real transport must expose run.attach").toBeTypeOf("function");
