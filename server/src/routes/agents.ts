@@ -5885,14 +5885,28 @@ export function agentRoutes(
       await assertCanConfigureAgentSetup(req, existing);
       const changed = !isDeepStrictEqual(nextAiBinding, existing.runtimeConfig.aiConnection);
       if (changed && req.actor.type === "agent") {
-        reportAiBindingAuthorized = await canAssignSharedReportAiConnection(db, req.actor, existing, {
-          adapterType: requestedAdapterType, adapterConfig: nextAiConfig, binding: nextAiBinding,
-        });
-        await connectionManagementService(db).authorize(req.actor, "connections:profiles", {
-          type: "connection_management", companyId: existing.companyId, purpose: "ai", targetAgentId: existing.id,
+        const management = connectionManagementService(db);
+        const resource = {
+          type: "connection_management" as const, companyId: existing.companyId, purpose: "ai" as const, targetAgentId: existing.id,
           connectionId: "connectionId" in nextAiBinding ? nextAiBinding.connectionId : undefined,
-          operation: reportAiBindingAuthorized ? ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION : "agent.ai-binding.update",
-        });
+          operation: "agent.ai-binding.update",
+        };
+        try {
+          // Preserve BASE's all-consumer authorization verbatim in effect. The
+          // manager's own harness need not resolve a report's selected account.
+          await management.authorize(req.actor, "connections:profiles", resource);
+        } catch (error) {
+          if (!(error instanceof HttpError && error.status === 403)) throw error;
+          // Only newly admitted company-report assignments require the manager
+          // to resolve the account. Never narrow an already-authorized legacy path.
+          reportAiBindingAuthorized = await canAssignSharedReportAiConnection(db, req.actor, existing, {
+            adapterType: requestedAdapterType, adapterConfig: nextAiConfig, binding: nextAiBinding,
+          });
+          if (!reportAiBindingAuthorized) throw error;
+          await management.authorize(req.actor, "connections:profiles", {
+            ...resource, operation: ASSIGN_SHARED_REPORT_AI_BINDING_OPERATION,
+          });
+        }
       }
       const aiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
       const nextEnvironmentId = Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")

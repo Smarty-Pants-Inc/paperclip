@@ -181,7 +181,7 @@ describe("manager assigns a company AI connection to its own report", () => {
     const observed = observeBindingAuthorization();
     try {
       await proveSavedAndNextRuntime(f, await f.patch());
-      expect(observed.operations).toEqual(["agent.ai-binding.assign-shared-report", "agent.ai-binding.assign-shared-report"]);
+      expect(observed.operations).toEqual(["agent.ai-binding.update", "agent.ai-binding.assign-shared-report", "agent.ai-binding.assign-shared-report"]);
     } finally { observed.restore(); }
     expect((await f.read()).adapterConfig.model).toBe(model);
   });
