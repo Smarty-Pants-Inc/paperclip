@@ -8967,11 +8967,18 @@ function canReuseNativeProcess(input: Parameters<typeof executePaperclipNativeSe
   return input.refreshTools !== true && typeof processConfigDigest === "string" && processConfigDigest === nativeProcessReuseKey(input);
 }
 
+/** True only when the run's target is a remote sandbox whose lease this run
+ * CREATED (a new box). Unknown or any other target keeps the warm cursor. */
+function createdSandboxAllocation(target: Parameters<typeof executePaperclipNativeSession>[0]["runnerExecutionTarget"]): boolean {
+  return target?.kind === "remote" && target.transport === "sandbox" && target.sandboxLeaseAcquisition?.outcome === "created";
+}
+
 function loadWarmNativeCheckpoint(
   execution: NativeExecutionInput,
   configDigest: string,
   executionTargetKind: "local" | "remote" = "local",
   refreshTools?: boolean,
+  newAllocation?: boolean,
 ): PersistedNativeSession | null {
   const scopedPath = nativeSessionCheckpointPath(execution);
   const path = [
@@ -9042,6 +9049,9 @@ function loadWarmNativeCheckpoint(
         // request authority must not cross into the new heartbeat run.
         // The prior result still decides replacement, as in the durable rebind.
         providerRecoveryPolicy: nativeProviderRecoveryPolicy(record(envelope.snapshot), refreshTools),
+        // A newly created box has no runner state to continue the prior run's
+        // event sequence, so its cursor resets as in the durable rebind.
+        ...(newAllocation ? { cursor: null } : {}),
         semanticResult: null,
         terminal: null,
         activeTurnId: null,
@@ -12598,7 +12608,7 @@ async function executePaperclipNativeSessionAttempt(
           input.execution,
           warmConfigDigest,
           input.runnerExecutionTarget?.kind ?? "local",
-          input.refreshTools,
+          input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget),
         );
       } else {
         if (entry.busy && entry.instructionPreparationRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
@@ -12646,7 +12656,7 @@ async function executePaperclipNativeSessionAttempt(
         input.execution,
         warmConfigDigest,
         input.runnerExecutionTarget?.kind ?? "local",
-        input.refreshTools,
+        input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget),
       );
     }
   }
@@ -12849,7 +12859,7 @@ async function executePaperclipNativeSessionAttempt(
       retained.detach();
       existingWarmSession = undefined; remoteWarmRecovery = undefined; remoteWarmRecoveryPending = false;
       await finishStartupContextForFallback();
-      const checkpoint = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools);
+      const checkpoint = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget));
       if (!checkpoint?.providerSessionId || checkpoint.providerSessionId !== expected?.providerSessionId) {
         throw new Error("native_sandbox_cold_resume_unproven");
       }
@@ -12892,7 +12902,7 @@ async function executePaperclipNativeSessionAttempt(
         if (!suspendedController) throw new Error("native_runner_checkpoint_missing_after_suspension");
         const verifiedConfigDigest = nativeSessionConfigDigest(remoteWarmRecovery.previousExecution, "remote");
         persistWarmNativeCheckpoint(remoteWarmRecovery.previousExecution, verifiedConfigDigest, await recovered.session.snapshot());
-        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, verifiedConfigDigest, "remote", input.refreshTools);
+        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, verifiedConfigDigest, "remote", input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget));
         runnerdBackend = await createRunnerdBackend({
           ...input,
           pluginTaskDescription: undefined,
@@ -12936,7 +12946,7 @@ async function executePaperclipNativeSessionAttempt(
       existingWarmSession = undefined;
       pluginTaskDescription = description;
       await finishStartupContextForFallback();
-      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools);
+      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools, createdSandboxAllocation(input.runnerExecutionTarget));
       runnerdBackend = await createExecutionBackend();
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
