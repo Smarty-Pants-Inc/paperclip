@@ -105,7 +105,7 @@ describe("warm refresh fail-closed authority and no-write proof", () => {
       if (args[1]?.includes("Descriptor-relative refresh unavailable")) {
         const needle = "verify(); checkFile(e.name);";
         expect(args[1]).toContain(needle);
-        args[1] = args[1].replace(needle, `if(e.name==='KEEP.md')fs.writeFileSync(root+'/KEEP.md','LATE OWNER EDIT\\n');` + needle);
+        args[1] = args[1].replace(needle, `if(e.name==="KEEP.md")fs.writeFileSync(root+"/KEEP.md","LATE OWNER EDIT\\n");` + needle);
         injected = true;
       }
       return execute({ ...input, args });
