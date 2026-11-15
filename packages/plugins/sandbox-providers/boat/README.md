@@ -1,4 +1,74 @@
-# Boat sandbox provider 0.1.16-retry429
+# Boat sandbox provider 0.1.16-spare.1
+
+## Ready spare pool (optional; default off)
+
+Set the Boat plugin's company-scoped instance setting `spares` to an integer from
+0 through 3. It defaults to 0. The count applies independently to each Boat
+environment used by that company; setting it to 0 or lowering it retires surplus
+spares with Boat's confirmed `POST /sandboxes/{id}/stop` path. This plugin has no
+user-presence/activity window: once an environment has been acquired, its
+configured pool is kept warm until the setting is lowered or the plugin stops.
+A never-used environment is first discovered at its first acquire. Configure the
+setting in plugin settings; no environment edit is needed.
+
+The keeper creates each spare from the same environment create body as an
+ordinary lease: configured type/size, effective Boat TTL, resolved snapshot or
+`from`, `setupScript`, and either `noEnv: true` or the configured Boat
+`environment`. It adds immutable labels for company owner, environment,
+`purpose=spare`, a SHA-256 create-config hash and an ISO `expiry` timestamp. If a
+Boat environment or setup script contains secrets, those remain present exactly
+as they would on an ordinary create; the spare does not receive additional
+run-specific credentials, workspace data, repository checkout or agent identity.
+After claim, the exact same post-create function used by a new box writes the
+workspace sentinel and applies guardian checks/binding. Boat's update API cannot
+change labels, so claim custody is recorded durably in the sandbox `name` as
+`paperclip-claim:<run>:<attempt>` and the lease metadata records that name.
+
+Only a ready/idle/running spare whose Pi warm-up succeeded, expiry is still in
+the future, and company/environment/config hash all match can be claimed. The
+claim is reserved in-process before a `PATCH` updates the name and TTL. A claim
+cache miss or unhealthy item follows the ordinary create path; spare inventory
+recovery is asynchronous so a slow list call does not delay that fallback. The
+replacement starts immediately after a claim. After a worker restart, the first
+acquire asynchronously rediscovers candidates by labels; if it has no in-memory
+candidate, that acquire creates normally and a later acquire may claim the adopted
+spare. Mismatched, stopped, expired or unfinished unclaimed spares are stopped,
+never deleted. At most three spares are configured
+per company/environment and no more than 12 spare create attempts per company
+per rolling hour are allowed. Failed starts use exponential backoff (up to 15
+minutes). A provider-side Boat TTL is applied at create and refreshed when less
+than half remains (maintenance checks every 15 seconds); if the plugin worker
+dies, Boat auto-stops the spare when that TTL expires. The immutable expiry
+label records the initial create deadline; Boat's refreshed `archiveAfter` is
+the enforced current deadline.
+
+Every successfully ready spare gets one throwaway Pi RPC warm-up, exactly:
+
+```sh
+printf '{"type":"get_state","id":"1"}\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session | head -1 >/dev/null
+```
+
+The `--no-session` flag prevents this probe from writing a Pi conversation
+session/transcript under `~/.pi/agent/sessions`; the plugin does not delete
+anything under `~/.pi`. The RPC runs inside the Boat sandbox, not on the plugin
+worker. This code does not inspect or clean files that Pi or loaded extensions
+may independently use for caches/settings under `~/.pi/agent`; those files, if
+any, are left untouched. A failed or timed-out warm-up is never claimable and
+its sandbox is stopped. The same create body means a configured Boat
+environment's own contents/secrets are present before claim, but no per-run
+Paperclip secrets are staged until the shared lease path runs.
+
+A running `small` spare costs about **$0.018/hour (~$13 per 30-day month)**;
+`default` is about **$0.036/hour (~$26/month)**. The actual cost follows the
+Boat `type` configured on each environment, and each spare runs continuously.
+These are provider pricing estimates, not billing observations. Prior Boat/Pi
+measurements supplied for this design found roughly 15–18 seconds cold to first
+tool use (including create, Pi's first launch and staging) versus about 1.2
+seconds with a running warmed spare. That historical measurement is not a live
+acceptance result for this code. The spare is a bridge until real daily-work
+measurements show the cold path from create through first command—including Pi
+startup and staging—below about **2 seconds**; then disable it. This local unit
+test run does not qualify live latency, live Boat billing or daily work.
 
 ## Provider liveness inspection
 
@@ -118,7 +188,7 @@ Exec env values are uploaded as shell-quoted `export` lines using the files API,
 
 There is no file-mode field in Boat's [write API](https://docs.boat.dev/api/reference/agent/write-sandbox-file.md): permissions use `umask 077` and shell chmod, not an invented API. Values exist briefly on sandbox disk; a snapshot in that window can capture them. They remain in the process environment. Whether file PUT bodies are retained in provider audit/internal logs is **unknown (docs silent)**. [Command history](https://docs.boat.dev/long-running-tasks/command-history.md) retains command text for 90 days and excludes regular-file writes from process-output capture; that is not a guarantee about HTTP-body retention. Cleanup cannot be guaranteed after a provider outage or plugin crash. This does not redact caller-supplied command arguments, stdin, or process output. No live qualification is claimed by these local tests.
 
-Install `paperclipai-plugin-boat-0.1.16-retry429.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
+Install `paperclipai-plugin-boat-0.1.16-spare.1.tgz` as an instance plugin. Destroy, release, failed-acquisition cleanup, and orphan cleanup always use the same non-force, completion-confirmed stop. The plugin never sends `DELETE /sandboxes/{id}`. The `retainOnDestroy` boolean remains accepted for compatibility, defaults to true, and is ignored: false, absent, and true all stop and keep the sandbox. Configure `"reuseLease": true` to resume the same retained Boat sandbox ID across runs; reuse defaults to false. A successful destroy returns `{ providerLeaseId, state: "stopped" }`, not a false `destroyed` receipt. Stop failures remain failures, without force or a destructive fallback. This is sandbox-lifecycle retention, not a general file-immutability policy: command cancellation and temporary stdin-file housekeeping do not delete the sandbox and are unchanged.
 
 Reuse is scoped by the same agent and the same execution workspace. For projectless environments, the issue ID is used instead. Reuse across issues therefore requires a project with a shared execution workspace. This follows Paperclip's `buildReusableSandboxLeaseScope` behavior (`server/src/services/environment-runtime.ts:1016-1043`). Retention without reuse preserves the disk but does not make a subsequent run reuse that allocation. Existing lease configurations are also protected once this plugin version is installed, even if their recorded `retainOnDestroy` is false or absent.
 
