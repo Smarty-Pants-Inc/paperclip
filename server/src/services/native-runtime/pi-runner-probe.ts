@@ -63,7 +63,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       const remoteFilesystemRoot = posix.join(remoteRoot, "filesystem"), runnerStateDirectory = posix.join(remoteRoot, "runner");
       const remoteBinary = posix.join(remoteRoot, "bin", "paperclip-runnerd");
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
-      let runnerExitEvidence: string | undefined;
+      let runnerExitEvidence: string | undefined, runnerExitEvidenceRead = false;
       let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
       const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
         if (prepared) return;
@@ -76,11 +76,15 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           targetPlatformArtifactVerified: true }).prepare(requiredMode);
         prepared = true;
       };
-      const cleanup = async () => {
+      const cleanup = async (result?: { succeeded: boolean; failure?: unknown }) => {
         if (remoteCreated) {
-          // Capture a possible exited Runner's diagnostics before the remote
-          // runtime is archived and removed. Success never reports this evidence.
-          runnerExitEvidence = (await readRemoteRunnerExitEvidence(runner!, [posix.join(remoteRoot, "diagnostics")], Date.now() + 5_000)).runnerExitEvidence;
+          const diagnostic = result?.failure === undefined ? null : readRemoteRunnerRecoveryError(result.failure);
+          if (!result?.succeeded && diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") {
+            // Capture only this failed probe's exit evidence before the remote
+            // runtime is archived and removed. Cache even an empty read result.
+            runnerExitEvidenceRead = true;
+            runnerExitEvidence = (await readRemoteRunnerExitEvidence(runner!, [posix.join(remoteRoot, "diagnostics")], Date.now() + 5_000)).runnerExitEvidence;
+          }
           // Reuse the retained-backup sync-out path, without exclusions. A
           // failed/partial pull must never authorize removal of the sole copy.
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
@@ -120,7 +124,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
         } catch (error) {
           const diagnostic = readRemoteRunnerRecoveryError(error);
           if (diagnostic?.stage === "process_verification" && diagnostic.reason === "process_not_running") {
-            const evidence = runnerExitEvidence ? { runnerExitEvidence } :
+            const evidence = runnerExitEvidenceRead ? { runnerExitEvidence } :
               await readRemoteRunnerExitEvidence(runner!, [posix.join(remoteRoot, "diagnostics")], Date.now() + 5_000);
             const message = describeExitedRemoteRunnerRunLog({ ...diagnostic, ...evidence });
             if (message) runnerExitFailureMessage = message;
@@ -151,8 +155,10 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
     const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
     // No raw provider error, argv, environment, request body or credential is reflected.
-    const message = error instanceof PaperclipRunnerProviderProfileError ? error.message : runnerExitFailureMessage ?? SAFE_FAILURES[code]
+    const causeMessage = SAFE_FAILURES[code]
       ?? (stage === "hello" ? "Native Pi did not prove a nonempty tool-free hello and successful retirement. The connection was not adopted." : "The selected factory could not complete native Pi metadata admission. No hello prompt was sent.");
+    const message = error instanceof PaperclipRunnerProviderProfileError ? error.message
+      : runnerExitFailureMessage ? `${causeMessage}\n${runnerExitFailureMessage}` : causeMessage;
     checks.push({ code: stage === "hello" ? "pi_hello_probe_failed" : "pi_rpc_metadata_failed", level: "error", message });
     return { adapterType: "paperclip_runner", testedAt, status: "fail", checks };
   }

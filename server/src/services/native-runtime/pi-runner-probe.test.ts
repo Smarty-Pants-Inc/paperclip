@@ -211,27 +211,40 @@ describe("native Pi probe runner artifact preparation", () => {
         await writeFile(join(diagnosticsDirectory, "runnerd.process-stderr.log"),
           "runner stopped after fixture failure\nsk-ant-api03-1234567890abcdefghijklmnopqrstuvwx\n");
       }
-      throw new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+      const failure = new RemoteRunnerRecoveryError({ stage: "process_verification", reason: "process_not_running" });
+      await options.onCleanupConfirmed({ succeeded: false, failure });
+      throw failure;
     });
     const result = await probeManagedNativePiRunner(f.context);
     expect(result.status).toBe("fail");
     const message = result.checks.at(-1)!.message;
     if (evidenceAvailable) {
+      expect(events.filter(event => event === "read-exit-evidence")).toHaveLength(1);
+      expect(events.lastIndexOf("read-exit-evidence")).toBeLessThan(events.lastIndexOf("rm"));
+      expect(message).toContain("Native Pi did not prove a nonempty tool-free hello and successful retirement.");
       expect(message).toContain("runner process is not running (identity check exit 45); last lines:");
       expect(message).toContain("runner stopped after fixture failure");
       expect(message).not.toContain("sk-ant-api03-");
-      expect(events.indexOf("read-exit-evidence")).toBeGreaterThanOrEqual(0);
-      expect(events.indexOf("read-exit-evidence")).toBeLessThan(events.indexOf("rm"));
     } else {
+      expect(events.filter(event => event === "read-exit-evidence")).toHaveLength(1);
+      expect(events.lastIndexOf("read-exit-evidence")).toBeLessThan(events.lastIndexOf("rm"));
+      expect(message).toContain("Native Pi did not prove a nonempty tool-free hello and successful retirement.");
       expect(message).toContain("runner process is not running (identity check exit 45); last lines unavailable:");
     }
   });
 
-  it("does not add runner-exit evidence to a successful check", async () => {
+  it("does not read runner-exit evidence on a successful check", async () => {
     const f = await fixture("matching");
+    const execute = f.runner.execute.bind(f.runner);
+    const evidenceReads: Request[] = [];
+    f.runner.execute = async request => {
+      if (request.args?.[1]?.startsWith("for directory in")) evidenceReads.push(request);
+      return execute(request);
+    };
     const result = await probeManagedNativePiRunner(f.context);
     expect(result.status).toBe("pass");
     expect(JSON.stringify(result)).not.toContain("runner process is not running");
+    expect(evidenceReads).toHaveLength(0);
   });
 
   it("does not prepare or upload when the platform resolver rejects the binary", async () => {
