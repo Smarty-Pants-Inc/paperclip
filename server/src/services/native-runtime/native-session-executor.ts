@@ -155,6 +155,7 @@ import { execFile } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   createReadStream,
   closeSync,
   constants,
@@ -15168,6 +15169,78 @@ export function assertRemoteRunnerBuildMetadata(
   }
 }
 
+const REMOTE_RUNTIME_ASSET_INSTALL_SCRIPT = `
+const fs=require("node:fs"),path=require("node:path");
+const root=path.resolve(process.argv[1]), assets=JSON.parse(process.argv[2]), nonce=process.argv[3];
+function regularTree(file){const s=fs.lstatSync(file);if(s.isSymbolicLink()||(!s.isDirectory()&&!s.isFile()))throw Error("runtime_asset_not_regular");if(s.isDirectory())for(const name of fs.readdirSync(file))regularTree(path.join(file,name));}
+function removeTree(file){const s=fs.lstatSync(file,{throwIfNoEntry:false});if(s?.isDirectory()&&!s.isSymbolicLink()){for(const name of fs.readdirSync(file))removeTree(path.join(file,name));fs.chmodSync(file,(s.mode&0o777)|0o700);}fs.rmSync(file,{recursive:true,force:true});}
+function ensureParents(file){const parts=path.resolve(path.dirname(file)).split(path.sep).filter(Boolean);let current=path.parse(file).root;for(const part of parts){current=path.join(current,part);try{const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error("unsafe_runtime_asset_parent");}catch(e){if(e.code!=="ENOENT")throw e;fs.mkdirSync(current,{mode:0o700});}}}
+for(const [index,a] of assets.entries()){
+ const source=path.join(root,String(index));regularTree(source);const target=path.resolve(a.targetPath);if(!path.isAbsolute(a.targetPath))throw Error("runner_remote_staging_target_invalid");ensureParents(target);
+ const old=fs.lstatSync(target,{throwIfNoEntry:false});if(old?.isSymbolicLink())throw Error("unsafe_runtime_asset_target");if(old&&((a.kind==="directory")!==old.isDirectory()))throw Error("runtime_asset_kind_mismatch");
+ const temp=path.join(path.dirname(target),"."+path.basename(target)+".stage-"+nonce),backup=temp+".old";fs.rmSync(temp,{recursive:true,force:true});fs.rmSync(backup,{recursive:true,force:true});
+ try{fs.cpSync(source,temp,{recursive:true,preserveTimestamps:true});fs.chmodSync(temp,a.mode);if(a.kind==="file"){fs.renameSync(temp,target);}else{if(old)fs.renameSync(target,backup);fs.renameSync(temp,target);if(old)removeTree(backup);}}
+ catch(e){if(fs.existsSync(temp))removeTree(temp);if(a.kind==="directory"&&old&&fs.existsSync(backup)&&!fs.existsSync(target))fs.renameSync(backup,target);throw e;}
+}
+`;
+
+export async function stageRemoteRunnerAssets(input: {
+  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+  runner: CommandManagedRuntimeRunner;
+  assets: { sourcePath: string; targetPath: string; mode: number; kind: "file" | "directory" }[];
+}): Promise<void> {
+  if (!input.assets.length) return;
+  const stagingRoot = mkdtempSync(join(tmpdir(), "paperclip-runtime-assets-"));
+  const archivePath = `${stagingRoot}.tar.gz`;
+  const assertRegularTree = (path: string): void => {
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error("runtime_asset_not_regular");
+    if (stat.isDirectory()) for (const name of readdirSync(path)) assertRegularTree(join(path, name));
+  };
+  const nonce = randomUUID();
+  const mappings = input.assets.map((asset, index) => ({ index, targetPath: asset.targetPath, kind: asset.kind, mode: asset.mode }));
+  try {
+    for (const [index, asset] of input.assets.entries()) {
+      assertRegularTree(asset.sourcePath);
+      const stagedPath = join(stagingRoot, String(index));
+      cpSync(asset.sourcePath, stagedPath, { recursive: true, preserveTimestamps: true });
+      chmodSync(stagedPath, asset.mode);
+    }
+    await execFileBuffered("tar", ["--no-xattrs", "-czf", archivePath, "-C", stagingRoot, "."], {
+      maxBuffer: 64 * 1024 * 1024, env: { ...process.env, COPYFILE_DISABLE: "1" },
+    });
+    const remoteArchive = posix.join("/tmp", `.paperclip-runtime-assets-${nonce}.tar.gz`);
+    const decodeArchive = input.runner.syncIn ? "" : "base64 -d > \"$archive\"; ";
+    const command = `set -eu; umask 077; archive=$1; manifest=$2; nonce=$3; ` +
+      `mkdir -p -- "$(dirname -- "$archive")"; ` +
+      `staging=$(mktemp -d "$(dirname -- "$archive")/.paperclip-runtime-assets.XXXXXX"); ` +
+      `trap 'find "$staging" -type d -exec chmod u+w {} + 2>/dev/null || true; rm -rf -- "$staging"; rm -f -- "$archive"' EXIT HUP INT TERM; ` +
+      decodeArchive + `tar -xzf "$archive" -C "$staging"; ` +
+      `node -e '${REMOTE_RUNTIME_ASSET_INSTALL_SCRIPT.replaceAll("'", "'\\''")}' "$staging" "$manifest" "$nonce"`;
+    if (input.runner.syncIn) {
+      await input.runner.syncIn([{ operationId: `runner-stage-${nonce}`, files: [{ sourcePath: archivePath,
+        targetPath: remoteArchive, kind: "file", mode: 0o600 }] }]);
+    }
+    const archiveBytes = input.runner.syncIn ? undefined : readFileSync(archivePath).toString("base64");
+    const result = await input.runner.execute({ command: "sh", args: ["-c", command, "paperclip-runtime-assets",
+      remoteArchive, JSON.stringify(mappings), nonce], ...(archiveBytes ? { stdin: archiveBytes } : {}), bypassSession: true,
+      timeoutMs: 30_000 });
+    if (result.exitCode !== 0 || result.timedOut) throw new Error("runner_remote_directory_staging_failed");
+  } finally {
+    const unseal = (path: string): void => {
+      const stat = lstatSync(path, { throwIfNoEntry: false });
+      if (!stat || stat.isSymbolicLink()) return;
+      if (stat.isDirectory()) {
+        for (const name of readdirSync(path)) unseal(join(path, name));
+        chmodSync(path, (stat.mode & 0o777) | 0o700);
+      }
+    };
+    unseal(stagingRoot);
+    rmSync(stagingRoot, { recursive: true, force: true });
+    rmSync(archivePath, { force: true });
+  }
+}
+
 export async function stageRemoteRunnerFile(input: {
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
   runner: CommandManagedRuntimeRunner;
@@ -18942,6 +19015,7 @@ async function createRunnerdBackendWithinSessionClaim(
             caBundleMapping: remoteCaBundleMapping,
             stageFile: asset => stageRemoteRunnerFile({ target: remoteTarget, runner: remoteCommandRunner, ...asset }),
             stageDirectory: asset => stageRemoteRunnerDirectory({ target: remoteTarget, runner: remoteCommandRunner, ...asset }),
+            stageAssets: assets => stageRemoteRunnerAssets({ target: remoteTarget, runner: remoteCommandRunner, assets }),
             isolatedCodexSkills: input.execution.provider.kind === "codex"
               && !("homeMode" in input.execution && input.execution.homeMode === "preconfigured")
               ? { workspaceRoot: remoteTarget.remoteCwd } : undefined,
