@@ -304,15 +304,18 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
         inner join native_run_results result on result.company_id = assessment.company_id
           and result.issue_id = assessment.issue_id and result.run_id = assessment.run_id
           and result.id = assessment.result_id and result.schema_status = 'accepted'
+        inner join heartbeat_runs producing_run on producing_run.company_id = result.company_id
+          and producing_run.native_issue_id = result.issue_id and producing_run.id = result.run_id
+          and producing_run.started_at is not null
         where assessment.assessment_json->>'reportedDisposition' = 'yielded'
           and assessment.assessment_json#>>'{continuation,kind}' = 'response_wake'
           and not exists (select 1 from issue_comments comment
             where comment.company_id = assessment.company_id and comment.issue_id = assessment.issue_id
               and comment.author_type = 'user' and comment.created_by_run_id is null and comment.deleted_at is null
-              and greatest(comment.created_at, comment.updated_at) > result.created_at)
+              and greatest(comment.created_at, comment.updated_at) > producing_run.started_at)
           and not exists (select 1 from issue_thread_interactions interaction
             where interaction.company_id = assessment.company_id and interaction.issue_id = assessment.issue_id
-              and greatest(interaction.created_at, interaction.updated_at, interaction.resolved_at) > result.created_at)
+              and greatest(interaction.created_at, interaction.updated_at, interaction.resolved_at) > producing_run.started_at)
       `),
     ]);
 
