@@ -133,6 +133,40 @@ async function reasoningContrast(page: Page) {
   });
 }
 
+/**
+ * Inline reasoning is plain text in the turn: no box around it and its text
+ * starts at the same left edge as the answer text.
+ */
+async function plainGeometry(page: Page) {
+  return page.evaluate((reply) => {
+    const blocks = Array.from(document.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
+    const answer = Array.from(document.querySelectorAll<HTMLElement>('[data-testid="task-chat-agent-bubble"] p'))
+      .find((node) => node.textContent?.includes(reply));
+    const textLeft = (node: Element) => {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      return Math.round(range.getClientRects()[0]!.left * 10) / 10;
+    };
+    return {
+      answerLeft: answer ? textLeft(answer) : null,
+      blocks: blocks.map((block) => {
+        const style = getComputedStyle(block);
+        const lines = Array.from(block.querySelectorAll(".task-chat-reasoning-headline, .task-chat-reasoning-markdown p"));
+        return {
+          border: style.borderTopWidth + " " + style.borderLeftWidth,
+          background: style.backgroundColor,
+          radius: style.borderTopLeftRadius,
+          paddingBlock: style.paddingTop + " " + style.paddingBottom,
+          bullets: block.querySelectorAll("ul, li, .rounded-full").length,
+          fontSize: getComputedStyle(lines[0]!).fontSize,
+          lineLefts: lines.map(textLeft),
+        };
+      }),
+      answerFontSize: answer ? getComputedStyle(answer).fontSize : null,
+    };
+  }, REPLY);
+}
+
 async function capture(page: Page, name: string) {
   if (!SHOTS) return;
   await mkdir(SHOTS, { recursive: true });
@@ -141,6 +175,9 @@ async function capture(page: Page, name: string) {
 
 async function scrollToReasoning(page: Page) {
   await page.locator('[data-reasoning-display="inline"]').first().scrollIntoViewIfNeeded();
+  // Frame the last reasoning block together with the answer below it so the
+  // shared left edge is in view.
+  await page.locator('[data-reasoning-display="inline"]').last().evaluate((node) => node.scrollIntoView({ block: "center" }));
 }
 
 async function captureMatrix(browser: Browser, chat: Awaited<ReturnType<typeof seedChat>>, label: string) {
@@ -169,6 +206,19 @@ async function captureMatrix(browser: Browser, chat: Awaited<ReturnType<typeof s
         for (const line of measured) {
           expect(line.fontStyle, JSON.stringify(line)).toBe("italic");
           expect(line.contrast, JSON.stringify(line)).toBeGreaterThanOrEqual(4.5);
+        }
+        // Plain text in the turn: no box, no bullet, the answer's size and left edge.
+        const geometry = await plainGeometry(page);
+        report[`${viewport.name}-${theme}-geometry`] = geometry;
+        expect(geometry.answerLeft, JSON.stringify(geometry)).not.toBeNull();
+        for (const block of geometry.blocks) {
+          expect(block.border, JSON.stringify(block)).toBe("0px 0px");
+          expect(block.background, JSON.stringify(block)).toBe("rgba(0, 0, 0, 0)");
+          expect(block.radius, JSON.stringify(block)).toBe("0px");
+          expect(block.paddingBlock, JSON.stringify(block)).toBe("0px 0px");
+          expect(block.bullets, JSON.stringify(block)).toBe(0);
+          expect(block.fontSize, JSON.stringify(block)).toBe(geometry.answerFontSize);
+          for (const left of block.lineLefts) expect(Math.abs(left - geometry.answerLeft!), JSON.stringify(geometry)).toBeLessThanOrEqual(0.5);
         }
       }
       await capture(page, `${label}-${viewport.name}-${theme}`);
@@ -225,7 +275,7 @@ test("reasoning display: inline reasoning look and the agent-page preference tha
 
     // 3. A fresh browser context (no localStorage at all) follows the preference,
     //    at 1440 and 390, light and dark.
-    await captureMatrix(browser, chat, "after");
+    await captureMatrix(browser, chat, process.env.REASONING_SHOTS_LABEL ?? "plain");
 
     // Agent page at 390 too.
     const phone = await browser.newContext({ viewport: { width: 390, height: 844 } });
