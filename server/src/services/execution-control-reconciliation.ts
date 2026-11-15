@@ -359,8 +359,6 @@ export async function reconcileAbandonedExecutionControl(
           // is no model reply for the normal finalizer to publish. Commit its
           // visible failure with the run, under the same current-task lock.
           // A repeated sweep takes the terminal-status guard above instead.
-          // The execution blocker reads this notice back (by its reason) and
-          // stops offering Retry until a later committed success supersedes it.
           await issueService(db).addComment(task.id, EXECUTION_DEADLINE_NOTICE_BODY,
             {}, { authorType: "system", presentation: { kind: "system_notice", tone: "danger",
               title: "Reply could not finish", density: "compact", detailsDefaultOpen: true },

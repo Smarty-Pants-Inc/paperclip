@@ -22,10 +22,8 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
-import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
-import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
-import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -91,6 +89,10 @@ export const UNANSWERED_MESSAGE_WAITING_TEXT =
   "Your message is waiting for the agent to be free; it will start by itself.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
+/** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
+export const FRESH_CONTINUATION_BOUND = 2;
+export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
+  + "and both attempts failed. Your message and the saved work are kept. Send a new message to try again.";
 
 // Codes the notice metadata may name. A run's error is reduced to its leading
 // code token; anything not listed is unclassified_failure, never raw text.
@@ -334,9 +336,6 @@ export async function settleUnansweredPersonMessage(
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
   if (decision.kind === "pending") {
-    if (decision.requestExecutionDisposition) await db.transaction(async tx => {
-      await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionDisposition);
-    });
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
         agentId: decision.recordDeferral.agentId, eventType: NATIVE_REPAIR_DEFERRAL_EVENT, stream: "system", level: "info",
@@ -383,7 +382,7 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
-  | { kind: "pending"; recheckAt: number; requestExecutionDisposition?: true; recordDeferral?: { runId: string; agentId: string; messageId: string };
+  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       /** Set when this replaces the message's standing waiting note. */
@@ -457,21 +456,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     return { kind: "answered" };
   }
 
-  // A refused fresh continuation that descends from the message's run is the
-  // run the person's message ended on: its refusal is the explanation
-  // (fork-lead a6342a4d4, fresh-continuation-chain.ts).
+  // A failed fresh continuation that descends from the message's run is the
+  // run the person's message ended on: the automatic lineage, typed or not,
+  // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
   const latest = runs[0];
-  const run = messageRun && latest && latest.id !== messageRun.id && isNativeContinuationRefusal(latest)
+  const run = messageRun && latest && latest.id !== messageRun.id
+    && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
     && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
       runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
-
-  // Impossible reconciliation has its own one-note, proven-stop owner. A
-  // generic 'send again' notice must never race or time out that ownership.
-  if (run && isFreshThreadRefusal(run)) {
-    // This predicate also runs with a plain read handle. Its caller owns the
-    // transaction needed to register delivery work; never signal here.
-    return { kind: "pending", recheckAt: now.getTime() + 60_000, requestExecutionDisposition: true };
-  }
 
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
@@ -637,8 +629,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   // Already explained: the executor's held notice for this conversation, or a
-  // person-facing recovery notice posted after the message.
-  if (await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id })) return { kind: "explained" };
+  // person-facing recovery notice, posted after the message. An older held
+  // notice never silences a newer message.
+  const heldNotice = await readUnsupersededHeldConversationNotice(q, { companyId: issue.companyId, issueId: issue.id });
+  if (heldNotice && heldNotice.createdAt > message.createdAt) return { kind: "explained" };
   const [explained] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
@@ -652,18 +646,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
+  // The ONE bound: the message's automatic lineage used its K=2 fresh
+  // continuations and the last one failed. Nothing further starts by itself.
+  const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+    && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
+      >= FRESH_CONTINUATION_BOUND);
   const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : held ? "This conversation can't continue" : "Your message wasn't answered",
+      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
-        : held ? "Assign this agent a new task to continue." : "Send the message again; if it fails again, assign this agent a new task.",
+        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,

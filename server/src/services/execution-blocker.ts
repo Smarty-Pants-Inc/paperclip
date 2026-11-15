@@ -7,7 +7,6 @@ import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } 
 import { z } from "zod";
 import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
-import { freshThreadStopNeedsRetry, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { heldRetryOffersRetry, heldTaskRetryRefusals } from "./task-retry-eligibility.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -20,12 +19,8 @@ import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recove
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
-import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
-import { readUnsupersededHeldConversationNotice } from "./native-runtime/pi-session-recovery-notice.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
-import { readUnsupersededExecutionDeadlineNotice } from "./execution-deadline-notice.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -450,19 +445,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   // an infrastructure failure (such as a restart) is not left to a new message.
   // An intentional Stop keeps "send a new message" as its only continuation.
   const recoveredFailure = Boolean(restoreHold && savedWorkOffersRetry(workspaceRecoveryState, run?.status, workspaceRepairRequired, action.evidence));
-  // A held conversation's durable notice that no later committed success on
-  // its session superseded refuses a Retry the same way it refuses a message,
-  // so do not offer Retry (or tell a person to use it) while it stands.
-  const heldConversationNotice = await readUnsupersededHeldConversationNotice(db, { companyId, issueId });
-  // The execution-deadline notice tells the person to verify the stopped
-  // execution before retrying. Until a later committed success supersedes it,
-  // follow it: no Retry, and its own guidance as the next action.
-  const deadlineNotice = await readUnsupersededExecutionDeadlineNotice(db, { companyId, issueId });
-  const canRetry = Boolean(!heldConversationNotice && !deadlineNotice && (!restoreHold || recoveredFailure) && run &&
-    conversation?.assigneeAgentId === run.agentId &&
-
-    !["done", "cancelled"].includes(conversation.status) &&
-    (isFreshThreadRefusal(run) ? freshThreadStopNeedsRetry(run) : await canRetryStoppedRun(db, run)));
+  const canRetry = Boolean((!restoreHold || recoveredFailure) && run && conversation?.assigneeAgentId === run.agentId &&
+    !["done", "cancelled"].includes(conversation.status) && await canRetryStoppedRun(db, run));
   const runError = run && canRetry && isPreDispatchReviewWait(run)
     ? "Waiting for review; this continuation never started."
     // Earlier releases saved operator-facing text for the cleanup gate. Show
@@ -516,24 +500,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     nextAction = "Verify the Grok connection, then send a new message to continue. The stopped work will not be replayed.";
   }
 
-  // The recovered files say nothing about the conversation. A held
-  // conversation's durable notice that no later committed success on its
-  // session superseded means a new message is refused the same way, so do
-  // not offer one. Runs from before that notice: the run's own refusal code,
-  // when nothing here can continue it.
-  const refusedRecoveredConversation = workspaceRecovery?.status === "recovered" && (
-    (!eligibleContinuation && !canRetry && isNativeContinuationRefusal(run))
-    || heldConversationNotice !== null);
-
   return {
     recoveryActionId: action.id,
     runId,
     // A stopped reviewer can differ from the task owner who receives the work back.
     agentId: run?.agentId ?? null,
     cause: action.cause,
-    nextAction: withoutUnavailableRetry((refusedRecoveredConversation ? HELD_PREDECESSOR_NOTICE
-      : deadlineNotice && !withoutWorkspace && (!workspaceRecovery || workspaceRecovery.status === "recovered") ? deadlineNotice.body
-      : workspaceRecovery?.message) ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
+    nextAction: withoutUnavailableRetry(workspaceRecovery?.message
+      ?? (reconstructionPending ? "Continuation from saved sources is queued and waiting for execution checks." : nextAction),
       retryOffered),
 
     ...(workspaceRecovery ? { workspaceRecovery } : {}),

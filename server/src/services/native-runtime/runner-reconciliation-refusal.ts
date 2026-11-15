@@ -44,10 +44,6 @@ export function isFreshThreadRefusal(run: { errorCode?: string | null; error?: s
 
 /** Projection only: this receipt never grants admission or proves a stop. */
 export const FRESH_THREAD_STOP_STATE_KEY = "nativeFreshContinuationStop";
-export function freshThreadStopNeedsRetry(run: { resultJson?: Record<string, unknown> | null }): boolean {
-  const stop = run.resultJson?.[FRESH_THREAD_STOP_STATE_KEY] as { schema?: unknown; state?: unknown } | undefined;
-  return stop?.schema === "paperclip.fresh-thread-stop.v1" && stop.state === "unavailable";
-}
 
 export function nativeReconciliationError(code: string, options?: ErrorOptions): Error & { code: string } {
   return Object.assign(new Error(code, options), { code });

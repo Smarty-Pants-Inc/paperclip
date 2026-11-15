@@ -164,7 +164,7 @@ export async function selectPiConversation(db: Db, input: {
     if (freshBoundary) {
       const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
       await writePiSessionHistoryLossNotice(db, tx, { ...input,
-        authorizationReason: freshBoundary.noticeAuthorizationReason ?? `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
+        authorizationReason: `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
         replaceExisting: true,
         body: freshBoundary.startedNote });
     }
@@ -201,7 +201,7 @@ export async function selectFreshContinuationThread(db: Db, input: {
       || run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null) return null;
     const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
     const fresh = await readFreshContinuationSessionBoundary(tx, run, issue.id);
-    if (!fresh?.noticeAuthorizationReason) return null;
+    if (!fresh) return null;
     const scope = and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId),
       eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issue.id));
     const [session] = await tx.select().from(agentTaskSessions).where(scope).for("update");
@@ -214,7 +214,7 @@ export async function selectFreshContinuationThread(db: Db, input: {
       adapterType: "paperclip_runner", taskKey: issue.id, sessionParamsJson: { sessionId: id } });
     await tx.update(heartbeatRuns).set({ nativeSessionId: id }).where(eq(heartbeatRuns.id, run.id));
     const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason: fresh.noticeAuthorizationReason,
+    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason: `fresh_provider_thread:${fresh.recoveryActionId}`,
       body: fresh.startedNote, replaceExisting: true });
     return id;
   });

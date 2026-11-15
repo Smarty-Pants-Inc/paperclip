@@ -1,5 +1,16 @@
 # Fresh-thread stop boundary
 
+> **Superseded (follow-Paperclip Cut B, RFL 04:5xZ / 05:51Z / 07:06Z).** The strict
+> physical-stop admission gate described below is removed. The typed refusal family now
+> follows upstream's fresh-continuation fallback: a bounded wait (about 10 minutes, 15
+> with progress), then a fenced epoch or a new isolated workspace, and the fork's K=2
+> chain cap as the one bound. When the bound is reached, the unanswered-message sweep
+> writes the one note the person sees. Still in force: the read-only stop-proof reader
+> (`readFreshThreadStopProof`) for exact owner settlement
+> (`native-failed-run-owner-release.ts`), known-stopped-owner routing, and the obsolete
+> boot-source stop-and-keep without verified custody (Cut A). The rest of this page is
+> the historical rationale.
+
 ## Why this is a core seam, not a plugin
 
 This is the fork's stricter admission policy for the closed impossible-reconciliation
