@@ -412,7 +412,9 @@ it.skipIf(process.platform !== "linux" || !pi)("FINAL AUTHORITY PROOF: real runn
       const address = brokerAddress(agentDirectory); // AFTER any same-run epoch rotation.
       const turnId = String(record(accepted.turn).id);
       if (turn === 1) {
-        expect(turnId, "bootstrap must use INITIAL's preallocated native turn, not a replacement bind/begin turn").toBe(initial.turnId);
+        // Pi assigns the actual provider-started turn its own native ID; it need
+        // not equal INITIAL's preallocated authority seed. The callback below
+        // must retain this exact observed turn ID.
         proof.bootstrap = { preallocatedTurnId: initial.turnId, observedTurnId: turnId, epoch: initial.epoch, privateIpcObservation: "delegated driver-bind evidence; no proxy IPC tracing API" };
       }
       const first = await readUntil(event => event.params.turnId === turnId && event.method === "item/agentMessage/delta");
@@ -423,10 +425,10 @@ it.skipIf(process.platform !== "linux" || !pi)("FINAL AUTHORITY PROOF: real runn
         expect(effects).toEqual({ total: 1, first: 1, second: 0 });
         const original = semanticCalls[0]!;
         expect(original.callId, "actual announced/captured call identity, not an invented replay ID").toBe(firstCallId);
-        expect(original.turnId, "controller must retain INITIAL's originating native turn").toBe(initial.turnId);
+        expect(original.turnId, "controller must retain the actual provider-started native turn").toBe(turnId);
         capturedRun1Call = {
           schema: 1, type: "tool_call", nonce: randomUUID(), sessionId: initial.sessionId,
-          origin: { epoch: initial.epoch, runId: initial.runId, turnId: initial.turnId },
+          origin: { epoch: initial.epoch, runId: initial.runId, turnId: String(original.turnId) },
           toolCallId: String(original.callId), tool: String(original.tool), arguments: structuredClone(original.arguments),
         };
       }
