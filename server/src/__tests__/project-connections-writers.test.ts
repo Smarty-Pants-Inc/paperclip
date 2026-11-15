@@ -14,6 +14,7 @@ vi.mock("../services/agent-identity.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/agent-identity.js")>(), agentIdentityService: () => ({ ensureAgentIdentity: async () => undefined }),
 }));
 import { initializeAgentHire } from "../services/agent-hiring.js";
+import { connectionManagementService } from "../services/connection-management.js";
 
 describe("project connection alternate saved-resource writers (A08)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -58,7 +59,11 @@ describe("project connection alternate saved-resource writers (A08)", () => {
     const [profile] = await db.select().from(toolProfiles).where(and(eq(toolProfiles.companyId, f.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`)));
     expect(profile).toBeDefined();
     await f.run();
-    await expect(f.service.deleteProfile(profile!.id, { force: true }))
+    const management = await connectionManagementService(db).authorize(
+      { type: "agent", companyId: f.companyId, agentId: f.primary.id, source: "agent_key", onBehalfOfUserId: f.human },
+      "connections:profiles", { type: "connection_management", companyId: f.companyId, profileId: profile!.id, operation: "DELETE /tool-profiles/:profileId" },
+    );
+    await expect(f.service.deleteProfile(profile!.id, { force: true }, management))
       .rejects.toMatchObject({ status: 409, details: { code: "project_connection_in_use" } });
     expect(await db.select().from(toolProfiles).where(eq(toolProfiles.id, profile!.id))).toHaveLength(1);
   });
