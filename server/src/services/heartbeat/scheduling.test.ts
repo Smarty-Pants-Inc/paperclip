@@ -829,8 +829,13 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       const f = await fixture();
       await db.update(agents).set({ status: "paused", lifecycleState: "paused", pauseReason: "import",
         lifecycleHolds: ["import"] }).where(eq(agents.id, f.agent.id));
+      let releaseResume!: () => void;
+      const resumeBarrier = new Promise<void>(resolve => { releaseResume = resolve; });
       const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [],
-        runPlugin: async () => "complete", runHost: async () => "complete" });
+        runPlugin: async () => "complete", runHost: async agent => {
+          if (agent.lifecycleState === "resuming") await resumeBarrier;
+          return "complete";
+        } });
       try {
         await start(f); await quiet();
         expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorWakeRequestedAt: null, monitorAttemptCount: 0 });
@@ -847,6 +852,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
           expect(await readIssue(f.issue.id)).toMatchObject({ monitorNextCheckAt: dueAt, monitorAttemptCount: 0 });
           expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
         } else await createAgentLifecycle(db).pauseAgent(f.agent.id, "manual");
+        releaseResume();
         await worker.process(f.agent.id);
         await advance(31_000);
         await vi.waitFor(async () => expect((await readIssue(f.issue.id)).monitorNextCheckAt).toBeNull());
@@ -860,7 +866,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
           expect(comments[0]!.body).toContain("won't run again unless re-armed");
         }
         await quiet();
-      } finally { await worker.stop(); }
+      } finally { releaseResume(); await worker.stop(); }
     });
 
     it("bounds global scans during repeated ordinary checkout and release writes", async () => {
