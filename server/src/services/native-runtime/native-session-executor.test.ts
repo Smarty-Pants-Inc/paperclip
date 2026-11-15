@@ -13328,7 +13328,7 @@ describe("native warm session supervision", () => {
 
     it.each(["codex", "pi"] as const)("compares %s export process compatibility without changing conversation identity", async kind => {
       const f = fixture(`observability-${kind}`);
-      const base = kind === "pi" ? { ...f.base, provider: { kind: "pi_rpc" as const, model: "neutral/model", piRpcThinkingLevel: "high" as const } } : f.base;
+      const base = kind === "pi" ? { ...f.base, provider: { kind: "pi_rpc" as const, model: "neutral/model", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "high" as const } } : f.base;
       const next = { ...base, binding: { ...base.binding, runId: `observability-${kind}-next` } };
       const close = vi.fn(async () => undefined);
       const shared = { close };
