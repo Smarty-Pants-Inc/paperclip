@@ -1214,6 +1214,15 @@ describe("live remote runner lease reattachment", () => {
     expect(runtime.acquireRunLease).not.toHaveBeenCalled();
     expect(runtime.execute).not.toHaveBeenCalled();
   });
+  it("S maps a choke-point denial during controller restart to environment_resume/lease_expired", async () => {
+    const runtime = makeMockRuntime({ resumeRunLease: vi.fn(async () => {
+      throw Object.assign(new Error("The source lease cannot start"), { code: "sandbox_lease_start_denied" });
+    }) });
+    await expect(environmentRunOrchestrator({} as never, { environmentRuntime: runtime }).acquireForRun(input))
+      .rejects.toThrow("native_remote_recovery_lease_mismatch: stage=environment_resume field=lease_expired");
+    expect(runtime.acquireRunLease).not.toHaveBeenCalled();
+    expect(runtime.execute).not.toHaveBeenCalled();
+  });
   it("preserves a retained sandbox startup failure without acquiring a replacement", async () => {
     const error = new Error("retained sandbox startup timed out");
     const runtime = makeMockRuntime({ resumeRunLease: vi.fn(async () => { throw error; }) });

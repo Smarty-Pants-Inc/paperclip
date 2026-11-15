@@ -51,6 +51,24 @@ describe("board retry of accepted workspace export", () => {
     } as never };
     return { ...request, request, resultId, leaseId };
   }
+  it.each(["released", "expired"])("S refuses superseded export repair without changing %s source authority", async status => {
+    const f = await seed();
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    await db.update(environmentLeases).set({ status, metadata: { ...lease.metadata,
+      reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "new-box" } } }).where(eq(environmentLeases.id, lease.id));
+    const [before] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    await expect(retryNativeWorkspaceExport(f.request)).rejects.toMatchObject({ details: { code: "workspace_export_retry_stale" } });
+    expect(probe).not.toHaveBeenCalled();
+    expect((f.request.environmentRuntime as { resumeRunLease: ReturnType<typeof vi.fn> }).resumeRunLease).not.toHaveBeenCalled();
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]?.status).toBe("failed");
+  });
+  it("S keeps upstream expired-source export repair when it is not superseded", async () => {
+    const f = await seed();
+    await db.update(environmentLeases).set({ status: "expired" }).where(eq(environmentLeases.id, f.leaseId));
+    await expect(retryNativeWorkspaceExport(f.request)).resolves.toMatchObject({ status: "queued", leaseId: f.leaseId });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]?.status).toBe("active");
+  });
   it("rejects manual unsafe-export admission without contacting the provider", async () => {
     const f = await seed("native_workspace_sync_out_unsafe_archive");
     await expect(retryNativeWorkspaceExport(f.request)).rejects.toThrow("no longer current");

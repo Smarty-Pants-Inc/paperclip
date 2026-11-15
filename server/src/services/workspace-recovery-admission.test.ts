@@ -300,7 +300,7 @@ describe("automatic retained workspace recovery", () => {
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).toHaveLength(1);
     }, 30_000);
 
-  it("forwards only the owned export directory through the sandbox provider boundary", async () => {
+  it.each([false, true])("S workspace recovery uses the owned export directory but refuses supersession (C=%s)", async superseded => {
     const driver = "sandbox";
     const f = await seed();
     const pluginId = f.lease.metadata!.pluginId as string;
@@ -312,7 +312,7 @@ describe("automatic retained workspace recovery", () => {
       packageName: "@fixture/export-cwd", version: manifest.version,
       apiVersion: 1, categories: manifest.categories, manifestJson: manifest, status: "ready", installOrder: 1 });
     const metadata = { ...f.lease.metadata, driver, provider: "daytona", pluginKey: manifest.id,
-      sandboxProviderPlugin: true };
+      sandboxProviderPlugin: true, ...(superseded ? { reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "new-box" } } : {}) };
     await db.update(environmentLeases).set({ metadata }).where(eq(environmentLeases.id, f.lease.id));
     await db.update(environments).set({ driver, config: { provider: "daytona" } }).where(eq(environments.id, f.lease.environmentId!));
     const call = vi.fn(async (_id: string, method: string, input: Record<string, unknown>) => {
@@ -324,6 +324,13 @@ describe("automatic retained workspace recovery", () => {
     const worker = { isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentStopLease"] }) } as unknown as PluginWorkerManager;
     const runtime = environmentRuntimeService(db, { pluginWorkerManager: worker });
     await recoverRetainedWorkspace({ ...f.input, environmentRuntime: runtime });
+    if (superseded) {
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.failure?.code).toBe("source_unavailable");
+      expect(call.mock.calls.some(([, method]) => method === "environmentResumeLease")).toBe(false);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]?.metadata)
+        .toHaveProperty("reusableSandboxLeaseSuperseded");
+      return;
+    }
     expect(readWorkspaceRecovery((await action(f.actionId)).evidence)?.status).toBe("recovered");
     expect(call.mock.calls.filter(([, method]) => method === "environmentResumeLease")).toEqual([
       expect.arrayContaining([pluginId, "environmentResumeLease", expect.objectContaining({

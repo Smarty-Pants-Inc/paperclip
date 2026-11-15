@@ -26,6 +26,30 @@ databaseSuite("environment task lease authority", () => {
   });
   afterAll(async () => { await stopDb?.(); });
 
+  it.each(["expired", "superseded", "ordinary"])("S environment-task resume respects the shared fence: %s", async mode => {
+    const companyId = randomUUID(), agentId = randomUUID(), environmentId = randomUUID(), pluginId = randomUUID(), runId = randomUUID(), leaseId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "S task fence", issuePrefix: `S${companyId.slice(0, 7).replace(/-/g, "").toUpperCase()}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Fixture", adapterType: "paperclip_runner" });
+    await db.insert(plugins).values({ id: pluginId, pluginKey: pluginId, packageName: "fixture-s-task-fence", version: "1", status: "ready",
+      manifestJson: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "tasks", supportsTasks: true }] } as never });
+    await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "plugin",
+      config: { pluginKey: pluginId, driverKey: "tasks", driverConfig: {} } });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "succeeded" });
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: runId,
+      provider: "plugin:fixture:tasks", providerLeaseId: "old-task", status: mode === "expired" ? "expired" : "released", leasePolicy: "reuse_by_environment",
+      metadata: { driver: "plugin", pluginId, pluginKey: pluginId, driverKey: "tasks", runnerTaskLease: true,
+        ...(mode === "superseded" ? { reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "new-task" } } : {}) } });
+    const before = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    const call = vi.fn(async () => ({ kind: "resume", taskId: "old-task", outcome: "resumed" }));
+    const workers = { getWorker: () => ({ supportedMethods: ["environmentTask"] }), call } as unknown as PluginWorkerManager;
+    const result = await environmentRuntimeService(db, { pluginWorkerManager: workers }).task({ companyId, leaseId,
+      operation: { kind: "resume", bootstrapTicket: "fixture-only", identity: { runnerInstanceId: "runner", environmentLeaseId: leaseId,
+        runId, normalizedSessionId: "session", turnId: "turn", itemId: "item" } } });
+    expect(result).toEqual({ kind: "resume", taskId: "old-task", outcome: mode === "ordinary" ? "resumed" : "unavailable" });
+    expect(call).toHaveBeenCalledTimes(mode === "ordinary" ? 1 : 0);
+    expect(await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId))).toEqual(before);
+  });
+
   it.each(["dispatch", "writeback"])("fences stale owner %s through maintained physical task replacement", async mode => {
     const companyId = randomUUID(), agentId = randomUUID(), environmentId = randomUUID(), pluginId = randomUUID(), runId = randomUUID(), leaseId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Warm candidate", issuePrefix: `T${companyId.slice(0, 7).replace(/-/g, "").toUpperCase()}` });

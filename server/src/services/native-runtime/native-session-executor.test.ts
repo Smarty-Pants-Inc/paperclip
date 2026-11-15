@@ -24,7 +24,7 @@ import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt,
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
 import { PgDialect } from "drizzle-orm/pg-core";
-import type { SQL } from "drizzle-orm";
+import { eq, type SQL } from "drizzle-orm";
 import {
   access,
   chmod,
@@ -23283,7 +23283,9 @@ describe("runnerd provider runtime wiring", () => {
       leaseOwner: "provider-owner", bootId: "backup-boot", generation: 1 }));
   });
 
-  it.each([true, false])("restores a migrated warm backup into a created lease only for its exact session (matching: %s)", async matching => {
+  it.each([true, false, "stamp-race"] as const)("S restores a migrated warm backup without overwriting current lease authority (matching: %s)", async mode => {
+    const matching = mode !== false;
+    const targetLeaseId = randomUUID();
     const remoteCwd = join(isolatedStateDirectory, "remote");
     const current: NativeExecutionInputV1 = { ...execution,
       binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(),
@@ -23292,6 +23294,22 @@ describe("runnerd provider runtime wiring", () => {
       session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } },
     };
     const operationId = randomUUID(), runnerInstanceId = "migrated-warm-runner";
+    // The stamp reader below holds the pre-C snapshot; execute its eventual
+    // write against PostgreSQL's current row, not a mock object merge.
+    let stampDb: Db | undefined;
+    if (mode === "stamp-race") {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const { createDb, companies, agents } = await import("@paperclipai/db");
+      const postgres = await startRecoveryPostgres("s-stamp-race");
+      stampDb = createDb(postgres.connectionString);
+      onTestFinished(async () => { await stampDb!.$client.end({ timeout: 1 }); await postgres.cleanup(); });
+      await stampDb.insert(companies).values({ id: current.binding.companyId, name: "S stamp race" });
+      await stampDb.insert(agents).values({ id: current.binding.agentId, companyId: current.binding.companyId, name: "Fixture", adapterType: "paperclip_runner" });
+      await stampDb.insert(heartbeatRuns).values({ id: current.binding.runId, companyId: current.binding.companyId, agentId: current.binding.agentId, status: "succeeded" });
+      await stampDb.insert(environmentLeases).values({ id: targetLeaseId, companyId: current.binding.companyId,
+        heartbeatRunId: current.binding.runId, provider: "daytona", providerLeaseId: "sandbox-created", status: "expired",
+        metadata: { reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "newer-box" }, preserved: "current" } });
+    }
     const receipt = { operationId,
       workspaceMetadata: { nativeWorkspaceMigration: { schema: "paperclip.native-workspace-migration.v1", operationId } },
       metadata: { schema: "paperclip.remote-workspace-migration.v1", snapshotId: randomUUID(), nativeSessionContinuity: {
@@ -23303,6 +23321,17 @@ describe("runnerd provider runtime wiring", () => {
     };
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const db = leaseDb(current, {}, {}, updates), ordinarySelect = db.select.bind(db);
+    if (stampDb) {
+      const transaction = db.transaction.bind(db);
+      db.transaction = async (operation, config) => transaction(async tx => operation({ ...tx,
+        // Map the synthetic fixture's lease id to its real PostgreSQL row. All
+        // SET expressions are the production writer's, evaluated by PostgreSQL.
+        update: ((table: unknown) => table === environmentLeases ? {
+          set: (values: typeof environmentLeases.$inferInsert) => ({ where: () => stampDb!.update(environmentLeases)
+            .set(values).where(eq(environmentLeases.id, targetLeaseId)) }),
+        } : tx.update(table as never)) as Db["update"],
+      } as typeof tx), config);
+    }
     db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
       if (table !== executionWorkspaces && table !== environmentLeases) return ordinarySelect(fields as never).from(table as never);
       const rows = table === executionWorkspaces ? [receipt] : [{ metadata: {}, providerLeaseId: "sandbox-created",
@@ -23364,11 +23393,14 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
-        values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-          normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
-          sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
-        }) } }),
+      if (stampDb) {
+        const [lease] = await stampDb.select().from(environmentLeases);
+        expect(lease!.metadata).toMatchObject({ preserved: "current",
+          reusableSandboxLeaseSuperseded: { supersededByProviderLeaseId: "newer-box" },
+          nativeHarnessBackup: { normalizedSessionId: current.session.normalizedSessionId,
+            runnerInstanceId, sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created" } });
+      } else expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
+        values: expect.objectContaining({ metadata: expect.anything() }),
       })]);
     } else {
       const refusal = await options.prepareExternalRunnerState().catch((error: unknown) => error);
