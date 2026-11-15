@@ -477,6 +477,9 @@ interface IssuesListProps {
   enableAgentCreatedVisibilityFilter?: boolean;
   /** Offer Show hidden tasks; the page must fetch with `includeHidden`. */
   enableHiddenVisibilityFilter?: boolean;
+  /** Dedicated Hidden view; never include visible rows as matches or context. */
+  hiddenOnly?: boolean;
+  onHiddenOnlyChange?: (checked: boolean) => void;
   hasMoreIssues?: boolean;
   isLoadingMoreIssues?: boolean;
   mutedIssueIds?: Set<string>;
@@ -698,6 +701,8 @@ export function IssuesList({
   parentIssueIdForCostSummary,
   enableAgentCreatedVisibilityFilter = false,
   enableHiddenVisibilityFilter = false,
+  hiddenOnly = false,
+  onHiddenOnlyChange,
   hasMoreIssues = false,
   isLoadingMoreIssues = false,
   mutedIssueIds,
@@ -875,6 +880,7 @@ export function IssuesList({
       queryKey: [
         ...queryKeys.issues.list(selectedCompanyId ?? "__no-company__"),
         "board-column",
+        hiddenOnly,
         status,
         normalizedIssueSearch,
         projectId ?? "__all-projects__",
@@ -891,6 +897,7 @@ export function IssuesList({
           displayStatus: status,
           limit: ISSUE_BOARD_COLUMN_RESULT_LIMIT,
           ...creationRequestFilters,
+          ...(hiddenOnly ? { hiddenOnly: !normalizedIssueSearch || undefined, includeAgentCreatedTasks: true } : {}),
         }, { signal }).then((rows) => rows as Issue[]),
       enabled: !!selectedCompanyId && viewState.viewMode === "board" && !searchWithinLoadedIssues,
       placeholderData: (previousData: Issue[] | undefined) => previousData,
@@ -1144,8 +1151,8 @@ export function IssuesList({
 
   const filtered = useMemo(() => {
     const filteredByControls = applyIssueFilters(
-      searchScopedIssues,
-      viewState,
+      hiddenOnly ? searchScopedIssues.filter(issue => issue.hiddenAt) : searchScopedIssues,
+      hiddenOnly ? { ...viewState, showHiddenTasks: true, showAgentCreatedTasks: true } : viewState,
       currentUserId,
       enableAgentCreatedVisibilityFilter,
       liveIssueIds,
@@ -1163,6 +1170,7 @@ export function IssuesList({
     });
   }, [
     searchScopedIssues,
+    hiddenOnly,
     viewState,
     currentUserId,
     enableAgentCreatedVisibilityFilter,
@@ -1244,7 +1252,7 @@ export function IssuesList({
     || viewState.boardColdLaneMode !== "auto"
     || viewState.boardColumnPageSize !== KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 
-  const hierarchyEnabled = enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
+  const hierarchyEnabled = !hiddenOnly && enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
   const hierarchy = useIssueHierarchyContext(
     selectedCompanyId, filtered.slice(0, renderedIssueRowLimit), viewState.collapsedParents,
     hierarchyEnabled,
@@ -1345,10 +1353,10 @@ export function IssuesList({
   ]);
   const groupedContent = useMemo(() => baseGroupedContent.map((group) => ({
     ...group,
-    items: enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list"
+    items: hierarchyEnabled
       ? includeIssueHierarchyContext(group.items, [...issues, ...hierarchy.issues])
       : group.items,
-  })), [baseGroupedContent, hierarchy.issues, issues, enableAgentCreatedVisibilityFilter, viewState.showAgentCreatedTasks, viewState.routineTasksOnly, viewState.nestingEnabled, viewState.viewMode]);
+  })), [baseGroupedContent, hierarchy.issues, issues, hierarchyEnabled]);
   const visibleListRowCount = groupedContent.reduce((total, group) => total + group.items.length, 0);
 
 
@@ -1873,7 +1881,7 @@ export function IssuesList({
             state={viewState}
             onChange={updateView}
             buttonVariant="outline"
-            activeFilterCount={activeFilterCount}
+            activeFilterCount={activeFilterCount + (onHiddenOnlyChange && hiddenOnly ? 1 : 0)}
             agents={agents}
             creators={creatorOptions}
             projects={projects?.map((project) => ({ id: project.id, name: project.name }))}
@@ -1882,6 +1890,8 @@ export function IssuesList({
             enableExternalObjectFilters={externalObjectsEnabled}
             enableAgentCreatedVisibilityFilter={enableAgentCreatedVisibilityFilter}
             enableHiddenVisibilityFilter={enableHiddenVisibilityFilter}
+            hiddenOnly={hiddenOnly}
+            onHiddenOnlyChange={onHiddenOnlyChange}
             iconOnly
           />
 
@@ -1985,16 +1995,16 @@ export function IssuesList({
         </p>
       )}
       {hierarchy.error ? <p className="text-sm text-destructive">Failed to load task hierarchy: {describeError(hierarchy.error).body}</p> : null}
-      {!isLoading && !error && !externalObjectFilterLoading && visibleListRowCount === 0 && viewState.viewMode === "list" && (
+      {!isLoading && !error && !externalObjectFilterLoading && visibleListRowCount === 0 && (viewState.viewMode === "list" || hiddenOnly) && (
         <EmptyState
           icon={CircleDot}
-          message="No tasks match the current filters or search."
-          action={createActionLabel}
+          message={hiddenOnly ? "No hidden tasks." : "No tasks match the current filters or search."}
+          action={hiddenOnly ? undefined : createActionLabel}
           onAction={() => openCreateIssueDialog()}
         />
       )}
 
-      {!error && (viewState.viewMode === "board" ? (
+      {!error && (!hiddenOnly || filtered.length > 0) && (viewState.viewMode === "board" ? (
         <KanbanBoard
           issues={filtered}
           agents={agents}
@@ -2178,6 +2188,7 @@ export function IssuesList({
                         checklistRowId={checklistRowId}
                         titleClassName={doneRowTitleClass}
                         externalObjectSummary={externalObjectSummaryByIssueId.get(issue.id) ?? null}
+                        titleBadge={issue.hiddenAt ? <HiddenTaskBadge /> : undefined}
                         titleSuffix={(
                           <>
                             {hasChildren && !isExpanded ? (
@@ -2201,7 +2212,6 @@ export function IssuesList({
                                 </Badge>
                               )
                             ) : null}
-                            {issue.hiddenAt ? <HiddenTaskBadge /> : null}
                             {isSuccessfulRunHandoffRequired(issue) ? (
                               <Badge variant="outline"
                                 className="ml-1.5 border-amber-400/45 bg-amber-50/60 px-1.5 text-(length:--text-nano) text-amber-700 dark:border-amber-300/35 dark:bg-amber-400/10 dark:text-amber-300"

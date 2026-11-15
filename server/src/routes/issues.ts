@@ -9144,6 +9144,11 @@ export function issueRoutes(
       res.status(400).json({ error: "includeAgentCreatedTasks must be true or false when provided" });
       return;
     }
+    const hiddenOnly = parseOptionalBooleanQuery(req.query.hiddenOnly);
+    if (hiddenOnly === null) {
+      res.status(400).json({ error: "hiddenOnly must be true or false when provided" });
+      return;
+    }
     const includeHidden = parseOptionalBooleanQuery(req.query.includeHidden);
     if (includeHidden === null) {
       res.status(400).json({ error: "includeHidden must be true or false when provided" });
@@ -9327,6 +9332,7 @@ export function issueRoutes(
         req.query.includeBlockedInboxAttention === "1",
       includeAgentCreatedTasks,
       includeHidden: includeHidden === true ? true : undefined,
+      hiddenOnly: hiddenOnly === true ? true : undefined,
       creationVisibilityUserId: includeParticipatedTasks === true && req.actor.type === "board" ? req.actor.userId : undefined,
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
       hasPlanDocument,

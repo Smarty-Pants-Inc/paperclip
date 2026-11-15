@@ -202,6 +202,13 @@ describe("issuesApi.list", () => {
     );
   });
 
+  it("sends hiddenOnly only when a list asks for the Hidden view", async () => {
+    await issuesApi.listCompact("company-1", { hiddenOnly: true, limit: 100 });
+    expect(mockApi.get).toHaveBeenCalledWith("/companies/company-1/issues?hiddenOnly=true&limit=100&view=compact");
+    await issuesApi.list("company-1", { hiddenOnly: false, limit: 100 });
+    expect(mockApi.get).toHaveBeenLastCalledWith("/companies/company-1/issues?limit=100");
+  });
+
   it("sends includeHidden only when a list asks for hidden tasks", async () => {
     await issuesApi.listCompact("company-1", { includeHidden: true, limit: 100 });
     expect(mockApi.get).toHaveBeenLastCalledWith(

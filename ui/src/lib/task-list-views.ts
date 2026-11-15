@@ -5,10 +5,11 @@ export const taskListViews = [
   { value: "unread", label: "Unread" },
   { value: "blocked", label: "Needs attention" },
   { value: "all", label: "All tasks" },
+  { value: "hidden", label: "Hidden" },
 ] as const;
 
 export type TaskListView = typeof taskListViews[number]["value"];
-type ViewIssue = Pick<Issue, "createdByUserId" | "assigneeUserId" | "status">;
+type ViewIssue = Pick<Issue, "createdByUserId" | "assigneeUserId" | "status"> & Partial<Pick<Issue, "hiddenAt">>;
 
 /** Apply within the current company's accessible tasks; ancestors are added separately. */
 export function matchesTaskListView(view: TaskListView, issue: ViewIssue, unread: boolean, userId: string | null): boolean {
@@ -17,6 +18,7 @@ export function matchesTaskListView(view: TaskListView, issue: ViewIssue, unread
     case "unread": return unread;
     case "blocked": return issue.status === "blocked" || issue.status === "in_review";
     case "all": return true;
+    case "hidden": return Boolean(issue.hiddenAt);
   }
 }
 

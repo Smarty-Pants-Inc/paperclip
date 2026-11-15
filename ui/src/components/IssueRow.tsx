@@ -71,6 +71,8 @@ export interface IssueRowProps {
   externalObjectSummary?: ExternalObjectSummary | null;
   trailingMeta?: ReactNode;
   titleSuffix?: ReactNode;
+  /** Persistent row state outside the title's truncation/marquee. */
+  titleBadge?: ReactNode;
   titleClassName?: string;
   checklistStepNumber?: number | string | null;
   checklistCurrentStep?: boolean;
@@ -156,6 +158,7 @@ export function IssueRow({
   externalObjectSummary,
   trailingMeta,
   titleSuffix,
+  titleBadge,
   titleClassName,
   checklistStepNumber = null,
   checklistCurrentStep = false,
@@ -382,6 +385,7 @@ export function IssueRow({
               >
                 {issue.title}{titleSuffix}
               </span>}
+              {titleBadge}
               {stableLayout && recoveryIndicator ? (
                 <span data-slot="task-row-recovery">
                   <span className="hidden sm:inline">{recoveryIndicator}</span>
@@ -500,6 +504,7 @@ export function IssueRow({
           >
             {issue.title}{titleSuffix}
           </span>
+          {titleBadge}
           {recoveryIndicator}
         </span>
         {checklistDependencyChips ? (

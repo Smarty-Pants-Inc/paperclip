@@ -167,6 +167,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   const useListSort = layout === "list" && !deferredQuery;
   // Hidden tasks join only the All tasks list; search, Mine and Unread keep excluding them.
   const includeHidden = showHiddenTasks && view === "all" && !deferredQuery;
+  const hiddenOnly = view === "hidden" && !deferredQuery;
   const serverSortField = useListSort && sort?.column === "created" ? "created" : "updated";
   const serverSortDir = useListSort && (sort?.column === "created" || sort?.column === "lastUpdated") && sort.direction === "ascending" ? "asc" : "desc";
   const participantAgentId = params.get("participantAgentId") ?? undefined;
@@ -189,7 +190,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   useEffect(() => { setBreadcrumbs([{ label: "Tasks" }]); }, [setBreadcrumbs]);
 
   const tasks = useInfiniteQuery({
-    queryKey: [...queryKeys.issues.list(companyId!), "coordinator-table", "index", userId, deferredQuery, participantAgentId, workspaceIds, originKind, serverSortField, serverSortDir, includeBlockedBy, view === "unread", includeHidden],
+    queryKey: [...queryKeys.issues.list(companyId!), "coordinator-table", "index", userId, deferredQuery, participantAgentId, workspaceIds, originKind, serverSortField, serverSortDir, includeBlockedBy, view === "unread", includeHidden, hiddenOnly],
     queryFn: async ({ pageParam, signal }) => {
       const pages = await Promise.all((workspaceIds.length ? workspaceIds : [undefined]).map(workspaceId => issuesApi.listCompact(companyId!, {
       projection: "index", limit: pageSize, offset: pageParam, includeAgentCreatedTasks: true, includeRoutineExecutions: true,
@@ -197,6 +198,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
       includeBlockedBy: includeBlockedBy || undefined, q: deferredQuery || undefined, participantAgentId, workspaceId, originKind,
       unreadForUserId: view === "unread" ? "me" : undefined,
       includeHidden: includeHidden || undefined,
+      hiddenOnly: hiddenOnly || undefined,
       }, { signal })));
       return { items: pages.flat(), hasNextPage: pages.some(page => page.length === pageSize) };
     },
@@ -314,7 +316,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
       next.delete("status");
       for (const status of patch.statuses) next.append("status", status);
       const preset = normalizeTaskViewKey(next.get("view"));
-      if (preset && taskView(preset).surface === "issues") next.set("view", "all");
+      if (preset && preset !== "hidden" && taskView(preset).surface === "issues") next.set("view", "all");
     }
     navigate({ search: next.toString(), hash: location.hash }, { replace: true });
   };
@@ -345,8 +347,8 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   const enrichItem = (item: TaskListItem): TaskListItem => ({ ...item, issue: enrichIssueRow(item.issue) });
   const narrowed = query || collection.activeFilterCount || view === "inbox" || view === "unread";
   const empty = <EmptyState icon={narrowed ? SearchX : ListChecks}
-    message={narrowed ? "No tasks match this view" : needsAttention ? "No tasks need a decision." : "No tasks in this organization"}
-    action={narrowed ? "Clear filters" : needsAttention ? undefined : "New Task"}
+    message={view === "hidden" ? "No hidden tasks." : narrowed ? "No tasks match this view" : needsAttention ? "No tasks need a decision." : "No tasks in this organization"}
+    action={narrowed ? "Clear filters" : needsAttention || view === "hidden" ? undefined : "New Task"}
     onAction={narrowed ? clearFilters : () => openNewIssue()} />;
   const issueLinkState = createIssueDetailLocationState("Tasks", `${location.pathname}${location.search}`, "issues");
   const retry = () => {

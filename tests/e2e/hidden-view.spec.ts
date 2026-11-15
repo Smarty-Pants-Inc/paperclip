@@ -24,6 +24,20 @@ for (const coordinator of [true, false]) for (const width of [1440, 390]) {
       const listRoute = `/${company.issuePrefix}/issues`;
       const taskRoute = `${listRoute}/${task.identifier}`;
       const row = (id: string) => page.locator(`[data-issue-row-details="${id}"]`);
+      const selectHidden = async (checked: boolean) => {
+        if (coordinator) {
+          await page.getByRole("button", { name: /Change view/ }).click();
+          await page.getByRole("menuitem", { name: checked ? /^Hidden/ : /^All tasks/ }).click();
+        } else {
+          await page.locator('button[title^="Filter"]').first().click();
+          const filter = page.getByRole("checkbox", { name: "Hidden tasks only", exact: true });
+          await expect(filter).toBeChecked({ checked: !checked });
+          await filter.click();
+          // The controlled checkbox follows React Router's asynchronous view change.
+          await expect(filter).toBeChecked({ checked });
+          await page.keyboard.press("Escape");
+        }
+      };
       await page.goto(`${listRoute}?view=all`);
       await expect(row(task.id)).toBeVisible({ timeout: 30_000 });
       await expect(row(other.id)).toBeVisible();
@@ -35,15 +49,16 @@ for (const coordinator of [true, false]) for (const width of [1440, 390]) {
       await page.goto(`${listRoute}?view=all`);
       await expect(row(other.id)).toBeVisible({ timeout: 30_000 });
       await expect(row(task.id)).toHaveCount(0);
-      await page.getByRole("button", { name: /Change view/ }).click();
-      await page.getByRole("menuitem", { name: /^Hidden/ }).click();
+      await selectHidden(true);
       await expect(page).toHaveURL(/view=hidden/);
       await expect(row(task.id)).toBeVisible();
       await expect(row(other.id)).toHaveCount(0);
       await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toHaveText("Hidden");
+      await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toBeInViewport();
       await page.reload();
       await expect(row(task.id)).toBeVisible({ timeout: 30_000 });
       await expect(row(other.id)).toHaveCount(0);
+      await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toBeInViewport();
       await page.screenshot({ path: testInfo.outputPath(`${coordinator ? "" : "classic-"}hidden-view-${width}.png`) });
       await row(task.id).locator("a[data-inbox-issue-link]").first().click();
       const banner = page.getByTestId("hidden-task-banner");
@@ -56,8 +71,7 @@ for (const coordinator of [true, false]) for (const width of [1440, 390]) {
       await expect(row(task.id)).toHaveCount(0);
       await expect(row(other.id)).toHaveCount(0);
       await page.screenshot({ path: testInfo.outputPath(`${coordinator ? "" : "classic-"}hidden-view-empty-${width}.png`) });
-      await page.getByRole("button", { name: /Change view/ }).click();
-      await page.getByRole("menuitem", { name: /^All tasks/ }).click();
+      await selectHidden(false);
       await expect(row(task.id)).toBeVisible();
       await expect(row(other.id)).toBeVisible();
       await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toHaveCount(0);

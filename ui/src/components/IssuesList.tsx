@@ -497,6 +497,9 @@ interface IssuesListProps {
   enableAgentCreatedVisibilityFilter?: boolean;
   /** Offer Show hidden tasks; the page must fetch with `includeHidden`. */
   enableHiddenVisibilityFilter?: boolean;
+  /** Dedicated Hidden view; never include visible rows as matches or context. */
+  hiddenOnly?: boolean;
+  onHiddenOnlyChange?: (checked: boolean) => void;
   hasMoreIssues?: boolean;
   isLoadingMoreIssues?: boolean;
   mutedIssueIds?: Set<string>;
@@ -753,6 +756,8 @@ function StreamlinedIssuesList({
   parentIssueIdForCostSummary,
   enableAgentCreatedVisibilityFilter = false,
   enableHiddenVisibilityFilter = false,
+  hiddenOnly = false,
+  onHiddenOnlyChange,
   hasMoreIssues = false,
   isLoadingMoreIssues = false,
   mutedIssueIds,
@@ -978,6 +983,7 @@ function StreamlinedIssuesList({
       queryKey: [
         ...queryKeys.issues.list(selectedCompanyId ?? "__no-company__"),
         "board-column",
+        hiddenOnly,
         status,
         normalizedIssueSearch,
         projectId ?? "__all-projects__",
@@ -994,6 +1000,7 @@ function StreamlinedIssuesList({
           displayStatus: status,
           limit: ISSUE_BOARD_COLUMN_RESULT_LIMIT,
           ...creationRequestFilters,
+          ...(hiddenOnly ? { hiddenOnly: !normalizedIssueSearch || undefined, includeAgentCreatedTasks: true } : {}),
         }, { signal }).then((rows) => rows as Issue[]),
       enabled: !!selectedCompanyId && viewState.viewMode === "board" && !searchWithinLoadedIssues,
       placeholderData: (previousData: Issue[] | undefined) => previousData,
@@ -1254,8 +1261,8 @@ function StreamlinedIssuesList({
 
   const filtered = useMemo(() => {
     const filteredByControls = applyIssueFilters(
-      searchScopedIssues,
-      viewState,
+      hiddenOnly ? searchScopedIssues.filter(issue => issue.hiddenAt) : searchScopedIssues,
+      hiddenOnly ? { ...viewState, showHiddenTasks: true, showAgentCreatedTasks: true } : viewState,
       currentUserId,
       enableAgentCreatedVisibilityFilter,
       liveIssueIds,
@@ -1273,6 +1280,7 @@ function StreamlinedIssuesList({
     });
   }, [
     searchScopedIssues,
+    hiddenOnly,
     viewState,
     currentUserId,
     enableAgentCreatedVisibilityFilter,
@@ -1354,7 +1362,7 @@ function StreamlinedIssuesList({
     || viewState.boardColdLaneMode !== "auto"
     || viewState.boardColumnPageSize !== KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 
-  const hierarchyEnabled = enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
+  const hierarchyEnabled = !hiddenOnly && enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list";
   const hierarchy = useIssueHierarchyContext(
     selectedCompanyId, filtered.slice(0, renderedIssueRowLimit), viewState.collapsedParents,
     hierarchyEnabled,
@@ -1458,10 +1466,10 @@ function StreamlinedIssuesList({
   ]);
   const groupedContent = useMemo(() => baseGroupedContent.map((group) => ({
     ...group,
-    items: enableAgentCreatedVisibilityFilter && !viewState.showAgentCreatedTasks && !viewState.routineTasksOnly && viewState.nestingEnabled && viewState.viewMode === "list"
+    items: hierarchyEnabled
       ? includeIssueHierarchyContext(group.items, [...issues, ...hierarchy.issues])
       : group.items,
-  })), [baseGroupedContent, hierarchy.issues, issues, enableAgentCreatedVisibilityFilter, viewState.showAgentCreatedTasks, viewState.routineTasksOnly, viewState.nestingEnabled, viewState.viewMode]);
+  })), [baseGroupedContent, hierarchy.issues, issues, hierarchyEnabled]);
   const visibleListRowCount = groupedContent.reduce((total, group) => total + group.items.length, 0);
 
 
@@ -2015,7 +2023,7 @@ function StreamlinedIssuesList({
             state={viewState}
             onChange={updateView}
             buttonVariant="outline"
-            activeFilterCount={activeFilterCount}
+            activeFilterCount={activeFilterCount + (onHiddenOnlyChange && hiddenOnly ? 1 : 0)}
             agents={agents}
             creators={creatorOptions}
             projects={projects?.map((project) => ({ id: project.id, name: project.name }))}
@@ -2024,6 +2032,8 @@ function StreamlinedIssuesList({
             enableExternalObjectFilters={externalObjectsEnabled}
             enableAgentCreatedVisibilityFilter={enableAgentCreatedVisibilityFilter}
             enableHiddenVisibilityFilter={enableHiddenVisibilityFilter}
+            hiddenOnly={hiddenOnly}
+            onHiddenOnlyChange={onHiddenOnlyChange}
             iconOnly
             presentation={rowPresentation === "task" ? "streamlined" : "legacy"}
           />
@@ -2136,16 +2146,16 @@ function StreamlinedIssuesList({
         </p>
       )}
       {hierarchy.error ? <div role="alert" className="flex items-center gap-2 text-sm text-destructive"><p>{describeError(hierarchy.error, { action: "load task hierarchy" }).body}</p><Button variant="outline" size="sm" onClick={hierarchy.refetch}>Retry hierarchy</Button></div> : null}
-      {!collectionLoading && !error && !externalObjectFilterError && visibleListRowCount === 0 && viewState.viewMode === "list" && (
+      {!collectionLoading && !error && !externalObjectFilterError && visibleListRowCount === 0 && (viewState.viewMode === "list" || hiddenOnly) && (
         <EmptyState
           icon={CircleDot}
-          message="No tasks match the current filters or search."
-          action={createActionLabel}
+          message={hiddenOnly ? "No hidden tasks." : "No tasks match the current filters or search."}
+          action={hiddenOnly ? undefined : createActionLabel}
           onAction={() => openCreateIssueDialog()}
         />
       )}
 
-      {!collectionLoading && !error && !externalObjectFilterError && (viewState.viewMode === "board" ? (
+      {!collectionLoading && !error && !externalObjectFilterError && (!hiddenOnly || filtered.length > 0) && (viewState.viewMode === "board" ? (
         <KanbanBoard
           issues={filtered}
           agents={agents}
@@ -2330,6 +2340,7 @@ function StreamlinedIssuesList({
                         checklistRowId={checklistRowId}
                         titleClassName={doneRowTitleClass}
                         externalObjectSummary={externalObjectSummaryByIssueId.get(issue.id) ?? null}
+                        titleBadge={issue.hiddenAt ? <HiddenTaskBadge /> : undefined}
                         titleSuffix={(
                           <>
                             {hasChildren && !isExpanded ? (
@@ -2355,7 +2366,6 @@ function StreamlinedIssuesList({
                                 </Badge>
                               )
                             ) : null}
-                            {issue.hiddenAt ? <HiddenTaskBadge /> : null}
                             {isSuccessfulRunHandoffRequired(issue) ? (
                               <Badge variant="outline"
                                 className="ml-1.5 border-amber-400/45 bg-amber-50/60 px-1.5 text-(length:--text-nano) text-amber-700 dark:border-amber-300/35 dark:bg-amber-400/10 dark:text-amber-300"

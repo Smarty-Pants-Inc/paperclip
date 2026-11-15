@@ -1930,6 +1930,7 @@ export interface IssueFilters {
    * tasks. Harness tasks stay excluded.
    */
   includeHidden?: boolean;
+  hiddenOnly?: boolean;
   /** Authenticated inbox discovery can retain existing participation. */
   creationVisibilityUserId?: string;
   includeRoutineExecutions?: boolean;
@@ -8541,14 +8542,14 @@ export function issueService(db: Db) {
         });
       }
 
-      const includeHidden = filters?.includeHidden === true
-        && !filters.q?.trim()
-        && !filters.touchedByUserId?.trim()
-        && !filters.unreadForUserId?.trim()
-        && !filters.inboxArchivedByUserId?.trim();
+      // Visibility overrides belong to task lists, never discovery or personal queues.
+      const allowHidden = !filters?.q?.trim()
+        && !filters?.touchedByUserId?.trim()
+        && !filters?.unreadForUserId?.trim()
+        && !filters?.inboxArchivedByUserId?.trim();
       const conditions = [
         eq(issues.companyId, companyId),
-        listVisibleIssueCondition(includeHidden),
+        listVisibleIssueCondition(allowHidden && filters?.includeHidden === true, allowHidden && filters?.hiddenOnly === true),
       ];
       if (filters?.issueIds) {
         if (filters.issueIds.length === 0) return [];

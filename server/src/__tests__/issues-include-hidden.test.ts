@@ -77,7 +77,7 @@ describeEmbeddedPostgres("issue list includeHidden", () => {
       }
       expect(idsOf((await request(app).get(`${path}?hiddenOnly=false${view}`).expect(200)).body)).toEqual([ids.visible]);
     }
-    for (const value of ["maybe", "1", "true&hiddenOnly=false"]) {
+    for (const value of ["maybe", "2", "true&hiddenOnly=false"]) {
       await request(app).get(`${path}?hiddenOnly=${value}`).expect(400);
     }
     expect((await issueService(ctx.db).list(companyId, { hiddenOnly: true })).map(issue => issue.id)).toEqual([ids.hidden]);
