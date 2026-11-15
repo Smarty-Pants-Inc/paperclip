@@ -90,6 +90,46 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/reuse-canary-image.mjs
 
+  # Fork only (Smarty-Pants-Inc/smarty-dev#20718): never move an existing sha-<short> tag. Image builds are not
+  # bit-reproducible, so a second build of an already-published commit would retag sha-<short> to a NEW digest
+  # (seen 2026-11-15: run 43757633634 moved sha-4f6dd45 from ff0755bc... to 64c13362...). When the tag exists,
+  # report its digest and skip the build; tag refs keep upstream behaviour.
+  existing_sha_image:
+    if: github.repository != 'paperclipai/paperclip' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      exists: ${{ steps.check.outputs.exists }}
+      digest: ${{ steps.check.outputs.digest }}
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Look up the commit's existing image
+        id: check
+        run: |
+          set -euo pipefail
+          tag="${IMAGE_NAME}:sha-${GITHUB_SHA::7}"
+          if out="$(docker buildx imagetools inspect "$tag" 2>/dev/null)"; then
+            digest="$(awk '/^Digest:/{print $2; exit}' <<< "$out")"
+            if [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "digest=$digest" >> "$GITHUB_OUTPUT"
+              echo "Existing image $tag is NOT rebuilt or retagged."
+              echo "Digest: $digest"
+              printf '### Existing image reused\n\n`%s` already published: `%s`. No build; tag not moved.\n' "$tag" "$digest" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+          fi
+          echo "exists=false" >> "$GITHUB_OUTPUT"
+          echo "No existing $tag: building."
+
   # Multi-arch by native runner, not QEMU.
   #
   # This was one job building linux/amd64,linux/arm64 together on an x86
@@ -113,8 +153,8 @@ jobs:
   # digest; `merge` assembles the manifest list. Both architectures remain
   # available to self-hosted installations and downstream image composers.
   build-and-push:
-    needs: [reuse_canary_image]
-    if: ${{ !cancelled() && (needs.reuse_canary_image.result == 'skipped' || (needs.reuse_canary_image.result == 'success' && needs.reuse_canary_image.outputs.reused == 'false')) }}
+    needs: [reuse_canary_image, existing_sha_image]
+    if: ${{ !cancelled() && needs.existing_sha_image.outputs.exists != 'true' && (needs.reuse_canary_image.result == 'skipped' || (needs.reuse_canary_image.result == 'success' && needs.reuse_canary_image.outputs.reused == 'false')) }}
     strategy:
       # Independent legs: one architecture failing should still publish
       # nothing, but it must not also hide the other's logs behind a
