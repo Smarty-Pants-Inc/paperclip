@@ -190,6 +190,62 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it("limits idle list calls over 60 seconds with the watchdog-safe backoff cap", async () => {
+    vi.useFakeTimers();
+    let listCalls = 0;
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {}, makeDirs: async () => {},
+      listJsonFiles: async () => { listCalls += 1; return []; },
+      fileSize: async () => 0, readTextFile: async () => "", writeTextFile: async () => {},
+      writeResponseFile: async () => ({ wrote: true }), rename: async () => {}, remove: async () => {},
+    };
+    const worker = await startSandboxCallbackBridgeWorker({
+      client, queueDir: "/workspace/idle-bridge", pollIntervalMs: 100, idleBackoffMaxMs: 1_000,
+      handleRequest: async () => ({ status: 200, body: "ok" }),
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(listCalls).toBeLessThanOrEqual(70);
+    } finally {
+      const stopping = worker.stop({ drainTimeoutMs: 0 });
+      await vi.advanceTimersByTimeAsync(0);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
+  it("handles a request arriving during the active 100ms poll window within 150ms", async () => {
+    vi.useFakeTimers();
+    const queueDir = "/workspace/bridge-arrival";
+    const requests = new Map<string, string>();
+    let handledAt: number | undefined;
+    const client: SandboxCallbackBridgeQueueClient = {
+      makeDir: async () => {}, makeDirs: async () => {},
+      listJsonFiles: async () => [...requests.keys()],
+      fileSize: async () => 0,
+      readTextFile: async (file) => requests.get(path.posix.basename(file)) ?? "",
+      writeTextFile: async () => {}, writeResponseFile: async () => ({ wrote: true }),
+      rename: async () => {}, remove: async (file) => { requests.delete(path.posix.basename(file)); },
+    };
+    const worker = await startSandboxCallbackBridgeWorker({
+      client, queueDir, pollIntervalMs: 100, idleBackoffMaxMs: 1_000,
+      handleRequest: async () => { handledAt = Date.now(); return { status: 200, body: "ok" }; },
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(50);
+      const arrivedAt = Date.now();
+      requests.set("arrived.json", JSON.stringify({ id: "arrived", method: "GET", path: "/api/issues/i", query: "", headers: {}, body: "" }));
+      await vi.advanceTimersByTimeAsync(100);
+      expect(handledAt).toBeDefined();
+      expect(handledAt! - arrivedAt).toBeLessThanOrEqual(150);
+    } finally {
+      const stopping = worker.stop({ drainTimeoutMs: 0 });
+      await vi.advanceTimersByTimeAsync(0);
+      await stopping;
+      vi.useRealTimers();
+    }
+  });
+
   it("pauses polling between attached runs, quarantines stale requests, and resumes with bounded idle backoff", async () => {
     vi.useFakeTimers();
     const previousInterval = process.env.PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS;
