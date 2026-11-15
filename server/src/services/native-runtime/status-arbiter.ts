@@ -323,6 +323,13 @@ export function arbitrateNativeStatus(input: {
     reasonCode: "case_handoff_waiting_for_release", unblockDescriptor: null,
     effects: [{ kind: "release_checkout" }],
   };
+  // The participant already made this durable decision. A subsequent provider
+  // failure or blocker report cannot replace its return with a reviewer retry.
+  if (input.executionStageChangesRequestedByRun) {
+    const status = input.governanceGate?.kind === "execution_stage" ? "in_review" : "in_progress";
+    return { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
+      reasonCode: "execution_stage_changes_requested", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
+  }
   if (input.providerModelRejected && input.terminalState === "failed" &&
       input.nativeReviewOutcome !== "stale" && input.nativeReviewOutcome !== "resolved") {
     if (input.nativeReviewOutcome === "pending") {
@@ -432,11 +439,6 @@ export function arbitrateNativeStatus(input: {
         },
       ],
     };
-  }
-  if (input.executionStageChangesRequestedByRun) {
-    const status = input.governanceGate?.kind === "execution_stage" ? "in_review" : "in_progress";
-    return { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
-      reasonCode: "execution_stage_changes_requested", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
   }
   if (input.governanceGate) {
     if (

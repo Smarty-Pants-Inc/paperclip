@@ -70,8 +70,10 @@ describe("native status authority", () => {
       effects: [{ kind: "release_checkout" }] });
     expect(arbitrate({ executionStageChangesRequestedByRun: true, governanceGate: { kind: "execution_stage", id: "escalated" } }))
       .toMatchObject({ statusAction: "in_review", reasonCode: "execution_stage_changes_requested", effects: [{ kind: "release_checkout" }] });
-    expect(arbitrate({ executionStageChangesRequestedByRun: true, terminalState: "failed" }).reasonCode)
-      .not.toBe("execution_stage_changes_requested");
+    // C3-2: the saved return, not a later failed provider report, owns the task.
+    expect(arbitrate({ executionStageChangesRequestedByRun: true, terminalState: "failed" }))
+      .toMatchObject({ statusAction: "in_progress", reasonCode: "execution_stage_changes_requested",
+        effects: [{ kind: "release_checkout" }] });
     expect(arbitrate({ executionStageChangesRequestedByRun: true, workspaceFinalizeStatus: "failed" }).statusAction).toBe("preserve");
   });
   it("cannot complete an explicitly required quality review from claims or file evidence", () => {
