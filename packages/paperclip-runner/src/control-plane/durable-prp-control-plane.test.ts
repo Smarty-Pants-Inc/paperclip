@@ -3591,6 +3591,48 @@ async function receiveSecure(
   return value;
 }
 
+it("routes github_access.http only through authenticated PRP without journaling credential bytes", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-prp-github-access-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  const sentinel = "server-sentinel-token-never-persist";
+  const requestId = "github-access-request-1";
+  const handler = vi.fn(async (frame: Readonly<Record<string, unknown>>, _boundIdentity: Readonly<DurableRecoveryIdentity>) => ({
+    requestId: String(frame.requestId), status: 200,
+    headers: { "cache-control": "no-store", "content-type": "application/json" },
+    bodyBase64: Buffer.from(JSON.stringify({ token: sentinel })).toString("base64"),
+  }));
+  const unregister = core.setGithubAccessHttpHandler(handler);
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    client = await authenticate(core, core.issueBootstrapTicket());
+    expect(client).not.toBeNull();
+    sendSecure(client!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId,
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    const reply = await receiveSecure(client!);
+    expect(reply).toMatchObject({ protocol: "paperclip.runner", version: 1, requestId, status: 200 });
+    expect(Buffer.from(String(reply?.bodyBase64), "base64").toString()).toContain(sentinel);
+    expect(handler).toHaveBeenCalledOnce();
+    sendSecure(client!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId,
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    const duplicateReply = await receiveSecure(client!);
+    expect(duplicateReply).toMatchObject({ protocol: "paperclip.runner", version: 1, requestId, status: 409 });
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler.mock.calls[0]![0]).toEqual({ kind: "github_access.http", requestId, method: "POST",
+      path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    expect(handler.mock.calls[0]![1]).toEqual(identity);
+    expect(core.store.state.commands).toHaveLength(0);
+    expect(core.store.state.committedEvents).toHaveLength(0);
+    expect(JSON.stringify(core.store.state)).not.toContain(sentinel);
+    expect(JSON.stringify(core.store.state)).not.toContain(Buffer.from(sentinel).toString("base64"));
+  } finally {
+    unregister();
+    client?.socket.destroy();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const semanticInputDigestFixtures = JSON.parse(readFileSync(
   new URL("../../test/fixtures/semantic-input-digests.json", import.meta.url),
   "utf8",
