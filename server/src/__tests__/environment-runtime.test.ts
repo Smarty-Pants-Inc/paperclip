@@ -4956,7 +4956,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // Keep: recorded real catch + provider-state data safety. Exercise the real
   // DB-backed admission path, including pre-upgrade scope fingerprints.
   it.each(["from", "snapshot", "image", "rootfs"].flatMap(key =>
-    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "stale lifecycle"].map(change => ({ key, change }))))(
+    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "stale lifecycle",
+      ...(key === "from" ? ["released no inspect"] : [])].map(change => ({ key, change }))))(
     "never reuses a retained allocation across a boot source change: $key / $change", async ({ key, change }) => {
     const pluginId = randomUUID();
     const providerConfig = { provider: "fake-plugin", [key]: "snap-A", reuseLease: true, timeoutMs: 1234 };
@@ -4968,10 +4969,16 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       supportsReusableLeases: true, configSchema: { type: "object" },
     }] });
     let acquisitions = 0;
+    let assertOriginalAtGet: (() => Promise<void>) | undefined;
     const workerManager = {
       isRunning: () => true,
-      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute",
+        ...(change === "released" ? ["environmentInspectLease"] : [])] }),
       call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentInspectLease" && change === "released") {
+          await assertOriginalAtGet!();
+          return { providerLeaseId: params.providerLeaseId, state: "running" };
+        }
         if (method === "environmentAcquireLease") return {
           providerLeaseId: `source-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" },
         };
@@ -4995,7 +5002,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
       await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
     }
-    await db.update(environmentLeases).set({ status: change === "released" ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    await db.update(environmentLeases).set({ status: change.startsWith("released") ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    const originalLease = await environmentService(db).getLeaseById(first.lease.id);
+    assertOriginalAtGet = async () => {
+      expect(await environmentService(db).getLeaseById(first.lease.id)).toEqual(originalLease);
+      expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentInspectLease"]);
+    };
     if (change === "stale lifecycle") vi.spyOn(workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentExecute"] } as never);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
     const nextRunId = randomUUID();
@@ -5012,12 +5024,31 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
       expect(acquisitions).toBe(2);
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
-      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
-        status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
-        metadata: { [key]: "snap-A", sandboxStopAndRetain: {
-          schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
-        } },
-      });
+      if (change === "released no inspect") {
+        // Older peers neither advertise GET nor accept it: absence of that
+        // capability must not reopen historical evidence or arm a stop loop.
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toEqual(originalLease);
+        const { heartbeatService } = await import("../services/heartbeat.js");
+        const heartbeat = heartbeatService(db, { environmentRuntime: service });
+        for (let pass = 0; pass < 8; pass++) await heartbeat.sweepPendingCleanupLeases();
+        await heartbeat.drainActiveRunExecutions();
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toEqual(originalLease);
+        expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentAcquireLease"]);
+      } else {
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+          status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
+          metadata: { [key]: "snap-A", sandboxStopAndRetain: {
+            schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
+          } },
+        });
+        if (change === "released") {
+          expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentInspectLease", "environmentAcquireLease"]);
+          const evidence = JSON.parse(JSON.stringify(originalLease));
+          await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+            metadata: { endedLeaseEvidence: evidence, sandboxStopAndRetain: { endedLeaseEvidence: evidence } },
+          });
+        }
+      }
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
     }
     await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
