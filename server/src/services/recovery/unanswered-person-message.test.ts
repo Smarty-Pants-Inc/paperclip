@@ -19,12 +19,13 @@ import {
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
+import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
-  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING } from "./unanswered-person-message.js";
+  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -693,81 +694,85 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   // RFL 03:16Z (E3.04): only a RUNNING turn is unbounded. A queued run that
-  // carries the message but is never claimed gets one "waiting to start" note.
-  it("E3.04: a carrying run queued behind a full agent -> one 'waiting' note at the bound; it starts later -> no second note; its answer supersedes it", async () => {
+  // carries the message is bounded. Upstream's turn header names that wait
+  // (#21447 useWaitingToStart: "Waiting to start" after 30 s for a run whose
+  // status is queued and whose execution projection names no hold, cause null;
+  // #21564: named once, in the header), so B' adds no thread note of its own.
+  const headerSaysWaitingToStart = async (f: { companyId: string }, runId: string) => {
+    const projection = (await executionProjectionsForRuns(db, f.companyId, [runId])).get(runId);
+    expect(projection, "the turn header reads this run's execution projection").toBeDefined();
+    expect(projection!.phase).toBe("queued");
+    expect(projection!.cause, "no named hold: the header says 'Waiting to start'").toBeNull();
+    expect(projection!.agentQueue ?? null).toBeNull();
+  };
+  it("E3.04: a carrying run queued behind a full agent -> no note, the turn header says it is waiting to start; it starts later -> still no note; its answer -> none", async () => {
     const f = await fixture();
     const commentId = await f.message();
     const queued = await f.run({ commentId, status: "queued" });
     await f.sweep();
     expect(await f.visible()).toHaveLength(0);
     await settleAt(f, AFTER_WAKE_BOUND_MS);
-    let notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(WAITING);
-    expect(notices[0]!.presentation).toMatchObject({ title: "Your message is waiting to start" });
-    // RFL 20:36Z: the waiting note is written open (systemNoticePresentation).
-    expect(notices[0]!.presentation).toMatchObject({ detailsDefaultOpen: true });
-    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(await f.visible()).toHaveLength(0);
+    await headerSaysWaitingToStart(f, queued);
     await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await settleAt(f, AFTER_WAKE_BOUND_MS + 60_000);
-    notices = await f.visible();
-    expect(notices).toHaveLength(1);
+    expect(await f.visible()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await f.reply(queued);
     await settleAt(f, AFTER_WAKE_BOUND_MS + 120_000);
     expect(await f.visible()).toHaveLength(0);
   });
 
-  // RFL 03:26Z: "it will start by itself" must stay TRUE. A carrying run that
-  // still has not started by T0 + 10 min turns the SAME note into the failure
-  // text; the waiting note carries no failure code.
+  // RFL 03:26Z: the wait must stay bounded. A carrying run that still has not
+  // started by T0 + 10 min gets ONE no-run note; until then the turn header
+  // says it is waiting to start, and the obligation stays open.
   const rowsOf = (notice: { metadata: unknown }) =>
     ((notice.metadata as { sections?: Array<{ rows: Array<{ label?: string; value?: string }> }> })?.sections ?? []).flatMap(section => section.rows);
-  it("E3.04 (2nd bound): a carrying queued run that never starts -> waiting note at ~2 min, the SAME note becomes the failure text at ~10 min", async () => {
-    const f = await fixture();
-    const commentId = await f.message();
-    await f.run({ commentId, status: "queued" });
-    await f.sweep();
-    await settleAt(f, 3 * 60_000);
-    let notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    const noteId = notices[0]!.id;
-    expect(notices[0]!.body).toBe(WAITING);
-    expect(rowsOf(notices[0]!).some(row => row.label === "Failure code")).toBe(false);
-    expect(rowsOf(notices[0]!).find(row => row.label === "Waiting code")?.value).toBe("waiting_to_start");
-    expect((await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
-      unansweredPersonMessageCommentCondition()))).length, "the waiting note keeps the obligation open").toBeGreaterThan(0);
-    await settleAt(f, 6 * 60_000);
-    expect((await f.visible())[0]!.body).toBe(WAITING);
-    await settleAt(f, 11 * 60_000);
-    notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.id).toBe(noteId);
-    expect(notices[0]!.body).toBe(NO_RUN);
-    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
-    expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
-    await settleAt(f, 12 * 60_000);
-    expect(await f.visible()).toHaveLength(1);
-  });
-
-  it("E3.04 (2nd bound) control: the carrying run starts at 5 min -> the note stays 'waiting', then the answer supersedes it", async () => {
+  it("E3.04 (2nd bound): a carrying queued run that never starts -> the turn header says it is waiting to start, no note until ~10 min, then ONE no-run note; its answer supersedes it", async () => {
     const f = await fixture();
     const commentId = await f.message();
     const queued = await f.run({ commentId, status: "queued" });
     await f.sweep();
     await settleAt(f, 3 * 60_000);
-    expect((await f.visible())[0]!.body).toBe(WAITING);
-    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
-    await settleAt(f, 5 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+    await headerSaysWaitingToStart(f, queued);
+    expect((await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      unansweredPersonMessageCommentCondition()))).length, "the obligation stays open while the header waits").toBeGreaterThan(0);
+    await settleAt(f, 6 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
     await settleAt(f, 11 * 60_000);
     let notices = await f.visible();
     expect(notices).toHaveLength(1);
-    expect(notices[0]!.body).toBe(WAITING);
+    expect(notices[0]!.body).toBe(NO_RUN);
+    // Keep c2's written-open notice contract on the surviving bounded note.
+    expect(notices[0]!.presentation).toMatchObject({ detailsDefaultOpen: true });
+    expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+    expect(rowsOf(notices[0]!).some(row => row.label === "Waiting code")).toBe(false);
+    await settleAt(f, 12 * 60_000);
+    expect(await f.visible()).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: new Date(), finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await f.reply(queued);
+    await settleAt(f, 13 * 60_000);
+    notices = await f.visible();
+    expect(notices).toHaveLength(0);
+  });
+
+  it("E3.04 (2nd bound) control: the carrying run starts at 5 min -> no note at any point (header waited, then a running turn), and its answer leaves none", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    const queued = await f.run({ commentId, status: "queued" });
+    await f.sweep();
+    await settleAt(f, 3 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
+    await headerSaysWaitingToStart(f, queued);
+    await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
+    await settleAt(f, 5 * 60_000);
+    await settleAt(f, 11 * 60_000);
+    expect(await f.visible()).toHaveLength(0);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, queued));
     await f.reply(queued);
     await settleAt(f, 12 * 60_000);
-    notices = await f.visible();
-    expect(notices).toHaveLength(0);
+    expect(await f.visible()).toHaveLength(0);
   });
 
   it("E3.04 control: a RUNNING run carrying the message is never bounded (a quiet healthy turn) -> no note at +30 min", async () => {
@@ -826,22 +831,6 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     await f.reply(run);
     await settleAt(f, 21 * 60_000);
     expect(await f.visible()).toHaveLength(0);
-  });
-
-  it("paused while a waiting-to-start note stands: the SAME note becomes the paused text", async () => {
-    const f = await fixture();
-    const commentId = await f.message();
-    await f.run({ commentId, status: "queued" });
-    await f.sweep();
-    await settleAt(f, 3 * 60_000);
-    const [waitingNote] = await f.visible();
-    expect(waitingNote!.body).toBe(WAITING);
-    await pause(f);
-    await settleAt(f, 4 * 60_000);
-    const notices = await f.visible();
-    expect(notices).toHaveLength(1);
-    expect(notices[0]!.id).toBe(waitingNote!.id);
-    expect(notices[0]!.body).toBe(PAUSED_TEXT);
   });
 
   it("RFL F2 lock order: the sweep and the executor's held-notice writer run CONCURRENTLY, both orders, no deadlock, exactly one notice", async () => {
