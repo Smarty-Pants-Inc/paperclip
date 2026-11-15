@@ -58,6 +58,29 @@ const uncommittedNoticeWrites = new WeakMap<object, Map<string, string>>();
  * selection. Caller must hold the company-scoped issue → run → task locks and
  * verify admission authority in this same transaction. Detail links preserve
  * run provenance without transient run ownership in chat relevance. */
+/** One current notice: a fresh provider thread that replaces a held
+ * conversation supersedes that conversation's held notice, without taking its
+ * authorizationReason or wording from its owner (moved from the removed
+ * fresh-thread stop gate's notice writer, follow-Paperclip Cut B). Caller holds
+ * the issue lock and has just written `reason`'s notice. */
+export async function supersedeHeldConversationNotice(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
+  companyId: string; issueId: string; heldSessionId: string | null; reason: string;
+}): Promise<void> {
+  if (!input.heldSessionId) return;
+  const [current] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${input.reason}`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
+  if (!current) return;
+  await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
+    '{supersededByCommentId}', to_jsonb(${current.id}::text))` }).where(and(
+    eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+    sql`${issueComments.metadata}->>'authorizationReason' = ${`${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${input.heldSessionId}`}`,
+    sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
+}
+
 export async function writePiSessionHistoryLossNotice(db: Db,
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
     companyId: string; issueId: string; runId: string; agentId: string;

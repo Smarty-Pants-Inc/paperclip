@@ -162,11 +162,12 @@ export async function selectPiConversation(db: Db, input: {
     else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
       adapterType: "paperclip_runner", taskKey: input.issueId, sessionParamsJson });
     if (freshBoundary) {
-      const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-      await writePiSessionHistoryLossNotice(db, tx, { ...input,
-        authorizationReason: `fresh_provider_thread:${freshBoundary.recoveryActionId}`,
-        replaceExisting: true,
+      const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
+      const authorizationReason = `fresh_provider_thread:${freshBoundary.recoveryActionId}`;
+      await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason, replaceExisting: true,
         body: freshBoundary.startedNote });
+      await supersedeHeldConversationNotice(tx, { companyId: input.companyId, issueId: input.issueId,
+        heldSessionId: freshBoundary.sourceSessionId, reason: authorizationReason });
     }
     if (legacyUnverified) {
       // The issue lock and this transaction make the notice and first recorded
@@ -213,9 +214,11 @@ export async function selectFreshContinuationThread(db: Db, input: {
     else await tx.insert(agentTaskSessions).values({ companyId: input.companyId, agentId: input.agentId,
       adapterType: "paperclip_runner", taskKey: issue.id, sessionParamsJson: { sessionId: id } });
     await tx.update(heartbeatRuns).set({ nativeSessionId: id }).where(eq(heartbeatRuns.id, run.id));
-    const { writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
-    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason: `fresh_provider_thread:${fresh.recoveryActionId}`,
-      body: fresh.startedNote, replaceExisting: true });
+    const { supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } = await import("./pi-session-recovery-notice.js");
+    const authorizationReason = `fresh_provider_thread:${fresh.recoveryActionId}`;
+    await writePiSessionHistoryLossNotice(db, tx, { ...input, authorizationReason, body: fresh.startedNote, replaceExisting: true });
+    await supersedeHeldConversationNotice(tx, { companyId: input.companyId, issueId: input.issueId,
+      heldSessionId: fresh.sourceSessionId, reason: authorizationReason });
     return id;
   });
 }
