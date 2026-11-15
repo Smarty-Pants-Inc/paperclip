@@ -220,6 +220,52 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     }, 60_000);
   });
 
+  // RFL 06:33Z: the custody guard FAILS CLOSED. Only a lease whose recorded adapter is KNOWN non-native skips it; an
+  // older lease with no adapterType in its metadata, acquired by a caller with no adapter type, is guarded.
+  it("fail closed: a pre-metadata warm lease (no adapterType) and a caller with no adapter type, no custody -> stopped and kept, never destroyed", async () => {
+    await company();
+    const issueId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
+    const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
+    const t0 = new Date(Date.now() - 3600_000);
+    await db.insert(issues).values({ id: issueId, companyId, title: "Answer Paul", status: "in_progress", assigneeAgentId: agentId });
+    const [environment] = await db.insert(environments).values({ id: environmentId, name: `Boat ${environmentId.slice(0, 8)}`, driver: "sandbox",
+      status: "active", config: { provider: "boat", image: "boot-source-before-upgrade", reuseLease: true } }).returning();
+    await db.insert(plugins).values({ id: pluginId, pluginKey: "paperclip.boat", packageName: "@paperclipai/plugin-boat",
+      version: "1.0.0", apiVersion: 1, status: "ready", categories: ["automation"],
+      manifestJson: { id: "paperclip.boat", apiVersion: 1, version: "1.0.0", displayName: "Boat", description: "Boat peer", author: "Paperclip",
+        categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
+        environmentDrivers: [{ driverKey: "boat", kind: "sandbox_provider", displayName: "Boat", supportsReusableLeases: true,
+          configSchema: { type: "object" } }] } } as never);
+    await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+      status: "succeeded", createdAt: t0, startedAt: t0, finishedAt: new Date(t0.getTime() + 60_000), contextSnapshot: { issueId } });
+    const providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
+    // A warm box from an older release: retained (still running), and no reusableSandboxLease.adapterType recorded.
+    await db.insert(environmentLeases).values({ id: oldLeaseId, companyId, environmentId, issueId, heartbeatRunId: oldRunId,
+      provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "retained", acquiredAt: t0,
+      metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, pluginKey: "paperclip.boat", agentId, ...environment!.config,
+        pendingCleanupInFlight: false } });
+    await db.insert(heartbeatRuns).values({ id: followUpId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+      status: "running", createdAt: new Date(Date.now() - 60_000), startedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId } });
+    const drifted = { ...environment!.config, image: "boot-source-after-upgrade" };
+    await db.update(environments).set({ config: drifted }).where(eq(environments.id, environmentId));
+    const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
+      if (method === "environmentAcquireLease") return { providerLeaseId: "bx-fresh", metadata: { ...drifted, remoteCwd: "/workspace" } };
+      if (method === "environmentDestroyLease") return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+      throw new Error(`unexpected provider call ${method}`);
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease"] }),
+    } as unknown as PluginWorkerManager });
+    const acquired = await runtime.acquireRunLease({ companyId, environment: { ...environment!, config: drifted, envVars: {} } as unknown as Environment,
+      issueId, agentId, heartbeatRunId: followUpId, adapterType: null, persistedExecutionWorkspace: null } as never);
+    expect(acquired.lease.providerLeaseId).toBe("bx-fresh");
+    expect.soft(call.mock.calls.filter(([, method]) => method === "environmentDestroyLease"), "unknown adapter, no custody -> never destroyed")
+      .toEqual([]);
+    const [old] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
+    expect.soft(old, "stopped and kept through the stop-only owner: billing stops, the disk stays").toMatchObject({
+      status: "pending_cleanup", metadata: { sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId } } });
+  }, 60_000);
+
   // ---------------------------------------------------------------- B-5 + B-2
   // The kept held-notice writer returns early for the typed family (native-session-executor.ts noticeHeldUnfinishedPredecessor,
   // `if (freshThreadRefusalCode(error)) return`). After Cut B the typed family is an ordinary failure: the fallback continues it
