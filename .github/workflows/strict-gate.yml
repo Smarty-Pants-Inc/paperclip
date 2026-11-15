@@ -1,0 +1,151 @@
+name: Strict native Pi gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full commit SHA to qualify (must be present in this repository)
+        required: true
+        type: string
+      base_sha:
+        description: Base commit whose server typecheck diagnostic list the candidate must equal
+        required: false
+        type: string
+        default: 95e4d9523524578bd6b5aa8c548fe18a48d411cd
+
+permissions:
+  contents: read
+
+jobs:
+  strict-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    outputs:
+      runnerd_sha256: ${{ steps.digests.outputs.runnerd_sha256 }}
+      provider_pack_digest: ${{ steps.digests.outputs.provider_pack_digest }}
+      server_dist_sha256: ${{ steps.digests.outputs.server_dist_sha256 }}
+    env:
+      GATE_OUT: ${{ runner.temp }}/strict-gate/out
+      GATE_TMP: ${{ runner.temp }}/strict-gate/tmp
+      CARGO_TARGET_DIR: ${{ runner.temp }}/strict-gate/cargo-target
+      PAPERCLIP_PI_GATE_INCLUDE_STOP: "0"
+      PAPERCLIP_PI_E2E_CONTINUING_STRICT: "1"
+      PAPERCLIP_PI_E2E_PROTOCOL: messages
+      PAPERCLIP_PI_E2E_THINKING_LEVEL: xhigh
+      PAPERCLIP_PI_E2E_TOOL_CALL: "1"
+      PAPERCLIP_PI_E2E_BIG_OUTPUT_BYTES: 300000,1500000
+      PAPERCLIP_PI_E2E_FINISH: "1"
+      PAPERCLIP_PI_E2E_STRICT_CANDIDATE: "1"
+      PAPERCLIP_PI_E2E_EXPECT_FINISH_RED: "0"
+
+    steps:
+      - name: Checkout requested source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha }}
+          fetch-depth: 0
+
+      - name: Free runner disk (14 GB SSD; remove preinstalled toolchains this job does not use)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h /
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.0
+      - name: Activate pnpm 9.15.4
+        run: corepack enable && corepack prepare pnpm@9.15.4 --activate
+      - name: Cache the pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/pnpm/store
+          key: strict-gate-pnpm-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: strict-gate-pnpm-${{ runner.os }}-
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Cache Cargo registry and compiled target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ runner.temp }}/strict-gate/cargo-target
+          key: strict-gate-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'packages/paperclip-runner/runner/Cargo.toml', 'packages/paperclip-runner/rust-toolchain.toml') }}
+          restore-keys: strict-gate-cargo-${{ runner.os }}-
+
+      - name: Install native prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang cmake pkg-config libssl-dev libpq-dev python3
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build credential-free Pi home fixture
+        run: |
+          mkdir -p "$GATE_OUT" "$GATE_TMP"
+          bash scripts/build-pi-e2e-home-fixture.sh "$GATE_OUT/pi-home-fixture"
+          echo "PAPERCLIP_PI_E2E_HOME_FIXTURE=$GATE_OUT/pi-home-fixture" >> "$GITHUB_ENV"
+          echo "PAPERCLIP_PI_GATE_OUT=$GATE_OUT" >> "$GITHUB_ENV"
+          echo "PAPERCLIP_PI_GATE_LOCK=$GATE_OUT/build-and-gate.lock" >> "$GITHUB_ENV"
+          echo "TMPDIR=$GATE_TMP" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET_DIR" >> "$GITHUB_ENV"
+
+      - name: Run strict native Pi full-server gate
+        env:
+          PAPERCLIP_PI_GATE_OUT: ${{ runner.temp }}/strict-gate/out
+          PAPERCLIP_PI_GATE_LOCK: ${{ runner.temp }}/strict-gate/out/build-and-gate.lock
+          PAPERCLIP_PI_E2E_HOME_FIXTURE: ${{ runner.temp }}/strict-gate/out/pi-home-fixture
+          TMPDIR: ${{ runner.temp }}/strict-gate/tmp
+        run: bash scripts/pi-rpc-full-server-gate.sh '${{ inputs.sha }}' candidate
+
+      - name: Compare server typecheck diagnostics with base
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ inputs.sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GATE_OUT/typecheck"
+          base="$RUNNER_TEMP/strict-gate/base"
+          git worktree add --detach "$base" "$BASE_SHA"
+          # Persist the exact base diagnostic list before running the candidate.
+          # Both commands use the pinned toolchain; pnpm's shared content-addressed
+          # store is warm, while each checkout gets its own workspace links.
+          (cd "$base" && pnpm install --frozen-lockfile && pnpm --filter @paperclipai/server typecheck) > "$GATE_OUT/typecheck/base.raw.log" 2>&1 || true
+          (grep -E '(^|/)[^ ]+\.(tsx?|mts|cts)\([0-9]+,[0-9]+\): error TS[0-9]+' "$GATE_OUT/typecheck/base.raw.log" | sed "s#^$base/##" | sort -u || true) > "$GATE_OUT/typecheck/base.diagnostics.txt"
+          (pnpm --filter @paperclipai/server typecheck) > "$GATE_OUT/typecheck/candidate.raw.log" 2>&1 || true
+          (grep -E '(^|/)[^ ]+\.(tsx?|mts|cts)\([0-9]+,[0-9]+\): error TS[0-9]+' "$GATE_OUT/typecheck/candidate.raw.log" | sed "s#^$GITHUB_WORKSPACE/##" | sort -u || true) > "$GATE_OUT/typecheck/candidate.diagnostics.txt"
+          diff -u "$GATE_OUT/typecheck/base.diagnostics.txt" "$GATE_OUT/typecheck/candidate.diagnostics.txt"
+          printf 'base=%s candidate=%s\n' "$(wc -l < "$GATE_OUT/typecheck/base.diagnostics.txt")" "$(wc -l < "$GATE_OUT/typecheck/candidate.diagnostics.txt")"
+
+      - name: Publish gate digests as job outputs
+        id: digests
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          receipt=$(find "$GATE_OUT" -name artifacts.json -type f -print -quit || true)
+          if [[ -n "$receipt" ]]; then
+            echo "runnerd_sha256=$(jq -r '.runnerBinarySha256' "$receipt")" >> "$GITHUB_OUTPUT"
+            echo "provider_pack_digest=$(jq -r '.providerPackDigest' "$receipt")" >> "$GITHUB_OUTPUT"
+            echo "server_dist_sha256=$(jq -r '.serverDistTreeSha256' "$receipt")" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload phases, digests, receipt and typecheck lists
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strict-pi-gate-${{ inputs.sha }}
+          path: |
+            ${{ runner.temp }}/strict-gate/out/**/phases.log
+            ${{ runner.temp }}/strict-gate/out/**/artifacts.json
+            ${{ runner.temp }}/strict-gate/out/**/receipt.json
+            ${{ runner.temp }}/strict-gate/out/typecheck/
+          if-no-files-found: warn
+          retention-days: 14
