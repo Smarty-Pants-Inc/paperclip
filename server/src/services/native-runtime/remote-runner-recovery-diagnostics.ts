@@ -79,6 +79,14 @@ export function boundRemoteRunnerExitEvidence(output: string, redact: (text: str
   }).join("\n");
 }
 
+/** Run-log line for process verification: exit 45 is the identity check's result, not the Runner's exit code. */
+export function describeExitedRemoteRunnerRunLog(diagnostic: RemoteRunnerRecoveryDiagnostic): string | null {
+  if (diagnostic.stage !== "process_verification" || diagnostic.reason !== "process_not_running") return null;
+  return diagnostic.runnerExitEvidence
+    ? `runner process is not running (identity check exit 45); last lines:\n${diagnostic.runnerExitEvidence}`
+    : "runner process is not running (identity check exit 45); last lines unavailable: runner stderr evidence is missing or unreadable";
+}
+
 export function describeExitedRemoteRunner(state: Record<string, unknown>): Pick<RemoteRunnerRecoveryDiagnostic,
   "runnerLifecycle" | "runnerSettled"> {
   const lifecycle = state.lifecycle;
