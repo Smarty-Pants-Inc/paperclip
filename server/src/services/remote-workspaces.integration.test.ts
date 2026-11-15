@@ -1,4 +1,7 @@
-import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
+import { parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE } from "../vendor/paperclip-runner/index.js";
+import { assertNativeRetainedSandboxBinding } from "./native-runtime/native-controller-recovery.js";
+import { prepareNativeHeartbeatRun } from "./native-runtime/prepare-native-run.js";
+import { nativeToolContractFingerprintForTarget, rebindNativeSessionCheckpoint } from "./native-runtime/native-session-resume.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd, canRestoreMigratedNativeSession } from "./native-runtime/native-workspace-migration.js";
 import { buildNativeHarnessBackupManifest, verifyNativeHarnessBackup } from "./native-runtime/native-session-executor.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -13,8 +16,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agents, agentTaskSessions, agentWakeupRequests, applyPendingMigrations, closeRegisteredClients, companies, createDb, environmentLeases, environments,
-  subscribeDatabaseWork, executionWorkspaceRepositories, executionWorkspaces, executionWorkspaceSnapshots, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, livenessDb, nativeRunFinalizations, projects, projectWorkspaces, workspaceOperations } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, agentWakeupRequests, applyPendingMigrations, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases, environments,
+  subscribeDatabaseWork, executionWorkspaceRepositories, executionWorkspaces, executionWorkspaceSnapshots, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issueThreadInteractions, issues, livenessDb, nativeRunFinalizations, nativeRunResults, projects, projectWorkspaces, workspaceOperations } from "@paperclipai/db";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { buildProjectMentionHref, type Environment, type EnvironmentLease } from "@paperclipai/shared";
@@ -107,10 +110,12 @@ suite("remote workspace lifecycle with real Postgres and independent filesystem 
     await db.delete(activityLog).where(eq(activityLog.companyId, ids.company));
     await db.delete(environmentLeases).where(eq(environmentLeases.companyId, ids.company));
     await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.companyId, ids.company));
+    await db.delete(nativeRunResults).where(eq(nativeRunResults.companyId, ids.company));
     await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, ids.company));
     await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.companyId, ids.company));
     await db.delete(agentTaskSessions).where(eq(agentTaskSessions.companyId, ids.company));
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.companyId, ids.company));
+    await db.delete(completionContracts).where(eq(completionContracts.companyId, ids.company));
     await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, ids.company));
     await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.companyId, ids.company));
     await db.delete(executionWorkspaces).where(eq(executionWorkspaces.companyId, ids.company));
@@ -156,6 +161,200 @@ suite("remote workspace lifecycle with real Postgres and independent filesystem 
   const reserve = (source: Parameters<typeof reserveRemoteWorkspace>[0]["source"]) => reserveRemoteWorkspace({ db, storage,
     companyId: ids.company, issueId: ids.issue, runId: ids.run, agentId: ids.agent, environmentId: ids.environment,
     projectId: null, projectWorkspaceId: null, existingWorkspaceId: null, source });
+
+  // Keep reason: BEN-37/BEN-48 allocator failure class and retained-session/data
+  // safety boundary. Real DB/filesystem preparation; only the provider is fake.
+  async function echoResume(existing: EnvironmentLease, remote: Awaited<ReturnType<typeof target>>) {
+    const storedCwd = existing.metadata!.remoteCwd as string;
+    const pluginId = randomUUID();
+    const call = vi.fn(async (_id: string, method: string, params: {
+      providerLeaseId: string; requestedCwd?: string; leaseMetadata: { remoteCwd: string };
+    }) => {
+      expect(method).toBe("environmentResumeLease");
+      expect(params.providerLeaseId).toBe(existing.providerLeaseId);
+      // Boat's requested-cwd equality fence must NOT be normalized away.
+      const requestedCwd = params.requestedCwd ?? params.leaseMetadata.remoteCwd;
+      if (requestedCwd !== storedCwd) throw new Error("requestedCwd != stored remoteCwd");
+      return { providerLeaseId: existing.providerLeaseId, metadata: { remoteCwd: storedCwd } };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: {
+      isRunning: () => true, getWorker: () => ({ supportedMethods: ["environmentResumeLease"] }), call,
+    } as never });
+    const [environment] = await db.select().from(environments).where(eq(environments.id, ids.environment));
+    const input = { environment: environment as Environment, lease: { ...existing, metadata: {
+      ...existing.metadata, sandboxProviderPlugin: true, pluginId, provider: "echo-boat",
+    } }, requestedCwd: storedCwd };
+    await expect(runtime.resumeRunLease({ ...input, requestedCwd: `${storedCwd}/wrong` }))
+      .rejects.toThrow("requestedCwd != stored remoteCwd");
+    const resumed = await runtime.resumeRunLease(input);
+    expect(call.mock.calls.at(-1)![2]).toMatchObject({ requestedCwd: storedCwd, leaseMetadata: { remoteCwd: storedCwd } });
+    return { ...remote, remoteCwd: resumed.metadata!.remoteCwd as string };
+  }
+
+  async function retainSession(prepared: Awaited<ReturnType<typeof prepareRemoteWorkspace>>, kind: "codex" | "pi_rpc") {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ids.run));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, ids.issue));
+    const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: ids.lease });
+    const [admitted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, ids.run));
+    const execution = parseNativeExecutionInput({ schema: "paperclip.native-execution-input.v1",
+      binding: { companyId: ids.company, agentId: ids.agent, issueId: ids.issue, runId: ids.run, executionWorkspaceId: prepared.workspace.id },
+      provider: kind === "codex" ? { kind, model: null } : { kind, model: "paperclip/faux", profile: QUALIFIED_PI_RPC_PROFILE },
+      task: { identifier: "RWP-1", title: issue.title, description: null, prompt: "Continue retained work", workMode: "standard" },
+      workspace: { cwd: prepared.remoteRoot, repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: native.normalizedSessionId, driverKind: kind === "codex" ? "codex_app_server" : kind,
+        protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } },
+      completionContract: { id: admitted.completionContractId, sha256: admitted.completionContractSha256,
+        schemaVersion: "paperclip.completion-contract.v1", contract: { revision: "1", objective: issue.title,
+          criteria: [{ id: "objective", requirement: "Retain the conversation" }] } }, credentialBindings: [], interactionResponses: [] });
+    const checkpoint = { backendKind: "runner", driverKind: execution.session.driverKind, sessionId: `${kind}-session`,
+      providerSessionId: `${kind}-session`, identity: { companyId: ids.company, agentId: ids.agent, issueId: ids.issue,
+        runId: ids.run, sessionId: native.normalizedSessionId }, cursor: null, activeTurnId: null,
+      terminal: null, terminalTurns: [], pendingRuntimeRequests: [] };
+    const profile = { nativeExecutionInput: execution, sessionCheckpoint: checkpoint,
+      nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("remote", kind) };
+    const [result] = await db.insert(nativeRunResults).values({ companyId: ids.company, issueId: ids.issue, runId: ids.run,
+      completionContractId: admitted.completionContractId!, serverFingerprint: "retained", schemaStatus: "accepted",
+      resultJson: {}, canonicalSha256: "retained" }).returning();
+    await db.insert(nativeRunFinalizations).values({ companyId: ids.company, issueId: ids.issue, runId: ids.run,
+      phase: "committed", resultId: result.id });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: profile, status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, ids.run));
+    const sessionFile = path.join(prepared.remoteRoot, ".paperclip-runtime", `${kind}-session.json`);
+    await fs.writeFile(sessionFile, JSON.stringify(checkpoint));
+    return async (current: Awaited<ReturnType<typeof prepareRemoteWorkspace>>, remote: Awaited<ReturnType<typeof target>>, runId: string) => {
+      await expect(assertNativeRetainedSandboxBinding(db, { companyId: ids.company, issueId: ids.issue, runId: ids.run,
+        target: { ...remote, environmentId: ids.environment, leaseId: current.lease.id, providerKey: prepared.lease.provider,
+          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: prepared.lease.providerLeaseId! } } as never }))
+        .resolves.toEqual({ remoteCwd: prepared.remoteRoot });
+      const rebound = rebindNativeSessionCheckpoint({ previousRun: { id: ids.run, companyId: ids.company,
+        agentId: ids.agent, nativeSessionId: native.normalizedSessionId, runnerProfileJson: profile }, executionTargetKind: "remote",
+        currentExecution: { ...execution, binding: { ...execution.binding, runId }, workspace: { ...execution.workspace, cwd: current.remoteRoot } } });
+      expect(rebound).toMatchObject({ sessionId: checkpoint.sessionId, providerSessionId: checkpoint.providerSessionId,
+        identity: { sessionId: native.normalizedSessionId, runId } });
+      expect(JSON.parse(await fs.readFile(sessionFile, "utf8"))).toEqual(checkpoint);
+    };
+  }
+
+  async function nextWriter(workspaceId: string, providerLeaseId: string) {
+    const runId = randomUUID(), leaseId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: ids.company, agentId: ids.agent,
+      nativeIssueId: ids.issue, runtimeMode: "native", status: "running" });
+    const [leased] = await db.insert(environmentLeases).values({ id: leaseId, companyId: ids.company,
+      environmentId: ids.environment, heartbeatRunId: runId, issueId: ids.issue, provider: "daytona", providerLeaseId, status: "active" }).returning();
+    const reserved = await reserveRemoteWorkspace({ db, storage, companyId: ids.company, issueId: ids.issue, runId,
+      agentId: ids.agent, environmentId: ids.environment, projectId: null, projectWorkspaceId: null,
+      existingWorkspaceId: workspaceId, source: { kind: "empty" } });
+    return { runId, lease: leased as EnvironmentLease, workspace: reserved };
+  }
+
+  it.each(["codex", "pi_rpc"] as const)("echoing provider keeps %s continuity on shared A -> B -> A without nesting", async kind => {
+    const [project] = await db.insert(projects).values({ companyId: ids.company, name: "Shared daily workspace shape" }).returning();
+    const [source] = await db.insert(projectWorkspaces).values({ companyId: ids.company, projectId: project.id, name: "Shared source" }).returning();
+    const reserved = await reserveRemoteWorkspace({ db, storage, companyId: ids.company, issueId: ids.issue, runId: ids.run,
+      agentId: ids.agent, environmentId: ids.environment, projectId: project.id, projectWorkspaceId: source.id,
+      existingWorkspaceId: null, mode: "shared_workspace", source: { kind: "empty" } });
+    expect(reserved.mode).toBe("shared_workspace");
+    const first = await target("echo-A"), base = first.remoteCwd;
+    const prepared = await prepareRemoteWorkspace({ db, storage, workspace: reserved, runId: ids.run, lease: await lease(), target: first });
+    await fs.writeFile(path.join(prepared.remoteRoot, "parent.md"), "parent work\n");
+    await saveRemoteWorkspace({ db, storage, workspace: prepared.workspace, runId: ids.run, lease: prepared.lease,
+      target: first, assertOwned: async () => undefined });
+    const assertSession = await retainSession(prepared, kind);
+    const child = await nextWriter(reserved.id, "allocation-B"), second = await target("echo-B");
+    const childPrepared = await prepareRemoteWorkspace({ db, storage, ...child, target: second });
+    await fs.writeFile(path.join(childPrepared.remoteRoot, "child.md"), "child work\n");
+    await saveRemoteWorkspace({ db, storage, workspace: childPrepared.workspace, runId: child.runId,
+      lease: childPrepared.lease, target: second, assertOwned: async () => undefined });
+    const resumed = await echoResume(prepared.lease, first);
+    expect(resumed.remoteCwd).toBe(prepared.remoteRoot);
+    const parent = await nextWriter(reserved.id, prepared.lease.providerLeaseId!);
+    const restored = await prepareRemoteWorkspace({ db, storage, ...parent, target: resumed });
+    expect(path.dirname(restored.remoteRoot)).toBe(path.join(base, ".paperclip-workspaces"));
+    expect(restored.remoteRoot).toBe(prepared.remoteRoot);
+    expect(await fs.readFile(path.join(restored.remoteRoot, "child.md"), "utf8")).toBe("child work\n");
+    await assertSession(restored, resumed, parent.runId);
+  }, 60_000);
+
+  it.each([ ["codex", "fresh"], ["codex", "nested"], ["pi_rpc", "fresh"], ["pi_rpc", "nested"] ] as const)(
+    "echoing provider leaves existing %s %s leases in place", async (kind, shape) => {
+    // SMA-4/no-project shape: source resolution selects an empty per-task
+    // workspace, never automatic project sharing.
+    const resolved = await resolveRemoteWorkspaceSource(db, { companyId: ids.company, issueId: ids.issue,
+      agentId: ids.agent, runId: ids.run, responsibleUserId: null, projectId: null, projectWorkspaceId: null });
+    if (resolved.authority !== "remote") throw new Error("Expected projectless remote source");
+    expect(resolved.source).toMatchObject({ kind: "empty" });
+    const reserved = await reserve(resolved.source), first = await target("existing-echo");
+    expect(reserved).toMatchObject({ projectId: null, projectWorkspaceId: null, mode: "isolated_workspace" });
+    let prepared = await prepareRemoteWorkspace({ db, storage, workspace: reserved, runId: ids.run, lease: await lease(), target: first });
+    // Seed a pre-fix nested lease without asking the fixed allocator to create it.
+    if (shape === "nested") {
+      const nested = path.join(prepared.remoteRoot, ".paperclip-workspaces", path.basename(prepared.remoteRoot));
+      await fs.cp(prepared.remoteRoot, path.join(root, "nested-seed"), { recursive: true });
+      await fs.cp(path.join(root, "nested-seed"), nested, { recursive: true });
+      const authority = readRemoteWorkspaceAuthority(prepared.workspace.metadata)!;
+      const [savedWorkspace] = await db.update(executionWorkspaces).set({ cwd: nested, providerRef: nested,
+        metadata: { ...prepared.workspace.metadata, remoteWorkspace: { ...authority, location: { ...authority.location!, remoteCwd: nested } } } })
+        .where(eq(executionWorkspaces.id, reserved.id)).returning();
+      const [savedLease] = await db.update(environmentLeases).set({ metadata: { ...prepared.lease.metadata, remoteCwd: nested } })
+        .where(eq(environmentLeases.id, ids.lease)).returning();
+      prepared = { ...prepared, workspace: savedWorkspace, lease: savedLease as EnvironmentLease, remoteRoot: nested };
+    }
+    await saveRemoteWorkspace({ db, storage, workspace: prepared.workspace, runId: ids.run, lease: prepared.lease,
+      target: { ...first, remoteCwd: prepared.remoteRoot }, assertOwned: async () => undefined });
+    const assertSession = await retainSession(prepared, kind);
+    const resumed = await echoResume(prepared.lease, first), currentCwd = resumed.remoteCwd;
+    const parent = await nextWriter(reserved.id, prepared.lease.providerLeaseId!);
+    const continued = await prepareRemoteWorkspace({ db, storage, ...parent, target: resumed });
+    expect(continued.remoteRoot).toBe(currentCwd);
+    await assertSession(continued, resumed, parent.runId);
+    expect(await fs.readdir(path.join(currentCwd, ".paperclip-runtime"))).toContain(`${kind}-session.json`);
+  }, 60_000);
+
+  it.each(["single", "repeated", "legacy"] as const)("echoing provider peels only this workspace's recorded %s allocation on a new join", async shape => {
+    const reserved = await reserve({ kind: "empty" }), remote = await target(`peel-${shape}`), base = remote.remoteCwd;
+    const prepared = await prepareRemoteWorkspace({ db, storage, workspace: reserved, runId: ids.run, lease: await lease(), target: remote });
+    await saveRemoteWorkspace({ db, storage, workspace: prepared.workspace, runId: ids.run, lease: prepared.lease,
+      target: remote, assertOwned: async () => undefined });
+    const authority = readRemoteWorkspaceAuthority((await workspace(reserved.id)).metadata)!;
+    const echoedCwd = shape === "repeated" ? path.join(prepared.remoteRoot, ".paperclip-workspaces", path.basename(prepared.remoteRoot))
+      : shape === "legacy" ? path.join(base, ".paperclip-workspaces", reserved.id) : prepared.remoteRoot;
+    await fs.mkdir(echoedCwd, { recursive: true });
+    if (shape === "legacy") await fs.writeFile(path.join(echoedCwd, "unknown.txt"), "never replace an unknown occupant\n");
+    const oldLease = { ...prepared.lease, metadata: { ...prepared.lease.metadata, remoteCwd: echoedCwd } };
+    // A pre-publish handoff has no saved directory name: allocation falls back
+    // to the current epoch/lease, not the old provider echo's epoch/lease.
+    await db.update(executionWorkspaces).set({ providerRef: shape === "legacy" ? echoedCwd : null,
+      metadata: { ...prepared.workspace.metadata, remoteWorkspace: { ...authority,
+        snapshotId: shape === "legacy" ? authority.snapshotId : null, location: null } } })
+      .where(eq(executionWorkspaces.id, reserved.id));
+    const parent = await nextWriter(reserved.id, prepared.lease.providerLeaseId!);
+    const resumed = await echoResume(oldLease, remote);
+    if (shape === "legacy") {
+      // Canonicalization must reach (and retain) the occupied-root fence, not
+      // evade it by restoring a child beneath an unknown user directory.
+      await expect(prepareRemoteWorkspace({ db, storage, ...parent, target: resumed })).rejects.toThrow("occupied_root");
+      expect(await fs.readFile(path.join(echoedCwd, "unknown.txt"), "utf8")).toBe("never replace an unknown occupant\n");
+      expect(resumed.remoteCwd).toBe(echoedCwd);
+      return;
+    }
+    const continued = await prepareRemoteWorkspace({ db, storage, ...parent, target: resumed });
+    expect(path.dirname(continued.remoteRoot)).toBe(path.join(base, ".paperclip-workspaces"));
+    expect(path.basename(continued.remoteRoot)).toBe(`${reserved.id}-${readRemoteWorkspaceAuthority(parent.workspace.metadata)!.epoch}-${parent.lease.id}`);
+    expect((await fs.stat(echoedCwd)).isDirectory()).toBe(true);
+  }, 60_000);
+
+  it.each(["middle", "foreign", "lookalike", "own-middle", "zero-epoch", "malformed-lease", "suffix", "unpublished-bare"] as const)("does not strip a user's .paperclip-workspaces path (%s)", async shape => {
+    const reserved = await reserve({ kind: "empty" }), remote = await target(`user-${shape}`);
+    const name = shape === "foreign" ? `${randomUUID()}-1-${ids.lease}` : shape === "lookalike" ? `${reserved.id}-notes`
+      : shape === "zero-epoch" ? `${reserved.id}-0-${ids.lease}` : shape === "malformed-lease" ? `${reserved.id}-1-not-a-lease`
+      : shape === "unpublished-bare" ? reserved.id : `${reserved.id}-1-${ids.lease}${shape === "suffix" ? "-extra" : ""}`;
+    remote.remoteCwd = path.join(remote.remoteCwd, ".paperclip-workspaces", name,
+      ...(["middle", "own-middle"].includes(shape) ? ["project"] : []));
+    await fs.mkdir(remote.remoteCwd, { recursive: true });
+    const base = remote.remoteCwd;
+    const prepared = await prepareRemoteWorkspace({ db, storage, workspace: reserved, runId: ids.run, lease: await lease(), target: remote });
+    expect(path.dirname(prepared.remoteRoot)).toBe(path.join(base, ".paperclip-workspaces"));
+  });
 
   it("keeps a fresh preparation timeout eligible for bounded bootstrap recovery", async () => {
     const reserved = await reserve({ kind: "empty" }), remote = await target("timed-out-bootstrap");
