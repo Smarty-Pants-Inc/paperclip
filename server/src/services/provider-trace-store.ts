@@ -28,6 +28,7 @@ function providerTraceExpired(expiresAt: Date, now: Date): boolean {
 const EXPIRED_PROVIDER_TRACE_REF = "00000000-0000-0000-0000-000000000000.ndjson";
 
 export function providerTraceRequiredChannels(provider: string): string[] {
+  if (provider === "pi_rpc") return [];
   if (provider === "opencode") return ["typescript_opencode_native"];
   if (provider === "acpx") return ["typescript_acpx_native"];
   return ["rust_native", "typescript_runnerd_rehydration"];

@@ -16,7 +16,7 @@ vi.mock("node:fs", async (importOriginal) => {
 
 afterEach(() => vi.restoreAllMocks());
 
-async function fixture(filePresent: boolean) {
+async function fixture(filePresent: boolean, tracing = true) {
   const directory = await mkdtemp(join(tmpdir(), "runnerd-pending-trace-"));
   const path = join(directory, "trace.ndjson");
   if (filePresent) writeFileSync(path, "");
@@ -33,7 +33,7 @@ async function fixture(filePresent: boolean) {
     runnerBinary: defaultCapabilityRunnerdBinary(),
     codexCommand: fakeCodex,
     codexArgs: fakeCodexArgs(directory),
-    environment: { PAPERCLIP_PROVIDER_TRACE_PATH: path },
+    environment: tracing ? { PAPERCLIP_PROVIDER_TRACE_PATH: path } : {},
     runnerProcessLauncher: (spec) => {
       const environment = { ...spec.environment };
       delete environment.PAPERCLIP_PROVIDER_TRACE_PATH;
@@ -74,6 +74,25 @@ const interpretation = (id: string, method = "item/started") => ({
   emittedEventIds: [`canonical:${id}:${method}`],
   reason: "Mapped notification",
 });
+
+it("does not index, retry, or write raw-trace sidecars when no trace path is set", async () => {
+  const locate = vi.spyOn(RunnerdTraceFrameIndex.prototype, "locate");
+  const f = await fixture(false, false);
+  try {
+    for (let i = 0; i < 512; i++) f.transport.recordTraceInterpretation!(interpretation(`untraced-${i}`));
+    for (let i = 0; i < 12; i++) await f.pump();
+    await expect(f.transport.request("thread/read", {})).resolves.toHaveProperty("thread");
+    await f.transport.close();
+    expect(locate).not.toHaveBeenCalled();
+    expect(existsSync(f.path)).toBe(false);
+    expect(existsSync(`${f.path}.rehydration`)).toBe(false);
+    expect(f.evidence().diagnostics).not.toEqual(expect.arrayContaining([
+      expect.stringContaining("typescript_rehydration_retry_limit"),
+    ]));
+  } finally {
+    await f.cleanup();
+  }
+}, 30_000);
 
 it.each([false, true])("bounds filesystem calls across M pending entries and K real pumps (file present: %s)", async (filePresent) => {
   const f = await fixture(filePresent);
