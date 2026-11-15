@@ -167,7 +167,7 @@ export const agentDirectoryTransferCleanupProgram = `${childNameHelper} const re
  * rm -rf, which follows intermediate symlinks. All removals use pinned parents;
  * a missing root is already clean, and an unsafe root stays cleanup-pending. */
 export const agentDirectoryConfinedCleanupProgram = String.raw`
-const fs=require('node:fs'),path=require('node:path');
+const fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 if(process.platform!=='linux')throw Error('Confined cleanup unavailable');
 const forbidden=p=>/(^|\/)paperclip-runner\/sessions(\/|$)/.test(p)||(/(^|\/)pi\//.test(p)&&p.endsWith('.jsonl'));
 for(const request of JSON.parse(process.argv[1])){
@@ -184,9 +184,56 @@ for(const request of JSON.parse(process.argv[1])){
       try{fd=pin(at(fd,segment));}catch(error){if(error.code==='ENOENT'){missing=true;break;}throw error;}
     }
     if(missing)continue;
+    const rootPins=pins.slice();
     if(expected&&identity(fs.fstatSync(fd,{bigint:true}))!==expected)throw Error('Cleanup root replaced');
     // Metadata-only observation for a later durable scratch-cleanup grant.
     if(request.inspect===true){verify();process.stdout.write(identity(fs.fstatSync(fd,{bigint:true})));continue;}
+    // Exclusively create a private directory beside the entry; its empty slot
+    // is an atomic, no-replace rename destination on the same filesystem.
+    const makePrivateDir=parent=>{
+      for(let attempt=0;attempt<8;attempt++){
+        const name='.paperclip-retire-'+crypto.randomUUID(), filename=at(parent,name);
+        try{fs.mkdirSync(filename,{mode:0o700});return {name,fd:pin(filename)};}
+        catch(error){if(error.code!=='EEXIST')throw error;}
+      }
+      throw Error('Unable to allocate private retirement name');
+    };
+    const makeRetainedDir=(parent,name)=>{
+      const filename=at(parent,name);
+      try{fs.mkdirSync(filename,{mode:0o700});}catch(error){if(error.code!=='EEXIST')throw error;}
+      return pin(filename);
+    };
+    // Retained traces are siblings of the root's parent, outside every root
+    // walked here and every per-run refresh destination.
+    const retainMoved=(source,stat)=>{
+      const outer=rootPins[Math.max(0,rootPins.length-3)].fd;
+      const retained=makeRetainedDir(outer,'.paperclip-retained');
+      const runName=(typeof request.runId==='string'?request.runId:path.basename(path.dirname(root))).replace(/[^A-Za-z0-9_-]/g,'_').slice(0,128)||'unknown';
+      const runFd=makeRetainedDir(retained,runName), timestamp=Date.now()+'-'+crypto.randomUUID();
+      const timeFd=makeRetainedDir(runFd,timestamp), filename=path.basename(root)+'-'+crypto.randomUUID();
+      const destination=at(timeFd,filename), fileIdentity=String(stat.dev)+':'+String(stat.ino);
+      fs.renameSync(source,destination);
+      process.stderr.write('PAPERCLIP_RETAINED path='+path.join(path.dirname(path.dirname(root)),'.paperclip-retained',runName,timestamp,filename)+' identity='+fileIdentity+' size='+String(stat.size)+'\n');
+    };
+    const unpin=fd=>{const index=pins.findIndex(pin=>pin.fd===fd);if(index>=0){fs.closeSync(fd);pins.splice(index,1);}};
+    const retireFile=(directory,name,source,observed)=>{
+      let file=null,pinnedStat=null;
+      try{file=fs.openSync(source,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);pinnedStat=fs.fstatSync(file,{bigint:true});
+        if(pinnedStat.dev!==observed.dev||pinnedStat.ino!==observed.ino){fs.closeSync(file);file=null;pinnedStat=null;}
+      }catch(error){if(file!==null)fs.closeSync(file);file=null;pinnedStat=null;}
+      const privateDir=makePrivateDir(directory), filename=at(privateDir.fd,'entry');
+      try{
+        verify();
+        try{fs.renameSync(source,filename);}catch(error){if(error.code==='ENOENT')return;throw error;}
+        const moved=fs.lstatSync(filename,{bigint:true});
+        if(file!==null&&pinnedStat.dev===moved.dev&&pinnedStat.ino===moved.ino){verify();fs.unlinkSync(filename);}
+        else retainMoved(filename,moved);
+      }finally{
+        if(file!==null)fs.closeSync(file);
+        try{fs.rmdirSync(at(directory,privateDir.name));}catch(error){if(error.code!=='ENOENT')throw error;}
+        unpin(privateDir.fd);
+      }
+    };
     let count=0;
     const remove=(directory,relative='')=>{
       for(const name of fs.readdirSync('/proc/self/fd/'+directory)){
@@ -196,7 +243,7 @@ for(const request of JSON.parse(process.argv[1])){
         if(s.isSymbolicLink())throw Error('Unsafe cleanup link');
         if(s.isDirectory()){
           const child=pin(filename);remove(child,next);verify();fs.rmdirSync(filename);forget(child);
-        }else{if(!s.isFile())throw Error('Unsafe cleanup entry');verify();fs.unlinkSync(filename);}
+        }else{if(!s.isFile())throw Error('Unsafe cleanup entry');retireFile(directory,name,filename,s);}
       }
     };
     verify();remove(fd);verify();const rootPin=pins.find(p=>p.fd===fd);fs.rmdirSync(rootPin.name);forget(fd);
@@ -204,9 +251,9 @@ for(const request of JSON.parse(process.argv[1])){
 }
 `;
 
-export async function removeLocalAgentDirectoryConfined(root: string, identity?: string) {
+export async function removeLocalAgentDirectoryConfined(root: string, identity?: string, runId?: string) {
   await new Promise<void>((resolve, reject) => {
-    childProcess.execFile(process.execPath, ["-e", agentDirectoryConfinedCleanupProgram, JSON.stringify([{ root, identity }])], {
+    childProcess.execFile(process.execPath, ["-e", agentDirectoryConfinedCleanupProgram, JSON.stringify([{ root, identity, runId }])], {
       cwd: "/", env: {}, timeout: 15_000, maxBuffer: 4096, killSignal: "SIGKILL",
     }, error => { if (error) reject(error); else resolve(); });
   });

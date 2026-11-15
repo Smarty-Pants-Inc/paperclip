@@ -53,7 +53,7 @@ function cleanupCommand(row: Copy, paths: string[]): string {
   const roots = paths.map(root => {
     const physicalIdentity = root === row.executionRoot ? identity : row.receipt?.transferCleanupIdentity;
     if (typeof physicalIdentity !== "string" || !/^[0-9]+:[0-9]+:[0-9]+$/.test(physicalIdentity)) throw new Error("Cleanup root has no physical authority");
-    return { root, identity: physicalIdentity };
+    return { root, identity: physicalIdentity, runId: row.runId };
   });
   return `node -e ${quote(agentDirectoryConfinedCleanupProgram)} ${quote(JSON.stringify(roots))}`;
 }
@@ -711,7 +711,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     if (completed.has(row.state) && row.processStoppedAt) {
       try {
-        await removeLocalAgentDirectoryConfined(path.dirname(row.localRoot), row.receipt!.localCleanupIdentity as string);
+        await removeLocalAgentDirectoryConfined(path.dirname(row.localRoot), row.receipt!.localCleanupIdentity as string, row.runId);
       }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.

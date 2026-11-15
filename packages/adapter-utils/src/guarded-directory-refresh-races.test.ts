@@ -61,6 +61,7 @@ describe.skipIf(process.platform !== "linux")("write-time file authority", () =>
     expect(result.status).toBe(0);
     expect(await fs.readdir(f.root)).toEqual([]);
     await expect(fs.stat(path.join(f.home, ".paperclip-retained"))).rejects.toMatchObject({ code: "ENOENT" });
+    console.log(JSON.stringify({ case: "ordinary-removal", retainedBytes: 0, checkpointBytesRetained: 0 }));
   });
 
   it.each(["removal", "replacement"] as const)("retains a Codex-shaped file renamed into a path scheduled for %s", async kind => {
@@ -85,6 +86,7 @@ describe.skipIf(process.platform !== "linux")("write-time file authority", () =>
     expect(retainedFiles).toEqual([bytes]);
     expect(result.stderr).toMatch(/PAPERCLIP_RETAINED .* identity=[0-9]+:[0-9]+ size=[0-9]+/);
     expect(result.status).not.toBe(0);
+    console.log(JSON.stringify({ case: kind, retainedBytes: retainedFiles.reduce((total, value) => total + Buffer.byteLength(value), 0), checkpointBytesRetained: 0 }));
     const rootEntries = JSON.parse(await directoryRefreshPayload(f.root));
     expect(rootEntries.map((entry: { name: string }) => entry.name)).not.toContain(".paperclip-retained");
   });

@@ -65,7 +65,7 @@ const pin=(name,parent)=>{
 };
 let fd=pin('/');
 for(const segment of root.split('/').filter(Boolean)) fd=pin('/proc/self/fd/'+fd+'/'+segment,fd);
-const rootFd=fd;
+const rootFd=fd, rootAncestors=pinned.slice();
 const at=(fd,name)=>'/proc/self/fd/'+fd+'/'+name;
 const verify=()=>{
   for(const p of pinned){
@@ -138,6 +138,51 @@ try {
       if(hash.digest('hex')!==old.hash||stamp(fs.fstatSync(file,{bigint:true}))!==old.stamp||stamp(fs.lstatSync(filename,{bigint:true}))!==old.stamp) changed();
     }catch(error){if(error.code==='ENOENT'||error.code==='ELOOP')changed();throw error;}
   };
+  const unpin=fd=>{const i=pinned.findIndex(p=>p.fd===fd);if(i>=0){fs.closeSync(fd);pinned.splice(i,1);}};
+  // A freshly mkdir'd private directory in the same parent gives rename an
+  // empty, exclusive destination on the same filesystem (no replace window).
+  const makePrivateDir=parent=>{
+    for(let attempt=0;attempt<8;attempt++){
+      const name='.paperclip-retire-'+crypto.randomUUID(), filename=at(parent,name);
+      try{fs.mkdirSync(filename,{mode:0o700});return {name,fd:pin(filename,parent)};}
+      catch(error){if(error.code!=='EEXIST')throw error;}
+    }
+    throw Error('Unable to allocate private retirement name');
+  };
+  const makeRetainedDir=(parent,name)=>{
+    const filename=at(parent,name);
+    try{fs.mkdirSync(filename,{mode:0o700});}catch(error){if(error.code!=='EEXIST')throw error;}
+    return pin(filename,parent);
+  };
+  // Retention sits beside the root's parent, never beneath a later refresh
+  // destination or cleanup root. The parent chain is pinned above.
+  const retainMoved=(source,stat)=>{
+    const outer=rootAncestors[Math.max(0,rootAncestors.length-3)].fd;
+    const retained=makeRetainedDir(outer,'.paperclip-retained');
+    const runName=path.basename(path.dirname(root)).replace(/[^A-Za-z0-9_-]/g,'_').slice(0,128)||'unknown';
+    const runFd=makeRetainedDir(retained,runName), timestamp=Date.now()+'-'+crypto.randomUUID();
+    const timeFd=makeRetainedDir(runFd,timestamp), filename=path.basename(root)+'-'+crypto.randomUUID();
+    const destination=at(timeFd,filename), identity=String(stat.dev)+':'+String(stat.ino);
+    fs.renameSync(source,destination);
+    process.stderr.write('PAPERCLIP_RETAINED path='+path.join(path.dirname(path.dirname(root)),'.paperclip-retained',runName,timestamp,filename)+' identity='+identity+' size='+String(stat.size)+'\n');
+  };
+  const retireFile=name=>{
+    const previous=files.get(name);
+    if(previous)checkFile(name);else verify();
+    const parent=parentOf(name), source=at(parent,path.posix.basename(name));
+    const privateDir=makePrivateDir(parent), filename=at(privateDir.fd,'entry');
+    try{
+      verify();
+      try{fs.renameSync(source,filename);}catch(error){if(error.code==='ENOENT')changed();throw error;}
+      mutated=true;
+      const moved=fs.lstatSync(filename,{bigint:true}), pinnedStat=previous&&fs.fstatSync(previous.fd,{bigint:true});
+      if(previous&&pinnedStat.dev===moved.dev&&pinnedStat.ino===moved.ino){
+        verify();fs.unlinkSync(filename);files.delete(name);
+      }else{
+        retainMoved(filename,moved);files.delete(name);changed();
+      }
+    }finally{try{fs.rmdirSync(at(parent,privateDir.name));}catch(error){if(error.code!=='ENOENT')throw error;}unpin(privateDir.fd);}
+  };
   // Validate every checkpointed file before the first destination mutation, so
   // an already-dirty later file cannot be discovered only after earlier writes.
   for(const name of files.keys())checkFile(name);
@@ -150,15 +195,15 @@ try {
       const removed=directories.get(name); const i=pinned.findIndex(p=>p.fd===removed);
       try{fs.rmdirSync(filename);}catch(error){if(error.code==='ENOTEMPTY'||error.code==='EEXIST'||error.code==='ENOENT')changed();throw error;}
       mutated=true;if(i>=0){fs.closeSync(removed);pinned.splice(i,1);} directories.delete(name);
-    }else {checkFile(name); mutated=true; fs.unlinkSync(filename); files.delete(name);}
+    }else retireFile(name);
   }
   for(const e of [...entries].sort((a,b)=>a.name.split('/').length-b.name.split('/').length)){
     verify(); const parent=parentOf(e.name); if(parent===undefined) throw Error('Missing refresh parent');
-    const filename=at(parent,path.posix.basename(e.name));
+    const destination=at(parent,path.posix.basename(e.name));
     if(e.data===undefined){
       if(!directories.has(e.name)){
-        try{fs.mkdirSync(filename,{mode:0o700});}catch(error){if(error.code==='EEXIST')changed();throw error;}
-        mutated=true;const child=pin(filename,parent);directories.set(e.name,child);
+        try{fs.mkdirSync(destination,{mode:0o700});}catch(error){if(error.code==='EEXIST')changed();throw error;}
+        mutated=true;const child=pin(destination,parent);directories.set(e.name,child);
       }
     }else{
       const temporary=at(parent,'.refresh-'+crypto.randomUUID());
@@ -167,17 +212,24 @@ try {
         verify(); const s=fs.fstatSync(file,{bigint:true}); if(!s.isFile()||s.nlink!==1n) throw Error('Unsafe refresh output');
         fs.writeFileSync(file,Buffer.from(e.data,'base64')); fs.fchmodSync(file,e.mode&0o777); fs.fsyncSync(file);
         verify(); checkFile(e.name);
-        if(files.has(e.name)){
-          // The observed inode stays pinned through commit. Ordinary rename
-          // still has a last-check-to-syscall window; see the delivery notes.
-          mutated=true; fs.renameSync(temporary,filename);
-        }else{
-          // link is an atomic no-replace install on the same filesystem. A new
-          // destination arriving AFTER checkFile must never be overwritten.
-          try{fs.linkSync(temporary,filename);}catch(error){if(error.code==='EEXIST')changed();throw error;}
+        if(files.has(e.name))retireFile(e.name);
+        // Atomically install without replacement, then move the source name into
+        // a fresh private slot; the destination stays linked if this is interrupted.
+        const privateDir=makePrivateDir(parent), filename=at(privateDir.fd,'entry');
+        try{
+          verify();
+          try{fs.linkSync(temporary,destination);}catch(error){if(error.code==='EEXIST')changed();throw error;}
           mutated=true;
+          fs.renameSync(temporary,filename);
+          verify();fs.unlinkSync(filename);
+        }finally{
+          try{fs.closeSync(file);}catch(error){if(error.code!=='EBADF')throw error;}
+          try{fs.unlinkSync(filename);}catch(error){if(error.code!=='ENOENT')throw error;}
+          try{fs.rmdirSync(at(parent,privateDir.name));}catch(error){if(error.code!=='ENOENT')throw error;}
+          unpin(privateDir.fd);
+          try{fs.unlinkSync(temporary);}catch(error){if(error.code!=='ENOENT')throw error;}
         }
-      }finally{fs.closeSync(file);try{fs.unlinkSync(temporary);}catch(e){if(e.code!=='ENOENT')throw e;}}
+      }finally{try{fs.closeSync(file);}catch(error){if(error.code!=='EBADF')throw error;}try{fs.unlinkSync(temporary);}catch(e){if(e.code!=='ENOENT')throw e;}}
     }
   }
   verify();

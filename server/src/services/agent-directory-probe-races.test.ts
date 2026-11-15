@@ -53,5 +53,6 @@ describe.skipIf(process.platform !== "linux")("confined cleanup file authority",
       for (const name of await fs.readdir(path.join(retainedRoot, run, timestamp)))
         retainedAfter.push(await fs.readFile(path.join(retainedRoot, run, timestamp, name), "utf8"));
     expect(retainedAfter).toEqual([bytes]);
+    console.log(JSON.stringify({ case: "confined-cleanup-race", retainedBytes: retainedAfter.reduce((total, value) => total + Buffer.byteLength(value), 0), checkpointBytesRetained: 0 }));
   });
 });
