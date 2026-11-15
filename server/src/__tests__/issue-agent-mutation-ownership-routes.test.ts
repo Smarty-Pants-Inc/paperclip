@@ -3307,7 +3307,8 @@ describe("agent issue mutation checkout ownership", () => {
           .send({ status: "in_progress", comment: "Reviewer decision: request changes - stale run must not decide." });
 
         expect(res.status, JSON.stringify(res.body)).toBe(409);
-        expect(res.body.details.code).toBe("native_run_status_reported_by_finish");
+        expect(res.body.details).toMatchObject({ code: "native_review_decision_run_lock", actorRunId: staleRunId,
+          executionRunId: ownerRunId, checkoutRunId: ownerRunId });
         expect(mockIssueService.update).not.toHaveBeenCalled();
         expect(mockIssueService.addComment).not.toHaveBeenCalled();
         expect(db.insert).not.toHaveBeenCalled();
