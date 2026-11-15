@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { expectHiddenTagLayout } from "./helpers/hidden-tag-layout";
 import { expect, test, type APIResponse, type Page } from "@playwright/test";
 
 async function json<T = Record<string, any>>(response: APIResponse): Promise<T> {
@@ -38,7 +39,7 @@ for (const workspace of workspaces) for (const viewport of viewports) {
     }));
     // Unassigned backlog tasks: no agent, provider or run is involved.
     const task = await json(await request.post(`/api/companies/${company.id}/issues`, {
-      data: { title: `Hide me ${viewport.label}`, status: "backlog" },
+      data: { title: "Review the release checklist", status: "backlog" },
     }));
     const other = await json(await request.post(`/api/companies/${company.id}/issues`, {
       data: { title: `Keep me ${viewport.label}`, status: "backlog" },
@@ -97,6 +98,7 @@ for (const workspace of workspaces) for (const viewport of viewports) {
     await page.keyboard.press("Escape");
     await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toHaveText("Hidden");
     await expect(row(other.id).locator('[data-slot="hidden-task-badge"]')).toHaveCount(0);
+    await expectHiddenTagLayout(row(task.id), testInfo, `show-hidden-${workspace.label}-${viewport.label}`);
     await capture("04-list-hidden-marked");
 
     // The same menu now offers Unhide this task instead of Hide this task.
@@ -108,6 +110,8 @@ for (const workspace of workspaces) for (const viewport of viewports) {
     await page.goto(hiddenListUrl);
     await expect(row(task.id)).toBeVisible({ timeout: 30_000 });
     await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toHaveText("Hidden");
+
+    await expectHiddenTagLayout(row(task.id), testInfo, `show-hidden-reopened-${workspace.label}-${viewport.label}`);
 
     // 4. Open it: the banner offers Unhide.
     await row(task.id).locator("a[data-inbox-issue-link]").first().click();
