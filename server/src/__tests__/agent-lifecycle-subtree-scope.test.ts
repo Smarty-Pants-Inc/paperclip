@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, companies, companyMemberships, createDb,
-  principalPermissionGrants, approvals, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  principalPermissionGrants, approvals, issues, budgetPolicies, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
@@ -161,6 +161,12 @@ describe("subtree-scoped agent lifecycle", () => {
         .where(eq(agents.id, workerId));
       const task = await issueService(db).create(f.companyId, { title: "Unfinished worker task", status: "blocked", assigneeAgentId: workerId });
       const done = await issueService(db).create(f.companyId, { title: "Completed worker task", status: "done", assigneeAgentId: workerId });
+      const active = await issueService(db).create(f.companyId, { title: "Active worker task", status: "in_progress", assigneeAgentId: workerId });
+      const other = await issueService(db).create(f.companyId, { title: "Other subtree task", status: "blocked", assigneeAgentId: f.ids.unrelated });
+      const otherBefore = (await db.select().from(issues).where(eq(issues.id, other.id)))[0];
+      const [policy] = await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: workerId,
+        windowKind: "calendar_month_utc", amount: 100 }).returning();
+      const company = (await db.select().from(companies).where(eq(companies.id, f.companyId)))[0];
       const unrelated = await f.current(f.ids.unrelated);
       const denied = await f.post(f.ids.unrelated, "terminate");
       expect(denied.status, denied.text).toBe(403);
@@ -178,9 +184,32 @@ describe("subtree-scoped agent lifecycle", () => {
       expect.soft(current).toMatchObject({ assigneeAgentId: f.ids.lead });
       // Preserve real task blockers and terminal history; retirement is not completion.
       expect.soft(current.status).toBe("blocked");
+      expect.soft((await db.select().from(issues).where(eq(issues.id, active.id)))[0]).toMatchObject({ assigneeAgentId: f.ids.lead, status: "todo", executionRunId: null, checkoutRunId: null });
       expect.soft((await db.select().from(issues).where(eq(issues.id, done.id)))[0]).toMatchObject({ assigneeAgentId: workerId, status: "done" });
+      expect.soft((await db.select().from(issues).where(eq(issues.id, other.id)))[0]).toEqual(otherBefore);
+      expect.soft((await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy!.id)))[0]).toEqual(policy);
+      expect.soft((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]).toEqual(company);
+      expect.soft(await f.current(f.ids.unrelated)).toEqual(unrelated);
+      const repeated = await f.post(workerId, "terminate");
+      expect(repeated.status, repeated.text).toBe(200);
+      const moves = await db.select().from(activityLog).where(and(eq(activityLog.entityId, task.id), eq(activityLog.action, "issue.reassigned")));
+      expect(moves).toHaveLength(1);
     }, 60_000);
   }
+
+  it("retirement cleanup still works after the reporting manager was terminated", async () => {
+    const f = await seed();
+    const workerId = await f.hire();
+    const task = await issueService(db).create(f.companyId, { title: "Existing recovery retains ownership", status: "blocked", assigneeAgentId: workerId });
+    const parent = await request(f.board).post(`/api/agents/${f.ids.lead}/terminate`).send({});
+    expect(parent.status, parent.text).toBe(200);
+    await f.worker.process(f.ids.lead);
+    const report = await request(f.board).post(`/api/agents/${workerId}/terminate`).send({});
+    expect(report.status, report.text).toBe(200);
+    await f.worker.process(workerId);
+    expect(await f.current(workerId)).toMatchObject({ lifecycleState: "terminated", lifecycleHolds: [] });
+    expect((await db.select().from(issues).where(eq(issues.id, task.id)))[0]).toMatchObject({ assigneeAgentId: workerId, status: "blocked" });
+  }, 60_000);
 
   it("allows transitive descendants, but loses lifecycle authority after a worker leaves the subtree", async () => {
     const f = await seed();
