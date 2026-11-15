@@ -1417,7 +1417,9 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   });
 
   it.each(["fold", "inline"] as const)("shows %s reasoning in the live phase", async (display) => {
-    if (display === "inline") reasoningPreferenceState.byAgent["agent-1"] = "inline";
+    // Explicit choice: paperclip_runner now defaults to inline, so "fold" is
+    // the person's stored Folded here (codex_local folds either way).
+    reasoningPreferenceState.byAgent["agent-1"] = display;
     const liveRun = {
       id: "live-reasoning-run", runtimeMode, status: "running" as const, invocationSource: "issue" as const,
       triggerDetail: null, startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
