@@ -122,7 +122,9 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const remoteFailure = await readRemoteRunnerState({ stateDirectory: "/remote/d10-row5",
       runner: { execute: async () => ({ exitCode: 1, timedOut: false, signal: null, stdout: "", stderr: "remote state unavailable" }) } as never,
     }).catch((error: unknown) => error);
-    expect(remoteFailure).toMatchObject({ code: "runner_remote_state_unavailable" });
+    // D-B1: the reader's failure is upstream's plain Error again; no typed code.
+    expect(String((remoteFailure as Error)?.message ?? remoteFailure)).toMatch(/^runner_remote_state_unavailable: exit=1 timedOut=false/);
+    expect((remoteFailure as { code?: unknown }).code).toBeUndefined();
     const transport = { request: async () => { throw remoteFailure; }, notify() {},
       async *notifications() {}, setServerRequestHandler() {}, async close() {} };
     const transportFactory = vi.fn(() => transport);
@@ -140,27 +142,25 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
         replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
       },
     }).catch((error: unknown) => error);
+    // D-B1 + D-B2 (deletions toward upstream): the failed read is a plain Error and the
+    // runner no longer turns it into a typed refusal, so our fresh-thread gate is
+    // never entered. Upstream's outcome for this same_session_only checkpoint: a plain
+    // native_session_recovery_failed. The hard lines stay.
     const { freshThreadRefusalCode } = await import("../native-runtime/runner-reconciliation-refusal.js");
-    expect(failure).toMatchObject({ code: "runner_remote_state_unavailable" });
-    const code = freshThreadRefusalCode(failure);
-    expect(code).toBe("runner_remote_state_unavailable");
-    expect(transportFactory).toHaveBeenCalledOnce();
-    expect(openRun).not.toHaveBeenCalled();
-    expect(completeRun).not.toHaveBeenCalled();
-    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
-      errorCode: code, nativeIssueId: issue.id, nativeSessionId: execution.session.normalizedSessionId })
+    expect(String((failure as Error)?.message ?? failure)).toMatch(/^native_session_recovery_failed: .*runner_remote_state_unavailable: exit=1 timedOut=false/);
+    expect((failure as { code?: unknown }).code).toBeUndefined();
+    expect(freshThreadRefusalCode(failure), "no typed refusal reaches our fresh-thread gate").toBeNull();
+    expect(transportFactory, "no fresh thread: one provider transport, the failed restore").toHaveBeenCalledOnce();
+    expect(openRun, "no fresh thread opened").not.toHaveBeenCalled();
+    expect(completeRun, "nothing completed").not.toHaveBeenCalled();
+    // Never silent: the run ends FAILED with the readable error recorded.
+    await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: (failure as Error).message,
+      nativeIssueId: issue.id, nativeSessionId: execution.session.normalizedSessionId })
       .where(eq(heartbeatRuns.id, run.id));
-    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: code })
-      .where(eq(nativeRunFinalizations.runId, run.id));
-    await db.insert(environmentLeases).values({ companyId: agent.companyId, heartbeatRunId: run.id,
-      issueId: issue.id, provider: "boat", providerLeaseId: `row5-${randomUUID()}`, status: "retained" });
-    expect(await ensureFreshContinuation(db, { companyId: agent.companyId, runId: run.id, trigger: "held_recovery" }))
-      .toMatchObject({ kind: "exact_recovery_pending", reason: "previous_execution_stop_unconfirmed" });
-    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id));
-    expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("cannot confirm that the earlier attempt stopped");
-    expect(notes[0].body).toContain("Retry");
-    expect(notes[0].body).not.toContain("I'm stopping");
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(ended).toMatchObject({ status: "failed", error: expect.stringMatching(/^native_session_recovery_failed: /) });
+    // This fixture has no person message, so no note is owed here (B' owns that note).
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).toHaveLength(0);
   });
 
   // Keep: D1, a read-only authorization cannot write a stop intent or a note;
