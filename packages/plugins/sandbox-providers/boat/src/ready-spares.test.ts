@@ -258,6 +258,32 @@ describe("Boat ready spare keeper", () => {
     expect(db.query).not.toHaveBeenCalled();
   });
 
+  it("does not idle-stop a refill created after a wake while the timer's stale idle pass is in flight", async () => {
+    const createdAt = new Date(start + 1_000).toISOString();
+    const refill = spare({ id: "bx_wake_refill", state: "ready", createdAt });
+    const { ops } = operations([refill]);
+    let active = false;
+    let activityAt = Number.NEGATIVE_INFINITY;
+    (ops.get as ReturnType<typeof vi.fn>).mockImplementation(async item => {
+      // The company wake records activity before its reconcile creates/finalizes the refill.
+      active = true;
+      activityAt = start + 500;
+      return item;
+    });
+    const keeper = new ReadySpareKeeper(() => start + 2_000);
+    await keeper.reconcileTimer(key, 0, ops,
+      async () => active);
+    expect(ops.get).toHaveBeenCalledWith(refill);
+    expect(ops.stop).not.toHaveBeenCalled();
+  });
+
+  it("still stops a genuinely idle ready spare after re-reading idle activity", async () => {
+    const idle = spare({ id: "bx_genuinely_idle", state: "ready", createdAt: new Date(start - 120_000).toISOString() });
+    const { ops } = operations([idle]);
+    await new ReadySpareKeeper(() => start).reconcileTimer(key, 0, ops, async () => false);
+    expect(ops.stop).toHaveBeenCalledWith(idle);
+  });
+
   it("re-reads and still stops genuinely surplus ready spares without querying the claim database", async () => {
     const candidate = spare({ state: "ready" });
     const extra = spare({ id: "bx_surplus", state: "ready" });
