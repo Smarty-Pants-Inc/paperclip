@@ -1,0 +1,3 @@
+-- paperclip:migration-compat requires_staging: The regular unique index is built transactionally on an existing table. Drain incompatible owner-unaware writers before enabling non-null ownership; existing rows remain NULL and no data is rewritten.
+ALTER TABLE "tool_connections" ADD COLUMN "project_id" uuid;--> statement-breakpoint
+CREATE UNIQUE INDEX "tool_connections_project_live_installation_uq" ON "tool_connections" USING btree ("company_id","project_id",("config" #>> '{projectScope,installationKey}')) WHERE "tool_connections"."project_id" IS NOT NULL AND "tool_connections"."status" <> 'archived' AND ("tool_connections"."config" #>> '{projectScope,installationKey}') IS NOT NULL;

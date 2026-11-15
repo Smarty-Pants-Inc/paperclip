@@ -3347,6 +3347,13 @@
       "when": 1794722400000,
       "tag": "0488_report_runtime_defaults",
       "breakpoints": true
+    },
+    {
+      "idx": 489,
+      "version": "7",
+      "when": 1794783213090,
+      "tag": "0489_salty_warbound",
+      "breakpoints": true
     }
   ]
 }

@@ -25,7 +25,7 @@ const connections: Connection[] = [];
 
 function fixture(method: "mcp-key" | "own-oauth" | "app-installation") {
   const connection: Connection = {
-    id: randomUUID(), companyId: randomUUID(), applicationId: randomUUID(), uid: randomUUID(),
+    id: randomUUID(), companyId: randomUUID(), projectId: null, applicationId: randomUUID(), uid: randomUUID(),
     name: "Protocol regression fixture", transport: "mcp_remote", connectionPurpose: "tool",
     connectionKind: "managed", ownership: "customer", agentInstructions: null,
     authKind: method === "own-oauth" ? "oauth" : "api_key",
