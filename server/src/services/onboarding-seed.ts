@@ -219,7 +219,7 @@ export function onboardingSeedService(db: Db) {
           spentMonthlyCents: 0,
           lastHeartbeatAt: null,
         }, { createdByUserId: audit?.actorType === "user" ? audit.actorId : null,
-          ...(actor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.agentId, createdByAgentCompanyId: actor.companyId } : {}),
+          ...(actor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.agentId, createdByAgentCompanyId: actor.companyId ?? undefined } : {}),
         });
         agentId = created.id;
       }

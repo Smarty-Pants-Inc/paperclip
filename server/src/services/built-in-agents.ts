@@ -1864,7 +1864,7 @@ export function builtInAgentService(db: Db) {
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
       }, { allowBuiltInAgentMetadata: true, createdByUserId: options.createdByUserId ?? null,
-        ...(options.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: options.admissionActor.agentId, createdByAgentCompanyId: options.admissionActor.companyId } : {}),
+        ...(options.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: options.admissionActor.agentId, createdByAgentCompanyId: options.admissionActor.companyId ?? undefined } : {}),
         ...(options.createdByUserId && resolvedInput.budgetMonthlyCents ? { initialBudgetPolicyUserId: options.createdByUserId } : {}) }) as Agent;
     } catch (error) {
       // Lost the provisioning race: a concurrent writer inserted the row first
@@ -1904,7 +1904,7 @@ export function builtInAgentService(db: Db) {
     const definition = requireBuiltInAgentDefinition(key);
     const company = await ensureCompany(companyId);
     if (!company.requireBoardApprovalForNewAgents) {
-      return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, admissionActor: actor.admissionActor }), approval: null };
+      return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, ...(actor.admissionActor ? { admissionActor: actor.admissionActor } : {}) }), approval: null };
     }
     await assertKnownBuiltInAgentModel(definition, input);
 
@@ -1936,7 +1936,7 @@ export function builtInAgentService(db: Db) {
       // it does when board approval is not required, instead of dead-ending on a
       // fresh board-approval requirement the operator can never satisfy.
       if (providesAdapterSetup && (existing.metadata?.paperclipBuiltInSetupRequired === true || !hasCompleteAdapterConfig(existing.adapterType, existing.adapterConfig))) {
-        return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, admissionActor: actor.admissionActor }), approval: null };
+        return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, ...(actor.admissionActor ? { admissionActor: actor.admissionActor } : {}) }), approval: null };
       }
 
       // Changing the adapter of an already-configured (`ready`/`paused`)
@@ -1979,7 +1979,7 @@ export function builtInAgentService(db: Db) {
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
       }, { allowBuiltInAgentMetadata: true, createdByUserId: actor.requestedByUserId ?? null,
-        ...(actor.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.admissionActor.agentId, createdByAgentCompanyId: actor.admissionActor.companyId } : {}),
+        ...(actor.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.admissionActor.agentId, createdByAgentCompanyId: actor.admissionActor.companyId ?? undefined } : {}),
       }) as Agent;
     } catch (error) {
       // Lost the provisioning race: a concurrent writer inserted the row (and
