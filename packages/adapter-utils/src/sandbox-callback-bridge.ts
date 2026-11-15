@@ -27,6 +27,8 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
+const DEFAULT_BRIDGE_LIST_WAIT_MS = 7_000;
+const BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS = 2_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
 const DEFAULT_BRIDGE_STOP_TIMEOUT_MS = 2_000;
@@ -297,7 +299,11 @@ export interface SandboxCallbackBridgeQueueClient {
   // omits it; the worker falls back to sequential `makeDir` calls, so an
   // external implementation stays compatible without a change.
   makeDirs?(remotePaths: string[]): Promise<void>;
-  listJsonFiles(remotePath: string): Promise<string[]>;
+  /** True when listJsonFiles honors its optional wait budget. */
+  supportsListWait?: boolean;
+  /** Maximum wait supported by the client's own command timeout. */
+  maxListWaitMs?: number;
+  listJsonFiles(remotePath: string, waitMs?: number): Promise<string[]>;
   fileSize?(remotePath: string): Promise<number>;
   readTextFile(remotePath: string, maxBytes?: number): Promise<string>;
   writeTextFile(remotePath: string, body: string): Promise<void>;
@@ -657,6 +663,8 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
     requireSuccessfulResult(action, await runShell(input.runner, input.remoteCwd, script, timeoutMs, shellCommand));
 
   return {
+    supportsListWait: true,
+    maxListWaitMs: Math.max(0, timeoutMs - BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS),
     makeDir: async (remotePath) => {
       await runChecked(`mkdir ${remotePath}`, `mkdir -p ${shellQuote(remotePath)}`);
     },
@@ -667,12 +675,31 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const quoted = remotePaths.map((remotePath) => shellQuote(remotePath));
       await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
     },
-    listJsonFiles: async (remotePath) => {
+    listJsonFiles: async (remotePath, waitMs) => {
+      const requestedWaitMs = typeof waitMs === "number" && Number.isFinite(waitMs) && waitMs > 0
+        ? Math.trunc(waitMs)
+        : 0;
+      const commandWaitMs = Math.min(requestedWaitMs, Math.max(0, timeoutMs - BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS));
+      const waitChecks = Math.ceil(commandWaitMs / 100);
       const result = await runShell(
         input.runner,
         input.remoteCwd,
         [
           `if [ -d ${shellQuote(remotePath)} ]; then`,
+          ...(waitChecks > 0 ? [
+            `  wait_checks=${waitChecks}`,
+            `  while [ "$wait_checks" -gt 0 ]; do`,
+            `    found_file=`,
+            `    for file in ${shellQuote(remotePath)}/*.json; do`,
+            `      [ -f "$file" ] || continue`,
+            `      found_file=1`,
+            `      break`,
+            `    done`,
+            `    [ -n "$found_file" ] && break`,
+            `    sleep 0.1`,
+            `    wait_checks=$((wait_checks - 1))`,
+            `  done`,
+          ] : []),
           `  for file in ${shellQuote(remotePath)}/*.json; do`,
           `    [ -f "$file" ] || continue`,
           "    basename \"$file\"",
@@ -825,7 +852,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
-  /** Idle-listing backoff cap; defaults to pollIntervalMs (backoff disabled). */
+  /** Idle-listing backoff cap for clients without list-wait support or all-guarded listings; defaults to pollIntervalMs. */
   idleBackoffMaxMs?: number | null;
   /** Begin without polling until a native run is bound. */
   startPaused?: boolean;
@@ -872,9 +899,17 @@ export async function startSandboxCallbackBridgeWorker(input: {
   runtimeSpan?: RuntimeSpanRunner;
 }): Promise<SandboxCallbackBridgeWorkerHandle> {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
-  // Idle backoff applies only while a run is attached; default = the interval (off).
+  // Idle backoff applies only to clients without list-wait support or listings
+  // that contain only already in-flight files; default = the interval (off).
   const idleBackoffMaxMs = Math.max(pollIntervalMs, normalizeTimeoutMs(input.idleBackoffMaxMs, pollIntervalMs));
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
+  const pollListWaitMs = input.client.supportsListWait
+    ? Math.max(0, Math.min(
+        DEFAULT_BRIDGE_LIST_WAIT_MS,
+        iterationTimeoutMs - BRIDGE_LIST_WAIT_TIMEOUT_MARGIN_MS,
+        input.client.maxListWaitMs ?? DEFAULT_BRIDGE_LIST_WAIT_MS,
+      ))
+    : 0;
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
   const abortedHandlerGraceMs = normalizeTimeoutMs(
     input.abortedHandlerGraceMs,
@@ -1586,7 +1621,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         pollSettledPromise = new Promise<void>((resolve) => { pollSettled = resolve; });
         try {
           fileNames = await withTimeout(
-            input.client.listJsonFiles(directories.requestsDir),
+            input.client.listJsonFiles(directories.requestsDir, pollListWaitMs),
             iterationTimeoutMs,
             "Sandbox callback bridge list requests",
           );
@@ -1620,6 +1655,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
         pollSettled = null;
         pollSettledPromise = null;
         if (paused) continue;
+        if (stopping && pollListWaitMs > 0) break;
         if (fileNames.length > 0) idlePollIntervalMs = pollIntervalMs;
         // A file whose attempt is still in flight (or waiting on its 504
         // backstop) is not actionable: `processRequestFile` would skip it via
@@ -1637,6 +1673,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
           }
           if (stopping) {
             break;
+          }
+          if (fileNames.length === 0 && pollListWaitMs > 0) {
+            // A blocking list already waited for work on the sandbox; do not
+            // add the idle backoff on top of that wait. Legacy/local clients
+            // without list-wait support keep their existing bounded backoff.
+            idlePollIntervalMs = pollIntervalMs;
+            continue;
           }
           await new Promise<void>((resolve) => {
             wakeSleep = resolve;
@@ -1776,9 +1819,13 @@ export async function startSandboxCallbackBridgeWorker(input: {
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
       if (!settled) {
+        // Let one in-flight list finish before quarantining its returned queue
+        // entries. This is bounded by the iteration timeout, which also bounds
+        // the poll-loop long wait.
+        const waitMs = polling && pollListWaitMs > 0 ? iterationTimeoutMs : drainMs;
         await Promise.race([
           settledPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, drainMs)),
+          new Promise<void>((resolve) => setTimeout(resolve, waitMs)),
         ]);
       }
       await failPendingRequests("Bridge worker stopped before request could be handled.");
