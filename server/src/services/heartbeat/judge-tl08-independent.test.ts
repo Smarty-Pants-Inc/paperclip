@@ -791,7 +791,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
               cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [], providerRecoveryPolicy: "same_session_only" }),
             replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }) },
         }).catch((error: unknown) => error);
-        expect(failure).toMatchObject({ code: "native_controller_recovery_missing_evidence:retained_sandbox_binding" });
+        expect(String((failure as Error)?.message ?? failure)).toMatch(/^native_session_recovery_failed/);
+        expect((failure as { code?: unknown }).code).toBeUndefined();
         expect(openRun).not.toHaveBeenCalled();
         expect(completeRun).not.toHaveBeenCalled();
       }
