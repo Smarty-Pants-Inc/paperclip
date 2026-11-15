@@ -49,6 +49,13 @@ function fixture(options: { transport?: "sandbox" | "ssh"; concurrent?: boolean 
   const stageDirectory = vi.fn(async (input: { sourcePath: string; targetPath: string; mode: number }) => {
     calls.push(`directory:${input.targetPath}`);
   });
+  const stageAssets = vi.fn(async (assets: { sourcePath: string; targetPath: string; mode: number; kind: "file" | "directory" }[]) => {
+    calls.push(`batch:${assets.length}`);
+    for (const asset of assets) {
+      if (asset.kind === "directory") await stageDirectory(asset);
+      else await stageFile(asset);
+    }
+  });
   const execute = vi.fn(async (_input: { command: string; args?: string[]; bypassSession?: boolean; timeoutMs?: number }) => {
     if (_input.command === "node" && _input.args?.[1]?.includes("const hashes = assets.map")) {
       return { exitCode: 0, signal: null, pid: null, startedAt: null, timedOut: false, stdout: "[null,null,null]", stderr: "" };
@@ -66,7 +73,7 @@ function fixture(options: { transport?: "sandbox" | "ssh"; concurrent?: boolean 
     stageFile,
     stageDirectory,
   };
-  return { input, root, calls, stageFile, stageDirectory, execute };
+  return { input, root, calls, stageFile, stageDirectory, stageAssets, execute };
 }
 
 it("restores safe source launch files without replacing runtime context", async () => {
@@ -108,6 +115,12 @@ async function filesystemFixture() {
     await createTarballFromDirectory({ localDir: sourcePath, archivePath });
     execFileSync("sh", ["-c", 'umask 022; mkdir -p "$1" && tar -xf "$2" -C "$1"', "native-directory-transfer", targetPath, archivePath]);
   });
+  f.input.stageAssets = async assets => {
+    for (const asset of assets) {
+      if (asset.kind === "directory") await f.input.stageDirectory(asset);
+      else await f.input.stageFile(asset);
+    }
+  };
   f.input.runner.execute = async ({ command, args }) => {
     try {
       const stdout = execFileSync(command, args, { encoding: "utf8", stdio: "pipe" });
@@ -222,7 +235,16 @@ describe("remote launch asset staging", () => {
       stdout: execFileSync(command, args, { encoding: "utf8", stdio: "pipe" }).toString(), stderr: "",
     }));
     f.input.stageFile = stageFile; f.input.stageDirectory = stageDirectory; f.input.runner.execute = execute;
+    const stageAssets = vi.fn(async assets => {
+      for (const asset of assets) {
+        if (asset.kind === "directory") await stageDirectory(asset);
+        else await stageFile(asset);
+      }
+    });
+    f.input.stageAssets = stageAssets;
     await stageRemoteLaunchAssets(f.input);
+    expect(stageAssets).toHaveBeenCalledTimes(1);
+    expect(stageAssets.mock.calls[0]![0]).toHaveLength(3);
     expect(stageDirectory).toHaveBeenCalledTimes(2);
     expect(stageFile.mock.calls.filter(([asset]) => asset.targetPath.startsWith(context.filesystemRoot))).toHaveLength(1);
     stageDirectory.mockClear(); stageFile.mockClear(); execute.mockClear();
