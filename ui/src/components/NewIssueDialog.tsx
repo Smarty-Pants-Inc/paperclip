@@ -700,6 +700,9 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
   const stagedFilesStorageKey = (key: string, companyId: unknown) => JSON.stringify([draftOwner, companyId, "submitted-task", key]);
   const restoreBackgroundCreate = (pending: PendingSend<PendingCreate>, error: ErrorDescription | null) => {
     if (!active.current || readOwner() !== draftOwner) return;
+    // The queue's attention item offers Send / Discard without replacing the
+    // selected company's draft or opening a form in the original company.
+    if (pending.payload.data.companyId !== effectiveCompanyId) return;
     if (visibleRequestKey.current === pending.idempotencyKey) {
       setResendError(error);
       return;
@@ -714,7 +717,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
         : newIssueDefaults[key] !== pending.payload.data[key]));
     const hasOtherDraft = differentLaunch || (!sameDraft && (titleRef.current.trim() || descriptionRef.current.trim()
       || savedDraft?.title.trim() || savedDraft?.description.trim()));
-    if (pending.payload.data.companyId !== effectiveCompanyId || hasOtherDraft) {
+    if (hasOtherDraft) {
       pushToast({ title: "A task could not be saved", body: "Open New task to recover the saved request.", tone: "warn" });
       return;
     }
@@ -743,6 +746,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
     storageKey: PENDING_CREATE_KEY,
     isPayload: isPendingCreate,
     action: "create the task",
+    canAutoResend: payload => payload.data.companyId === effectiveCompanyId,
     send: async (payload, idempotencyKey) => {
       await submittedFileWrites.current.get(idempotencyKey);
       let stagedFiles = stagedFilesByKey.current.get(idempotencyKey);
@@ -774,7 +778,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
       return result;
     },
     onSent: (_result, pending) => {
-      if (visibleRequestKey.current !== pending.idempotencyKey) return;
+      if (pending.payload.data.companyId !== effectiveCompanyId || visibleRequestKey.current !== pending.idempotencyKey) return;
       if (draftTimer.current) clearTimeout(draftTimer.current);
       clearDraft(draftOwner);
       reset();
@@ -782,6 +786,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
     },
     onAttention: restoreBackgroundCreate,
     onRejected: (error, description, pending) => {
+      if (pending.payload.data.companyId !== effectiveCompanyId) return;
       if (error instanceof StagedFilesMissingError && !pending.payload.draft) {
         // Reattaching the same files resubmits under the original key, so a
         // create that already reached the server is replayed, not duplicated.
@@ -799,16 +804,18 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
   });
   // A create restored after reload without its files cannot be sent; say so
   // now rather than after the first resend delay. Nothing reaches the network.
-  const visiblePending = durableCreate.pending && (!durableCreate.pending.payload.draft || visibleRequestKey.current === durableCreate.pending.idempotencyKey)
+  const visiblePending = durableCreate.pending && durableCreate.pending.payload.data.companyId === effectiveCompanyId
+    && (!durableCreate.pending.payload.draft || visibleRequestKey.current === durableCreate.pending.idempotencyKey)
     ? durableCreate.pending : null;
   const submittingRecoveredCreate = Boolean(visiblePending && durableCreate.status === "sending");
   const pendingCreate = durableCreate.pending;
   const { resendNow: resendCreateNow } = durableCreate;
   useEffect(() => {
-    if (pendingCreate?.payload.stagedFileNames?.length && !stagedFilesByKey.current.has(pendingCreate.idempotencyKey)) {
+    if (pendingCreate?.payload.data.companyId === effectiveCompanyId
+      && pendingCreate?.payload.stagedFileNames?.length && !stagedFilesByKey.current.has(pendingCreate.idempotencyKey)) {
       resendCreateNow();
     }
-  }, [pendingCreate, resendCreateNow]);
+  }, [pendingCreate, resendCreateNow, effectiveCompanyId]);
 
   function discardCreate(idempotencyKey: string, payload?: PendingCreate) {
     durableCreate.discard(idempotencyKey);
@@ -1583,8 +1590,26 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
                 runSettings: composerSettings,
                 onRunSettingsChange: setComposerSettings,
                 header:
-                  hasTitle || isSubIssueMode || (visiblePending && durableCreate.status !== "sending") || otherFailedCreates.length > 0 || otherPending || resendError ? (
+                  hasTitle || isSubIssueMode || (visiblePending && durableCreate.status !== "sending") || durableCreate.awaitingConfirmation.length > 0 || otherFailedCreates.length > 0 || otherPending || resendError ? (
                     <div className="mb-3 flex flex-col gap-2 text-xs">
+                      {durableCreate.awaitingConfirmation.map(item => (
+                        <div key={item.idempotencyKey}>
+                          <p role="status" className="text-sm text-muted-foreground">
+                            A task you created in {companies.find(company => company.id === item.payload.data.companyId)?.name ?? "another company"} hasn't been sent yet.
+                          </p>
+                          <p className="text-sm break-words">{String(item.payload.data.title ?? item.payload.data.description ?? "New task").slice(0, 80)}</p>
+                          {item.rejection ? <p role="alert" className="text-sm text-destructive">{item.rejection.title}. {item.rejection.body}</p> : null}
+                          <Button type="button" size="sm" variant="ghost"
+                            disabled={durableCreate.status === "sending" || durableCreate.resending || Boolean(durableCreate.pending && durableCreate.pending.idempotencyKey !== item.idempotencyKey)}
+                            onClick={() => {
+                              if (durableCreate.pending?.idempotencyKey === item.idempotencyKey) durableCreate.resendNow();
+                              else void durableCreate.submit(item.payload, { idempotencyKey: item.idempotencyKey });
+                            }}>Send</Button>
+                          <Button type="button" size="sm" variant="ghost"
+                            disabled={durableCreate.pending?.idempotencyKey === item.idempotencyKey && (durableCreate.status === "sending" || durableCreate.resending)}
+                            onClick={() => discardCreate(item.idempotencyKey, item.payload)}>Discard</Button>
+                        </div>
+                      ))}
                       {otherCreates.map(item => (
                         <div key={item.idempotencyKey}>
                           <p role="alert" className="text-sm text-destructive">{item.rejection ? `${item.rejection.title}. ${item.rejection.body}` : "This task is waiting to be saved."}</p>
