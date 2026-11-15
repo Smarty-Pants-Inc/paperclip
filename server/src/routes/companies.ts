@@ -628,6 +628,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
         assertImportTargetAccess(req, importBody.target);
         const activity = importedCompanyActivityContext(actor, importBody.include ?? null);
         const result = await portability.importBundle(importBody, boardUserId, {
+          actor: req.actor,
           pauseAutomations: importBody.pauseAutomations === true,
         });
         // The import is committed. Settlement (hooks) runs before the
@@ -1172,6 +1173,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     const actor = getActorInfo(req);
     const result = await portability.importBundle(body, req.actor.type === "board" ? req.actor.userId : null, {
       mode: "agent_safe",
+      actor: req.actor,
       actorAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
       actorAgentCompanyId: req.actor.type === "agent" ? req.actor.companyId : null,
       sourceCompanyId: companyId,
@@ -1199,6 +1201,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
         warningCount: result.warnings.length,
         companyAction: result.company.action,
         importMode: "agent_safe",
+        warnings: result.warnings,
       },
     });
     res.json(result);
@@ -1568,6 +1571,7 @@ async function logImportedCompanyActivity(
       include: activity.include,
       agentCount: result.agents.length,
       warningCount: result.warnings.length,
+      warnings: result.warnings,
       companyAction: result.company.action,
     },
   });

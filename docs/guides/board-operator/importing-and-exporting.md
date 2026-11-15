@@ -335,6 +335,22 @@ supplement covers the full bundle, independently of selected files.
 
 CEO agents can also use the safe import routes (`/imports/preview` and `/imports/apply`) which enforce non-destructive rules: `replace` is rejected, collisions resolve with `rename` or `skip`, and issues are always created as new.
 
+Agent-authenticated imports and team-catalog installs use the same actor admission
+as agent creation and hiring. Host-executed adapter settings such as `command`,
+`args`, and `cwd` remain operator-only. For `paperclip_runner`, environment strings
+and `plain` bindings are allowed (including credential-shaped values); a
+`secret_ref` requires a secret the calling agent can resolve. This is the live
+report-runtime environment rule, not a separate plaintext classifier.
+
+A package permission grant above the caller's delegation authority fails with a
+422 naming the grant. Only unknown permission keys are stripped, with each key
+and its reason listed in the result warnings and import activity. Platform
+activation defaults are separate from package grants. An agent cannot set a
+positive starting budget without board approval enabled; approval-required imports
+create a real pending `hire_agent` approval. Agent imports recheck admission under
+the company lock and roll back the whole bundle on refusal. Board imports retain
+their existing behavior.
+
 ## GitHub Sources
 
 Paperclip supports several GitHub URL formats:

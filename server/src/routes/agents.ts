@@ -147,13 +147,9 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
+import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, boardAccessRequired, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
-import {
-  assertNoAgentHostWorkspaceCommandMutation,
-  collectAgentAdapterWorkspaceCommandPaths,
-} from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 
@@ -172,6 +168,9 @@ import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { assertAgentLifecycleAuthority, assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
 import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv } from "../services/agent-report-runtime.js";
+import { admitAgentActorHire, assertNoAgentAdapterConfigMutation, assertNoAgentLocalAdapterHostCommandMutation,
+  assertNoAgentProcessAdapterMutation, INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS, isInheritableCredentialReference,
+  KNOWN_INSTRUCTIONS_BUNDLE_KEYS } from "../services/agent-actor-admission.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
 import {
@@ -599,13 +598,6 @@ export function agentRoutes(
     return DEFAULT_INSTRUCTIONS_PATH_KEYS[adapterType] ?? null;
   }
   const KNOWN_INSTRUCTIONS_PATH_KEYS = new Set(["instructionsFilePath", "agentsMdPath"]);
-  const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = [
-    "instructionsBundleMode",
-    "instructionsRootPath",
-    "instructionsEntryFile",
-    "instructionsFilePath",
-    "agentsMdPath",
-  ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
 
   const router = Router();
@@ -2304,24 +2296,6 @@ export function agentRoutes(
     };
   }
 
-  // The provider credential environment keys a hired agent can inherit from the
-  // hiring agent, by adapter type. Each key holds a credential. A configuration
-  // key such as CODEX_HOME or GROK_HOME is a path, not a credential, and stays
-  // out of this list.
-  const INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS: Record<string, readonly string[]> = {
-    claude_local: ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"],
-    codex_local: ["OPENAI_API_KEY", "CODEX_API_KEY"],
-    grok_local: ["XAI_API_KEY"],
-    // OpenCode reaches its models through OpenRouter, the provider account
-    // AI connections bind for opencode_local.
-    opencode_local: ["OPENROUTER_API_KEY"],
-  };
-
-  function isInheritableCredentialReference(value: unknown): value is Record<string, unknown> {
-    const record = asRecord(value);
-    return record !== null && (record.type === "secret_ref" || record.type === "user_secret_ref");
-  }
-
   // A hired agent inherits the provider credential references the hiring
   // agent already holds for the same adapter type, so a freshly hired agent
   // can run without a separate credential setup step. The merge copies each
@@ -2631,21 +2605,6 @@ export function agentRoutes(
       tx => assertAgentLifecycleAuthority(tx, req.actor, target, command));
   }
 
-  function assertNoAgentInstructionsConfigMutation(
-    req: Request,
-    adapterConfig: Record<string, unknown> | null | undefined,
-    path = "adapterConfig",
-  ) {
-    if (req.actor.type !== "agent" || !adapterConfig) return;
-    const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
-      .map((key) => `${path}.${key}`);
-    if (changedSensitiveKeys.length === 0) return;
-    throw forbidden(
-      `Agent-authenticated callers cannot modify instructions path or bundle configuration (${changedSensitiveKeys.join(", ")})`,
-    );
-  }
-
   function assertExternalInstructionsAdmin(
     req: Request,
     agent: Parameters<typeof agentInstructionsBundleMode>[0],
@@ -2657,89 +2616,6 @@ export function agentRoutes(
 
   function adapterConfigTouchesInstructionsConfig(adapterConfig: Record<string, unknown>) {
     return KNOWN_INSTRUCTIONS_BUNDLE_KEYS.some((key) => adapterConfig[key] !== undefined);
-  }
-
-  function assertNoAgentAdapterConfigMutation(
-    req: Request,
-    adapterConfig: Record<string, unknown>,
-    path = "adapterConfig",
-  ) {
-    if (req.actor.type === "agent" && hasOwn(adapterConfig, "homeMode"))
-      throw forbidden("Only an operator can configure Runner homeMode.");
-    if (req.actor.type === "agent" && ["dotAttachmentAccess", "dotWorkspaceAccess", "dotBindingId", "externalBindingId", "museBindingId", "museGeneration", "museConnection"].some(key => hasOwn(adapterConfig, key)))
-      throw forbidden("Only an operator can configure external-agent pairing, attachment access, or workspace access.");
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
-    assertNoAgentHostWorkspaceCommandMutation(
-      req,
-      collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
-    );
-  }
-
-  function assertNoAgentProcessAdapterMutation(req: Request, adapterType: string, mutatesConfiguration: boolean) {
-    if (req.actor.type !== "agent" || adapterType !== "process" || !mutatesConfiguration) return;
-    throw forbidden("Agent keys cannot configure host-executed process adapters.");
-  }
-
-  const LOCAL_ADAPTER_HOST_COMMAND_KEYS = [
-    "command",
-    "hermesCommand",
-    "args",
-    "extraArgs",
-    "cwd",
-    "env",
-    "filesystemSandboxCommand",
-  ] as const;
-
-  const LOCAL_ADAPTER_CREDENTIAL_ENV_KEYS: Record<string, readonly string[]> = {
-    ...INHERITABLE_AGENT_CREDENTIAL_ENV_KEYS,
-    gemini_local: ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-    kimi_local: ["KIMI_MODEL_API_KEY"],
-    opencode_local: ["PAPERCLIP_OPENCODE_PROVIDERS", "OPENCODE_AUTH_JSON"],
-  };
-  const POOL_AUTH_OVERRIDE_ENV_KEYS = [
-    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "PAPERCLIP_OPENCODE_PROVIDERS", "OPENCODE_AUTH_JSON",
-  ] as const;
-
-  async function callerUsesAiConnectionPool(req: Request, companyId: string): Promise<boolean> {
-    if (req.actor.type !== "agent" || !req.actor.agentId) return false;
-    const caller = await svc.getById(req.actor.agentId);
-    if (!caller || caller.companyId !== companyId) return false;
-    return asRecord(asRecord(caller.runtimeConfig)?.aiConnection)?.mode === "router";
-  }
-
-  function containsOnlyLocalAdapterCredentialRefs(
-    adapterType: string,
-    env: unknown,
-    allowPlainCredentials: boolean,
-  ): boolean {
-    const envRecord = asRecord(env);
-    if (!envRecord) return false;
-    const allowedKeys = LOCAL_ADAPTER_CREDENTIAL_ENV_KEYS[adapterType] ?? [];
-    return Object.entries(envRecord).every(([key, value]) =>
-      (allowedKeys.includes(key) && isInheritableCredentialReference(value)) ||
-      (allowPlainCredentials && POOL_AUTH_OVERRIDE_ENV_KEYS.includes(key as typeof POOL_AUTH_OVERRIDE_ENV_KEYS[number]) && asEnvBindingString(value) !== null),
-    );
-  }
-
-  function assertNoAgentLocalAdapterHostCommandMutation(
-    req: Request,
-    adapterType: string,
-    adapterConfig: Record<string, unknown>,
-    allowPlainCredentials = false,
-    harnessConfig = adapterConfig,
-    allowReportEnv = false,
-  ) {
-    if (req.actor.type !== "agent" || (!adapterType.endsWith("_local") && adapterType !== "paperclip_runner")) return;
-    const harness = agentHarnessType(adapterType, harnessConfig);
-    const changedKeys = LOCAL_ADAPTER_HOST_COMMAND_KEYS.filter((key) =>
-      adapterConfig[key] !== undefined &&
-      (key !== "env" || (!(allowReportEnv && adapterType === "paperclip_runner")
-        && !containsOnlyLocalAdapterCredentialRefs(harness, adapterConfig.env, allowPlainCredentials))),
-    );
-    if (changedKeys.length === 0) return;
-    throw forbidden(
-      `Agent keys cannot configure host-executed local adapter settings (${changedKeys.join(", ")}).`,
-    );
   }
 
   function summarizeAgentUpdateDetails(patch: Record<string, unknown>) {
@@ -4395,12 +4271,12 @@ export function agentRoutes(
       && (["openai_dot", "muse"].includes(String(rollbackAdapterConfig.provider)) || ["openai_dot", "muse"].includes(String(existingRollbackProvider))))) {
       await assertSelectableAdapterType(rollbackAdapterType, rollbackAdapterConfig, existing.companyId);
     }
-    assertNoAgentAdapterConfigMutation(req, rollbackAdapterConfig);
+    assertNoAgentAdapterConfigMutation(req.actor, rollbackAdapterConfig);
     if (req.actor.type === "agent" && rollbackAdapterConfig.homeMode !== asRecord(existing.adapterConfig)?.homeMode)
       throw forbidden("Only an operator can configure Runner homeMode.");
-    assertNoAgentLocalAdapterHostCommandMutation(req, rollbackAdapterType, rollbackAdapterConfig);
+    assertNoAgentLocalAdapterHostCommandMutation(req.actor, rollbackAdapterType, rollbackAdapterConfig);
     assertNoAgentProcessAdapterMutation(
-      req,
+      req.actor,
       rollbackAdapterType,
       true,
     );
@@ -4529,7 +4405,9 @@ export function agentRoutes(
 
     // Budgets are board-only. An agent may propose one in a hire that waits for
     // board approval; the approving operator then activates it.
-    if (!company.requireBoardApprovalForNewAgents && req.body.budgetMonthlyCents > 0) assertBoard(req, COMPANY_BUDGETS_PAGE);
+    await admitAgentActorHire(db, req.actor, company, { budgetMonthlyCents: req.body.budgetMonthlyCents }, {
+      budgetError: () => boardAccessRequired(req, COMPANY_BUDGETS_PAGE),
+    });
     const sourceIssueIds = parseSourceIssueIds(req.body);
     const {
       desiredSkills: requestedDesiredSkills,
@@ -4593,9 +4471,7 @@ export function agentRoutes(
     const hiredAgentId = setupAgentId ?? randomUUID();
     const requestedHireConfig = (hireInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, hireInput.runtimeConfig);
-    assertNoAgentAdapterConfigMutation(req, requestedHireConfig);
-    assertNoAgentLocalAdapterHostCommandMutation(req, hireInput.adapterType ?? "process", requestedHireConfig, await callerUsesAiConnectionPool(req, companyId));
-    assertNoAgentProcessAdapterMutation(req, hireInput.adapterType ?? "process", Object.keys(requestedHireConfig).length > 0);
+    await admitAgentActorHire(db, req.actor, company, hireInput);
     assertExternalInstructionsAdmin(req, { id: hiredAgentId, companyId, name: hireInput.name, adapterConfig: requestedHireConfig });
 
     if (inheritRuntimeFrom === "caller") {
@@ -4636,9 +4512,7 @@ export function agentRoutes(
       hireInput.adapterType,
       rawHireAdapterConfig,
     );
-    assertNoAgentAdapterConfigMutation(req, rawHireAdapterConfig);
-    assertNoAgentLocalAdapterHostCommandMutation(req, hireInput.adapterType, rawHireAdapterConfig, await callerUsesAiConnectionPool(req, companyId));
-    assertNoAgentProcessAdapterMutation(req, hireInput.adapterType, Object.keys(rawHireAdapterConfig).length > 0);
+    await admitAgentActorHire(db, req.actor, company, { ...hireInput, adapterConfig: rawHireAdapterConfig });
     const authInheritance = await applyHiringAgentAuthInheritance(
       req,
       companyId,
@@ -4908,7 +4782,9 @@ export function agentRoutes(
   router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
     const companyId = req.params.companyId as string;
     await assertCanCreateAgentsForCompany(req, companyId, { hiring: true });
-    if (req.body.budgetMonthlyCents > 0) assertBoard(req, COMPANY_BUDGETS_PAGE);
+    await admitAgentActorHire(db, req.actor, { id: companyId }, { budgetMonthlyCents: req.body.budgetMonthlyCents }, {
+      operation: "create", budgetError: () => boardAccessRequired(req, COMPANY_BUDGETS_PAGE),
+    });
 
     const company = await db
       .select()
@@ -4949,9 +4825,7 @@ export function agentRoutes(
     const agentId = setupId ?? randomUUID();
     const requestedCreateConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
-    assertNoAgentAdapterConfigMutation(req, requestedCreateConfig);
-    assertNoAgentLocalAdapterHostCommandMutation(req, createInput.adapterType ?? "process", requestedCreateConfig, await callerUsesAiConnectionPool(req, companyId));
-    assertNoAgentProcessAdapterMutation(req, createInput.adapterType ?? "process", Object.keys(requestedCreateConfig).length > 0);
+    await admitAgentActorHire(db, req.actor, company, createInput, { operation: "create" });
     assertExternalInstructionsAdmin(req, { id: agentId, companyId, name: createInput.name, adapterConfig: requestedCreateConfig });
     let configurationWarnings: AgentConfigurationWarning[] = [];
     Object.assign(createInput, await resolveNewAgentRunnerForCompany(db, companyId, { ...createInput, runner: createRunner, setupOnly: Boolean(setupId),
@@ -4968,9 +4842,7 @@ export function agentRoutes(
       createInput.adapterType,
       rawCreateAdapterConfig,
     );
-    assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
-    assertNoAgentLocalAdapterHostCommandMutation(req, createInput.adapterType, rawCreateAdapterConfig, await callerUsesAiConnectionPool(req, companyId));
-    assertNoAgentProcessAdapterMutation(req, createInput.adapterType, Object.keys(rawCreateAdapterConfig).length > 0);
+    await admitAgentActorHire(db, req.actor, company, { ...createInput, adapterConfig: rawCreateAdapterConfig }, { operation: "create" });
     const requestedAdapterConfig = applyCodexLocalKeyIsolation(
       companyId,
       agentId,
@@ -5685,7 +5557,7 @@ export function agentRoutes(
         res.status(422).json({ error: "adapterConfig must be an object" });
         return;
       }
-      assertNoAgentAdapterConfigMutation(req, adapterConfig);
+      assertNoAgentAdapterConfigMutation(req.actor, adapterConfig);
       const changingInstructionsConfig = adapterConfigTouchesInstructionsConfig(adapterConfig);
       if (changingInstructionsConfig) {
         await assertCanManageInstructionsPath(req, existing);
@@ -5738,7 +5610,7 @@ export function agentRoutes(
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
       hasOwn(patchData, "adapterConfig");
-    assertNoAgentProcessAdapterMutation(req, requestedAdapterType, touchesAdapterConfiguration);
+    assertNoAgentProcessAdapterMutation(req.actor, requestedAdapterType, touchesAdapterConfiguration);
     if (touchesAdapterConfiguration) {
       assertExternalInstructionsAdmin(req, existing);
       const existingAdapterConfig = asRecord(existing.adapterConfig) ?? {};
@@ -5802,7 +5674,7 @@ export function agentRoutes(
           && isReportRuntimeEnv(hostCommandPatch.env)
           && await canConfigureReportRuntime(db, req.actor, existing);
         assertNoAgentLocalAdapterHostCommandMutation(
-          req,
+          req.actor,
           requestedAdapterType,
           hostCommandPatch,
           false,

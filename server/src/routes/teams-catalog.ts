@@ -116,6 +116,7 @@ export function teamsCatalogRoutes(db: Db) {
       const result = await svc.installCatalogTeam(companyId, catalogRef, {
         ...req.body,
         actor: getActorInfo(req),
+        admissionActor: req.actor,
       });
       res.status(201).json(result);
     },

@@ -45,6 +45,8 @@ export interface CatalogTeamSourcePolicy {
   allowLocalPathSources?: boolean;
 }
 
+import type { AuthorizationActor } from "./authorization.js";
+
 export interface CatalogTeamActorContext {
   actorType: "agent" | "user" | "system" | "plugin";
   actorId: string;
@@ -65,6 +67,8 @@ export interface CatalogTeamImportOptions {
   secretValues?: CompanyPortabilityImport["secretValues"];
   sourcePolicy?: CatalogTeamSourcePolicy;
   actor?: CatalogTeamActorContext | null;
+  /** Authenticated server context, not part of the request schema. */
+  admissionActor?: AuthorizationActor;
 }
 
 export type CatalogTeamSkillPreparationAction =
@@ -949,12 +953,17 @@ export function teamsCatalogService(db: Db) {
       {
         mode: "agent_safe",
         sourceCompanyId: companyId,
+        actor: options.admissionActor ?? (options.actor?.actorType === "agent"
+          ? { type: "agent", agentId: options.actor.agentId ?? options.actor.actorId, companyId,
+              runId: options.actor.runId, source: options.actor.runId ? "agent_jwt" : "agent_key" }
+          : undefined),
       },
     );
     warnings.push(...await prepareSkillInstalls(companyId, prepared));
     result.warnings.push(...warnings);
     await logCatalogEvent("company.team_catalog_installed", companyId, prepared.team, options.actor, {
       warningCount: result.warnings.length,
+      warnings: result.warnings,
       agentCount: result.agents.length,
       projectCount: result.projects.length,
       skillPreparationCount: prepared.skillPreparations.length,

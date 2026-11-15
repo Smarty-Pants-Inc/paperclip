@@ -1,5 +1,9 @@
 import { publishActivity, type ActivityPublication } from "./activity-log.js";
 import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
+import { admitAgentActorHire, assertAgentActorPermissionGrants } from "./agent-actor-admission.js";
+import { authorizationService, type AuthorizationActor } from "./authorization.js";
+import { approvalService } from "./approvals.js";
+import { redactEventPayload } from "../redaction.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
@@ -768,6 +772,8 @@ type ImportPlanInternal = {
 type ImportMode = "board_full" | "agent_safe";
 
 type ImportBehaviorOptions = {
+  /** Server-derived identity only; never populated from the import manifest. */
+  actor?: AuthorizationActor;
   actorAgentId?: string | null;
   actorAgentCompanyId?: string | null;
   interactionTransaction?: boolean;
@@ -867,12 +873,16 @@ type PortableAgentPermissionGrant = CompanyPortabilityAgentManifestEntry["permis
 
 const VALID_PERMISSION_KEYS = new Set<PermissionKey>(PERMISSION_KEYS);
 
-function normalizePortablePermissionGrants(value: unknown): PortableAgentPermissionGrant[] {
+function normalizePortablePermissionGrants(value: unknown, warnings: string[], slug: string): PortableAgentPermissionGrant[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry): PortableAgentPermissionGrant[] => {
     if (!isPlainRecord(entry)) return [];
     const permissionKey = asString(entry.permissionKey);
-    if (!permissionKey || !VALID_PERMISSION_KEYS.has(permissionKey as PermissionKey)) return [];
+    if (!permissionKey) return [];
+    if (!VALID_PERMISSION_KEYS.has(permissionKey as PermissionKey)) {
+      warnings.push(`Agent ${slug}: stripped unknown permission grant ${permissionKey}: unrecognized permission key.`);
+      return [];
+    }
     return [{
       permissionKey: permissionKey as PermissionKey,
       scope: isPlainRecord(entry.scope) ? entry.scope : null,
@@ -3261,7 +3271,7 @@ function buildManifestFromPackageFiles(
     }
     const extensionRuntime = isPlainRecord(extension.runtime) ? extension.runtime : null;
     const extensionPermissions = isPlainRecord(extension.permissions) ? extension.permissions : null;
-    const extensionPermissionGrants = normalizePortablePermissionGrants(extension.permissionGrants);
+    const extensionPermissionGrants = normalizePortablePermissionGrants(extension.permissionGrants, warnings, slug);
     const extensionMetadata = isPlainRecord(extension.metadata) ? extension.metadata : null;
     const adapterConfig = isPlainRecord(extensionAdapter?.config)
       ? extensionAdapter.config
@@ -5398,16 +5408,42 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     // deliberately small bundle. Reject the fragment rather than importing it.
     assertInlineSourceComplete(input.source);
     const origin = currentPluginInteractionOrigin();
-    const actorAgentId = origin?.agentId ?? options?.actorAgentId;
-    const actorAgentCompanyId = origin?.companyId ?? options?.actorAgentCompanyId ?? options?.sourceCompanyId;
+    const legacyAgentId = origin?.agentId ?? options?.actorAgentId;
+    const legacyCompanyId = origin?.companyId ?? options?.actorAgentCompanyId ?? options?.sourceCompanyId;
+    const actor: AuthorizationActor = origin && options?.actor?.agentId !== origin.agentId
+      ? { type: "agent", agentId: origin.agentId, companyId: origin.companyId, runId: origin.runId,
+          source: origin.runId ? "agent_jwt" : "agent_key" }
+      : options?.actor ?? (legacyAgentId
+        ? { type: "agent", agentId: legacyAgentId, companyId: legacyCompanyId, runId: origin?.runId,
+            source: origin?.runId ? "agent_jwt" : "agent_key" }
+        : { type: "board", userId: actorUserId });
+    const actorAgentId = actor.type === "agent" ? actor.agentId : null;
+    const actorAgentCompanyId = actor.type === "agent" ? actor.companyId : null;
     if (actorAgentId && !options?.interactionTransaction) {
+      // Preflight the submitted package before entering the writer. Repeat with
+      // live, transaction-bound services below, after the company lock.
+      const preflight = await buildPreview(input, options);
+      const company = input.target.mode === "existing_company"
+        ? await companies.getById(input.target.companyId)
+        : { id: actorAgentCompanyId!, requireBoardApprovalForNewAgents: preflight.source.manifest.company?.requireBoardApprovalForNewAgents };
+      if (company && preflight.include.agents) for (const entry of preflight.preview.plan.agentPlans) {
+        if (entry.action === "skip") continue;
+        const agent = preflight.selectedAgents.find(agent => agent.slug === entry.slug);
+        if (!agent) continue;
+        const override = input.adapterOverrides?.[entry.slug];
+        await admitAgentActorHire(db, actor, company, {
+          adapterType: override?.adapterType ?? agent.adapterType,
+          adapterConfig: override?.adapterConfig ?? agent.adapterConfig,
+          budgetMonthlyCents: agent.budgetMonthlyCents,
+        }, { permissionGrants: agent.permissionGrants });
+      }
       const publications: ActivityPublication[] = [];
       const result = await db.transaction(async tx => {
         const companyIds = [actorAgentCompanyId, input.target.mode === "existing_company" ? input.target.companyId : null]
           .filter((id): id is string => Boolean(id));
         await tx.select({ id: companiesTable.id }).from(companiesTable).where(inArray(companiesTable.id, companyIds)).orderBy(companiesTable.id).for("no key update");
         return companyPortabilityService(tx as unknown as Db, storage).importBundle(input, actorUserId, {
-          ...options, actorAgentId, actorAgentCompanyId, interactionTransaction: true, interactionPublications: publications,
+          ...options, actor, actorAgentId, actorAgentCompanyId, interactionTransaction: true, interactionPublications: publications,
         });
       });
       for (const publication of publications) publishActivity(publication);
@@ -5439,8 +5475,14 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     if (plan.preview.errors.length > 0) {
       throw unprocessable(`Import preview has errors: ${plan.preview.errors.join("; ")}`);
     }
-    if (options?.assertCanCreateAgents && plan.preview.plan.agentPlans.some((entry) => entry.action === "create")) {
-      await options.assertCanCreateAgents();
+    if (plan.preview.plan.agentPlans.some((entry) => entry.action === "create")) {
+      if (options?.assertCanCreateAgents) await options.assertCanCreateAgents();
+      if (actor.type === "agent") {
+        // Do not reuse a route's pre-lock authorization result or DB service.
+        const companyId = input.target.mode === "existing_company" ? input.target.companyId : actor.companyId!;
+        const decision = await authorizationService(db).decide({ actor, action: "agents:create", resource: { type: "company", companyId } });
+        if (!decision.allowed) throw forbidden(`${decision.explanation} Importing new agents is hiring.`);
+      }
     }
     if (
       mode === "agent_safe"
@@ -5743,6 +5785,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       }
 
       const resultAgents: CompanyPortabilityImportResult["agents"] = [];
+      const pendingImportedHireIds: string[] = [];
       const resultProjects: CompanyPortabilityImportResult["projects"] = [];
       const resultRoutines: CompanyPortabilityImportResult["routines"] = [];
       const importedSlugToAgentId = new Map<string, string>();
@@ -5860,6 +5903,10 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               if (retainedNative.adapterConfig[field] !== undefined) baseAdapterConfig[field] = retainedNative.adapterConfig[field];
             }
           }
+          const admission = await admitAgentActorHire(db, actor, targetCompany, {
+            adapterType: selectedAdapterType, adapterConfig: baseAdapterConfig,
+            budgetMonthlyCents: manifestAgent.budgetMonthlyCents,
+          }, { permissionGrants: importedGrants(manifestAgent, manifestAgent) });
           const normalizedAdapter = await prepareImportedAgentAdapter(
             targetCompany.id,
             selectedAdapterType,
@@ -5922,11 +5969,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             } catch (err) {
               warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
             }
-            await applyImportedAgentPermissionGrants(
-              targetCompany.id,
-              updated.id,
-              importedGrants(updated, manifestAgent),
-              actorUserId ?? null,
+            if (actor.type !== "agent") await applyImportedAgentPermissionGrants(
+              targetCompany.id, updated.id, importedGrants(updated, manifestAgent), actorUserId ?? null,
             );
             agentStatusById.set(updated.id, updated.status ?? agentStatusById.get(updated.id) ?? null);
             await secrets.syncEnvBindingsForTarget?.(
@@ -5952,19 +5996,15 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           let created = await requestHire(targetCompany.id, {
             ...patch,
             runner: agentRunner(patch.adapterType),
-            ...automationPausePatch,
-            status: pauseAutomations ? "paused" : "idle",
+            ...(admission.requiresApproval ? {} : automationPausePatch),
+            status: admission.requiresApproval ? "pending_approval" : pauseAutomations ? "paused" : "idle",
           }, { createdByUserId: actorUserId, createdByAgentId: actorAgentId, createdByAgentCompanyId: actorAgentCompanyId ?? undefined });
           created = await applyImportedCeoHiringDenial(targetCompany.id, created, manifestAgent.permissions) ?? created;
           await access.ensureMembership(targetCompany.id, "agent", created.id, "member", "active");
-          await access.setPrincipalPermission(
-            targetCompany.id,
-            "agent",
-            created.id,
-            "tasks:assign",
-            true,
-            actorUserId ?? null,
+          if (!admission.requiresApproval) await access.setPrincipalPermission(
+            targetCompany.id, "agent", created.id, "tasks:assign", true, actorUserId ?? null,
           );
+          if (admission.requiresApproval) pendingImportedHireIds.push(created.id);
           try {
             const materialized = await instructions.materializeManagedBundle(created, bundleFiles, {
               clearLegacyPromptTemplate: true,
@@ -5974,11 +6014,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           } catch (err) {
             warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
           }
-          await applyImportedAgentPermissionGrants(
-            targetCompany.id,
-            created.id,
-            importedGrants(created, manifestAgent),
-            actorUserId ?? null,
+          if (actor.type !== "agent") await applyImportedAgentPermissionGrants(
+            targetCompany.id, created.id, importedGrants(created, manifestAgent), actorUserId ?? null,
           );
           agentStatusById.set(created.id, created.status ?? (pauseAutomations ? "paused" : "idle"));
           await secrets.syncEnvBindingsForTarget?.(
@@ -6028,6 +6065,36 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
               ?? manifestAgent.reportsToExistingAgentId;
             warnings.push(`Could not assign manager ${managerRef} for imported agent ${manifestAgent.slug}.`);
           }
+        }
+        // A package's permission replay is not a platform activation default.
+        // Validate against the final reporting tree, still inside the locked
+        // import transaction, so a bad grant rolls back every bundle agent.
+        if (actor.type === "agent") for (const manifestAgent of plan.selectedAgents) {
+          const entry = resultAgents.find(entry => entry.slug === manifestAgent.slug && entry.action !== "skipped");
+          if (!entry?.id) continue;
+          const grants = importedGrants(manifestAgent, manifestAgent);
+          await assertAgentActorPermissionGrants(db, actor, targetCompany.id, grants, entry.id);
+          await applyImportedAgentPermissionGrants(targetCompany.id, entry.id, grants, actorUserId ?? null);
+        }
+        for (const id of pendingImportedHireIds) {
+          const agent = await agents.getById(id);
+          if (!agent) throw unprocessable(`Imported pending hire ${id} is missing`);
+          const adapterConfig = redactEventPayload(agent.adapterConfig) ?? {};
+          const runtimeConfig = redactEventPayload(agent.runtimeConfig) ?? {};
+          const metadata = redactEventPayload(agent.metadata ?? {}) ?? {};
+          await approvalService(db).create(targetCompany.id, {
+            type: "hire_agent", status: "pending", requestedByAgentId: actorAgentId,
+            requestedByUserId: null, payload: {
+              agentId: id, requestedByAgentId: actorAgentId,
+              name: agent.name, role: agent.role, title: agent.title, icon: agent.icon,
+              appearance: agent.appearance, reportsTo: agent.reportsTo, capabilities: agent.capabilities,
+              adapterType: agent.adapterType, adapterConfig, runtimeConfig, metadata,
+              budgetMonthlyCents: agent.budgetMonthlyCents,
+              desiredSkills: readPaperclipSkillSyncPreference(agent.adapterConfig).desiredSkills,
+              requestedConfigurationSnapshot: { adapterType: agent.adapterType, adapterConfig, runtimeConfig,
+                desiredSkills: readPaperclipSkillSyncPreference(agent.adapterConfig).desiredSkills },
+            },
+          });
         }
       }
 
