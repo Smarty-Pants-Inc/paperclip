@@ -1579,7 +1579,12 @@ describePostgres("heartbeat recovery module ownership", () => {
     await db.insert(nativeRunFinalizations).values({ runId: run.id, companyId: run.companyId, issueId: run.issueId!, phase: "observed", attempt: 1,
       controllerBootId: controller.bootId, controllerPid: controller.pid, controllerProcessStartedAt: controller.processStartedAt,
       leaseOwner: claim.leaseOwner, leaseExpiresAt: firstLeaseEndsAt });
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    // #21444 schedules renewal with timeouts against a monotonic clock. Keep
+    // the existing awaited timeout sleep live while advancing that fixture clock.
+    vi.useFakeTimers({
+      toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"],
+      shouldAdvanceTime: true,
+    });
     native.claims.mockImplementationOnce(async input => {
       await input.onClaim?.(claim, scope);
       return [claim];
