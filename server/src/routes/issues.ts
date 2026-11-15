@@ -14880,10 +14880,17 @@ export function issueRoutes(
     if (!run || run.runtimeMode !== "native" || run.status !== "running"
       || run.agentId !== req.actor.agentId || run.companyId !== issue.companyId) return;
     if (!holdsExecutionLock) {
-      throw conflict("Only the run holding the task's execution lock can record its native review decision.", {
-        code: "native_review_decision_run_lock", actorRunId: runId,
-        executionRunId: issue.executionRunId, checkoutRunId: issue.checkoutRunId,
-      });
+      // As checkout ownership does, refuse only a lock that another live run owns.
+      // An unowned lock, or one left by a finished run, keeps the ordinary decision path.
+      for (const lockRunId of new Set([issue.executionRunId, issue.checkoutRunId])) {
+        const holder = lockRunId ? await heartbeat.getRun(lockRunId) : null;
+        if (!holder || holder.companyId !== issue.companyId || !["running", "queued"].includes(holder.status)) continue;
+        throw conflict("Only the run holding the task's execution lock can record its native review decision.", {
+          code: "native_review_decision_run_lock", actorRunId: runId,
+          executionRunId: issue.executionRunId, checkoutRunId: issue.checkoutRunId,
+        });
+      }
+      return;
     }
     if (stageDecisionRequested) return "defer_final_status";
     // A blocker that the dependency rules reject anyway keeps its specific
