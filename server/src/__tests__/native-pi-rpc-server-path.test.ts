@@ -402,7 +402,9 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     });
     const launch = capturedLaunch();
     expect(launch.environment?.PI_CODING_AGENT_DIR).toBe(source === "agent absolute"
-      ? agentDir : posix.join(launch.runnerFilesystemRoot ?? launch.stateDirectory!, "pi-agent"));
+      ? agentDir
+      : target === "remote sandbox" ? undefined : posix.join(launch.runnerFilesystemRoot ?? launch.stateDirectory!, "pi-agent"));
+    expect(launch.environment?.PI_CODING_AGENT_DIR).not.toBe(ambient);
     expect(runnerEnvironment.PI_CODING_AGENT_DIR).toBe(agentDir);
   });
 
