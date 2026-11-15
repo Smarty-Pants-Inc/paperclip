@@ -19,7 +19,7 @@ import { listFreshContinuations } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { prepareUnconfirmedSourceSandboxStop, retryUnconfirmedSourceSandboxStop } from "./sandbox-stop-and-retain.js";
-import { freshThreadStopGate, readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
+import { freshThreadStartedNote, readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 
 // Keep reason: SEED-B's recorded data-loss/silence incident, and the allocation
@@ -60,7 +60,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); if (root) await rm(root, { recursive: true, force: true }); });
 
   it.each(["idle-release", "receipt-window-end", "released-no-receipt", "expired-no-receipt", "retained-age-stop", "observed-owner", "observed-proof-arrives", "proof-arrives", "running", "stopping", "unknown", "other-lease", "tl07-idle", "tl07-running"] as const)(
-    "%s: immutable receipt, one current note, no impossible run; proof wakes the saved message", async shape => {
+    "%s: immutable receipt, one selected-thread note, one answer to the saved message", async shape => {
     const t0 = Date.now();
     const tl07 = shape.startsWith("tl07-");
     const liveTurn = shape === "tl07-running";
@@ -93,9 +93,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "Remember the word ALDER-B. Reply only: noted.", createdAt: new Date(t0 - 600_000) });
     await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id, authorType: "user", authorUserId: userId, body: "TEST: What word did I ask you to remember? Reply with that word only.", createdAt: new Date(t0 - 60_000) });
     // TL07 is the server-level refusal from an old Runner on an OPEN task.
-    // Even idle needs positive physical-stop proof: one waiting note now,
-    // then the saved message wakes automatically when that later read arrives.
-    // A genuinely in-flight turn keeps its owner. RFL ruling 23:08Z (B).
+    // follow-Paperclip Cut B R1/R5: idle refusals need no physical-stop proof; an actual in-flight owner still excludes continuation.
     if (tl07) await writeFile(join(root, "AGENTS.md"), "Updated assigned skill: answer the saved word from history.\n");
     const [source] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, issueId: issue.id, nativeIssueId: issue.id, nativeSessionId: sessionId, runtimeMode: "native", status: "failed", nativePhase: "terminal_failure", errorCode: tl07 ? "native_runner_refresh_required" : "native_controller_recovery_missing_evidence:retained_sandbox_binding", resultJson: tl07 ? { nativeFreshContinuationRefusal: { code: "native_runner_refresh_required", prepareRefusalCode: "provider_instructions_changed", waitForTurn: liveTurn } } : null, responsibleUserId: userId, createdAt: new Date(t0 - 60_000), finishedAt: new Date(t0 - 30_000), contextSnapshot: { issueId: issue.id } }).returning();
     await db.insert(nativeRunFinalizations).values({ runId: source.id, companyId: company.id, issueId: issue.id, phase: "terminal_failure", failureCode: source.errorCode, recoveryState: "blocked" });
@@ -115,7 +113,8 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect((await readFreshThreadStopProof(db, source, issue.id)).gone).toBe(true);
     }
     if (endedWithoutReceipt) {
-      await db.transaction(tx => freshThreadStopGate(tx as unknown as Db, source, issue.id));
+      // follow-Paperclip Cut B R5: the retained proof reader is read-only; the effectful gate is gone.
+      expect((await readFreshThreadStopProof(db, source, issue.id)).gone).toBe(false);
       expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
       expect(await prepareUnconfirmedSourceSandboxStop(db, before)).toBeNull();
       expect(await retryUnconfirmedSourceSandboxStop(db, before)).toBeNull();
@@ -128,6 +127,7 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       await db.insert(nativeRunFinalizations).values({ companyId: company.id, issueId: peerIssue.id, runId: peer.id, phase: "observed", leaseOwner: "actual-allocation-holder", leaseExpiresAt: new Date(t0 + 3600_000) });
       await db.insert(environmentLeases).values({ companyId: company.id, heartbeatRunId: peer.id, issueId: peerIssue.id, provider: "boat", providerLeaseId: lease.providerLeaseId, status: "active" });
     }
+    const beforeFallback = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]!;
     let providerState: string = inspectedStop ? "stopped" : shape === "running" ? "active" : shape;
     const inspectLeaseResource = vi.fn(async () => {
       // A separate transaction can take the task lock NOWAIT at the provider
@@ -140,9 +140,10 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const tick = async (n: number) => {
       vi.setSystemTime(t0 + n * (inspectedStop ? 30_000 : 300_000));
       await hb.reapOrphanedRuns();
-      await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+      // follow-Paperclip Cut B R5: only the existing heartbeat stopped-owner recovery may inspect, never disposition/fresh admission.
+      await settleUnrecoverableExecutions(db, new Date());
       await hb.sweepPendingCleanupLeases();
-      await settleUnrecoverableExecutions(db, new Date(), { inspectLeaseResource });
+      await settleUnrecoverableExecutions(db, new Date());
       if (process.env.TASK_OUT) await appendFile(join(process.env.TASK_OUT, "seed-states.jsonl"), JSON.stringify({ shape, n, runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id)), leases: await db.select().from(environmentLeases).where(eq(environmentLeases.issueId, issue.id)), actions: await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issue.id)) }) + "\n");
     };
     const notes = async () => (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id))).filter(c => c.authorType === "system");
@@ -150,13 +151,14 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, issue.id))).length;
     for (let n = 0; n < 3; n++) {
       await tick(n);
-      if ((!preconfirmed && !inspectedStop) || shape === "other-lease") {
-        expect(await runCount()).toBe(2);
+      expect(await runCount()).toBe(2); // recording never starts a second executor
+      if (liveTurn || shape === "observed-proof-arrives") {
         expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(0);
-        expect(await current()).toHaveLength(1);
-        expect((await current())[0].body).toMatch(liveTurn || observedOwner ? /current step must finish/ : /earlier attempt.*stop|stopping the earlier attempt/);
-        expect(await notes()).toHaveLength(1); // no repeated note at ~5-min sweeps
+      } else {
+        // follow-Paperclip Cut B R1/R5: unknown, active or foreign allocations do not veto the task's recorded fallback.
+        expect(await listFreshContinuations(db, { companyId: company.id, issueId: issue.id })).toHaveLength(1);
       }
+      // The exactly-one started-note assertion moves below to actual selection (R2), not the removed gate.
     }
     if (preconfirmed) {
       expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(before);
@@ -165,32 +167,33 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
       expect(stop).not.toHaveBeenCalled();
       expect(inspectLeaseResource).not.toHaveBeenCalled();
     }
-    if (inspectedStop) {
-      expect(inspectLeaseResource).toHaveBeenCalled();
-      expect(stop).not.toHaveBeenCalled();
-      const [settledLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
-      expect(settledLease.status).toBe(endedWithoutReceipt ? before.status : "released");
-      expect(hasRemoteTerminationReceipt(settledLease)).toBe(true);
-      expect(settledLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
+    // follow-Paperclip Cut B R5: removed fresh-gate inspection cannot mint or backdate receipts, stop a peer, or rewrite history.
+    expect(stop).not.toHaveBeenCalled();
+    if (!observedOwner) {
+      expect(inspectLeaseResource).not.toHaveBeenCalled();
+      const [unchangedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+      expect(unchangedLease).toEqual(beforeFallback);
       if (endedWithoutReceipt) {
-        // The new physical observation is now, not the historical idle close;
-        // never backdate its receipt to that old timestamp.
-        expect(settledLease.releasedAt!.getTime()).toBeGreaterThanOrEqual(before.releasedAt!.getTime());
-        expect((settledLease.metadata?.remoteExecutionTermination as { confirmedAt: string }).confirmedAt).toBe(settledLease.releasedAt!.toISOString());
+        expect(unchangedLease.releasedAt).toEqual(before.releasedAt);
+        expect(unchangedLease.metadata).not.toHaveProperty("remoteExecutionTermination");
       }
-      expect(await current()).toHaveLength(1);
     }
-    if (!["idle-release", "receipt-window-end", "observed-owner", "observed-proof-arrives", "proof-arrives", "tl07-idle"].includes(shape) && !inspectedStop) {
-      expect(await runCount()).toBe(2);
-      return;
-    }
-    const proofLands = shape === "proof-arrives" || shape === "observed-proof-arrives" || shape === "tl07-idle";
-    if (proofLands) {
+    if (shape === "observed-proof-arrives") {
+      // The kept stopped-owner seam, not fresh admission, observes and settles this actual running owner.
       providerState = "stopped"; await tick(3); expect(inspectLeaseResource).toHaveBeenCalled();
       const [stoppedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
       expect(stoppedLease).toMatchObject({ status: "released", cleanupStatus: "success", metadata: { remoteExecutionTermination: { leaseId: lease.id, runId: old.id, providerLeaseId: lease.providerLeaseId, state: "stopped" } } });
       expect(stoppedLease.metadata).not.toHaveProperty("sandboxStopAndRetainReceipt");
       expect((stoppedLease.metadata?.pendingCleanupController as { bootId?: string } | undefined)?.bootId).not.toBe("stale-boot");
+    }
+    if (liveTurn) {
+      expect(await runCount()).toBe(2);
+      expect(await readRun(old.id)).toMatchObject({ status: "running" });
+      // follow-Paperclip Cut B R1/R2: finish the real turn before selection; a flag or timeout cannot bypass its live authority.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, old.id));
+      await db.update(nativeRunFinalizations).set({ phase: "committed", leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, old.id));
+      await tick(3);
     }
     // Occupy the agent slot so real delivery/admission leaves its automatically
     // admitted run observable as queued. No test mints a successor run or resends
@@ -206,7 +209,11 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id)))[0]).toMatchObject({ status: "resolved", outcome: "restored" });
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).not.toBe("blocked");
     expect(await getExecutionBlocker(db, company.id, issue.id)).toBeNull();
-    const [next] = await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, successors[0].id)).returning();
+    // PostgreSQL's default clock is real even with Date faked. Mirror the simulated admission timestamp
+    // after an owner finishes, so selection can validate recordedAt <= the successor's actual creation.
+    const [next] = await db.update(heartbeatRuns).set({ status: "running",
+      ...(liveTurn || shape === "observed-proof-arrives" ? { createdAt: new Date() } : {}) })
+      .where(eq(heartbeatRuns.id, successors[0].id)).returning();
     await db.update(issues).set({ executionRunId: next.id }).where(eq(issues.id, issue.id));
     // The controlled peer starts the genuinely queued admission in place of
     // dispatch's external provider. Mirror dispatch's agent running projection;
@@ -223,8 +230,11 @@ describe.skipIf(!support.supported)("F1 SEED-B real sequence", () => {
     for (let n = 4; n < 7; n++) { await settleUnrecoverableExecutions(db); await deliverReconciledExecutions(db, hb.wakeup); }
     expect(await runCount()).toBe(3);
     expect(await current()).toHaveLength(1);
-    expect((await current())[0].body).toContain("fresh thread");
-    expect(await notes()).toHaveLength(proofLands || endedWithoutReceipt ? 2 : 1);
+    // follow-Paperclip Cut B R2/R5: keep exactly one note, now owned by actual selection, never a stop-gate notice.
+    expect((await current())[0].body).toBe(await freshThreadStartedNote(db, await readRun(source.id)));
+    expect(await notes()).toHaveLength(1);
+    expect(stop).not.toHaveBeenCalled();
+    if (!observedOwner) expect(inspectLeaseResource).not.toHaveBeenCalled();
     if (inspectedStop) expect(Date.now() - t0).toBeLessThanOrEqual(60_000);
     if (observedOwner) expect(await readRun(old.id)).toMatchObject({ status: "failed", nativePhase: "terminal_failure" });
   }, 60_000);
