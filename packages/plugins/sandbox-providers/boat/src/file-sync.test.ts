@@ -187,6 +187,56 @@ describe("Boat native hybrid file sync", () => {
     expect((await fs.readdir(output)).sort()).toEqual(["._metadata", "keep", "literal-other", "nested"].sort());
     expect(await fs.readFile(path.join(output, "nested/literal*"), "utf8")).toBe("keep nested literal"); await clean();
   });
+  it("drops outbound managed company-skills bundle links and keeps owner metadata", async () => {
+    const source = path.join(remote, "tree"), target = path.join(host, "out");
+    const companySkills = path.join(source, "skills", "paperclip-company-skills");
+    await fs.mkdir(companySkills, { recursive: true });
+    await fs.writeFile(path.join(companySkills, ".owner"), "owner");
+    await fs.symlink("/absolute/canonical/bundle/root", path.join(companySkills, `bundle-${"a".repeat(64)}`));
+    await sync({ sourcePath: source, targetPath: target, kind: "directory" }, true);
+    expect(await fs.readFile(path.join(target, "skills", "paperclip-company-skills", ".owner"), "utf8")).toBe("owner");
+    await expect(fs.lstat(path.join(target, "skills", "paperclip-company-skills", `bundle-${"a".repeat(64)}`))).rejects.toMatchObject({ code: "ENOENT" });
+    await clean();
+  });
+  it.each([
+    ["63 lowercase hex", `skills/paperclip-company-skills/bundle-${"a".repeat(63)}`],
+    ["65 lowercase hex", `skills/paperclip-company-skills/bundle-${"a".repeat(65)}`],
+    ["non-hex character", `skills/paperclip-company-skills/bundle-${"a".repeat(63)}g`],
+    ["uppercase hex", `skills/paperclip-company-skills/bundle-${"A".repeat(64)}`],
+    ["deeper path", `skills/paperclip-company-skills/bundle-${"a".repeat(64)}/x`],
+    ["different folder", `skills/other/bundle-${"a".repeat(64)}`],
+    ["at root", `bundle-${"a".repeat(64)}`],
+    ["under another parent", `foo/skills/paperclip-company-skills/bundle-${"a".repeat(64)}`],
+  ])("still refuses outbound symlink with %s", async (_label, relativeLink) => {
+    const source = path.join(remote, "tree"), target = path.join(host, "out");
+    const link = path.join(source, relativeLink);
+    await fs.mkdir(path.dirname(link), { recursive: true });
+    await fs.writeFile(path.join(host, "outside-file"), "SAFE");
+    await fs.symlink(path.join(host, "outside-file"), link);
+    await expect(sync({ sourcePath: source, targetPath: target, kind: "directory" }, true)).rejects.toThrow("Unsafe Boat archive symlink");
+    expect(await fs.readFile(path.join(host, "outside-file"), "utf8")).toBe("SAFE");
+    await clean();
+  });
+  it.each(["file", "directory"] as const)("still refuses an ordinary symlink to a %s", async targetKind => {
+    const source = path.join(remote, "tree"), target = path.join(host, "out");
+    const other = path.join(source, "skills", "other");
+    const outside = path.join(host, "outside");
+    await fs.mkdir(other, { recursive: true });
+    if (targetKind === "file") await fs.writeFile(outside, "SAFE"); else await fs.mkdir(outside);
+    await fs.symlink(outside, path.join(other, "link"));
+    await expect(sync({ sourcePath: source, targetPath: target, kind: "directory" }, true)).rejects.toThrow("Unsafe Boat archive symlink");
+    expect((await fs.lstat(outside)).isDirectory()).toBe(targetKind === "directory");
+    await clean();
+  });
+  it("copies a regular directory at the managed bundle path without dropping it", async () => {
+    const source = path.join(remote, "tree"), target = path.join(host, "out");
+    const bundle = path.join(source, "skills", "paperclip-company-skills", `bundle-${"c".repeat(64)}`);
+    await fs.mkdir(bundle, { recursive: true });
+    await fs.writeFile(path.join(bundle, "kept"), "regular directory");
+    await sync({ sourcePath: source, targetPath: target, kind: "directory" }, true);
+    expect(await fs.readFile(path.join(target, "skills", "paperclip-company-skills", `bundle-${"c".repeat(64)}`, "kept"), "utf8")).toBe("regular directory");
+    await clean();
+  });
   it("rejects outbound escaping symlinks before publishing or touching their referent", async () => {
     const source = path.join(remote, "tree"), target = path.join(host, "out"), outside = path.join(host, "outside");
     await fs.mkdir(source); await fs.mkdir(target); await fs.writeFile(outside, "SAFE"); await fs.writeFile(path.join(target, "old"), "OLD"); await fs.symlink(outside, path.join(source, "evil"));
