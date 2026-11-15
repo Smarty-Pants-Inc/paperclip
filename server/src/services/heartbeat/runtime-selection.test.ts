@@ -566,6 +566,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(await canBypassFailedNativePredecessor(db, { companyId: f.agent.companyId, runId: f.run.id })).toBe(false);
   });
 
+  // Flip (RFL 17:14Z): 6e0454bb changed uncommitted Stopping/Starting rows to one final row; person sees exactly Starting and their own comment byte-unchanged.
   it("updates only the system-owned fresh-thread notice, never a person's matching metadata", async () => {
     const f = await piFixture();
     const authorizationReason = `fresh_provider_thread_pending:${randomUUID()}`;
@@ -581,14 +582,14 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       await writePiSessionHistoryLossNotice(db, tx, { ...input, body: "Starting a fresh thread from saved history." });
     });
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
-    expect(comments.find(comment => comment.id === person.id)?.body).toBe(person.body);
+    expect(comments).toHaveLength(2);
+    expect(comments.find(comment => comment.id === person.id)).toEqual(person);
     const allNotes = comments.filter(comment => comment.authorType === "system");
-    expect(allNotes).toHaveLength(2);
-    const old = allNotes.find(note => note.body === "Stopping the earlier attempt before starting fresh.")!;
-    expect(old).toBeDefined();
-    expect(old.metadata?.sections?.[0].rows).toContainEqual({ type: "run_link", runId: f.run.id, agentId: f.agent.id, title: "Fresh conversation" });
-    expect(currentNotices(allNotes)).toMatchObject([{ body: "Starting a fresh thread from saved history." }]);
-    expect(old.metadata?.supersededByCommentId).toBe(currentNotices(allNotes)[0].id);
+    expect(allNotes.map(note => note.body)).toEqual(["Starting a fresh thread from saved history."]);
+    expect(allNotes[0].metadata).toEqual({ version: 1, authorizationReason,
+      sections: [{ rows: [{ type: "run_link", runId: f.run.id, agentId: f.agent.id, title: "Fresh conversation" }] }],
+    });
+    expect(currentNotices(allNotes)).toEqual(allNotes);
   });
 
   // Keep: SMA-183 real persisted sequence and SMAA-382's dead-end banner.
