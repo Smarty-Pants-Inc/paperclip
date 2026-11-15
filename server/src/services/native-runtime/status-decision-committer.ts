@@ -20,7 +20,7 @@ import { scheduledIssueMonitorWait } from "../issue-monitors.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
 import { NativeDeliverableEvidenceError, validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
 import { hasPublishedGitHubReview, readInheritedGitHubReviewWait } from "../chat-channels/github/review-wait.js";
-import { lockNativeGovernanceSources, pendingNativeGovernance } from "./native-governance.js";
+import { executionStageChangesRequestedByRun, lockNativeGovernanceSources, pendingNativeGovernance } from "./native-governance.js";
 import { findSupersededExternalReviewRequests, supersedeExternalReviewRequestsInTransaction } from "./superseded-external-review-requests.js";
 import { normalizePrpResultSignals, type PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { readNativeMonitorDelivery, readNativePreservedMonitorWait, readNativeSupersededMonitorWait, type NativeSupersededMonitorWait, type NativeMonitorDelivery, type NativePreservedMonitorWait } from "./native-monitor-delivery.js";
@@ -75,7 +75,7 @@ import {
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
 import { directParentReportDisabledForIssue } from "../direct-parent-report.js";
-import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
+import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -2360,10 +2360,21 @@ export async function commitNativeStatusDecision(input: {
       const reviewStage = input.decision.reasonCode === COMPLETION_REVIEW_STAGE_REASON
         ? completionReviewStageEntry(issue, originRun?.agentId ?? "") : null;
       if (reviewStage && reviewStage.kind !== "starts") throw new NativeStatusRaceError();
+      const changesState = reasonCode === "execution_stage_changes_requested" ? parseIssueExecutionState(issue.executionState) : null;
+      const returnTo = changesState?.status === "pending" ? changesState.currentParticipant : changesState?.returnAssignee;
+      if (reasonCode === "execution_stage_changes_requested" && (!changesState || !returnTo || !originRun ||
+          issue.status !== "in_review" || issue.assigneeAgentId !== originRun.agentId || issue.assigneeUserId ||
+          heldByAnotherRun(issue, input.runId) ||
+          input.decision.toStatus !== (changesState.status === "pending" ? "in_review" : "in_progress") ||
+          !await executionStageChangesRequestedByRun(tx as unknown as Db, { id: input.runId, companyId: input.companyId, agentId: originRun.agentId }, issue))) {
+        throw new NativeStatusRaceError();
+      }
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
           ...(reviewStage?.kind === "starts" ? reviewStage.patch : {}),
+          ...(returnTo ? { assigneeAgentId: returnTo.type === "agent" ? returnTo.agentId : null,
+            assigneeUserId: returnTo.type === "user" ? returnTo.userId : null } : {}),
           status: input.decision.toStatus,
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
@@ -2389,6 +2400,17 @@ export async function commitNativeStatusDecision(input: {
         await enqueueWake({ tx: tx as unknown as Db, companyId: input.companyId, issueId: input.issueId,
           agentId: participant.agentId, reason, idempotencyKey: `native-status:${decisionRow.id}:execution-stage`,
           payload: { mutation: "update", executionStage },
+          contextSnapshot: { executionStage, executionStageSource: "issue.execution_stage" } });
+      }
+      if (changesState && returnTo?.type === "agent" && returnTo.agentId) {
+        const executionStage = { wakeRole: "executor",
+          stageId: changesState.currentStageId, stageType: changesState.currentStageType,
+          currentParticipant: changesState.currentParticipant, returnAssignee: changesState.returnAssignee,
+          reviewRequest: changesState.reviewRequest ?? null, lastDecisionOutcome: changesState.lastDecisionOutcome,
+          allowedActions: ["address_changes", "resubmit"] };
+        await enqueueWake({ tx: tx as unknown as Db, companyId: input.companyId, issueId: input.issueId,
+          agentId: returnTo.agentId, reason: "execution_changes_requested",
+          idempotencyKey: `native-status:${decisionRow.id}:execution-stage`, payload: { mutation: "update", executionStage },
           contextSnapshot: { executionStage, executionStageSource: "issue.execution_stage" } });
       }
       if (updated.originKind === "routine_execution") {

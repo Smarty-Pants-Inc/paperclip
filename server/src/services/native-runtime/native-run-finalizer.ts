@@ -17,7 +17,7 @@ import { notifyInstructionCollection } from "../instruction-collection-notificat
 import { readRequiredQualityReview } from "../required-quality-review.js";
 import { NativeDeliverableEvidenceError, validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
 import { OWN_QUESTION_UNANSWERED_REASON, pendingOwnQuestionId, reportsOnlyProviderMessage } from "./own-question-wait.js";
-import { conversationTurnPresentsAnswer, pendingNativeGovernance } from "./native-governance.js";
+import { conversationTurnPresentsAnswer, executionStageChangesRequestedByRun, pendingNativeGovernance } from "./native-governance.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -69,6 +69,7 @@ import {
   supersedeStaleOwnerCompletion,
   type NativeAuthoritativeIssueStatus,
   gateDoneOnConfiguredReview,
+  heldByAnotherRun,
 } from "./status-arbiter.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
 import {
@@ -1760,6 +1761,8 @@ export async function finalizeNativeRun(input: {
     const statusInput: Parameters<typeof resolveNativeFinalizerStatus>[0] = {
       requiredQualityReviewSatisfied: qualityReview.satisfied,
       executionStageApprovedByRun: await executionStageApprovedByRun(input.db, run, authoritativeIssue),
+      executionStageChangesRequestedByRun: authoritativeIssue.status === "in_review" && authoritativeIssue.assigneeAgentId === run.agentId &&
+        !heldByAnotherRun(authoritativeIssue, run.id) && await executionStageChangesRequestedByRun(input.db, run, authoritativeIssue),
       executionReviewStageStarts: reviewStage.kind === "starts",
       caseHandoffAuthorized: Boolean(await assertNativeCaseHandoffResult(input.db, run.id, authoritativeIssue.id, result)),
       monitorWaitDispatched: monitorDelivery !== null,

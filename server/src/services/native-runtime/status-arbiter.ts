@@ -247,6 +247,8 @@ export function arbitrateNativeStatus(input: {
    * the completion authority for its done report, as the policy intends.
    */
   executionStageApprovedByRun?: boolean;
+  /** The saved changes decision, not the reviewer's report, owns the return. */
+  executionStageChangesRequestedByRun?: boolean;
   /**
    * Done would start the task's configured review stage. That reviewer, not
    * the worker's evidence references, accepts the work, as on the issue route.
@@ -430,6 +432,11 @@ export function arbitrateNativeStatus(input: {
         },
       ],
     };
+  }
+  if (input.executionStageChangesRequestedByRun) {
+    const status = input.governanceGate?.kind === "execution_stage" ? "in_review" : "in_progress";
+    return { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
+      reasonCode: "execution_stage_changes_requested", unblockDescriptor: null, effects: [{ kind: "release_checkout" }] };
   }
   if (input.governanceGate) {
     if (
