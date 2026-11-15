@@ -14245,11 +14245,11 @@ describe("native warm session supervision", () => {
       expect(readNativeSessionIdleWork()).toBe("none");
     });
 
-    it("closes ten idle warm sessions within the restart drain window despite an individual failure", async () => {
+    it("closes thirteen idle warm sessions within the restart drain window despite an individual failure", async () => {
       await closeIdleWarmNativeSessionsForRestart();
       const closeFns: ReturnType<typeof vi.fn<() => Promise<void>>>[] = [];
       const finishCloseDelays: Array<() => void> = [];
-      for (let index = 0; index < 10; index++) {
+      for (let index = 0; index < 14; index++) {
         const close = vi.fn(async () => {
           if (index === 4 && close.mock.calls.length > 1) return;
           await new Promise<void>(resolve => finishCloseDelays.push(resolve));
@@ -14264,8 +14264,8 @@ describe("native warm session supervision", () => {
       const flush = async () => { for (let index = 0; index < 10; index++) await Promise.resolve(); };
       try {
         closing = closeIdleWarmNativeSessionsForRestart().then(result => { completed = result; });
-        // Each release represents one 6-second close completing. The first
-        // three ticks model the entire 18 seconds available in a 20-second drain.
+        // Each release represents one 6-second close completing. Five workers
+        // drain fourteen closes in three waves (18 seconds), inside the 20-second budget.
         for (let tick = 0; tick < 3; tick++) {
           while (finishCloseDelays.length === 0) await flush();
           const pending = finishCloseDelays.splice(0);
@@ -14273,10 +14273,10 @@ describe("native warm session supervision", () => {
           await flush();
         }
         expect(completed).toEqual({
-          closed: 9, busy: 0, failed: 1,
+          closed: 13, busy: 0, failed: 1,
           failures: [expect.objectContaining({ reason: expect.stringContaining("fixture close failure") })],
         });
-        expect(closeFns.map(close => close.mock.calls.length)).toEqual(Array(10).fill(1));
+        expect(closeFns.map(close => close.mock.calls.length)).toEqual(Array(14).fill(1));
         await closing;
       } finally {
         for (let tick = 0; closing && completed === undefined && tick < 12; tick++) {
@@ -14288,6 +14288,22 @@ describe("native warm session supervision", () => {
         await closeIdleWarmNativeSessionsForRestart();
       }
     }, 60_000);
+
+    it("fences a busy warm session on restart and closes it on release", async () => {
+      let releaseTurn!: () => void;
+      let markTurnStarted!: () => void;
+      const turnStarted = new Promise<void>(resolve => { markTurnStarted = resolve; });
+      const turn = new Promise<void>(resolve => { releaseTurn = resolve; });
+      const close = vi.fn(async () => undefined);
+      const execution = start("restart-busy", close, async () => { markTurnStarted(); await turn; });
+      await turnStarted;
+
+      expect(await closeIdleWarmNativeSessionsForRestart()).toMatchObject({ closed: 0, busy: 1 });
+      expect(close).not.toHaveBeenCalled();
+      releaseTurn();
+      await execution;
+      expect(close).toHaveBeenCalledOnce();
+    });
 
     it("leaves an idle owner intact without current drain authority", async () => {
       const f = await start("sleep-stale-hold");
