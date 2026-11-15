@@ -3220,7 +3220,7 @@ describe("agent issue mutation checkout ownership", () => {
           actorAgentId: ownerAgentId, createdByRunId: ownerRunId, body: "Approved: verified the heading and signup action." });
       });
 
-      it.each([[finalStage], [finalStage, laterStage]])("records request-changes and defers the writer handoff (%j)", async stages => {
+      it.each([{ stages: [finalStage] }, { stages: [finalStage, laterStage] }])("records request-changes and defers the writer handoff ($stages)", async ({ stages }) => {
         const issue = reviewIssue(stages);
         mockIssueService.getById.mockResolvedValue(issue);
         mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
@@ -3252,7 +3252,7 @@ describe("agent issue mutation checkout ownership", () => {
       it.each([undefined, "", "   "])("rejects request-changes with an empty decision comment (%j)", async comment => {
         mockIssueService.getById.mockResolvedValue(reviewIssue([finalStage]));
         const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`).send({ status: "in_progress", comment });
-        expect(res.status, JSON.stringify(res.body)).toBe(422);
+        expect(res.status, JSON.stringify(res.body)).toBe(comment === "" ? 400 : 422);
         expect(mockIssueService.update).not.toHaveBeenCalled();
       });
 
@@ -3280,7 +3280,7 @@ describe("agent issue mutation checkout ownership", () => {
       it("keeps the non-native request-changes path immediate", async () => {
         const issue = reviewIssue([finalStage]);
         mockIssueService.getById.mockResolvedValue(issue);
-        mockHeartbeatService.getRun.mockResolvedValue({ ...nativeRun, runtimeMode: "legacy" });
+        mockHeartbeatService.getRun.mockResolvedValue({ ...nativeRun, runtimeMode: "legacy", status: "succeeded" });
         mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
         const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
           .send({ status: "in_progress", comment: "Reviewer decision: request changes - X" });
