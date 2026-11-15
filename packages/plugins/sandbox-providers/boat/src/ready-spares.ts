@@ -81,6 +81,8 @@ export class ReadySpareKeeper {
   private readonly pools = new Map<string, ReadySpare[]>();
   private readonly inFlightCreates = new Map<string, number>();
   private readonly reconciling = new Map<string, Promise<void>>();
+  private readonly activeDesired = new Map<string, number>();
+  private readonly pendingReconciliations = new Map<string, { key: ReadySpareKey; desired: number; operations: ReadySpareOperations }>();
   private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
   private readonly recentCreates = new Map<string, Map<string, number>>();
@@ -160,12 +162,34 @@ export class ReadySpareKeeper {
   /** Re-discover, adopt healthy owned spares, stop stale owned spares, then fill to N. */
   async reconcile(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
     const poolId = readySparePoolKey(key);
+    const boundedDesired = Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired)));
     const active = this.reconciling.get(poolId);
-    if (active) return active;
-    const work = this.reconcileOnce(key, Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired))), operations);
+    if (active) {
+      const pending = this.pendingReconciliations.get(poolId);
+      if (boundedDesired !== this.activeDesired.get(poolId) || pending) {
+        this.pendingReconciliations.set(poolId, { key, desired: boundedDesired, operations });
+      }
+      return active;
+    }
+    const work = (async () => {
+      let next: { key: ReadySpareKey; desired: number; operations: ReadySpareOperations } | undefined = { key, desired: boundedDesired, operations };
+      let lastError: unknown;
+      while (next) {
+        this.activeDesired.set(poolId, next.desired);
+        try { await this.reconcileOnce(next.key, next.desired, next.operations); }
+        catch (error) { lastError = error; }
+        next = this.pendingReconciliations.get(poolId);
+        this.pendingReconciliations.delete(poolId);
+      }
+      if (lastError) throw lastError;
+    })();
     this.reconciling.set(poolId, work);
     try { await work; }
-    finally { if (this.reconciling.get(poolId) === work) this.reconciling.delete(poolId); }
+    finally {
+      if (this.reconciling.get(poolId) === work) this.reconciling.delete(poolId);
+      this.activeDesired.delete(poolId);
+      this.pendingReconciliations.delete(poolId);
+    }
   }
 
   private async reconcileOnce(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
@@ -256,7 +280,13 @@ export class ReadySpareKeeper {
       for (const spare of [...pool]) {
         const spareTtl = spare.ttlSeconds ?? ttlSeconds;
         const spareThreshold = this.now() + spareTtl * 500;
-        if (!readyAndHealthy(spare, spare.key, this.now()) || Date.parse(spare.expiresAt) > spareThreshold) continue;
+        if (!readyAndHealthy(spare, spare.key, this.now())) {
+          const index = pool.findIndex(item => item.id === spare.id);
+          if (index >= 0) pool.splice(index, 1);
+          try { await operations.stop(spare); } catch { /* Expired Boat TTL is the final stop boundary. */ }
+          continue;
+        }
+        if (Date.parse(spare.expiresAt) > spareThreshold) continue;
         try {
           const refreshed = await operations.refresh(spare, spareTtl);
           const index = pool.findIndex(item => item.id === spare.id);

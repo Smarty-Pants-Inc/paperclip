@@ -91,6 +91,20 @@ describe("Boat ready spare keeper", () => {
     expect(keeper.ready(key)).toHaveLength(0);
   });
 
+  it("applies a changed desired count after an in-flight spare warm-up", async () => {
+    const { ops } = operations();
+    let finishCreate!: (item: ReadySpare) => void;
+    (ops.create as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<ReadySpare>(resolve => { finishCreate = resolve; }));
+    const keeper = new ReadySpareKeeper(() => start);
+    const filling = keeper.reconcile(key, 1, ops);
+    await vi.waitFor(() => expect(ops.create).toHaveBeenCalledTimes(1));
+    const disabling = keeper.reconcile(key, 0, ops);
+    finishCreate(spare({ id: "bx_inflight" }));
+    await Promise.all([filling, disabling]);
+    expect(keeper.ready(key)).toEqual([]);
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_inflight" }));
+  });
+
   it("stops surplus spares when disabled or lowered and never deletes them", async () => {
     const initial = [spare(), spare({ id: "bx_second" }), spare({ id: "bx_third" })];
     const { ops } = operations(initial);
@@ -138,6 +152,18 @@ describe("Boat ready spare keeper", () => {
       labels: { ...spare().labels, owner: `paperclip:${failKey.companyId}`, environment: failKey.environmentId } }));
     await retryKeeper.reconcile(failKey, 1, failing.ops);
     expect(failing.ops.create).toHaveBeenCalledTimes(2);
+  });
+
+  it("retires an expired in-memory spare instead of keeping it claimable or refreshing it", async () => {
+    let now = start;
+    const { ops } = operations([spare()]);
+    const keeper = new ReadySpareKeeper(() => now);
+    await keeper.reconcile(key, 1, ops);
+    now += 1_800_001;
+    await keeper.refreshDue(1800, ops);
+    expect(keeper.ready(key)).toEqual([]);
+    expect(ops.refresh).not.toHaveBeenCalled();
+    expect(ops.stop).toHaveBeenCalledWith(expect.objectContaining({ id: "bx_abcdefgh" }));
   });
 
   it("refreshes near-expiry TTLs and makes a failed refresh unclaimable", async () => {
