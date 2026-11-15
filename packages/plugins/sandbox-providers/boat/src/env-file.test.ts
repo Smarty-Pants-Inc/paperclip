@@ -94,6 +94,50 @@ describe("execute environment files", () => {
     expect(f.deletes).toContain(path); expect(f.deletes).toHaveLength(1);
     expect(existsSync(f.local(path))).toBe(false);
   });
+  it("re-verifies the directory and retries only the explicit exit 197 signal", async () => {
+    const f = fixture(); const original = f.fetch.getMockImplementation()!; let first = true;
+    f.fetch.mockImplementation(async (input, init = {}) => {
+      if (String(input) === `${API}/commands` && init.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        if (body.command.includes("exec ") && first) { first = false; return json({ exitCode: 197, stderr: "unrelated diagnostic text" }); }
+      }
+      return original(input, init);
+    });
+    expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 0 });
+    expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(2);
+    expect(f.commands.at(-2).command).toContain("|| exit 197");
+    expect(f.fetch.mock.calls.filter(([input, init]) => String(input) === `${API}/commands` && init?.method === "POST").map(([, init]) => JSON.parse(String(init!.body)).command).at(-1)).toContain("|| exit 197");
+    expect(f.deletes).toHaveLength(2);
+  });
+  it("does not retry an ordinary nonzero result based on stderr text", async () => {
+    const f = fixture(); const original = f.fetch.getMockImplementation()!;
+    f.fetch.mockImplementation(async (input, init = {}) => {
+      if (String(input) === `${API}/commands` && init.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        if (body.command.includes("exec ")) return json({ exitCode: 1, stderr: "No such file: /tmp/old-env-path" });
+      }
+      return original(input, init);
+    });
+    expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 1 });
+    expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(1);
+    expect(f.fetch.mock.calls.filter(([input, init]) => String(input) === `${API}/commands` && init?.method === "POST" && JSON.parse(String(init.body)).command.includes("exec "))).toHaveLength(1);
+  });
+  it("resume clears the verified-directory cache before the next secret PUT", async () => {
+    const f = fixture(); const original = f.fetch.getMockImplementation()!;
+    f.fetch.mockImplementation(async (input, init = {}) => {
+      if (String(input) === `${API}/resume` && init.method === "POST") return json({ sandbox: { id: "bx_test", state: "archived" } });
+      if (String(input) === `${API}` && (init.method ?? "GET") === "GET") return json({ sandbox: { id: "bx_test", state: "ready" } });
+      return original(input, init);
+    });
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
+    expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(1);
+    await plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config: { apiKey: "boat_test", duplexCarrier: "off" }, providerLeaseId: "bx_test" });
+    await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
+    expect(f.commands.filter(body => body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(2);
+    const lastPut = f.fetch.mock.calls.findLastIndex(([input, init]) => String(input) === `${API}/files` && init?.method === "PUT");
+    const lastVerify = f.fetch.mock.calls.findLastIndex(([input, init]) => String(input) === `${API}/commands` && init?.method === "POST" && JSON.parse(String(init.body)).command.includes("/bin/mkdir -p -m 0700"));
+    expect(lastVerify).toBeLessThan(lastPut);
+  });
   it("real /bin/sh preserves bytes and exports to a child; temp file is gone at process start", async () => {
     const f = fixture(undefined, true);
     const env = { SECRET_X: "single' dollar$ backtick`\nbackslash\\ space 雪 = end", EMPTY: "", EQ: "a=b=c", PATH: "/nonexistent" };

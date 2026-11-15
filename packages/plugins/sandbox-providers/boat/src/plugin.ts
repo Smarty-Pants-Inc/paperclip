@@ -318,6 +318,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         duplexLogger?.warn("Boat IP rate-limit pause", {
           reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(boatRateLimitPauseUntil).toISOString(),
           retryAfter: retryAfterText, method, route,
+          rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
         });
         await waitForRateLimitPause();
       } else if (retryAfter !== null) {
@@ -571,7 +572,7 @@ async function ensurePrivateEnvDirectory(config: Config, id: string, roots: stri
   const directory = privateEnvDirectory(id, roots);
   if (!directory) throw new Error("Boat env file requires a private path outside the workspace.");
   const qdir = q(directory);
-  const command = `umask 077 && /bin/mkdir -p -m 0700 -- ${qdir} && test ! -L ${qdir} && test -d ${qdir} && test "$(/usr/bin/stat -c %u -- ${qdir})" = "$(/usr/bin/id -u)" && test "$(/usr/bin/stat -c %a -- ${qdir})" = 700`;
+  const command = `umask 077 && /bin/mkdir -p -m 0700 -- ${qdir} && test ! -L ${qdir} && test -d ${qdir} && test "$(/usr/bin/stat -c %u -- ${qdir})" = "$(/usr/bin/id -u)" && test "$(/usr/bin/stat -c %a -- ${qdir})" = 700 || exit 197`;
   const result = await runCommand(config, id, command, 30_000);
   if (result.exitCode !== 0 || result.timedOut) throw new Error("Boat private env directory verification failed");
   preparedEnvDirectories.set(id, directory);
@@ -944,6 +945,8 @@ async function finishAcquisition(
   claimName: string | null,
   claimedSpare?: ReadySpare,
 ): Promise<PluginEnvironmentLease> {
+  // Every acquisition handoff (including a claimed spare) may carry stale guest state.
+  preparedEnvDirectories.delete(id);
   if (claimedSpare) {
     if (!claimedSpare.warmed || !["ready", "idle", "running"].includes(ready?.state)
         || ready?.name !== claimName || claimedSpare.labels.owner !== `paperclip:${params.companyId}`
@@ -1280,6 +1283,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
     await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config), id = params.providerLeaseId;
+    preparedEnvDirectories.delete(id);
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     await sshCarrier.invalidate({ ...params, providerLeaseId: id });
     const metadata = params.leaseMetadata;
@@ -1363,6 +1367,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     await recordCompanySpareActivity(params.companyId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config); const id = params.providerLeaseId;
+    preparedEnvDirectories.delete(id);
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: id });
     // Lifecycle hooks issue no guest command; leave the now-empty private env directory rather than add one solely for cleanup.
@@ -1373,6 +1378,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentStopLease(params: PluginEnvironmentReleaseLeaseParams) {
     if (!params.providerLeaseId) throw new Error("Boat stop requires an exact providerLeaseId");
     const c = parse(params.config);
+    preparedEnvDirectories.delete(params.providerLeaseId);
     await duplexChannels.suspend({ ...params, providerLeaseId: params.providerLeaseId });
     const warnings = await retireForLifecycle({ ...params, providerLeaseId: params.providerLeaseId });
     const receipt = await stopSandbox(c, params.providerLeaseId);
@@ -1382,6 +1388,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentDestroyLease(params: PluginEnvironmentDestroyLeaseParams) {
     if (!params.providerLeaseId) return;
     const c = parse(params.config);
+    preparedEnvDirectories.delete(params.providerLeaseId);
     if (params.leaseMetadata?.failedCreateCleanup !== undefined) {
       const cleanup = readEnvironmentCreationCleanupError({ data: { schema: "paperclip/environment-creation-cleanup/v1", cleanup: params.leaseMetadata.failedCreateCleanup } });
       if (!cleanup || cleanup.companyId !== params.companyId || cleanup.environmentId !== params.environmentId ||
@@ -1496,10 +1503,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       const invocation = [q(params.command), ...(params.args ?? []).map(q)].join(" ");
       // Absolute cleanup utilities still work when the caller overrides PATH.
-      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && ` : "";
-      const wrapped = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
+      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && ` : "";
+      const wrapped = `${params.cwd ? (envPath ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : `cd ${q(params.cwd)} && `) : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
       let result = await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
-      if (!envRecoveryUsed && envPath && result.stderr.includes(posix.dirname(envPath)) && /(?:No such file|not found|missing)/i.test(result.stderr)) {
+      if (!envRecoveryUsed && envPath && result.exitCode === 197) {
         envRecoveryUsed = true;
         preparedEnvDirectories.delete(id);
         const retryDir = await ensurePrivateEnvDirectory(c, id, roots);
@@ -1507,7 +1514,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         await request(c, `${base}?path=${encodeURIComponent(envPath)}`, { method: "DELETE" }).catch(() => undefined);
         await stage(retryPath, Object.entries(params.env ?? {}).map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
         envPath = retryPath;
-        const retryWrapper = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
+        const retryWrapper = `${params.cwd ? `if cd ${q(params.cwd)}; then :; else exit 1; fi; ` : ""}umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} || exit 197 && exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
         result = await runCommand(c, id, retryWrapper, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
       }
       return result;

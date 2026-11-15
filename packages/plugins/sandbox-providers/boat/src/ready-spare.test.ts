@@ -65,6 +65,7 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = fa
       if (body.ttlSeconds) sb.archiveAfter = new Date(Date.now() + body.ttlSeconds * 1000).toISOString();
       return response({ sandbox: sb });
     }
+    if (method === "PUT" && /^\/sandboxes\/[^/]+\/files$/.test(route)) return response({ success: true });
     if (method === "POST" && /^\/sandboxes\/[^/]+\/commands$/.test(route)) return response({ exitCode: warmExitCode, timedOut: warmTimedOut, stdout: "{}\n", stderr: "" });
     if (method === "POST" && /^\/sandboxes\/[^/]+\/resume$/.test(route)) {
       const id = route.split("/").at(-2)!;
@@ -265,13 +266,25 @@ describe("Boat ready spare", () => {
     expect(spareCreate.body.labels).toMatchObject({ owner: `paperclip:${company}`, environment: env, purpose: "spare", configHash: expect.stringMatching(/^[a-f0-9]{64}$/) });
     expect(Date.parse(spareCreate.body.labels.expiry)).toBeGreaterThan(Date.now());
     const spareBeforeClaim = f.inventory.find(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))!;
+    const executeEnv = (id: string) => plugin.definition.onEnvironmentExecute!({
+      driverKey: "boat", companyId: company, environmentId: env, config: baseConfig,
+      lease: { providerLeaseId: id, metadata: { remoteCwd: "/home/user/paperclip-workspace" } }, command: "true", env: { SECRET_X: "spare-secret" },
+    } as any);
+    await executeEnv(spareBeforeClaim.id);
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/commands` && call.body.command.includes("/bin/mkdir -p -m 0700"))).toHaveLength(1);
     const normalCreatesBeforeClaim = f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "run").length;
     const lease = await acquire("run-claim", baseConfig, env, company);
     expect(lease.providerLeaseId).toBe(spareBeforeClaim.id);
     expect(lease.metadata).toMatchObject({ providerClaimName: "paperclip-claim:run-claim:attempt-run-claim", providerLabels: spareBeforeClaim.labels, boatOrgId: "team-spare-test", sandboxId: spareBeforeClaim.id, resumedLease: false });
     expect(f.calls.filter(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toHaveLength(1);
-    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/commands`)).toHaveLength(1);
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/commands`)).toHaveLength(3);
     expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "run")).toHaveLength(normalCreatesBeforeClaim);
+    await executeEnv(spareBeforeClaim.id);
+    const verificationCalls = f.calls.filter(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/commands` && call.body.command.includes("/bin/mkdir -p -m 0700"));
+    expect(verificationCalls).toHaveLength(2);
+    const verifyIndex = f.calls.findLastIndex(call => call === verificationCalls.at(-1));
+    const putIndex = f.calls.findLastIndex(call => call.method === "PUT" && call.url.pathname === `/api/v1/sandboxes/${spareBeforeClaim.id}/files`);
+    expect(verifyIndex).toBeLessThan(putIndex);
     await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare").length).toBeGreaterThan(1), { timeout: 2_000 });
     const warmCommand = f.calls.find(call => call.method === "POST" && call.url.pathname.endsWith("/commands"))?.body.command as string;
     expect(warmCommand).toContain("/opt/paperclip-runner/provider-pack/node_modules/node/bin/node");
@@ -282,7 +295,7 @@ describe("Boat ready spare", () => {
     expect(warmCommand).toContain("HOME: process.env.HOME, PATH: process.env.PATH");
     expect(warmCommand).toContain("get_state");
     expect(lease.metadata).toHaveProperty("workspaceSentinel");
-    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+    expect(f.calls.filter(call => call.method === "DELETE" && call.url.pathname.endsWith("/files"))).toHaveLength(2);
   });
 
   it.each([
