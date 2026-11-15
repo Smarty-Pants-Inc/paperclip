@@ -48,13 +48,21 @@ function commandText(row) {
   push(row.command); push(row.input); push(row.args); push(row.commandLine); push(row.argv);
   return parts.join('\n');
 }
+function isCommandRecord(row) {
+  return row?.mode !== 'process';
+}
 function isBridgeQueueListing(row) {
+  if (!isCommandRecord(row)) return false;
   const kind = commandKind(row).toLowerCase();
   const text = commandText(row).toLowerCase();
   const isListKind = /(^|[._-])(list|ls|listdir|readdir|find)([._-]|$)/.test(kind);
   const targetsQueue = /paperclip_bridge_queue_dir|(?:^|[\\/])requests(?:[\\/\s"']|$)|bridge[-_ ]queue[^\n]*requests/.test(text);
   const usesListCommand = /(^|[\s;&|])(?:ls|find|dir|get-childitem|list|listdir|readdir)(?:[\s;&|]|$)/.test(text) || isListKind;
-  return targetsQueue && usesListCommand;
+  // Boat's command-history records the real bridge listing as an env-wrapped
+  // shell loop. Its queue path may be masked, so recognize the stable listing
+  // operation rather than depending on that private path being visible.
+  const boatJsonListing = /for\s+\w+\s+in\s+[^;\n]*\*\.json[\s\S]*?basename\s+["']?\$\w+/i.test(text);
+  return (targetsQueue && usesListCommand) || boatJsonListing;
 }
 function rowsFrom(document) {
   if (Array.isArray(document)) return document;
@@ -128,13 +136,14 @@ try {
     if (!options.box || !options.run || !options.history) throw new Error('required: --box BOX --run RUN --history HISTORY.json');
     const text = options.history === '-' ? fs.readFileSync(0, 'utf8') : fs.readFileSync(options.history, 'utf8');
     const rows = rowsFrom(JSON.parse(text)).filter(row => matches(row, options.box, options.run));
-    if (rows.length === 0) { fail(`No Boat history rows matched box=${options.box} run=${options.run}; zero counts are not evidence.`, 2); }
+    const commandRows = rows.filter(isCommandRecord);
+    if (commandRows.length === 0) { fail(`No Boat command records matched box=${options.box} run=${options.run}; zero counts are not evidence.`, 2); }
     else {
       const counts = {};
-      for (const row of rows) { const kind = commandKind(row); counts[kind] = (counts[kind] || 0) + 1; }
-      const bridgeQueueLists = rows.filter(isBridgeQueueListing).length;
+      for (const row of commandRows) { const kind = commandKind(row); counts[kind] = (counts[kind] || 0) + 1; }
+      const bridgeQueueLists = commandRows.filter(isBridgeQueueListing).length;
       const transportCheck = options.requirePrp ? verifyPrpTransport(options.transportLog, options.run) : undefined;
-      console.log(JSON.stringify({ box: options.box, run: options.run, historyRows: rows.length, commandsByKind: Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b))), bridgeQueueLists, ...(transportCheck ? { transportCheck } : {}) }, null, 2));
+      console.log(JSON.stringify({ box: options.box, run: options.run, historyRows: commandRows.length, commandsByKind: Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b))), bridgeQueueLists, ...(transportCheck ? { transportCheck } : {}) }, null, 2));
       if (bridgeQueueLists !== 0) fail(`Gate check failed: ${bridgeQueueLists} bridge queue list command(s) found.`, 1);
     }
   }

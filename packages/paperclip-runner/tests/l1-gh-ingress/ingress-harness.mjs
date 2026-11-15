@@ -262,6 +262,77 @@ function scanFiles(paths, token) {
   for (const item of paths) visit(item);
   return found;
 }
+function scanCheckedSinks(paths, token) {
+  assertPositiveControls(paths, token);
+  return scanFiles(paths, token);
+}
+function cloneWithSentinel(value, token) {
+  if (Array.isArray(value)) return value.map(item => cloneWithSentinel(item, token));
+  if (value && typeof value === 'object') {
+    const copy = { ...value };
+    const stringKey = Object.keys(copy).find(key => typeof copy[key] === 'string');
+    if (stringKey) copy[stringKey] = token;
+    else copy.positiveControl = token;
+    return copy;
+  }
+  return token;
+}
+function plantSentinelInSink(file, token) {
+  const source = fs.readFileSync(file, 'utf8');
+  const extension = path.extname(file).toLowerCase();
+  if (extension === '.ndjson' || extension === '.jsonl') {
+    const rows = source.split(/\r?\n/).filter(line => line.trim()).map(line => JSON.parse(line));
+    const record = rows.length ? cloneWithSentinel(rows[0], token) : { positiveControl: token };
+    fs.writeFileSync(file, `${source}${source && !source.endsWith('\n') ? '\n' : ''}${JSON.stringify(record)}\n`);
+    return;
+  }
+  try {
+    const document = JSON.parse(source);
+    if (Array.isArray(document)) {
+      document.push(document.length ? cloneWithSentinel(document[0], token) : { positiveControl: token });
+    } else if (document && typeof document === 'object') {
+      const arrayKey = Object.keys(document).find(key => Array.isArray(document[key]));
+      if (arrayKey) {
+        const rows = document[arrayKey];
+        rows.push(rows.length ? cloneWithSentinel(rows[0], token) : { positiveControl: token });
+      } else {
+        document.positiveControlRecord = cloneWithSentinel(document, token);
+      }
+    } else {
+      fs.writeFileSync(file, JSON.stringify(token));
+      return;
+    }
+    fs.writeFileSync(file, JSON.stringify(document));
+    return;
+  } catch (error) {
+    if (error instanceof SyntaxError && (extension === '.json' || extension === '.ndjson' || extension === '.jsonl')) throw error;
+  }
+  fs.writeFileSync(file, `${source}${source && !source.endsWith('\n') ? '\n' : ''}${token}\n`);
+}
+function filesBelow(entry) {
+  const stat = fs.statSync(entry);
+  if (stat.isFile()) return [entry];
+  if (!stat.isDirectory()) return [];
+  return fs.readdirSync(entry).flatMap(name => filesBelow(path.join(entry, name)));
+}
+function assertPositiveControls(paths, token, scanner = scanFiles) {
+  const root = fs.mkdtempSync(path.join(process.env.TMPDIR || os.tmpdir(), 'l1e-scan-control-'));
+  try {
+    let sinkIndex = 0;
+    for (const sink of paths) {
+      for (const sourceFile of filesBelow(sink)) {
+        for (let variant = 0; variant < 4; variant++) {
+          const copy = path.join(root, `sink-${sinkIndex++}`, path.basename(sourceFile));
+          fs.mkdirSync(path.dirname(copy), { recursive: true });
+          fs.copyFileSync(sourceFile, copy);
+          plantSentinelInSink(copy, scanVariants(token)[variant].toString());
+          const pattern = variant === 0 ? 'raw' : `base64-offset-${variant - 1}`;
+          assert(scanner([copy], token).some(hit => hit.file === copy && hit.pattern === pattern), `positive control failed for sink file ${sourceFile}, sentinel form ${variant}`);
+        }
+      }
+    }
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+}
 function collectSockets(root, depth = 0) {
   let names; try { names = fs.readdirSync(root); } catch { return []; }
   const sockets = [];
@@ -406,6 +477,35 @@ async function selfTest() {
         assert(scanFiles([sample], token).length > 0, `scanner missed sentinel variant ${i}`);
       }
     });
+    await test('native-format positive controls fire per file, fail with a broken scanner, and reject separate-file hits', async () => {
+      const token = `l1e_sentinel_${randomHex(16)}`;
+      const sinks = [
+        path.join(fixture, 'positive-array.json'),
+        path.join(fixture, 'positive-object.json'),
+        path.join(fixture, 'positive-process.ndjson'),
+        path.join(fixture, 'positive-plain.log'),
+      ];
+      fs.writeFileSync(sinks[0], JSON.stringify([{ type: 'event', data: 'clean' }]));
+      fs.writeFileSync(sinks[1], JSON.stringify({ type: 'event', data: 'clean' }));
+      fs.writeFileSync(sinks[2], `${JSON.stringify({ type: 'process.output', data: 'clean' })}\n`);
+      fs.writeFileSync(sinks[3], 'clean sink\n');
+      assertPositiveControls(sinks, token);
+      let brokenScannerFailed = false;
+      try { assertPositiveControls(sinks, token, () => []); } catch { brokenScannerFailed = true; }
+      assert(brokenScannerFailed, 'a broken scanner incorrectly allowed a clean sink result');
+      let separateFileFailed = false;
+      try { assertPositiveControls([sinks[0]], token, paths => [{ file: path.join(path.dirname(paths[0]), '.l1e-positive-control'), pattern: 'raw' }]); } catch { separateFileFailed = true; }
+      assert(separateFileFailed, 'a planted sentinel in a separate file incorrectly counted as a positive control');
+    });
+    await test('real Boat history sample counts exactly one bridge listing and excludes process records', async () => {
+      const sample = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'packages/paperclip-runner/tests/l1-gh-ingress/fixtures/real-history-sample.json'), 'utf8'));
+      const history = path.join(fixture, 'real-history-with-gate-identity.json');
+      const commands = sample.commands.map(row => ({ ...row, box: 'bx_SANDBOX', run: 'fixture-run' }));
+      fs.writeFileSync(history, JSON.stringify({ commands }));
+      const result = spawnSync(process.execPath, [path.join(process.cwd(), 'packages/paperclip-runner/scripts/count-boat-history.mjs'), '--box', 'bx_SANDBOX', '--run', 'fixture-run', '--history', history], { encoding: 'utf8' });
+      const report = JSON.parse(result.stdout);
+      assert(result.status === 1 && report.historyRows === 4 && report.bridgeQueueLists === 1, `real Boat listing was miscounted: ${result.stdout} ${result.stderr}`);
+    });
     await test('Boat command history and 72 h process output scan every sentinel encoding', async () => {
       const token = `l1e_sentinel_${randomHex(16)}`;
       const history = path.join(fixture, 'boat-history.json');
@@ -419,7 +519,7 @@ async function selfTest() {
       fs.writeFileSync(history, JSON.stringify({ type: 'command.list', commands: [{ commandId: 'cmd-clean', data: 'sanitized' }] }));
       fs.writeFileSync(processOutput, `${JSON.stringify({ type: 'process.output', process: 'shim', data: 'sanitized' })}\n`);
       const cleanBoatInputs = scanInputs({ scanPaths: [], historyFiles: [history], processOutputFiles: [processOutput] });
-      assert(scanFiles(cleanBoatInputs, token).length === 0, 'clean Boat exports triggered the sentinel scanner');
+      assert(scanCheckedSinks(cleanBoatInputs, token).length === 0, 'clean Boat exports triggered the sentinel scanner');
     });
     // Scanner fixture only: it never held the token; this is not product evidence.
     await test('sanitized logs and durable PRP fixture stay sentinel-free', async () => {
@@ -567,7 +667,7 @@ async function runnerdMode(binary, options) {
       const sentinel = process.env.L1E_SENTINEL || returned?.env?.GH_TOKEN || returned?.env?.GITHUB_TOKEN;
       scanToken = sentinel || null;
       if (sentinel) {
-        const hits = scanFiles([stateDir, ...options.scanPaths], sentinel);
+        const hits = scanCheckedSinks([stateDir, ...options.scanPaths], sentinel);
         assert(hits.length === 0, `sentinel detected in runnerd/server/run/Langfuse/durable sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
       }
       console.log(`PASS joint real-server/real-runnerd request status=${response.status} size=${response.body.length}; credential body withheld`);
@@ -627,7 +727,7 @@ async function runnerdMode(binary, options) {
     assert(Date.now() - disconnectAt < BRIDGE_TIMEOUT_MS, 'ingress drop exceeded bridge response timeout');
     console.log('PASS real runnerd ingress drop -> HTTP 503 runner ingress unavailable within bridge timeout');
     const scanPaths = [stateDir, ...options.scanPaths];
-    const hits = scanFiles(scanPaths, sentinel);
+    const hits = scanCheckedSinks(scanPaths, sentinel);
     assert(hits.length === 0, `sentinel detected in secret sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
     console.log('PASS sentinel absent from runnerd stdout/stderr, PRP metadata log, supplied server/run/Langfuse sinks, and durable PRP state');
     return { authenticated, featureAvailable: true, socketMode: mode, otherUid: uidResult, elapsedMs: Date.now() - started };
@@ -645,7 +745,7 @@ async function runnerdMode(binary, options) {
     const logFile = path.join(root, 'runnerd-captured-output.log'); fs.writeFileSync(logFile, output, { mode: 0o600 });
     const sentinelFromResponse = scanToken || (response && /l1e_sentinel_[A-Za-z0-9_-]+/.exec(response.body.toString())?.[0]);
     if (sentinelFromResponse) {
-      const hits = scanFiles([logFile, stateDir, ...options.scanPaths], sentinelFromResponse);
+      const hits = scanCheckedSinks([logFile, stateDir, ...options.scanPaths], sentinelFromResponse);
       assert(hits.length === 0, `sentinel found in runnerd/log/durable sink (${hits.map(h => h.pattern).join(', ')})`);
     }
     await fs.promises.rm(root, { recursive: true, force: true });
@@ -694,7 +794,7 @@ async function stubRunnerMode(port, pathname, testCase, options) {
       let resultValue = {}; try { resultValue = JSON.parse(responseBody.toString()); } catch {}
       const sentinel = process.env.L1E_SENTINEL || resultValue?.env?.GH_TOKEN || resultValue?.env?.GITHUB_TOKEN;
       if (sentinel) {
-        const hits = scanFiles(options.scanPaths, sentinel);
+        const hits = scanCheckedSinks(options.scanPaths, sentinel);
         assert(hits.length === 0, `sentinel detected in supplied server/run/Langfuse sinks: ${hits.map(hit => `${hit.file}:${hit.pattern}`).join(', ')}`);
         console.log('PASS sentinel absent from supplied server/run/Langfuse scan paths; response body withheld');
       }
