@@ -15,6 +15,19 @@ describe("buildProjectListMetricMaps", () => {
     expect(taskCountByProjectId.get("p2")).toBe(11);
   });
 
+  it("maps open task counts by project, coercing string counts to numbers", () => {
+    const { openTaskCountByProjectId } = buildProjectListMetricMaps(
+      [
+        { projectId: "p1", count: 24, openCount: 3 },
+        { projectId: "p2", count: 11, openCount: "0" as unknown as number },
+      ],
+      [],
+    );
+
+    expect(openTaskCountByProjectId.get("p1")).toBe(3);
+    expect(openTaskCountByProjectId.get("p2")).toBe(0);
+  });
+
   it("ignores task-count rows with a null project id", () => {
     const { taskCountByProjectId } = buildProjectListMetricMaps(
       [{ projectId: null, count: 5 }],
