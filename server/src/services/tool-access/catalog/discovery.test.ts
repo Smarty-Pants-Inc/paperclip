@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Db, toolConnections } from "@paperclipai/db";
 import { createToolCatalogDiscovery, forgetRemoteToolListCache } from "./discovery.js";
+import { createConnectionHealth } from "./health.js";
 import { forgetMcpProtocolVersion, mcpEraKey, MCP_MODERN_PROTOCOL_VERSION } from "../../mcp-http.js";
 
 vi.mock("../../github-app-credentials.js", async () => {
@@ -14,20 +15,28 @@ vi.mock("../../github-app-credentials.js", async () => {
     refreshGitHubAppAccess: vi.fn(async () => ({ token: "fixture-token" })),
   };
 });
+vi.mock("../../tool-connection-health-notifications.js", () => ({
+  writeToolConnectionHealthChange: vi.fn(async (_db: Db, connection: Connection) => [connection]),
+}));
 
 type Connection = typeof toolConnections.$inferSelect;
 const endpoint = "https://api.githubcopilot.com/mcp/";
 const connections: Connection[] = [];
 
 function fixture(method: "mcp-key" | "own-oauth" | "app-installation") {
-  const connection = {
-    id: randomUUID(), companyId: randomUUID(), applicationId: randomUUID(),
+  const connection: Connection = {
+    id: randomUUID(), companyId: randomUUID(), applicationId: randomUUID(), uid: randomUUID(),
     name: "Protocol regression fixture", transport: "mcp_remote", connectionPurpose: "tool",
+    connectionKind: "managed", ownership: "customer", agentInstructions: null,
     authKind: method === "own-oauth" ? "oauth" : "api_key",
-    credentialSource: "paperclip_vault", credentialPolicy: "shared", status: "active", enabled: true,
+    credentialSource: "paperclip_vault", externalCredential: null,
+    credentialPolicy: "shared", status: "active", enabled: true,
     config: { sourceTemplateKey: "github", connectionMethodKey: method, mcpProtocolVersion: MCP_MODERN_PROTOCOL_VERSION },
     transportConfig: {}, credentialRefs: [], credentialSecretRefs: [],
-  } as Connection;
+    healthStatus: "unchecked", healthMessage: null, healthCheckedAt: null,
+    lastHealthAt: null, lastCatalogRefreshAt: null, lastError: null,
+    createdByAgentId: null, createdByUserId: null, createdAt: new Date(), updatedAt: new Date(),
+  };
   connections.push(connection);
   let token = "fixture-token";
   const resolveCredentialHeaders = vi.fn(async (_connection?: unknown, _actor?: unknown, options?: { forceRefresh?: boolean }) => {
@@ -93,5 +102,19 @@ describe("GitHub App port preserves modern MCP discovery", () => {
     connection.config = { ...connection.config, connectionMethodKey: "app-installation" };
     expect((await discovery.discoverTools(connection)).map(tool => tool.name)).toEqual(["read_repository"]);
     expect(requestRemoteHttpEndpoint).toHaveBeenCalledTimes(1);
+  });
+
+  it("probes the App MCP server during health checks even when its public catalog is cached", async () => {
+    const { connection, discovery, requestRemoteHttpEndpoint, resolveCredentialHeaders, setupPolicy } = fixture("app-installation");
+    await discovery.discoverTools(connection);
+    expect(requestRemoteHttpEndpoint).toHaveBeenCalledTimes(1);
+    const health = createConnectionHealth({} as Db, {
+      now: () => new Date(), audit: vi.fn(async () => {}),
+      getConnectionRow: vi.fn(async () => connection), discovery, setupPolicy,
+      resolveCredentialHeaders, refreshManagedGitHubGrantAccess: vi.fn(),
+      ensureRuntimeSlot: vi.fn(async () => null), stdioTemplateId: vi.fn(),
+    } as unknown as Parameters<typeof createConnectionHealth>[1]);
+    await health.checkConnectionHealth(connection.id);
+    expect(requestRemoteHttpEndpoint).toHaveBeenCalledTimes(2);
   });
 });
