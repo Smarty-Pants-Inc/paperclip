@@ -31,6 +31,7 @@ const readySpares = new ReadySpareKeeper();
 const knownSparePools = new Map<string, { key: ReadySpareKey; ttlSeconds: number; desired: number; operations: ReadySpareOperations }>();
 let pluginContext: PluginContext | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
+let spareMaintenanceWork: Promise<void> | undefined;
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
@@ -571,8 +572,17 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
     duplexLogger?.warn("Boat ready spare reconciliation failed", { companyId: key.companyId, environmentId: key.environmentId });
   });
 }
-function refreshReadySpareTtls(): void {
-  void readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => knownSparePools.get(readySparePoolKey(key))?.operations);
+async function maintainReadySpares(): Promise<void> {
+  if (spareMaintenanceWork) return spareMaintenanceWork;
+  const work = (async () => {
+    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => knownSparePools.get(readySparePoolKey(key))?.operations);
+    for (const pool of knownSparePools.values()) {
+      if (pool.desired !== readySpares.ready(pool.key).length) await readySpares.reconcile(pool.key, pool.desired, pool.operations);
+    }
+  })();
+  spareMaintenanceWork = work;
+  try { await work; }
+  finally { if (spareMaintenanceWork === work) spareMaintenanceWork = undefined; }
 }
 async function finishAcquisition(
   params: PluginEnvironmentAcquireLeaseParams,
@@ -624,7 +634,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
-    spareRefreshTimer = setInterval(refreshReadySpareTtls, 60_000);
+    spareRefreshTimer = setInterval(() => { void maintainReadySpares().catch(() => undefined); }, 15_000);
     spareRefreshTimer.unref?.();
     ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight");
   },
@@ -653,13 +663,17 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           await sshCarrier.health(lease); checked++;
         });
       }
+      await maintainReadySpares();
       return { status: "ok", message: checked ? `Boat resident status probes passed for ${checked} bound leases (not live Boat qualification).` : "Boat sandbox provider healthy" };
     } catch { return { status: "error", message: "Boat SSH guardian status probe failed." }; }
   },
   async onShutdown() {
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
-    try { await readySpares.drain(); } finally {
+    try {
+      if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
+      await readySpares.drain();
+    } finally {
       try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
     }
     duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
@@ -730,12 +744,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     let id: string | undefined;
     let claimedSpare: ReadySpare | undefined;
     let claimName: string | null = null;
+    let adoptionTask: Promise<void> | undefined;
     try {
       if (spareOperations && desiredSpares > 0 && readySpares.ready(spareKey).length === 0) {
-        // A restart loses only the in-memory fast index. Rebuild it from Boat's
-        // immutable ownership labels before the claim; inventory errors fall
-        // straight through to the ordinary create path.
-        try { await readySpares.adopt(spareKey, spareOperations); } catch { /* fail open to the established create path */ }
+        // Recovery inventory is asynchronous: a cache miss never waits on Boat
+        // before following the established create path. A healthy adopted
+        // candidate becomes available to the next acquire.
+        adoptionTask = readySpares.adopt(spareKey, spareOperations).catch(() => undefined);
       }
       if (spareOperations && desiredSpares > 0) {
         const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${attemptId}`;
@@ -751,7 +766,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           return await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
         }
       }
-      if (spareOperations) queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+      if (spareOperations) {
+        if (adoptionTask) void adoptionTask.then(() => queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations));
+        else queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+      }
       const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
       const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
       id = sb.id;

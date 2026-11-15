@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const MAX_READY_SPARES = 3;
 export const MAX_READY_SPARE_CREATES_PER_HOUR = 12;
@@ -83,11 +83,11 @@ export class ReadySpareKeeper {
   private readonly reconciling = new Map<string, Promise<void>>();
   private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
-  private readonly recentCreates = new Map<string, number[]>();
+  private readonly recentCreates = new Map<string, Map<string, number>>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
 
   constructor(
-    private readonly now: () => number = Date.now,
+    private readonly now: () => number = () => Date.now(),
     private readonly maxCreatesPerHour = MAX_READY_SPARE_CREATES_PER_HOUR,
   ) {}
 
@@ -123,7 +123,7 @@ export class ReadySpareKeeper {
     const keep: ReadySpare[] = [];
     for (const spare of listed) {
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
-      if (spare.name.startsWith("paperclip-claim:")) continue;
+      if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else await operations.stop(spare);
     }
@@ -175,9 +175,9 @@ export class ReadySpareKeeper {
     const toStop: ReadySpare[] = [];
     for (const spare of listed) {
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
-      // A claim name is a durable handoff marker. Never stop a sandbox already
-      // handed to a run, even though Boat's immutable spare labels remain.
-      if (spare.name.startsWith("paperclip-claim:")) continue;
+      // An in-flight local claim may not have reached Boat's durable marker yet.
+      // Never race a reconcile into stopping or re-adopting it.
+      if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else toStop.push(spare);
     }
@@ -199,21 +199,27 @@ export class ReadySpareKeeper {
     if (missing === 0) return;
     const failure = this.failures.get(poolId);
     if (failure && this.now() < failure.retryAt) return;
-    const recent = (this.recentCreates.get(key.companyId) ?? []).filter(at => this.now() - at < 60 * 60 * 1000);
-    this.recentCreates.set(key.companyId, recent);
-    if (recent.length >= this.maxCreatesPerHour) return;
-    if (operations.allowCreate && !(await operations.allowCreate())) return;
 
-    // One create per key is in flight at a time. Reserve before awaiting the
-    // provider to prevent another reconcile call from overfilling the pool.
+    // One create per key is in flight at a time. Company-wide reservations are
+    // recorded before any provider-side quota read, so concurrent environments
+    // cannot race past the rolling hourly cap.
     this.inFlightCreates.set(poolId, (this.inFlightCreates.get(poolId) ?? 0) + 1);
     try {
       for (let i = 0; i < missing; i++) {
         if (this.now() < (this.failures.get(poolId)?.retryAt ?? 0)) break;
         const current = this.pools.get(poolId) ?? [];
-        if (current.length + (this.inFlightCreates.get(poolId) ?? 0) > desired) break;
-        recent.push(this.now());
+        if (current.length >= desired) break;
+        const recent = this.recentCreates.get(key.companyId) ?? new Map<string, number>();
+        for (const [token, at] of recent) if (this.now() - at >= 60 * 60 * 1000) recent.delete(token);
         this.recentCreates.set(key.companyId, recent);
+        if (recent.size >= this.maxCreatesPerHour) break;
+        const reservation = randomUUID();
+        recent.set(reservation, this.now());
+        if (operations.allowCreate) {
+          let allowed = false;
+          try { allowed = await operations.allowCreate(); } catch { allowed = false; }
+          if (!allowed) { recent.delete(reservation); break; }
+        }
         try {
           const spare = await operations.create(key);
           if (readyAndHealthy(spare, key, this.now())) {
@@ -226,7 +232,8 @@ export class ReadySpareKeeper {
             throw new Error("Boat spare create did not return a warmed running sandbox");
           }
         } catch (error) {
-          recent.pop();
+          // The start attempt counts against the hourly cap even when Boat or
+          // warm-up fails; exponential backoff prevents immediate retry loops.
           const count = (this.failures.get(poolId)?.count ?? 0) + 1;
           this.failures.set(poolId, { count, retryAt: this.now() + Math.min(15 * 60_000, 1000 * 2 ** Math.min(count - 1, 10)) });
           throw error;

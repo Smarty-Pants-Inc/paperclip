@@ -116,16 +116,17 @@ describe("Boat ready spare keeper", () => {
     expect(second.ops.create).not.toHaveBeenCalled();
 
     const failKey = { ...key, companyId: "company-b" };
+    const retryKeeper = new ReadySpareKeeper(() => now, 12);
     const failing = operations();
     (failing.ops.create as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("429"));
-    await expect(keeper.reconcile(failKey, 1, failing.ops)).rejects.toThrow("429");
+    await expect(retryKeeper.reconcile(failKey, 1, failing.ops)).rejects.toThrow("429");
     now += 999;
-    await keeper.reconcile(failKey, 1, failing.ops);
+    await retryKeeper.reconcile(failKey, 1, failing.ops);
     expect(failing.ops.create).toHaveBeenCalledTimes(1);
     now += 1;
     (failing.ops.create as ReturnType<typeof vi.fn>).mockResolvedValueOnce(spare({ id: "bx_after_backoff", key: failKey,
       labels: { ...spare().labels, owner: `paperclip:${failKey.companyId}`, environment: failKey.environmentId } }));
-    await keeper.reconcile(failKey, 1, failing.ops);
+    await retryKeeper.reconcile(failKey, 1, failing.ops);
     expect(failing.ops.create).toHaveBeenCalledTimes(2);
   });
 
