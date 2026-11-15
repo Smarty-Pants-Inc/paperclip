@@ -698,7 +698,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       if (sandbox?.id !== spare.id || !sandbox.labels) return undefined;
       return readySpareFromSandbox(sandbox, ttlSeconds);
     },
-    create: () => createAndWarmSpare(config, key, ttlSeconds, from),
+    create: () => createReadySpare(config, key, ttlSeconds, from),
     async warmUp(spare) {
       const startedAt = new Date().toISOString();
       const started = Date.now();
