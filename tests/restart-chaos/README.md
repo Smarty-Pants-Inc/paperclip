@@ -1130,7 +1130,11 @@ task finishes with no Retry and no run ends with
 
 Before starting, the harness compares the image's `io.paperclip.runner.content-id`
 label with the content ID of this checkout (`pnpm test:e2e:runner:image-id`,
-which hashes every runner input) and refuses to run on a mismatch. To get an
+which hashes every runner input) and refuses to run on a mismatch. For a local
+test of a branch that changes only controller-side TypeScript, set
+`PAPERCLIP_CHAOS_TEST_ACCEPT_IMAGE_CONTENT_ID` to the image's exact content ID
+to run against that existing image; the harness prints a `TEST OVERRIDE` warning
+and the timeline keeps both content IDs. Such a wave is not image qualification. To get an
 image for the current master, dispatch a narrow image build and reject its paid
 gate:
 
@@ -1580,6 +1584,11 @@ tried again on the next poll with the same `clientRequestId`. The overlap window
 `staging-mix.ts`, which a swap driver registers. Without a probe, the window is any time a fault is in progress and the
 server still answers (a K15 overlap). The timeline records `staging_mix_follow_up`.
 
+When no run is active once the hold or the 85% point has passed (the agent finished early), the harness posts the
+follow-up after the run ended instead. The task then waits for that post before it counts as finished, and the post is
+graded like an after-end follow-up: `after_end_follow_ups_served` needs an agent comment after it and the
+`FOLLOWUP-<nonce>` ledger line. The `follow_up_posted` detail says "after the run ended".
+
 To aim a follow-up at the warm session's idle close instead, set `RESTART_CHAOS_MIX_FOLLOW_UP_AFTER_END_MS=<min>-<max>`
 (for example `298000-306000` for the 300 s idle timeout). The harness then posts the follow-up that long after the
 task's last run ended, `RESTART_CHAOS_MIX_FOLLOW_UP_COUNT` times (default 2), and waits for every post before the task
@@ -1639,15 +1648,23 @@ started from a wake that carries a person's comment posted after the task's firs
 wake payload's `commentId`) is a required run. This includes the retry of a failed attempt for the same comment. OpenCode,
 for example, takes no input mid-turn, so a comment posted during its turn is answered by the next run. Such runs are
 listed under "Follow-ups the running turn did not receive, answered in a later run" (`followUpsAnsweredLater`,
-`followUpWaits`). An extra turn is a run that started after completion from a wake that carries no comment. The
+`followUpWaits`). An extra turn is a run that started after completion from a wake that carries no comment. A run
+counts as having received its comments only when it started a provider turn (a `turn.submitted`, `turn.accepted` or
+`turn.started` run event, `providerTurnStarted` in the wake evidence). When a run fails before any provider turn, its
+comments carry to the next run that starts one: that run is the required run and may re-complete the task, and the
+failed run is not an extra turn. Wake evidence without `providerTurnStarted` counts every started run as a delivery. The
 server's delivery rule (`task_history.read`, cited evidence, child-result reads) is covered by the server's own tests.
 
 `completion_once` stays the independent side-effect check. The first run that reported completion is always the
-baseline. A later completion counts as a duplicate unless its run answered a comment as above.
+baseline. A later completion counts as a duplicate unless its run answered a comment as above. A `done` result that the
+server rejected as incomplete is not a completion: the server shows the rejection by queueing a same-agent continuation
+wake with key `native-completion-incomplete` for the issue, and the latest accepted result before that wake is the
+`done`. A wake that follows a later result, such as a `yielded` one, does not reject an earlier `done`. Such a run counts only when it posted the
+DONE comment itself. Otherwise the continuation run that finishes the work is the baseline.
 
 The completion time comes from the product's own record, in this order:
 
-1. the earliest accepted run result whose `reportedWorkDisposition` is `done`;
+1. the earliest accepted run result whose `reportedWorkDisposition` is `done`, skipping a rejected `done` as above;
 2. the issue's `completedAt`;
 3. the first bare `DONE-<nonce>` comment, only when neither exists.
 

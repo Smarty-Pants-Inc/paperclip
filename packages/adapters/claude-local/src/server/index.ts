@@ -65,6 +65,7 @@ export type {
 } from "./setup-token-runner.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
+import { normalizeAdapterExecutionTargetSessionIdentity } from "@paperclipai/adapter-utils/execution-target";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -77,6 +78,17 @@ function readRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? { ...(value as Record<string, unknown>) }
     : null;
+}
+
+function remoteSessionMetadata(record: Record<string, unknown>): Record<string, unknown> {
+  const remoteExecution = normalizeAdapterExecutionTargetSessionIdentity(record.remoteExecution);
+  const conversationId = readNonEmptyString(record.sshClaudeConversationId);
+  const scope = readNonEmptyString(record.sshClaudeAccountScope);
+  return {
+    ...(remoteExecution ? { remoteExecution } : {}),
+    ...(conversationId && scope && /^[a-f0-9]{64}$/.test(conversationId) && /^[a-f0-9]{64}$/.test(scope)
+      ? { sshClaudeConversationId: conversationId, sshClaudeAccountScope: scope } : {}),
+  };
 }
 
 export const sessionCodec: AdapterSessionCodec = {
@@ -99,6 +111,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const remoteExecution = readRecord(record.remoteExecution);
     return {
       sessionId,
+      ...remoteSessionMetadata(record),
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),
@@ -126,6 +139,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const remoteExecution = readRecord(params.remoteExecution);
     return {
       sessionId,
+      ...remoteSessionMetadata(params),
       ...(cwd ? { cwd } : {}),
       ...(promptBundleKey ? { promptBundleKey } : {}),
       ...(mcpServerIdentity ? { mcpServerIdentity } : {}),

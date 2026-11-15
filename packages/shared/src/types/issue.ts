@@ -1348,6 +1348,9 @@ export interface ConversationTaskHandoff {
   sourceRunId: string | null;
   /** When present, the accepted suggestion already renders this task card. */
   suggestionInteractionId: string | null;
+  /** The conversation reply that reported this task's latest completion, once the server
+   * settled that completion delivery; null while it is still owed. */
+  completionReportCommentId?: string | null;
 }
 
 export interface ConversationTaskHandoffPage {

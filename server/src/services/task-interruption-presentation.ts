@@ -44,6 +44,16 @@ const QUEUED_INTERRUPT_HANDOFF_GRACE_MS = 5 * 60_000;
 const QUEUED_INPUT_DISPATCH_GRACE_MS = 2 * 60_000;
 const AUTOMATIC_DISPOSITION_GRACE_MS = 2 * 60_000;
 const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
+const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
+const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
+
+function awaitsExactRemoteResume(issue: Pick<typeof issues.$inferSelect, "status" | "executionRunId">,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "processPid" | "processGroupId">,
+  coordinator: Pick<typeof nativeRunFinalizations.$inferSelect, "failureDetail">): boolean {
+  const detail = coordinator.failureDetail as Record<string, unknown> | null;
+  return issue.status === "blocked" && issue.executionRunId === run.id
+    && (run.processPid !== null || run.processGroupId !== null) && detail?.recoveryMode === "exact_checkpoint_resume";
+}
 
 type ProjectionIssue = Pick<typeof issues.$inferSelect, "id" | "companyId" | "status" | "assigneeAgentId" | "projectId">;
 type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
@@ -175,6 +185,11 @@ const retryWaitMessages: Record<string, string> = {
   retry_source_changed: "Retry cannot continue because its saved message changed. Send a new message to continue from saved work.",
 };
 
+/** The stable text for a Retry admission refusal, as the task view shows it. */
+export function taskRetryWaitMessage(reason: string): string {
+  return retryWaitMessages[reason] ?? "Retry is waiting for execution checks. Your message is saved.";
+}
+
 const UNIDENTIFIED_RUNNER_STOP_MESSAGE = "Paperclip can't confirm that the previous run stopped. The server restarted after it started the agent but before it recorded the agent's process. "
   + "If no agent is still working on this task, a board operator can confirm that it stopped, and your Retry starts right away. Your message is saved.";
 
@@ -302,6 +317,10 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
     return { ...base, state: "retry_scheduled", nextRetryAt: new Date(input.freshContinuation.nextCheckAt).toISOString(), canRetry: false };
   if (input.automaticDispositionAt !== undefined && ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
       && now - Math.max(input.automaticDispositionAt, run.finishedAt?.getTime() ?? 0) < AUTOMATIC_DISPOSITION_GRACE_MS)
+    return { ...base, state: "working", canRetry: false };
+  if (run.status === "failed" && NO_WORK_CONTINUATION_CAUSES.has(String(run.resultJson?.failureCause))
+      && run.resultJson?.continuationScheduling !== "refused" && run.finishedAt
+      && now - run.finishedAt.getTime() < NO_WORK_CONTINUATION_HANDOFF_GRACE_MS)
     return { ...base, state: "working", canRetry: false };
   const deniedProject = deniedProjectId(issue, run);
   let projectAccess: TaskInterruptionPresentation["projectAccess"];
@@ -598,13 +617,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         const issue = run?.nativeIssueId ? issueById.get(run.nativeIssueId) : undefined;
         const coordinator = coordinatorByRun.get(candidate.id);
         const admitted = run && issue && coordinator
-          && await readNativeSessionResumptionAgent(db, { issue, run, coordinator }).catch(() => null);
+          && (awaitsExactRemoteResume(issue, run, coordinator)
+            || await readNativeSessionResumptionAgent(db, { issue, run, coordinator }).catch(() => null));
         if (!admitted) candidate.nativeResumeAt = null;
       }));
     }
   }
   // A queued-message Interrupt records its queue on the stopped run. Newer
   // input can hide that wake from the latest-wait read, so load it by id.
+  // The click's recorded intent is the authority, not the wake's requester:
+  // a user's message can join an earlier automatic wake.
   const interruptQueueId = (run: typeof runs[number]) => {
     const id = run.status === "cancelled" ? run.resultJson?.queuedCommentInterruptQueueId : null;
     return typeof id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id) ? id : null;
@@ -614,7 +636,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     requestedAt: agentWakeupRequests.requestedAt,
     queuedInterruptRequestedAt: boundedJsonString(sql`${agentWakeupRequests.payload}#>'{queuedCommentInterrupt,requestedAt}'`, 40) })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.id, interruptQueueIds),
-      eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"))) : [];
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+      sql`${agentWakeupRequests.payload}#>>'{queuedCommentInterrupt,actorId}' is not null`)) : [];
   const interruptWaitById = new Map(interruptWaits.map(wait => [wait.id, wait]));
   const runIds = runs.map(run => run.id);
   const actions = runIds.length ? await db.selectDistinctOn([issueRecoveryActions.sourceIssueId]).from(issueRecoveryActions).where(and(
@@ -925,4 +948,24 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
 
 export async function taskInterruptionPresentation(db: Db, issue: ProjectionIssue) {
   return (await taskInterruptionPresentations(db, issue.companyId, [issue])).get(issue.id) ?? null;
+}
+
+/**
+ * The refusal that admission recorded on this Retry request, when another
+ * click cannot change it. A Retry answer must name it instead of reporting
+ * the request as accepted: such a request starts no run by itself. The task
+ * view's projection says whether a quarantined session is still cleaning up.
+ */
+export async function taskRetryRefusal(db: Pick<Db, "select">, companyId: string, requestId: string,
+  presentation?: Pick<TaskInterruptionPresentation, "canRetry" | "retryWait"> | null):
+  Promise<{ reason: string; message: string } | null> {
+  const [wake] = await db.select({ status: agentWakeupRequests.status, runId: agentWakeupRequests.runId,
+    reason: sql<string | null>`${agentWakeupRequests.payload}#>>'{executionWait,reason}'` })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId)));
+  if (!wake || wake.status !== "deferred_issue_execution" || wake.runId || !wake.reason) return null;
+  const shown = presentation?.retryWait?.reason === wake.reason ? presentation : null;
+  // A quarantined session that is still cleaning up is a refusal only while
+  // the task view hides Retry for it; every other reason has a fixed verdict.
+  if (heldRetryOffersRetry(wake.reason, wake.reason === "cleanup_quarantined" && shown?.canRetry === false)) return null;
+  return { reason: wake.reason, message: shown?.retryWait?.message ?? taskRetryWaitMessage(wake.reason) };
 }

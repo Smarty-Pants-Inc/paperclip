@@ -12,7 +12,7 @@ import { createCostEventInTransaction } from "../costs.js";
 import { withOperationAccountingTransaction } from "../accounting-transaction.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { nativeRunKeyScope, nativeSkillTestToolAllowed, assertNativeSkillTestTool } from "./native-skill-test-scope.js";
-import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
+import { notifyIssueAttentionRetentionWork } from "../retention-work-notifications.js";
 import { requiredQualityReviewSchema, type RequestCheckboxConfirmationOption } from "@paperclipai/shared";
 import { priorRecoveryApiReceipt } from "../recovery-effect-receipts.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -369,7 +369,7 @@ function hireAgentResult(value: unknown, provider: unknown) {
 export class PaperclipRunnerToolAuthority {
   #taskAttachmentCache = new TaskAttachmentReadCache();
   #skillLibraryCache = new SkillLibraryReadCache();
-  close() { this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); }
+  close() { this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); this.binding.assignedMcpTools?.close?.(); }
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
@@ -1271,11 +1271,11 @@ export class PaperclipRunnerToolAuthority {
     const token = this.#apiToken(bound);
     if (!token) throw new Error("Paperclip run authentication is unavailable");
     let dispatchAuthorized = false;
-    const execute = async () => {
+    const execute = async (callKey?: string) => {
       const current = await this.#boundContext();
       assertAvailable(current.issue.workMode);
       const result = await executeRunnerApi(input, { ...context, workMode: current.issue.workMode }, {
-        apiUrl, token,
+        apiUrl, token, callKey,
         beforeDispatch: async () => {
           const fresh = await this.#boundContext();
           assertAvailable(fresh.issue.workMode);
@@ -1339,7 +1339,7 @@ export class PaperclipRunnerToolAuthority {
       return null;
     }));
     if (prior) return prior.result;
-    const result = await execute().catch(async error => {
+    const result = await execute(key).catch(async error => {
       if (addressedResponse && !dispatchAuthorized) await this.db.transaction(async tx => {
         const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, this.binding.runId),
           eq(heartbeatRuns.companyId, this.binding.companyId), eq(heartbeatRuns.agentId, this.binding.agentId))).for("update");
@@ -2673,7 +2673,7 @@ export class PaperclipRunnerToolAuthority {
         replayMonitor = summarizeIssueMonitor(target, normalizeIssueExecutionPolicy(target.executionPolicy));
         return { taskId: target.id, status: target.status, monitor: replayMonitor };
       }
-      await notifyAttentionRetentionWork(tx, { companyId: this.binding.companyId });
+      await notifyIssueAttentionRetentionWork(tx, { companyId: this.binding.companyId, issueId: target.id });
       const patch = prepareIssueMonitorUpdate(target, input.monitor, actor);
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
       await notifyStatusCardIssueChange(tx, this.binding.companyId);

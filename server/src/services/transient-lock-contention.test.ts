@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { postgresErrorCode, retryTransientLockContention } from "./transient-lock-contention.js";
+import { retryRunPreparationLockContention } from "./run-preparation-lock-retry.js";
 
 // Keep: data safety. Only a classified transaction failure may replay SQL;
 // transport loss has an unknown commit outcome and must never be replayed here.
@@ -24,7 +25,7 @@ describe("retryTransientLockContention", () => {
       callback(undefined); return undefined as unknown as ReturnType<typeof setTimeout>;
     });
     const retries: Array<{ error: unknown; attempt: number; delayMs: number }> = [];
-    await expect(retryTransientLockContention(write, 3, {
+    await expect(retryRunPreparationLockContention(write, 3, {
       jitterMs: attempt => 500 * 2 ** (attempt - 1),
       onRetry: (error, attempt, delayMs) => retries.push({ error, attempt, delayMs }),
     })).rejects.toBe(error);
@@ -36,7 +37,7 @@ describe("retryTransientLockContention", () => {
   it.each(["23505", "42501", "CONNECTION_CLOSED"])("does not retry non-contention %s", async code => {
     const error = new Error("not retry-safe", { cause: { code } });
     const write = vi.fn().mockRejectedValue(error), onRetry = vi.fn();
-    await expect(retryTransientLockContention(write, 20, { jitterMs: 500, onRetry })).rejects.toBe(error);
+    await expect(retryRunPreparationLockContention(write, 20, { jitterMs: 500, onRetry })).rejects.toBe(error);
     expect(write).toHaveBeenCalledTimes(1);
     expect(onRetry).not.toHaveBeenCalled();
   });

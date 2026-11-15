@@ -1,4 +1,5 @@
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
+import { isAppQuestionCardKey } from "../services/mcp-elicitation.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -12,7 +13,7 @@ import { readInboxMine } from "../services/inbox-mine-read.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperclipai/shared";
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
-import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
+import { taskInterruptionPresentation, taskInterruptionPresentations, taskRetryRefusal } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { ISSUE_SUMMARIES_MAX_IDS, issueChatBootstrapQuerySchema, issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
@@ -26,6 +27,7 @@ import { assertHandedOffRunTaskOwnership } from "../run-task-ownership.js";
 import { recordNativeHumanSelfHandoff } from "../services/native-runtime/native-human-self-handoff.js";
 import { recordChildTaskRead } from "../services/native-runtime/native-child-completion-delivery.js";
 import { recordCompletedHandoffRead } from "../services/chat-completion-delivery.js";
+import { recordDeclinedInteractionRead } from "../services/chat-interaction-outcome-report.js";
 import { runRetainsIssueIdentity } from "../services/task-repository-acquisition.js";
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { markIssueReadSchema } from "@paperclipai/shared";
@@ -3627,6 +3629,9 @@ async function recordAgentChildTaskRead(db: Db, req: Request, issue: { id: strin
     parentIssueId: issue.parentId, children: [issue] })
     .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the child task a run read"));
 }
+
+/** How long a Retry answer waits for admission before it reports the saved request as accepted. */
+const TASK_RETRY_ANSWER_ADMISSION_WAIT_MS = 5_000;
 
 export function issueRoutes(
   db: Db,
@@ -7676,6 +7681,8 @@ export function issueRoutes(
     response?: QueuedInteractionResponse | null;
   };
 
+  const QUEUED_INTERRUPT_HANDOFF_WAIT = { reason: "interrupt_handoff", message: "Sending your messages." } as const;
+
   async function findQueuedCommentWake(
     executor: IssueQueueDb,
     issue: { id: string; companyId: string; assigneeAgentId: string | null },
@@ -7858,10 +7865,15 @@ export function issueRoutes(
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // The user's Interrupt click is delivering these messages. Its stopped run
+    // settling is not something to read about under the composer; the task
+    // notice owns any wait that needs the user.
+    const interruptHandoff = queueState?.state === "deferred" && readObject(wake?.payload).queuedCommentInterrupt != null;
     const queue = buildQueuedCommentQueueSnapshot({
       issueId: input.issue.id,
-      executionWait: typeof wait.reason === "string" && typeof wait.message === "string"
-        ? { reason: wait.reason, message: wait.message } : null,
+      executionWait: interruptHandoff ? QUEUED_INTERRUPT_HANDOFF_WAIT
+        : typeof wait.reason === "string" && typeof wait.message === "string"
+          ? { reason: wait.reason, message: wait.message } : null,
       queueId: wake?.id ?? null,
       state: queueState?.state ?? null,
       activeRunId: input.activeRun?.id ?? null,
@@ -8433,9 +8445,9 @@ export function issueRoutes(
     companyId: string;
     projectId: string | null;
     goalId: string | null;
-  }) {
+  }, options: { workspaceProvider?: boolean } = {}) {
     const projectPromise = issue.projectId
-      ? projectsSvc.getById(issue.projectId)
+      ? projectsSvc.getById(issue.projectId, options)
       : Promise.resolve(null);
     const directGoalPromise = issue.goalId
       ? goalsSvc.getById(issue.goalId)
@@ -10112,20 +10124,20 @@ export function issueRoutes(
       workProducts,
       createdFrom,
     ] = await Promise.all([
-      timing.time("project_goal", () => resolveIssueProjectAndGoal(issue)),
-      timing.time("ancestors", () => svc.getAncestors(issue.id)),
-      timing.time("mentions", () => svc.findMentionedProjectIds(issue.id, { includeCommentBodies: false })),
+      timing.time("project_goal", () => resolveIssueProjectAndGoal(issue, { workspaceProvider: false })),
+      timing.time("ancestors", () => svc.getAncestors(issue.id, { parentId: issue.parentId })),
+      timing.time("mentions", () => svc.findMentionedProjectIds(issue.id, { includeCommentBodies: false, issue })),
       timing.time("documents", () => documentsSvc.getIssueDocumentPayload(issue)),
-      timing.time("relations", () => svc.getRelationSummaries(issue.id)),
+      timing.time("relations", () => svc.getRelationSummaries(issue.id, { companyId: issue.companyId })),
       timing.time("blockers", () => svc
         .listBlockerAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null)),
       timing.time("review", () => svc
         .listReviewAttention(issue.companyId, [issue])
         .then((map) => map.get(issue.id) ?? null)),
-      timing.time("references", () => issueReferencesSvc.listIssueReferenceSummary(issue.id)),
+      timing.time("references", () => issueReferencesSvc.listIssueReferenceSummary(issue.id, undefined, { companyId: issue.companyId })),
       timing.time("handoff", () => listSuccessfulRunHandoffStates(db, issue.companyId, [issue.id])),
-      timing.time("retry", () => svc.getCurrentScheduledRetry(issue.id)),
+      timing.time("retry", () => svc.getCurrentScheduledRetry(issue.id, { companyId: issue.companyId })),
       timing.time("recovery", () => recoveryActionsSvc.getActiveForIssue(issue.companyId, issue.id)),
       inboxArchiveFieldsPromise,
       timing.time("channel", () => getExternalChannelBindingSummary(db, issue.companyId, issue.id)),
@@ -10400,13 +10412,39 @@ export function issueRoutes(
         runId: scheduledRetry.scheduledRetry?.runId ?? scheduledRetryRunId ?? null,
         details: { outcome: scheduledRetry.outcome, message: scheduledRetry.message, source: "task_retry" } });
     }
-    res.status(receipt.accepted ? 202 : 200).json({ ...receipt,
-      ...(scheduledRetry ? { scheduledRetry: { outcome: scheduledRetry.outcome, message: scheduledRetry.message } } : {}),
-      presentation: await taskInterruptionPresentation(db, issue) });
-    // The receipt commits before dispatch. Maintenance redelivers it after a
-    // crash or a lost response; this nudge only reduces perceived latency.
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
     const finalizeRunId = "finalizeRunId" in receipt ? receipt.finalizeRunId : undefined;
+    // Admit a plain Retry before answering, so the answer never reports as
+    // accepted a request that admission refused for a reason another click
+    // cannot change. The receipt is already committed. Admission that waits
+    // (for example on the agent's start lock) keeps running after the answer,
+    // which then stays "accepted"; maintenance redelivers it after a crash.
+    let refused: { reason: string; message: string } | null = null;
+    let admissionSettled: string | null = null;
+    if (receipt.accepted && receipt.requestId && !finalizeRunId && !chatActionId) {
+      const requestId = receipt.requestId;
+      const admitted = heartbeat.resumeTaskRetry(issue.companyId, requestId).then(() => true, err => {
+        logger.warn({ err, issueId: issue.id }, "Task Retry remains queued");
+        return false;
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const answeredInTime = await Promise.race([admitted, new Promise<false>(resolve => {
+        timer = setTimeout(() => resolve(false), TASK_RETRY_ANSWER_ADMISSION_WAIT_MS);
+        timer.unref?.();
+      })]);
+      if (timer) clearTimeout(timer);
+      if (answeredInTime) admissionSettled = requestId;
+    }
+    const presentation = await taskInterruptionPresentation(db, issue);
+    if (admissionSettled) refused = await Promise.resolve()
+      .then(() => taskRetryRefusal(db, issue.companyId, admissionSettled!, presentation)).catch(err => {
+        logger.warn({ err, issueId: issue.id }, "Task Retry admission state could not be read");
+        return null;
+      });
+    res.status(receipt.accepted && !refused ? 202 : 200).json({ ...receipt,
+      ...(refused ? { accepted: false, refused } : {}),
+      ...(scheduledRetry ? { scheduledRetry: { outcome: scheduledRetry.outcome, message: scheduledRetry.message } } : {}),
+      presentation });
     if (finalizeRunId) {
       // The saved result is applied again; no provider run starts. The
       // result-commit worker repeats this if the process stops first.
@@ -10415,8 +10453,6 @@ export function issueRoutes(
         logger.warn({ err, issueId: issue.id, runId: finalizeRunId }, "Saved result finalization remains queued"));
     } else if (chatActionId) void opts.chatRunRetries?.processFailedChatRunRetry(chatActionId).catch(err =>
       logger.warn({ err, issueId: issue.id }, "Connected task Retry remains queued"));
-    else if (receipt.accepted && receipt.requestId) void heartbeat.resumeTaskRetry(issue.companyId, receipt.requestId).catch(err =>
-      logger.warn({ err, issueId: issue.id }, "Task Retry remains queued"));
   });
 
   router.post("/issues/:id/recovery-actions/recover-workspace", validate(recoverWorkspaceSchema), async (req, res) => {
@@ -18484,7 +18520,12 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const interactions =
-      await issueThreadInteractionService(db).listForIssue(id);
+      await issueThreadInteractionService(db).listForIssue(issue.id, issue);
+    if (req.actor.type === "agent" && req.actor.agentId && req.actor.runId) {
+      await recordDeclinedInteractionRead(db, { companyId: issue.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
+        issue, interactions: interactions as Parameters<typeof recordDeclinedInteractionRead>[1]["interactions"] })
+        .catch(error => logger.warn({ err: error, runId: req.actor.runId }, "could not record the declined actions a run read"));
+    }
     res.json(interactions);
   });
 
@@ -19457,6 +19498,18 @@ export function issueRoutes(
 
       // Skip intentionally does not enqueue an interaction continuation. A
       // subsequent ordinary message uses the existing comment steering path.
+      // An app's question is the exception: skipping is the person's "no",
+      // which only reaches the app on the agent's next call, so wake it.
+      if (isAppQuestionCardKey(interaction.idempotencyKey)) {
+        await queueResolvedInteractionContinuationWakeup({
+          db,
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.skip",
+        });
+      }
       res.json(interaction);
     },
   );

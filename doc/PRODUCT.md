@@ -417,6 +417,25 @@ in-app only.
 
 Coordinator is the standard workspace for everyone. Settings → Experimental offers a personal **Classic workspace** opt-in, off by default. Historical Coordinator experiment settings do not enable Classic. Agent Chat is available to everyone on new and existing instances. The retired `enableAgentChat` key remains accepted for compatibility; stored and managed off values are ignored. Each person has one persistent task-backed conversation per agent and company, with ordinary company task visibility. The shared task composer, transcript, tools, files, and document panel remain the interaction surface. Agents clarify goals and hand substantial execution to linked, assigned tasks; a reply ends a turn without completing the conversation. `/new` starts fresh provider context in the same conversation while preserving visible history and artifacts. Healthy idle conversations wait for a message and do not count as unfinished execution work. See `doc/plans/2026-09-10-agent-chat.md` for the implementation contract.
 
+### Slack task progress
+
+Slack threads reuse one editable progress message for each active run. Native
+runtimes with an explicit public progress channel can supply a short completed
+commentary note, up to 400 characters, plus a task link when a public board URL
+is configured. The server coalesces bursts, suppresses repeated text, allows a
+10-second initial grace period, and waits at least 30 seconds between updates.
+A pending note is recovered from run events and the publication outbox after a
+restart. Delivery receipts wake the progress owner; idle history does not poll.
+
+Reasoning, unknown assistant channels, raw tool output, and provider diagnostics
+cannot supply progress prose. Providers without a public channel retain factual
+lifecycle fallbacks. Questions, approvals, and final answers bypass the progress
+cooldown. Slack final answers use a fresh reply, so users can see completion
+without watching message edits. After the answer is sent, a generic working
+message changes to “Response sent.” A useful public note stays in place.
+Registered run secrets are redacted before progress text is saved or sent.
+Other connectors retain their delivery policy.
+
 ### Agent chat project handoff (2026-09-11)
 
 Chat supports research and full plan drafting/revision in its existing plan document. On handoff, each ordinary assigned task receives the relevant plan in its own `plan` document, committed with task creation before execution is scheduled. The source plan remains in the conversation. Plan acceptance hands off execution; it never switches the conversation into implementation.
@@ -525,7 +544,7 @@ The agent performs authorized setup, reuses saved accounts and drafts, and hands
 
 Authorized policy administration includes user-requested changes that loosen the acting agent’s own tool controls. These writes remain bounded by management grants, resource scope and the responsible user’s current authority; they do not need an additional approval solely because the agent is a target. Subsequent tool calls obey the resulting policy. Agents cannot approve their own governed action requests or edit their own principal permission grants.
 
-Ordinary tool approvals remain reviewable without an implicit one-hour deadline. Authenticated OAuth refresh preserves a pending approval for the same saved action and authorization. Sign-in repair retains an accepted decision and resumes through connection-change events after revalidation; changed consent, permissions, credentials or action targets require a new review. Current access, explicit deadlines, task closure and execution receipts remain enforced. See [Delayed tool approvals](execution-semantics.md#delayed-tool-approvals).
+Ordinary tool approvals remain reviewable without an implicit one-hour deadline. Authenticated OAuth refresh preserves a pending approval for the same saved action and authorization. Sign-in repair retains an accepted decision and resumes through connection-change events after revalidation; changed consent, permissions, credentials or action targets require a new review. Current access, explicit deadlines, task closure and execution receipts remain enforced.
 
 The implementation, operation inventory, permission matrix and fixture qualification are recorded in [Agent API parity for connection configuration](plans/2026-10-13-connection-api-parity.md). Provider fixtures establish API behavior; they do not constitute live provider setup or an empirical agent-success claim.
 

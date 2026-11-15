@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { and, desc, eq, inArray, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, like, ne, notInArray, notLike, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -50,7 +50,7 @@ import {
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { PgTransaction } from "drizzle-orm/pg-core";
-import { enqueueSecretAccessEvent, enqueueSecretLastResolvedAt, flushSecretResolutionWrites } from "./secret-resolution-writes.js";
+import { enqueueSecretAccessEvent, flushSecretResolutionWrites } from "./secret-resolution-writes.js";
 import { resolveCachedEnvironmentProviderSecret } from "./environment-provider-secret-cache.js";
 import {
   checkSecretProviders,
@@ -69,6 +69,8 @@ import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationDeniedDetails, authorizationService } from "./authorization.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
 import { logActivity } from "./activity-log.js";
+import { retireTailscaleSecret } from "./connectors/tailscale/deletion.js";
+import { isTailscaleNodeState } from "./connectors/tailscale/network.js";
 // Only a `local_encrypted` secret can hold a literal directory path, so only a
 // `local_encrypted` secret can ever name a Codex account-home directory. A
 // create or a rotate that writes a new `local_encrypted` value runs inside
@@ -88,6 +90,12 @@ import {
   assertAccountHomeCacheDirStillValid,
   withAccountHomeSecretMutationLock,
 } from "@paperclipai/adapter-codex-local/server";
+
+function latestDate(a: Date | null, b: Date | null): Date | null {
+  if (!a) return b;
+  if (!b) return a;
+  return a.getTime() >= b.getTime() ? a : b;
+}
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const AGENT_ACCESS_CONFIG_PATH_PREFIX = "access.";
@@ -643,6 +651,8 @@ type SecretConsumerContext = {
   allowedBindingIds?: string[] | null;
 };
 
+const UNATTRIBUTED_SECRET_READ: SecretConsumerContext = { consumerType: "system", consumerId: "system", actorType: "system" };
+
 type SecretBindingContext = Omit<SecretConsumerContext, "consumerType"> & {
   consumerType: SecretBindingTargetType;
 };
@@ -747,6 +757,7 @@ type SecretResolutionErrorCode =
   | "secret_deleted"
   | "secret_inactive"
   | "secret_scope_invalid"
+  | "secret_system_only"
   | "responsible_user_missing"
   | "user_secret_definition_missing"
   | "user_secret_definition_inactive"
@@ -847,6 +858,7 @@ function secretResolutionErrorCode(error: unknown): SecretResolutionErrorCode {
       case "binding_missing":
       case "secret_deleted":
       case "secret_inactive":
+      case "secret_system_only":
       case "version_missing":
       case "version_inactive":
       case "provider_error":
@@ -1006,6 +1018,7 @@ export function secretService(db: Db | DbTransaction) {
       .where(and(
         eq(companySecrets.companyId, companyId),
         eq(companySecrets.scope, "company"),
+        isNull(companySecrets.systemPurpose),
         eq(companySecrets.name, name),
         ne(companySecrets.status, "deleted"),
       ))
@@ -1020,6 +1033,7 @@ export function secretService(db: Db | DbTransaction) {
         eq(companySecrets.companyId, companyId),
         eq(companySecrets.key, key),
         eq(companySecrets.scope, "company"),
+        isNull(companySecrets.systemPurpose),
         ne(companySecrets.status, "deleted"),
       ))
       .then((rows) => rows[0] ?? null);
@@ -1233,6 +1247,7 @@ export function secretService(db: Db | DbTransaction) {
     if (secret.status === "deleted") throw notFound("Secret not found");
     if (secret.companyId !== companyId) throw unprocessable("Secret must belong to same company");
     if (secret.scope !== "company") throw unprocessable("Secret references require company-scoped secrets");
+    if (secret.systemPurpose) throw forbidden("System-owned secrets cannot be bound to agent or environment credentials");
     return secret;
   }
 
@@ -1365,6 +1380,19 @@ export function secretService(db: Db | DbTransaction) {
     };
   }
 
+  /** Newest successful resolution per secret, read backwards on (secret_id, created_at). */
+  async function lastSuccessfulResolutions(secretIds: string[]): Promise<Map<string, Date>> {
+    if (secretIds.length === 0) return new Map();
+    const rows = await db.execute<{ secret_id: string; used_at: string | Date | null }>(sql`
+      select ids.secret_id, (
+        select e.created_at from ${secretAccessEvents} e
+        where e.secret_id = ids.secret_id and e.outcome = 'success'
+        order by e.created_at desc limit 1
+      ) as used_at
+      from unnest(array[${sql.join(secretIds.map((id) => sql`${id}`), sql`, `)}]::uuid[]) as ids(secret_id)`);
+    return new Map(rows.flatMap((row) => row.used_at ? [[row.secret_id, new Date(row.used_at)] as const] : []));
+  }
+
   async function resolveSecretValueInternal(
     companyId: string,
     secretId: string,
@@ -1373,6 +1401,7 @@ export function secretService(db: Db | DbTransaction) {
     readOnlyEnvironmentInspection = false,
     preloaded?: { secret: typeof companySecrets.$inferSelect; version: typeof companySecretVersions.$inferSelect | null },
     recordResolutionAccess = true,
+    systemPurpose?: "tailscale_network",
   ): Promise<RuntimeSecretResolution> {
     const bindingContext = options?.bindingContext;
     const accessContext = options?.accessContext ?? bindingContext;
@@ -1396,6 +1425,9 @@ export function secretService(db: Db | DbTransaction) {
       }
       if (secret.status !== "active") {
         throw unprocessable("Secret is not active", { code: "secret_inactive" });
+      }
+      if ((secret.systemPurpose ?? null) !== (systemPurpose ?? null)) {
+        throw forbidden("System-owned secrets require their server-only consumer", { code: "secret_system_only" });
       }
       const binding = await assertBindingContext(companyId, secret.id, bindingContext);
       const versionRow = preloaded?.secret === secret && preloaded.version?.version === resolvedVersion
@@ -1422,8 +1454,15 @@ export function secretService(db: Db | DbTransaction) {
           version: resolvedVersion,
         },
       });
+      if (isTailscaleNodeState(value) && systemPurpose !== "tailscale_network") {
+        throw forbidden("Network node state requires its server-only consumer", { code: "secret_system_only" });
+      }
+      // The access event is the usage record; "Last used" is derived from it
+      // in list(). A read must not write the secret row: admission paths
+      // (decisions, fast responses, browser use, prompt-injection checks)
+      // share-lock it under REPEATABLE READ to fence rotation, and a new row
+      // version would abort them with a serialization failure.
       if (!readOnlyEnvironmentInspection) {
-        if (!(db instanceof PgTransaction)) await enqueueSecretLastResolvedAt(db as Db, secret);
         if (recordResolutionAccess) await recordAccessEvent({
           companyId,
           secretId: secret.id,
@@ -1431,7 +1470,8 @@ export function secretService(db: Db | DbTransaction) {
           secretScope: secret.scope,
           version: resolvedVersion,
           provider: providerId,
-          context: accessContext,
+          // A read without a consumer still counts as "Last used".
+          context: accessContext ?? UNATTRIBUTED_SECRET_READ,
           credentialOwnerUserId: secret.ownerUserId ?? null,
           credentialSubjectType: secret.scope === "user" ? "user" : null,
           credentialSubjectId: secret.ownerUserId ?? null,
@@ -2281,6 +2321,7 @@ export function secretService(db: Db | DbTransaction) {
     },
     actor?: { userId?: string | null; agentId?: string | null },
     instanceOwner?: InstanceSecretOwner,
+    systemPurpose?: "tailscale_network",
   ) {
     const existing = instanceOwner ? null : await getByName(companyId, input.name);
     if (existing) throw conflict(`Secret already exists: ${input.name}`);
@@ -2325,6 +2366,7 @@ export function secretService(db: Db | DbTransaction) {
       .values({
         companyId,
         scope: instanceOwner ? "instance" : "company",
+        systemPurpose: systemPurpose ?? null,
         ownerAgentId: instanceOwner?.agentId ?? null,
         ownerProjectId: instanceOwner?.projectId ?? null,
         ownerPluginId: instanceOwner?.pluginId ?? null,
@@ -3501,6 +3543,7 @@ export function secretService(db: Db | DbTransaction) {
     // New references now see the deleted status, so the caller can settle
     // every reference that exists before the row and its cascades go.
     await options.beforeDelete?.(secret);
+    await retireTailscaleSecret(db, secret.companyId, secretId);
     const providerConfig = secret.providerConfigId
       ? await getProviderConfigById(secret.providerConfigId)
       : null;
@@ -3899,6 +3942,7 @@ export function secretService(db: Db | DbTransaction) {
           .where(and(
             eq(companySecrets.companyId, companyId),
             eq(companySecrets.scope, "company"),
+            isNull(companySecrets.systemPurpose),
             ne(companySecrets.status, "deleted"),
           ))
           .orderBy(desc(companySecrets.createdAt)),
@@ -3912,8 +3956,10 @@ export function secretService(db: Db | DbTransaction) {
           .groupBy(companySecretBindings.secretId),
       ]);
       const countsBySecretId = new Map(referenceCounts.map((row) => [row.secretId, row.count]));
+      const lastUsedBySecretId = await lastSuccessfulResolutions(secrets.map((secret) => secret.id));
       return secrets.map((secret) => ({
         ...secret,
+        lastResolvedAt: latestDate(secret.lastResolvedAt, lastUsedBySecretId.get(secret.id) ?? null),
         referenceCount: countsBySecretId.get(secret.id) ?? 0,
       }));
     },
@@ -4712,6 +4758,16 @@ export function secretService(db: Db | DbTransaction) {
     getByKey,
     resolveSecretValue,
     resolveSecretValueForEnvironmentRuntime,
+    resolveSystemSecretValue: async (companyId: string, secretId: string, version: number | "latest", purpose: "tailscale_network", consumerId: string) =>
+      (await resolveSecretValueInternal(companyId, secretId, version, {
+        accessContext: { consumerType: "system", consumerId, actorType: "system", actorId: null },
+      }, false, undefined, true, purpose)).value,
+    createSystemSecret: async (companyId: string, input: Parameters<typeof createSecretUnlocked>[1], purpose: "tailscale_network",
+      actor?: { userId?: string | null; agentId?: string | null }) =>
+      withAccountHomeSecretMutationLock(undefined, companyId, async () => {
+        if (input.value) await assertAccountHomeCacheDirStillValid(undefined, companyId, input.value);
+        return createSecretUnlocked(companyId, input, actor, undefined, purpose);
+      }),
     resolveSecretVersion,
     resolveSecretVersionIdentity,
     resolveSecretValueForAgentAccess,
