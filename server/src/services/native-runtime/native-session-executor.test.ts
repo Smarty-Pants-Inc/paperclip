@@ -19,7 +19,7 @@ import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import { trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { configuredEnvironment, configuredEnvironmentProjection } from "../../vendor/paperclip-runner/index.js";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { createSystemRecovery, failSystemRecovery, reserveSystemRecoveryAttempt, SystemRecoveryFailure } from "../system-recovery-state.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { once } from "node:events";
@@ -12097,6 +12097,196 @@ describe("native warm session supervision", () => {
     } finally {
       await closeWarmNativeSessionsForEnvironment({ environmentId: identity, reason: "test cleanup" });
     }
+  });
+
+  describe("S TL08b person-DONE server boundary", () => {
+    let proofDb: Db;
+    let cleanup: (() => Promise<void>) | undefined;
+    beforeAll(async () => {
+      const { startRecoveryPostgres } = await import("../../__tests__/helpers/recovery-postgres.js");
+      const { createDb } = await import("@paperclipai/db");
+      const database = await startRecoveryPostgres("s-tl08b-");
+      cleanup = database.cleanup;
+      proofDb = createDb(database.connectionString);
+    }, 180_000);
+    afterAll(async () => { await proofDb?.$client.end(); await cleanup?.(); });
+
+    async function fixture(withBackup: boolean) {
+      const { companies, agents, authUsers, environments, plugins, issueComments } = await import("@paperclipai/db");
+      const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
+      const environmentId = randomUUID(), pluginId = randomUUID(), workspaceId = randomUUID(), sessionId = randomUUID();
+      const userId = `tl08-board-${randomUUID()}`, providerLeaseId = `old-${randomUUID()}`;
+      await proofDb.insert(companies).values({ id: companyId, name: "TL08 person-DONE", issuePrefix: `T${companyId.slice(0, 7).toUpperCase()}` });
+      await proofDb.insert(authUsers).values({ id: userId, name: "Board", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
+      await proofDb.insert(agents).values({ id: agentId, companyId, name: "Continuing", adapterType: "paperclip_runner" });
+      await proofDb.insert(issues).values({ id: issueId, companyId, title: "Follow-up after DONE", status: "in_progress" });
+      await proofDb.insert(executionWorkspaces).values({ id: workspaceId, companyId, sourceIssueId: issueId,
+        mode: "shared_workspace", strategyType: "project_primary", name: "Conversation workspace" });
+      await proofDb.update(issues).set({ executionWorkspaceId: workspaceId }).where(eq(issues.id, issueId));
+      await proofDb.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox", config: { provider: "fixture" } });
+      await proofDb.insert(plugins).values({ id: pluginId, pluginKey: pluginId, packageName: "tl08-fixture", version: "1", status: "ready",
+        manifestJson: { capabilities: ["environment.drivers.register"], environmentDrivers: [{ driverKey: "fixture", kind: "sandbox_provider",
+          sandboxCapabilities: { reusableLeases: true, duplexCommandStream: true } }] } as never });
+      await proofDb.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, status: "succeeded", runtimeMode: "native",
+        nativeSessionId: sessionId, finishedAt: new Date(Date.now() - 10_000) });
+      const manifestSha256 = `sha256:${"b".repeat(64)}`, runnerInstanceId = "tl08-server-runner";
+      const [lease] = await proofDb.insert(environmentLeases).values({ companyId, environmentId, executionWorkspaceId: workspaceId,
+        issueId, heartbeatRunId: runId, provider: "fixture", providerLeaseId, status: "retained", leasePolicy: "reuse_by_environment",
+        metadata: { pluginId, provider: "fixture", sandboxProviderPlugin: true,
+          reusableSandboxLease: { version: 1, adapterType: "paperclip_runner", executionWorkspaceId: workspaceId },
+          ...(withBackup ? { nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: sessionId,
+            runnerInstanceId, sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: providerLeaseId,
+            authorizedProviderLeaseId: providerLeaseId, manifestSha256, completedAt: new Date().toISOString() } } : {}) },
+      }).returning();
+      await proofDb.insert(issueComments).values({ companyId, issueId, authorAgentId: agentId, body: "Earlier answer: the release color is indigo." });
+      const warmExecution: NativeExecutionInputV1 = { ...execution,
+        binding: { companyId, agentId, issueId, runId, executionWorkspaceId: workspaceId },
+        session: { ...execution.session, normalizedSessionId: sessionId, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 8 * 60 * 60_000 } } };
+      const close = vi.fn(async (): Promise<void> => { throw new Error("The old sandbox lease is no longer active"); });
+      onTestFinished(async () => {
+        close.mockResolvedValue(undefined);
+        expect(await closeWarmNativeSessionsForEnvironment({ environmentId, reason: "test cleanup" })).toMatchObject({ busy: 0, failed: 0 });
+      });
+      state.execute.mockReset().mockImplementation(async options => {
+        await options.onSession?.({ close });
+        return { result: { summary: "Earlier answer: the release color is indigo." }, terminal: { runTerminalState: "succeeded" },
+          turnId: runId, normalizedSessionId: options.input.session.normalizedSessionId, providerSessionId: sessionId,
+          driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      });
+      const copy = (ownerRunId: string) => ({ runId: ownerRunId, root: join(tmpdir(), sessionId), preparationKey: "unchanged",
+        hasChanges: async () => false, collectStopped: async () => undefined });
+      const target = (id: string, outcome: "created" | "resumed" = "created") => ({ kind: "remote" as const, transport: "sandbox" as const,
+        environmentId, remoteCwd: warmExecution.workspace.cwd!, sandboxLeaseAcquisition: { outcome, providerLeaseId: id } });
+      // The executor's coordinator is its established unit fixture. Lease proofs
+      // and the person-DONE route use real PostgreSQL, not that coordinator double.
+      const executorDb = (input: NativeExecutionInput) => {
+        const db = leaseDb(input), select = db.select.bind(db);
+        db.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => table === environmentLeases
+          ? proofDb.select(fields as never).from(environmentLeases) : select(fields as never).from(table as never) })) as unknown as Db["select"];
+        return db;
+      };
+      await executePaperclipNativeSession({ db: executorDb(warmExecution), execution: warmExecution, runnerInstanceId,
+        runnerExecutionTarget: target(providerLeaseId), instructionWorkingCopy: copy(runId) });
+      const call = vi.fn(async (_id: string, method: string) => {
+        if (method !== "environmentDestroyLease") throw new Error(`Unexpected old-box dispatch: ${method}`);
+        return { providerLeaseId, state: "stopped" };
+      });
+      const workers = { isRunning: () => true, call, getWorker: () => ({ supportedMethods: ["environmentDestroyLease", "environmentResumeLease", "duplexChannelOpen"],
+        openDuplexChannel: vi.fn(async () => { throw new Error("Old-box command reached worker"); }) }) } as unknown as import("../plugin-worker-manager.js").PluginWorkerManager;
+      const { environmentRuntimeService } = await import("../environment-runtime.js");
+      const runtime = environmentRuntimeService(proofDb, { pluginWorkerManager: workers });
+      const { environmentService } = await import("../environments.js");
+      const environment = (await environmentService(proofDb).getById(environmentId))!;
+      const stale = (await environmentService(proofDb).getLeaseById(lease!.id))!;
+      const done = async () => {
+        const { default: express } = await import("express"), { default: request } = await import("supertest");
+        const { issueRoutes } = await import("../../routes/issues.js");
+        const { errorHandler } = await import("../../middleware/index.js");
+        // The enclosing executor unit suite mocks recovery actions. The HTTP
+        // request needs the real service and database, not that partial double.
+        const recoveryModule = await import("../issue-recovery-actions.js");
+        const actualRecovery = await vi.importActual<typeof import("../issue-recovery-actions.js")>("../issue-recovery-actions.js");
+        const recovery = vi.spyOn(recoveryModule, "issueRecoveryActionService").mockImplementation(actualRecovery.issueRecoveryActionService);
+        onTestFinished(() => recovery.mockRestore());
+        const app = express();
+        app.use(express.json());
+        app.use((req, _res, next) => { req.actor = { type: "board", source: "local_implicit", userId }; next(); });
+        app.use("/api", issueRoutes(proofDb, {} as never, { pluginWorkerManager: workers }));
+        const errors: unknown[] = [];
+        app.use(((error, _req, _res, next) => { errors.push(error); next(error); }) as import("express").ErrorRequestHandler);
+        app.use(errorHandler);
+        const response = await request(app).patch(`/api/issues/${issueId}`).send({ status: "done" }).then(response => response)
+          .finally(() => recovery.mockRestore());
+        expect(response.status, errors.map(String).join("\n") || JSON.stringify(response.body)).toBe(200);
+        expect(response.body).toMatchObject({ status: "done", executionWorkspaceId: workspaceId });
+        // The route returns before its existing terminal-issue cleanup task.
+        await expect.poll(() => environmentService(proofDb).getLeaseById(lease!.id), { timeout: 10_000 }).toMatchObject({ status: "expired",
+          failureReason: "issue_terminal_done", cleanupStatus: "success", metadata: { remoteExecutionTermination: {
+            state: "stopped", runId, leaseId: lease!.id, providerLeaseId } } });
+        expect(call).toHaveBeenCalledOnce();
+      };
+      const nextRunId = randomUUID();
+      const claim = (id = `new-${providerLeaseId}`, forceRetirement = id !== providerLeaseId) => claimWarmNativeInstructionCopy({ priorExecution: warmExecution, companyId, agentId,
+        executionWorkspaceId: workspaceId, workspace: warmExecution.workspace, environmentId, target: target(id), runId: nextRunId,
+        preparationKey: "unchanged", forceRetirement, adopt: async () => copy(nextRunId) });
+      return { companyId, agentId, issueId, runId, environmentId, sessionId, providerLeaseId, lease: lease!, nextRunId,
+        warmExecution, executorDb, close, copy, target, claim, done, call, runtime, environment, stale, runnerInstanceId, manifestSha256 };
+    }
+
+    it.each(([60_000, 300_000, 3_600_000, "warm-gone"] as const).flatMap(delay => [false, true].map(backup => ({ delay, backup }))))(
+      "admits the first person-DONE follow-up at $delay (backup=$backup)", async ({ delay, backup }) => {
+        const f = await fixture(backup);
+        await f.done();
+        if (delay === "warm-gone") {
+          f.close.mockResolvedValue(undefined);
+          await closeWarmNativeSessionsForEnvironment({ environmentId: f.environmentId, reason: "simulated warm idle expiry" });
+          f.close.mockRejectedValue(new Error("Old sandbox unavailable"));
+        }
+        const closes = f.close.mock.calls.length;
+        const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + (delay === "warm-gone" ? 8 * 3_600_000 + 1 : delay));
+        try { await expect(f.claim()).resolves.toBeNull(); } finally { clock.mockRestore(); }
+        expect(f.close).toHaveBeenCalledTimes(closes);
+        await proofDb.insert(heartbeatRuns).values({ id: f.nextRunId, companyId: f.companyId, agentId: f.agentId, issueId: f.issueId, status: "running" });
+        if (backup) {
+          const { retiredSourceAuthorizesNativeBackupRestore } = await import("./native-retired-backup-source.js");
+          expect(await retiredSourceAuthorizesNativeBackupRestore(proofDb, { companyId: f.companyId, currentRunId: f.nextRunId,
+            normalizedSessionId: f.sessionId, targetProviderLeaseId: `new-${f.providerLeaseId}`, manifestSha256: f.manifestSha256,
+            manifest: { sourceProviderLeaseId: f.providerLeaseId, runnerInstanceId: f.runnerInstanceId, normalizedSessionId: f.sessionId } })).toBe(true);
+        }
+        const { issueComments } = await import("@paperclipai/db");
+        const history = await proofDb.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+        expect(history.map(comment => comment.body)).toContain("Earlier answer: the release color is indigo.");
+        const next: NativeExecutionInputV1 = { ...f.warmExecution, binding: { ...f.warmExecution.binding, runId: f.nextRunId },
+          task: { ...f.warmExecution.task, prompt: history.map(comment => comment.body).join("\n") + "\nWhat color was it?" },
+          session: { ...f.warmExecution.session, normalizedSessionId: backup ? f.sessionId : randomUUID() } };
+        // This is server admission, not a real Pi answer: the external execution
+        // boundary returns a deterministic answer using the provided history.
+        state.execute.mockImplementationOnce(async options => {
+          expect(options.input.task.prompt).toContain("release color is indigo");
+          return { result: { summary: "It was indigo." }, terminal: { runTerminalState: "succeeded" }, turnId: f.nextRunId,
+            normalizedSessionId: next.session.normalizedSessionId, providerSessionId: next.session.normalizedSessionId,
+            driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+        });
+        await expect(executePaperclipNativeSession({ db: f.executorDb(next), execution: next, runnerInstanceId: f.runnerInstanceId,
+          runnerExecutionTarget: f.target(`new-${f.providerLeaseId}`) })).resolves.toMatchObject({ exitCode: 0, summary: "It was indigo." });
+        expect((await proofDb.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+          .filter(comment => comment.authorAgentId === null && comment.authorUserId === null)).toHaveLength(0);
+        f.call.mockClear();
+        await expect(f.runtime.resumeRunLease({ environment: f.environment, lease: f.stale }))
+          .rejects.toMatchObject({ code: "sandbox_lease_start_denied" });
+        await expect(f.runtime.openDuplexChannel({ environment: f.environment, lease: f.stale, command: ["no-old-turn"] }))
+          .rejects.toMatchObject({ code: "sandbox_lease_start_denied" });
+        expect(f.call).not.toHaveBeenCalled();
+      }, 60_000);
+
+    it.each(["missing", "other-run", "other-lease", "active", "same-box"])("keeps an unproven owner after %s proof", async mode => {
+      const f = await fixture(false);
+      await f.done();
+      const [lease] = await proofDb.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+      const receipt = lease!.metadata!.remoteExecutionTermination as Record<string, unknown>;
+      if (mode !== "same-box") await proofDb.update(environmentLeases).set({ status: mode === "active" ? "active" : "expired",
+        metadata: { ...lease!.metadata, remoteExecutionTermination: mode === "missing" ? null : { ...receipt,
+          ...(mode === "other-run" ? { runId: randomUUID() } : mode === "other-lease" ? { leaseId: randomUUID() } : {}) } },
+      }).where(eq(environmentLeases.id, f.lease.id));
+      await expect(f.claim(mode === "same-box" ? f.providerLeaseId : undefined, true))
+        .rejects.toMatchObject({ code: "native_predecessor_retirement_unproven" });
+      expect(f.close).toHaveBeenCalled();
+    }, 60_000);
+
+    it("keeps agent completion warm on the same sandbox without a DONE PATCH", async () => {
+      const f = await fixture(false);
+      expect((await proofDb.select().from(issues).where(eq(issues.id, f.issueId)))[0]!.status).toBe("in_progress");
+      const release = await f.claim(f.providerLeaseId);
+      try {
+        expect(release).toBeTypeOf("function");
+        expect(f.close).not.toHaveBeenCalled();
+        expect(f.call).not.toHaveBeenCalled();
+      } finally {
+        // Claiming owns a busy preparation slot until the caller releases it.
+        f.close.mockResolvedValue(undefined);
+        await release?.();
+      }
+    }, 60_000);
   });
 
   // Staging: instruction preparation retires the previous
