@@ -1,4 +1,4 @@
-import type { BudgetWindowKind, PauseReason, ProjectStatus } from "../constants.js";
+import type { BudgetWindowKind, PauseReason, ProjectDerivedStatus, ProjectStatus } from "../constants.js";
 import type {
   ProjectExecutionWorkspacePolicy,
   ProjectWorkspaceRuntimeConfig,
@@ -174,6 +174,15 @@ export interface Project {
    * single-project payloads.
    */
   openTaskCount?: number;
+  /**
+   * The project's pill, derived from its tasks (chats excluded):
+   * `in_progress` while an open task has begun, `done` when the project has
+   * tasks and none is open, `not_started` otherwise (no tasks, or every open
+   * task is still backlog/todo and never started). Populated by the projects
+   * list endpoint and the single-project read. The stored `status` is
+   * separate and is not what the pill shows.
+   */
+  derivedStatus?: ProjectDerivedStatus;
   /**
    * Active budget for the project, when set. Populated by the projects list
    * endpoint (IA Phase 4 — PAP-60); omitted on single-project payloads.

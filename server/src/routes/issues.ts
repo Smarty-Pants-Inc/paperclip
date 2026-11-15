@@ -8520,6 +8520,7 @@ export function issueRoutes(
       managedByPlugin: project.managedByPlugin ?? null,
       taskCount: project.taskCount,
       openTaskCount: project.openTaskCount,
+      derivedStatus: project.derivedStatus,
       budget: project.budget,
       archivedAt: project.archivedAt,
       createdAt: project.createdAt,

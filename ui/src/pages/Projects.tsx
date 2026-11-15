@@ -6,7 +6,7 @@ import { useDialogActions } from "../context/DialogContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { EntityRow } from "../components/EntityRow";
 import { ProjectTile } from "../components/ProjectTile";
-import { StatusBadge } from "../components/StatusBadge";
+import { ProjectStatusPill } from "../components/ProjectStatusPill";
 import { MembershipAction } from "../components/MembershipAction";
 import { StarToggle } from "../components/StarToggle";
 import { ArtifactEmptyGraphic } from "@/components/artifacts/v1/ArtifactEmptyGraphic";
@@ -32,8 +32,8 @@ function countTasks(count: number) {
 
 /**
  * The work left in a project, in plain words. "All tasks done" when every
- * task is done, cancelled or hidden; the project's status is separate and
- * only a person changes it. Older servers send only `taskCount`.
+ * task is done, cancelled or hidden; the pill beside it follows the same
+ * tasks. Older servers send only `taskCount`.
  */
 export function projectTaskCountLabel(project: Pick<Project, "taskCount" | "openTaskCount">) {
   const total = project.taskCount ?? 0;
@@ -244,7 +244,7 @@ export function Projects() {
                                 {formatDate(project.targetDate)}
                               </span>
                             )}
-                            <StatusBadge status={project.status} />
+                            <ProjectStatusPill project={project} />
                             <MembershipAction
                               state={state}
                               pending={joinLeavePending}

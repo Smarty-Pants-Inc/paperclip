@@ -28,9 +28,20 @@ function sentenceCaseStatus(status: string): string {
  */
 // design-allow(pill-pattern): DECISION-SHEET.md C8 - status badges keep the bespoke WCAG-tuned
 // .status-chip color-mix mechanic and do not wrap the Badge primitive.
-export function StatusBadge({ status, label, className }: { status: string; label?: string; className?: string }) {
+export function StatusBadge({
+  status,
+  label,
+  className,
+  "data-testid": testId,
+}: {
+  status: string;
+  label?: string;
+  className?: string;
+  "data-testid"?: string;
+}) {
   return (
     <span
+      data-testid={testId}
       className={cn(
         "inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0",
         statusBadge[status] ?? statusBadgeDefault,

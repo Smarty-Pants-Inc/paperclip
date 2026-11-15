@@ -216,7 +216,8 @@ describe("Projects", () => {
     expect(content.indexOf("Alpha")).toBeLessThan(content.indexOf("Charlie"));
     expect(content.indexOf("Charlie")).toBeLessThan(content.indexOf("Other Projects"));
     expect(content.indexOf("Other Projects")).toBeLessThan(content.indexOf("Bravo"));
-    expect(content).toContain("in progress");
+    // The pill follows the tasks (derivedStatus); the stored status is not shown.
+    expect(content).not.toContain("in progress");
   });
 
   it("searches projects and clears back to the grouped list", async () => {

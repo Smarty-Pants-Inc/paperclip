@@ -602,6 +602,14 @@ export const PROJECT_STATUSES = [
 ] as const;
 export type ProjectStatus = (typeof PROJECT_STATUSES)[number];
 
+/**
+ * The project's pill, derived from its tasks on the server (not stored):
+ * `not_started` with no tasks or none begun, `in_progress` while a begun task
+ * is open, `done` when it has tasks and none is open.
+ */
+export const PROJECT_DERIVED_STATUSES = ["not_started", "in_progress", "done"] as const;
+export type ProjectDerivedStatus = (typeof PROJECT_DERIVED_STATUSES)[number];
+
 export const ENVIRONMENT_DRIVERS = ["local", "ssh", "sandbox", "plugin"] as const;
 export type EnvironmentDriver = (typeof ENVIRONMENT_DRIVERS)[number];
 
