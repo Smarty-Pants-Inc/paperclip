@@ -30,6 +30,7 @@ type LaunchAssetsInput = {
   caBundleMapping: { sourcePath: string; targetPath: string } | null;
   stageFile: (input: StageAsset) => Promise<void>;
   stageDirectory: (input: StageAsset) => Promise<void>;
+  stageAssets?: (assets: RuntimeStageAsset[]) => Promise<void>;
   isolatedCodexSkills?: { workspaceRoot: string };
   trace?: NativeRunTrace;
 };
@@ -168,7 +169,9 @@ export async function stageRemoteLaunchAssets(input: LaunchAssetsInput): Promise
       const changed = await changedRemoteRuntimeAssets(input.runner.execute.bind(input.runner), assets);
       const stage = ({ kind, ...asset }: RuntimeStageAsset) =>
         kind === "directory" ? input.stageDirectory(asset) : input.stageFile(asset);
-      if (allowConcurrentSyncOperations) {
+      if (input.stageAssets) {
+        await input.stageAssets(changed);
+      } else if (allowConcurrentSyncOperations) {
         const concurrency = 4;
         for (let offset = 0; offset < changed.length; offset += concurrency) {
           let failed = false;
