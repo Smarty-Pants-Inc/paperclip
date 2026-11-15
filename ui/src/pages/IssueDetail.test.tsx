@@ -2436,6 +2436,78 @@ describe("IssueDetail", () => {
     });
   });
 
+  it("offers Unhide on the hidden-task banner and clears hiddenAt", async () => {
+    const hiddenIssue = createIssue({ hiddenAt: new Date("2026-11-15T05:00:00.000Z") });
+    mockIssuesApi.get.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.getCore.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.update.mockReset();
+    mockIssuesApi.update.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="hidden-task-banner"]')).not.toBeNull());
+    const banner = container.querySelector<HTMLElement>('[data-testid="hidden-task-banner"]')!;
+    expect(banner.textContent).toContain("This task is hidden");
+    const unhide = Array.from(banner.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "Unhide");
+    expect(unhide).toBeTruthy();
+    // The server now returns the task without hiddenAt.
+    mockIssuesApi.get.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    mockIssuesApi.getCore.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    await act(async () => unhide!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledWith(expect.stringMatching(/^(issue-1|PAP-1)$/), { hiddenAt: null }));
+    expect(mockNavigate).not.toHaveBeenCalledWith("/issues/all");
+    // The response clears hiddenAt, so the banner goes away.
+    await waitForAssertion(() => expect(container.querySelector('[data-testid="hidden-task-banner"]')).toBeNull());
+  });
+
+  it("toggles the task menu between Hide this task and Unhide this task", async () => {
+    const hiddenIssue = createIssue({ hiddenAt: new Date("2026-11-15T05:00:00.000Z") });
+    mockIssuesApi.get.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.getCore.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.update.mockReset();
+    mockIssuesApi.update.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    await act(async () => renderIssueView());
+    await waitForAssertion(() => expect(container.querySelector('button[aria-label="More task actions"]')).not.toBeNull());
+    const menuButton = (label: string) => Array.from(document.body.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === label);
+    await waitForAssertion(() => expect(menuButton("Unhide this task")).toBeTruthy());
+    expect(menuButton("Hide this task")).toBeUndefined();
+    mockIssuesApi.get.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    mockIssuesApi.getCore.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    await act(async () => menuButton("Unhide this task")!.click());
+    await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledWith(expect.stringMatching(/^(issue-1|PAP-1)$/), { hiddenAt: null }));
+    await waitForAssertion(() => expect(menuButton("Hide this task")).toBeTruthy());
+    expect(menuButton("Unhide this task")).toBeUndefined();
+  });
+
+  it("offers Unhide this task in the phone inbox toolbar menu for a hidden task", async () => {
+    mockSidebarState.isMobile = true;
+    mockLocation.state = createIssueDetailLocationState("Inbox", "/inbox/mine", "inbox");
+    const hiddenIssue = createIssue({ hiddenAt: new Date("2026-11-15T05:00:00.000Z") });
+    mockIssuesApi.get.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.getCore.mockResolvedValue(hiddenIssue);
+    mockIssuesApi.update.mockReset();
+    mockIssuesApi.update.mockResolvedValue({ ...hiddenIssue, hiddenAt: null });
+    await act(async () => renderIssueView());
+    await flushReact();
+    await flushReact();
+    await waitForAssertion(() => expect(mockSetMobileToolbar.mock.calls.some(([node]) => Boolean(node))).toBe(true));
+    const toolbar = [...mockSetMobileToolbar.mock.calls].map(([node]) => node).filter(Boolean).at(-1) as ReactNode;
+    const toolbarContainer = document.createElement("div");
+    document.body.appendChild(toolbarContainer);
+    const toolbarRoot = createRoot(toolbarContainer);
+    try {
+      flushSync(() => toolbarRoot.render(toolbar));
+      const labels = Array.from(toolbarContainer.querySelectorAll("button")).map((button) => button.textContent?.trim());
+      expect(labels).toContain("Unhide this task");
+      expect(labels).not.toContain("Hide this task");
+      await act(async () => Array.from(toolbarContainer.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === "Unhide this task")!.click());
+      await waitForAssertion(() => expect(mockIssuesApi.update).toHaveBeenCalledWith(expect.stringMatching(/^(issue-1|PAP-1)$/), { hiddenAt: null }));
+    } finally {
+      flushSync(() => toolbarRoot.unmount());
+      toolbarContainer.remove();
+    }
+  });
+
   it("loads full first-run activity from the task menu without an older-message disclosure", async () => {
     queryClient.setQueryData(["issues", "history-expanded", "PAP-1"], false);
     mockIssuesApi.get.mockResolvedValue(createIssue());

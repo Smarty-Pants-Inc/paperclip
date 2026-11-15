@@ -145,6 +145,7 @@ vi.mock("./IssueRow", () => ({
     treeGuides,
     showIdentifier,
     trailingMeta,
+    titleSuffix,
   }: {
     issue: Issue;
     desktopMetaLeading?: ReactNode;
@@ -160,6 +161,7 @@ vi.mock("./IssueRow", () => ({
     treeGuides?: number;
     showIdentifier?: boolean;
     trailingMeta?: ReactNode;
+    titleSuffix?: ReactNode;
   }) => (
     <div
       data-testid="issue-row"
@@ -174,6 +176,7 @@ vi.mock("./IssueRow", () => ({
       data-title-class={titleClassName ?? undefined}
     >
       <span>{issue.title}</span>
+      <span data-testid="issue-row-title-suffix">{titleSuffix}</span>
       {leadingControl}
       {externalObjectSummary ? (
         <span data-testid="external-object-summary">{externalObjectSummary.total}</span>
@@ -532,6 +535,40 @@ describe("IssuesList", () => {
     });
 
     act(() => root.unmount());
+  });
+
+  it.each([true, false])("marks hidden tasks in the list rows (streamlined=%s)", async (streamlined) => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: streamlined });
+    // Rows only reach the list when Show hidden tasks asked the server for them.
+    localStorage.setItem(
+      taskCollectionPreferencesStorageKey({ companyId: "company-1", collectionKey: "paperclip:test-hidden-rows" }),
+      JSON.stringify({ version: 1, companyId: "company-1", collectionKey: "paperclip:test-hidden-rows", viewState: { showHiddenTasks: true }, columns: [] }),
+    );
+    const { root, queryClient } = renderWithQueryClient(
+      <IssuesList
+        issues={[
+          createIssue({ id: "hidden-issue", title: "Hidden row", hiddenAt: new Date("2026-11-15T05:00:00Z") }),
+          createIssue({ id: "shown-issue", title: "Shown row" }),
+        ]}
+        agents={[]}
+        projects={[]}
+        viewStateKey="paperclip:test-hidden-rows"
+        rowPresentation="task"
+        enableAgentCreatedVisibilityFilter
+        enableHiddenVisibilityFilter
+        onUpdateIssue={() => undefined}
+      />,
+      container,
+    );
+    try {
+      await waitForAssertion(() => {
+        const rows = [...container.querySelectorAll<HTMLElement>("[data-testid='issue-row']")];
+        const byTitle = (title: string) => rows.find(row => row.querySelector("span")?.textContent === title);
+        expect(byTitle("Hidden row")?.querySelector('[data-slot="hidden-task-badge"]')?.textContent).toBe("Hidden");
+        expect(byTitle("Hidden row")?.querySelector('[data-slot="hidden-task-badge"]')?.getAttribute("title")).toBe("This task is hidden");
+        expect(byTitle("Shown row")?.querySelector('[data-slot="hidden-task-badge"]')).toBeNull();
+      });
+    } finally { act(() => root.unmount()); queryClient.clear(); }
   });
 
   it("forwards external-object summaries into issue rows", async () => {
