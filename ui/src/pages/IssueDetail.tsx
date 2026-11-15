@@ -370,6 +370,7 @@ import {
   Check,
   ChevronRight,
   Copy,
+  Eye,
   EyeOff,
   ScanEye,
   Flag,
@@ -1121,6 +1122,7 @@ interface InboxMobileToolbarProps {
   onCopy: () => void;
   onProperties: () => void;
   onHide: () => void;
+  onUnhide: () => void;
 }
 
 function InboxMobileToolbar({
@@ -1133,6 +1135,7 @@ function InboxMobileToolbar({
   onCopy,
   onProperties,
   onHide,
+  onUnhide,
 }: InboxMobileToolbarProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1197,7 +1200,18 @@ function InboxMobileToolbar({
               <SlidersHorizontal className="h-3 w-3" />
               Properties
             </button>
-            {issueIdProp && (
+            {issueIdProp && (issueHidden ? (
+              <button
+                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
+                onClick={() => {
+                  onUnhide();
+                  setMenuOpen(false);
+                }}
+              >
+                <Eye className="h-3 w-3" />
+                Unhide this task
+              </button>
+            ) : (
               <button
                 className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
                 onClick={() => {
@@ -1208,7 +1222,7 @@ function InboxMobileToolbar({
                 <EyeOff className="h-3 w-3" />
                 Hide this task
               </button>
-            )}
+            ))}
           </PopoverContent>
         </Popover>
       </div>
@@ -6855,6 +6869,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         { onSuccess: () => navigate("/issues/all") },
       );
     },
+    onUnhide: () => updateIssue.mutate({ hiddenAt: null }),
   });
   inboxToolbarCallbacksRef.current = {
     onArchive: () => {
@@ -6869,6 +6884,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         { onSuccess: () => navigate("/issues/all") },
       );
     },
+    onUnhide: () => updateIssue.mutate({ hiddenAt: null }),
   };
 
   const backHref = sourceBreadcrumb.href ?? "/inbox";
@@ -6894,6 +6910,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         onCopy={() => inboxToolbarCallbacksRef.current.onCopy()}
         onProperties={() => inboxToolbarCallbacksRef.current.onProperties()}
         onHide={() => inboxToolbarCallbacksRef.current.onHide()}
+        onUnhide={() => inboxToolbarCallbacksRef.current.onUnhide()}
       />,
     );
 
@@ -8124,19 +8141,32 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                     setMoreOpen(false);
                   }}
                 />
-                <button
-                  className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
-                  onClick={() => {
-                    updateIssue.mutate(
-                      { hiddenAt: new Date().toISOString() },
-                      { onSuccess: () => navigate("/issues/all") },
-                    );
-                    setMoreOpen(false);
-                  }}
-                >
-                  <EyeOff className="h-3 w-3" />
-                  Hide this task
-                </button>
+                {issue.hiddenAt ? (
+                  <button
+                    className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
+                    onClick={() => {
+                      updateIssue.mutate({ hiddenAt: null });
+                      setMoreOpen(false);
+                    }}
+                  >
+                    <Eye className="h-3 w-3" />
+                    Unhide this task
+                  </button>
+                ) : (
+                  <button
+                    className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
+                    onClick={() => {
+                      updateIssue.mutate(
+                        { hiddenAt: new Date().toISOString() },
+                        { onSuccess: () => navigate("/issues/all") },
+                      );
+                      setMoreOpen(false);
+                    }}
+                  >
+                    <EyeOff className="h-3 w-3" />
+                    Hide this task
+                  </button>
+                )}
               </PopoverContent>
             </Popover>
                 )}
@@ -8325,6 +8355,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
 
           {issue.hiddenAt && (
             <div
+              data-testid="hidden-task-banner"
               className={cn(
                 "flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive",
                 shellSectionClass,
@@ -8332,7 +8363,17 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               )}
             >
               <EyeOff className="h-4 w-4 shrink-0" />
-              This task is hidden
+              <span className="min-w-0 flex-1">This task is hidden</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="xs"
+                className={cn("shrink-0 border-destructive/30 bg-background text-foreground", isMobile && "h-8 px-3")}
+                disabled={updateIssue.isPending}
+                onClick={() => updateIssue.mutate({ hiddenAt: null })}
+              >
+                Unhide
+              </Button>
             </div>
           )}
           {treeControlWakeWarning ? (

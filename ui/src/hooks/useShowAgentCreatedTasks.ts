@@ -1,8 +1,19 @@
 import { useCallback, useSyncExternalStore } from "react";
 import { taskCollectionPreferencesStorageKey, TASK_COLLECTION_PREFERENCES_CHANGED, TASK_COLLECTION_PREFERENCES_VERSION } from "../lib/task-collection-preferences";
 
+type CollectionViewFlag = "showAgentCreatedTasks" | "showHiddenTasks";
+
 /** Subscribe the collection's fetching owner to its persisted filter control. */
 export function useShowAgentCreatedTasks(companyId: string | null, collectionKey: string): boolean {
+  return useCollectionViewFlag(companyId, collectionKey, "showAgentCreatedTasks");
+}
+
+/** Subscribe the collection's fetching owner to its persisted Show hidden tasks control. */
+export function useShowHiddenTasks(companyId: string | null, collectionKey: string): boolean {
+  return useCollectionViewFlag(companyId, collectionKey, "showHiddenTasks");
+}
+
+function useCollectionViewFlag(companyId: string | null, collectionKey: string, flag: CollectionViewFlag): boolean {
   const getSnapshot = useCallback(() => {
     try {
       const key = taskCollectionPreferencesStorageKey({ companyId: companyId ?? "__unscoped__", collectionKey });
@@ -12,11 +23,11 @@ export function useShowAgentCreatedTasks(companyId: string | null, collectionKey
       const valid = envelope?.version === TASK_COLLECTION_PREFERENCES_VERSION
         && envelope.companyId === (companyId ?? "__unscoped__") && envelope.collectionKey === collectionKey;
       const view = valid ? envelope.viewState : legacy ? JSON.parse(legacy) : null;
-      return view?.showAgentCreatedTasks === true;
+      return view?.[flag] === true;
     } catch {
       return false;
     }
-  }, [companyId, collectionKey]);
+  }, [companyId, collectionKey, flag]);
   return useSyncExternalStore(subscribe, getSnapshot, () => false);
 }
 
