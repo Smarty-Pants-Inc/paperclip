@@ -2273,7 +2273,10 @@ export function heartbeatService(
       // Reviewed chat turns rebuild it from the current durable owner below.
       delete context[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
       delete context[EXTERNAL_CHAT_QUESTION_RESPONSE_KEY];
+      // Pi's session JSONL already retains the request and response. Its RPC
+      // provider never writes rust_native frames, so raw capture is inapplicable.
       const providerTraceRequested =
+        (readNonEmptyString(parseObject(agent.adapterConfig).provider) ?? agent.adapterType) !== "pi_rpc" &&
         parseObject(context.debug).providerTrace === "raw";
       if (providerTraceRequested) {
         if (context.providerTraceRequestSource === "agent_debug_setting") {

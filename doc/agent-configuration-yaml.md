@@ -29,6 +29,21 @@ their normal UI. The YAML can select existing accounts/connections and configure
 channel credentials; it cannot synthesize provider consent or export stored
 credential values. AgentMail provisioning remains owned by its connection flow.
 
+## Raw provider tracing
+
+For Paperclip Runner agents with `adapterConfig.provider: pi_rpc`,
+`runtimeConfig.debug.providerTrace: raw` is accepted but ignored. The same applies
+to per-run `debug.providerTrace: raw` on the wakeup and heartbeat-invoke APIs.
+Pi does not produce the Rust `rust_native` raw-trace channel; its session `.jsonl`
+already retains the full request and response, including system instructions,
+tool definitions, and user, assistant, and tool-result messages. These runs create
+no provider-trace record and receive no `PAPERCLIP_PROVIDER_TRACE_PATH`, so the
+transport does not wait for or rehydrate nonexistent raw frames. Use the Pi
+session transcript for inspection instead. Existing instance-admin permission
+checks for requesting or changing raw tracing still apply.
+
+Codex, OpenCode, and ACPX raw provider tracing is unchanged.
+
 ## Document contract
 
 ```yaml
