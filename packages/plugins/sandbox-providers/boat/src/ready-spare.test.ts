@@ -8,6 +8,10 @@ const apiKey = "boat_ready_spare_test";
 const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
 const companyId = "company-spare-test";
 const environmentId = "environment-spare-test";
+const eventHandlers = new Map<string, (event: any) => Promise<void>>();
+const persistedState = new Map<string, unknown>();
+let inferredEnvironmentId: string | undefined;
+let explicitEnvironmentIds: string[] | undefined;
 const response = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 
 function hashFor(config: typeof baseConfig = baseConfig) {
@@ -78,16 +82,40 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0) {
   vi.stubGlobal("fetch", fetch);
   return { calls, inventory, fetch };
 }
-async function setup(spares: number) {
+async function setup(spares: number, environmentIds?: string[], idleMinutes = 60) {
+  explicitEnvironmentIds = environmentIds;
+  inferredEnvironmentId = undefined;
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
-  await plugin.definition.setup({ config: { get: vi.fn(async () => ({ spares })) }, logger } as any);
+  await plugin.definition.setup({
+    config: { get: vi.fn(async () => ({ spares, spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes })) },
+    logger,
+    events: { on: vi.fn((name: string, handler: (event: any) => Promise<void>) => { eventHandlers.set(name, handler); return () => eventHandlers.delete(name); }) },
+    state: {
+      get: vi.fn(async (key: { scopeId?: string; stateKey: string }) => persistedState.get(`${key.scopeId}:${key.stateKey}`) ?? null),
+      set: vi.fn(async (key: { scopeId?: string; stateKey: string }, value: unknown) => { persistedState.set(`${key.scopeId}:${key.stateKey}`, value); }),
+    },
+  } as any);
 }
 function acquire(runId: string, config: Record<string, unknown> = baseConfig, env = environmentId, company = companyId) {
+  if (!explicitEnvironmentIds) inferredEnvironmentId = env;
   return plugin.definition.onEnvironmentAcquireLease!({ driverKey: "boat", companyId: company, environmentId: env, runId, creationOperationId: `attempt-${runId}`, config });
+}
+async function emitActivity(eventType: string, company = companyId) {
+  const handler = eventHandlers.get(eventType);
+  if (!handler) throw new Error(`No handler subscribed for ${eventType}`);
+  await handler({ eventId: `event-${eventType}-${company}`, eventType, companyId: company, occurredAt: new Date().toISOString() });
+}
+function companyActivityState(company: string): any {
+  for (const [key, value] of persistedState) if (key.startsWith(`${company}:`) && value && typeof value === "object" && "lastActivityAt" in value) return value;
+  return undefined;
 }
 
 afterEach(async () => {
   await plugin.definition.onShutdown?.();
+  eventHandlers.clear();
+  persistedState.clear();
+  inferredEnvironmentId = undefined;
+  explicitEnvironmentIds = undefined;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
@@ -98,6 +126,8 @@ describe("Boat ready spare", () => {
       type: "object",
       properties: {
         spares: { type: "integer", minimum: 0, maximum: 3, default: 0 },
+        spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
+        spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true },
       },
     });
   });
@@ -248,6 +278,111 @@ describe("Boat ready spare", () => {
     await plugin.definition.onConfigChanged!({ spares: 0 }, { companyId: company } as any);
     await vi.waitFor(() => expect(f.calls.some(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${spareId}/stop`)).toBe(true), { timeout: 2_000 });
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+  });
+
+  it("stops idle spares and wakes one immediately on same-company issue activity", async () => {
+    const env = "environment-idle-rule", company = "company-idle-rule";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env], 60);
+    await acquire("run-idle-seed", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const original = f.inventory.find(item => item.labels.purpose === "spare")!;
+    const createdSpares = f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare").length;
+
+    now += 60 * 60_000 + 1;
+    await plugin.definition.onHealth!();
+    await vi.waitFor(() => expect(f.calls.some(call => call.method === "POST" && call.url.pathname === `/api/v1/sandboxes/${original.id}/stop`)).toBe(true), { timeout: 2_000 });
+    expect(f.inventory.find(item => item.id === original.id)?.state).toBe("archived");
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createdSpares);
+    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+
+    await emitActivity("issue.comment.created", company);
+    await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createdSpares + 1), { timeout: 2_000 });
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:") && item.state === "running")).toBe(true), { timeout: 2_000 });
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/commands"))).toBe(true);
+    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+  });
+
+  it("does not let another company's event wake this company's idle spare", async () => {
+    const env = "environment-company-filter", company = "company-company-filter";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env], 60);
+    await acquire("run-company-filter", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.owner === `paperclip:${company}` && item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
+    now += 60 * 60_000 + 1;
+    await plugin.definition.onHealth!();
+    const before = f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare").length;
+    await emitActivity("issue.comment.created", "company-other");
+    await plugin.definition.onHealth!();
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(before);
+    expect(f.inventory.find(item => item.labels.owner === `paperclip:${company}` && item.labels.purpose === "spare")?.state).toBe("archived");
+  });
+
+  it("scopes spares to explicitly listed environments", async () => {
+    const allowed = "environment-allowed", excluded = "environment-excluded", company = "company-environment-scope";
+    const f = fixture();
+    await setup(1, [allowed]);
+    await acquire("run-excluded", baseConfig, excluded, company);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare" && call.body.labels.environment === excluded)).toBe(false);
+    await acquire("run-allowed", baseConfig, allowed, company);
+    await vi.waitFor(() => expect(f.calls.some(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare" && call.body.labels.environment === allowed)).toBe(true), { timeout: 2_000 });
+  });
+
+  it("records acquire and release as company activity", async () => {
+    const env = "environment-lease-activity", company = "company-lease-activity";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env]);
+    const lease = await acquire("run-activity", baseConfig, env, company);
+    expect(companyActivityState(company)).toMatchObject({ lastActivityAt: now, lastLeaseAcquiredAt: now });
+    now += 5 * 60_000;
+    await plugin.definition.onEnvironmentReleaseLease!({ driverKey: "boat", companyId: company, environmentId: env,
+      config: baseConfig, providerLeaseId: lease.providerLeaseId });
+    expect(companyActivityState(company)).toMatchObject({ lastActivityAt: now, lastLeaseAcquiredAt: now - 5 * 60_000 });
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true);
+  });
+
+  it("refreshes a spare TTL while active but stops refreshing once idle", async () => {
+    const env = "environment-idle-ttl", company = "company-idle-ttl";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env], 60);
+    await acquire("run-idle-ttl", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const spare = f.inventory.find(item => item.labels.purpose === "spare")!;
+    now += 1_000_000;
+    await plugin.definition.onHealth!();
+    const ttlPatches = f.calls.filter(call => call.method === "PATCH" && call.url.pathname.endsWith(`/${spare.id}`) && call.body?.ttlSeconds === 1800).length;
+    expect(ttlPatches).toBeGreaterThan(0);
+    now += 60 * 60_000 + 1;
+    await plugin.definition.onHealth!();
+    const idleTtlPatches = f.calls.filter(call => call.method === "PATCH" && call.url.pathname.endsWith(`/${spare.id}`) && call.body?.ttlSeconds === 1800).length;
+    await plugin.definition.onHealth!();
+    expect(f.calls.filter(call => call.method === "PATCH" && call.url.pathname.endsWith(`/${spare.id}`) && call.body?.ttlSeconds === 1800)).toHaveLength(idleTtlPatches);
+    expect(f.inventory.find(item => item.id === spare.id)?.state).toBe("archived");
+    expect(idleTtlPatches).toBe(ttlPatches);
+  });
+
+  it("subscribes to company activity events and validates environment, idle, and count settings", async () => {
+    const f = fixture();
+    await setup(1);
+    const eventTypes = ["agent.run.started", "agent.run.finished", "agent.run.failed", "agent.run.cancelled", "issue.comment.created", "issue.created", "issue.updated"];
+    expect(eventTypes.every(type => eventHandlers.has(type))).toBe(true);
+    expect(manifest.capabilities).toContain("events.subscribe");
+    expect(manifest.instanceConfigSchema.properties).toMatchObject({
+      spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
+      spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true, items: { type: "string", minLength: 1 } },
+    });
+    expect(f.calls.some(call => call.body?.labels?.purpose === "spare")).toBe(false);
   });
 
   it("never claims a spare from the resume/reuse hook", async () => {
