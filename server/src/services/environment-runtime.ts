@@ -1731,19 +1731,25 @@ function createSandboxEnvironmentDriver(
   }
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
-    config: Record<string, unknown>;
     environment: Environment;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
+    adapterType: string | null;
   }) {
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
     for (const lease of input.leases) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease)) continue;
-      // A stale boot source must not serve the next run, but may hold its only
-      // workspace/session copy. Use the existing durable stop-only intent, not
-      // destruction; the cleanup sweep can stop it even after a worker restart.
-      if (!sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) {
+      // Destroying an obsolete source deletes its box. A native session there
+      // needs verified custody first: upstream's own resume-replacement guard
+      // (verifyRecoverableNativeHarnessBackup). Without it nothing is
+      // destroyed: the box is stopped and kept through the existing stop-only
+      // owners, so billing stops and the disk stays (RFL 06:21Z). The source
+      // mismatch already keeps it from serving the next run.
+      const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
+      if ((input.adapterType === "paperclip_runner" || scope?.adapterType === "paperclip_runner")
+        && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
+          stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }))) {
         const [stale] = await db.select().from(environmentLeases).where(and(
           eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
         ));
@@ -1990,10 +1996,10 @@ function createSandboxEnvironmentDriver(
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
         if (reusableCandidateLeases.length > reusableExistingLeases.length) {
           await cleanupObsoleteReusableSandboxLeases({
-            config: providerConfigForLease,
             environment: input.environment,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
+            adapterType: input.adapterType ?? null,
           });
         }
         const reusableProviderLeaseId =
@@ -2420,10 +2426,10 @@ function createSandboxEnvironmentDriver(
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
       if (reusableCandidateLeases.length > reusableExistingLeases.length) {
         await cleanupObsoleteReusableSandboxLeases({
-          config: providerConfigForLease,
           environment: input.environment,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
+          adapterType: input.adapterType ?? null,
         });
       }
       const reusableProviderLeaseId =
