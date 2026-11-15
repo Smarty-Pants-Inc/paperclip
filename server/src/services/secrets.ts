@@ -5027,6 +5027,7 @@ export function secretService(db: Db | DbTransaction) {
             { code: "secret_missing", configPath: ref.configPath },
           );
         }
+        if (secret.scope !== "company") throw unprocessable("Secret references require company-scoped secrets");
         assertSecretBindingConfigPath({ targetType: target.targetType, configPath: ref.configPath });
         const projectionClass = ref.projectionClass ?? "unclassified";
         const projectionAllowlistKey = ref.projectionAllowlistKey ?? null;
