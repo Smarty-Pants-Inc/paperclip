@@ -4,7 +4,7 @@ import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScop
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { isProcessRunAdmissionClosed } from "./heartbeat/run-admission.js";
-import { isYieldingRunStarts, refreshRunStartYieldIfStale, type RunStartHandover } from "./run-start-handover.js";
+import { isYieldingRunStarts, refreshRunStartYieldIfStale, RUN_START_YIELD_RECHECK_MS, type RunStartHandover } from "./run-start-handover.js";
 import type { StopInvocationOptions } from "./heartbeat/run-control.js";
 import { isContextCompactionRun } from "./context-compaction.js";
 import { isUnstartedTaskQuestionAnswer } from "./unstarted-task-question-answer.js";
@@ -1856,6 +1856,10 @@ export function heartbeatService(
       void (async () => {
         if ((await getSchedulingSuppression()).suppressed) return;
         if (nativeRecoveryDeadlines.get(runId) !== pending) return;
+        if (options.runStartHandover ? options.runStartHandover.isYielding() : isYieldingRunStarts()) {
+          scheduleNativeSessionResumeDispatch(runId, new Date(Date.now() + RUN_START_YIELD_RECHECK_MS), mode);
+          return;
+        }
         nativeRecoveryDeadlines.delete(runId);
         if (mode === "restart") {
           await recoverNativeRunsAfterRestart(new Date(), [runId]);
