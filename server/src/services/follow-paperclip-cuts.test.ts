@@ -25,6 +25,14 @@ import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_SETTLE_MS } from "./recovery/unanswered-person-message.js";
 
+// Custody peer, the same rule as environment-runtime-reusable-resume-replacement.test.ts: a lease's backup verifies only when
+// its stamp authorizes that exact provider lease. Everything else in the module is the real implementation.
+vi.mock("./native-runtime/native-harness-backup-storage.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./native-runtime/native-harness-backup-storage.js")>(),
+  verifyRecoverableNativeHarnessBackup: vi.fn(async (input: { stamp: unknown; providerLeaseId: string }) =>
+    Boolean(input.stamp && (input.stamp as { authorizedProviderLeaseId?: unknown }).authorizedProviderLeaseId === input.providerLeaseId)),
+}));
+
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 // A typed fresh-thread refusal (runner-reconciliation-refusal.ts FRESH_THREAD_REFUSAL_CODES).
@@ -98,47 +106,55 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
   }
 
   // ---------------------------------------------------------------- A-5
-  // The obsolete-lease path after Cut A is upstream's guarded destroy (environment-runtime destroyReusableSandboxLease).
-  // A typed destroyed receipt is recorded on the old lease; a failed or void destroy records none and strips the old
-  // stop receipt (environments.ts releaseLease). Either way the person's held message is still answered: continued
-  // within upstream's bound and delivered once, carrying the message (RFL A-5: A and B ship together).
-  describe("A-5: follow-up acquisition with boot-source drift destroys the obsolete source; the held message is still answered", () => {
-    async function driftedReusableSource(f: Awaited<ReturnType<typeof heldTypedMessage>>) {
-      const environmentId = randomUUID(), pluginId = randomUUID(), leaseId = randomUUID();
-      const [environment] = await db.insert(environments).values({ id: environmentId, name: `Boat ${environmentId.slice(0, 8)}`, driver: "sandbox", status: "active",
-        config: { provider: "boat", image: "boot-source-before-upgrade", reuseLease: true } }).returning();
+  // The person's next message wakes a follow-up run on the SAME task (reuse leases are scoped to the task). After the image
+  // change its acquisition finds the old boot-source lease obsolete. After Cut A that is upstream's guarded destroy
+  // (destroyReusableSandboxLease), dispatched ONLY with the box's native session in verified custody (RFL's A-5 condition,
+  // upstream's own resume-replacement guard verifyRecoverableNativeHarnessBackup). A typed destroyed receipt lands on the old
+  // lease; a failed or void destroy records none and strips the old stop receipt (environments.ts releaseLease). Without
+  // custody nothing is destroyed: the lease is kept, and source mismatch keeps it from serving the next run. In every case
+  // the follow-up, which then fails with a typed fresh-thread refusal, is still continued within upstream's bound and
+  // delivered once, carrying the message (RFL A-5: A and B ship together).
+  describe("A-5: a follow-up acquisition with boot-source drift; the held message is still answered", () => {
+    it.each(["destroyed", "failed", "void", "no_custody"] as const)("%s", async variant => {
+      await company();
+      expect(isFreshThreadRefusal({ errorCode: TYPED })).toBe(true);
+      const issueId = randomUUID(), messageId = randomUUID(), oldRunId = randomUUID(), followUpId = randomUUID();
+      const environmentId = randomUUID(), pluginId = randomUUID(), oldLeaseId = randomUUID();
+      const t0 = new Date(Date.now() - 3600_000);
+      await db.insert(issues).values({ id: issueId, companyId, title: "Answer Paul", status: "in_progress",
+        assigneeAgentId: agentId, responsibleUserId: userId, statusVersion: 4 });
+      const [environment] = await db.insert(environments).values({ id: environmentId, name: `Boat ${environmentId.slice(0, 8)}`, driver: "sandbox",
+        status: "active", config: { provider: "boat", image: "boot-source-before-upgrade", reuseLease: true } }).returning();
       await db.insert(plugins).values({ id: pluginId, pluginKey: "paperclip.boat", packageName: "@paperclipai/plugin-boat",
         version: "1.0.0", apiVersion: 1, status: "ready", categories: ["automation"],
         manifestJson: { id: "paperclip.boat", apiVersion: 1, version: "1.0.0", displayName: "Boat", description: "Boat peer", author: "Paperclip",
           categories: ["automation"], capabilities: ["environment.drivers.register"], entrypoints: { worker: "dist/worker.js" },
           environmentDrivers: [{ driverKey: "boat", kind: "sandbox_provider", displayName: "Boat", supportsReusableLeases: true,
             configSchema: { type: "object" } }] } } as never);
-      const releasedAt = new Date(f.finishedAt.getTime() - 1_000);
-      const binding = { companyId, runId: f.runId, leaseId, provider: "boat", providerLeaseId: `bx-old-${leaseId.slice(0, 8)}`,
-        confirmedAt: releasedAt.toISOString() };
-      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, issueId: f.issueId, heartbeatRunId: f.runId,
-        provider: "boat", providerLeaseId: binding.providerLeaseId, leasePolicy: "reuse_by_environment", status: "released",
-        cleanupStatus: "success", acquiredAt: new Date(f.finishedAt.getTime() - 10 * 60_000), releasedAt,
+      // The earlier turn: its warm box was released for reuse with a bound stop receipt.
+      await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+        status: "succeeded", createdAt: t0, startedAt: t0, finishedAt: new Date(t0.getTime() + 60_000), contextSnapshot: { issueId } });
+      const releasedAt = new Date(t0.getTime() + 61_000), providerLeaseId = `bx-old-${oldLeaseId.slice(0, 8)}`;
+      await db.insert(environmentLeases).values({ id: oldLeaseId, companyId, environmentId, issueId, heartbeatRunId: oldRunId,
+        provider: "boat", providerLeaseId, leasePolicy: "reuse_by_environment", status: "released", cleanupStatus: "success",
+        acquiredAt: t0, releasedAt,
         metadata: { driver: "sandbox", sandboxProviderPlugin: true, pluginId, pluginKey: "paperclip.boat", agentId, ...environment!.config,
-          pendingCleanupInFlight: false, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", state: "stopped", ...binding } } });
-      // The next image changes the boot source.
+          reusableSandboxLease: { adapterType: "paperclip_runner" }, pendingCleanupInFlight: false,
+          ...(variant === "no_custody" ? {} : { nativeHarnessBackup: { authorizedProviderLeaseId: providerLeaseId } }),
+          remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", state: "stopped", companyId, runId: oldRunId,
+            leaseId: oldLeaseId, provider: "boat", providerLeaseId, confirmedAt: releasedAt.toISOString() } } });
+      const [oldBefore] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
+      // Paul's message wakes the follow-up on the same task; the next image changed the boot source.
+      await db.insert(issueComments).values({ id: messageId, companyId, issueId, authorType: "user", authorUserId: userId,
+        body: "Please summarise the copper orchard report.", createdAt: new Date(Date.now() - 5 * 60_000) });
+      await db.insert(heartbeatRuns).values({ id: followUpId, companyId, agentId, issueId, nativeIssueId: issueId, runtimeMode: "native",
+        invocationSource: "on_demand", status: "running", responsibleUserId: userId, createdAt: new Date(Date.now() - 4 * 60_000),
+        startedAt: new Date(Date.now() - 4 * 60_000),
+        contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: messageId, wakeCommentIds: [messageId] } });
       const drifted = { ...environment!.config, image: "boot-source-after-upgrade" };
       await db.update(environments).set({ config: drifted }).where(eq(environments.id, environmentId));
-      return { environment: { ...environment!, config: drifted, envVars: {} } as unknown as Environment, pluginId, leaseId,
-        providerLeaseId: binding.providerLeaseId };
-    }
-
-    it.each(["destroyed", "failed", "void"] as const)("%s destroy", async variant => {
-      await company();
-      const f = await heldTypedMessage();
-      expect(isFreshThreadRefusal({ errorCode: TYPED })).toBe(true);
-      const source = await driftedReusableSource(f);
-      // A different task's run on the same environment acquires after the image change.
-      const [otherIssue] = await db.insert(issues).values({ companyId, title: "Another task", status: "in_progress", assigneeAgentId: agentId }).returning();
-      const [followUp] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: otherIssue!.id, nativeIssueId: otherIssue!.id,
-        runtimeMode: "native", status: "running", contextSnapshot: { issueId: otherIssue!.id } }).returning();
       const call = vi.fn(async (_id: string, method: string, params: Record<string, unknown>) => {
-        if (method === "environmentAcquireLease") return { providerLeaseId: "bx-fresh", metadata: { ...source.environment.config, remoteCwd: "/workspace" } };
+        if (method === "environmentAcquireLease") return { providerLeaseId: "bx-fresh", metadata: { ...drifted, remoteCwd: "/workspace" } };
         if (method === "environmentDestroyLease") {
           if (variant === "failed") throw new Error("boat destroy timed out");
           return variant === "void" ? undefined : { providerLeaseId: params.providerLeaseId, state: "destroyed" };
@@ -148,37 +164,59 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
       const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
         getWorker: () => ({ supportedMethods: ["environmentAcquireLease", "environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentStopLease"] }),
       } as unknown as PluginWorkerManager });
-      const acquired = await runtime.acquireRunLease({ companyId, environment: source.environment, issueId: otherIssue!.id, agentId,
-        heartbeatRunId: followUp!.id, adapterType: "paperclip_runner", persistedExecutionWorkspace: null } as never);
-      expect(acquired.lease.providerLeaseId).toBe("bx-fresh");
+      const acquired = await runtime.acquireRunLease({ companyId, environment: { ...environment!, config: drifted, envVars: {} } as unknown as Environment,
+        issueId, agentId, heartbeatRunId: followUpId, adapterType: "paperclip_runner", persistedExecutionWorkspace: null } as never);
+      expect(acquired.lease.providerLeaseId, "the stale source never serves the next run").toBe("bx-fresh");
 
-      // Cut A: upstream's obsolete-lease destroy ran for the drifted source (no stop-only intent, no skip).
-      expect.soft(call.mock.calls.filter(([, method]) => method === "environmentDestroyLease")
-        .map(([, , params]) => params.providerLeaseId), "the drifted source is destroyed through upstream's guarded path").toEqual([source.providerLeaseId]);
+      const destroys = call.mock.calls.filter(([, method]) => method === "environmentDestroyLease").map(([, , params]) => params.providerLeaseId);
       expect.soft(call.mock.calls.some(([, method]) => method === "environmentStopLease"), "no acquisition-issued stop").toBe(false);
-      const [old] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, source.leaseId));
-      if (variant === "destroyed") {
-        expect.soft(old).toMatchObject({ status: "expired", cleanupStatus: "success",
-          metadata: { remoteExecutionTermination: { state: "destroyed", leaseId: source.leaseId, runId: f.runId, providerLeaseId: source.providerLeaseId } } });
-        expect.soft(hasRemoteTerminationReceipt(old!)).toBe(true);
+      const [oldAfter] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, oldLeaseId));
+      if (variant === "no_custody") {
+        // Never-OK guard: no verified custody of the box's session, no destroy. The lease is kept as it was.
+        expect.soft(destroys, "no verified custody -> no destroy").toEqual([]);
+        expect.soft(oldAfter, "the lease is kept unchanged").toEqual(oldBefore);
       } else {
-        expect.soft(old!.metadata?.remoteExecutionTermination, "a failed or void destroy is no termination receipt").toBeUndefined();
-        expect.soft(old!.status).toBe(variant === "failed" ? "pending_cleanup" : "expired");
+        expect.soft(destroys, "the drifted source is destroyed through upstream's guarded path").toEqual([providerLeaseId]);
+        if (variant === "destroyed") {
+          expect.soft(oldAfter).toMatchObject({ status: "expired", cleanupStatus: "success",
+            metadata: { remoteExecutionTermination: { state: "destroyed", leaseId: oldLeaseId, runId: oldRunId, providerLeaseId } } });
+          expect.soft(hasRemoteTerminationReceipt(oldAfter!)).toBe(true);
+        } else {
+          expect.soft(oldAfter!.metadata?.remoteExecutionTermination, "a failed or void destroy is no termination receipt").toBeUndefined();
+          expect.soft(oldAfter!.status).toBe(variant === "failed" ? "pending_cleanup" : "expired");
+        }
       }
+
+      // The follow-up then fails with a typed fresh-thread refusal before answering; its own box stopped with a receipt.
+      // Its receipt is confirmed after the acquisition and no later than its release (the gate's time rule).
+      const failedAt = new Date(Math.max(Date.now(), acquired.lease.acquiredAt.getTime() + 1));
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: failedAt,
+        metadata: { ...acquired.lease.metadata, remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", state: "stopped",
+          companyId, runId: followUpId, leaseId: acquired.lease.id, provider: "boat", providerLeaseId: "bx-fresh", confirmedAt: failedAt.toISOString() } } })
+        .where(eq(environmentLeases.id, acquired.lease.id));
+      const [blocked] = await db.update(issues).set({ status: "blocked", blockedTransitionAt: failedAt }).where(eq(issues.id, issueId)).returning();
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: TYPED, error: TYPED, nativePhase: "terminal_failure", finishedAt: failedAt })
+        .where(eq(heartbeatRuns.id, followUpId));
+      await db.insert(nativeRunFinalizations).values({ runId: followUpId, companyId, issueId, phase: "terminal_failure",
+        recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
+      await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active",
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation",
+        fingerprint: `native-continuation:${followUpId}`, nextAction: "Continue from the last saved work.", maxAttempts: 3, createdAt: failedAt,
+        evidence: { runId: followUpId, originalFailureCode: TYPED, nativeFailureBlock: { runId: followUpId, statusVersion: blocked!.statusVersion } } });
 
       // The person's message is still answered: continued within upstream's bound, delivered exactly once.
       let result: Awaited<ReturnType<typeof ensureFreshContinuation>> | null = null;
       for (const at of [0, FRESH_CONTINUATION_PENDING_BOUND_MS + 60_000]) {
-        result = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery", now: new Date(Date.now() + at) });
+        result = await ensureFreshContinuation(db, { companyId, runId: followUpId, trigger: "held_recovery", now: new Date(Date.now() + at) });
         if (result.kind === "continued") break;
       }
       expect(result, "continued within ~10 min (upstream's bound), never held forever").toMatchObject({ kind: "continued" });
       await occupySlot();
       await deliver();
-      const next = await successors(f.runId);
+      const next = await successors(followUpId);
       expect(next).toHaveLength(1);
-      expect(next[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, previousRunId: f.runId, forceFreshSession: true,
-        wakeCommentIds: [f.messageId] });
+      expect(next[0]!.contextSnapshot).toMatchObject({ issueId, previousRunId: followUpId, forceFreshSession: true,
+        wakeCommentIds: [messageId] });
     }, 60_000);
   });
 
