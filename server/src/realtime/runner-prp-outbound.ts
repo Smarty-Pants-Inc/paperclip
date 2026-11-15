@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { isSandboxLeaseStartDeniedError } from "../services/retained-sandbox-absent-error.js";
 import { logger } from "../middleware/logger.js";
 import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "./ingress-error-summary.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
@@ -534,6 +535,7 @@ export function connectRunnerPrpIngress(input: {
           } catch (refreshError) {
             if (abort.signal.aborted) return;
             failure = refreshError;
+            if (isSandboxLeaseStartDeniedError(refreshError)) leaseFailureCode = "runner_connection_lease_expired";
           }
         }
         // A timed-out dial is an attempt, not evidence that three attempts ran.
@@ -543,7 +545,7 @@ export function connectRunnerPrpIngress(input: {
         const floorRetry = transportFailure && dialStarted
           && connectAttempts < minimumAttempts && Date.now() >= recoveryDeadline;
         let retryDeadline = floorRetry ? Date.now() + HANDSHAKE_TIMEOUT_MS : recoveryDeadline;
-        if (Date.now() < retryDeadline) {
+        if (leaseFailureCode === null && Date.now() < retryDeadline) {
           const base = RECONNECT_DELAYS_MS[
             Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
           ]!;
@@ -587,9 +589,10 @@ export function connectRunnerPrpIngress(input: {
               } catch (refreshError) {
                 if (abort.signal.aborted) return;
                 failure = refreshError;
+                if (isSandboxLeaseStartDeniedError(refreshError)) leaseFailureCode = "runner_connection_lease_expired";
               }
             }
-            if (Date.now() < retryDeadline) {
+            if (leaseFailureCode === null && Date.now() < retryDeadline) {
               nextAttemptDeadline = retryDeadline;
               continue;
             }

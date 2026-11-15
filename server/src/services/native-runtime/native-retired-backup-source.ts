@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY } from "../../agent-run-cancellation.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
@@ -38,7 +39,9 @@ export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string
  * With no provider work after the backup, the idle sandbox holds exactly the
  * checkpointed state, so restoring the backup continues the same session. The
  * source is claimed as superseded first, so it is never resumed with that
- * older state after the restored lease moves on.
+ * older state after the restored lease moves on. An expired native reusable
+ * source with a bound stopped receipt is the fourth class: the same idle proof
+ * applies, and the runtime start fence keeps its stopped allocation retired.
  */
 export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: {
   companyId: string;
@@ -121,11 +124,13 @@ async function supersedeIdleWarmSource(db: Db, lease: typeof environmentLeases.$
   companyId: string; currentRunId: string; manifestSha256: string; targetProviderLeaseId?: string | null;
 }) {
   const { reusableSandboxLease: scope, ...metadata } = lease.metadata ?? {};
-  const [claimed] = await db.update(environmentLeases).set({
+  const prior = metadata[SUPERSEDED_REUSABLE_SANDBOX_KEY] as { reusableSandboxLease?: unknown } | undefined;
+  return db.transaction(async tx => {
+  const [claimed] = await tx.update(environmentLeases).set({
     metadata: { ...metadata, [SUPERSEDED_REUSABLE_SANDBOX_KEY]: {
       schema: "paperclip.reusable-sandbox-lease-superseded.v1", reason: "harness_backup_restored_elsewhere",
       supersededByRunId: input.currentRunId, supersededByProviderLeaseId: input.targetProviderLeaseId ?? null,
-      manifestSha256: input.manifestSha256, reusableSandboxLease: scope ?? null, supersededAt: new Date().toISOString(),
+      manifestSha256: input.manifestSha256, reusableSandboxLease: scope ?? prior?.reusableSandboxLease ?? null, supersededAt: new Date().toISOString(),
     } },
     updatedAt: new Date(),
   }).where(and(
@@ -133,8 +138,16 @@ async function supersedeIdleWarmSource(db: Db, lease: typeof environmentLeases.$
     eq(environmentLeases.status, lease.status), eq(environmentLeases.leasePolicy, "reuse_by_environment"),
     eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!),
     sql`${environmentLeases.metadata} = ${JSON.stringify(lease.metadata)}::jsonb`,
+    sql`(not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${SUPERSEDED_REUSABLE_SANDBOX_KEY})
+      or (${environmentLeases.metadata}->${SUPERSEDED_REUSABLE_SANDBOX_KEY}->>'supersededByProviderLeaseId' = ${input.targetProviderLeaseId ?? null}
+        and ${environmentLeases.metadata}->${SUPERSEDED_REUSABLE_SANDBOX_KEY}->>'manifestSha256' = ${input.manifestSha256}))`,
   )).returning({ id: environmentLeases.id });
-  return Boolean(claimed);
+  if (!claimed) return false;
+  await tx.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
+    || ${JSON.stringify({ [SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY]: new Date().toISOString() })}::jsonb`, updatedAt: new Date() })
+    .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId!)));
+  return true;
+  });
 }
 
 const TERMINAL_SOURCE_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
@@ -146,7 +159,12 @@ const TERMINAL_SOURCE_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled"
  * workspace export or cleanup on the allocation keeps it ambiguous.
  */
 async function idleWarmSourceRetiresBackup(db: Db, lease: typeof environmentLeases.$inferSelect, currentRunId: string) {
-  if (lease.leasePolicy !== "reuse_by_environment" || !["released", "retained"].includes(lease.status)
+  const superseded = lease.metadata?.[SUPERSEDED_REUSABLE_SANDBOX_KEY] as { reusableSandboxLease?: unknown } | undefined;
+  const scope = (lease.metadata?.reusableSandboxLease ?? superseded?.reusableSandboxLease) as { adapterType?: unknown } | undefined;
+  const stoppedNative = lease.status === "expired" && scope?.adapterType === "paperclip_runner"
+    && hasRemoteTerminationReceipt(lease)
+    && (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state === "stopped";
+  if (lease.leasePolicy !== "reuse_by_environment" || (!stoppedNative && !["released", "retained"].includes(lease.status))
     || !lease.heartbeatRunId || lease.heartbeatRunId === currentRunId
     || lease.metadata?.pendingCleanupInFlight === true
     // A restore hold or a pending shutdown settlement still protects the files; reuse skips these too.

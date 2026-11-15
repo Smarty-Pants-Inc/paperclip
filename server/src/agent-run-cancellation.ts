@@ -10,7 +10,7 @@ export function agentRunWritesRevoked(run: {
   resultJson?: Record<string, unknown> | null;
 } | null | undefined): boolean {
   const cancellation = run?.resultJson?.executionCancellation;
-  return run?.status === "cancelled" || agentRunSupersededByFreshContinuation(run) || Boolean(cancellation && typeof cancellation === "object"
+  return run?.status === "cancelled" || agentRunSuperseded(run) || Boolean(cancellation && typeof cancellation === "object"
     && "state" in cancellation && cancellation.state === "requested");
 }
 
@@ -38,6 +38,14 @@ export function agentRunSupersededByFreshContinuation(run: { resultJson?: Record
   return typeof run?.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] === "string";
 }
 
+/** Backup restoration revokes the terminal source run in the source-lease CAS transaction. */
+export const SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY = "sandboxBackupSourceSupersededAt";
+
+export function agentRunSuperseded(run: { resultJson?: Record<string, unknown> | null } | null | undefined) {
+  return agentRunSupersededByFreshContinuation(run)
+    || typeof run?.resultJson?.[SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY] === "string";
+}
+
 /** The caller must supply its write transaction, so Stop and commit serialize. */
 export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, actor: {
   agentId?: string | null;
@@ -53,7 +61,7 @@ export async function assertAgentRunWriteAllowed(tx: Db, companyId: string, acto
     .for("share");
   const stoppedForThisMutation = run?.status === "cancelled" && actor.stopId &&
     run.resultJson?.issueMutationStopId === actor.stopId;
-  if (agentRunSupersededByFreshContinuation(run)) {
+  if (agentRunSuperseded(run)) {
     throw forbidden("A newer run continues this task. End the turn.", { code: "agent_run_superseded" });
   }
   if (agentRunWritesRevoked(run) && !stoppedForThisMutation) {

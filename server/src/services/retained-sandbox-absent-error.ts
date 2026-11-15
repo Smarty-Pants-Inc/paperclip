@@ -10,6 +10,19 @@ export class RetainedSandboxAbsentError extends Error {
   }
 }
 
+/** Durable server authority forbids a start; this does not claim physical absence. */
+export class SandboxLeaseStartDeniedError extends Error {
+  readonly code = "sandbox_lease_start_denied";
+  constructor() {
+    super("The source sandbox lease is retired or superseded and cannot start.");
+    this.name = "SandboxLeaseStartDeniedError";
+  }
+}
+
+export function isSandboxLeaseStartDeniedError(error: unknown): error is SandboxLeaseStartDeniedError {
+  return error instanceof Error && "code" in error && error.code === "sandbox_lease_start_denied";
+}
+
 /** A resume reply that confirms the sandbox is gone, as sandbox providers report it. */
 export function resumeReplyConfirmsAbsence(reply: unknown): boolean {
   if (!reply || typeof reply !== "object") return false;

@@ -1,3 +1,4 @@
+import { isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { pluginTaskResumeRefused, resolvePluginTaskResume } from "./plugin-task-resume.js";
 export { resolvePluginTaskResume } from "./plugin-task-resume.js";
 import { attachSandboxCreation, environmentService } from "./environments.js";
@@ -488,7 +489,7 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
     const result = await callWorker("environmentTask", params, timeout).catch(error => {
       // The plugin may have applied the saved claim before its reply was lost.
       // Keep the same operation ID; the RPC response below still needs validation.
-      if (ownership && (!(error instanceof JsonRpcCallError) ||
+      if (ownership && !isSandboxLeaseStartDeniedError(error) && (!(error instanceof JsonRpcCallError) ||
           error.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT || error.code === PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE)) throw new PluginTaskOwnershipPendingError();
       throw error;
     });
@@ -584,6 +585,10 @@ export async function executeEnvironmentTask(db: Db, workers: Pick<PluginWorkerM
     }
     return parsed;
   } catch (error) {
+    if (isSandboxLeaseStartDeniedError(error)) {
+      if (operation.kind === "resume") return { kind: "resume", taskId, outcome: "unavailable" };
+      throw error;
+    }
     if (error instanceof PluginTaskOwnershipPendingError) throw error;
     const diagnostic = operation.kind === "submit" && operation.resumeFrom ? readEnvironmentTaskErrorDiagnostic(error) : null;
     if (diagnostic) throw new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR,

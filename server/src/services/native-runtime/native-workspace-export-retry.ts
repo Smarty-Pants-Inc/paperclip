@@ -46,7 +46,8 @@ export async function retryNativeWorkspaceExport(input: {
     const reference = readNativeWorkspaceSyncReference(record(run.runnerProfileJson).nativeWorkspaceSync);
     if (!reference || reference.state !== "prepared") throw changed();
     const lease = await one(db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, reference.leaseId))).limit(1));
-    if (!lease || lease.heartbeatRunId !== run.id || lease.issueId !== issue.id
+    if (!lease || Object.hasOwn(lease.metadata ?? {}, "reusableSandboxLeaseSuperseded")
+      || lease.heartbeatRunId !== run.id || lease.issueId !== issue.id
       || lease.providerLeaseId !== reference.providerLeaseId || !lease.environmentId
       || typeof lease.metadata?.pluginId !== "string" || !lease.metadata.pluginId) throw changed();
     const [otherLease] = await db.select({ id: environmentLeases.id }).from(environmentLeases).where(and(
@@ -112,7 +113,9 @@ export async function retryNativeWorkspaceExport(input: {
               pendingCleanupAttemptId: requestId, pendingCleanupInFlight: true,
               pendingCleanupRetryAfterMs: 0, pendingCleanupRetryAttempts: 0, pendingCleanupRetryCapWarned: false,
               pendingCleanupLeaseExpiresAtMs: now.getTime() + 15 * 60_000 },
-          }).where(eq(environmentLeases.id, current.lease.id)).returning();
+          }).where(and(eq(environmentLeases.id, current.lease.id), eq(environmentLeases.status, current.lease.status),
+            sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableSandboxLeaseSuperseded')`)).returning();
+          if (!lease) throw changed();
           return lease;
         });
         resumeRequestId = requestId;

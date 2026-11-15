@@ -1,7 +1,7 @@
 import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import { and, eq } from "drizzle-orm";
 import { environmentLeases } from "@paperclipai/db";
-import { RetainedSandboxAbsentError } from "./retained-sandbox-absent-error.js";
+import { RetainedSandboxAbsentError, isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import type { Db } from "@paperclipai/db";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { adapterSupportsRemoteManagedEnvironments } from "@paperclipai/shared";
@@ -285,7 +285,7 @@ function bindSandboxRunnerLeaseLifecycle(input: {
         if (!resumed || resumed.providerLeaseId !== lease.providerLeaseId) throw new Error("native_sandbox_runner_resume_allocation_mismatch");
         return "resumed";
       } catch (error) {
-        if (error instanceof RetainedSandboxAbsentError) return "unavailable";
+        if (error instanceof RetainedSandboxAbsentError || isSandboxLeaseStartDeniedError(error)) return "unavailable";
         throw error;
       }
     },

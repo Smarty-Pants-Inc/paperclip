@@ -1,3 +1,4 @@
+import { isSandboxLeaseStartDeniedError } from "./retained-sandbox-absent-error.js";
 import { classifyWorkspaceRestoreFailure } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { createHash } from "node:crypto";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
@@ -356,7 +357,7 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         try {
           const opened = await input.environmentRuntime.resumeWorkspaceRecoveryLease({ source: input,
             leaseId: cleanupLease.id, environmentId: environment.id, ownership }).catch(error => {
-              throw sandboxDiskFull.test((error as Error | undefined)?.message ?? "")
+              throw isSandboxLeaseStartDeniedError(error) || sandboxDiskFull.test((error as Error | undefined)?.message ?? "")
                 ? new SystemRecoveryFailure("source_unavailable", "use_alternative_strategy") : error;
             });
           const confirmed = await confirmSandboxRecoveryRestart(db, cleanupLease, { attemptId: ownership.token });
