@@ -40,12 +40,21 @@ function sandboxTransferRoot(row: Copy, remoteCwd: string): string {
   const origin = typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId);
   return path.posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "agent-file-transfers", row.agentId, origin);
 }
+function hasCleanupAuthority(row: Copy): boolean {
+  const identity = (value: unknown) => typeof value === "string" && /^[0-9]+:[0-9]+:[0-9]+$/.test(value);
+  return row.receipt?.refreshConfinedCleanup === true && row.receipt?.refreshCleanupBlocked !== true &&
+    identity(row.receipt.materializationIdentity) && identity(row.receipt.localCleanupIdentity) &&
+    (row.receipt.cleanupTransport !== "sandbox" || identity(row.receipt.transferCleanupIdentity));
+}
 function cleanupCommand(row: Copy, paths: string[]): string {
+  if (!hasCleanupAuthority(row)) throw new Error("Agent directory cleanup authority is unavailable");
   const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
-  if (row.receipt?.refreshConfinedCleanup !== true) return `rm -rf -- ${paths.map(quote).join(" ")}`;
-  // Missing physical authority must defer cleanup, not weaken it to rm -rf.
-  const identity = typeof row.receipt.materializationIdentity === "string" ? row.receipt.materializationIdentity : "unavailable";
-  const roots = paths.map(root => ({ root, ...(root === row.executionRoot ? { identity } : {}) }));
+  const identity = row.receipt!.materializationIdentity;
+  const roots = paths.map(root => {
+    const physicalIdentity = root === row.executionRoot ? identity : row.receipt?.transferCleanupIdentity;
+    if (typeof physicalIdentity !== "string" || !/^[0-9]+:[0-9]+:[0-9]+$/.test(physicalIdentity)) throw new Error("Cleanup root has no physical authority");
+    return { root, identity: physicalIdentity };
+  });
   return `node -e ${quote(agentDirectoryConfinedCleanupProgram)} ${quote(JSON.stringify(roots))}`;
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
@@ -82,7 +91,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return await fs.readFile(ownerFile(row), "utf8").then(s => JSON.parse(s).runId === row.runId).catch(error => error.code === "ENOENT" && row.processStoppedAt !== null);
   }
   async function warmReusable(row: Copy, agentId: string) {
-    if (row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
+    if (row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || row.receipt?.retirementRequired || !await owns(row)) return false;
     const entry = baseline(row).entries.get(row.entryFile);
     return entry?.kind === "file" && entry.hash === row.receipt?.sessionEntryHash;
   }
@@ -106,9 +115,30 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     try {
       return await serial(row, current => store.locked(input.companyId, input.agentId, actor(current), false, async (_tx, agent, canonical) => {
         if (!await warmReusable(current, input.agentId) || current.location !== (input.target?.kind === "remote" ? `remote:${input.target.environmentId ?? ""}` : "local")) return false;
-        // Refusal also retires this owner. Preserve physical custody through
-        // that cleanup even when a later context or observation check refuses.
-        current = await patch(current, { receipt: { ...current.receipt, refreshConfinedCleanup: true } });
+        // Revoke cleanup BEFORE attempting to grant confined-cleanup authority.
+        // This independent, committed intent survives a failed authority write,
+        // a lost acknowledgement, and a fresh service/controller on retirement.
+        // It deliberately does not use the fallible authority writer below.
+        const previous = current;
+        const [pending] = await db.transaction(async tx => tx.update(copies).set({
+          state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
+          errorMessage: "Refresh cleanup authority is unconfirmed. All files must be retained.", nextAttemptAt: null,
+          receipt: { ...current.receipt, refreshConfinedCleanup: false, refreshCleanupBlocked: true }, updatedAt: new Date(),
+        }).where(and(eq(copies.companyId, current.companyId), eq(copies.runId, current.runId),
+          eq(copies.state, current.state), eq(copies.baseHash, current.baseHash),
+          sql`${copies.receipt} = ${JSON.stringify(current.receipt)}::jsonb`)).returning());
+        if (!pending) return false;
+        // The grant cannot clear the denial or restore collectability. Even an
+        // ambiguous commit (write succeeded, acknowledgement lost) stays closed.
+        await patch(pending, { receipt: { ...pending.receipt, refreshConfinedCleanup: true } });
+        // A returned value is not durable proof: reread the committed authority.
+        const authority = await get(pending.companyId, pending.runId);
+        if (!authority || authority.state !== "unavailable" || authority.errorCode !== "AGENT_FILES_REFRESH_INCOMPLETE" ||
+            authority.receipt?.refreshCleanupBlocked !== true || authority.receipt?.refreshConfinedCleanup !== true) return false;
+        // Only a verified grant allows the ordinary retirement path again.
+        current = await patch(authority, { state: previous.state, errorCode: previous.errorCode, errorMessage: previous.errorMessage,
+          receipt: { ...previous.receipt, refreshCleanupBlocked: false, refreshConfinedCleanup: true } });
+        if (current.receipt?.refreshCleanupBlocked !== false) return false;
         if (!await warmReusable(current, input.agentId) || current.receipt?.refreshConfinedCleanup !== true) return false;
         const status = await reuseStatus(current, deriveBundleState(agent).entryFile, canonical);
         if (status === "other" || !await input.canRefresh(canonical, current.entryFile)) return false;
@@ -152,8 +182,21 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         } catch (error) {
           await runtime?.cleanupWorkspaceSnapshot?.().catch(() => {});
           const latest = await get(current.companyId, current.runId);
-          if (latest && await owns(latest)) await patch(latest, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
-            errorMessage: `Agent-file refresh failed; transfer output will not be saved. ${String(error).slice(0, 1024)}`, nextAttemptAt: null });
+          if (latest && await owns(latest)) {
+            if ((error as { code?: string }).code === "AGENT_FILES_REFRESH_UNMODIFIED") {
+              // The destination guard proved that it changed no owner bytes.
+              // The mirror may be newer; checkpoint collection reads the actual
+              // host against the ORIGINAL baseline, preserving this owner edit.
+              await patch(latest, { state: current.state, errorCode: null, errorMessage: null, nextAttemptAt: null,
+                receipt: { ...current.receipt, retirementRequired: true } });
+            } else await patch(latest, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
+              errorMessage: `Agent-file refresh failed; transfer output will not be saved. ${String(error).slice(0, 1024)}`, nextAttemptAt: null,
+              ...((error as { code?: string }).code === "AGENT_FILES_REFRESH_CHANGED" ? {
+                // A genuine edit detected after earlier transfer writes cannot
+                // be collected as a clean checkpoint OR discarded on retirement.
+                receipt: { ...latest.receipt, retirementRequired: true, refreshCleanupBlocked: true },
+              } : {}) });
+          }
           throw error;
         }
       }), "agent_directory_prepare");
@@ -277,7 +320,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // leaves a recoverable preparing receipt instead of an orphan directory.
     const preparing = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: "preparing",
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
-      receipt: { schema: AGENT_FILES_CONTRACT, workspaceCwd: input.cwd, materializationRunId: origin, ...(input.warm ? { warm: true, directoryRunId: input.runId } : {}), ...(input.target?.kind === "remote"
+      receipt: { schema: AGENT_FILES_CONTRACT, workspaceCwd: input.cwd, materializationRunId: origin,
+        cleanupTransport: input.target?.kind === "remote" ? input.target.transport : "local", ...(input.warm ? { warm: true, directoryRunId: input.runId } : {}), ...(input.target?.kind === "remote"
         ? { cleanup: { leaseId: input.target.leaseId ?? null, remoteCwd: input.target.remoteCwd } } : {}) }, processStoppedAt: null, attempts: 0,
       nextAttemptAt: null, errorCode: null, errorMessage: null };
     if (row) row = await patch(row, preparing);
@@ -309,6 +353,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const values = { entryFile: deriveBundleState(agent).entryFile, baseRevisionId: null, baseHash: directorySnapshotSha256(snapshot),
       localRoot, executionRoot, location, state: "preparing", candidateBase64: null, candidateHash: null,
       receipt: { ...preparing.receipt, baseline: serializeDirectorySnapshot(snapshot), storageWarning,
+        localCleanupIdentity: await fs.lstat(path.dirname(localRoot), { bigint: true })
+          .then(s => { if (!s.isDirectory() || s.isSymbolicLink()) throw new Error("Unsafe local cleanup root"); return [s.dev, s.ino, s.birthtimeNs].join(":"); }),
         ...(input.warm ? { sessionEntryHash: loadedEntry?.kind === "file" ? loadedEntry.hash : null } : {}) },
       processStoppedAt: null, attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null };
     try {
@@ -319,6 +365,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       throw error;
     }
     try {
+      let transferCleanupIdentity: string | undefined;
       if (input.target?.kind === "remote") {
         const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
         const excluded = await runAdapterExecutionTargetShellCommand(input.runId, input.target,
@@ -329,11 +376,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         transports.set(key(row), runtime);
         if (input.target.transport === "sandbox") {
           if (runtime.runtimeRootDir !== sandboxTransferRoot(row, input.target.remoteCwd)) throw new Error("Agent directory transfer scratch path changed");
+          // One bounded metadata-only RPC, not a recursive scratch scan. A
+          // missing/unverifiable identity leaves cleanup denied after restart.
+          const scratch = await runAdapterExecutionTargetShellCommand(row.runId, input.target,
+            `node -e ${quote(agentDirectoryConfinedCleanupProgram)} ${quote(JSON.stringify([{ root: runtime.runtimeRootDir, inspect: true }]))}`,
+            { cwd: input.target.remoteCwd, env: {}, timeoutSec: 10 }).catch(() => null);
+          if (scratch && scratch.exitCode === 0 && !scratch.timedOut && /^[0-9]+:[0-9]+:[0-9]+$/.test(scratch.stdout)) transferCleanupIdentity = scratch.stdout;
         }
       }
       const observed = await observe(row, input.target).catch(() => null);
       return await patch(row, { state: "prepared", receipt: { ...row.receipt,
-        ...(observed?.digest === agentDirectoryBaselineDigest(snapshot) ? { materializationIdentity: observed.identity } : {}) } });
+        ...(transferCleanupIdentity ? { transferCleanupIdentity } : {}),
+        ...(observed?.digest === agentDirectoryBaselineDigest(snapshot) ? { materializationIdentity: observed.identity, refreshConfinedCleanup: true } : {}) } });
     } catch (error) {
       // Preparation failed before a provider could start using this copy.
       row = await patch(row, { state: "unavailable", processStoppedAt: new Date(), errorCode: "AGENT_FILES_PREPARE_FAILED",
@@ -607,6 +661,19 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   async function release(row: Copy, target?: AdapterExecutionTarget | null) {
     row = await settleCompletedCleanupRetry(row);
     if (releaseIsNoop(row) || !await owns(row)) return;
+    // ONE default-deny gate precedes runtime, remote, local AND restart cleanup.
+    // A callback's returned object is not a durable grant. Re-read the exact
+    // stopped owner before doing any I/O; absent/ambiguous authority keeps files.
+    // The confined programs then validate physical identities through pinned
+    // ancestors on each actual host, never through an rm -rf fallback.
+    const authority = await get(row.companyId, row.runId).catch(() => null);
+    if (!authority || !hasCleanupAuthority(authority) || !authority.processStoppedAt ||
+        authority.state !== row.state || authority.localRoot !== row.localRoot || authority.executionRoot !== row.executionRoot ||
+        authority.receipt?.retainedByRunId || !isDeepStrictEqual(authority.receipt, row.receipt)) {
+      await patch(row, { receipt: { ...row.receipt, cleanupPending: true }, nextAttemptAt: new Date(Date.now() + 30_000) });
+      return;
+    }
+    row = authority;
     const destroyedOnly = row.receipt?.cleanupDestroyedOnly === true;
     if (row.receipt?.retainedByRunId || row.state === "superseded" || !await owns(row) || !row.processStoppedAt) return;
     // Collection and environment teardown can both release the same copy.
@@ -640,8 +707,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     if (completed.has(row.state) && row.processStoppedAt) {
       try {
-        if (row.receipt?.refreshConfinedCleanup === true) await removeLocalAgentDirectoryConfined(path.dirname(row.localRoot));
-        else await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true });
+        await removeLocalAgentDirectoryConfined(path.dirname(row.localRoot), row.receipt!.localCleanupIdentity as string);
       }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
@@ -651,7 +717,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
-        ...(row.receipt?.refreshConfinedCleanup ? { refreshConfinedCleanup: true, materializationIdentity: row.receipt.materializationIdentity } : {}),
+        refreshConfinedCleanup: true, materializationIdentity: row.receipt?.materializationIdentity, localCleanupIdentity: row.receipt?.localCleanupIdentity,
+        cleanupTransport: row.receipt?.cleanupTransport, transferCleanupIdentity: row.receipt?.transferCleanupIdentity,
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }
@@ -729,9 +796,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const remoteCwd = cleanup?.remoteCwd ?? lease.metadata?.remoteCwd;
     if (typeof remoteCwd !== "string" || row.executionRoot !== path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", row.agentId, typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId))) return false;
     const paths = environment.driver === "sandbox" ? [row.executionRoot, sandboxTransferRoot(row, remoteCwd)] : [row.executionRoot];
-    const confined = row.receipt?.refreshConfinedCleanup === true;
     const result = await environmentRuntime.execute({ environment: environment as Environment, lease: lease as EnvironmentLease,
-      command: confined ? "sh" : "rm", args: confined ? ["-c", cleanupCommand(row, paths)] : ["-rf", "--", ...paths],
+      command: "sh", args: ["-c", cleanupCommand(row, paths)],
       cwd: remoteCwd, env: {}, timeoutMs: 15_000, bypassSession: true });
     return result.exitCode === 0 && !result.timedOut;
   }

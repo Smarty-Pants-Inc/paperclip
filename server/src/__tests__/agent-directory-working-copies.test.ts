@@ -1029,7 +1029,7 @@ describe("persistent agent directories", () => {
     await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
     await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId, provider: "daytona", providerLeaseId: "original-sandbox" });
     await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), location: `remote:${environmentId}`, executionRoot,
-      receipt: { ...copy.receipt, cleanup: { leaseId, remoteCwd } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      receipt: { ...copy.receipt, transferCleanupIdentity: "1:2:3", cleanup: { leaseId, remoteCwd } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
     copies = agentInstructionWorkingCopyService(db);
     await copies.recoverCaptured();
     const pending = (await copies.get(companyId, copy.runId))!;
@@ -1045,8 +1045,11 @@ describe("persistent agent directories", () => {
     }
     expect(execute).toHaveBeenCalledTimes(2);
     expect(execute).toHaveBeenLastCalledWith(expect.objectContaining({ lease: expect.objectContaining({ id: leaseId, providerLeaseId: "original-sandbox" }),
-      command: "rm", args: ["-rf", "--", executionRoot,
-        path.posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "agent-file-transfers", agentId, copy.runId)], bypassSession: true }));
+      command: "sh", args: ["-c", expect.stringContaining("Confined cleanup unavailable")], bypassSession: true }));
+    const cleanupCommand = execute.mock.lastCall![0].args[1] as string;
+    expect(cleanupCommand).toContain(executionRoot);
+    expect(cleanupCommand).toContain(path.posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "agent-file-transfers", agentId, copy.runId));
+    expect(cleanupCommand).toContain("O_NOFOLLOW");
     await copies.recoverCaptured();
     expect(execute).toHaveBeenCalledTimes(2);
     await copies.release(companyId, copy.runId);

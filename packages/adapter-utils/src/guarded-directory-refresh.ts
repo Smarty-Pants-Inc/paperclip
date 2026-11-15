@@ -55,7 +55,9 @@ if(!path.isAbsolute(root)||path.resolve(root)!==root||root.includes('\0')||forbi
 const identify=s=>[s.dev,s.ino,s.birthtimeNs].join(':');
 const stamp=s=>[s.dev,s.ino,s.mode,s.nlink,s.size,s.mtimeNs,s.ctimeNs].join(':');
 const dirFlags=fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW;
-const pinned=[];
+const pinned=[], pinnedFiles=[];
+let mutated=false;
+const changed=()=>{throw Object.assign(Error('Live refresh bytes changed'),{code:'LIVE_CHANGED'});};
 const pin=(name,parent)=>{
   const fd=fs.openSync(name,dirFlags), s=fs.fstatSync(fd,{bigint:true});
   if(!s.isDirectory()) throw Error('Unsafe refresh ancestor');
@@ -90,7 +92,7 @@ try {
   }
   // Preflight the complete existing tree before any write, including files
   // absent from the new canonical tree. Reject links instead of following them.
-  const observed=[]; const directories=new Map([['',rootFd]]);
+  const observed=[]; const files=new Map(); const directories=new Map([['',rootFd]]);
   const walk=(parent,relative)=>{
     for(const name of fs.readdirSync('/proc/self/fd/'+parent).sort()){
       verify(); const next=relative?relative+'/'+name:name, filename=at(parent,name);
@@ -106,20 +108,39 @@ try {
       }else{
         if(!s.isFile()||s.nlink!==1n||forbidden(root+'/'+next)) throw Error('Unsafe live refresh file');
         const file=fs.openSync(filename,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);
-        try{
+        pinnedFiles.push(file);
+        {
           if(stamp(fs.fstatSync(file,{bigint:true}))!==stamp(s)) throw Error('Live refresh file replaced');
           const hash=crypto.createHash('sha256'), buffer=Buffer.alloc(65536); let size=0;
           for(;;){const n=fs.readSync(file,buffer,0,buffer.length,null);if(!n)break;size+=n;if(size>Number(s.size))throw Error('Live refresh file grew');hash.update(buffer.subarray(0,n));}
           if(size!==Number(s.size)||stamp(fs.fstatSync(file,{bigint:true}))!==stamp(s)||stamp(fs.lstatSync(filename,{bigint:true}))!==stamp(s)) throw Error('Live refresh file changed');
-          observed.push([next,{kind:'file',mode:Number(s.mode),hash:hash.digest('hex')}]);
-        }finally{fs.closeSync(file);}
+          const digest=hash.digest('hex');
+          files.set(next,{fd:file,stamp:stamp(s),hash:digest,size:Number(s.size)});
+          observed.push([next,{kind:'file',mode:Number(s.mode),hash:digest}]);
+        }
       }
     }
   };
   walk(rootFd,''); verify();
   observed.sort(([a],[b])=>a<b?-1:a>b?1:0);
-  if(crypto.createHash('sha256').update(JSON.stringify(observed)).digest('hex')!==expected.digest) throw Error('Live refresh bytes changed');
+  if(crypto.createHash('sha256').update(JSON.stringify(observed)).digest('hex')!==expected.digest) changed();
   const parentOf=name=>directories.get(path.posix.dirname(name)==='.'?'':path.posix.dirname(name));
+  // Compare the *open* current inode with the identity captured at hash time.
+  // Re-hash immediately before each replace/unlink, not just at RPC preflight.
+  const checkFile=name=>{
+    const old=files.get(name), filename=at(parentOf(name),path.posix.basename(name));
+    if(!old){try{fs.lstatSync(filename);changed();}catch(e){if(e.code!=='ENOENT')throw e;}return;}
+    const file=old.fd;
+    try{
+      if(stamp(fs.fstatSync(file,{bigint:true}))!==old.stamp) changed();
+      const hash=crypto.createHash('sha256'), buffer=Buffer.alloc(65536); let offset=0;
+      for(;;){const n=fs.readSync(file,buffer,0,buffer.length,offset);if(!n)break;offset+=n;if(offset>old.size)changed();hash.update(buffer.subarray(0,n));}
+      if(hash.digest('hex')!==old.hash||stamp(fs.fstatSync(file,{bigint:true}))!==old.stamp||stamp(fs.lstatSync(filename,{bigint:true}))!==old.stamp) changed();
+    }catch(error){if(error.code==='ENOENT'||error.code==='ELOOP')changed();throw error;}
+  };
+  // Validate every checkpointed file before the first destination mutation, so
+  // an already-dirty later file cannot be discovered only after earlier writes.
+  for(const name of files.keys())checkFile(name);
   // Remove only obsolete/type-changing entries, deepest first, using pinned
   // parents. unlink/rmdir never follows a destination link.
   for(const [name,old] of [...observed].sort(([a],[b])=>b.split('/').length-a.split('/').length)){
@@ -127,24 +148,45 @@ try {
     if(keep)continue; verify(); const filename=at(parentOf(name),path.posix.basename(name));
     if(old.kind==='dir'){
       const removed=directories.get(name); const i=pinned.findIndex(p=>p.fd===removed);
-      if(i>=0){fs.closeSync(removed);pinned.splice(i,1);} directories.delete(name); fs.rmdirSync(filename);
-    }else fs.unlinkSync(filename);
+      try{fs.rmdirSync(filename);}catch(error){if(error.code==='ENOTEMPTY'||error.code==='EEXIST'||error.code==='ENOENT')changed();throw error;}
+      mutated=true;if(i>=0){fs.closeSync(removed);pinned.splice(i,1);} directories.delete(name);
+    }else {checkFile(name); mutated=true; fs.unlinkSync(filename); files.delete(name);}
   }
   for(const e of [...entries].sort((a,b)=>a.name.split('/').length-b.name.split('/').length)){
     verify(); const parent=parentOf(e.name); if(parent===undefined) throw Error('Missing refresh parent');
     const filename=at(parent,path.posix.basename(e.name));
     if(e.data===undefined){
-      if(!directories.has(e.name)){fs.mkdirSync(filename,{mode:0o700});const child=pin(filename,parent);directories.set(e.name,child);}
+      if(!directories.has(e.name)){
+        try{fs.mkdirSync(filename,{mode:0o700});}catch(error){if(error.code==='EEXIST')changed();throw error;}
+        mutated=true;const child=pin(filename,parent);directories.set(e.name,child);
+      }
     }else{
       const temporary=at(parent,'.refresh-'+crypto.randomUUID());
       const file=fs.openSync(temporary,fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
       try{
         verify(); const s=fs.fstatSync(file,{bigint:true}); if(!s.isFile()||s.nlink!==1n) throw Error('Unsafe refresh output');
         fs.writeFileSync(file,Buffer.from(e.data,'base64')); fs.fchmodSync(file,e.mode&0o777); fs.fsyncSync(file);
-        verify(); fs.renameSync(temporary,filename);
+        verify(); checkFile(e.name);
+        if(files.has(e.name)){
+          // The observed inode stays pinned through commit. Ordinary rename
+          // still has a last-check-to-syscall window; see the delivery notes.
+          mutated=true; fs.renameSync(temporary,filename);
+        }else{
+          // link is an atomic no-replace install on the same filesystem. A new
+          // destination arriving AFTER checkFile must never be overwritten.
+          try{fs.linkSync(temporary,filename);}catch(error){if(error.code==='EEXIST')changed();throw error;}
+          mutated=true;
+        }
       }finally{fs.closeSync(file);try{fs.unlinkSync(temporary);}catch(e){if(e.code!=='ENOENT')throw e;}}
     }
   }
   verify();
-} finally { for(const p of pinned.reverse())fs.closeSync(p.fd); }
+} catch(error) {
+  // Only this explicit no-destination-write proof permits normal collection.
+  // Any I/O failure, crash, or failure after a mutation remains INCOMPLETE.
+  if(error.code==='LIVE_CHANGED'){
+    process.stderr.write(mutated?'AGENT_FILES_REFRESH_CHANGED\n':'AGENT_FILES_REFRESH_UNMODIFIED\n');
+    process.exitCode=mutated?76:75;
+  }else throw error;
+} finally { for(const file of pinnedFiles)fs.closeSync(file);for(const p of pinned.reverse())fs.closeSync(p.fd); }
 `;

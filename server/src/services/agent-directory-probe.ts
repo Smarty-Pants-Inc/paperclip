@@ -185,6 +185,8 @@ for(const request of JSON.parse(process.argv[1])){
     }
     if(missing)continue;
     if(expected&&identity(fs.fstatSync(fd,{bigint:true}))!==expected)throw Error('Cleanup root replaced');
+    // Metadata-only observation for a later durable scratch-cleanup grant.
+    if(request.inspect===true){verify();process.stdout.write(identity(fs.fstatSync(fd,{bigint:true})));continue;}
     let count=0;
     const remove=(directory,relative='')=>{
       for(const name of fs.readdirSync('/proc/self/fd/'+directory)){
@@ -202,9 +204,9 @@ for(const request of JSON.parse(process.argv[1])){
 }
 `;
 
-export async function removeLocalAgentDirectoryConfined(root: string) {
+export async function removeLocalAgentDirectoryConfined(root: string, identity?: string) {
   await new Promise<void>((resolve, reject) => {
-    childProcess.execFile(process.execPath, ["-e", agentDirectoryConfinedCleanupProgram, JSON.stringify([{ root }])], {
+    childProcess.execFile(process.execPath, ["-e", agentDirectoryConfinedCleanupProgram, JSON.stringify([{ root, identity }])], {
       cwd: "/", env: {}, timeout: 15_000, maxBuffer: 4096, killSignal: "SIGKILL",
     }, error => { if (error) reject(error); else resolve(); });
   });

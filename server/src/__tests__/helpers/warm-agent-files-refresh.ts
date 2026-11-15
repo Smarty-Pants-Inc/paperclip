@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { execFile as execFileCallback } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -11,7 +10,27 @@ import { resolveManagedInstructionsRoot } from "../../services/agent-instruction
 import { buildNativeRuntimeContext } from "../../services/native-runtime/runtime-context.js";
 import { startEmbeddedPostgresTestDatabase } from "./embedded-postgres.js";
 
-const execFile = promisify(execFileCallback);
+// Exercise the runner's real stdin contract. Putting an RPC body in an env
+// variable fails at Linux's per-string exec limit, long before the byte bound.
+function execFile(command: string, args: string[], options: { cwd?: string; env: NodeJS.ProcessEnv; timeout?: number }, stdin?: string | null) {
+  return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(command, args, { ...options, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [], stderr: Buffer[] = [];
+    let size = 0;
+    const collect = (chunks: Buffer[]) => (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > 32 * 1024 * 1024) child.kill("SIGKILL");
+      else chunks.push(chunk);
+    };
+    child.stdout.on("data", collect(stdout)); child.stderr.on("data", collect(stderr));
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      const result = { stdout: Buffer.concat(stdout).toString(), stderr: Buffer.concat(stderr).toString() };
+      if (code === 0) resolve(result); else reject(Object.assign(new Error("runner command failed"), result, { code, signal }));
+    });
+    child.stdin.on("error", () => {}); child.stdin.end(stdin ?? undefined);
+  });
+}
 
 export async function warmAgentFilesRefreshFixture() {
   const home = await fs.mkdtemp(path.join(os.tmpdir(), "warm-agent-files-refresh-"));
@@ -44,12 +63,8 @@ export async function warmAgentFilesRefreshFixture() {
     execute: async input => {
       const startedAt = new Date().toISOString();
       const env = { ...process.env, ...input.env }, args = [...(input.args ?? [])];
-      if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
-        env.PAPERCLIP_TEST_STDIN = input.stdin;
-        args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
-      }
       try {
-        const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+        const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs }, input.stdin);
         return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
       } catch (error) {
         const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };

@@ -1601,7 +1601,19 @@ export async function prepareAdapterExecutionTargetRuntime(input: {
       cwd: target.kind === "remote" ? target.remoteCwd : path.dirname(destination), env: {}, stdin: payload,
       timeoutSec: input.timeoutSec ?? 30, graceSec: 1, onLog: async () => {},
     });
-    if (result.exitCode !== 0 || result.timedOut || result.signal) throw new Error(`Guarded directory refresh refused or failed: ${result.stderr.slice(-1024)}`);
+    if (result.exitCode !== 0 || result.timedOut || result.signal) {
+      const error = new Error(`Guarded directory refresh refused or failed: ${result.stderr.slice(-1024)}`);
+      // An interrupted/unknown transfer must never masquerade as this proof.
+      if (!result.timedOut && !result.signal) {
+        if (result.exitCode === 75 && result.stderr === "AGENT_FILES_REFRESH_UNMODIFIED\n") {
+          throw Object.assign(error, { code: "AGENT_FILES_REFRESH_UNMODIFIED" });
+        }
+        if (result.exitCode === 76 && result.stderr === "AGENT_FILES_REFRESH_CHANGED\n") {
+          throw Object.assign(error, { code: "AGENT_FILES_REFRESH_CHANGED" });
+        }
+      }
+      throw error;
+    }
     // The upload is finished. Build only the existing no-overwrite collector;
     // never fall through to a provider's destructive inbound staging path.
     return prepareAdapterExecutionTargetRuntime({ ...input, workspaceRefreshGuard: undefined,
