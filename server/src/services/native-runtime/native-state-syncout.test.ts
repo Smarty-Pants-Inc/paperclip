@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { logger } from "../../middleware/logger.js";
+import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import {
   readRemoteRunnerProviderState,
   readRemoteRunnerState,
@@ -56,6 +57,26 @@ describe("native session state syncOut", () => {
     for (const called of [runner, runnerStateRunner, providerRunner]) {
       expect(called.execute.mock.calls.flatMap(([request]) => request.args ?? []).join(" ")).not.toContain("base64 <");
     }
+  });
+
+  it("preserves a recovery probe diagnostic on syncOut and fallback reads", async () => {
+    const diagnostics: unknown[] = [];
+    for (const syncOut of [true, false]) {
+      const runner = {
+        execute: vi.fn(async () => ({ exitCode: 0, timedOut: true, stdout: "", stderr: "" })),
+        ...(syncOut ? { syncOut: vi.fn(async () => ({ operations: [] })) } : {}),
+      };
+      let thrown: unknown;
+      try {
+        await readRemoteRunnerState({ runner: runner as never, stateDirectory: "/private",
+          recoveryDeadline: Date.now() + 1 });
+      } catch (error) { thrown = error; }
+      diagnostics.push(readRemoteRunnerRecoveryError(thrown));
+    }
+    expect(diagnostics).toEqual([
+      { stage: "runner_state", reason: "probe_timeout" },
+      { stage: "runner_state", reason: "probe_timeout" },
+    ]);
   });
 
   it("removes its private staging directory after a parse failure", async () => {
