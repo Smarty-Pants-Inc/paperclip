@@ -1,4 +1,5 @@
 -- paperclip:migration-compat online_compatible: Inserts only a new permission key and append-only audit rows; old releases ignore the new key. No existing grants or schema are rewritten; ON CONFLICT skips existing grants without updating them.
+-- Fork migration: a merge-down renumbers this file (byte-identical SQL body) if upstream ships its own 0488.
 -- Add the independent, company-scoped runtime capability once; existing
 -- configure scopes and later operator revocations remain authoritative.
 WITH added AS (
