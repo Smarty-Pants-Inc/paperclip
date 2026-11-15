@@ -71,6 +71,35 @@ describe("IssueFiltersPopover", () => {
     act(() => root.unmount());
   });
 
+  it.each(["legacy", "streamlined", "refreshed"] as const)("offers Show hidden tasks under Visibility, off by default, in %s", presentation => {
+    const root = createRoot(container);
+    const onChange = vi.fn();
+    act(() => root.render(<IssueFiltersPopover enableAgentCreatedVisibilityFilter enableHiddenVisibilityFilter enableRoutineTasksFilter presentation={presentation} state={defaultIssueFilterState} onChange={onChange} activeFilterCount={0} />));
+    const visibility = container.querySelector('[data-filter-options="visibility"]');
+    expect(Array.from(visibility?.querySelectorAll("label") ?? []).map(label => label.textContent)).toEqual([
+      "Live runs only", "Show agent-created tasks", "Show hidden tasks", "Routine tasks",
+    ]);
+    const row = Array.from(visibility!.querySelectorAll("label")).find(label => label.textContent === "Show hidden tasks");
+    expect(row?.querySelector("input")?.checked).toBe(false);
+    act(() => row?.querySelector("input")?.click());
+    expect(onChange).toHaveBeenLastCalledWith({ showHiddenTasks: true });
+
+    act(() => root.render(<IssueFiltersPopover enableHiddenVisibilityFilter presentation={presentation} state={{ ...defaultIssueFilterState, showHiddenTasks: true }} onChange={onChange} activeFilterCount={1} />));
+    const checkedRow = Array.from(container.querySelectorAll('[data-filter-options="visibility"] label')).find(label => label.textContent === "Show hidden tasks");
+    expect(checkedRow?.querySelector("input")?.checked).toBe(true);
+    act(() => checkedRow?.querySelector("input")?.click());
+    expect(onChange).toHaveBeenLastCalledWith({ showHiddenTasks: false });
+    // Clear filters turns it off.
+    act(() => Array.from(container.querySelectorAll("button")).find(button => button.textContent === "Clear")?.click());
+    expect(onChange).toHaveBeenLastCalledWith(defaultIssueFilterState);
+    expect(defaultIssueFilterState.showHiddenTasks).toBe(false);
+
+    // Collections that do not opt in never show the row.
+    act(() => root.render(<IssueFiltersPopover enableAgentCreatedVisibilityFilter presentation={presentation} state={defaultIssueFilterState} onChange={onChange} activeFilterCount={0} />));
+    expect(container.textContent).not.toContain("Show hidden tasks");
+    act(() => root.unmount());
+  });
+
   it.each(["legacy", "streamlined", "refreshed"] as const)("hides unsupported live filters in %s", presentation => {
     const root = createRoot(container);
     const props = { presentation, enableLiveRunsFilter: false, state: defaultIssueFilterState, onChange: vi.fn(), activeFilterCount: 0 };

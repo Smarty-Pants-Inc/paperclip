@@ -7,8 +7,8 @@ import { TaskList, type TaskListItem } from "./TaskList";
 import { TooltipProvider } from "./ui/tooltip";
 import { readTaskListSortParams } from "../lib/task-list";
 
-vi.mock("./IssueRow", () => ({ IssueRow: ({ issue, leadingControl }: { issue: { id: string; title: string }; leadingControl?: ReactNode }) =>
-  <div data-issue-row-details={issue.id}>{leadingControl}<button>{issue.title}</button></div> }));
+vi.mock("./IssueRow", () => ({ IssueRow: ({ issue, leadingControl, titleSuffix }: { issue: { id: string; title: string }; leadingControl?: ReactNode; titleSuffix?: ReactNode }) =>
+  <div data-issue-row-details={issue.id}>{leadingControl}<button>{issue.title}</button>{titleSuffix}</div> }));
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
 const tasks = (count: number, parentId: string | null = null): TaskListItem[] => Array.from({ length: count }, (_, i) => ({
@@ -37,6 +37,16 @@ describe("TaskList progressive rendering", () => {
     expect(host.querySelector('[role="columnheader"][aria-sort="descending"]')).toBeNull();
     expect(host.querySelector('.task-list-sort-button[data-active]')).toBeNull();
     expect(host.querySelector('[data-slot="task-list-sort-direction"]')).toBeNull();
+  });
+  it("marks hidden tasks with a Hidden tag", async () => {
+    await render([
+      { issue: createIssue({ id: "hidden-task", title: "Hidden task", parentId: null, hiddenAt: new Date("2026-11-15T05:00:00Z") }) },
+      { issue: createIssue({ id: "shown-task", title: "Shown task", parentId: null, hiddenAt: null }) },
+    ]);
+    const badge = (id: string) => host.querySelector(`[data-issue-row-details="${id}"] [data-slot="hidden-task-badge"]`);
+    expect(badge("hidden-task")?.textContent).toBe("Hidden");
+    expect(badge("hidden-task")?.getAttribute("title")).toBe("This task is hidden");
+    expect(badge("shown-task")).toBeNull();
   });
   it("highlights Last updated only after selection and returns to the unhighlighted default when reset", async () => {
     const items = tasks(2).reverse();
