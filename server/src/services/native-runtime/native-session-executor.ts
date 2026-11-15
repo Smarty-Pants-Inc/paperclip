@@ -19459,9 +19459,21 @@ async function createRunnerdBackendWithinSessionClaim(
     // inheritance. Only the resolved agent env may select a configured home;
     // an ambient controller home must never replace session-owned Pi state.
     const configuredPiAgentDir = runnerEnvironment?.PI_CODING_AGENT_DIR;
-    effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = configuredPiAgentDir && posix.isAbsolute(configuredPiAgentDir)
-      ? configuredPiAgentDir
-      : posix.join(remoteRunnerFilesystemRoot ?? root, "pi-agent");
+    if (remoteTarget?.transport === "sandbox") {
+      // Pi defaults to ~/.pi/agent. Preserve that sandbox image snapshot when
+      // there is no absolute agent-configured override; never point at an empty
+      // runner directory instead.
+      if (configuredPiAgentDir && posix.isAbsolute(configuredPiAgentDir)) {
+        effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = configuredPiAgentDir;
+      } else {
+        delete effectiveRunnerEnvironment.PI_CODING_AGENT_DIR;
+      }
+    } else {
+      // Other targets retain their per-session Pi state directory.
+      effectiveRunnerEnvironment.PI_CODING_AGENT_DIR = configuredPiAgentDir && posix.isAbsolute(configuredPiAgentDir)
+        ? configuredPiAgentDir
+        : posix.join(remoteRunnerFilesystemRoot ?? root, "pi-agent");
+    }
   }
   const archiveContinuityState = async (previous?: PersistedNativeSession) => {
     if (hasRetainedWarmTransitionEvidence(root)) {

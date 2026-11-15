@@ -348,8 +348,8 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
       expect.soft(launch[digestKey], `${digestKey} must preserve the verified pack digest`).toBe(artifact.sha256);
     }
     expect.soft(launch.providerPackAuthorityDigest).toBe(manifest.digest);
-    expect.soft(launch.environment?.PI_CODING_AGENT_DIR, "sandbox must receive an absolute Pi agent directory").toEqual(expect.stringMatching(/^\/(?!$)/));
-    expect.soft(launch.environment?.PI_CODING_AGENT_DIR).not.toEqual(expect.stringContaining(root));
+    // No agent override: leave the remote image's ~/.pi/agent default intact.
+    expect.soft(launch.environment?.PI_CODING_AGENT_DIR).toBeUndefined();
     expect.soft(execute.mock.calls.some(([command]) => command.args?.[0] === "-e" && command.args?.[2] === remotePack),
       "server must verify the selected pack on the sandbox before launch").toBe(true);
     expect(launch.externallySandboxed).toBe(true);
@@ -404,7 +404,7 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     expect(launch.environment?.PI_CODING_AGENT_DIR).toBe(source === "agent absolute"
       ? agentDir
       : target === "remote sandbox" ? undefined : posix.join(launch.runnerFilesystemRoot ?? launch.stateDirectory!, "pi-agent"));
-    expect(launch.environment?.PI_CODING_AGENT_DIR).not.toBe(ambient);
+    expect(launch.environment?.PI_CODING_AGENT_DIR).not.toBe("/controller/.pi/agent");
     expect(runnerEnvironment.PI_CODING_AGENT_DIR).toBe(agentDir);
   });
 
