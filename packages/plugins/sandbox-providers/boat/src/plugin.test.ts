@@ -82,6 +82,47 @@ describe("Boat provider", () => {
     const receipt = await plugin.definition.onEnvironmentDestroyLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" });
     expect(fetch).toHaveBeenCalledTimes(2); expect(fetch.mock.calls[0][1]?.method).toBe("POST"); expect(fetch.mock.calls[1][0]).toBe("https://boat.dev/api/v1/sandboxes/bx_1"); expect(receipt).toEqual({ providerLeaseId: "bx_1", state: "stopped" });
   });
+  it("pins sandbox collection methods across destroy, release, and failed-create cleanup", async () => {
+    const rootCalls: Array<[string, string]> = [];
+    const stopFetch = vi.fn(async (input: string, init: RequestInit = {}) => {
+      const url = new URL(input), method = init.method ?? "GET";
+      rootCalls.push([url.pathname, method]);
+      return response(url.pathname.endsWith("/stop") ? { operation: { id: "stop_pin", status: "pending" } }
+        : { sandbox: { id: "bx_pin", state: "archiving", stop: { id: "stop_pin", status: "completed" } } }, url.pathname.endsWith("/stop") ? 202 : 200);
+    });
+    vi.stubGlobal("fetch", stopFetch);
+    expect(await plugin.definition.onEnvironmentDestroyLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_pin" }))
+      .toEqual({ providerLeaseId: "bx_pin", state: "stopped" });
+    await plugin.definition.onEnvironmentReleaseLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_pin" });
+    expect(rootCalls).toEqual([
+      ["/api/v1/sandboxes/bx_pin/stop", "POST"], ["/api/v1/sandboxes/bx_pin", "GET"],
+      ["/api/v1/sandboxes/bx_pin/stop", "POST"], ["/api/v1/sandboxes/bx_pin", "GET"],
+    ]);
+
+    const cleanupCalls: Array<[string, string]> = [];
+    let cleanupStopped = false;
+    vi.stubGlobal("fetch", vi.fn(async (input: string, init: RequestInit = {}) => {
+      const url = new URL(input), method = init.method ?? "GET";
+      cleanupCalls.push([url.pathname, method]);
+      if (url.pathname === "/api/v1/sandboxes") return response({ sandbox: { id: "bx_pin", state: "provisioning" } }, 202);
+      if (url.pathname === "/api/v1/sandboxes/bx_pin") {
+        if (method === "GET" && cleanupStopped) return response({ sandbox: { id: "bx_pin", state: "archived", stop: { id: "stop_pin", status: "completed" } } });
+        return response({ sandbox: { id: "bx_pin", state: "error" } });
+      }
+      if (url.pathname.endsWith("/stop")) { cleanupStopped = true; return response({ operation: { id: "stop_pin", status: "pending" } }, 202); }
+      return response({});
+    }));
+    await expect(plugin.definition.onEnvironmentAcquireLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", runId: "r", config: cfg }))
+      .rejects.toThrow("entered error");
+    expect(cleanupCalls).toEqual([
+      ["/api/v1/sandboxes", "POST"], ["/api/v1/sandboxes/bx_pin", "GET"],
+      ["/api/v1/sandboxes/bx_pin/stop", "POST"], ["/api/v1/sandboxes/bx_pin", "GET"],
+    ]);
+    const collectionCalls = [...rootCalls, ...cleanupCalls].filter(([path]) => /^\/api\/v1\/sandboxes\/[^/]+$/.test(path));
+    expect(collectionCalls.every(([, method]) => ["GET", "POST", "PATCH"].includes(method))).toBe(true);
+    expect([...rootCalls, ...cleanupCalls].some(([, method]) => method === "DELETE")).toBe(false);
+  });
+
   it("does not report stopped or destroyed when stop returns 404", async () => {
     const fetch = vi.fn().mockResolvedValueOnce(response({ error: "not_found" }, 404)); vi.stubGlobal("fetch", fetch);
     await expect(plugin.definition.onEnvironmentReleaseLease?.({ driverKey: "boat", companyId: "c", environmentId: "e", config: cfg, providerLeaseId: "bx_1" })).rejects.toThrow("failed (404)");

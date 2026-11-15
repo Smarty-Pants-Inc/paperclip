@@ -499,6 +499,9 @@ describe("Boat ready spare", () => {
     expect(f.inventory.find(item => item.id === original.id)?.state).toBe("archived");
     expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createdSpares);
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+    const methodPathSet = new Set(f.calls.map(call => `${call.method} ${call.url.pathname}`));
+    expect([...methodPathSet].some(item => item.startsWith("DELETE /api/v1/sandboxes/") && !item.includes("/commands/") && !item.includes("/files/"))).toBe(false);
+    expect([...methodPathSet]).toContain(`POST /api/v1/sandboxes/${original.id}/stop`);
 
     await emitActivity("issue.comment.created", company);
     await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createdSpares + 1), { timeout: 2_000 });
