@@ -4,7 +4,7 @@ import type { ComponentProps, ReactElement } from "react";
 import { act, forwardRef, useImperativeHandle, type ForwardedRef } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
@@ -62,6 +62,11 @@ const DIRECT_ADAPTER_TYPES = [
 ] as const;
 const editorCallbacks = vi.hoisted(() => ({ change: (_value: string) => {} }));
 const streamlinedState = vi.hoisted(() => ({ enabled: true }));
+// The person's reasoning display per agent, as saved on the agent's page.
+const reasoningPreferenceState = vi.hoisted(() => ({ byAgent: {} as Record<string, "fold" | "inline"> }));
+vi.mock("@/hooks/useAgentReasoningDisplay", () => ({
+  useAgentReasoningDisplayPreferences: () => reasoningPreferenceState.byAgent,
+}));
 
 vi.mock("@/components/transcript/useLiveRunTranscripts", () => ({
   useLiveRunTranscripts: ({ runs, logReadLimitBytes }: { runs: unknown[]; logReadLimitBytes?: number }) => {
@@ -134,6 +139,7 @@ let queryClient: QueryClient;
 
 beforeEach(() => {
   localStorage.clear();
+  reasoningPreferenceState.byAgent = {};
   transcriptState.transcriptByRun.clear();
   transcriptState.isInitialHydrating = false;
   transcriptState.hydratedRunIds = undefined;
@@ -865,13 +871,6 @@ it.each([true, false])("reveals saved conversation when initial history stalls (
   }
 });
 
-/** Declare an adapter's reasoning default for one test; restored when it ends. */
-function useAdapterReasoningDefault(adapterType: string, view: "inline" | "fold") {
-  const original = findUIAdapter(adapterType)!;
-  registerUIAdapter({ ...original, transcriptPresentation: { ...original.transcriptPresentation, liveReasoningView: view } });
-  onTestFinished(() => { registerUIAdapter(original); });
-}
-
 describe.each(["legacy", "native"] as const)("%s task history readiness", (runtimeMode) => {
   const retryRun = {
     runId: "scheduled-run",
@@ -1134,7 +1133,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   it.each(["running", "succeeded"])(
     "reveals durable comments together with a %s run's initial history",
     async (status) => {
-      useAdapterReasoningDefault(retryRun.adapterType, "inline");
+      reasoningPreferenceState.byAgent["agent-1"] = "inline";
       const props = {
         issueId: "issue-1",
         comments: [...createLongThreadComments(), {
@@ -1203,23 +1202,21 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     },
   );
 
-  // Reasoning display (look-only): the run adapter's
-  // transcriptPresentation.liveReasoningView > fold. There is no per-chat
-  // switch and the old per-browser localStorage choice decides nothing. Each
-  // case runs on this runtime's REAL renderer: native runs are
-  // `paperclip_runner` runs read from the native transcript store, so they
-  // render through TaskChatRunnerTurn.
+  // Reasoning display precedence: the person's saved choice for the run's
+  // agent (set on the agent's page) > the run adapter's
+  // transcriptPresentation.liveReasoningView > fold. The old per-browser
+  // localStorage choice and the per-chat switch are gone. Each case runs on
+  // this runtime's REAL renderer: native runs are `paperclip_runner` runs read
+  // from the native transcript store, so they render through TaskChatRunnerTurn.
   const reasoningThoughts = ["First adapter thought", "Second adapter thought"];
-  /** `"registered"` keeps the adapter exactly as the app registers it. */
+  // "registered" keeps the adapter exactly as the app registers it (no override).
   function reasoningRun(adapterDisplay?: "inline" | "fold" | "registered") {
     const adapterType = runtimeMode === "native" ? "paperclip_runner" : "codex_local";
     const original = findUIAdapter(adapterType)!;
-    if (adapterDisplay !== "registered") {
-      registerUIAdapter({
-        ...original,
-        transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
-      });
-    }
+    if (adapterDisplay !== "registered") registerUIAdapter({
+      ...original,
+      transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
+    });
     const runId = "adapter-default-run";
     const startedAt = "2026-08-25T18:00:00.000Z";
     const liveRun = {
@@ -1270,11 +1267,16 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     }
     expect(container.textContent).not.toContain("Private tool output");
   }
+
   it.each([
-    { adapterDisplay: "inline", expected: "inline" },
-    { adapterDisplay: "fold", expected: "fold" },
-    { adapterDisplay: undefined, expected: "fold" },
-  ] as const)("live run uses adapter default $adapterDisplay", async ({ adapterDisplay, expected }) => {
+    { adapterDisplay: "inline", preference: null, expected: "inline" },
+    { adapterDisplay: "fold", preference: null, expected: "fold" },
+    { adapterDisplay: "inline", preference: "fold", expected: "fold" },
+    { adapterDisplay: "fold", preference: "inline", expected: "inline" },
+    { adapterDisplay: undefined, preference: null, expected: "fold" },
+    { adapterDisplay: undefined, preference: "inline", expected: "inline" },
+  ] as const)("live run uses adapter default $adapterDisplay with the agent preference $preference", async ({ adapterDisplay, preference, expected }) => {
+    if (preference) reasoningPreferenceState.byAgent["agent-1"] = preference;
     const run = reasoningRun(adapterDisplay);
     try {
       render(<TaskChatThread {...run.live} />);
@@ -1330,31 +1332,94 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     }
   });
 
-  if (runtimeMode === "native") {
-    // Paul's agents are all paperclip_runner / pi_rpc. With the adapter as the
-    // app registers it (no override) and nothing clicked, a stale folded
-    // per-browser value included, the reasoning is inline live and settled.
-    it("shows a paperclip_runner run's reasoning inline with no click (registered adapter default)", async () => {
-      localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "fold");
-      const run = reasoningRun("registered");
-      try {
-        render(<TaskChatThread {...run.live} />);
-        await settleThreadLayout();
-        expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
-        expectReasoning("inline");
-        render(<TaskChatThread {...run.settled} />);
-        await settleThreadLayout();
-        expectReasoning("inline");
-        expect(container.querySelector(".tc-turn-fold")).toBeNull();
-        expect(container.textContent).toContain("Saved adapter reply");
-      } finally {
-        run.restore();
-      }
-    });
+  it("applies the person's agent preference live, after settle and after a cold remount", async () => {
+    reasoningPreferenceState.byAgent["agent-1"] = "inline";
+    const run = reasoningRun("fold");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      expect(container.querySelector(".tc-turn-fold")).toBeNull();
+      flushSync(() => root!.unmount());
+      root = createRoot(container);
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("inline");
+      expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
+    }
+  });
+
+  // Paul's Smarty agents are `paperclip_runner` with provider pi_rpc. With no
+  // stored choice for the agent, a native run's reasoning shows inline as the
+  // plain paragraphs (no fold, no click) through the adapter as registered.
+  function expectPlainInline() {
+    expectReasoning("inline");
+    for (const block of inlineReasoning()) {
+      expect(block.querySelector('[data-testid="task-chat-reasoning-plain"]')).not.toBeNull();
+      expect(block.querySelectorAll("ul, li, button").length).toBe(0);
+    }
+    expect(container.querySelector('[data-testid="task-chat-thinking-preview"]')).toBeNull();
+    expect(container.querySelector(".tc-turn-fold")).toBeNull();
   }
+  it.runIf(runtimeMode === "native")("shows a native paperclip_runner run's reasoning inline with no stored choice, live, settled and after a cold remount", async () => {
+    expect(reasoningPreferenceState.byAgent).toEqual({});
+    const run = reasoningRun("registered");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+      expectPlainInline();
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectPlainInline();
+      expect(container.textContent).toContain("Saved adapter reply");
+      flushSync(() => root!.unmount());
+      root = createRoot(container);
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectPlainInline();
+      expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
+    }
+  });
+
+  it.runIf(runtimeMode === "native")("still folds a native paperclip_runner run when the person stored Folded for the agent", async () => {
+    reasoningPreferenceState.byAgent["agent-1"] = "fold";
+    const run = reasoningRun("registered");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+    } finally {
+      run.restore();
+    }
+  });
+
+  it("does not apply one agent's preference to another agent's chat", async () => {
+    reasoningPreferenceState.byAgent["agent-2"] = "inline";
+    const run = reasoningRun("fold");
+    try {
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+    } finally {
+      run.restore();
+    }
+  });
 
   it.each(["fold", "inline"] as const)("shows %s reasoning in the live phase", async (display) => {
-    useAdapterReasoningDefault(runtimeMode === "native" ? "paperclip_runner" : "codex_local", display);
+    // Explicit choice: paperclip_runner now defaults to inline, so "fold" is
+    // the person's stored Folded here (codex_local folds either way).
+    reasoningPreferenceState.byAgent["agent-1"] = display;
     const liveRun = {
       id: "live-reasoning-run", runtimeMode, status: "running" as const, invocationSource: "issue" as const,
       triggerDetail: null, startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
