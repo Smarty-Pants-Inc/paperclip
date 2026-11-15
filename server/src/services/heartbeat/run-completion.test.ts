@@ -1211,7 +1211,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     "runner_harness_state_mismatch: resumed_unavailable",
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding",
-  ])("persists structured fresh-thread refusal without generic Retry (%s)", async code => {
+  ])("persists structured fresh-thread refusal through ordinary completion recovery (%s)", async code => {
+    // follow-Paperclip Cut B R7: typed refusals keep diagnostics but use ordinary completion and recovery owners.
     for (const phase of ["execute", "setup"]) {
       const f = await fixture({ runtimeMode: "native" }, `FR${randomUUID().slice(0, 6)}`);
       const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Structured refusal", assigneeAgentId: f.run.agentId }).returning();
@@ -1226,12 +1227,14 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: code,
         resultJson: { nativeFreshContinuationRefusal: { code, waitForTurn: true } } });
       expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)))[0])
-        .toMatchObject({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null, leaseOwner: null });
+        .toMatchObject({ phase: "observed", failureCode: null, nextAttemptAt: null, leaseOwner: null, resultId: null });
       expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
-      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
-      expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
-      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(expect.objectContaining({ id: f.run.id }),
-        expect.objectContaining({ suppressImmediateRecovery: true }));
+      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: f.run.id, errorCode: code }), expect.objectContaining({ id: f.agent.id }));
+      expect(f.deps.finalizeIssueCommentPolicy).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: f.run.id, errorCode: code }), expect.objectContaining({ id: f.agent.id }));
+      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.run.id }),
+        expect.objectContaining({ suppressImmediateRecovery: false }));
     }
   });
 
@@ -1242,6 +1245,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     "runner_harness_state_mismatch: backup_without_reusable_lease",
     "native_controller_recovery_missing_evidence:retained_sandbox_binding"])(
     "persists the precise prepare code through the server completion boundary (%s)", async refusalCode => {
+    // follow-Paperclip Cut B R7: precise prepare facts no longer suppress ordinary comment finalization or recovery.
     for (const phase of ["execute", "setup"]) {
       const f = await fixture({ runtimeMode: "native" }, `WC${randomUUID().slice(0, 6)}`);
       const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Wire refusal", assigneeAgentId: f.run.agentId }).returning();
@@ -1263,8 +1267,12 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         resultJson: { nativeFreshContinuationRefusal: { code,
           prepareRefusalCode: !refusalCode || refusalCode === "future_unknown" ? "provider_prepare_refused" : refusalCode } } });
       expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
-      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).not.toHaveBeenCalled();
-      expect(f.deps.finalizeIssueCommentPolicy).not.toHaveBeenCalled();
+      expect(f.deps.scheduleInteractionContinuationInfrastructureRetryIfEligible).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: f.run.id, errorCode: code }), expect.objectContaining({ id: f.agent.id }));
+      expect(f.deps.finalizeIssueCommentPolicy).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ id: f.run.id, errorCode: code }), expect.objectContaining({ id: f.agent.id }));
+      expect(f.deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ id: f.run.id }),
+        expect.objectContaining({ suppressImmediateRecovery: false }));
     }
   });
 
