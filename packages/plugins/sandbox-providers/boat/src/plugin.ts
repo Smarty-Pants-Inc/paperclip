@@ -3,8 +3,8 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
-import { ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySparePoolKey,
-  type ReadySpare, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
+import { ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySpareEnvironmentIds,
+  readySpareIdleMinutes, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -26,15 +26,90 @@ import type {
 
 type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
 const API = "https://boat.dev/api/v1";
+const SPARE_ACTIVITY_EVENTS = ["agent.run.started", "agent.run.finished", "agent.run.failed", "agent.run.cancelled",
+  "issue.comment.created", "issue.created", "issue.updated"] as const;
 const idleActivity = new BoatIdleActivity();
 const readySpares = new ReadySpareKeeper();
-const knownSparePools = new Map<string, { key: ReadySpareKey; ttlSeconds: number; desired: number; operations: ReadySpareOperations }>();
+type KnownSparePool = { key: ReadySpareKey; ttlSeconds: number; desired: number; idleMinutes: number; operations: ReadySpareOperations; idleStopped: boolean };
+type CompanySpareActivity = { lastActivityAt?: number; lastLeaseAcquiredAt?: number };
+const knownSparePools = new Map<string, KnownSparePool>();
+const companySpareActivity = new Map<string, CompanySpareActivity>();
+const companySpareActivityLoads = new Map<string, Promise<CompanySpareActivity>>();
+const companySpareActivityWrites = new Map<string, Promise<void>>();
+const SPARE_ACTIVITY_NAMESPACE = "boat-ready-spares";
+const SPARE_ACTIVITY_STATE_KEY = "company-activity";
+let activityUnsubscribers: Array<() => void> = [];
 let pluginContext: PluginContext | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
+function stateTimestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") { const parsed = Date.parse(value); if (Number.isFinite(parsed)) return parsed; }
+  return undefined;
+}
+async function loadCompanySpareActivity(companyId: string): Promise<CompanySpareActivity> {
+  const cached = companySpareActivity.get(companyId);
+  if (cached) return cached;
+  const pending = companySpareActivityLoads.get(companyId);
+  if (pending) return pending;
+  const work = (async () => {
+    let activity: CompanySpareActivity = {};
+    const stateClient = pluginContext?.state;
+    if (!stateClient?.get) {
+      companySpareActivity.set(companyId, activity);
+      return activity;
+    }
+    try {
+      const state = await stateClient.get({ scopeKind: "company", scopeId: companyId,
+        namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_ACTIVITY_STATE_KEY });
+      if (state && typeof state === "object" && !Array.isArray(state)) {
+        const value = state as Record<string, unknown>;
+        activity = { lastActivityAt: stateTimestamp(value.lastActivityAt), lastLeaseAcquiredAt: stateTimestamp(value.lastLeaseAcquiredAt) };
+      }
+    } catch {
+      duplexLogger?.warn("Boat spare activity state read failed", { companyId });
+    }
+    companySpareActivity.set(companyId, activity);
+    return activity;
+  })();
+  companySpareActivityLoads.set(companyId, work);
+  try { return await work; }
+  finally { if (companySpareActivityLoads.get(companyId) === work) companySpareActivityLoads.delete(companyId); }
+}
+async function persistCompanySpareActivity(companyId: string, activity: CompanySpareActivity): Promise<void> {
+  if (!pluginContext?.state?.set) return;
+  const previous = companySpareActivityWrites.get(companyId) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(() => pluginContext!.state.set({ scopeKind: "company", scopeId: companyId,
+    namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_ACTIVITY_STATE_KEY }, activity));
+  companySpareActivityWrites.set(companyId, write);
+  try { await write; }
+  catch { duplexLogger?.warn("Boat spare activity state write failed", { companyId }); }
+  finally { if (companySpareActivityWrites.get(companyId) === write) companySpareActivityWrites.delete(companyId); }
+}
+async function companySpareIsActive(companyId: string, idleMinutes: number): Promise<boolean> {
+  const activity = await loadCompanySpareActivity(companyId);
+  const latest = Math.max(activity.lastActivityAt ?? Number.NEGATIVE_INFINITY,
+    activity.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY);
+  return Number.isFinite(latest) && Date.now() - latest <= idleMinutes * 60_000;
+}
+async function recordCompanySpareActivity(companyId: string, leaseAcquired = false, waitForWake = false): Promise<void> {
+  if (!companyId) return;
+  const previous = await loadCompanySpareActivity(companyId);
+  const now = Date.now();
+  const activity: CompanySpareActivity = {
+    lastActivityAt: Math.max(previous.lastActivityAt ?? Number.NEGATIVE_INFINITY, now),
+    ...(leaseAcquired ? { lastLeaseAcquiredAt: Math.max(previous.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY, now) }
+      : previous.lastLeaseAcquiredAt !== undefined ? { lastLeaseAcquiredAt: previous.lastLeaseAcquiredAt } : {}),
+  };
+  companySpareActivity.set(companyId, activity);
+  await persistCompanySpareActivity(companyId, activity);
+  const wake = wakeCompanySparePools(companyId);
+  if (waitForWake) await wake;
+  else void wake.catch(() => undefined);
+}
 function parse(raw: Record<string, unknown>): Config {
   return {
     apiKey: typeof raw.apiKey === "string" ? raw.apiKey.trim() : "",
@@ -568,7 +643,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     },
   };
 }
-function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSeconds: number, operations: ReadySpareOperations): void {
+function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSeconds: number, operations: ReadySpareOperations, idleMinutes = readySpareIdleMinutes(undefined)): void {
   const poolId = readySparePoolKey(key);
   for (const [oldPoolId, oldPool] of knownSparePools) {
     if (oldPool.key.companyId !== key.companyId || oldPool.key.environmentId !== key.environmentId
@@ -582,17 +657,48 @@ function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSecond
     });
     knownSparePools.set(oldPoolId, oldPool);
   }
-  knownSparePools.set(poolId, { key, ttlSeconds, desired, operations });
+  knownSparePools.set(poolId, { key, ttlSeconds, desired, idleMinutes, operations, idleStopped: false });
   void readySpares.reconcile(key, desired, operations).catch(() => {
     duplexLogger?.warn("Boat ready spare reconciliation failed", { companyId: key.companyId, environmentId: key.environmentId });
   });
 }
+async function wakeCompanySparePools(companyId: string): Promise<void> {
+  const work: Promise<void>[] = [];
+  for (const pool of knownSparePools.values()) {
+    if (pool.key.companyId !== companyId || pool.desired <= 0) continue;
+    pool.idleStopped = false;
+    work.push(readySpares.reconcile(pool.key, pool.desired, pool.operations).catch(error => {
+      duplexLogger?.warn("Boat ready spare wake reconciliation failed", { companyId, environmentId: pool.key.environmentId });
+      throw error;
+    }));
+  }
+  await Promise.all(work);
+}
 async function maintainReadySpares(): Promise<void> {
   if (spareMaintenanceWork) return spareMaintenanceWork;
   const work = (async () => {
-    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => knownSparePools.get(readySparePoolKey(key))?.operations);
-    for (const pool of knownSparePools.values()) {
-      if (pool.desired !== readySpares.ready(pool.key).length) await readySpares.reconcile(pool.key, pool.desired, pool.operations);
+    const activeByPool = new Map<string, boolean>();
+    for (const [poolId, pool] of knownSparePools) {
+      activeByPool.set(poolId, await companySpareIsActive(pool.key.companyId, pool.idleMinutes));
+    }
+    await readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => {
+      const poolId = readySparePoolKey(key);
+      return activeByPool.get(poolId) ? knownSparePools.get(poolId)?.operations : undefined;
+    });
+    for (const [poolId, pool] of knownSparePools) {
+      const active = activeByPool.get(poolId) === true;
+      if (!active) {
+        if (!pool.idleStopped) {
+          await readySpares.reconcile(pool.key, 0, pool.operations);
+          pool.idleStopped = true;
+        }
+        continue;
+      }
+      const wasIdleStopped = pool.idleStopped;
+      pool.idleStopped = false;
+      if (wasIdleStopped || pool.desired !== readySpares.ready(pool.key).length) {
+        await readySpares.reconcile(pool.key, pool.desired, pool.operations);
+      }
     }
   })();
   spareMaintenanceWork = work;
@@ -648,6 +754,16 @@ async function finishAcquisition(
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
+    for (const unsubscribe of activityUnsubscribers) unsubscribe();
+    activityUnsubscribers = [];
+    if (ctx.events?.on) {
+      for (const eventType of SPARE_ACTIVITY_EVENTS) {
+        activityUnsubscribers.push(ctx.events.on(eventType, async event => {
+          if (!event.companyId) return;
+          await recordCompanySpareActivity(event.companyId, false, true);
+        }));
+      }
+    }
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = setInterval(() => { void maintainReadySpares().catch(() => undefined); }, 15_000);
     spareRefreshTimer.unref?.();
@@ -656,13 +772,24 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   multiCompanyConfig: true,
   async onConfigChanged(newConfig, context) {
     // Company/global plugin config is NOT the environment's effective config.
-    // Company spare count is instance config; environment lease config remains
+    // Company spare policy is instance config; environment lease config remains
     // the source for Boat credentials and create-shaping fields.
     const companyId = context?.companyId;
     if (!companyId) return;
-    const desired = readySpareCount(newConfig);
+    const configuredCount = readySpareCount(newConfig);
+    const environments = readySpareEnvironmentIds(newConfig);
+    const idleMinutes = readySpareIdleMinutes(newConfig);
+    const active = await companySpareIsActive(companyId, idleMinutes);
     for (const pool of knownSparePools.values()) {
-      if (pool.key.companyId === companyId) queueSpareReconciliation(pool.key, desired, pool.ttlSeconds, pool.operations);
+      if (pool.key.companyId !== companyId) continue;
+      pool.desired = environments.includes(pool.key.environmentId) ? configuredCount : 0;
+      pool.idleMinutes = idleMinutes;
+      try {
+        await readySpares.reconcile(pool.key, active ? pool.desired : 0, pool.operations);
+        pool.idleStopped = !active;
+      } catch {
+        duplexLogger?.warn("Boat ready spare config reconciliation failed", { companyId, environmentId: pool.key.environmentId });
+      }
     }
   },
   onDuplexChannelOpen: params => duplexChannels.open(params),
@@ -683,14 +810,18 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } catch { return { status: "error", message: "Boat SSH guardian status probe failed." }; }
   },
   async onShutdown() {
+    for (const unsubscribe of activityUnsubscribers) unsubscribe();
+    activityUnsubscribers = [];
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
     try {
       if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
       await readySpares.drain();
+      await Promise.all([...companySpareActivityWrites.values()].map(write => write.catch(() => undefined)));
     } finally {
       try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
     }
+    knownSparePools.clear(); companySpareActivity.clear(); companySpareActivityLoads.clear(); companySpareActivityWrites.clear();
     duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
   },
   async onIdleDrain() { return idleActivity.present() || duplexChannels.present() || readySpares.present() ? "present" : "none"; },
@@ -727,6 +858,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     catch (e) { return { ok: false, summary: "Boat API probe failed.", metadata: { provider: "boat", error: e instanceof Error ? e.message : String(e) } }; }
   },
   async onEnvironmentAcquireLease(params: PluginEnvironmentAcquireLeaseParams): Promise<PluginEnvironmentLease> {
+    await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config);
     const snapshotError = snapshotConfigError(params.config);
     if (snapshotError) throw new Error(snapshotError);
@@ -749,10 +881,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     const snapshot = c.snapshot === undefined ? undefined : await resolveSnapshotForCreate(c);
     const from = snapshot?.name ?? c.from;
-    let desiredSpares = 0, hasSpareSetting = false;
+    let desiredSpares = 0, spareIdleMinutes = readySpareIdleMinutes(undefined), hasSpareSetting = false;
     if (pluginContext?.config && typeof pluginContext.config.get === "function") {
-      try { desiredSpares = readySpareCount(await pluginContext.config.get(params.companyId)); hasSpareSetting = true; }
-      catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
+      try {
+        const companyConfig = await pluginContext.config.get(params.companyId);
+        desiredSpares = readySpareEnvironmentIds(companyConfig).includes(params.environmentId) ? readySpareCount(companyConfig) : 0;
+        spareIdleMinutes = readySpareIdleMinutes(companyConfig);
+        hasSpareSetting = true;
+      } catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
     const spareHash = readySpareHash(c, ttl, from, snapshot ?? pinnedIdentity);
     const spareKey: ReadySpareKey = { companyId: params.companyId, environmentId: params.environmentId, configHash: spareHash };
@@ -778,13 +914,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
           const ready = observation ?? { id, state: claimedSpare.state, name: claimName, labels: claimedSpare.labels };
           // Immediately begin the replacement while shared lease preparation
           // runs; no claims can see the transferred ID again.
-          queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+          queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations, spareIdleMinutes);
           return await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
         }
       }
       if (spareOperations) {
-        if (adoptionTask) void adoptionTask.then(() => queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations));
-        else queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+        if (adoptionTask) void adoptionTask.then(() => queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations, spareIdleMinutes));
+        else queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations, spareIdleMinutes);
       }
       const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
       const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
@@ -849,6 +985,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { providerLeaseId: params.providerLeaseId, state, stoppedAt, lastRebootAt: sandbox.lastReboot?.at ?? null, observedAt };
   },
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
+    await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config), id = params.providerLeaseId;
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     await sshCarrier.invalidate({ ...params, providerLeaseId: id });
@@ -930,6 +1067,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {
+    await recordCompanySpareActivity(params.companyId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config); const id = params.providerLeaseId;
     await duplexChannels.suspend({ ...params, providerLeaseId: id });

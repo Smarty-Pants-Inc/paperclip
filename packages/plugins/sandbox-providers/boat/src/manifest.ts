@@ -8,11 +8,13 @@ const manifest: PaperclipPluginManifestV1 = {
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
   categories: ["automation"],
-  capabilities: ["environment.drivers.register"],
+  capabilities: ["environment.drivers.register", "events.subscribe", "plugin.state.read", "plugin.state.write"],
   instanceConfigSchema: {
     type: "object",
     properties: {
-      spares: { type: "integer", minimum: 0, maximum: 3, default: 0, title: "Warm Boat spares", description: "Keep this many running, pre-warmed Boat sandboxes per environment (0 disables the spare pool)." },
+      spares: { type: "integer", minimum: 0, maximum: 3, default: 0, title: "Warm Boat spares", description: "Keep this many running, pre-warmed Boat sandboxes per listed environment (0 disables the spare pool)." },
+      spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60, title: "Spare idle timeout (minutes)", description: "Stop company spares after this long with no agent or user activity." },
+      spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true, default: [], title: "Spare environments", description: "Environment IDs allowed to hold warm spares. Empty disables spare creation.", items: { type: "string", minLength: 1 } },
     },
   },
   entrypoints: { worker: "./dist/worker.js" },

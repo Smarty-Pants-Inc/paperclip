@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
-  MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount,
-  readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
+  MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount, readySpareEnvironmentIds,
+  readySpareIdleMinutes, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
 } from "./ready-spares.js";
 
 const start = Date.parse("2026-11-15T00:00:00.000Z");
@@ -40,6 +40,18 @@ describe("Boat ready spare keeper", () => {
     expect(readySparePoolKey(key)).not.toBe(readySparePoolKey({ ...key, companyId: "company-b" }));
     expect(readySparePoolKey(key)).not.toBe(readySparePoolKey({ ...key, environmentId: "env-b" }));
     expect(readySparePoolKey(key)).not.toBe(readySparePoolKey({ ...key, configHash: "different" }));
+  });
+
+  it("requires an explicit bounded environment allowlist and defaults the idle timeout safely", () => {
+    expect(readySpareEnvironmentIds({ spares: 1 })).toEqual([]);
+    expect(readySpareEnvironmentIds({ spareEnvironmentIds: [] })).toEqual([]);
+    expect(readySpareEnvironmentIds({ spareEnvironmentIds: ["env-a", " env-b "] })).toEqual(["env-a", "env-b"]);
+    expect(readySpareEnvironmentIds({ spareEnvironmentIds: ["env-a", "env-a"] })).toEqual([]);
+    expect(readySpareEnvironmentIds({ spareEnvironmentIds: Array.from({ length: 11 }, (_, i) => `env-${i}`) })).toEqual([]);
+    expect(readySpareIdleMinutes({})).toBe(60);
+    expect(readySpareIdleMinutes({ spareIdleMinutes: 15 })).toBe(15);
+    expect(readySpareIdleMinutes({ spareIdleMinutes: 14 })).toBe(60);
+    expect(readySpareIdleMinutes({ spareIdleMinutes: 1441 })).toBe(60);
   });
 
   it("adopts only exact company/environment/config warmed running spares; stops stale owned spares", async () => {

@@ -3,6 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 export const MAX_READY_SPARES = 3;
 export const MAX_READY_SPARE_CREATES_PER_HOUR = 12;
 export const READY_SPARE_TTL_SECONDS = 1_800;
+export const DEFAULT_READY_SPARE_IDLE_MINUTES = 60;
+export const MIN_READY_SPARE_IDLE_MINUTES = 15;
+export const MAX_READY_SPARE_IDLE_MINUTES = 1_440;
+export const MAX_READY_SPARE_ENVIRONMENTS = 10;
 
 export type ReadySpareKey = {
   companyId: string;
@@ -54,6 +58,23 @@ export function readySpareCount(config: unknown): number {
   if (!config || typeof config !== "object" || Array.isArray(config)) return 0;
   const count = (config as Record<string, unknown>).spares;
   return Number.isInteger(count) && Number(count) >= 0 && Number(count) <= MAX_READY_SPARES ? Number(count) : 0;
+}
+
+export function readySpareIdleMinutes(config: unknown): number {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return DEFAULT_READY_SPARE_IDLE_MINUTES;
+  const minutes = (config as Record<string, unknown>).spareIdleMinutes;
+  return Number.isInteger(minutes) && Number(minutes) >= MIN_READY_SPARE_IDLE_MINUTES && Number(minutes) <= MAX_READY_SPARE_IDLE_MINUTES
+    ? Number(minutes) : DEFAULT_READY_SPARE_IDLE_MINUTES;
+}
+
+/** Empty, absent, or malformed environment scope is deliberately safe: no spare environments. */
+export function readySpareEnvironmentIds(config: unknown): string[] {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return [];
+  const ids = (config as Record<string, unknown>).spareEnvironmentIds;
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_READY_SPARE_ENVIRONMENTS) return [];
+  const normalized = ids.map(id => typeof id === "string" ? id.trim() : "");
+  if (normalized.some(id => !id) || new Set(normalized).size !== normalized.length) return [];
+  return normalized;
 }
 
 function isActiveState(state: string): boolean {

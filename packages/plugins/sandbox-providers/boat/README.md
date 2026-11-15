@@ -1,15 +1,30 @@
-# Boat sandbox provider 0.1.16-spare.1
+# Boat sandbox provider 0.1.16-spare (unreleased)
 
-## Ready spare pool (optional; default off)
+## Ready spare pool
 
-Set the Boat plugin's company-scoped instance setting `spares` to an integer from
-0 through 3. It defaults to 0. The count applies independently to each Boat
-environment used by that company; setting it to 0 or lowering it retires surplus
-spares with Boat's confirmed `POST /sandboxes/{id}/stop` path. This plugin has no
-user-presence/activity window: once an environment has been acquired, its
-configured pool is kept warm until the setting is lowered or the plugin stops.
-A never-used environment is first discovered at its first acquire. Configure the
-setting in plugin settings; no environment edit is needed.
+The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),
+`spareEnvironmentIds` (up to 10 environment IDs, default empty), and
+`spareIdleMinutes` (15–1440, default 60). Empty or absent `spareEnvironmentIds`
+means **no spares**. For each listed environment, `spares` is the number of
+running, pre-warmed Boat sandboxes to keep ready. Configure these settings in
+plugin settings; no environment edit is needed.
+
+A company is active after any lease acquire, resume or release handled by this
+plugin, or any `agent.run.started`, `agent.run.finished`, `agent.run.failed`,
+`agent.run.cancelled`, `issue.comment.created`, `issue.created` or `issue.updated`
+event for that company. The plugin records company `lastActivityAt` in its
+company-scoped plugin state. When `now - lastActivityAt` is greater than
+`spareIdleMinutes`, all that company's ready spares are stopped through Boat's
+confirmed `POST /sandboxes/{id}/stop` path (never deleted), spare TTL refresh
+stops, and no replacements are created. The next activity wakes the listed
+environment pools through the normal refill path. On restart, an unknown activity
+state is considered active only when the persisted last lease acquire is within
+the configured idle window; otherwise it is idle.
+
+A spare's Boat auto-stop TTL is renewed while its company is active, so a warm
+spare does not silently go cold. Once idle, no renewal occurs; confirmed stop is
+attempted and Boat's existing TTL remains the crash/outage bound. A never-used
+environment is first discovered at its first acquire.
 
 The keeper creates each spare from the same environment create body as an
 ordinary lease: configured type/size, effective Boat TTL, resolved snapshot or
