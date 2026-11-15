@@ -46,7 +46,7 @@ export function IssueFilterPanel({ state, onChange, activeFilterCount, agents = 
         </FilterGroup>
         {enableLiveRunsFilter || enableAgentCreatedVisibilityFilter || enableHiddenVisibilityFilter || enableRoutineTasksFilter ? <FilterGroup title="Visibility" optionsKey="visibility">
           {enableLiveRunsFilter ? <FilterRow label="Live runs only" checked={state.liveOnly === true} onToggle={() => onChange({ liveOnly: !state.liveOnly })} /> : null}
-          {enableAgentCreatedVisibilityFilter ? <FilterRow label="Show agent-created tasks" checked={state.showAgentCreatedTasks} onToggle={() => onChange({ showAgentCreatedTasks: !state.showAgentCreatedTasks })} /> : null}
+          {enableAgentCreatedVisibilityFilter ? <FilterRow label="Show agent-created tasks" checked={state.showAgentCreatedTasks} onToggle={() => onChange({ showAgentCreatedTasks: !state.showAgentCreatedTasks, showAgentCreatedTasksExplicit: true })} /> : null}
           {enableHiddenVisibilityFilter ? <FilterRow label="Show hidden tasks" checked={state.showHiddenTasks === true} onToggle={() => onChange({ showHiddenTasks: !state.showHiddenTasks })} /> : null}
           {enableRoutineTasksFilter ? <FilterRow label="Routine tasks" checked={state.routineTasksOnly === true} onToggle={() => onChange({ routineTasksOnly: !state.routineTasksOnly })} /> : null}
         </FilterGroup> : null}

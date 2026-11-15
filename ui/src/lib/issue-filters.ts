@@ -39,6 +39,12 @@ export type IssueFilterState = {
   showAgentCreatedTasks: boolean;
   /** Include hidden tasks so they can be found and un-hidden. Off by default. */
   showHiddenTasks?: boolean;
+  /**
+   * True only after the person toggles Show agent-created tasks. Without it a
+   * stored `showAgentCreatedTasks` (from before the instance default existed)
+   * is not a choice, and the list uses the instance default instead.
+   */
+  showAgentCreatedTasksExplicit?: boolean;
   routineTasksOnly?: boolean;
 };
 
@@ -54,6 +60,9 @@ export const defaultIssueFilterState: IssueFilterState = {
   externalObjectStatuses: [],
   showAgentCreatedTasks: false,
   showHiddenTasks: false,
+  // Present (as undefined) so merging the defaults, as Clear filters does,
+  // also drops an explicit choice.
+  showAgentCreatedTasksExplicit: undefined,
   routineTasksOnly: false,
 };
 
@@ -124,8 +133,22 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
     externalObjectStatuses: normalizeIssueFilterValueArray(candidate.externalObjectStatuses),
     showAgentCreatedTasks: candidate.showAgentCreatedTasks === true,
     showHiddenTasks: candidate.showHiddenTasks === true,
+    showAgentCreatedTasksExplicit: candidate.showAgentCreatedTasksExplicit === true ? true : undefined,
     routineTasksOnly: candidate.routineTasksOnly === true,
   };
+}
+
+/**
+ * Apply the instance default (General setting
+ * `taskListsShowAgentCreatedByDefault`) unless the person chose explicitly.
+ */
+export function resolveAgentCreatedTasksDefault<
+  T extends Pick<IssueFilterState, "showAgentCreatedTasks" | "showAgentCreatedTasksExplicit">,
+>(state: T, instanceDefault: boolean): T {
+  const showAgentCreatedTasks = state.showAgentCreatedTasksExplicit === true
+    ? state.showAgentCreatedTasks === true
+    : instanceDefault;
+  return state.showAgentCreatedTasks === showAgentCreatedTasks ? state : { ...state, showAgentCreatedTasks };
 }
 
 export function toggleIssueFilterValue(values: string[], value: string): string[] {
@@ -301,6 +324,7 @@ export function applyIssueFilters(
 export function countActiveIssueFilters(
   state: IssueFilterState,
   enableAgentCreatedVisibilityFilter = false,
+  agentCreatedTasksDefault = false,
 ): number {
   let count = 0;
   if (state.statuses.length > 0) count += 1;
@@ -313,7 +337,7 @@ export function countActiveIssueFilters(
   if (state.liveOnly) count += 1;
   if (state.routineTasksOnly) count += 1;
   if (state.externalObjectStatuses.length > 0) count += 1;
-  if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks) count += 1;
+  if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks !== agentCreatedTasksDefault) count += 1;
   if (state.showHiddenTasks) count += 1;
   return count;
 }

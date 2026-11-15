@@ -94,6 +94,7 @@ Daytona snapshot for future leases.
   their management endpoints with `403 settings_operator_managed`; hiding
   `instance.experimental` floors every experimental toggle write.
 - Any Instance → General section: `instance.general.censorUsernameInLogs`,
+  `instance.general.taskListsShowAgentCreatedByDefault`,
   `instance.general.backupRetention`,
   `instance.general.feedbackDataSharingPreference` (each also rejects
   value-changing writes via `PATCH /api/instance/settings/general`), plus the

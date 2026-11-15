@@ -3,7 +3,7 @@ import { ISSUE_SORT_FIELDS, sortIssues, type IssueSort, type IssueSortField } fr
 import { saveTaskCollectionPreferences } from "../lib/task-collection-preferences";
 import { useWarmTaskDetailCode } from "@/hooks/useWarmTaskDetailCode";
 import { topRenderedNavEntryRefs, usePreloadTaskChats } from "../hooks/usePreloadTaskChats";
-import { useShowAgentCreatedTasks, useShowHiddenTasks } from "../hooks/useShowAgentCreatedTasks";
+import { useAgentCreatedTasksDefault, useShowAgentCreatedTasks, useShowHiddenTasks } from "../hooks/useShowAgentCreatedTasks";
 import { HiddenTaskBadge } from "./HiddenTaskBadge";
 import { useIssueHierarchyContext } from "../hooks/useIssueHierarchyContext";
 import { includeIssueHierarchyContext } from "../lib/issue-hierarchy-context";
@@ -767,13 +767,17 @@ export function IssuesList({
   const [savedViewState, setViewState] = useState<IssueViewState>(() =>
     getInitialWorkspaceViewState(scopedKey, initialAssignees, initialWorkspaces, defaultSortField),
   );
+  const showAgentCreatedTasks = useShowAgentCreatedTasks(selectedCompanyId, viewStateKey);
+  const agentCreatedTasksDefault = useAgentCreatedTasksDefault();
   // The Tasks URL owns this filter; other collections keep their saved state.
+  // Agent-created visibility follows the fetching owner: the person's
+  // explicit choice, else the instance default.
   const viewState = useMemo(() => ({
     ...savedViewState,
     ...sort,
     ...(routineTasksOnly === undefined ? {} : { routineTasksOnly }),
-  }), [savedViewState, sort, routineTasksOnly]);
-  const showAgentCreatedTasks = useShowAgentCreatedTasks(selectedCompanyId, viewStateKey);
+    ...(enableAgentCreatedVisibilityFilter ? { showAgentCreatedTasks } : {}),
+  }), [savedViewState, sort, routineTasksOnly, enableAgentCreatedVisibilityFilter, showAgentCreatedTasks]);
   useEffect(() => {
     if (!enableAgentCreatedVisibilityFilter) return;
     setViewState((previous) => previous.showAgentCreatedTasks === showAgentCreatedTasks
@@ -1234,7 +1238,7 @@ export function IssuesList({
     enabled: !!selectedCompanyId,
   });
 
-  const activeFilterCount = countActiveIssueFilters(viewState, enableAgentCreatedVisibilityFilter);
+  const activeFilterCount = countActiveIssueFilters(viewState, enableAgentCreatedVisibilityFilter, agentCreatedTasksDefault);
   const boardHighVolume = viewState.viewMode === "board" && filtered.length > KANBAN_BOARD_HIGH_VOLUME_THRESHOLD;
   const boardCompactCards =
     viewState.boardCardDensity === "compact"

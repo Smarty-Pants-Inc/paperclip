@@ -33,6 +33,11 @@ export interface InstanceGeneralSettings {
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
   /**
+   * Task and project lists show agent-created tasks by default. A person's
+   * explicit choice in a list's Filters menu still wins. Default `false`.
+   */
+  taskListsShowAgentCreatedByDefault: boolean;
+  /**
    * Execution policy. Absent/`"any"` = unrestricted; `"kubernetes"` forces the
    * Kubernetes sandbox provider and denies local/ssh execution.
    */

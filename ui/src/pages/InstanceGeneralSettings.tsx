@@ -80,16 +80,19 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
   }
 
   const censorUsernameInLogs = generalQuery.data?.censorUsernameInLogs === true;
+  const taskListsShowAgentCreatedByDefault = generalQuery.data?.taskListsShowAgentCreatedByDefault === true;
   const feedbackDataSharingPreference = generalQuery.data?.feedbackDataSharingPreference ?? "prompt";
   const backupRetention: BackupRetentionPolicy = generalQuery.data?.backupRetention ?? DEFAULT_BACKUP_RETENTION;
   const hiddenSettings = new Set(healthQuery.data?.hiddenSettings ?? []);
   const showDeploymentStatus = !hiddenSettings.has("instance.general.deploymentStatus");
   const showCensorUsernameInLogs = !hiddenSettings.has("instance.general.censorUsernameInLogs");
+  const showTaskListsAgentCreatedDefault = !hiddenSettings.has("instance.general.taskListsShowAgentCreatedByDefault");
   const showBackupRetention = !hiddenSettings.has("instance.general.backupRetention");
   const showFeedbackDataSharing = !hiddenSettings.has("instance.general.feedbackDataSharingPreference");
   const showSignOut = !hiddenSettings.has("instance.general.signOut");
   const visibleTopics = [
     ...(showCensorUsernameInLogs ? ["log display"] : []),
+    ...(showTaskListsAgentCreatedDefault ? ["task lists"] : []),
     ...(showBackupRetention ? ["backup retention"] : []),
     ...(showFeedbackDataSharing ? ["data sharing"] : []),
   ];
@@ -172,6 +175,29 @@ export function InstanceGeneralSettings({ embedded = false }: { embedded?: boole
             onCheckedChange={() => updateGeneralMutation.mutate({ censorUsernameInLogs: !censorUsernameInLogs })}
             disabled={updateGeneralMutation.isPending || signOutMutation.isPending}
             aria-label="Toggle username log censoring"
+          />
+        </div>
+      </section>
+      )}
+
+      {showTaskListsAgentCreatedDefault && (
+      <section>
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1.5">
+            <h2 className="text-sm font-semibold">Show agent-created tasks in task lists by default</h2>
+            <p className="max-w-2xl text-sm text-muted-foreground">
+              Task and project lists include tasks that agents, routines and other automation created, without
+              anyone opening Filters. A person who picks Show agent-created tasks in a list keeps their own
+              choice. This is off by default.
+            </p>
+          </div>
+          <ToggleSwitch
+            checked={taskListsShowAgentCreatedByDefault}
+            onCheckedChange={() => updateGeneralMutation.mutate({
+              taskListsShowAgentCreatedByDefault: !taskListsShowAgentCreatedByDefault,
+            })}
+            disabled={updateGeneralMutation.isPending || signOutMutation.isPending}
+            aria-label="Toggle showing agent-created tasks in task lists by default"
           />
         </div>
       </section>
