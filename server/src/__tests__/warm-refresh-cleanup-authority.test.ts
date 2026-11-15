@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import { agentInstructionWorkingCopies } from "@paperclipai/db";
 import { warmAgentFilesRefreshFixture } from "./helpers/warm-agent-files-refresh.js";
 import { agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
+import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 
 // The absence of an authority record must be a denial, not permission to use
 // the pre-refresh recursive fallback. Exercise local and fresh-controller paths.
@@ -24,16 +25,16 @@ describe("default-deny directory cleanup authority", () => {
       const { refreshConfinedCleanup: _grant, localCleanupIdentity: _local, ...receipt } = copy.receipt!;
       const [stopped] = await f.db.update(agentInstructionWorkingCopies).set({ state: "unavailable", processStoppedAt: new Date(),
         errorCode: "AGENT_FILES_REFRESH_INCOMPLETE", receipt: { ...receipt, cleanupPending: true } })
-        .where(eq(agentInstructionWorkingCopies.id, copy.id)).returning();
+        .where(eq(agentInstructionWorkingCopies.runId, copy.runId)).returning();
       const commands: string[] = [];
       const restarted = agentDirectoryWorkingCopyService(f.db, f.copies.get, async (row, values) => {
         const [updated] = await f.db.update(agentInstructionWorkingCopies).set(values)
-          .where(eq(agentInstructionWorkingCopies.id, row.id)).returning();
+          .where(eq(agentInstructionWorkingCopies.runId, row.runId)).returning();
         return updated!;
-      }, { execute: async input => {
+      }, { execute: async (input: Parameters<EnvironmentRuntimeService["execute"]>[0]) => {
         commands.push(input.command);
-        return remote.target.runner!.execute(input);
-      } } as never);
+        return remote.target.runner!.execute({ command: input.command, args: input.args, cwd: input.cwd, env: input.env, timeoutMs: input.timeoutMs });
+      } } as EnvironmentRuntimeService);
       for (let i = 0; i < 2; i++) await restarted.release((await f.copies.get(f.companyId, stopped!.runId))!);
       expect(commands).toEqual([]);
       expect(await fs.readFile(sentinel, "utf8").catch(() => "MISSING")).toBe("OWNER SENTINEL\n");
