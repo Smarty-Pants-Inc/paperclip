@@ -284,13 +284,11 @@ describe("Boat ready spare keeper", () => {
     await expect(keeper.claimWithOutcome(key, "new-config-attempt", 1800, ops)).resolves.toEqual({ outcome: "cold", reason: "config_mismatch" });
   });
 
-  it("skips any spare with a persisted claim row after keeper restart", async () => {
-    const alreadyClaimed = spare();
+  it("skips a spare already marked as claimed in Boat after keeper restart", async () => {
+    const alreadyClaimed = spare({ name: "paperclip-claim:other-worker" });
     const db = {
       namespace: "boat_test",
       execute: async () => ({ rowCount: 0 }),
-      query: async (_sql: string, params: unknown[] = []) => String(params[0]) === alreadyClaimed.id
-        ? [{ provider_lease_id: alreadyClaimed.id }] : [],
     };
     const { ops } = operations([alreadyClaimed]);
     const restarted = new ReadySpareKeeper(() => start, 12, createReadySpareClaimStore(db));

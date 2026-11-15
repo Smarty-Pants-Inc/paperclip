@@ -824,7 +824,7 @@ async function wakeCompanySparePools(companyId: string): Promise<void> {
     if (pool.key.companyId !== companyId || pool.baseDesired <= 0) continue;
     pool.desired = readySpares.demandTarget(pool.key, pool.baseDesired, pool.spareMax, pool.demandWindowMinutes);
     pool.idleStopped = false;
-    work.push(readySpares.reconcile(pool.key, pool.desired, pool.operations).catch(error => {
+    work.push(readySpares.reconcile(pool.key, pool.desired, pool.operations, true).catch(error => {
       duplexLogger?.warn("Boat ready spare wake reconciliation failed", { companyId, environmentId: pool.key.environmentId });
       throw error;
     }));

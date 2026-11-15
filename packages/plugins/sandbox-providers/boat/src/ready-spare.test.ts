@@ -575,7 +575,7 @@ describe("Boat ready spare", () => {
     expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true);
   });
 
-  it("keeps claim queries out of the unscoped background maintenance timer", async () => {
+  it("keeps claim queries out of unscoped timer and event maintenance", async () => {
     let inInvocation = true;
     let maintenanceTick: (() => void) | undefined;
     const setInterval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, delay?: number) => {
@@ -611,8 +611,33 @@ describe("Boat ready spare", () => {
 
     inInvocation = true;
     await emitActivity("issue.created", company);
-    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("SELECT provider_lease_id"), expect.any(Array));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(db.query).not.toHaveBeenCalled();
     setInterval.mockRestore();
+  });
+
+  it("does not query the claim store from the host-delivered company activity event", async () => {
+    let inInvocation = true;
+    const db = fakeDatabase();
+    db.query.mockImplementation(async (_sql: string, params: unknown[] = []) => {
+      if (!inInvocation) throw new Error("Missing or unknown invocation scope");
+      return [];
+    });
+    const env = "environment-event-scope", company = "company-event-scope";
+    const f = fixture();
+    await setup(1, [env], 60, db, 3, 10, company);
+    await acquire("run-event-scope", baseConfig, env, company);
+    await emitActivity("issue.created", company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    db.query.mockClear();
+    inInvocation = false;
+
+    // The host event delivery enters the plugin handler, but does not create a
+    // worker→host RPC invocation scope; work it starts runs after delivery too.
+    await emitActivity("issue.created", company);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(db.query).not.toHaveBeenCalled();
   });
 
   it("decays demand on the timer without claim-store queries", async () => {

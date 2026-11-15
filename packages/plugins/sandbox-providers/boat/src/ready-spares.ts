@@ -48,7 +48,6 @@ export type ReadySpareOperations = {
 
 export type ReadySpareClaimStore = {
   reserve(spare: ReadySpare, claimToken: string, runId: string): Promise<boolean>;
-  hasClaim(providerLeaseId: string): Promise<boolean>;
 };
 
 export type ReadySpareClaimResult =
@@ -58,7 +57,6 @@ export type ReadySpareClaimResult =
 export type ReadySpareClaimDatabase = {
   namespace: string;
   execute(sql: string, params?: unknown[]): Promise<{ rowCount: number }>;
-  query(sql: string, params?: unknown[]): Promise<unknown[]>;
 };
 
 /** Build the cross-worker claim store on the plugin's restricted database namespace. */
@@ -73,13 +71,6 @@ export function createReadySpareClaimStore(db: ReadySpareClaimDatabase): ReadySp
         [spare.id, spare.key.companyId, spare.key.environmentId, claimToken, runId, new Date().toISOString()],
       );
       return result.rowCount === 1;
-    },
-    async hasClaim(providerLeaseId) {
-      const rows = await db.query(
-        `SELECT provider_lease_id FROM ${table} WHERE provider_lease_id = $1 LIMIT 1`,
-        [providerLeaseId],
-      );
-      return rows.length > 0;
     },
   };
 }
@@ -174,7 +165,7 @@ export class ReadySpareKeeper {
   private readonly inFlightCreates = new Map<string, number>();
   private readonly reconciling = new Map<string, Promise<void>>();
   private readonly activeDesired = new Map<string, number>();
-  private readonly pendingReconciliations = new Map<string, { key: ReadySpareKey; desired: number; operations: ReadySpareOperations }>();
+  private readonly pendingReconciliations = new Map<string, { key: ReadySpareKey; desired: number; operations: ReadySpareOperations; strictBoatOnly?: boolean }>();
   private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
   private readonly inFlightClaims = new Map<string, number>();
@@ -271,10 +262,6 @@ export class ReadySpareKeeper {
       if (this.stopping) return;
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
       if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
-      if (this.claimStore) {
-        try { if (await this.claimStore.hasClaim(spare.id)) continue; }
-        catch { continue; } // Unknown claim state is reserved, never adopted or retired.
-      }
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
       else await operations.stop(spare);
     }
@@ -359,24 +346,24 @@ export class ReadySpareKeeper {
   }
 
   /** Re-discover, adopt healthy owned spares, stop stale owned spares, then fill to N. */
-  async reconcile(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+  async reconcile(key: ReadySpareKey, desired: number, operations: ReadySpareOperations, strictBoatOnly = false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const boundedDesired = Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired)));
     const active = this.reconciling.get(poolId);
     if (active) {
       const pending = this.pendingReconciliations.get(poolId);
-      if (boundedDesired !== this.activeDesired.get(poolId) || pending) {
-        this.pendingReconciliations.set(poolId, { key, desired: boundedDesired, operations });
+      if (strictBoatOnly || boundedDesired !== this.activeDesired.get(poolId) || pending) {
+        this.pendingReconciliations.set(poolId, { key, desired: boundedDesired, operations, strictBoatOnly });
       }
       return active;
     }
     const work = (async () => {
-      let next: { key: ReadySpareKey; desired: number; operations: ReadySpareOperations } | undefined = { key, desired: boundedDesired, operations };
+      let next: { key: ReadySpareKey; desired: number; operations: ReadySpareOperations; strictBoatOnly?: boolean } | undefined = { key, desired: boundedDesired, operations, strictBoatOnly };
       let lastError: unknown;
       while (next) {
         this.activeDesired.set(poolId, next.desired);
-        try { await this.reconcileOnce(next.key, next.desired, next.operations); }
+        try { await this.reconcileOnce(next.key, next.desired, next.operations, next.strictBoatOnly === true); }
         catch (error) { lastError = error; }
         next = this.pendingReconciliations.get(poolId);
         this.pendingReconciliations.delete(poolId);
@@ -392,7 +379,7 @@ export class ReadySpareKeeper {
     }
   }
 
-  private async reconcileOnce(key: ReadySpareKey, desired: number, operations: ReadySpareOperations): Promise<void> {
+  private async reconcileOnce(key: ReadySpareKey, desired: number, operations: ReadySpareOperations, strictBoatOnly = false): Promise<void> {
     if (this.stopping) return;
     const poolId = readySparePoolKey(key);
     const listed = await operations.list();
@@ -404,12 +391,11 @@ export class ReadySpareKeeper {
       // An in-flight local claim may not have reached Boat's durable marker yet.
       // Never race a reconcile into stopping or re-adopting it.
       if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
-      if (this.claimStore) {
-        try { if (await this.claimStore.hasClaim(spare.id)) continue; }
-        catch { continue; } // Unknown claim state is reserved, never adopted or retired.
-      }
+      if (strictBoatOnly && (spare.labels.configHash !== key.configHash
+          || spare.name !== `paperclip-spare:ready:${key.configHash}`
+          || (spare.state !== "ready" && spare.state !== "idle"))) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
-      else toStop.push(spare);
+      else if (!strictBoatOnly) toStop.push(spare);
     }
     for (const stale of toStop) {
       if (this.stopping) return;
@@ -420,11 +406,22 @@ export class ReadySpareKeeper {
     // Preserve any concurrently warming local candidates which are not yet in
     // the provider list's eventual-consistency window.
     const local = this.pools.get(poolId) ?? [];
-    for (const spare of local) {
+    if (!strictBoatOnly) for (const spare of local) {
       if (readyAndHealthy(spare, key, this.now()) && !keep.some(item => item.id === spare.id)) keep.push(spare);
     }
     const selected = keep.slice(0, desired);
-    for (const surplus of keep.slice(desired)) await operations.stop(surplus);
+    for (const surplus of keep.slice(desired)) {
+      if (!strictBoatOnly) { await operations.stop(surplus); continue; }
+      if (this.stopping) return;
+      let current: ReadySpare | undefined;
+      try { current = await operations.get(surplus); } catch { continue; }
+      if (current?.id === surplus.id && current.labels.owner === `paperclip:${key.companyId}`
+          && current.labels.environment === key.environmentId && current.labels.purpose === "spare"
+          && current.labels.configHash === key.configHash && current.name === `paperclip-spare:ready:${key.configHash}`
+          && (current.state === "ready" || current.state === "idle") && !this.claiming.has(surplus.id)) {
+        await operations.stop(current);
+      }
+    }
     if (selected.length) this.pools.set(poolId, selected);
     else this.pools.delete(poolId);
     if (desired === 0 || this.stopping) return;
