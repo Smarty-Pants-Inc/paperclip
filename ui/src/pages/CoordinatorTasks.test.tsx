@@ -33,6 +33,9 @@ vi.mock("@/components/TaskListToolbar", () => ({ TaskListToolbar: ({ filters, vi
   {mocks.realFilters ? <IssueFilterPanel {...filters} onClear={() => filters.onChange({ labels: [] })} /> : null}
   <span data-selected-view>{view}</span>
   {taskListViews.map(option => <button key={option.value} onClick={() => onViewChange(option.value)}>{option.label}</button>)}
+  <span data-hidden-filter-enabled={String(filters.enableHiddenVisibilityFilter === true)} data-hidden-filter-checked={String(filters.state.showHiddenTasks === true)} />
+  <button onClick={() => filters.onChange({ showHiddenTasks: true })}>Show hidden tasks</button>
+  <button onClick={() => filters.onChange({ showHiddenTasks: false })}>Stop showing hidden tasks</button>
   <button onClick={() => filters.onChange({ routineTasksOnly: true })}>Routine tasks</button>
   <button onClick={() => filters.onChange({ routineTasksOnly: false })}>Show other tasks</button>
   <button onClick={() => filters.onChange({ liveOnly: true })}>Live runs only</button>
@@ -173,6 +176,43 @@ describe("Coordinator tasks using the proposed table", () => {
     expect(mocks.list.mock.lastCall?.[1].originKind).toBeUndefined();
     flushSync(() => Array.from(host.querySelectorAll("button")).find(button => button.textContent === "Routine tasks")!.click());
     await vi.waitFor(() => expect(host.querySelector('[data-task-id="manual-task"]')).toBeNull());
+  });
+
+  it("adds hidden tasks to All tasks only after Show hidden tasks, kept in the URL, and never to Mine or search", async () => {
+    const shown = createIssue({ id: "shown-task", companyId: "company", parentId: null, title: "Shown report", hiddenAt: null });
+    const hidden = createIssue({ id: "hidden-task", companyId: "company", parentId: null, title: "Hidden report", hiddenAt: new Date("2026-11-15T05:00:00Z") });
+    mocks.list.mockImplementation(async (_company, filters) => filters.includeHidden ? [shown, hidden] : [shown]);
+    const rowIds = () => [...host.querySelectorAll("[data-task-id]")].map(row => row.getAttribute("data-task-id"));
+    const listCalls = () => mocks.list.mock.calls.filter(call => call[1].projection === "index" && !call[1].ids);
+    await mount("/issues?view=all");
+    expect(host.querySelector("[data-hidden-filter-enabled]")?.getAttribute("data-hidden-filter-enabled")).toBe("true");
+    expect(host.querySelector("[data-hidden-filter-checked]")?.getAttribute("data-hidden-filter-checked")).toBe("false");
+    expect(listCalls().every(call => call[1].includeHidden === undefined)).toBe(true);
+    expect(rowIds()).toEqual(["shown-task"]);
+
+    flushSync(() => Array.from(host.querySelectorAll("button")).find(button => button.textContent === "Show hidden tasks")!.click());
+    await vi.waitFor(() => expect(rowIds()).toEqual(["shown-task", "hidden-task"]));
+    expect(listCalls().at(-1)?.[1]).toMatchObject({ includeHidden: true, offset: 0 });
+    expect(new URLSearchParams(host.querySelector("output")!.textContent!).get("includeHidden")).toBe("true");
+    expect(host.querySelector("[data-hidden-filter-checked]")?.getAttribute("data-hidden-filter-checked")).toBe("true");
+
+    flushSync(() => Array.from(host.querySelectorAll("button")).find(button => button.textContent === "Stop showing hidden tasks")!.click());
+    await vi.waitFor(() => expect(rowIds()).toEqual(["shown-task"]));
+    // The earlier All tasks read (without includeHidden) serves the list again.
+    expect(host.querySelector("[data-hidden-filter-checked]")?.getAttribute("data-hidden-filter-checked")).toBe("false");
+    await vi.waitFor(() => expect(new URLSearchParams(host.querySelector("output")!.textContent!).has("includeHidden")).toBe(false));
+  });
+
+  it.each(["/issues?view=inbox&includeHidden=true", "/issues?view=unread&includeHidden=true", "/issues?view=all&includeHidden=true&q=report"])("keeps hidden tasks out of %s", async (url) => {
+    mocks.identity = { userId: "person", settled: true };
+    mocks.list.mockImplementation(async (_company, filters) => filters.includeHidden
+      ? [createIssue({ id: "hidden-task", companyId: "company", parentId: null, createdByUserId: "person", hiddenAt: new Date("2026-11-15T05:00:00Z") })]
+      : []);
+    await mount(url);
+    const listCalls = mocks.list.mock.calls.filter(call => call[1].projection === "index" && !call[1].ids);
+    expect(listCalls.length).toBeGreaterThan(0);
+    expect(listCalls.every(call => call[1].includeHidden === undefined)).toBe(true);
+    expect(host.querySelector('[data-task-id="hidden-task"]')).toBeNull();
   });
 
   it("reads newest-first sorting and puts column sort clicks in the URL", async () => {

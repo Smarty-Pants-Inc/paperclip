@@ -1020,6 +1020,7 @@ describe("inbox helpers", () => {
         liveOnly: true,
         externalObjectStatuses: [],
         showAgentCreatedTasks: true,
+        showHiddenTasks: false,
         routineTasksOnly: false,
       },
     });
@@ -1037,6 +1038,7 @@ describe("inbox helpers", () => {
         liveOnly: false,
         externalObjectStatuses: [],
         showAgentCreatedTasks: false,
+        showHiddenTasks: false,
         routineTasksOnly: false,
       },
     });
@@ -1073,6 +1075,7 @@ describe("inbox helpers", () => {
         liveOnly: false,
         externalObjectStatuses: [],
         showAgentCreatedTasks: false,
+        showHiddenTasks: false,
         routineTasksOnly: false,
       },
     });
