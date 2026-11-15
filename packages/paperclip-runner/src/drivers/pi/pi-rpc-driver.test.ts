@@ -13,6 +13,7 @@ import * as piTurnImages from "./pi-turn-images.js";
 import { bindContent, type PiBindCommand } from "./pi-bind-protocol.js";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { questionSetSchema, requestSchema } from "../../protocol/generated/schema-bundle.js";
+import { readCompletedAssistantMessageCandidate } from "../../../../../server/src/services/heartbeat-run-summary.js";
 
 // Keep reason: recorded large-output incident439 and failure attribution across
 // resident runs. Drive the real session pump rather than a projector surrogate.
@@ -73,6 +74,93 @@ async function inputProxyFixture() {
   await request("thread/start", { model: "neutral/model" });
   return { ...f, frames, request, async close() { await proxy.close(); await f.close(); } };
 }
+// Keep: the production driver dropped Pi thinking despite the projector's opt-in
+// support. Replay a real 1.5.2 turn through the session pump, not mapPiRpcRecord
+// or a test-owned projector. The controlled-peer recordings have no thinking;
+// inject only the docs/json.md thinking wire shapes, retaining recorded prose.
+const displayThinking = "Check the recorded response without changing the answer.";
+type ThinkingReplay = "none" | "streamed" | "final-only" | "redacted";
+async function replayThinkingTurn(mode: ThinkingReplay) {
+  const f = await failureFixture();
+  try {
+    const turn = await f.session.startTurn({ message: { role: "user", text: "scenario:text" } });
+    const records: PiRpcRecord[] = (await readFile(new URL("../../../test-fixtures/pi-rpc/baseline-1.5.2.jsonl", import.meta.url), "utf8"))
+      .trim().split("\n").map(line => JSON.parse(line));
+    const first = records.findIndex(record => record.type === "agent_start");
+    const last = records.findIndex((record, index) => index >= first && record.type === "agent_settled");
+    const thinking = { type: "thinking", thinking: displayThinking, thinkingSignature: "opaque-replay-signature", ...(mode === "redacted" ? { redacted: true } : {}) };
+    const withThinking = (message: unknown) => {
+      const value = message as Record<string, unknown>;
+      return mode !== "none" && value.role === "assistant" && Array.isArray(value.content) && value.content.length
+        ? { ...value, content: [thinking, ...value.content] } : value;
+    };
+    let injected = false;
+    for (const recorded of records.slice(first, last + 1)) {
+      let event = recorded;
+      if (event.type === "message_update" && mode !== "none") {
+        const update = event.assistantMessageEvent as Record<string, unknown>;
+        if (!injected && mode === "streamed") {
+          injected = true;
+          for (const update of [
+            { type: "thinking_start", contentIndex: 0 },
+            { type: "thinking_delta", contentIndex: 0, delta: displayThinking },
+            { type: "thinking_end", contentIndex: 0, content: displayThinking },
+          ]) f.transport.send({ type: "message_update", usage: event.usage, assistantMessageEvent: update });
+          await flushFailure();
+          expect(f.events.filter(event => event.payload.kind === "reasoning")).toMatchObject([
+            { eventType: "item.started", payload: { kind: "reasoning", channel: "detail", text: "" } },
+            { eventType: "item.delta", payload: { kind: "reasoning", channel: "detail", text: displayThinking } },
+          ]);
+        }
+        event = { ...event, assistantMessageEvent: { ...update, contentIndex: Number(update.contentIndex) + 1 } };
+      }
+      if (event.type === "message_end" || event.type === "turn_end") event = { ...event, message: withThinking(event.message) };
+      if (event.type === "agent_end") event = { ...event, messages: (event.messages as unknown[]).map(withThinking) };
+      f.transport.send(event);
+    }
+    await vi.waitFor(() => expect(f.events.some(event => event.eventType === "turn.completed" && event.turnId === turn.turnId)).toBe(true));
+    for (const event of f.events) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
+    return { events: [...f.events], turnId: turn.turnId };
+  } finally { await f.close(); }
+}
+function completedThinkingReplayAnswer(events: PrpEvent[]) {
+  const completed = events.filter(event => event.eventType === "item.completed");
+  return {
+    assistant: completed.filter(event => event.payload.kind === "agentMessage").map(event => event.payload.text),
+    // This production selector feeds final-response/deliverable publication;
+    // unlike a test-only kind filter, it proves the real answer boundary too.
+    deliverable: completed.flatMap((event, seq) => {
+      const candidate = readCompletedAssistantMessageCandidate({ seq, prpEvent: event });
+      return candidate ? [candidate.text] : [];
+    }),
+  };
+}
+
+describe("PiRpcDriver thinking display", () => {
+  it.each(["streamed", "final-only"] as const)("projects %s thinking as detail reasoning without changing the deliverable answer", async mode => {
+    const baseline = await replayThinkingTurn("none");
+    const replay = await replayThinkingTurn(mode);
+    const reasoning = replay.events.filter(event => event.payload.kind === "reasoning");
+    expect(reasoning.map(event => event.eventType)).toEqual(mode === "streamed"
+      ? ["item.started", "item.delta", "item.completed"] : ["item.completed"]);
+    expect(reasoning.at(-1)).toMatchObject({ runId: "run-old", turnId: replay.turnId,
+      payload: { kind: "reasoning", channel: "detail", text: displayThinking } });
+    expect(new Set(reasoning.map(event => event.itemId)).size).toBe(1);
+    expect(JSON.stringify(replay.events)).not.toContain("opaque-replay-signature");
+    expect(completedThinkingReplayAnswer(replay.events)).toEqual(completedThinkingReplayAnswer(baseline.events));
+    expect(completedThinkingReplayAnswer(replay.events)).toEqual({ assistant: ["Hello 🌍\u2028line"], deliverable: ["Hello 🌍\u2028line"] });
+  });
+  it("omits a redacted thinking receipt entirely and preserves the same deliverable answer", async () => {
+    const baseline = await replayThinkingTurn("none");
+    const replay = await replayThinkingTurn("redacted");
+    expect(replay.events.filter(event => event.payload.kind === "reasoning")).toEqual([]);
+    expect(JSON.stringify(replay.events)).not.toContain(displayThinking);
+    expect(JSON.stringify(replay.events)).not.toContain("opaque-replay-signature");
+    expect(completedThinkingReplayAnswer(replay.events)).toEqual(completedThinkingReplayAnswer(baseline.events));
+    expect(completedThinkingReplayAnswer(replay.events)).toEqual({ assistant: ["Hello 🌍\u2028line"], deliverable: ["Hello 🌍\u2028line"] });
+  });
+});
+
 describe("PiRpcDriver", () => {
   it("k: runner session and RPC mode win over manager-supplied Pi environment", async () => {
     const root = await mkdtemp(join(tmpdir(), "pi-manager-env-"));
