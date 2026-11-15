@@ -5278,6 +5278,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environment,
       issueId: null,
       agentId,
+      adapterType: "process",
       heartbeatRunId: runId,
       persistedExecutionWorkspace: {
         id: executionWorkspaceId,
@@ -5325,6 +5326,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environment: updatedEnvironment,
       issueId: null,
       agentId,
+      adapterType: "process",
       heartbeatRunId: nextRunId,
       persistedExecutionWorkspace: {
         id: executionWorkspaceId,
@@ -5441,6 +5443,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environment,
       issueId: null,
       agentId,
+      adapterType: "process",
       heartbeatRunId: runId,
       persistedExecutionWorkspace: {
         id: executionWorkspaceId,
@@ -5457,6 +5460,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       environment,
       issueId: null,
       agentId,
+      adapterType: "process",
       heartbeatRunId: nextRunId,
       persistedExecutionWorkspace: {
         id: executionWorkspaceId,
