@@ -11,8 +11,8 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./ex
 import { continueHeldExecutions } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { isNativeContinuationRefusal, NATIVE_CONTINUATION_REFUSED_ACTION } from "./native-continuation-refusal.js";
-import { settleUnansweredPersonMessagesForTask } from "./recovery/unanswered-person-message.js";
+import { isNativeContinuationRefusal } from "./native-continuation-refusal.js";
+import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_BOUND_REACHED_TEXT } from "./recovery/unanswered-person-message.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -145,7 +145,8 @@ suite("fresh-continuation watchdog snapshot-binding chain", () => {
     expect.soft(forbidden).toHaveLength(0);
     expect.soft(records).toHaveLength(2);
     expect.soft(notes).toHaveLength(1);
-    expect.soft(notes[0]?.body).toBe(NATIVE_CONTINUATION_REFUSED_ACTION);
+    // follow-Paperclip B-2 (RFL 05:51Z): the K=2 bound's one note reads the ruled bound text.
+    expect.soft(notes[0]?.body).toBe(UNANSWERED_MESSAGE_BOUND_REACHED_TEXT);
     expect.soft(notes[0]?.metadata).toMatchObject({ authorizationReason: `unanswered_message:${messageId}`,
       recoveryResponsibility: "user" });
   }, 60_000);
