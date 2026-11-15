@@ -127,6 +127,7 @@ describe("Boat ready spare keeper", () => {
     (second.ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
     await expect(keeper.reconcile(secondKey, 1, second.ops)).resolves.toBeUndefined();
     expect(keeper.ready(secondKey)).toHaveLength(1);
+    await expect(keeper.claim(secondKey, "after-warm-failure", 1800, second.ops)).resolves.toMatchObject({ id: "bx_created_0" });
   });
 
   it("does not warm when there are no spares or only claimed spares", async () => {
@@ -140,7 +141,8 @@ describe("Boat ready spare keeper", () => {
     const inventory = operations([claimed]);
     (inventory.ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
     await keeper.reconcile(key, 1, inventory.ops);
-    expect(warmUp).not.toHaveBeenCalled();
+    expect(warmUp).toHaveBeenCalledTimes(1);
+    expect(warmUp).not.toHaveBeenCalledWith(claimed);
   });
 
   it("fills to demand target concurrently and stops the surplus when demand expires", async () => {

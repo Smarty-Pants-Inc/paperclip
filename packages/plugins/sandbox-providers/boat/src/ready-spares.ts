@@ -36,6 +36,8 @@ export type ReadySpare = {
 export type ReadySpareOperations = {
   list(): Promise<ReadySpare[]>;
   create(key: ReadySpareKey): Promise<ReadySpare>;
+  /** Best-effort one-time work after a newly created spare is ready. */
+  warmUp?(spare: ReadySpare): Promise<"completed" | "missing_pack" | "failed" | "timeout">;
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
   refresh(spare: ReadySpare, ttlSeconds: number): Promise<ReadySpare>;
   stop(spare: ReadySpare): Promise<void>;
@@ -438,6 +440,7 @@ export class ReadySpareKeeper {
           const next = this.pools.get(poolId) ?? [];
           if (!next.some(item => item.id === spare.id)) next.push(spare);
           this.pools.set(poolId, next);
+          if (operations.warmUp) void operations.warmUp(spare).catch(() => undefined);
         } catch (error) {
           // The start attempt counts against the hourly cap even when Boat or
           // warm-up fails; exponential backoff prevents immediate retry loops.
