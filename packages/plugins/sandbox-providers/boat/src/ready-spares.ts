@@ -224,7 +224,7 @@ export class ReadySpareKeeper {
 
   isRefilling(key: ReadySpareKey): boolean {
     const poolId = readySparePoolKey(key);
-    return this.reconciling.has(poolId) || this.adopting.has(poolId) || (this.inFlightCreates.get(poolId) ?? 0) > 0;
+    return this.reconciling.has(poolId) || (this.inFlightCreates.get(poolId) ?? 0) > 0;
   }
 
   hasConfigMismatch(key: ReadySpareKey): boolean {

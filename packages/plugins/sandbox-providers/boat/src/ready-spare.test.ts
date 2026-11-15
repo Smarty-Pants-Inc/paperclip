@@ -98,12 +98,13 @@ function fakeDatabase() {
     }),
   };
 }
-async function setup(spares: number, environmentIds?: string[], idleMinutes = 60, db = fakeDatabase()) {
+async function setup(spares: number, environmentIds?: string[], idleMinutes = 60, db = fakeDatabase(), spareMax = 3, spareDemandWindowMinutes = 10) {
   explicitEnvironmentIds = environmentIds;
   inferredEnvironmentId = undefined;
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   await plugin.definition.setup({
-    config: { get: vi.fn(async () => ({ spares, spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes })) },
+    config: { get: vi.fn(async () => ({ spares, spareMax, spareDemandWindowMinutes,
+      spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes })) },
     logger,
     db,
     events: { on: vi.fn((name: string, handler: (event: any) => Promise<void>) => { eventHandlers.set(name, handler); return () => eventHandlers.delete(name); }) },
@@ -112,6 +113,7 @@ async function setup(spares: number, environmentIds?: string[], idleMinutes = 60
       set: vi.fn(async (key: { scopeId?: string; stateKey: string }, value: unknown) => { persistedState.set(`${key.scopeId}:${key.stateKey}`, value); }),
     },
   } as any);
+  return logger;
 }
 function acquire(runId: string, config: Record<string, unknown> = baseConfig, env = environmentId, company = companyId) {
   if (!explicitEnvironmentIds) inferredEnvironmentId = env;
@@ -144,10 +146,107 @@ describe("Boat ready spare", () => {
       type: "object",
       properties: {
         spares: { type: "integer", minimum: 0, maximum: 3, default: 0 },
+        spareMax: { type: "integer", minimum: 1, maximum: 5, default: 3 },
+        spareDemandWindowMinutes: { type: "integer", minimum: 5, maximum: 60, default: 10 },
         spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60 },
         spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true },
       },
     });
+  });
+
+  it("records exactly one outcome per acquire in plugin state, structured logs, and health", async () => {
+    const env = "environment-outcome-counts", company = "company-outcome-counts";
+    const f = fixture();
+    const logger = await setup(1, [env]);
+    await acquire("run-outcome-cold", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:")).length).toBeGreaterThan(0), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await acquire("run-outcome-spare", baseConfig, env, company);
+    const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
+    expect(lines.map(([message]) => message)).toEqual([
+      `[boat] acquire outcome=cold reason=no_ready_spare env=${env}`,
+      `[boat] acquire outcome=spare env=${env}`,
+    ]);
+    expect(JSON.stringify(lines)).not.toContain(apiKey);
+    expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
+      environmentId: env, spare: 1, cold: 1, reasons: { no_ready_spare: 1 },
+    }] });
+    expect((await plugin.definition.onHealth!()).message).toContain("acquire outcomes spare=1 cold=1");
+  });
+
+  it.each([
+    ["unlisted environment", 1, [], "environment-outcome-env_not_listed", "env_not_listed"],
+    ["disabled spares", 0, ["environment-outcome-spares_disabled"], "environment-outcome-spares_disabled", "spares_disabled"],
+  ] as const)("records a cold %s outcome exactly once", async (_label, spares, environments, env, reason) => {
+    const company = `company-outcome-${reason}`;
+    const f = fixture();
+    const logger = await setup(spares, environments);
+    await acquire(`run-outcome-${reason}`, baseConfig, env, company);
+    const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
+    expect(lines.map(([message]) => message)).toEqual([`[boat] acquire outcome=cold reason=${reason} env=${env}`]);
+    expect(f.calls.some(call => call.method === "POST" && call.body.labels.purpose === "run")).toBe(true);
+    expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
+      environmentId: env, spare: 0, cold: 1, reasons: { [reason]: 1 },
+    }] });
+  });
+
+  it("records refill_in_flight while a replacement is still warming", async () => {
+    const env = "environment-outcome-refilling", company = "company-outcome-refilling";
+    const f = fixture();
+    let releaseWarmup!: () => void;
+    let signalWarmup!: () => void;
+    const warmupEntered = new Promise<void>(resolve => { signalWarmup = resolve; });
+    const warmupGate = new Promise<void>(resolve => { releaseWarmup = resolve; });
+    vi.stubGlobal("fetch", async (input: any, init: any = {}) => {
+      const url = new URL(String(input));
+      const body = init.body ? JSON.parse(String(init.body)) : undefined;
+      if (url.pathname.endsWith("/commands") && String(body?.command ?? "").includes("PI_CODING_AGENT_DIR=/home/user/.pi/agent")) {
+        signalWarmup();
+        await warmupGate;
+      }
+      return f.fetch(input, init);
+    });
+    const logger = await setup(1, [env], 60, fakeDatabase(), 1);
+    await acquire("run-outcome-refill-start", baseConfig, env, company);
+    try {
+      await warmupEntered;
+      await acquire("run-outcome-refill-during", baseConfig, env, company);
+      const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
+      expect(lines.map(([message]) => message)).toEqual([
+        `[boat] acquire outcome=cold reason=no_ready_spare env=${env}`,
+        `[boat] acquire outcome=cold reason=refill_in_flight env=${env}`,
+      ]);
+      expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
+        environmentId: env, spare: 0, cold: 2, reasons: { no_ready_spare: 1, refill_in_flight: 1 },
+      }] });
+    } finally { releaseWarmup(); }
+  });
+
+  it("records config_mismatch when a ready spare has the previous create configuration", async () => {
+    const env = "environment-outcome-config-mismatch", company = "company-outcome-config-mismatch";
+    const f = fixture();
+    const logger = await setup(1, [env]);
+    await acquire("run-outcome-config-seed", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:")).length).toBeGreaterThan(0), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await acquire("run-outcome-config-change", { ...baseConfig, type: "default" }, env, company);
+    const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
+    expect(lines.map(([message]) => message)).toContain(`[boat] acquire outcome=cold reason=config_mismatch env=${env}`);
+    expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
+      environmentId: env, spare: 0, cold: 2, reasons: { no_ready_spare: 1, config_mismatch: 1 },
+    }] });
+  });
+
+  it("records no_ready_spare when atomic spare claims are unavailable", async () => {
+    const env = "environment-outcome-no-ready", company = "company-outcome-no-ready";
+    fixture();
+    const logger = await setup(1, [env], 60, null as any);
+    await acquire("run-outcome-no-ready", baseConfig, env, company);
+    const lines = logger.debug.mock.calls.filter(([message]) => typeof message === "string" && message.startsWith("[boat] acquire outcome="));
+    expect(lines.map(([message]) => message)).toEqual([`[boat] acquire outcome=cold reason=no_ready_spare env=${env}`]);
+    expect(persistedState.get(`${company}:acquire-outcomes`)).toEqual({ environments: [{
+      environmentId: env, spare: 0, cold: 1, reasons: { no_ready_spare: 1 },
+    }] });
   });
 
   it("claims a warmed spare through the shared post-create path and starts a replacement", async () => {
@@ -373,6 +472,28 @@ describe("Boat ready spare", () => {
     await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createdSpares + 1), { timeout: 2_000 });
     await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:") && item.state === "running")).toBe(true), { timeout: 2_000 });
     expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/commands"))).toBe(true);
+    expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
+  });
+
+  it("idle policy stops a demand-expanded pool regardless of live demand", async () => {
+    const env = "environment-demand-idle", company = "company-demand-idle";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env], 15, fakeDatabase(), 3, 60);
+    await acquire("run-demand-idle-one", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(1), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await acquire("run-demand-idle-two", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:") && item.state === "running")).toHaveLength(2), { timeout: 2_000 });
+    await acquire("run-demand-idle-three", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:") && item.state === "running")).toHaveLength(3), { timeout: 2_000 });
+    const createsBeforeIdle = f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare").length;
+    now += 15 * 60_000 + 1; // demand window (60m) is still populated, but company activity is idle
+    await plugin.definition.onHealth!();
+    expect(f.inventory.filter(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:") && item.state === "running")).toHaveLength(0);
+    expect(f.calls.filter(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "spare")).toHaveLength(createsBeforeIdle);
+    expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true);
     expect(f.calls.some(call => call.method === "DELETE")).toBe(false);
   });
 

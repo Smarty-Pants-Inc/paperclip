@@ -3,11 +3,25 @@
 ## Ready spare pool
 
 The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),
+`spareMax` (1–5, default 3), `spareDemandWindowMinutes` (5–60, default 10),
 `spareEnvironmentIds` (up to 10 environment IDs, default empty), and
 `spareIdleMinutes` (15–1440, default 60). Empty or absent `spareEnvironmentIds`
-means **no spares**. For each listed environment, `spares` is the number of
-running, pre-warmed Boat sandboxes to keep ready. Configure these settings in
-plugin settings; no environment edit is needed.
+means **no spares**. For each listed environment in an active company, `spares`
+is the floor and the pool follows demand: target is `clamp(max(spares,
+claims_in_window + 1 when claims_in_window >= 1, otherwise spares), spares,
+spareMax)`. Successful warm-spare claims are counted in the rolling
+`spareDemandWindowMinutes` window. Thus two successful claims in the default
+window raise a floor of one to three ready spares (subject to `spareMax`); when
+that window empties, the pool scales back to its floor by stopping surplus
+sandboxes through Boat's confirmed stop path, never deleting them. The floor
+remains at least one only when `spares` is configured above zero, the environment
+is listed and the company is active. Configure these
+settings in plugin settings; no environment edit is needed.
+
+Every acquire records exactly one outcome (`spare` when a warm spare is claimed,
+otherwise `cold` with a reason) in company-scoped plugin state by environment,
+and emits one structured `[boat] acquire outcome=...` log line without secrets.
+Counts are exposed in the plugin health message alongside its existing status.
 
 A company is active after any lease acquire, resume or release handled by this
 plugin, or any `agent.run.started`, `agent.run.finished`, `agent.run.failed`,
