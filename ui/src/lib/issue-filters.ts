@@ -37,6 +37,8 @@ export type IssueFilterState = {
    */
   externalObjectStatuses: string[];
   showAgentCreatedTasks: boolean;
+  /** Include hidden tasks so they can be found and un-hidden. Off by default. */
+  showHiddenTasks?: boolean;
   routineTasksOnly?: boolean;
 };
 
@@ -51,6 +53,7 @@ export const defaultIssueFilterState: IssueFilterState = {
   liveOnly: false,
   externalObjectStatuses: [],
   showAgentCreatedTasks: false,
+  showHiddenTasks: false,
   routineTasksOnly: false,
 };
 
@@ -120,6 +123,7 @@ export function normalizeIssueFilterState(value: unknown): IssueFilterState {
     liveOnly: candidate.liveOnly === true,
     externalObjectStatuses: normalizeIssueFilterValueArray(candidate.externalObjectStatuses),
     showAgentCreatedTasks: candidate.showAgentCreatedTasks === true,
+    showHiddenTasks: candidate.showHiddenTasks === true,
     routineTasksOnly: candidate.routineTasksOnly === true,
   };
 }
@@ -241,6 +245,10 @@ export function applyIssueFilters(
   if (state.routineTasksOnly) {
     result = result.filter((issue) => issue.originKind === "routine_execution");
   }
+  // Lists return hidden tasks only when asked; drop any a cache still holds.
+  if (!state.showHiddenTasks) {
+    result = result.filter((issue) => !issue.hiddenAt);
+  }
   if (enableAgentCreatedVisibilityFilter && !state.showAgentCreatedTasks && !state.routineTasksOnly) {
     result = result.filter((issue) => !isAgentCreatedIssue(issue));
   }
@@ -306,5 +314,6 @@ export function countActiveIssueFilters(
   if (state.routineTasksOnly) count += 1;
   if (state.externalObjectStatuses.length > 0) count += 1;
   if (enableAgentCreatedVisibilityFilter && state.showAgentCreatedTasks) count += 1;
+  if (state.showHiddenTasks) count += 1;
   return count;
 }
