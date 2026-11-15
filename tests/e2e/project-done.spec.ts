@@ -31,7 +31,10 @@ for (const viewport of VIEWPORTS) {
 
     await page.goto(`/${company.issuePrefix}/projects`);
     const row = projectRow(page, projectName);
-    const count = row.getByTestId("project-task-count");
+    // The count sits in the trailing column from sm up and leads the
+    // description line below it; exactly one copy is visible at a time.
+    const count = row.getByTestId("project-task-count").filter({ visible: true });
+    await expect(row.getByText(projectName, { exact: true })).toBeVisible();
     await expect(count).toHaveText("1 open");
     await expect(count).toBeVisible();
     await page.screenshot({ path: testInfo.outputPath(`project-done-${viewport.width}-1-before.png`) });
