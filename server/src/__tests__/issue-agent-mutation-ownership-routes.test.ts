@@ -3244,9 +3244,28 @@ describe("agent issue mutation checkout ownership", () => {
         expect(inserted.find(row => row.table === "issue_execution_decisions")?.values).toMatchObject({
           id: patch.executionState.lastDecisionId, companyId, issueId, stageId: finalStage, outcome: "changes_requested",
           actorAgentId: ownerAgentId, createdByRunId: ownerRunId, body: comment });
-        expect(mockIssueService.addComment).toHaveBeenCalledWith(issueId, comment, expect.anything());
+        expect(mockIssueService.addComment.mock.calls[0]?.slice(0, 3)).toEqual([issueId, comment, expect.objectContaining({ agentId: ownerAgentId, runId: ownerRunId })]);
         expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
         expect(mockHeartbeatService.wakeup.mock.calls.filter(([id]) => id === peerAgentId)).toHaveLength(0);
+      });
+
+      it("defers the policy's human escalation at the review-round cap", async () => {
+        const issue = reviewIssue([finalStage]);
+        const escalated = { ...issue, responsibleUserId: "board-user",
+          executionState: { ...(issue.executionState as unknown as Record<string, unknown>), changesRequestedCount: 2 } };
+        mockIssueService.getById.mockResolvedValue(escalated);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...escalated, ...patch }));
+        const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
+          .send({ status: "in_progress", comment: "Reviewer decision: request changes - third round." });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+        expect(patch).not.toHaveProperty("status");
+        expect(patch).not.toHaveProperty("assigneeAgentId");
+        expect(patch).not.toHaveProperty("assigneeUserId");
+        expect(patch.executionState).toMatchObject({ status: "pending", currentParticipant: { type: "user", userId: "board-user" },
+          changesRequestedCount: 3, lastDecisionOutcome: null });
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
       });
 
       it.each([undefined, "", "   "])("rejects request-changes with an empty decision comment (%j)", async comment => {
@@ -3258,23 +3277,14 @@ describe("agent issue mutation checkout ownership", () => {
 
       it.each(["non-participant", "writer"])("keeps refusing request-changes from the %s", async kind => {
         const issue = reviewIssue([finalStage]);
-        mockIssueService.getById.mockResolvedValue(kind === "writer" ? makeIssue({ executionRunId: ownerRunId, checkoutRunId: ownerRunId }) : {
+        mockIssueService.getById.mockResolvedValue(kind === "writer" ? makeIssue({ status: "in_review", executionRunId: ownerRunId, checkoutRunId: ownerRunId }) : {
           ...issue, executionState: { ...(issue.executionState as unknown as Record<string, unknown>), currentParticipant: { type: "agent", agentId: peerAgentId } },
         });
         const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
           .send({ status: "in_progress", comment: "Reviewer decision: request changes - X" });
-        // A no-op status write by the writer is still allowed as before. A real
-        // status change must go through its finish report.
-        if (kind === "writer") {
-          mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_review", executionRunId: ownerRunId, checkoutRunId: ownerRunId }));
-          const changed = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
-            .send({ status: "in_progress", comment: "Writer cannot decide a review." });
-          expect(changed.status).toBe(409);
-          expect(changed.body.details.code).toBe("native_run_status_reported_by_finish");
-        } else {
-          expect(res.status, JSON.stringify(res.body)).toBe(409);
-          expect(res.body.details.code).toBe("native_run_status_reported_by_finish");
-        }
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.details.code).toBe("native_run_status_reported_by_finish");
+        expect(mockIssueService.update).not.toHaveBeenCalled();
       });
 
       it("keeps the non-native request-changes path immediate", async () => {
@@ -3288,14 +3298,14 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.update.mock.calls[0]?.[1]).toMatchObject({ status: "in_progress", assigneeAgentId: peerAgentId });
       });
 
-      it("rechecks the review policy under the issue lock for the deferred approval", async () => {
+      it.each(["done", "in_progress"])("rechecks the review policy under the issue lock for the deferred %s decision", async status => {
         const issue = reviewIssue([finalStage]);
         mockIssueService.getById.mockResolvedValue(issue);
         // The policy becomes human-only after the first check, before the locked write.
         mockIssueService.getByIdForUpdate.mockResolvedValue({ ...issue, reviewPolicy: "human_only" });
 
         const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
-          .send({ status: "done", comment: "Approved: verified." });
+          .send({ status, comment: "Reviewer decision: verified." });
 
         expect(res.status, JSON.stringify(res.body)).toBe(403);
         expect(mockIssueService.update).not.toHaveBeenCalled();

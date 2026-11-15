@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, agentWakeupRequests, companies, completionContracts, createDb, documentRevisions, executionWorkspaces, executionWorkspaceRepositories, heartbeatRuns, issueComments, issueExecutionDecisions, issues, issueThreadInteractions, issueTreeHolds, issueDocuments, statusDecisions } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, companyMemberships, completionContracts, createDb, documentRevisions, executionWorkspaces, executionWorkspaceRepositories, heartbeatRuns, issueComments, issueExecutionDecisions, issues, issueThreadInteractions, issueTreeHolds, issueDocuments, statusDecisions } from "@paperclipai/db";
 import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { documentService } from "../documents.js";
@@ -153,19 +153,24 @@ describe("native final-response feedback", () => {
       expect(await executionStageChangesRequestedByRun(db, changed, issue)).toBe(false);
     }
     expect(await executionStageChangesRequestedByRun(db, run, { ...issue, id: randomUUID() })).toBe(false);
-    for (const changed of [{ ...state, lastDecisionId: randomUUID() }, { ...state, lastDecisionOutcome: "approved" }, { ...state, status: "completed" }]) {
+    for (const changed of [{ ...state, lastDecisionId: randomUUID() }, { ...state, currentStageId: randomUUID() }, { ...state, lastDecisionOutcome: "approved" },
+      { ...state, status: "completed" }, { ...state, status: "pending", currentParticipant: { type: "agent", agentId: value.agentId } }]) {
       expect(await executionStageChangesRequestedByRun(db, run, { ...issue, executionState: changed })).toBe(false);
     }
     await db.update(issues).set({ status: "in_review", executionState: state }).where(eq(issues.id, value.issueId));
     await expect(nativeCompletionFeedback(db, value.runId, done)).resolves.toContain("report accepted");
   });
-  it("finishes a saved changes request by returning to the writer with one wake and its visible comment", async () => {
+  it.each(["agent", "user", "escalation"] as const)("finishes a saved changes request via its %s return path exactly once, with the visible comment", async target => {
     const value = await fixture(), writerId = randomUUID(), stageId = randomUUID(), decisionId = randomUUID();
+    const humanId = `writer-${randomUUID()}`;
+    await db.insert(companyMemberships).values({ companyId: value.companyId, principalType: "user", principalId: humanId,
+      status: "active", membershipRole: "operator" });
     await db.insert(agents).values({ id: writerId, companyId: value.companyId, name: "Writer", adapterType: "paperclip_runner", status: "active" });
     const comment = "Reviewer decision: request changes - annotate all public Python test methods.";
-    const state = { status: "changes_requested", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
-      currentParticipant: { type: "agent", agentId: value.agentId }, returnAssignee: { type: "agent", agentId: writerId },
-      completedStageIds: [], lastDecisionId: decisionId, lastDecisionOutcome: "changes_requested", changesRequestedCount: 1 };
+    const state = { status: target === "escalation" ? "pending" : "changes_requested", currentStageId: stageId, currentStageIndex: 0, currentStageType: "review",
+      currentParticipant: target === "escalation" ? { type: "user", userId: humanId } : { type: "agent", agentId: value.agentId },
+      returnAssignee: target === "user" ? { type: "user", userId: humanId } : { type: "agent", agentId: writerId },
+      completedStageIds: [], lastDecisionId: decisionId, lastDecisionOutcome: target === "escalation" ? null : "changes_requested", changesRequestedCount: target === "escalation" ? 3 : 1 };
     await db.update(issues).set({ status: "in_review", checkoutRunId: value.runId, executionState: state,
       executionPolicy: { mode: "normal", commentRequired: true, stages: [{ id: stageId, type: "review", approvalsNeeded: 1,
         participants: [{ id: randomUUID(), type: "agent", agentId: value.agentId }] }] } }).where(eq(issues.id, value.issueId));
@@ -190,11 +195,13 @@ describe("native final-response feedback", () => {
     await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
     await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded" });
     const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(task).toMatchObject({ status: "in_progress", assigneeAgentId: writerId, assigneeUserId: null, executionRunId: null, checkoutRunId: null });
+    expect(task).toMatchObject({ status: target === "escalation" ? "in_review" : "in_progress",
+      assigneeAgentId: target === "agent" ? writerId : null, assigneeUserId: target === "agent" ? null : humanId,
+      executionRunId: null, checkoutRunId: null });
     expect(task?.executionState).toMatchObject(state);
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    expect(wakes).toEqual([expect.objectContaining({ agentId: writerId, reason: "execution_changes_requested", status: "queued" })]);
-    expect(wakes[0]?.payload).toMatchObject({ _paperclipWakeContext: { executionStage: { wakeRole: "executor",
+    expect(wakes).toEqual(target === "agent" ? [expect.objectContaining({ agentId: writerId, reason: "execution_changes_requested", status: "queued" })] : []);
+    if (target === "agent") expect(wakes[0]?.payload).toMatchObject({ _paperclipWakeContext: { executionStage: { wakeRole: "executor",
       returnAssignee: { type: "agent", agentId: writerId }, allowedActions: ["address_changes", "resubmit"] } } });
     const decisions = await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, issueId));
     expect(decisions.map(row => row.reasonCode)).toEqual(["execution_stage_changes_requested"]);
