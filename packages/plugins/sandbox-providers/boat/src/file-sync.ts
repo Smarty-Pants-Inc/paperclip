@@ -116,11 +116,18 @@ async function signedTransfer(io: SyncTransport, base: string, remote: string, l
 async function validateExtracted(root: string, mapping: PluginSyncFileMapping): Promise<void> {
   // Never follow sandbox-planted links while inspecting/applying modes. GNU tar
   // rejects traversal/link-pivot writes during extraction into this private tree.
+  let droppedManagedLinks = 0;
   const visit = async (directory: string): Promise<void> => {
     for await (const entry of await fs.opendir(directory)) {
       const name = path.join(directory, entry.name), stat = await fs.lstat(name);
       if (stat.isDirectory()) await visit(name);
       else if (stat.isSymbolicLink()) {
+        const relative = path.relative(root, name).split(path.sep).join("/");
+        if (/^skills\/paperclip-company-skills\/bundle-[a-f0-9]{64}$/.test(relative)) {
+          await fs.unlink(name);
+          droppedManagedLinks++;
+          continue;
+        }
         const link = await fs.readlink(name), resolved = path.resolve(directory, link);
         if (path.isAbsolute(link) || (resolved !== root && !resolved.startsWith(`${root}/`))) throw new Error("Unsafe Boat archive symlink");
       } else if (stat.isFile()) {
@@ -129,6 +136,7 @@ async function validateExtracted(root: string, mapping: PluginSyncFileMapping): 
     }
   };
   await visit(root);
+  if (droppedManagedLinks > 0) console.info(`[boat] dropped ${droppedManagedLinks} managed company-skills bundle link(s) from outbound sync`);
 }
 async function ensureHostParent(parent: string): Promise<void> {
   // Check ancestors before mkdir: a recursive mkdir followed by realpath could
