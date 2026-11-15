@@ -1753,7 +1753,7 @@ function createSandboxEnvironmentDriver(
           && stale.metadata?.pendingCleanupInFlight !== true) {
           // A stale boot source is not stop authority. GET the recorded resource
           // outside transactions, then reuse the fallback's snapshot/CAS owner.
-          const observation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: stale })
+          const observation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(stale) })
             .catch(() => undefined);
           await prepareInspectedSourceSandboxStop(db, stale, observation);
         }
