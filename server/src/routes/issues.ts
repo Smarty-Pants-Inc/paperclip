@@ -3098,6 +3098,8 @@ function toCompactIssue(issue: any): CompactIssue {
     cancelledAt: issue.cancelledAt,
     createdAt: issue.createdAt,
     updatedAt: issue.updatedAt,
+    // Only lists that include hidden tasks return such rows; mark them.
+    ...(issue.hiddenAt ? { hiddenAt: issue.hiddenAt } : {}),
     ...(issue.labelIds ? { labelIds: issue.labelIds } : {}),
     ...(issue.labels ? { labels: issue.labels } : {}),
     ...(issue.blockedBy ? { blockedBy: issue.blockedBy } : {}),
@@ -9142,6 +9144,11 @@ export function issueRoutes(
       res.status(400).json({ error: "includeAgentCreatedTasks must be true or false when provided" });
       return;
     }
+    const includeHidden = parseOptionalBooleanQuery(req.query.includeHidden);
+    if (includeHidden === null) {
+      res.status(400).json({ error: "includeHidden must be true or false when provided" });
+      return;
+    }
     const includeLiveDescendantSummary = parseOptionalBooleanQuery(
       req.query.includeLiveDescendantSummary,
     );
@@ -9319,6 +9326,7 @@ export function issueRoutes(
         req.query.includeBlockedInboxAttention === "true" ||
         req.query.includeBlockedInboxAttention === "1",
       includeAgentCreatedTasks,
+      includeHidden: includeHidden === true ? true : undefined,
       creationVisibilityUserId: includeParticipatedTasks === true && req.actor.type === "board" ? req.actor.userId : undefined,
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
       hasPlanDocument,

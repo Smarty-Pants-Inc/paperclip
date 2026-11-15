@@ -156,14 +156,17 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   }, { replace: true });
   const routineTasksOnly = params.get("originKind") === "routine_execution";
   const originKind = routineTasksOnly ? "routine_execution" : undefined;
+  const showHiddenTasks = params.get("includeHidden") === "true";
   const normalizedView = normalizeTaskViewKey(urlView);
   const presetStatuses = normalizedView && taskView(normalizedView).surface === "issues" ? taskView(normalizedView).statuses ?? [] : [];
   const initialStatuses: string[] = params.has("status") ? params.getAll("status") : presetStatuses;
-  const previousUrlFilters = useRef({ assignee: urlAssignee, statuses: urlStatuses, labels: urlLabels, view: urlView, routineTasksOnly });
+  const previousUrlFilters = useRef({ assignee: urlAssignee, statuses: urlStatuses, labels: urlLabels, view: urlView, routineTasksOnly, showHiddenTasks });
   const needsAttention = view === "blocked";
   const query = params.get("q") ?? "";
   const deferredQuery = useDeferredValue(query.trim());
   const useListSort = layout === "list" && !deferredQuery;
+  // Hidden tasks join only the All tasks list; search, Mine and Unread keep excluding them.
+  const includeHidden = showHiddenTasks && view === "all" && !deferredQuery;
   const serverSortField = useListSort && sort?.column === "created" ? "created" : "updated";
   const serverSortDir = useListSort && (sort?.column === "created" || sort?.column === "lastUpdated") && sort.direction === "ascending" ? "asc" : "desc";
   const participantAgentId = params.get("participantAgentId") ?? undefined;
@@ -186,13 +189,14 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   useEffect(() => { setBreadcrumbs([{ label: "Tasks" }]); }, [setBreadcrumbs]);
 
   const tasks = useInfiniteQuery({
-    queryKey: [...queryKeys.issues.list(companyId!), "coordinator-table", "index", userId, deferredQuery, participantAgentId, workspaceIds, originKind, serverSortField, serverSortDir, includeBlockedBy, view === "unread"],
+    queryKey: [...queryKeys.issues.list(companyId!), "coordinator-table", "index", userId, deferredQuery, participantAgentId, workspaceIds, originKind, serverSortField, serverSortDir, includeBlockedBy, view === "unread", includeHidden],
     queryFn: async ({ pageParam, signal }) => {
       const pages = await Promise.all((workspaceIds.length ? workspaceIds : [undefined]).map(workspaceId => issuesApi.listCompact(companyId!, {
       projection: "index", limit: pageSize, offset: pageParam, includeAgentCreatedTasks: true, includeRoutineExecutions: true,
       sortField: serverSortField, sortDir: serverSortDir,
       includeBlockedBy: includeBlockedBy || undefined, q: deferredQuery || undefined, participantAgentId, workspaceId, originKind,
       unreadForUserId: view === "unread" ? "me" : undefined,
+      includeHidden: includeHidden || undefined,
       }, { signal })));
       return { items: pages.flat(), hasNextPage: pages.some(page => page.length === pageSize) };
     },
@@ -272,26 +276,31 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
     searchMode: "server",
     liveIssueIds: collectLiveIssueIds(liveRuns.data, records),
     viewStorageKey,
-    initialFilters: { labels: params.getAll("label").filter(Boolean), assignees: params.getAll("assignee"), statuses: initialStatuses, routineTasksOnly },
+    initialFilters: { labels: params.getAll("label").filter(Boolean), assignees: params.getAll("assignee"), statuses: initialStatuses, routineTasksOnly, showHiddenTasks },
   });
   useEffect(() => {
     const previous = previousUrlFilters.current;
-    if (previous.assignee === urlAssignee && previous.view === urlView && previous.statuses === urlStatuses && previous.labels === urlLabels && previous.routineTasksOnly === routineTasksOnly) return;
-    previousUrlFilters.current = { assignee: urlAssignee, statuses: urlStatuses, labels: urlLabels, view: urlView, routineTasksOnly };
+    if (previous.assignee === urlAssignee && previous.view === urlView && previous.statuses === urlStatuses && previous.labels === urlLabels && previous.routineTasksOnly === routineTasksOnly && previous.showHiddenTasks === showHiddenTasks) return;
+    previousUrlFilters.current = { assignee: urlAssignee, statuses: urlStatuses, labels: urlLabels, view: urlView, routineTasksOnly, showHiddenTasks };
     collection.updateFilters({
       ...(previous.labels !== urlLabels ? { labels: params.getAll("label").filter(Boolean) } : {}),
       ...(previous.routineTasksOnly !== routineTasksOnly ? { routineTasksOnly } : {}),
+      ...(previous.showHiddenTasks !== showHiddenTasks ? { showHiddenTasks } : {}),
       ...(previous.assignee !== urlAssignee ? { assignees: params.getAll("assignee") } : {}),
       ...(previous.view !== urlView || previous.statuses !== urlStatuses ? { statuses: initialStatuses } : {}),
     });
-  }, [urlAssignee, urlView, urlStatuses, urlLabels, initialStatuses, routineTasksOnly, collection.updateFilters]);
+  }, [urlAssignee, urlView, urlStatuses, urlLabels, initialStatuses, routineTasksOnly, showHiddenTasks, collection.updateFilters]);
   const updateFilters = (patch: Partial<IssueFilterState>) => {
     collection.updateFilters(patch);
-    if (patch.assignees === undefined && patch.statuses === undefined && patch.labels === undefined && patch.routineTasksOnly === undefined) return;
+    if (patch.assignees === undefined && patch.statuses === undefined && patch.labels === undefined && patch.routineTasksOnly === undefined && patch.showHiddenTasks === undefined) return;
     const next = new URLSearchParams(params);
     if (patch.routineTasksOnly !== undefined) {
       if (patch.routineTasksOnly) next.set("originKind", "routine_execution");
       else next.delete("originKind");
+    }
+    if (patch.showHiddenTasks !== undefined) {
+      if (patch.showHiddenTasks) next.set("includeHidden", "true");
+      else next.delete("includeHidden");
     }
     if (patch.labels !== undefined) {
       next.delete("label");
@@ -312,7 +321,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
   const clearFilters = () => {
     collection.updateFilters(defaultIssueFilterState);
     const next = new URLSearchParams(params);
-    for (const key of ["q", "assignee", "status", "label", "originKind"]) next.delete(key);
+    for (const key of ["q", "assignee", "status", "label", "originKind", "includeHidden"]) next.delete(key);
     if (next.get("view") !== "needs_attention") next.set("view", "all");
     navigate({ search: next.toString(), hash: location.hash }, { replace: true });
   };
@@ -354,7 +363,7 @@ export function CoordinatorTasks({ viewControl }: { viewControl?: ReactNode } = 
     <TaskListToolbar view={view} onViewChange={setView} viewControl={viewControl}
       query={searchDraft} onQueryChange={setSearchDraft} layout={collection.layout} onLayoutChange={collection.setLayout}
       allExpanded={collection.allExpanded} onToggleExpanded={collection.toggleExpanded} onNewTask={() => openNewIssue()}
-      filters={{ enableRoutineTasksFilter: true, state: collection.filters, onChange: updateFilters, activeFilterCount: collection.activeFilterCount,
+      filters={{ enableRoutineTasksFilter: true, enableHiddenVisibilityFilter: view === "all", state: collection.filters, onChange: updateFilters, activeFilterCount: collection.activeFilterCount,
         agents: agents.data ?? [], projects: projects.data ?? [], labels: labels.data ?? [], currentUserId: userId, creators: collection.creators }} />
     {error ? <div role="alert" className="flex items-center gap-2 text-sm text-destructive"><span>{error instanceof Error ? error.message : "Could not load tasks"}</span><Button variant="outline" size="sm" onClick={retry}>Retry</Button></div> : null}
     {rowDetailsError ? <div role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><span>Task details couldn’t load.</span><Button variant="ghost" size="sm" onClick={() => void retryRowDetails()}>Retry</Button></div> : null}

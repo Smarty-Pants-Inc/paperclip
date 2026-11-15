@@ -262,7 +262,7 @@ import {
   type IssueGraphLivenessInput,
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
-import { visibleIssueCondition } from "./issue-visibility.js";
+import { listVisibleIssueCondition, visibleIssueCondition } from "./issue-visibility.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -1924,6 +1924,12 @@ export interface IssueFilters {
   originKindPrefix?: string;
   originId?: string;
   includeAgentCreatedTasks?: boolean;
+  /**
+   * Include hidden tasks (`hidden_at` set) in an ordinary task list. Ignored by
+   * search and by the inbox and unread filters, which always exclude hidden
+   * tasks. Harness tasks stay excluded.
+   */
+  includeHidden?: boolean;
   /** Authenticated inbox discovery can retain existing participation. */
   creationVisibilityUserId?: string;
   includeRoutineExecutions?: boolean;
@@ -8535,9 +8541,14 @@ export function issueService(db: Db) {
         });
       }
 
+      const includeHidden = filters?.includeHidden === true
+        && !filters.q?.trim()
+        && !filters.touchedByUserId?.trim()
+        && !filters.unreadForUserId?.trim()
+        && !filters.inboxArchivedByUserId?.trim();
       const conditions = [
         eq(issues.companyId, companyId),
-        visibleIssueCondition(),
+        listVisibleIssueCondition(includeHidden),
       ];
       if (filters?.issueIds) {
         if (filters.issueIds.length === 0) return [];

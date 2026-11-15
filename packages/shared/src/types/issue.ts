@@ -1069,6 +1069,8 @@ export type CompactIssue = Pick<
   | "createdAt"
   | "updatedAt"
 > & {
+  /** Present only on hidden tasks, which only `includeHidden` lists return. */
+  hiddenAt?: Date | null;
   interruption?: TaskInterruptionPresentation | null;
   labelIds?: string[];
   labels?: IssueLabel[];

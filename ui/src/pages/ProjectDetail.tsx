@@ -1,4 +1,4 @@
-import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
+import { useShowAgentCreatedTasks, useShowHiddenTasks } from "../hooks/useShowAgentCreatedTasks";
 import { configurationWarningMessages } from "../lib/configuration-warnings";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Link, useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
@@ -192,6 +192,7 @@ function ProjectTilePicker({
 
 function ProjectIssuesList({ projectId, companyId }: { projectId: string; companyId: string }) {
   const showAgentCreatedTasks = useShowAgentCreatedTasks(companyId, "paperclip:project-issues-view");
+  const showHiddenTasks = useShowHiddenTasks(companyId, "paperclip:project-issues-view");
   const queryClient = useQueryClient();
 
   const { data: agents } = useQuery({
@@ -223,8 +224,8 @@ function ProjectIssuesList({ projectId, companyId }: { projectId: string; compan
   });
 
   const issuesQuery = useQuery({
-    queryKey: [...queryKeys.issues.listByProject(companyId, projectId), showAgentCreatedTasks],
-    queryFn: () => issuesApi.listAll(companyId, { projectId, includeRoutineExecutions: true, includeAgentCreatedTasks: showAgentCreatedTasks }),
+    queryKey: [...queryKeys.issues.listByProject(companyId, projectId), showAgentCreatedTasks, showHiddenTasks],
+    queryFn: () => issuesApi.listAll(companyId, { projectId, includeRoutineExecutions: true, includeAgentCreatedTasks: showAgentCreatedTasks, includeHidden: showHiddenTasks }),
     enabled: !!companyId,
   });
   const { data: issues } = issuesQuery;
@@ -247,6 +248,7 @@ function ProjectIssuesList({ projectId, companyId }: { projectId: string; compan
       liveIssueIds={liveIssueIds}
       projectId={projectId}
       enableAgentCreatedVisibilityFilter
+      enableHiddenVisibilityFilter
       viewStateKey="paperclip:project-issues-view"
       onUpdateIssue={(id, data) => updateIssue.mutate({ id, data })}
     />

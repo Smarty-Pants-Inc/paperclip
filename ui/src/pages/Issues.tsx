@@ -1,6 +1,6 @@
 import { companyProjectsQuery } from "@/lib/company-projects-query";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
-import { useShowAgentCreatedTasks } from "../hooks/useShowAgentCreatedTasks";
+import { useShowAgentCreatedTasks, useShowHiddenTasks } from "../hooks/useShowAgentCreatedTasks";
 import { useCoordinatorWorkspaceEnabled } from "../hooks/useCoordinatorWorkspaceEnabled";
 import { CoordinatorTaskViews } from "./CoordinatorTaskViews";
 import { useDesignSandbox } from "../context/DesignSandboxContext";
@@ -190,6 +190,7 @@ function OrganizationIssues({
     return urlSearch;
   }, [searchOverride, urlSearch, location.search]);
   const showAgentCreatedTasks = useShowAgentCreatedTasks(selectedCompanyId, "paperclip:issues-view");
+  const showHiddenTasks = useShowHiddenTasks(selectedCompanyId, "paperclip:issues-view");
   const sort = useMemo(() => readIssueSortParams(searchParams), [searchParams]);
   const includeBlockedBy = sort?.sortField === "workflow";
   const serverSortField = sort?.sortField === "created" ? "created" : "updated";
@@ -285,6 +286,8 @@ function OrganizationIssues({
       streamlinedUiEnabled ? "index" : "compact",
       "with-routine-executions",
       includeAgentCreatedTasks,
+      "include-hidden",
+      showHiddenTasks,
       originKind,
       "infinite",
       issuePageSize,
@@ -298,6 +301,7 @@ function OrganizationIssues({
       workspaceId: workspaceIdFilter,
       includeRoutineExecutions: true,
       includeAgentCreatedTasks,
+      includeHidden: showHiddenTasks,
       originKind,
       limit: issuePageSize,
       offset: pageParam,
@@ -364,6 +368,7 @@ function OrganizationIssues({
       initialSearch={syncedSearch}
       onSearchChange={handleSearchChange}
       enableAgentCreatedVisibilityFilter
+      enableHiddenVisibilityFilter
       routineTasksOnly={routineTasksOnly}
       onRoutineTasksOnlyChange={handleRoutineTasksOnlyChange}
       sort={sort}
