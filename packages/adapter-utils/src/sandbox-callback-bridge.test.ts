@@ -160,6 +160,72 @@ describe("sandbox callback bridge", () => {
     };
   }
 
+  function createFakeRemoteBridgeRunner(queueDir: string) {
+    const directories = sandboxCallbackBridgeDirectories(queueDir);
+    const requests = new Map<string, string>();
+    const responses = new Map<string, string>();
+    const listCommands: string[] = [];
+    let activeLongPolls = 0;
+    const result = (stdout = ""): RunProcessResult => ({
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      stdout,
+      stderr: "",
+      pid: null,
+      startedAt: new Date().toISOString(),
+    });
+    const listNames = () => [...requests.keys()]
+      .filter((requestPath) => path.posix.dirname(requestPath) === directories.requestsDir)
+      .map((requestPath) => path.posix.basename(requestPath))
+      .sort((left, right) => left.localeCompare(right));
+    const runner = {
+      execute: vi.fn(async (input: { args?: string[]; stdin?: string }): Promise<RunProcessResult> => {
+        const script = input.args?.[1] ?? "";
+        if (script.includes("for file in") && script.includes(directories.requestsDir)) {
+          listCommands.push(script);
+          if (script.includes("sleep 0.1")) {
+            activeLongPolls += 1;
+            try {
+              const waitChecks = Number(/wait_checks=(\d+)/.exec(script)?.[1] ?? 70);
+              for (let check = 0; check <= waitChecks; check += 1) {
+                const names = listNames();
+                if (names.length > 0) return result(`${names.join("\n")}\n`);
+                if (check === waitChecks) break;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+              }
+              return result();
+            } finally {
+              activeLongPolls -= 1;
+            }
+          }
+          const names = listNames();
+          return result(names.length > 0 ? `${names.join("\n")}\n` : "");
+        }
+        const sizePath = /wc -c < '([^']+)'/.exec(script)?.[1];
+        if (sizePath) return result(String(Buffer.byteLength(requests.get(sizePath) ?? "")));
+        const readPath = /base64 < '([^']+)'/.exec(script)?.[1] ?? /head -c \d+ '([^']+)' \| base64/.exec(script)?.[1];
+        if (readPath) return result(Buffer.from(requests.get(readPath) ?? "", "utf8").toString("base64"));
+        const responsePath = /^response_path='([^']+)'/m.exec(script)?.[1];
+        if (responsePath) {
+          responses.set(responsePath, input.stdin ?? "");
+          return result('{"wrote":true}\n');
+        }
+        const removePath = /rm -rf '([^']+)'/.exec(script)?.[1];
+        if (removePath) requests.delete(removePath);
+        return result();
+      }),
+    };
+    return {
+      directories,
+      requests,
+      responses,
+      listCommands,
+      runner,
+      get activeLongPolls() { return activeLongPolls; },
+    };
+  }
+
   // Match the gateway's atomic publication. A visible, growing .json file can
   // be stat'ed while empty and exceed the reader's reserved size on the read.
   function publishBridgeRequest(requestPath: string, body: string): Promise<void> {
@@ -213,6 +279,110 @@ describe("sandbox callback bridge", () => {
       vi.useRealTimers();
     }
   });
+
+  it("long-polls remote requests with low command volume and a healthy quiet watchdog", async () => {
+    vi.useFakeTimers();
+    const fake = createFakeRemoteBridgeRunner("/workspace/long-poll-quiet");
+    const { runtimeSpan, workerErrors } = createWorkerErrorCapture();
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createCommandManagedSandboxCallbackBridgeQueueClient({
+        runner: fake.runner,
+        remoteCwd: "/workspace",
+      }),
+      queueDir: "/workspace/long-poll-quiet",
+      pollIntervalMs: 100,
+      idleBackoffMaxMs: 1_000,
+      runtimeSpan,
+      handleRequest: async () => ({ status: 200, body: "ok" }),
+    });
+    try {
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect.soft(fake.listCommands.length).toBeLessThanOrEqual(10);
+      expect(workerErrors).toEqual([]);
+    } finally {
+      const stopping = worker.stop({ drainTimeoutMs: 1 });
+      await vi.advanceTimersByTimeAsync(8_000);
+      await stopping;
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
+  it("wakes for arriving callbacks, fences pause/stop requests, and serves the first resumed callback", async () => {
+    vi.useFakeTimers();
+    const queueDir = "/workspace/long-poll-lifecycle";
+    const fake = createFakeRemoteBridgeRunner(queueDir);
+    const handled: string[] = [];
+    const worker = await startSandboxCallbackBridgeWorker({
+      client: createCommandManagedSandboxCallbackBridgeQueueClient({
+        runner: fake.runner,
+        remoteCwd: "/workspace",
+      }),
+      queueDir,
+      pollIntervalMs: 100,
+      idleBackoffMaxMs: 1_000,
+      handleRequest: async (request) => {
+        handled.push(request.id);
+        return { status: 200, body: request.id };
+      },
+    });
+    const responseFor = (id: string) => fake.responses.get(`${fake.directories.responsesDir}/${id}.json`);
+    const enqueue = (id: string) => {
+      fake.requests.set(`${fake.directories.requestsDir}/${id}.json`, bridgeRequestJson(id));
+    };
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      const arrivedAt = Date.now();
+      enqueue("mid-wait");
+      await vi.advanceTimersByTimeAsync(100);
+      expect.soft(handled).toContain("mid-wait");
+      expect.soft(Date.now() - arrivedAt).toBeLessThanOrEqual(300);
+      expect.soft(JSON.parse(responseFor("mid-wait") ?? "{}")).toMatchObject({ id: "mid-wait", status: 200 });
+
+      // The next empty poll is a remote wait. A file arriving after pause begins
+      // must be quarantined, never delivered to the detached run.
+      await vi.advanceTimersByTimeAsync(0);
+      expect.soft(fake.activeLongPolls).toBeGreaterThan(0);
+      const longPollsBeforePause = fake.listCommands.filter((script) => script.includes("sleep 0.1")).length;
+      const pause = worker.pause();
+      enqueue("late-while-paused");
+      await vi.advanceTimersByTimeAsync(100);
+      await pause;
+      const longPollsAfterPause = fake.listCommands.filter((script) => script.includes("sleep 0.1")).length;
+      expect(longPollsAfterPause - longPollsBeforePause).toBeLessThanOrEqual(1);
+      expect.soft(handled).not.toContain("late-while-paused");
+      expect.soft(JSON.parse(responseFor("late-while-paused") ?? "{}")).toMatchObject({
+        id: "late-while-paused", status: 503,
+      });
+      const listsWhilePaused = fake.listCommands.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(fake.listCommands).toHaveLength(listsWhilePaused);
+
+      await worker.resume("generation-b");
+      enqueue("first-resumed");
+      const resumedAt = Date.now();
+      await vi.advanceTimersByTimeAsync(100);
+      expect.soft(handled).toContain("first-resumed");
+      expect.soft(Date.now() - resumedAt).toBeLessThanOrEqual(300);
+      expect.soft(JSON.parse(responseFor("first-resumed") ?? "{}")).toMatchObject({ id: "first-resumed", status: 200 });
+
+      await vi.advanceTimersByTimeAsync(0);
+      const stop = worker.stop({ drainTimeoutMs: 1 });
+      enqueue("late-while-stopping");
+      await vi.advanceTimersByTimeAsync(100);
+      await stop;
+      expect.soft(handled).not.toContain("late-while-stopping");
+      expect.soft(JSON.parse(responseFor("late-while-stopping") ?? "{}")).toMatchObject({
+        id: "late-while-stopping", status: 503,
+      });
+    } finally {
+      if (vi.isFakeTimers()) {
+        const stopping = worker.stop({ drainTimeoutMs: 1 });
+        await vi.advanceTimersByTimeAsync(8_000);
+        await stopping;
+        vi.useRealTimers();
+      }
+    }
+  }, 30_000);
 
   it("handles a request arriving during the active 100ms poll window within 150ms", async () => {
     vi.useFakeTimers();
