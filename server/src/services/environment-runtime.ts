@@ -36,10 +36,10 @@ import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareHistoricalSandboxStopVerification, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1748,7 +1748,15 @@ function createSandboxEnvironmentDriver(
           eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
         ));
         if (stale?.status === "retained") await prepareSupersededWarmSandboxStop(db, stale, { reason: "sandbox_source_changed" });
-        else if (stale?.status === "released") await prepareHistoricalSandboxStopVerification(db, stale);
+        else if (stale && ["released", "expired"].includes(stale.status)
+          && !hasBoundRemoteStopReceipt(stale) && !hasStopOnlyCleanup(stale)
+          && stale.metadata?.pendingCleanupInFlight !== true) {
+          // A stale boot source is not stop authority. GET the recorded resource
+          // outside transactions, then reuse the fallback's snapshot/CAS owner.
+          const observation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: stale })
+            .catch(() => undefined);
+          await prepareInspectedSourceSandboxStop(db, stale, observation);
+        }
         continue;
       }
       await destroyReusableSandboxLease({
@@ -1804,7 +1812,7 @@ function createSandboxEnvironmentDriver(
     });
   }
 
-  return {
+  const sandboxDriver: EnvironmentRuntimeDriver = {
     driver: "sandbox",
 
     async acquireRunLease(input) {
@@ -3222,6 +3230,7 @@ function createSandboxEnvironmentDriver(
       });
     },
   };
+  return sandboxDriver;
 
   /**
    * Resolve the effective capability snapshot for one sandbox lease. This is
