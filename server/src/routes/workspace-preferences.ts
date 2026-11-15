@@ -1,6 +1,6 @@
 import { Router } from "express";
-import { companies, type Db } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { agents, companies, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import { updateWorkspacePreferenceSchema } from "@paperclipai/shared";
 import { forbidden, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
@@ -30,9 +30,17 @@ export function workspacePreferenceRoutes(db: Db) {
       throw forbidden("User does not have active company access");
     }
     if (!await db.query.companies.findFirst({ where: eq(companies.id, companyId) })) throw notFound("Company not found");
+    const reasoning = req.body.agentReasoningDisplay as { agentId: string } | undefined;
+    // A read only: the reasoning choice is the person's view of this
+    // company's agent and is never written to the agent record (#20303).
+    if (reasoning && !await db.query.agents.findFirst({
+      columns: { id: true },
+      where: and(eq(agents.id, reasoning.agentId), eq(agents.companyId, companyId)),
+    })) throw notFound("Agent not found");
     res.json(await svc.set(companyId, req.actor.userId!, {
       coordinatorWorkspaceEnabled: req.body.coordinatorWorkspaceEnabled,
       timeZone: req.body.timeZone,
+      agentReasoningDisplay: req.body.agentReasoningDisplay,
     }));
   });
   return router;

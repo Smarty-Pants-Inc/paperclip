@@ -1,0 +1,1 @@
+ALTER TABLE "user_workspace_preferences" ADD COLUMN "agent_reasoning_display" jsonb DEFAULT '{}'::jsonb NOT NULL;
