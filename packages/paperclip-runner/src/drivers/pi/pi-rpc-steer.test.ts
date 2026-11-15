@@ -40,9 +40,11 @@ describe("Pi RPC same-turn steering", () => {
       expect(admissionEvents[0].turnId).toBeUndefined();
       expect(events.every(event => event.runId === "steer-run")).toBe(true);
       const timings = events.filter(event => event.eventType === "harness.diagnostic" && event.payload.code === "provider_performance_spans");
-      expect(timings).toHaveLength(1);
-      expect(events.findIndex(event => event.eventType === "turn.started")).toBeLessThan(events.indexOf(timings[0]!));
-      expect(events.every(event => event.eventType === "session.started" || event.turnId === turnId)).toBe(true);
+      expect(timings).toHaveLength(2);
+      expect(timings[0]!.turnId).toBeUndefined();
+      expect(events.indexOf(timings[0]!)).toBeLessThan(events.findIndex(event => event.eventType === "turn.started"));
+      expect(events.findIndex(event => event.eventType === "turn.started")).toBeLessThan(events.indexOf(timings[1]!));
+      expect(events.every(event => event.eventType === "session.started" || event === timings[0] || event.turnId === turnId)).toBe(true);
       for (const event of events) expect(validatePrpEvent(event)).toMatchObject({ ok: true });
       expect((await peer.commands()).filter(command => ["prompt", "steer", "abort", "follow_up"].includes(command.type))).toEqual([
         expect.objectContaining({ type: "prompt", message: "scenario:queue" }),

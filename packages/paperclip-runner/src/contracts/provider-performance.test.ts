@@ -25,6 +25,15 @@ describe("closed provider-performance timing admission", () => {
       .toEqual(existingPhases.map(name => ({ name, startedAtMs: now - 20, endedAtMs: now, outcome: "failed" })));
   });
 
+  it("admits all closed cold-open phases and strips extra fields at the server/facade boundary", () => {
+    const phases = ["workspace", "native_mcp_config", "company_skills", "extension_resolve", "models_snapshot", "model_catalog",
+      "model_resolve", "compaction_config", "provider_binding", "models_json_write", "pi_spawn_to_get_state", "admission",
+      "available_models", "tool_inventory", "settle", "bind_receipt", "begin_turn", "total"];
+    const spans = phases.map(step => ({ name: `runner.pi.open.${step}`, startedAtMs: now - 100, endedAtMs: now, outcome: "ok" }));
+    expect(parse(spans.map(span => ({ ...span, instructions: "PRIVATE", apiKey: "PRIVATE" })))).toEqual(spans);
+    expect(parse([{ ...spans[0], name: "runner.pi.open.unregistered" }])).toEqual([]);
+  });
+
   it("retains freshness edges and rejects lookalike phases, malformed times and nonzero Pi durations", () => {
     expect(parse([instant(now - day), instant(now + 1000)])).toEqual([instant(now - day), instant(now + 1000)]);
     const invalid: unknown[] = [
