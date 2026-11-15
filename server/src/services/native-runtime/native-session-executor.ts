@@ -15917,7 +15917,8 @@ export async function readRemoteRunnerState(input: {
   const escapedPath = statePath.replaceAll("'", "'\\''");
   const request = {
     command: "sh",
-    args: ["-c", `test -f '${escapedPath}' && base64 < '${escapedPath}'`],
+    // Exit 66 only when the file is absent, so a reader can tell "no saved state" from a read failure.
+    args: ["-c", `test -f '${escapedPath}' || exit 66; base64 < '${escapedPath}'`],
     bypassSession: true,
     timeoutMs: 10_000,
   };

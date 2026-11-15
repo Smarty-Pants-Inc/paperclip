@@ -6583,7 +6583,13 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       // that state already archived, and preparing again could re-stage it.
       read: async () => {
         await prepareExternalRunnerState?.();
-        return readRunnerState();
+        try { return await readRunnerState(); }
+        catch (error) {
+          // A replaced box has no saved Runner state: the same fact as a missing
+          // control plane, so it takes the same classified resume-unavailable route.
+          if (!(error instanceof Error) || !/^runner_remote_state_unavailable: exit=66 timedOut=false(?:\s|$)/.test(error.message)) throw error;
+          throw Object.assign(new NativeRunnerResumeStateUnavailableError(), { cause: error });
+        }
       },
       archive: archiveExternalRunnerState,
     };
