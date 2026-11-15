@@ -831,11 +831,12 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     expect(targets.find(target => target.runId === next.runId)?.acquisition).toMatchObject({ outcome: sameBoxCold ? "resumed" : "created", providerLeaseId: allocationIds[sameBoxCold ? 0 : 1] });
 
     if (governedWait) {
-      // G TARGET (expected RED before D-B6): answer, not a fresh-thread refusal.
-      // No history claim: upstream governed-wait replacement omits old context.
+      // G TARGET: answer, not a fresh-thread refusal, and WITH its history (RFL
+      // 12:31Z, every answer row): the pre-replacement fact is in the model request.
       expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
       expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
       expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
+      expect(requests.filter(request => request.runId === next.runId)[0], "history present in the model request").toMatchObject({ containsFact: true });
       expect(notes.length).toBeLessThanOrEqual(1);
       expect(notes.filter(note => note.body.includes(FRESH_THREAD_STOPPING_NOTE))).toHaveLength(0);
       expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toHaveLength(0);
