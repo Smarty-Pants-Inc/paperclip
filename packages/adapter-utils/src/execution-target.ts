@@ -104,6 +104,28 @@ const DEFAULT_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = 100;
 // together leave only 2,000ms. Cap sleep at 1,000ms: 1,000 + 9,000 + 9,000 =
 // 19,000ms, leaving 1,000ms below the watchdog for scheduling/operation overhead.
 const MAX_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS = 1_000;
+const SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_ENV = "PAPERCLIP_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS";
+const DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS = 1_000;
+
+export function resolveSandboxCallbackBridgeIdleBackoffMaxMs(
+  rawValue = process.env[SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_ENV],
+): number {
+  if (rawValue === undefined) return DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+  if (!/^\d+$/.test(rawValue)) {
+    console.warn(
+      `[paperclip] Invalid ${SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_ENV}=${JSON.stringify(rawValue)}; using ${DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS}ms.`,
+    );
+    return DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+  }
+  const parsed = Number(rawValue);
+  if (!Number.isSafeInteger(parsed)) {
+    console.warn(
+      `[paperclip] Invalid ${SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_ENV}=${JSON.stringify(rawValue)}; using ${DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS}ms.`,
+    );
+    return DEFAULT_SANDBOX_CALLBACK_BRIDGE_IDLE_BACKOFF_MAX_MS;
+  }
+  return Math.min(MAX_SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_MS, Math.max(100, parsed));
+}
 
 export function resolveSandboxCallbackBridgePollIntervalMs(
   rawValue = process.env[SANDBOX_CALLBACK_BRIDGE_POLL_INTERVAL_ENV],
@@ -5084,6 +5106,7 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       queueDir,
       maxBodyBytes,
       pollIntervalMs,
+      idleBackoffMaxMs: resolveSandboxCallbackBridgeIdleBackoffMaxMs(),
       getRuntimeParentContext: input.getRuntimeParentContext,
       runtimeSpan: input.runtimeSpan,
       startPaused: input.startPaused,
