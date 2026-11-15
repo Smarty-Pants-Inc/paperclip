@@ -947,16 +947,17 @@ export function teamsCatalogService(db: Db) {
           ]
         : []),
     ];
+    const admissionActor: AuthorizationActor | undefined = options.admissionActor ?? (options.actor?.actorType === "agent"
+      ? { type: "agent", agentId: options.actor.agentId ?? options.actor.actorId, companyId,
+          runId: options.actor.runId, source: options.actor.runId ? "agent_jwt" : "agent_key" }
+      : undefined);
     const result = await portability.importBundle(
       importInput,
       options.actor?.userId ?? (options.actor?.actorType === "user" ? options.actor.actorId : null),
       {
         mode: "agent_safe",
         sourceCompanyId: companyId,
-        actor: options.admissionActor ?? (options.actor?.actorType === "agent"
-          ? { type: "agent", agentId: options.actor.agentId ?? options.actor.actorId, companyId,
-              runId: options.actor.runId, source: options.actor.runId ? "agent_jwt" : "agent_key" }
-          : undefined),
+        ...(admissionActor ? { actor: admissionActor } : {}),
       },
     );
     warnings.push(...await prepareSkillInstalls(companyId, prepared));

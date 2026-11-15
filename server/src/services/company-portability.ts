@@ -5417,8 +5417,9 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         ? { type: "agent", agentId: legacyAgentId, companyId: legacyCompanyId, runId: origin?.runId,
             source: origin?.runId ? "agent_jwt" : "agent_key" }
         : { type: "board", userId: actorUserId });
-    const actorAgentId = actor.type === "agent" ? actor.agentId : null;
-    const actorAgentCompanyId = actor.type === "agent" ? actor.companyId : null;
+    // Preserve upstream's exact attribution values when no agent is attributed.
+    const actorAgentId = actor.type === "agent" ? actor.agentId : legacyAgentId;
+    const actorAgentCompanyId = actor.type === "agent" ? actor.companyId : legacyCompanyId;
     if (actorAgentId && !options?.interactionTransaction) {
       // Preflight the submitted package before entering the writer. Repeat with
       // live, transaction-bound services below, after the company lock.
