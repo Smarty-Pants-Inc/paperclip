@@ -102,14 +102,14 @@ describePg("RFL importfence8 FIX 2 agent-reachable creators", () => {
   it("RED join approval with joins:approve refuses stored local command without approving or hiring", async () => {
     const { companyId, app } = await seed();
     const [invite] = await db.insert(invites).values({ companyId, tokenHash: randomUUID(), allowedJoinTypes: "agent", expiresAt: new Date(Date.now() + 60_000) }).returning();
-    const [join] = await db.insert(joinRequests).values({ companyId, inviteId: invite!.id, requestType: "agent", status: "pending_approval", requestIp: "127.0.0.1", agentName: "Joiner", adapterType: "codex_local", agentDefaultsPayload: { command } }).returning();
+    const [join] = await db.insert(joinRequests).values({ companyId, inviteId: invite!.id, requestType: "agent", status: "pending_approval", requestIp: "127.0.0.1", agentName: "Joiner", adapterType: "gemini_local", agentDefaultsPayload: { command } }).returning();
     const before = await snapshot(companyId);
     await assertRefused(await request(app).post(`/api/companies/${companyId}/join-requests/${join!.id}/approve`).send({}), before, companyId);
   });
   it.each(["managedReconcile", "managedReset"] as const)("RED plugin %s preserves agent invocation origin at managed creation", async method => {
     const { companyId, actor } = await seed();
     const pluginId = randomUUID();
-    const manifest: PaperclipPluginManifestV1 = { id: "paperclip.creator-admission", apiVersion: 1, version: "0.1.0", displayName: "Creator admission", description: "Fixture", author: "Paperclip", categories: ["automation"], capabilities: ["agents.managed"], entrypoints: { worker: "./worker.js" }, agents: [{ agentKey: "worker", displayName: "Plugin worker", role: "engineer", adapterType: "codex_local", adapterConfig: { command }, budgetMonthlyCents: 0 }] };
+    const manifest: PaperclipPluginManifestV1 = { id: `paperclip.creator-admission-${method}`, apiVersion: 1, version: "0.1.0", displayName: "Creator admission", description: "Fixture", author: "Paperclip", categories: ["automation"], capabilities: ["agents.managed"], entrypoints: { worker: "./worker.js" }, agents: [{ agentKey: "worker", displayName: "Plugin worker", role: "engineer", adapterType: "gemini_local", adapterConfig: { command }, budgetMonthlyCents: 0 }] };
     await db.insert(plugins).values({ id: pluginId, pluginKey: manifest.id, packageName: "@paperclipai/creator-admission-fixture", version: manifest.version, apiVersion: 1, categories: manifest.categories, manifestJson: manifest, status: "ready", installOrder: 1 });
     const services = buildHostServices(db, pluginId, manifest.id, { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never, undefined, { manifest });
     try {
