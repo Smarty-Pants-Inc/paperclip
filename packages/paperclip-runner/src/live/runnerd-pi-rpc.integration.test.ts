@@ -142,8 +142,8 @@ it.skipIf(process.platform !== "linux" || !pi)("keeps one Pi RPC child resident 
   await makeRuntimeReadOnly(piPackageRoot);
   const piExecutable = join(piPackageRoot, "node_modules", closure.executableRelative);
   expect(execFileSync(process.execPath, [piExecutable, "--version"], { encoding: "utf8", timeout: 10_000 }).trim()).toBe("1.5.2");
-  const proxy = join(root, "cli", "pi-rpc-app-server-proxy.cjs");
-  const extension = join(root, "drivers", "pi", "extension", "index.js");
+  const proxy = join(root, "dist", "cli", "pi-rpc-app-server-proxy.cjs");
+  const extension = join(root, "dist", "drivers", "pi", "extension", "index.js");
   const artifacts = JSON.parse(execFileSync(process.execPath, ["--input-type=module", "-e", `
     import { build } from "esbuild";
     import { builtinModules } from "node:module";
@@ -166,8 +166,10 @@ it.skipIf(process.platform !== "linux" || !pi)("keeps one Pi RPC child resident 
   await writeFile(join(root, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
   await writeFile(proxy, artifacts.proxy, { mode: 0o755 });
   await writeFile(extension, artifacts.extension, { mode: 0o644 });
-  const childBridge = join(root, "drivers", "pi", "extension", "child-bridge.js");
+  const childBridge = join(root, "dist", "drivers", "pi", "extension", "child-bridge.js");
   await writeFile(childBridge, artifacts.childBridge, { mode: 0o644 });
+  const payload = { artifacts: { piChildBridge: { path: "dist/drivers/pi/extension/child-bridge.js", sha256: digest(childBridge) } } };
+  await writeFile(join(root, "provider-pack.json"), `${JSON.stringify({ schema: "paperclip-runner/remote-provider-pack/v1", digest: `sha256:${createHash("sha256").update(JSON.stringify(payload)).digest("hex")}`, payload })}\n`, { mode: 0o444 });
   await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile, childBridge: artifacts.childBridgeMetafile }, null, 2)}\n`);
   const diagnostics: string[] = [];
   const notifications: unknown[] = [];

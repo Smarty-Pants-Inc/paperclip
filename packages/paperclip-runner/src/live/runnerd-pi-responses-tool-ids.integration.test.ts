@@ -369,7 +369,7 @@ it.skipIf(process.platform !== "linux" || !pi)(`real runnerd/Pi ${modelProtocol}
   const workspace = join(root, "workspace"), agentDirectory = join(root, "pi-agent");
   await mkdir(workspace); await mkdir(agentDirectory);
   // The real package owns the liveness/status RPC that sub-wire7's Stop awaits.
-  await writeFile(join(agentDirectory, "settings.json"), `${JSON.stringify({ packages: [runtime.subagentsRoot], cacheWarming: "off" })}\n`, { mode: 0o600 });
+  await writeFile(join(agentDirectory, "settings.json"), `${JSON.stringify({ packages: [runtime.subagentsRoot], cacheWarming: "off", defaultThinkingLevel: "xhigh" })}\n`, { mode: 0o600 });
   const faux = await fauxResponses(root);
   const environment = { PATH: process.env.PATH, PI_CODING_AGENT_DIR: agentDirectory, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: faux.url,
     PAPERCLIP_AI_PROVIDER_PROTOCOL: modelProtocol, PAPERCLIP_AI_PROVIDER_AUTH: "none", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "broker" };
