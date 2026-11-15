@@ -513,6 +513,7 @@ import {
   runnerdStateProvesIncompleteBootstrap,
   semanticProviderPlanMarkdown,
   sha256DirectoryTree,
+  stageRemoteRunnerAssets,
   stageRemoteRunnerDirectory,
   stageRemoteRunnerFile,
   steerNativeSession,
@@ -5473,6 +5474,43 @@ describe("remote provider checkpoint snapshots", () => {
 });
 
 describe("remote provider checkpoint restores", () => {
+  it.each([true, false])("archives all runtime assets into one transfer and atomically installs their original paths and modes (native sync: %s)", async nativeSync => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-runtime-asset-batch-"));
+    try {
+      const sourceDirectory = join(root, "instructions"), sourceFile = join(root, "runtime-context.json");
+      await mkdir(sourceDirectory); await writeFile(join(sourceDirectory, "AGENTS.md"), "instructions\n", { mode: 0o444 });
+      await chmod(sourceDirectory, 0o555); await writeFile(sourceFile, "{\"runtime\":true}\n", { mode: 0o600 });
+      const targetDirectory = join(root, "remote", "context", "instructions");
+      const targetFile = join(root, "remote", "runtime-context.json");
+      const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+        for (const operation of operations) for (const file of operation.files) {
+          await mkdir(dirname(file.targetPath), { recursive: true });
+          await cp(file.sourcePath, file.targetPath);
+        }
+      });
+      const execute = vi.fn(async (command: { command: string; args: string[]; stdin?: string }) => {
+        const result = spawnSync(command.command, command.args, { input: command.stdin, encoding: "utf8" });
+        return { exitCode: result.status, timedOut: false, stdout: result.stdout, stderr: result.stderr };
+      });
+      await stageRemoteRunnerAssets({ target: { kind: "remote", transport: "ssh", remoteCwd: root } as never,
+        runner: { ...(nativeSync ? { syncIn } : {}), execute } as never, assets: [
+          { sourcePath: sourceDirectory, targetPath: targetDirectory, kind: "directory", mode: 0o555 },
+          { sourcePath: sourceFile, targetPath: targetFile, kind: "file", mode: 0o600 },
+        ] });
+      expect(syncIn).toHaveBeenCalledTimes(nativeSync ? 1 : 0);
+      if (nativeSync) expect(syncIn.mock.calls[0]![0][0]!.files).toHaveLength(1);
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(await readFile(join(targetDirectory, "AGENTS.md"), "utf8")).toBe("instructions\n");
+      expect((await lstat(targetDirectory)).mode & 0o777).toBe(0o555);
+      expect(await readFile(targetFile, "utf8")).toBe("{\"runtime\":true}\n");
+      expect((await lstat(targetFile)).mode & 0o777).toBe(0o600);
+    } finally {
+      await chmod(join(root, "instructions"), 0o700).catch(() => undefined);
+      await chmod(join(root, "remote", "context", "instructions"), 0o700).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(["auth.json", "config.toml"].flatMap(name => ["hard", "symbolic"].map(kind => ({ name, kind }))))("atomically stages an SSH launch file without following a retained $kind link ($name)", async ({ name, kind }) => {
     const root = await mkdtemp(join(tmpdir(), "paperclip-ssh-stage-"));
     try {
@@ -23753,6 +23791,8 @@ describe("runnerd provider runtime wiring", () => {
         ? { proof: "session_opened_without_turn", runnerInstanceId: "runner-new-in-retained-workspace" } : null);
     onTestFinished(() => controllerProof.mockRestore());
     const runtimeContext = nativeRuntimeContextFixture();
+    runtimeContext.instructions.bundle.rootPath = join(isolatedStateDirectory, "runtime-context-instructions");
+    await mkdir(runtimeContext.instructions.bundle.rootPath, { recursive: true });
     const executionWithContext = homeMode === "preconfigured"
       ? { ...execution, schema: "paperclip.native-execution-input.v7" as const,
         homeMode: "preconfigured" as const, executionMode: "default" as const, planningContext: null,
@@ -23903,14 +23943,11 @@ describe("runnerd provider runtime wiring", () => {
         command: "/controller/paperclip-runnerd", args: [], cwd: "/controller", environment: {},
       });
       await expect(launched.completion).rejects.toThrow("fixture_stop_after_launch_staging");
+      const stagedFiles = syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string; kind: string; mode: number }> }) => entry.files);
       if (homeMode === "isolated") {
-        expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
-          files: [expect.objectContaining({ sourcePath: join(home, "skills"), kind: "directory", mode: 0o700 })],
-        })]);
+        expect(stagedFiles).toContainEqual(expect.objectContaining({ sourcePath: join(home, "skills"), kind: "directory", mode: 0o700 }));
         for (const name of ["auth.json", "config.toml"]) {
-          expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
-            files: [expect.objectContaining({ sourcePath: join(home, name), kind: "file", mode: 0o600 })],
-          })]);
+          expect(stagedFiles).toContainEqual(expect.objectContaining({ sourcePath: join(home, name), kind: "file", mode: 0o600 }));
         }
       } else {
         const files = syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string }> }) => entry.files);
@@ -23918,11 +23955,13 @@ describe("runnerd provider runtime wiring", () => {
           expect(files.some(file => file.sourcePath === join(home, name))).toBe(false);
         }
       }
-      expect(syncIn.mock.calls.flat(2).flatMap((entry: { files: Array<{ sourcePath: string }> }) => entry.files)
-        .filter((file: { sourcePath: string }) => file.sourcePath === runtimeContext.instructions.bundle.rootPath)).toHaveLength(1);
-      expect(syncIn).toHaveBeenCalledWith([expect.objectContaining({
-        files: [expect.objectContaining({ sourcePath: join(options.stateDirectory!, "runtime-context.json"), kind: "file" })],
-      })]);
+      const syncOperations = syncIn.mock.calls as unknown as [Array<{ files: Array<{ sourcePath: string; kind: string; targetPath: string; mode: number }> }>][];
+      const contextTransferBatches = syncOperations.flatMap(([operations]) => operations)
+        .filter(operation => operation.files.some(file => file.sourcePath.includes("paperclip-runtime-assets-")));
+      expect(contextTransferBatches).toHaveLength(1);
+      expect(contextTransferBatches[0]!.files).toHaveLength(1);
+      expect(contextTransferBatches[0]!.files[0]).toMatchObject({ kind: "file", mode: 0o600 });
+      expect(contextTransferBatches[0]!.files[0]!.targetPath).toMatch(/\.tar\.gz$/);
       expect(remoteExecute.mock.calls.filter(([command]) => command.args?.[2] === "paperclip-runner-claim-unstarted-session")).toHaveLength(1);
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow(
