@@ -207,6 +207,31 @@ describe("manager assigns a company AI connection to its own report", () => {
     expect(response.status, response.text).toBe(403); expect(response.body.error).toBe(denyScope);
     expect(await f.read()).toEqual(before);
   });
+  it("FIX 8: legacy unscoped Claude manager assigns a non-routed OpenAI account to its Codex report", async () => {
+    const f = await seed();
+    await db.update(principalPermissionGrants).set({ scope: null }).where(and(
+      eq(principalPermissionGrants.principalId, f.ids.lead), eq(principalPermissionGrants.permissionKey, "agents:configure")));
+    await db.update(agents).set({ adapterConfig: { provider: "claude", model: "claude-sonnet-4-5", githubAuthenticationMode: "agent_env" } })
+      .where(eq(agents.id, f.ids.lead));
+    await db.update(agents).set({ adapterConfig: { provider: "codex", model: "gpt-5.1-codex", githubAuthenticationMode: "agent_env" } })
+      .where(eq(agents.id, f.ids.report));
+    const saved = await aiConnectionService(db).save(f.companyId, f.userId, {
+      provider: "openai", method: "api_key", ownership: "shared", name: "Non-routed legacy OpenAI", allAgents: true, agentIds: [],
+    }, "synthetic-legacy-openai-key");
+    const selected = { provider: "openai", method: "api_key", mode: "shared", ...saved } as const;
+    // The report can use it, but the manager's Claude harness cannot. BASE
+    // authorized this all-consumer assignment without resolving as the manager.
+    await expect(aiConnectionService(db).select({ companyId: f.companyId, userId: f.userId, agentId: f.ids.lead,
+      adapterType: "paperclip_runner", runnerProvider: "claude", model: "claude-sonnet-4-5", binding: selected })).rejects.toThrow();
+    const observed = observeBindingAuthorization();
+    try {
+      const response = await f.patch(f.ids.report, selected);
+      expect(response.status, response.text).toBe(200);
+      expect((await f.read()).runtimeConfig.aiConnection).toEqual(selected);
+      expect((await f.call("get", f.ids.report)).body.runtimeConfig.aiConnection).toEqual(selected);
+      expect(observed.operations).toEqual(["agent.ai-binding.update"]);
+    } finally { observed.restore(); }
+  });
   for (const target of ["outside", "root", "lead"] as const) {
     it(`R2: ${target} is refused for the scoped lead`, async () => {
       const f = await seed(); const before = await f.read(f.ids[target]);
