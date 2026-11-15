@@ -11,7 +11,7 @@ import { notifyAttentionRetentionWork } from "./retention-work-notifications.js"
 import { notifySkillVersionPinChange } from "./skill-version-retention-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { agents, assets, agentConfigRevisions, agentTaskSessions, agentRuntimeState, type Db } from "@paperclipai/db";
 import { aiRuntimeConnectionBindingSchema, normalizeAgentUrlKey, extractAgentMentionIds } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
@@ -33,6 +33,15 @@ export async function lockAgentConfigurationInteractions(tx: Db, id: string, dat
   const pluginOrigin = currentPluginInteractionOrigin();
   if (pluginOrigin) options = { ...options, recordRevision: { ...options?.recordRevision,
     createdByAgentId: pluginOrigin.agentId, createdByUserId: null, source: options?.recordRevision?.source ?? "plugin_agent" } };
+  if (options?.reportAiBindingActor) {
+    const runtime = data.runtimeConfig;
+    const binding = aiRuntimeConnectionBindingSchema.safeParse(isPlainRecord(runtime) ? runtime.aiConnection : undefined).data;
+    if (binding?.mode !== "shared") throw forbidden("Report AI assignment requires a shared account");
+    // Audience replacement owns this mutex and its runtime-invalidation trigger
+    // locks agents. Join it BEFORE taking any agent locks to avoid lock inversion,
+    // then re-read eligibility in prepareAgentConfiguration through commit.
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${"paperclip.connection_grant_audience:" + binding.grantId}, 0))`);
+  }
   const interactionActorId = pluginOrigin?.agentId ?? options?.recordRevision?.createdByAgentId;
   if (interactionActorId) {
     const [target] = await tx.select({ companyId: agents.companyId }).from(agents).where(eq(agents.id, id));

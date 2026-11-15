@@ -78,12 +78,19 @@ describe("manager assigns a company AI connection to its own report", () => {
     // Schedule committed authority changes after HTTP admission, immediately
     // before the lifecycle writer opens its company-locked transaction.
     let beforeWrite: (() => Promise<void>) | undefined;
+    let onWriterExecute: (() => void) | undefined;
     const routeDb = new Proxy(db, { get(target, key, receiver) {
       if (key !== "transaction") return Reflect.get(target, key, receiver);
       return async (...args: Parameters<typeof target.transaction>) => {
         const change = beforeWrite; beforeWrite = undefined;
         await change?.();
-        return target.transaction(...args);
+        return target.transaction(tx => args[0](new Proxy(tx, { get(transaction, property, proxyReceiver) {
+          if (property !== "execute") return Reflect.get(transaction, property, proxyReceiver);
+          return (...query: Parameters<typeof transaction.execute>) => {
+            onWriterExecute?.();
+            return transaction.execute(...query);
+          };
+        } })), args[1]);
       };
     } });
     const api = express(); api.use(express.json()); api.use(actorMiddleware(routeDb, { deploymentMode: "authenticated" }));
@@ -109,7 +116,8 @@ describe("manager assigns a company AI connection to its own report", () => {
     const revoke = (permissionKey: string) => db.delete(principalPermissionGrants).where(and(eq(principalPermissionGrants.companyId, companyId),
       eq(principalPermissionGrants.principalId, ids.lead), eq(principalPermissionGrants.permissionKey, permissionKey)));
     return { companyId, userId, otherUserId, ids, key: key!, call, read, account, binding, oldBinding, patch, revoke,
-      beforeWrite: (change: () => Promise<void>) => { beforeWrite = change; } };
+      beforeWrite: (change: () => Promise<void>) => { beforeWrite = change; },
+      onWriterExecute: (observe: () => void) => { onWriterExecute = observe; } };
   }
 
   function observeBindingAuthorization() {
@@ -309,17 +317,7 @@ describe("manager assigns a company AI connection to its own report", () => {
     const replacing = toolAccessService(audienceDb).replaceConnectionGrantMembers(f.binding.connectionId, f.binding.grantId,
       [f.otherUserId], { actorType: "user", actorId: f.userId });
     await audienceLocked.promise;
-    const original = configuration.prepareAgentConfiguration;
-    const seam = vi.spyOn(configuration, "prepareAgentConfiguration").mockImplementationOnce(async (tx, ...args) => {
-      const observed = new Proxy(tx, { get(target, key, receiver) {
-        if (key !== "execute") return Reflect.get(target, key, receiver);
-        return (...query: Parameters<typeof target.execute>) => {
-          writerLockAttempted.resolve();
-          return target.execute(...query);
-        };
-      } });
-      return original(observed, ...args);
-    });
+    f.onWriterExecute(() => writerLockAttempted.resolve());
     let pending: Promise<request.Response> | undefined;
     try {
       pending = f.patch().then(response => response);
@@ -336,7 +334,6 @@ describe("manager assigns a company AI connection to its own report", () => {
     } finally {
       releaseAudience.resolve();
       await Promise.allSettled([replacing, ...(pending ? [pending] : [])]);
-      seam.mockRestore();
     }
   });
   for (const race of ["reparent", "runtime-grant", "configure-grant", "account-grant", "audience", "install", "key", "archive"] as const) {
