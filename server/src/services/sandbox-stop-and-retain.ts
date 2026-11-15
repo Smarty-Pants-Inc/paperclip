@@ -112,10 +112,10 @@ export async function prepareSandboxStopAndRetain(db: Db, lease: Lease, recovery
  * ownership before calling. Lease reuse policy does not authorize destruction. */
 export async function prepareHistoricalSandboxStopVerification(db: Db, lease: typeof environmentLeases.$inferSelect) {
   if (lease.status !== "released" || !lease.heartbeatRunId || !lease.providerLeaseId ||
-      lease.metadata?.pendingCleanupInFlight === true || hasRemoteTerminationReceipt(lease))
+      lease.metadata?.pendingCleanupInFlight === true || hasBoundRemoteStopReceipt(lease))
     return null;
-  // Verification fills a missing proof; it must not erase an already completed
-  // stop when follow-up acquisition rejects this lease's old boot source.
+  // Binding, not the independent cleanup flag, makes an ended receipt immutable.
+  // Verification must not erase it when acquisition rejects the old boot source.
   return prepareStopAndRetain(db, lease, "released");
 }
 
