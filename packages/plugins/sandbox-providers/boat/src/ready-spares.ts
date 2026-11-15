@@ -16,8 +16,10 @@ export type ReadySpare = {
   state: string;
   warmed: boolean;
   expiresAt: string;
+  ttlSeconds?: number;
   name: string;
   labels: Record<string, string>;
+  providerObservation?: Record<string, unknown>;
 };
 
 export type ReadySpareOperations = {
@@ -79,6 +81,7 @@ export class ReadySpareKeeper {
   private readonly pools = new Map<string, ReadySpare[]>();
   private readonly inFlightCreates = new Map<string, number>();
   private readonly reconciling = new Map<string, Promise<void>>();
+  private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
   private readonly recentCreates = new Map<string, number[]>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
@@ -90,6 +93,42 @@ export class ReadySpareKeeper {
 
   ready(key: ReadySpareKey): readonly ReadySpare[] {
     return [...(this.pools.get(readySparePoolKey(key)) ?? [])];
+  }
+
+  present(): boolean {
+    return this.pools.size > 0 || this.reconciling.size > 0 || this.adopting.size > 0;
+  }
+
+  async drain(): Promise<void> {
+    while (this.reconciling.size || this.adopting.size) {
+      await Promise.all([...this.reconciling.values(), ...this.adopting.values()].map(work => work.catch(() => undefined)));
+    }
+  }
+
+  /** Load durable labeled inventory into the fast claim index without creating anything. */
+  async adopt(key: ReadySpareKey, operations: ReadySpareOperations): Promise<void> {
+    const poolId = readySparePoolKey(key);
+    if ((this.pools.get(poolId) ?? []).some(item => readyAndHealthy(item, key, this.now()))) return;
+    const active = this.adopting.get(poolId);
+    if (active) return active;
+    const work = this.adoptOnce(key, operations);
+    this.adopting.set(poolId, work);
+    try { await work; }
+    finally { if (this.adopting.get(poolId) === work) this.adopting.delete(poolId); }
+  }
+
+  private async adoptOnce(key: ReadySpareKey, operations: ReadySpareOperations): Promise<void> {
+    const poolId = readySparePoolKey(key);
+    const listed = await operations.list();
+    const keep: ReadySpare[] = [];
+    for (const spare of listed) {
+      if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
+      if (spare.name.startsWith("paperclip-claim:")) continue;
+      if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
+      else await operations.stop(spare);
+    }
+    if (keep.length) this.pools.set(poolId, keep);
+    else this.pools.delete(poolId);
   }
 
   /**
@@ -140,7 +179,7 @@ export class ReadySpareKeeper {
       // handed to a run, even though Boat's immutable spare labels remain.
       if (spare.name.startsWith("paperclip-claim:")) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
-      else if (spare.name.startsWith("paperclip-spare:")) toStop.push(spare);
+      else toStop.push(spare);
     }
     for (const stale of toStop) await operations.stop(stale);
 
@@ -152,7 +191,8 @@ export class ReadySpareKeeper {
     }
     const selected = keep.slice(0, desired);
     for (const surplus of keep.slice(desired)) await operations.stop(surplus);
-    this.pools.set(poolId, selected);
+    if (selected.length) this.pools.set(poolId, selected);
+    else this.pools.delete(poolId);
     if (desired === 0) return;
 
     const missing = Math.max(0, desired - selected.length - (this.inFlightCreates.get(poolId) ?? 0));
@@ -200,13 +240,18 @@ export class ReadySpareKeeper {
   }
 
   /** Refresh only near-expiry live candidates. Failed refreshes make them unclaimable. */
-  async refreshDue(ttlSeconds: number, operations: ReadySpareOperations): Promise<void> {
-    const threshold = this.now() + ttlSeconds * 500;
+  async refreshDue(ttlSeconds: number, operationSource: ReadySpareOperations | ((key: ReadySpareKey) => ReadySpareOperations | undefined)): Promise<void> {
     for (const [poolId, pool] of this.pools) {
+      const representative = pool[0];
+      if (!representative) { this.pools.delete(poolId); continue; }
+      const operations = typeof operationSource === "function" ? operationSource(representative.key) : operationSource;
+      if (!operations) continue;
       for (const spare of [...pool]) {
-        if (!readyAndHealthy(spare, spare.key, this.now()) || Date.parse(spare.expiresAt) > threshold) continue;
+        const spareTtl = spare.ttlSeconds ?? ttlSeconds;
+        const spareThreshold = this.now() + spareTtl * 500;
+        if (!readyAndHealthy(spare, spare.key, this.now()) || Date.parse(spare.expiresAt) > spareThreshold) continue;
         try {
-          const refreshed = await operations.refresh(spare, ttlSeconds);
+          const refreshed = await operations.refresh(spare, spareTtl);
           const index = pool.findIndex(item => item.id === spare.id);
           if (index >= 0) pool[index] = refreshed;
         } catch {

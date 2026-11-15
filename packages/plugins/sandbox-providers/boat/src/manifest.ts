@@ -9,6 +9,12 @@ const manifest: PaperclipPluginManifestV1 = {
   author: "Paperclip",
   categories: ["automation"],
   capabilities: ["environment.drivers.register"],
+  instanceConfigSchema: {
+    type: "object",
+    properties: {
+      spares: { type: "integer", minimum: 0, maximum: 3, default: 0, title: "Warm Boat spares", description: "Keep this many running, pre-warmed Boat sandboxes per environment (0 disables the spare pool)." },
+    },
+  },
   entrypoints: { worker: "./dist/worker.js" },
   environmentDrivers: [{
     driverKey: "boat",

@@ -3,6 +3,8 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
+import { ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySparePoolKey,
+  type ReadySpare, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -25,6 +27,10 @@ import type {
 type Config = RunnerConfig & { provider: string; setupTimeoutSeconds: number; retainOnDestroy: boolean; labels: Record<string, string>; duplexCarrier: "off" | "ssh" };
 const API = "https://boat.dev/api/v1";
 const idleActivity = new BoatIdleActivity();
+const readySpares = new ReadySpareKeeper();
+const knownSparePools = new Map<string, { key: ReadySpareKey; ttlSeconds: number; desired: number; operations: ReadySpareOperations }>();
+let pluginContext: PluginContext | undefined;
+let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 const BOAT_CALL_BUDGET_MS = 30_000;
 const BOAT_MAX_ATTEMPTS = 3;
 function activityKey(config: Config, id: string): string { return createHash("sha256").update(`${API}\0${config.apiKey}\0${id}`).digest("hex"); }
@@ -427,12 +433,212 @@ async function retireForLifecycle(lease: DuplexLease): Promise<SshRetireWarning[
     return [warning];
   }
 }
+function createSandboxBody(config: Config, ttlSeconds: number, labels: Record<string, unknown>, from?: string): Record<string, unknown> {
+  return {
+    type: config.type, ttlSeconds, labels,
+    ...(config.boatEnvironment === undefined ? { noEnv: true } : {}),
+    ...(config.setupScript !== undefined ? { setupScript: config.setupScript } : {}),
+    ...(from !== undefined ? { from } : {}),
+    ...(config.boatEnvironment !== undefined ? { environment: config.boatEnvironment } : {}),
+  };
+}
+function readySpareHash(config: Config, ttlSeconds: number, from: string | undefined): string {
+  return readySpareConfigHash({
+    ...createSandboxBody(config, ttlSeconds, config.labels, from),
+    accountFingerprint: createHash("sha256").update(`${API}\n${config.apiKey}`).digest("hex"),
+  });
+}
+async function listBoatSandboxes(config: Config, labels: Array<[string, string]>): Promise<any[]> {
+  const sandboxes: any[] = [], cursors = new Set<string>();
+  let cursor: string | undefined;
+  do {
+    const query = new URLSearchParams({ limit: "200" });
+    for (const [key, value] of labels) query.append("label", `${key}=${value}`);
+    if (cursor) query.set("cursor", cursor);
+    const result = await request(config, `/sandboxes?${query}`, { signal: AbortSignal.timeout(2500) }, false, { requireJson: true });
+    if (!Array.isArray(result?.sandboxes)) throw new Error("Boat sandbox inventory omitted a sandboxes array");
+    for (const sandbox of result.sandboxes) {
+      if (!sandbox || typeof sandbox !== "object" || typeof sandbox.id !== "string" || !sandbox.id || !sandbox.labels || typeof sandbox.labels !== "object") {
+        throw new Error("Boat sandbox inventory returned an incomplete sandbox record");
+      }
+      sandboxes.push(sandbox);
+    }
+    cursor = result.pageInfo?.nextCursor ?? undefined;
+    if (cursor !== undefined && (typeof cursor !== "string" || !cursor || cursors.has(cursor) || cursors.size >= 100)) {
+      throw new Error("Boat sandbox inventory pagination did not converge");
+    }
+    if (cursor) cursors.add(cursor);
+  } while (cursor);
+  return sandboxes;
+}
+function readySpareFromSandbox(sandbox: any, ttlSeconds: number): ReadySpare {
+  const labels = Object.fromEntries(Object.entries(sandbox.labels ?? {}).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
+  const owner = typeof labels.owner === "string" && labels.owner.startsWith("paperclip:") ? labels.owner.slice("paperclip:".length) : "";
+  const key: ReadySpareKey = { companyId: owner, environmentId: labels.environment ?? "", configHash: labels.configHash ?? "" };
+  const name = typeof sandbox.name === "string" ? sandbox.name : "";
+  const expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? parseDeadline(sandbox.autoStopAt) ?? labels.expiry ?? "";
+  return {
+    id: sandbox.id, key, state: typeof sandbox.state === "string" ? sandbox.state : "unknown",
+    warmed: name === `paperclip-spare:ready:${key.configHash}`, expiresAt, ttlSeconds, name, labels,
+    providerObservation: sandbox as Record<string, unknown>,
+  };
+}
+async function createAndWarmSpare(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): Promise<ReadySpare> {
+  const expiry = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  const labels = { ...config.labels, owner: `paperclip:${key.companyId}`, purpose: "spare", expiry,
+    environment: key.environmentId, configHash: key.configHash };
+  const created = await request(config, "/sandboxes", {
+    method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": randomUUID() },
+    body: JSON.stringify(createSandboxBody(config, ttlSeconds, labels, from)),
+  });
+  const sandbox = created?.sandbox ?? created;
+  if (typeof sandbox?.id !== "string" || !sandbox.id) throw new Error("Boat spare create response omitted sandbox.id");
+  idleActivity.resource(activityKey(config, sandbox.id));
+  try {
+    const ready = await waitReady(config, sandbox.id);
+    const setup = config.setupScript === undefined ? ready : await waitSetup(config, sandbox.id);
+    const warmCommand = `printf '{"type":"get_state","id":"1"}\\n' | PI_CODING_AGENT_DIR=/home/user/.pi/agent timeout 25 pi --mode rpc --no-session | head -1 >/dev/null`;
+    const warmed = await runCommand(config, sandbox.id, warmCommand, 25_000);
+    if (warmed.exitCode !== 0 || warmed.timedOut) throw new Error("Boat spare Pi warm-up did not complete successfully");
+    const name = `paperclip-spare:ready:${key.configHash}`;
+    const updated = await request(config, `/sandboxes/${encodeURIComponent(sandbox.id)}`, {
+      method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ name, ttlSeconds }),
+    }, false, { requireJson: true });
+    const warmedSandbox = updated?.sandbox ?? updated;
+    if (warmedSandbox?.id !== sandbox.id || !["ready", "idle", "running"].includes(warmedSandbox.state)) {
+      throw new Error("Boat spare was not running after Pi warm-up");
+    }
+    const observation = { ...setup, ...warmedSandbox, id: sandbox.id, name };
+    return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
+  } catch (error) {
+    try { await stopSandbox(config, sandbox.id); } catch { /* Boat-side TTL remains the crash-safe stop. */ }
+    throw error;
+  }
+}
+function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSeconds: number, from?: string): ReadySpareOperations {
+  const scoped = [["owner", `paperclip:${key.companyId}`], ["environment", key.environmentId], ["purpose", "spare"]] as Array<[string, string]>;
+  return {
+    async list() {
+      const sandboxes = await listBoatSandboxes(config, scoped);
+      return sandboxes.filter(sandbox => sandbox.labels.owner === `paperclip:${key.companyId}` && sandbox.labels.environment === key.environmentId && sandbox.labels.purpose === "spare")
+        .map(sandbox => readySpareFromSandbox(sandbox, ttlSeconds));
+    },
+    create: () => createAndWarmSpare(config, key, ttlSeconds, from),
+    async claim(spare, name, claimTtlSeconds) {
+      const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+        method: "PATCH", signal: AbortSignal.timeout(2500), body: JSON.stringify({ name, ttlSeconds: claimTtlSeconds }),
+      }, false, { requireJson: true });
+      const sandbox = result?.sandbox ?? result;
+      if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state) || (sandbox.name && sandbox.name !== name)) return false;
+      spare.name = name;
+      spare.state = sandbox.state;
+      spare.expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt) ?? new Date(Date.now() + claimTtlSeconds * 1000).toISOString();
+      spare.ttlSeconds = claimTtlSeconds;
+      spare.providerObservation = { ...(spare.providerObservation ?? {}), ...sandbox, id: spare.id, name };
+      return true;
+    },
+    async refresh(spare, refreshTtlSeconds) {
+      const requestedAt = Date.now();
+      const result = await request(config, `/sandboxes/${encodeURIComponent(spare.id)}`, {
+        method: "PATCH", signal: AbortSignal.timeout(5_000), body: JSON.stringify({ ttlSeconds: refreshTtlSeconds }),
+      }, false, { requireJson: true });
+      const sandbox = result?.sandbox ?? result;
+      if (sandbox?.id !== spare.id || !["ready", "idle", "running"].includes(sandbox.state)) throw new Error("Boat spare TTL refresh returned an unhealthy sandbox");
+      const expiresAt = parseDeadline(sandbox.archiveAfter) ?? parseDeadline(sandbox.expiresAt);
+      if (!expiresAt || Math.abs(Date.parse(expiresAt) - (requestedAt + refreshTtlSeconds * 1000)) > 120_000) throw new Error("Boat spare TTL refresh was not confirmed");
+      return { ...spare, state: sandbox.state, expiresAt, ttlSeconds: refreshTtlSeconds,
+        providerObservation: { ...(spare.providerObservation ?? {}), ...sandbox } };
+    },
+    stop: async spare => { await stopSandbox(config, spare.id); },
+    async allowCreate() {
+      const inventory = await listBoatSandboxes(config, [["owner", `paperclip:${key.companyId}`], ["purpose", "spare"]]);
+      const cutoff = Date.now() - 60 * 60 * 1000;
+      let recent = 0;
+      for (const sandbox of inventory) {
+        if (sandbox.labels.owner !== `paperclip:${key.companyId}` || sandbox.labels.purpose !== "spare") throw new Error("Boat hourly spare inventory returned foreign ownership");
+        const createdAt = Date.parse(sandbox.createdAt);
+        if (!Number.isFinite(createdAt)) return false;
+        if (createdAt >= cutoff) recent++;
+      }
+      return recent < 12;
+    },
+  };
+}
+function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSeconds: number, operations: ReadySpareOperations): void {
+  const poolId = readySparePoolKey(key);
+  knownSparePools.set(poolId, { key, ttlSeconds, desired, operations });
+  void readySpares.reconcile(key, desired, operations).catch(() => {
+    duplexLogger?.warn("Boat ready spare reconciliation failed", { companyId: key.companyId, environmentId: key.environmentId });
+  });
+}
+function refreshReadySpareTtls(): void {
+  void readySpares.refreshDue(READY_SPARE_TTL_SECONDS, key => knownSparePools.get(readySparePoolKey(key))?.operations);
+}
+async function finishAcquisition(
+  params: PluginEnvironmentAcquireLeaseParams,
+  config: Config,
+  id: string,
+  ready: any,
+  labels: Record<string, unknown>,
+  remoteCwd: string,
+  snapshot: ResolvedSnapshot | undefined,
+  claimName: string | null,
+  claimedSpare?: ReadySpare,
+): Promise<PluginEnvironmentLease> {
+  if (claimedSpare) {
+    if (!claimedSpare.warmed || !["ready", "idle", "running"].includes(ready?.state)
+        || ready?.name !== claimName || claimedSpare.labels.owner !== `paperclip:${params.companyId}`
+        || claimedSpare.labels.environment !== params.environmentId || claimedSpare.labels.purpose !== "spare"
+        || claimedSpare.labels.configHash !== claimedSpare.key.configHash) {
+      throw new Error("Boat ready spare ownership or health check failed");
+    }
+  }
+  const ownership = boatOwnershipForLease(ready, id);
+  let snapshotIdentity: BoatLeaseSnapshotIdentity | undefined;
+  if (params.resolveSnapshotIdentity === true && snapshot) {
+    const organizationId = ownership.boatOrgId;
+    if (typeof organizationId !== "string" || !organizationId.trim()) {
+      throw new Error("Boat snapshot identity requires a team organizationId on the created sandbox.");
+    }
+    snapshotIdentity = { provider: config.provider, requestedRef: config.snapshot!, ...snapshot, organizationId };
+  }
+  const expiry = ready.archiveAfter ?? ready.expiresAt ?? ready.autoStopAt ?? null;
+  const workspaceSentinel = await writeWorkspaceSentinel(params, config, id, remoteCwd, {
+    request: (path, init) => request(config, path, init), run: (command, timeout) => runCommand(config, id, command, timeout),
+  });
+  const guardianPreflight = await stageGuardian(params.config, id, {
+    request: (path, init) => request(config, path, init), run: (command, timeout) => runCommand(config, id, command, timeout),
+  });
+  await bindDuplexLease(params, id, guardianPreflight);
+  return { providerLeaseId: id, expiresAt: expiry, metadata: { provider: config.provider, sandboxId: id, remoteCwd,
+    ...ownership,
+    ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}),
+    ...(config.snapshot === undefined ? {} : { snapshot: config.snapshot }),
+    ...(snapshotIdentity ? { snapshotIdentity } : {}),
+    adapterType: params.adapterType ?? null, reuseLease: config.reuseLease, resumedLease: false, labels: config.labels,
+    providerLabels: labels, providerClaimName: claimName,
+    workspaceSentinel, ...("allocationFiles" in workspaceSentinel ? { workspaceAllocationFiles: workspaceSentinel.allocationFiles } : {}) } };
+}
+
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
-  async setup(ctx) { duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger; ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight"); },
+  async setup(ctx) {
+    pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
+    if (spareRefreshTimer) clearInterval(spareRefreshTimer);
+    spareRefreshTimer = setInterval(refreshReadySpareTtls, 60_000);
+    spareRefreshTimer.unref?.();
+    ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight");
+  },
   multiCompanyConfig: true,
-  async onConfigChanged() {
+  async onConfigChanged(newConfig, context) {
     // Company/global plugin config is NOT the environment's effective config.
-    // Only scoped acquire/resume and lifecycle teardown can revoke this lease.
+    // Company spare count is instance config; environment lease config remains
+    // the source for Boat credentials and create-shaping fields.
+    const companyId = context?.companyId;
+    if (!companyId) return;
+    const desired = readySpareCount(newConfig);
+    for (const pool of knownSparePools.values()) {
+      if (pool.key.companyId === companyId) queueSpareReconciliation(pool.key, desired, pool.ttlSeconds, pool.operations);
+    }
   },
   onDuplexChannelOpen: params => duplexChannels.open(params),
   onDuplexChannelWrite: params => duplexChannels.write(params),
@@ -451,10 +657,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } catch { return { status: "error", message: "Boat SSH guardian status probe failed." }; }
   },
   async onShutdown() {
-    try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
-    duplexContext = undefined; duplexLogger = undefined; runnerIngressGenerationStore.reset();
+    if (spareRefreshTimer) clearInterval(spareRefreshTimer);
+    spareRefreshTimer = undefined;
+    try { await readySpares.drain(); } finally {
+      try { await duplexChannels.shutdown(); } finally { await sshCarrier.close(); }
+    }
+    duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
   },
-  async onIdleDrain() { return idleActivity.present() || duplexChannels.present() ? "present" : "none"; },
+  async onIdleDrain() { return idleActivity.present() || duplexChannels.present() || readySpares.present() ? "present" : "none"; },
   async onEnvironmentValidateConfig(params: PluginEnvironmentValidateConfigParams): Promise<PluginEnvironmentValidationResult> {
     const c = parse(params.config); const errors: string[] = [];
     if (!c.apiKey) errors.push("Boat apiKey is required.");
@@ -509,38 +719,46 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     const snapshot = c.snapshot === undefined ? undefined : await resolveSnapshotForCreate(c);
     const from = snapshot?.name ?? c.from;
+    let desiredSpares = 0, hasSpareSetting = false;
+    if (pluginContext) {
+      try { desiredSpares = readySpareCount(await pluginContext.config.get(params.companyId)); hasSpareSetting = true; }
+      catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
+    }
+    const spareHash = readySpareHash(c, ttl, from);
+    const spareKey: ReadySpareKey = { companyId: params.companyId, environmentId: params.environmentId, configHash: spareHash };
+    const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
     let id: string | undefined;
+    let claimedSpare: ReadySpare | undefined;
+    let claimName: string | null = null;
     try {
-      const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify({ type: c.type, ttlSeconds: ttl, labels, ...(c.boatEnvironment === undefined ? { noEnv: true } : {}), ...(c.setupScript !== undefined ? { setupScript: c.setupScript } : {}), ...(from !== undefined ? { from } : {}), ...(c.boatEnvironment !== undefined ? { environment: c.boatEnvironment } : {}) }) });
+      if (spareOperations && desiredSpares > 0 && readySpares.ready(spareKey).length === 0) {
+        // A restart loses only the in-memory fast index. Rebuild it from Boat's
+        // immutable ownership labels before the claim; inventory errors fall
+        // straight through to the ordinary create path.
+        try { await readySpares.adopt(spareKey, spareOperations); } catch { /* fail open to the established create path */ }
+      }
+      if (spareOperations && desiredSpares > 0) {
+        const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${attemptId}`;
+        claimedSpare = await readySpares.claim(spareKey, claimAttempt, ttl, spareOperations);
+        if (claimedSpare) {
+          id = claimedSpare.id;
+          claimName = `paperclip-claim:${claimAttempt}`;
+          const observation = claimedSpare.providerObservation;
+          const ready = observation ?? { id, state: claimedSpare.state, name: claimName, labels: claimedSpare.labels };
+          // Immediately begin the replacement while shared lease preparation
+          // runs; no claims can see the transferred ID again.
+          queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+          return await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
+        }
+      }
+      if (spareOperations) queueSpareReconciliation(spareKey, desiredSpares, ttl, spareOperations);
+      const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
       const sb = created?.sandbox ?? created; if (typeof sb?.id !== "string" || !sb.id) throw new Error("Boat create response did not contain sandbox.id");
       id = sb.id;
       idleActivity.resource(activityKey(c, sb.id));
       const ready = await waitReady(c, sb.id);
       const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
-      const ownership = boatOwnershipForLease(ownershipObservation, sb.id);
-      let snapshotIdentity: BoatLeaseSnapshotIdentity | undefined;
-      if (params.resolveSnapshotIdentity === true && snapshot) {
-        const organizationId = ownership.boatOrgId;
-        if (typeof organizationId !== "string" || !organizationId.trim()) {
-          throw new Error("Boat snapshot identity requires a team organizationId on the created sandbox.");
-        }
-        snapshotIdentity = { provider: c.provider, requestedRef: c.snapshot!, ...snapshot, organizationId };
-      }
-      const expiry = ready.archiveAfter ?? ready.expiresAt ?? ready.autoStopAt ?? null;
-      const workspaceSentinel = await writeWorkspaceSentinel(params, c, sb.id, remoteCwd, {
-        request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, sb.id, command, timeout),
-      });
-      const guardianPreflight = await stageGuardian(params.config, sb.id, {
-        request: (path, init) => request(c, path, init), run: (command, timeout) => runCommand(c, sb.id, command, timeout),
-      });
-      await bindDuplexLease(params, sb.id, guardianPreflight);
-      return { providerLeaseId: sb.id, expiresAt: expiry, metadata: { provider: c.provider, sandboxId: sb.id, remoteCwd,
-        ...ownership,
-        ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}),
-        ...(c.snapshot === undefined ? {} : { snapshot: c.snapshot }),
-        ...(snapshotIdentity ? { snapshotIdentity } : {}),
-        adapterType: params.adapterType ?? null, reuseLease: c.reuseLease, resumedLease: false, labels: c.labels, providerLabels: labels,
-        workspaceSentinel, ...("allocationFiles" in workspaceSentinel ? { workspaceAllocationFiles: workspaceSentinel.allocationFiles } : {}) } };
+      return await finishAcquisition(params, c, sb.id, ownershipObservation, labels, remoteCwd, snapshot, null);
     } catch (e) {
       // A lost reply can still have allocated: recover exact IDs before teardown.
       // If lookup is unavailable, the durable creation label remains inspectable.
