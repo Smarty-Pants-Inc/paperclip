@@ -47,6 +47,8 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
     : sql``;
   // A retained allocation is warm capacity, not agent execution. Finished-run,
   // ownership, finalization and cleanup obligations must still settle separately.
+  // Superseded handoff receipts are aliases: the successor owns the shared tree,
+  // so none of the predecessor's stale stop/retry/cleanup fields owns work.
   return sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs r
       WHERE r.company_id = ${agents.companyId} AND r.agent_id = ${agents.id}
         AND r.status IN ('running', 'queued'))
@@ -72,6 +74,8 @@ export function settledAgentWorkCondition(liveRunIds: ReadonlySet<string>, now: 
         AND (${sql.raw(finishedIdleWake("w"))}) IS NOT TRUE)
     AND NOT EXISTS (SELECT 1 FROM agent_instruction_working_copies c
       WHERE c.company_id = ${agents.companyId} AND c.agent_id = ${agents.id}
+        AND (c.state = 'superseded' AND jsonb_typeof(c.receipt->'successorRunId') = 'string'
+          AND btrim(c.receipt->>'successorRunId') <> '') IS NOT TRUE
         AND (c.state NOT IN ('saved', 'unchanged', 'resolved', 'unavailable', 'conflict')
           OR c.process_stopped_at IS NULL OR c.next_attempt_at IS NOT NULL
           OR c.receipt ? 'baseline' OR c.receipt->>'cleanupPending' = 'true'))`;
