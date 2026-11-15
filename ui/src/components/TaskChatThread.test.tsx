@@ -1209,10 +1209,11 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   // this runtime's REAL renderer: native runs are `paperclip_runner` runs read
   // from the native transcript store, so they render through TaskChatRunnerTurn.
   const reasoningThoughts = ["First adapter thought", "Second adapter thought"];
-  function reasoningRun(adapterDisplay?: "inline" | "fold") {
+  // "registered" keeps the adapter exactly as the app registers it (no override).
+  function reasoningRun(adapterDisplay?: "inline" | "fold" | "registered") {
     const adapterType = runtimeMode === "native" ? "paperclip_runner" : "codex_local";
     const original = findUIAdapter(adapterType)!;
-    registerUIAdapter({
+    if (adapterDisplay !== "registered") registerUIAdapter({
       ...original,
       transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
     });
@@ -1348,6 +1349,56 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
       await settleThreadLayout();
       expectReasoning("inline");
       expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
+    }
+  });
+
+  // Paul's Smarty agents are `paperclip_runner` with provider pi_rpc. With no
+  // stored choice for the agent, a native run's reasoning shows inline as the
+  // plain paragraphs (no fold, no click) through the adapter as registered.
+  function expectPlainInline() {
+    expectReasoning("inline");
+    for (const block of inlineReasoning()) {
+      expect(block.querySelector('[data-testid="task-chat-reasoning-plain"]')).not.toBeNull();
+      expect(block.querySelectorAll("ul, li, button").length).toBe(0);
+    }
+    expect(container.querySelector('[data-testid="task-chat-thinking-preview"]')).toBeNull();
+    expect(container.querySelector(".tc-turn-fold")).toBeNull();
+  }
+  it.runIf(runtimeMode === "native")("shows a native paperclip_runner run's reasoning inline with no stored choice, live, settled and after a cold remount", async () => {
+    expect(reasoningPreferenceState.byAgent).toEqual({});
+    const run = reasoningRun("registered");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+      expectPlainInline();
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectPlainInline();
+      expect(container.textContent).toContain("Saved adapter reply");
+      flushSync(() => root!.unmount());
+      root = createRoot(container);
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectPlainInline();
+      expect(container.textContent).toContain("Saved adapter reply");
+    } finally {
+      run.restore();
+    }
+  });
+
+  it.runIf(runtimeMode === "native")("still folds a native paperclip_runner run when the person stored Folded for the agent", async () => {
+    reasoningPreferenceState.byAgent["agent-1"] = "fold";
+    const run = reasoningRun("registered");
+    try {
+      render(<TaskChatThread {...run.live} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
+      render(<TaskChatThread {...run.settled} />);
+      await settleThreadLayout();
+      expectReasoning("fold");
     } finally {
       run.restore();
     }
