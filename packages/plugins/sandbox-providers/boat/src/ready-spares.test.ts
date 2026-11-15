@@ -54,6 +54,7 @@ describe("Boat ready spare keeper", () => {
     expect(readySpareDemandWindowMinutes({ spareDemandWindowMinutes: 61 })).toBe(10);
     expect(readySpareDemandTarget(1, 1, 3)).toBe(2);
     expect(readySpareDemandTarget(1, 2, 3)).toBe(3);
+    expect(readySpareDemandTarget(1, 4, 5)).toBe(5);
     expect(readySpareDemandTarget(1, 8, 3)).toBe(3);
     expect(readySpareDemandTarget(3, 1, 5)).toBe(3);
     expect(readySpareConfigHash({ type: "small", labels: { b: "2", a: "1" } }))
