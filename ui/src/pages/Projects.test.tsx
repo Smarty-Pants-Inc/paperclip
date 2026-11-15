@@ -268,7 +268,29 @@ describe("Projects", () => {
     expect(taskCountText("Charlie")?.textContent).toBe("All tasks done");
     expect(taskCountText("Charlie")?.title).toBe("0 open of 1 task");
     expect(taskCountText("Delta")?.textContent).toBe("No tasks");
-    // The badge stays the project's own status; it never flips on its own.
+  });
+
+  function pillText(projectName: string) {
+    const link = Array.from(container.querySelectorAll<HTMLAnchorElement>("a")).find((element) =>
+      element.textContent?.includes(projectName),
+    );
+    return link?.querySelector<HTMLElement>("[data-testid='project-status-pill']")?.textContent ?? null;
+  }
+
+  it("shows the pill derived from the tasks, not the stored status", async () => {
+    mockProjectsApi.list.mockResolvedValue([
+      makeProject({ id: "project-a", urlKey: "alpha", name: "Alpha", status: "backlog", taskCount: 3, openTaskCount: 1, derivedStatus: "in_progress" }),
+      makeProject({ id: "project-b", urlKey: "bravo", name: "Bravo", status: "in_progress", taskCount: 1, openTaskCount: 0, derivedStatus: "done" }),
+      makeProject({ id: "project-c", urlKey: "charlie", name: "Charlie", status: "completed", taskCount: 0, openTaskCount: 0, derivedStatus: "not_started" }),
+    ]);
+    await renderProjects();
+
+    expect(pillText("Alpha")).toBe("In progress");
+    expect(pillText("Bravo")).toBe("Done");
+    expect(taskCountText("Bravo")?.textContent).toBe("All tasks done");
+    expect(pillText("Charlie")).toBe("Not started");
+    // The stored status is no longer what the pill shows.
+    expect(container.textContent).not.toContain("backlog");
     expect(container.textContent).not.toContain("completed");
   });
 

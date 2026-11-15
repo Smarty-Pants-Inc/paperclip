@@ -42,7 +42,7 @@ vi.mock("../context/CompanyContext", () => ({
   useCompany: () => ({ companies: [{ id: "company-1", issuePrefix: "PAP" }], selectedCompanyId: "company-1", setSelectedCompanyId: vi.fn() }),
 }));
 
-// Heavy children that are unrelated to the status picker.
+// Heavy children that are unrelated to the status control.
 vi.mock("./environment-variables-editor", () => ({ EnvironmentVariablesEditor: () => null }));
 vi.mock("./InlineEditor", () => ({ InlineEditor: ({ value }: { value?: ReactNode }) => <div>{value}</div> }));
 vi.mock("./PathInstructionsModal", () => ({ ChoosePathButton: () => null }));
@@ -87,7 +87,7 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-async function render(project: Project, onFieldUpdate: (field: string, data: Record<string, unknown>) => void) {
+async function render(project: Project, onFieldUpdate?: (field: string, data: Record<string, unknown>) => void) {
   act(() => {
     root.render(
       <QueryClientProvider client={primedClient()}>
@@ -98,58 +98,27 @@ async function render(project: Project, onFieldUpdate: (field: string, data: Rec
     );
   });
   await vi.waitFor(() => {
-    expect(container.querySelector("[data-testid='project-status']")).not.toBeNull();
+    expect(container.textContent).toContain("Visibility");
   });
 }
 
-function picker(): HTMLSelectElement {
-  const select = container.querySelector<HTMLSelectElement>("[data-testid='project-status']");
-  if (!select) throw new Error("Status picker not rendered");
-  return select;
-}
-
-// A project reads finished only when a person says so: the Configuration tab
-// carries the project's own status, saved through the project update.
+// The project's pill follows its tasks, so Configuration carries no hand-set
+// Status control (upstream removed it; it stays removed).
 describe("ProjectProperties status", () => {
-  it("lists the five project statuses with plain labels and shows the current one", async () => {
+  it("has no Status control", async () => {
     await render(makeProject({ status: "in_progress" }), vi.fn());
 
-    expect([...picker().options].map((option) => [option.value, option.textContent])).toEqual([
-      ["backlog", "Backlog"],
-      ["planned", "Planned"],
-      ["in_progress", "In progress"],
-      ["completed", "Completed"],
-      ["cancelled", "Cancelled"],
-    ]);
-    expect(picker().value).toBe("in_progress");
-    expect(container.textContent).toContain("Status");
+    expect(container.querySelector("[data-testid='project-status']")).toBeNull();
+    expect(container.querySelector("select[aria-label='Status']")).toBeNull();
+    const optionLabels = [...container.querySelectorAll("option")].map((option) => option.textContent);
+    expect(optionLabels).not.toContain("Completed");
+    expect(optionLabels).not.toContain("Planned");
   });
 
-  it("saves a new status through the field update", async () => {
-    const onFieldUpdate = vi.fn();
-    await render(makeProject({ status: "in_progress" }), onFieldUpdate);
+  it("has no Status control when the project is read-only", async () => {
+    await render(makeProject({ status: "planned" }));
 
-    act(() => {
-      picker().value = "completed";
-      picker().dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(onFieldUpdate).toHaveBeenCalledWith("status", { status: "completed" });
-  });
-
-  it("is read-only when the project cannot be updated", async () => {
-    act(() => {
-      root.render(
-        <QueryClientProvider client={primedClient()}>
-          <TooltipProvider>
-            <ProjectProperties project={makeProject({ status: "planned" })} onArchive={noop} />
-          </TooltipProvider>
-        </QueryClientProvider>,
-      );
-    });
-    await vi.waitFor(() => {
-      expect(container.querySelector("[data-testid='project-status']")).not.toBeNull();
-    });
-    expect(picker().disabled).toBe(true);
-    expect(picker().value).toBe("planned");
+    expect(container.querySelector("[data-testid='project-status']")).toBeNull();
+    expect(container.querySelector("select[aria-label='Status']")).toBeNull();
   });
 });
