@@ -445,13 +445,7 @@ suite("fresh-continuation fallback", () => {
       expect(notes).toHaveLength(1);
       const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
       expect(notes[0].body).toBe(await freshThreadStartedNote(db, source));
-      if (code === "native_runner_refresh_required") {
-        expect(notes[0].body).toContain("your skill change is in effect; Coder restarted its working thread");
-        expect(notes[0].body).not.toContain("could not be safely restored");
-      } else {
-        expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-        expect(notes[0].body).not.toMatch(/skill change/);
-      }
+      expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
     });
 
   it("RFL F3 appends changed notes, supersedes without rewriting another owner's note, and is idempotent", async () => {

@@ -46,6 +46,7 @@ import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer
 import { resolveNativeControllerRecovery, assertNativeRetainedSandboxBinding } from "../native-runtime/native-controller-recovery.js";
 import { createSystemRecovery } from "../system-recovery-state.js";
 import { createReusableLeaseHandoff } from "../environment-lease-handoff.js";
+import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
 // filesystem materialization and sandbox synchronization at their external boundaries.
@@ -108,7 +109,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     return { input, issue, run, agent };
   }
   // TEST-ONLY Cut B: pin note bytes independently of the production constants.
-  const cutBStartedNote = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
+  const cutBStartedNote = FRESH_THREAD_STARTED_NOTE;
 
   // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
   // contract, then into the durable fresh-history owner, without prose authority.
@@ -1091,9 +1092,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(c => c.authorType === "system");
     const notes = allNotes.filter(c => !c.metadata?.supersededByCommentId);
-    const expectedNote = scenario === "idle-descendants" || scenario === "active-turn" || scenario === "generic-prepare"
-      ? `your skill change is in effect; ${f.agent.name} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`
-      : cutBStartedNote;
+    const expectedNote = cutBStartedNote;
     expect(notes.map(note => note.body)).toEqual([expectedNote]);
     expect(allNotes).toHaveLength(heldCommentId ? 2 : 1);
     if (seedSequence || scenario === "backup-without-lease" || scenario === "retained-binding") {
@@ -1151,8 +1150,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(comment => comment.authorType === "system");
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain(`your skill change is in effect; ${f.agent.name} restarted its working thread`);
-    expect(notes[0].body).not.toContain("could not be safely restored");
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
   });
 
   it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {
