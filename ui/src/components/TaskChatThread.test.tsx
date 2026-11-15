@@ -4,7 +4,7 @@ import type { ComponentProps, ReactElement } from "react";
 import { act, forwardRef, useImperativeHandle, type ForwardedRef } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
   useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
@@ -865,6 +865,13 @@ it.each([true, false])("reveals saved conversation when initial history stalls (
   }
 });
 
+/** Declare an adapter's reasoning default for one test; restored when it ends. */
+function useAdapterReasoningDefault(adapterType: string, view: "inline" | "fold") {
+  const original = findUIAdapter(adapterType)!;
+  registerUIAdapter({ ...original, transcriptPresentation: { ...original.transcriptPresentation, liveReasoningView: view } });
+  onTestFinished(() => { registerUIAdapter(original); });
+}
+
 describe.each(["legacy", "native"] as const)("%s task history readiness", (runtimeMode) => {
   const retryRun = {
     runId: "scheduled-run",
@@ -1127,7 +1134,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   it.each(["running", "succeeded"])(
     "reveals durable comments together with a %s run's initial history",
     async (status) => {
-      localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
+      useAdapterReasoningDefault(retryRun.adapterType, "inline");
       const props = {
         issueId: "issue-1",
         comments: [...createLongThreadComments(), {
@@ -1196,19 +1203,23 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     },
   );
 
-  // Reasoning display precedence: the in-memory choice (even when saving it
-  // fails) > the saved device choice > the run adapter's
-  // transcriptPresentation.liveReasoningView > fold. Each case runs on this
-  // runtime's REAL renderer: native runs are `paperclip_runner` runs read from
-  // the native transcript store, so they render through TaskChatRunnerTurn.
+  // Reasoning display (look-only): the run adapter's
+  // transcriptPresentation.liveReasoningView > fold. There is no per-chat
+  // switch and the old per-browser localStorage choice decides nothing. Each
+  // case runs on this runtime's REAL renderer: native runs are
+  // `paperclip_runner` runs read from the native transcript store, so they
+  // render through TaskChatRunnerTurn.
   const reasoningThoughts = ["First adapter thought", "Second adapter thought"];
-  function reasoningRun(adapterDisplay?: "inline" | "fold") {
+  /** `"registered"` keeps the adapter exactly as the app registers it. */
+  function reasoningRun(adapterDisplay?: "inline" | "fold" | "registered") {
     const adapterType = runtimeMode === "native" ? "paperclip_runner" : "codex_local";
     const original = findUIAdapter(adapterType)!;
-    registerUIAdapter({
-      ...original,
-      transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
-    });
+    if (adapterDisplay !== "registered") {
+      registerUIAdapter({
+        ...original,
+        transcriptPresentation: adapterDisplay ? { liveReasoningView: adapterDisplay } : undefined,
+      });
+    }
     const runId = "adapter-default-run";
     const startedAt = "2026-08-25T18:00:00.000Z";
     const liveRun = {
@@ -1243,10 +1254,12 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
   }
   const inlineReasoning = () =>
     Array.from(container.querySelectorAll<HTMLElement>('[data-reasoning-display="inline"]'));
-  const reasoningToggle = () =>
-    container.querySelector<HTMLButtonElement>('[data-testid="task-chat-reasoning-display-toggle"]')!;
+  function expectNoPerChatSwitch() {
+    expect(container.querySelector('[data-testid="task-chat-reasoning-display-toggle"]')).toBeNull();
+    expect(Array.from(container.querySelectorAll("button")).some((button) => /Reasoning:/.test(button.textContent ?? ""))).toBe(false);
+  }
   function expectReasoning(display: "inline" | "fold") {
-    expect(reasoningToggle().textContent).toContain(display === "inline" ? "Inline" : "Folded");
+    expectNoPerChatSwitch();
     if (display === "fold") {
       expect(inlineReasoning()).toHaveLength(0);
     } else {
@@ -1257,21 +1270,11 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     }
     expect(container.textContent).not.toContain("Private tool output");
   }
-  function chooseReasoningWithFailingSave() {
-    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
-      throw new Error("storage denied");
-    });
-    flushSync(() => reasoningToggle().click());
-  }
-
   it.each([
-    { adapterDisplay: "inline", override: null, expected: "inline" },
-    { adapterDisplay: "fold", override: null, expected: "fold" },
-    { adapterDisplay: "inline", override: "fold", expected: "fold" },
-    { adapterDisplay: "fold", override: "inline", expected: "inline" },
-    { adapterDisplay: undefined, override: null, expected: "fold" },
-  ] as const)("live run uses adapter default $adapterDisplay with saved choice $override", async ({ adapterDisplay, override, expected }) => {
-    if (override) localStorage.setItem("paperclip:task-chat:reasoning-display:v1", override);
+    { adapterDisplay: "inline", expected: "inline" },
+    { adapterDisplay: "fold", expected: "fold" },
+    { adapterDisplay: undefined, expected: "fold" },
+  ] as const)("live run uses adapter default $adapterDisplay", async ({ adapterDisplay, expected }) => {
     const run = reasoningRun(adapterDisplay);
     try {
       render(<TaskChatThread {...run.live} />);
@@ -1307,45 +1310,51 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     }
   });
 
-  it("folds reasoning live and after settle when Folded is chosen and saving it fails", async () => {
-    localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
-    const run = reasoningRun("inline");
+  it.each([
+    { adapterDisplay: "fold", stored: "inline", expected: "fold" },
+    { adapterDisplay: "inline", stored: "fold", expected: "inline" },
+    { adapterDisplay: undefined, stored: "inline", expected: "fold" },
+  ] as const)("ignores the old per-browser choice $stored (adapter default $adapterDisplay)", async ({ adapterDisplay, stored, expected }) => {
+    localStorage.setItem("paperclip:task-chat:reasoning-display:v1", stored);
+    const run = reasoningRun(adapterDisplay);
     try {
       render(<TaskChatThread {...run.live} />);
       await settleThreadLayout();
-      expectReasoning("inline");
-      chooseReasoningWithFailingSave();
-      expect(localStorage.getItem("paperclip:task-chat:reasoning-display:v1")).toBe("inline");
-      expectReasoning("fold");
+      expectReasoning(expected);
       render(<TaskChatThread {...run.settled} />);
       await settleThreadLayout();
-      expectReasoning("fold");
-      expect(container.textContent).toContain("Saved adapter reply");
+      expectReasoning(expected);
+      expect(localStorage.getItem("paperclip:task-chat:reasoning-display:v1")).toBe(stored);
     } finally {
       run.restore();
     }
   });
 
-  it("shows reasoning live and after settle when Inline is chosen and saving it fails", async () => {
-    const run = reasoningRun();
-    try {
-      render(<TaskChatThread {...run.live} />);
-      await settleThreadLayout();
-      expectReasoning("fold");
-      chooseReasoningWithFailingSave();
-      expect(localStorage.getItem("paperclip:task-chat:reasoning-display:v1")).toBeNull();
-      expectReasoning("inline");
-      render(<TaskChatThread {...run.settled} />);
-      await settleThreadLayout();
-      expectReasoning("inline");
-      expect(container.textContent).toContain("Saved adapter reply");
-    } finally {
-      run.restore();
-    }
-  });
+  if (runtimeMode === "native") {
+    // Paul's agents are all paperclip_runner / pi_rpc. With the adapter as the
+    // app registers it (no override) and nothing clicked, a stale folded
+    // per-browser value included, the reasoning is inline live and settled.
+    it("shows a paperclip_runner run's reasoning inline with no click (registered adapter default)", async () => {
+      localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "fold");
+      const run = reasoningRun("registered");
+      try {
+        render(<TaskChatThread {...run.live} />);
+        await settleThreadLayout();
+        expect(container.querySelector('[data-testid="task-chat-runner-turn"]')).not.toBeNull();
+        expectReasoning("inline");
+        render(<TaskChatThread {...run.settled} />);
+        await settleThreadLayout();
+        expectReasoning("inline");
+        expect(container.querySelector(".tc-turn-fold")).toBeNull();
+        expect(container.textContent).toContain("Saved adapter reply");
+      } finally {
+        run.restore();
+      }
+    });
+  }
 
   it.each(["fold", "inline"] as const)("shows %s reasoning in the live phase", async (display) => {
-    if (display === "inline") localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "inline");
+    useAdapterReasoningDefault(runtimeMode === "native" ? "paperclip_runner" : "codex_local", display);
     const liveRun = {
       id: "live-reasoning-run", runtimeMode, status: "running" as const, invocationSource: "issue" as const,
       triggerDetail: null, startedAt: "2026-08-25T18:00:00.000Z", finishedAt: null,
