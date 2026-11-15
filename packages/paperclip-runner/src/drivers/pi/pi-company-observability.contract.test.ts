@@ -1,21 +1,26 @@
-import { readFile, readdir, writeFile } from "node:fs/promises";
+import { access, readFile, readdir, writeFile } from "node:fs/promises";
+import { setImmediate } from "node:timers/promises";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
 import { configuredEnvironmentProjection } from "../../configured-environment.js";
-import { assistant, attrs, environment, openPi, sentinel, spans, terminal, tool, user } from "./pi-observability.test-fixture.js";
+import { assistant, attrs, createPiObservabilityTest, environment, sentinel, spans, terminal, tool, user } from "./pi-observability.test-fixture.js";
 
-let bodies: any[];
-let transport: ReturnType<typeof vi.fn<typeof fetch>>;
-beforeEach(() => {
-  bodies = [];
-  transport = vi.fn<typeof fetch>(async (_url, init) => { bodies.push(JSON.parse(String(init?.body))); return new Response("{}"); });
-  vi.stubGlobal("fetch", transport);
+type Capture = ReturnType<typeof createPiObservabilityTest>;
+declare module "vitest" {
+  interface TestContext { capture: Capture }
+}
+beforeEach(context => {
+  context.capture = createPiObservabilityTest();
+  vi.stubGlobal("fetch", context.capture.transport);
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+afterEach(async ({ capture }) => {
+  try { await capture.close(); }
+  finally { vi.unstubAllGlobals(); vi.restoreAllMocks(); }
+});
 
-async function run(env = environment) {
-  const pi = await openPi(env);
+async function run(capture: Capture, env = environment) {
+  const pi = await capture.openPi(env);
   try {
     await pi.start();
     pi.peer.send(...assistant("call-1", { tool: "read" }), ...tool("call-1"), ...terminal);
@@ -24,9 +29,80 @@ async function run(env = environment) {
   } finally { await pi.close(); }
 }
 
+describe("capture isolation guard", { concurrent: false, shuffle: false }, () => {
+  let previousBodies: any[];
+  let release: () => void;
+  let late: Promise<unknown>;
+  it("schedules a fetch push after this test ends", ({ capture: { bodies, transport } }) => {
+    previousBodies = bodies;
+    const previousTransport = transport;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    late = gate.then(() => previousTransport("https://collector.example/v1/traces", { body: JSON.stringify({ late: "safe binding" }) }));
+    expect(previousBodies).toEqual([]);
+  });
+  it("keeps the previous test's late fetch out of this test's array", async ({ capture: { bodies, transport } }) => {
+    expect(bodies).not.toBe(previousBodies);
+    release();
+    await late;
+    expect(previousBodies).toEqual([{ late: "safe binding" }]);
+    expect(bodies).toEqual([]);
+    expect(transport).not.toHaveBeenCalled();
+  });
+});
+
+describe("fixture cleanup guard", { concurrent: false, shuffle: false }, () => {
+  let previous: Awaited<ReturnType<Capture["openPi"]>>;
+  it("leaves an active session for afterEach to close", async ({ capture }) => {
+    previous = await capture.openPi();
+    await previous.start();
+    expect(previous.peer.closed).toBe(false);
+  });
+  it("awaits the previous session and its files before the next test", async ({ capture }) => {
+    expect(previous.peer.closed).toBe(true);
+    await expect(access(previous.root)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(capture.bodies).toEqual([]);
+    expect(capture.transport).not.toHaveBeenCalled();
+  });
+});
+
+it("fixture cleanup drains pending exports from every opened session", async ({ capture }) => {
+  const { bodies, transport, openPi } = capture;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  transport.mockImplementation(async (_url, init) => {
+    await gate;
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response("{}");
+  });
+  const sessions = await Promise.all([openPi(), openPi()]);
+  let closed = false;
+  let cleanup: Promise<void> | undefined;
+  try {
+    for (const pi of sessions) {
+      await pi.start(); pi.peer.send(...assistant("drain"), ...terminal); await pi.settled();
+    }
+    await vi.waitFor(() => expect(transport).toHaveBeenCalledTimes(2));
+    cleanup = capture.close().then(() => { closed = true; });
+    await setImmediate();
+    expect(closed).toBe(false);
+    expect(bodies).toEqual([]);
+  } finally {
+    release();
+    await cleanup;
+  }
+  expect(closed).toBe(true);
+  expect(bodies).toHaveLength(2);
+  for (const pi of sessions) {
+    expect(pi.peer.closed).toBe(true);
+    await expect(access(pi.root)).rejects.toMatchObject({ code: "ENOENT" });
+  }
+  expect(() => openPi()).toThrow("already closing");
+});
+
 describe("R1 native Pi / shared observability contract (obs3, revised by Addenda)", () => {
-  it("exports one root/tool/usage request through the real Pi sink and observability-only adapter", async () => {
-    const pi = await run();
+  it("exports one root/tool/usage request through the real Pi sink and observability-only adapter", async ({ capture }) => {
+    const { bodies, transport } = capture;
+    const pi = await run(capture);
     expect(pi.events).toEqual(expect.arrayContaining([
       expect.objectContaining({ eventType: "turn.started" }),
       expect.objectContaining({ eventType: "turn.completed" }),
@@ -40,21 +116,23 @@ describe("R1 native Pi / shared observability contract (obs3, revised by Addenda
       await writeFile(join(process.env.TASK_OUT, "R3-golden-otlp.json"), JSON.stringify(bodies, null, 2));
     }
   });
-  it("A2.7 containment: subscribers/receipts never see synthetic turn.submitted or rewritten usage", async () => {
-    const pi = await run();
+  it("A2.7 containment: subscribers/receipts never see synthetic turn.submitted or rewritten usage", async ({ capture }) => {
+    const { transport } = capture;
+    const pi = await run(capture);
     expect(pi.events.some(e => e.eventType === "turn.submitted")).toBe(false);
     const receipt = pi.events.find(e => e.eventType === "item.completed" && e.payload.kind === "usage");
     expect(receipt?.payload).not.toHaveProperty("usageMessageId");
     expect(receipt?.payload.usage).toHaveProperty("total.inputTokens", 10);
     expect(transport).toHaveBeenCalledOnce();
   });
-  it("disabled export: zero requests", async () => {
-    await run({ ...environment, PAPERCLIP_OBSERVABILITY_PI: "0" });
+  it("disabled export: zero requests", async ({ capture }) => {
+    const { transport } = capture;
+    await run(capture, { ...environment, PAPERCLIP_OBSERVABILITY_PI: "0" });
     expect(transport).not.toHaveBeenCalled();
   });
 });
 
-it("R2: credentials stay out of Pi child env/argv/config, run receipts and diagnostics", async () => {
+it("R2: credentials stay out of Pi child env/argv/config, run receipts and diagnostics", async ({ capture: { openPi, transport } }) => {
   const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
   const pi = await openPi();
   try {
@@ -83,7 +161,7 @@ describe("F-1: configured and runtime credentials never enter OTLP bodies", () =
   const identity = "-----BEGIN PRIVATE KEY-----\nidentity-f1-first-line\nidentity-f1-second-line\n-----END PRIVATE KEY-----";
   const provider = "f1-provider-6e3a-credential";
   const escaped = (value: string) => JSON.stringify(value).slice(1, -1);
-  async function assertWire(label: string, secrets: string[], expected: string) {
+  async function assertWire({ bodies, transport }: Capture, label: string, secrets: string[], expected: string) {
     expect(transport).toHaveBeenCalled();
     for (const body of bodies) {
       const wire = JSON.stringify(body);
@@ -96,34 +174,38 @@ describe("F-1: configured and runtime credentials never enter OTLP bodies", () =
     expect(JSON.stringify(bodies)).toContain("[REDACTED]");
     if (process.env.TASK_OUT) await writeFile(join(process.env.TASK_OUT, `F1-${label}-otlp.json`), JSON.stringify(bodies, null, 2));
   }
-  it.each([false, true])("(a) redacts a configured task secret echoed by a TOOL RESULT (escaped=%s)", async jsonEscaped => {
+  it.for([false, true])("(a) redacts a configured task secret echoed by a TOOL RESULT (escaped=%s)", async (jsonEscaped, { capture }) => {
+    const { openPi } = capture;
     const pi = await openPi({ ...environment, ...taskEnvironment });
     try {
       await pi.start();
       pi.peer.send(...assistant("result", { tool: "read" }), ...tool("result", "read", `safe result ${jsonEscaped ? escaped(resultSecret) : resultSecret}`), ...terminal);
       await pi.settled();
     } finally { await pi.close(); }
-    await assertWire(`result-${jsonEscaped}`, [resultSecret, escaped(resultSecret)], "safe result");
+    await assertWire(capture, `result-${jsonEscaped}`, [resultSecret, escaped(resultSecret)], "safe result");
   });
-  it("(b) redacts a SECOND configured task secret echoed in the assistant ANSWER", async () => {
+  it("(b) redacts a SECOND configured task secret echoed in the assistant ANSWER", async ({ capture }) => {
+    const { openPi } = capture;
     const pi = await openPi({ ...environment, ...taskEnvironment });
     try {
       await pi.start(); pi.peer.send(...assistant("answer", { text: `safe answer ${answerSecret}` }), ...terminal); await pi.settled();
     } finally { await pi.close(); }
-    await assertWire("answer", [answerSecret], "safe answer");
+    await assertWire(capture, "answer", [answerSecret], "safe answer");
   });
-  it.each([
+  it.for([
     ["identity-raw", identity], ["identity-escaped", escaped(identity)], ["identity-line", "identity-f1-second-line"], ["provider", provider],
-  ])("redacts %s appearing in TOOL ARGS and projected bash command names", async (label, value) => {
+  ])("redacts %s appearing in TOOL ARGS and projected bash command names", async ([label, value], { capture }) => {
+    const { openPi } = capture;
     const pi = await openPi({ ...environment, PAPERCLIP_AGENT_PRIVATE_KEY: identity, OPENROUTER_API_KEY: provider });
     const args = { command: `echo ${value}` };
     try {
       await pi.start(); pi.peer.send(...assistant(label, { tool: "bash", args }), ...tool(label, "bash", "safe tool output", args), ...terminal); await pi.settled();
       expect(pi.events.some(e => e.eventType === "tool.execution.started" && e.payload.name === args.command)).toBe(true);
     } finally { await pi.close(); }
-    await assertWire(label, [value, "identity-f1-first-line", "identity-f1-second-line", provider], "safe tool output");
+    await assertWire(capture, label, [value, "identity-f1-first-line", "identity-f1-second-line", provider], "safe tool output");
   });
-  it("redacts prompt content, managed provider keys, assigned MCP and runner API credentials", async () => {
+  it("redacts prompt content, managed provider keys, assigned MCP and runner API credentials", async ({ capture }) => {
+    const { openPi } = capture;
     const values = { PAPERCLIP_AI_PROVIDER_KEY: "f1-managed-provider-28ab", PAPERCLIP_NATIVE_MCP_TOKEN: "f1-assigned-mcp-54cd", PAPERCLIP_API_KEY: "f1-runner-api-76ef" };
     const pi = await openPi({ ...environment, ...taskEnvironment, ...values,
       PAPERCLIP_NATIVE_MCP_NAME: "fixture", PAPERCLIP_NATIVE_MCP_URL: "https://mcp.example/rpc" });
@@ -131,9 +213,10 @@ describe("F-1: configured and runtime credentials never enter OTLP bodies", () =
       await pi.start(`safe prompt ${answerSecret} ${Object.values(values).join(" ")}`);
       pi.peer.send(...assistant("prompt"), ...terminal); await pi.settled();
     } finally { await pi.close(); }
-    await assertWire("prompt", [answerSecret, ...Object.values(values)], "safe prompt");
+    await assertWire(capture, "prompt", [answerSecret, ...Object.values(values)], "safe prompt");
   });
-  it("redacts generated bind/tool socket capabilities and broker auth on initial AND warm bindings", async () => {
+  it("redacts generated bind/tool socket capabilities and broker auth on initial AND warm bindings", async ({ capture }) => {
+    const { openPi, transport } = capture;
     const pi = await openPi({ ...environment, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1",
       PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "bearer", PAPERCLIP_AI_PROVIDER_KEY: provider }, { model: "paperclip/model" });
     const secrets: string[] = [provider];
@@ -155,11 +238,12 @@ describe("F-1: configured and runtime credentials never enter OTLP bodies", () =
       }
     } finally { await pi.close(); }
     expect(transport).toHaveBeenCalledTimes(2);
-    await assertWire("bindings", secrets, "safe binding");
+    await assertWire(capture, "bindings", secrets, "safe binding");
   });
 });
-it("R3: Langfuse golden mapping includes I/O, native session, provider cost and all Paperclip ids", async () => {
-  await run();
+it("R3: Langfuse golden mapping includes I/O, native session, provider cost and all Paperclip ids", async ({ capture }) => {
+  const { bodies } = capture;
+  await run(capture);
   const all = spans(bodies);
   expect(all).toHaveLength(3);
   for (const span of all) expect(attrs(span)).toMatchObject({ "session.id": "native-pi-session", "paperclip.company.id": "company", "paperclip.agent.id": "agent", "paperclip.run.id": "run", "paperclip.task.id": "task", "paperclip.turn.id": expect.any(String) });
@@ -167,11 +251,12 @@ it("R3: Langfuse golden mapping includes I/O, native session, provider cost and 
   expect(attrs(all[1])).toHaveProperty("langfuse.observation.output", "fixture body");
   expect(attrs(all[2])).toMatchObject({ "gen_ai.usage.cost": 0.125, costProvenance: "provider_reported" });
 });
-it.each([
+it.for([
   ["OTEL_LOG_USER_PROMPTS", "Read the fixture"], ["OTEL_LOG_ASSISTANT_RESPONSES", "Fixture read"],
   ["OTEL_LOG_TOOL_DETAILS", "tool read"], ["OTEL_LOG_TOOL_CONTENT", "fixture body"],
-])("R4: %s removes only its capture category", async (key, omitted) => {
-  await run({ ...environment, [key]: "0" });
+])("R4: %s removes only its capture category", async ([key, omitted], { capture }) => {
+  const { bodies } = capture;
+  await run(capture, { ...environment, [key]: "0" });
   const wire = JSON.stringify(bodies);
   expect(spans(bodies).length).toBeGreaterThan(0);
   expect(wire).not.toContain(omitted);
@@ -179,12 +264,13 @@ it.each([
   if (key !== "OTEL_LOG_ASSISTANT_RESPONSES") expect(wire).toContain("Fixture read");
   if (!["OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_TOOL_DETAILS"].includes(key)) expect(wire).toContain("fixture body");
 });
-it("R4: all four switches off leaves metadata only", async () => {
-  await run({ ...environment, ...Object.fromEntries(["USER_PROMPTS", "ASSISTANT_RESPONSES", "TOOL_DETAILS", "TOOL_CONTENT"].map(k => [`OTEL_LOG_${k}`, "0"])) });
+it("R4: all four switches off leaves metadata only", async ({ capture }) => {
+  const { bodies } = capture;
+  await run(capture, { ...environment, ...Object.fromEntries(["USER_PROMPTS", "ASSISTANT_RESPONSES", "TOOL_DETAILS", "TOOL_CONTENT"].map(k => [`OTEL_LOG_${k}`, "0"])) });
   expect(spans(bodies)).toHaveLength(2);
   expect(JSON.stringify(bodies)).not.toMatch(/Read the fixture|Fixture read|fixture body|braintrust\.(input|output)|langfuse\.observation\.(input|output)/);
 });
-it("A2.1: two per-receipt deltas plus cumulative items sum to the final run total exactly once", async () => {
+it("A2.1: two per-receipt deltas plus cumulative items sum to the final run total exactly once", async ({ capture: { openPi, bodies } }) => {
   const pi = await openPi();
   try {
     await pi.start(); pi.peer.send(...assistant("one"), ...assistant("two"), ...terminal); await pi.settled();
@@ -195,7 +281,7 @@ it("A2.1: two per-receipt deltas plus cumulative items sum to the final run tota
   expect(usage.reduce((n, s) => n + attrs(s)["gen_ai.usage.input_tokens"], 0)).toBe(cumulative.total.inputTokens);
   expect(usage.reduce((n, s) => n + attrs(s)["gen_ai.usage.cost"], 0)).toBe(cumulative.providerReportedCostUsd);
 });
-it("A2.6: consumed mid-turn steer joins the prompt with a blank line, redaction and 8 KiB cap", async () => {
+it("A2.6: consumed mid-turn steer joins the prompt with a blank line, redaction and 8 KiB cap", async ({ capture: { openPi, bodies } }) => {
   const turnStart = new Date("2026-11-15T12:00:00.000Z");
   let now = turnStart;
   const pi = await openPi(environment, { now: () => now });
@@ -221,7 +307,7 @@ it("A2.6: consumed mid-turn steer joins the prompt with a blank line, redaction 
   expect(input).not.toContain("\ufffd");
   expect(attrs(root)["paperclip.observability.truncated"]).toBe(true);
 });
-it("R8: OFF company cannot inherit enabled company export, including reused warm sessions", async () => {
+it("R8: OFF company cannot inherit enabled company export, including reused warm sessions", async ({ capture: { openPi, bodies, transport } }) => {
   const enabled = await openPi();
   const off = await openPi({ ...environment, PAPERCLIP_OBSERVABILITY_PI: "0", OTEL_RESOURCE_ATTRIBUTES: "paperclip.company.id=client" });
   try {

@@ -63,6 +63,38 @@ export const terminal: PiRpcRecord[] = [{ type: "agent_end", messages: [] }, { t
 export const attrs = (span: any): Record<string, any> => Object.fromEntries(span.attributes.map((a: any) =>
   [a.key, a.value.stringValue ?? a.value.doubleValue ?? a.value.boolValue]));
 export const spans = (bodies: any[]): any[] => bodies.flatMap(b => b.resourceSpans.flatMap((r: any) => r.scopeSpans.flatMap((s: any) => s.spans)));
+// Each scope owns its capture closure and every open attempt, including one
+// still awaiting admission when Vitest times out the test body.
+export function createPiObservabilityTest() {
+  const bodies: any[] = [];
+  const transport = vi.fn<typeof fetch>(async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response("{}");
+  });
+  const opened: ReturnType<typeof openPi>[] = [];
+  let closing = false;
+  return {
+    bodies, transport,
+    openPi(...args: Parameters<typeof openPi>) {
+      if (closing) throw new Error("Pi observability test is already closing");
+      const opening = openPi(...args);
+      opened.push(opening);
+      return opening;
+    },
+    async close() {
+      closing = true;
+      // Start every close even if another fails. Session.close drains the real
+      // observability export queue; fixture.close also awaits the receipt reader.
+      const results = await Promise.allSettled(opened.map(async opening => {
+        const pi = await opening;
+        await pi.close();
+      }));
+      const errors = results.flatMap(result => result.status === "rejected" ? [result.reason] : []);
+      if (errors.length) throw new AggregateError(errors, "Pi observability test cleanup failed");
+    },
+  };
+}
+
 export async function openPi(env = environment, options: Pick<PiRpcDriverOptions, "now" | "model"> = {}) {
   const root = await mkdtemp(join(tmpdir(), "pi-obs-"));
   const model = options.model ?? "neutral/model";
@@ -85,6 +117,7 @@ export async function openPi(env = environment, options: Pick<PiRpcDriverOptions
   }).openSession({ runId: "run", normalizedSessionId: "normalized", workingDirectory: root });
   const drained = (async () => { for await (const event of session.events()) events.push(event); })();
   let ordinal = 0;
+  let closing: Promise<void> | undefined;
   return { root, peer, session, events, child, bindings,
     async start(prompt = "Read the fixture") {
       const turn = await session.startTurn({ message: { role: "user", text: prompt } });
@@ -92,6 +125,14 @@ export async function openPi(env = environment, options: Pick<PiRpcDriverOptions
       return turn;
     },
     async settled(count = 1) { await vi.waitFor(() => expect(events.filter(e => e.eventType === "turn.completed")).toHaveLength(count), { interval: 1 }); },
-    async close() { await session.close({ reason: "test complete" }); await drained; await rm(root, { recursive: true, force: true }); },
+    close() {
+      // A timed-out body's finally and afterEach must await the SAME cleanup,
+      // rather than race receipt draining or directory removal.
+      return closing ??= (async () => {
+        await session.close({ reason: "test complete" });
+        await drained;
+        await rm(root, { recursive: true, force: true });
+      })();
+    },
   };
 }
