@@ -202,6 +202,17 @@ describe("issuesApi.list", () => {
     );
   });
 
+  it("sends includeHidden only when a list asks for hidden tasks", async () => {
+    await issuesApi.listCompact("company-1", { includeHidden: true, limit: 100 });
+    expect(mockApi.get).toHaveBeenLastCalledWith(
+      "/companies/company-1/issues?includeHidden=true&limit=100&view=compact",
+    );
+    await issuesApi.list("company-1", { includeHidden: false, limit: 100 });
+    expect(mockApi.get).toHaveBeenLastCalledWith("/companies/company-1/issues?limit=100");
+    await issuesApi.list("company-1", { limit: 100 });
+    expect(mockApi.get).toHaveBeenLastCalledWith("/companies/company-1/issues?limit=100");
+  });
+
   it("passes plan document filters through to the company issues endpoint", async () => {
     await issuesApi.list("company-1", { hasPlanDocument: false, limit: 25 });
 

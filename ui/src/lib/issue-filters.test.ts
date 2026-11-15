@@ -106,6 +106,19 @@ describe("issue filters", () => {
     expect(normalizeIssueFilterState({ showAgentCreatedTasks: true }).showAgentCreatedTasks).toBe(true);
   });
 
+  it("keeps hidden tasks out unless Show hidden tasks is on, and persists the choice", () => {
+    const hidden = makeIssue({ id: "hidden", createdByUserId: "person", hiddenAt: new Date("2026-11-15T05:00:00Z") });
+    const shown = makeIssue({ id: "shown", createdByUserId: "person" });
+    expect(defaultIssueFilterState.showHiddenTasks).toBe(false);
+    expect(applyIssueFilters([hidden, shown], defaultIssueFilterState, null, true).map((issue) => issue.id)).toEqual(["shown"]);
+    expect(applyIssueFilters([hidden, shown], { ...defaultIssueFilterState, showHiddenTasks: true }, null, true).map((issue) => issue.id)).toEqual(["hidden", "shown"]);
+    expect(countActiveIssueFilters(defaultIssueFilterState, true)).toBe(0);
+    expect(countActiveIssueFilters({ ...defaultIssueFilterState, showHiddenTasks: true }, true)).toBe(1);
+    expect(normalizeIssueFilterState({ showHiddenTasks: true }).showHiddenTasks).toBe(true);
+    expect(normalizeIssueFilterState({ showHiddenTasks: "true" }).showHiddenTasks).toBe(false);
+    expect(normalizeIssueFilterState({ statuses: ["todo"] }).showHiddenTasks).toBe(false);
+  });
+
   it("searches filter options case-insensitively without mutating the source", () => {
     const options = [{ name: "Alpha Agent" }, { name: "Release QA" }];
     expect(searchIssueFilterOptions(options, "  qa ", (option) => option.name)).toEqual([
