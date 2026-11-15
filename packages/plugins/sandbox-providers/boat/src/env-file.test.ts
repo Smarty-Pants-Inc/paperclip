@@ -24,9 +24,7 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
   const run = (command: string) => spawnSync("/bin/sh", ["-c", local(command)], { encoding: "utf8", timeout: 5000, env: { PATH: "/usr/bin:/bin" } });
   const store = (path: string, content: string) => {
     puts.push({ path, content });
-    if (path.endsWith("/env.sh")) {
-      modes.push([statSync(local(dirname(path))).mode & 0o777, statSync(local(path)).mode & 0o777]);
-    }
+    if (path.endsWith(".sh")) modes.push([statSync(dirname(local(path))).mode & 0o777]);
     mkdirSync(dirname(local(path)), { recursive: true }); writeFileSync(local(path), content);
     if (failure === "upload") throw new Error("fixture upload lost reply");
   };
@@ -52,6 +50,7 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
         if (failure === "setup") return json({ exitCode: 1 });
         const result = run(body.command); expect(result.status, result.stderr).toBe(0); return json({ exitCode: 0 });
       }
+      if (failure === "setup") return json({ exitCode: 1 });
       if (failure === "throw") throw new Error("fixture command request lost");
       if (failure === "request-timeout") throw new DOMException("fixture request timeout", "TimeoutError");
       if (failure === "poll-timeout") { vi.spyOn(Date, "now").mockReturnValueOnce(0).mockReturnValue(10_000); return json({ processId: "proc1" }); }
@@ -64,12 +63,12 @@ function fixture(failure?: "nonzero" | "throw" | "timeout" | "request-timeout" |
     throw new Error(`Unexpected fixture request: ${init.method} ${url}`);
   });
   vi.stubGlobal("fetch", fetch);
-  return { root, puts, commands, deletes, modes, fetch, local, envFiles: () => puts.filter(p => p.path.endsWith("/env.sh")) };
+  return { root, puts, commands, deletes, modes, fetch, local, envFiles: () => puts.filter(p => p.path.endsWith(".sh")) };
 }
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("execute environment files", () => {
-  it("keeps values AND names out of every commands POST; sources then removes the file and directory before exec", async () => {
+  it("keeps values AND names out of every commands POST; sources then removes the file before exec", async () => {
     const f = fixture(undefined, true);
     expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 0 });
     for (const body of f.commands) { expect(JSON.stringify(body)).not.toContain(sentinel); expect(body.command).not.toContain("SECRET_X"); }
@@ -79,13 +78,14 @@ describe("execute environment files", () => {
     for (const body of f.commands) { expect(JSON.stringify(body)).not.toContain(sentinel); expect(body.command).not.toContain("SECRET_X"); }
     const command = f.commands.at(-1).command;
     expect(command).toContain(`. '${path}'`);
+    expect(command.indexOf("/bin/chmod 600")).toBeLessThan(command.indexOf(`. '${path}'`));
     expect(command.indexOf("rm -f --")).toBeLessThan(command.indexOf("exec "));
-    expect(command.indexOf("rmdir --")).toBeLessThan(command.indexOf("exec "));
-    expect(f.modes).toEqual([[0o700, 0o600]]);
-    expect(f.deletes).toContain(path); expect(f.deletes).toContain(dirname(path));
-    expect(existsSync(f.local(path))).toBe(false); expect(existsSync(f.local(dirname(path)))).toBe(false);
+    expect(command).not.toContain("rmdir --");
+    expect(f.modes).toEqual([[statSync(f.root).mode & 0o777]]);
+    expect(f.deletes).toContain(path); expect(f.deletes).toHaveLength(1);
+    expect(existsSync(f.local(path))).toBe(false);
   });
-  it("real /bin/sh preserves bytes and exports to a child; temp file and dir are gone at process start", async () => {
+  it("real /bin/sh preserves bytes and exports to a child; temp file is gone at process start", async () => {
     const f = fixture(undefined, true);
     const env = { SECRET_X: "single' dollar$ backtick`\nbackslash\\ space 雪 = end", EMPTY: "", EQ: "a=b=c", PATH: "/nonexistent" };
     const child = `process.stdout.write(JSON.stringify(Object.fromEntries(${JSON.stringify(Object.keys(env))}.map(k=>[k,process.env[k]]))))`;
@@ -116,14 +116,14 @@ describe("execute environment files", () => {
     for (const p of f.puts) { expect(f.deletes).toContain(p.path); expect(existsSync(f.local(p.path))).toBe(false); }
     for (const body of f.commands) expect(body.command).not.toContain(sentinel);
   });
-  for (const failure of ["nonzero", "throw", "timeout", "request-timeout", "upload", "setup", "poll-timeout"] as const) it(`${failure}: backup DELETE removes the file and directory`, async () => {
+  for (const failure of ["nonzero", "throw", "timeout", "request-timeout", "upload", "setup", "poll-timeout"] as const) it(`${failure}: backup DELETE removes the file`, async () => {
     const f = fixture(failure);
     const call = plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } });
-    if (["throw", "request-timeout", "upload", "setup"].includes(failure)) await expect(call).rejects.toThrow();
-    else expect(await call).toMatchObject(failure === "nonzero" ? { exitCode: 7 } : { timedOut: true });
-    const path = f.envFiles()[0]?.path ?? f.deletes.find(p => p.endsWith("/env.sh"));
-    expect(path).toBeTruthy(); expect(f.deletes).toContain(path); expect(f.deletes).toContain(dirname(path!));
-    expect(existsSync(f.local(path!))).toBe(false); expect(existsSync(f.local(dirname(path!)))).toBe(false);
+    if (["throw", "request-timeout", "upload"].includes(failure)) await expect(call).rejects.toThrow();
+    else expect(await call).toMatchObject(failure === "nonzero" ? { exitCode: 7 } : failure === "setup" ? { exitCode: 1 } : { timedOut: true });
+    const path = f.envFiles()[0]?.path ?? f.deletes.find(p => p.endsWith(".sh"));
+    expect(path).toBeTruthy(); expect(f.deletes).toContain(path);
+    expect(existsSync(f.local(path!))).toBe(false);
     if (failure === "poll-timeout") expect(f.fetch.mock.calls.some(([u, i]) => String(u).endsWith("/commands/proc1") && i?.method === "DELETE")).toBe(true);
   });
   it("detached command and result polling use the same secret-free wrapper", async () => {
@@ -146,12 +146,12 @@ describe("execute environment files", () => {
     expect(f.fetch.mock.calls.some(([u]) => String(u) === "https://upload.invalid/env")).toBe(true);
     for (const body of f.commands) expect(body.command).not.toContain("雪");
   });
-  it("a failed cd still deletes the uploaded env file and directory", async () => {
+  it("a failed cd still deletes the uploaded env file", async () => {
     const f = fixture(undefined, true);
     const result = await plugin.definition.onEnvironmentExecute!({ ...params, cwd: join(f.root, "missing"), env: { SECRET_X: sentinel } });
     expect(result.exitCode).not.toBe(0); expect(f.envFiles()).toHaveLength(1);
     const path = f.envFiles()[0].path; expect(f.deletes).toContain(path);
-    expect(existsSync(f.local(dirname(path)))).toBe(false);
+    expect(existsSync(f.local(path))).toBe(false);
   });
   it("cleanup errors do not replace the command result", async () => {
     const f = fixture(undefined, true), original = f.fetch.getMockImplementation()!;
@@ -160,7 +160,7 @@ describe("execute environment files", () => {
       return original(input, init);
     });
     expect(await plugin.definition.onEnvironmentExecute!({ ...params, env: { SECRET_X: sentinel } })).toMatchObject({ exitCode: 0 });
-    expect(f.envFiles()).toHaveLength(1); expect(existsSync(f.local(dirname(f.envFiles()[0].path)))).toBe(false);
+    expect(f.envFiles()).toHaveLength(1); expect(existsSync(f.local(f.envFiles()[0].path))).toBe(false);
   });
   for (const key of ["BAD-NAME", "X;echo bad", "1BAD", "A\nB"]) it(`refuses invalid key ${JSON.stringify(key)} before requests`, async () => {
     const f = fixture(); await expect(plugin.definition.onEnvironmentExecute!({ ...params, env: { [key]: sentinel } })).rejects.toThrow("Invalid environment variable"); expect(f.fetch).not.toHaveBeenCalled();

@@ -54,13 +54,13 @@ describe("Boat 429 retry", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
-  it("adds positive jitter without waiting less than Retry-After", async () => {
+  it("waits exactly Retry-After before retrying start-limit 429s", async () => {
     vi.useFakeTimers(); vi.spyOn(Math, "random").mockReturnValue(0.5);
     const fetch = vi.fn().mockResolvedValueOnce(response({ code: "rate_limited" }, 429, { "Retry-After": "1" }))
       .mockResolvedValueOnce(response({ sandbox: { id, state: "archived" } }, 202))
       .mockResolvedValueOnce(response({ sandbox: { id, state: "ready", expiresAt: "2030-01-01T00:00:00Z" } })); vi.stubGlobal("fetch", fetch);
     const pending = plugin.definition.onEnvironmentResumeLease!({ driverKey: "boat", companyId: "c", environmentId: "e", config, providerLeaseId: id });
-    await vi.advanceTimersByTimeAsync(1099);
+    await vi.advanceTimersByTimeAsync(999);
     expect(fetch).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     await expect(pending).resolves.toMatchObject({ providerLeaseId: id });
@@ -78,5 +78,27 @@ describe("Boat 429 retry", () => {
     controller.abort();
     await rejected;
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("honors IP_RATE_LIMIT_EXCEEDED once and pauses other calls in this worker", async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(response({ code: "IP_RATE_LIMIT_EXCEEDED", retryAfter: 2 }, 429, { "Retry-After": "2" }))
+      .mockResolvedValueOnce(response({ exitCode: 0, stdout: "", stderr: "", timedOut: false }));
+    vi.stubGlobal("fetch", fetch);
+    const first = plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config,
+      lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 });
+    const firstRejected = first.then(error => { throw new Error(`expected first call to fail, got ${JSON.stringify(error)}`); }, error => {
+      expect(error).toMatchObject({ httpStatus: 429 });
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const second = plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: "c", environmentId: "e", config,
+      lease: { providerLeaseId: id }, command: "true", args: [], timeoutMs: 5000 });
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await firstRejected;
+    await expect(second).resolves.toMatchObject({ exitCode: 0 });
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

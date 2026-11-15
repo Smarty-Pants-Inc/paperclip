@@ -54,6 +54,7 @@ let spareClaimStore: ReadySpareClaimStore | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
 let shuttingDown = false;
+let boatRateLimitPauseUntil = 0;
 const inFlightAcquisitions = new Set<Promise<PluginEnvironmentLease>>();
 function subscribeCompanyActivity(companyId: string): void {
   if (!pluginContext?.events?.on || activitySubscriptionCompanies.has(companyId)) return;
@@ -249,6 +250,13 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     const deadline = Date.now() + BOAT_CALL_BUDGET_MS;
     const signal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
     const method = (init.method ?? "GET").toUpperCase();
+    const waitForRateLimitPause = async () => {
+      const remaining = boatRateLimitPauseUntil - Date.now();
+      if (remaining <= 0) return;
+      const budget = deadline - Date.now();
+      if (budget <= 0 || remaining > budget) throw new Error("http_error");
+      await delay(remaining, undefined, { signal });
+    };
     const retryable429Routes: { method: string; pattern: RegExp }[] = [
       // POST /sandboxes (create): docs/llms-full.txt lines 9864, 9889-9890, 2174.
       { method: "POST", pattern: /^\/sandboxes$/ },
@@ -260,6 +268,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     // Not allowlisted: POST commands can execute (docs lines 1415-1416, 2115-2127); upload-url (1397-1398) and PUT files (1559-1560) lack a 429 no-execution guarantee.
     const retryableStart = retryable429Routes.some(route => route.method === method && route.pattern.test(path));
     for (let attempt = 1; ; attempt++) {
+      await waitForRateLimitPause();
       category = "network_error";
       httpStatus = null;
       response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal });
@@ -280,6 +289,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (body && typeof body === "object") {
         const code = (body as any).code ?? (body as any).error?.code;
         if (typeof code === "string") errorCode = code;
+        if (retryAfter === null && String(errorCode) === "IP_RATE_LIMIT_EXCEEDED") {
+          const bodyWait = Number((body as any).retryAfter ?? (body as any).retryAfterSeconds);
+          if (Number.isFinite(bodyWait) && bodyWait >= 0) retryAfterMs = bodyWait * 1_000;
+        }
       }
       const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
       duplexLogger?.warn("Boat API 429", {
@@ -288,11 +301,22 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         ...(errorCode ? { code: errorCode } : {}),
       });
       await response.body?.cancel();
+      const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
+      const hasRateLimitWait = retryAfter !== null || isIpLimit;
+      if (isIpLimit) {
+        boatRateLimitPauseUntil = Math.max(boatRateLimitPauseUntil, Date.now() + retryAfterMs);
+        await waitForRateLimitPause();
+      } else if (retryAfter !== null) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0 || retryAfterMs > remainingMs) throw new Error(category);
+        await delay(retryAfterMs, undefined, { signal });
+      }
       if (!retryableStart || isStreamBody || attempt >= BOAT_MAX_ATTEMPTS || !["rate_limited", "limit_reached", "member_limit_reached"].includes(String(errorCode))) throw new Error(category);
-      const remainingMs = deadline - Date.now();
-      if (retryAfterMs > remainingMs || remainingMs <= 0) throw new Error(category);
-      const waitMs = Math.min(remainingMs, retryAfterMs + Math.random() * retryAfterMs * 0.2);
-      await delay(waitMs, undefined, { signal });
+      if (!hasRateLimitWait) {
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new Error(category);
+        await delay(Math.min(2_000, remainingMs), undefined, { signal });
+      }
     }
     responseOptions.onHeaders?.(response.headers);
     if (allowMissing && response.status === 404) {
@@ -533,6 +557,7 @@ async function runCommand(config: Config, id: string, command: string, timeoutMs
     stdout: started.stdout ?? "", stderr: started.stderr ?? "",
   };
   const until = Date.now() + timeoutMs;
+  let pollDelayMs = 1_000;
   while (Date.now() < until) {
     const result = await request(config, `/sandboxes/${encodeURIComponent(id)}/commands/${encodeURIComponent(started.processId)}`, { signal });
     if (result.running === false || result.status === "completed" || result.status === "exited") return {
@@ -540,7 +565,8 @@ async function runCommand(config: Config, id: string, command: string, timeoutMs
       timedOut: false, stdout: result.stdout ?? "", stderr: result.stderr ?? "",
       signal: result.signal ?? null,
     };
-    await delay(1000, undefined, { signal });
+    await delay(Math.min(pollDelayMs, Math.max(0, until - Date.now())), undefined, { signal });
+    pollDelayMs = Math.min(5_000, pollDelayMs + 1_000);
   }
   await request(config, `/sandboxes/${encodeURIComponent(id)}/commands/${encodeURIComponent(started.processId)}`, { method: "DELETE", signal }).catch(() => undefined);
   return { exitCode: null, timedOut: true, stdout: "", stderr: "Command exceeded Paperclip timeout and was stopped." };
@@ -1390,7 +1416,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async onEnvironmentExecute(params: PluginEnvironmentExecuteParams): Promise<PluginEnvironmentExecuteResult> {
     const id = params.lease.providerLeaseId; if (!id) return { exitCode: 1, timedOut: false, stdout: "", stderr: "No Boat lease ID available." };
     const c = parse(params.config); validEnv(params.env);
-    let stdinPath: string | null = null, envDir: string | null = null, envPath: string | null = null;
+    let stdinPath: string | null = null, envPath: string | null = null;
     const base = `/sandboxes/${encodeURIComponent(id)}/files`;
     const stage = async (path: string, content: string, kind: "stdin" | "env") => {
       if (Buffer.byteLength(content, "utf8") > 4_194_304) {
@@ -1412,15 +1438,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         const roots = [params.cwd, params.lease.metadata?.remoteCwd].filter((p): p is string => typeof p === "string")
           .map(p => posix.resolve("/home/user", p));
         const uuid = randomUUID();
-        envDir = [`/tmp/paperclip-boat-env-${uuid}`, `/home/user/.paperclip-boat-env-${uuid}`]
-          .find(dir => roots.every(root => dir !== root && !dir.startsWith(root === "/" ? root : `${root}/`))) ?? null;
-        if (!envDir) throw new Error("Boat env file requires a private directory outside the workspace.");
-        envPath = `${envDir}/env.sh`;
-        // No mode field in PUT /files. Precreate under umask 077 (0700/0600),
-        // then enforce 0600 again before sourcing in case upload replaces it.
-        // Non-recursive mkdir refuses an existing directory/symlink.
-        const made = await runCommand(c, id, `umask 077 && /bin/mkdir -- ${q(envDir)} && : > ${q(envPath)}`, 30_000);
-        if (made.timedOut || made.exitCode !== 0) throw new Error("Boat private env directory creation failed.");
+        envPath = [`/tmp/paperclip-boat-env-${uuid}.sh`, `/home/user/.paperclip-boat-env-${uuid}.sh`]
+          .find(path => roots.every(root => path !== root && !path.startsWith(root === "/" ? root : `${root}/`))) ?? null;
+        if (!envPath) throw new Error("Boat env file requires a private path outside the workspace.");
+        // Boat's file API has no mode field; chmod before sourcing. Keep secrets
+        // out of retained command text and delete the file after execution.
         await stage(envPath, env.map(([k, v]) => `export ${k}=${q(v)}\n`).join(""), "env");
       }
       if (params.stdin !== undefined) {
@@ -1429,12 +1451,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       }
       const invocation = [q(params.command), ...(params.args ?? []).map(q)].join(" ");
       // Absolute cleanup utilities still work when the caller overrides PATH.
-      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && /bin/rmdir -- ${q(envDir!)} && ` : "";
+      const environment = envPath ? `umask 077 && /bin/chmod 600 -- ${q(envPath)} && . ${q(envPath)} && /bin/rm -f -- ${q(envPath)} && ` : "";
       const wrapped = `${params.cwd ? `cd ${q(params.cwd)} && ` : ""}${environment}exec ${invocation}${stdinPath ? ` < ${q(stdinPath)}` : ""}`;
       return await runCommand(c, id, wrapped, params.timeoutMs ?? params.commandTimeoutMs ?? 600_000);
     } finally {
       for (const path of [envPath, stdinPath]) if (path) await request(c, `${base}?path=${encodeURIComponent(path)}`, { method: "DELETE" }).catch(() => undefined);
-      if (envDir) await request(c, `${base}?path=${encodeURIComponent(envDir)}&recursive=true`, { method: "DELETE" }).catch(() => undefined);
     }
   },
 }, leaseActivityKey), idleActivity));
