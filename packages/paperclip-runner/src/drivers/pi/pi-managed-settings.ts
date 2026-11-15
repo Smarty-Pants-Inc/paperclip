@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { access, mkdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { writePrivateFile } from "../private-file.js";
 
@@ -35,12 +35,19 @@ export async function configurePiManagedCompaction(input: {
 }): Promise<void> {
   const path = join(input.agentHome, "settings.json");
   const settings = await readSettings(path);
+  let settingsExist = true;
+  try { await access(path); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    settingsExist = false;
+  }
   if (explicitReserve(settings, input.model) !== undefined) return;
   const original = input.originalAgentHome === input.agentHome ? settings
     : await readSettings(join(input.originalAgentHome, "settings.json"));
   const reserveTokens = explicitReserve(original, input.model)
     ?? Math.min(100000, Math.floor(input.contextWindow * 0.25));
   const compaction = record(settings.compaction) ? settings.compaction : {};
+  const packages = !settingsExist && input.originalAgentHome !== input.agentHome && original.packages !== undefined
+    ? { packages: original.packages } : {};
   await mkdir(input.agentHome, { recursive: true, mode: 0o700 });
-  await writePrivateFile(path, `${JSON.stringify({ ...settings, compaction: { ...compaction, reserveTokens } })}\n`);
+  await writePrivateFile(path, `${JSON.stringify({ ...settings, ...packages, compaction: { ...compaction, reserveTokens } })}\n`);
 }

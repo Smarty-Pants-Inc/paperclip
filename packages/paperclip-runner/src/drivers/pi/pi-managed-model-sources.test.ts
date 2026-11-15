@@ -112,10 +112,10 @@ it.each([0, 42000, 120000])("preserves an explicit managed-home reserve of %i", 
   expect(f.settings).toEqual(settings);
 });
 
-it("respects the user's original Pi reserve without importing unrelated settings", async () => {
+it("respects the user's original Pi reserve and imports only packages", async () => {
   const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
     { user: { compaction: { reserveTokens: 54321 }, packages: ["do-not-import"] } });
-  expect(f.settings).toEqual({ compaction: { reserveTokens: 54321 } });
+  expect(f.settings).toEqual({ packages: ["do-not-import"], compaction: { reserveTokens: 54321 } });
 });
 
 it("keeps managed settings ahead of the original user's reserve", async () => {
