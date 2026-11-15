@@ -456,15 +456,14 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       // outside this executor-level row).
       const [accepted] = await db.select().from(nativeRunResults).where(and(eq(nativeRunResults.runId, current.id),
         eq(nativeRunResults.schemaStatus, "accepted")));
-      if (row === "R") {
-        // The answer USES the earlier conversation: ALDER was stated only before
-        // the replacement, and the provider names it only if it was sent.
-        expect(JSON.stringify(turns[1].request.params)).toContain("Remember ALDER as our conversation word.");
-        expect(JSON.stringify(turns[1].request.params)).toContain(earlierAnswer);
-        expect(String((accepted?.resultJson as { result?: { summary?: unknown } } | undefined)?.result?.summary ?? ""),
-          `the answer names the earlier fact: ${JSON.stringify(accepted?.resultJson ?? null).slice(0, 600)}`)
-          .toContain(ANSWER_WITH_HISTORY);
-      }
+      // HISTORY PRESENT (RFL 12:31Z, every answer row): the answer USES the earlier
+      // conversation. ALDER was stated only before the replacement, and the provider
+      // names it only if it was sent. Answering without history is a hard fail.
+      expect(JSON.stringify(turns[1].request.params), "history present in the model request").toContain("Remember ALDER as our conversation word.");
+      if (row === "R") expect(JSON.stringify(turns[1].request.params)).toContain(earlierAnswer);
+      expect(String((accepted?.resultJson as { result?: { summary?: unknown } } | undefined)?.result?.summary ?? ""),
+        `the answer names the earlier fact: ${JSON.stringify(accepted?.resultJson ?? null).slice(0, 600)}`)
+        .toContain(ANSWER_WITH_HISTORY);
       expect(performance.now() - started).toBeLessThanOrEqual(
         FRESH_CONTINUATION_PENDING_BOUND_MS + coldAdmissionTimeoutMs("codex", undefined, false));
       const notes = await systemNotes();
