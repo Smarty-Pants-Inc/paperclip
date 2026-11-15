@@ -217,6 +217,7 @@ import {
   formatTokens,
   visibleRunCostUsd,
   visibleRunTokenTotal,
+  COST_FIGURES_HIDDEN,
 } from "../lib/utils";
 import { liveBlueBadge } from "../lib/status-colors";
 import { ApprovalCard } from "../components/ApprovalCard";
@@ -3070,7 +3071,7 @@ function IssueDetailActivityTab({
                 <span className="font-medium text-foreground">This task</span>
                 {issueCostSummary.hasCost ? (
                   <span className="font-medium text-foreground">
-                    ${issueCostSummary.cost.toFixed(4)}
+                    {COST_FIGURES_HIDDEN ? "—" : `$${issueCostSummary.cost.toFixed(4)}`}
                   </span>
                 ) : null}
                 {issueCostSummary.hasTokens ? (
@@ -3097,7 +3098,7 @@ function IssueDetailActivityTab({
                 <div className="flex flex-wrap gap-3">
                   <span className="font-medium text-foreground">
                     Including sub-tasks{" "}
-                    {(issueTreeCostSummary.costCents / 100).toLocaleString(
+                    {COST_FIGURES_HIDDEN ? "—" : (issueTreeCostSummary.costCents / 100).toLocaleString(
                       undefined,
                       {
                         style: "currency",

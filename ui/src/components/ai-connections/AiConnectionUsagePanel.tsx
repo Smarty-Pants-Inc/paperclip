@@ -5,11 +5,11 @@ import { aiConnectionsApi } from "@/api/ai-connections";
 import { describeError } from "@/api/errors";
 import { Button } from "@/components/ui/button";
 import { QuotaBar } from "@/components/QuotaBar";
-import { formatDateTime, formatNumber } from "@/lib/utils";
+import { formatDateTime, formatNumber, COST_FIGURES_HIDDEN } from "@/lib/utils";
 
 const usageNumber = (value: number) => formatNumber(value, { maximumFractionDigits: 20 });
 const amount = (value: number, unit: string | null) => unit === "USD"
-  ? formatNumber(value, { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 20 })
+  ? (COST_FIGURES_HIDDEN ? "—" : formatNumber(value, { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 20 }))
   : `${usageNumber(value)}${unit ? ` ${unit}` : ""}`;
 
 function limitLabel(window: AiConnectionUsageLimit) {

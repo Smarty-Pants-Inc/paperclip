@@ -11,7 +11,7 @@ import {
 } from "lucide-react";
 import { useReducedMotion } from "motion/react";
 import { MarkdownBody } from "@/components/MarkdownBody";
-import { cn } from "@/lib/utils";
+import { cn, COST_FIGURES_HIDDEN } from "@/lib/utils";
 import { useRevealableTaskChatExpansion, useTaskChatExpansion } from "./expansion-state";
 import type { TaskChatActivityPhaseItem, TaskChatAutoReview } from "./task-chat-model";
 import { AutoApprovedBadge, AutoReviewDetail } from "./TaskChatAutoReview";
@@ -200,7 +200,7 @@ function presentation(item: Activity, active: boolean, taskLabel?: string): Acti
     inputTokens != null || outputTokens != null
       ? `↑${(inputTokens ?? 0).toLocaleString()} ↓${(outputTokens ?? 0).toLocaleString()}`
       : undefined,
-    costUsd != null ? `$${costUsd.toFixed(4)}` : undefined,
+    costUsd != null ? (COST_FIGURES_HIDDEN ? "—" : `$${costUsd.toFixed(4)}`) : undefined,
   ]
     .filter(Boolean)
     .join(" · ");

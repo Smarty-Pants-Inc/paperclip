@@ -33,7 +33,11 @@ export function asFiniteNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+// Temporary: cost figures are rate-card estimates, not the real bill; set false when corrected costs land (smarty-dev #20670)
+export const COST_FIGURES_HIDDEN = true;
+
 export function formatCents(cents: number, currency = "USD"): string {
+  if (COST_FIGURES_HIDDEN) return "—";
   // Older finance writes accepted arbitrary three-character codes. Keep those
   // amounts readable without passing an invalid currency to Intl.
   if (!/^[a-z]{3}$/i.test(currency)) {
@@ -297,5 +301,6 @@ export function projectWorkspaceUrl(
 
 /** Preserve sub-cent inference charges instead of showing a misleading $0.00. */
 export function formatDetailedCents(cents: string | number): string {
+  if (COST_FIGURES_HIDDEN) return "—";
   return (Number(cents) / 100).toLocaleString("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 9 });
 }

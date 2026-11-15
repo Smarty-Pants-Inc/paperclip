@@ -1,4 +1,5 @@
 import type { StatusCard, StatusCardRefreshPolicy } from "@paperclipai/shared";
+import { COST_FIGURES_HIDDEN } from "./utils";
 
 /**
  * The lifecycle states a status card renders as on the board (plan §7,
@@ -119,6 +120,7 @@ export function formatTokens(tokens: number): string {
 
 /** US-dollar cost from integer cents, e.g. `$0.09`, `$1.20`. Sub-cent → `<$0.01`. */
 export function formatUsdFromCents(cents: number): string {
+  if (COST_FIGURES_HIDDEN) return "—";
   if (cents <= 0) return "$0.00";
   if (cents < 1) return "<$0.01";
   return `$${(cents / 100).toFixed(2)}`;

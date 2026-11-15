@@ -28,7 +28,7 @@ describe.each(["provider", "biller"] as const)("%s price status", kind => {
       ? <ProviderQuotaCard {...props} provider="openai" rows={[row]} windowRows={[]} showDeficitNotch={false} />
       : <BillerSpendCard {...props} row={row} providerRows={[row]} />));
     const header = container.querySelector('[data-slot="card-header"]')!;
-    expect(header.textContent).toContain(example.amount);
+    expect(header.textContent).toContain("—");
     if (example.amount === "—") expect(header.textContent).not.toContain("$0.00");
     const badges = [...header.querySelectorAll('[data-slot="badge"]')].map(badge => badge.textContent);
     expect(badges).toEqual([example.estimate, example.unavailable].filter(Boolean));

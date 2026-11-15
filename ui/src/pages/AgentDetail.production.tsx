@@ -65,7 +65,7 @@ import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallo
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal } from "../lib/utils";
-import { cn } from "../lib/utils";
+import { cn, COST_FIGURES_HIDDEN } from "../lib/utils";
 import { describeRunRetryState } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -1450,7 +1450,7 @@ function CostsSection({
                     <td className="px-3 py-2 text-right tabular-nums">{formatTokens(metrics.output)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">
                       {metrics.cost > 0
-                        ? `$${metrics.cost.toFixed(4)}`
+                        ? (COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(4)}`)
                         : "-"
                       }
                     </td>
@@ -2679,7 +2679,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
       {(metrics.totalTokens > 0 || metrics.cost > 0) && (
         <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
           {metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
-          {metrics.cost > 0 && <span>${metrics.cost.toFixed(3)}</span>}
+          {metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
         </div>
       )}
     </Link>
@@ -3148,7 +3148,7 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
               </div>
               <div>
                 <div className="text-xs text-muted-foreground">Cost</div>
-                <div className="text-sm font-medium font-mono">{metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"}</div>
+                <div className="text-sm font-medium font-mono">{COST_FIGURES_HIDDEN ? "—" : metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"}</div>
               </div>
             </div>
           )}

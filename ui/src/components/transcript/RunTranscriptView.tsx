@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "../MarkdownBody";
-import { cn, formatTokens } from "../../lib/utils";
+import { cn, formatTokens, COST_FIGURES_HIDDEN } from "../../lib/utils";
 import { runningLabelText } from "../../lib/status-colors";
 import {
   Check,
@@ -553,7 +553,7 @@ function groupToolBlocks(blocks: TranscriptBlock[]): TranscriptBlock[] {
 
 function usageDetail(entry: Extract<TranscriptEntry, { kind: "result" }>): string {
   const tokens = (value: number) => Number.isFinite(value) ? formatTokens(value) : "unknown";
-  const cost = Number.isFinite(entry.costUsd) ? `$${entry.costUsd.toFixed(6)}` : "cost unknown";
+  const cost = COST_FIGURES_HIDDEN ? "—" : Number.isFinite(entry.costUsd) ? `$${entry.costUsd.toFixed(6)}` : "cost unknown";
   return `${tokens(entry.inputTokens)} / ${tokens(entry.outputTokens)} / ${cost}`;
 }
 
