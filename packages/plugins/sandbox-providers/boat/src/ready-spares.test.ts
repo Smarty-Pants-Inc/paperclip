@@ -113,6 +113,37 @@ describe("Boat ready spare keeper", () => {
     expect(keeper.demandTarget(key, 1, 3, 10)).toBe(1);
   });
 
+  it("warms each newly ready spare once without making warm-up failures unclaimable", async () => {
+    const { ops } = operations();
+    const warmUp = vi.fn(async () => undefined);
+    (ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
+    const keeper = new ReadySpareKeeper(() => start, undefined, claimStore());
+    await keeper.reconcile(key, 1, ops);
+    await keeper.reconcile(key, 1, ops);
+    expect(warmUp).toHaveBeenCalledTimes(1);
+    expect(keeper.ready(key)).toHaveLength(1);
+    warmUp.mockRejectedValueOnce(new Error("warm-up failed"));
+    const secondKey = { ...key, configHash: "second" };
+    const second = operations();
+    (second.ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
+    await expect(keeper.reconcile(secondKey, 1, second.ops)).resolves.toBeUndefined();
+    expect(keeper.ready(secondKey)).toHaveLength(1);
+  });
+
+  it("does not warm when there are no spares or only claimed spares", async () => {
+    const keeper = new ReadySpareKeeper(() => start, undefined, claimStore());
+    const warmUp = vi.fn(async () => undefined);
+    const empty = operations();
+    (empty.ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
+    await keeper.reconcile(key, 0, empty.ops);
+    expect(warmUp).not.toHaveBeenCalled();
+    const claimed = spare({ name: "paperclip-claim:run" });
+    const inventory = operations([claimed]);
+    (inventory.ops as ReadySpareOperations & { warmUp?: (candidate: ReadySpare) => Promise<void> }).warmUp = warmUp;
+    await keeper.reconcile(key, 1, inventory.ops);
+    expect(warmUp).not.toHaveBeenCalled();
+  });
+
   it("fills to demand target concurrently and stops the surplus when demand expires", async () => {
     let now = start;
     const keeper = new ReadySpareKeeper(() => now, 12);
