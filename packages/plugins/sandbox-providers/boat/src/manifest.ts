@@ -8,10 +8,11 @@ const manifest: PaperclipPluginManifestV1 = {
   description: "Provisions isolated Boat cloud sandboxes as Paperclip execution environments.",
   author: "Paperclip",
   categories: ["automation"],
-  capabilities: ["environment.drivers.register", "events.subscribe", "plugin.state.read", "plugin.state.write", "database.namespace.migrate", "database.namespace.read", "database.namespace.write"],
+  capabilities: ["environment.drivers.register", "events.subscribe", "plugin.state.read", "plugin.state.write", "database.namespace.migrate", "database.namespace.read", "database.namespace.write", "webhooks.receive", "secrets.read-ref"],
   instanceConfigSchema: {
     type: "object",
     properties: {
+      boatWebhookSigningSecret: { type: "string", format: "secret-ref", description: "Boat webhook signing secret reference returned when registering the endpoint. Never enter the secret value directly." },
       spares: { type: "integer", minimum: 0, maximum: 3, default: 0, title: "Warm Boat spares", description: "Minimum running, pre-warmed Boat sandboxes per listed environment (0 disables the spare pool)." },
       spareMax: { type: "integer", minimum: 1, maximum: 5, default: 3, title: "Maximum warm Boat spares", description: "Maximum demand-following ready spares per listed environment." },
       spareDemandWindowMinutes: { type: "integer", minimum: 5, maximum: 60, default: 10, title: "Spare demand window (minutes)", description: "Count acquisitions in this rolling window when scaling the spare pool." },
@@ -24,6 +25,7 @@ const manifest: PaperclipPluginManifestV1 = {
     namespaceSlug: "boat_sandbox_provider",
     migrationsDir: "migrations",
   },
+  webhooks: [{ endpointKey: "boat-lifecycle", displayName: "Boat sandbox lifecycle", description: "Verifies Boat lifecycle deliveries and wakes in-plugin waiters; Boat GET remains authoritative." }],
   environmentDrivers: [{
     driverKey: "boat",
     kind: "sandbox_provider",
