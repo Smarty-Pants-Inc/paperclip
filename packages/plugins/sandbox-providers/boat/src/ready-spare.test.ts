@@ -82,13 +82,30 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0) {
   vi.stubGlobal("fetch", fetch);
   return { calls, inventory, fetch };
 }
-async function setup(spares: number, environmentIds?: string[], idleMinutes = 60) {
+function fakeDatabase() {
+  const claims = new Map<string, unknown[]>();
+  return {
+    namespace: "boat_sandbox_provider",
+    execute: vi.fn(async (_sql: string, params: unknown[] = []) => {
+      const leaseId = String(params[0]);
+      if (claims.has(leaseId)) return { rowCount: 0 };
+      claims.set(leaseId, params);
+      return { rowCount: 1 };
+    }),
+    query: vi.fn(async (_sql: string, params: unknown[] = []) => {
+      const leaseId = String(params[0]);
+      return claims.has(leaseId) ? [{ provider_lease_id: leaseId }] : [];
+    }),
+  };
+}
+async function setup(spares: number, environmentIds?: string[], idleMinutes = 60, db = fakeDatabase()) {
   explicitEnvironmentIds = environmentIds;
   inferredEnvironmentId = undefined;
   const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
   await plugin.definition.setup({
     config: { get: vi.fn(async () => ({ spares, spareEnvironmentIds: explicitEnvironmentIds ?? [inferredEnvironmentId ?? environmentId], spareIdleMinutes: idleMinutes })) },
     logger,
+    db,
     events: { on: vi.fn((name: string, handler: (event: any) => Promise<void>) => { eventHandlers.set(name, handler); return () => eventHandlers.delete(name); }) },
     state: {
       get: vi.fn(async (key: { scopeId?: string; stateKey: string }) => persistedState.get(`${key.scopeId}:${key.stateKey}`) ?? null),
@@ -118,6 +135,7 @@ afterEach(async () => {
   explicitEnvironmentIds = undefined;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  await setup(0);
 });
 
 describe("Boat ready spare", () => {
@@ -171,6 +189,58 @@ describe("Boat ready spare", () => {
     expect(lease.providerLeaseId).toMatch(/^bx_run_/);
     expect(f.calls.some(call => call.method === "POST" && call.url.pathname === "/api/v1/sandboxes" && call.body.labels.purpose === "run")).toBe(true);
     expect(f.calls.some(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toBe(false);
+  });
+
+  it("does not hand over a spare when Boat read-back changes the claim token", async () => {
+    const env = "environment-claim-readback", company = "company-claim-readback";
+    const warm = inventorySpare({ company, environment: env, id: "bx_readback_mismatch" });
+    const f = fixture([warm]);
+    let claimWritten = false;
+    const realFetch = f.fetch;
+    vi.stubGlobal("fetch", vi.fn(async (input: any, init: any = {}) => {
+      const url = new URL(String(input)), method = init.method ?? "GET";
+      const result = await realFetch(input, init);
+      if (method === "PATCH" && url.pathname.endsWith(`/${warm.id}`) && JSON.parse(String(init.body)).name?.startsWith("paperclip-claim:")) claimWritten = true;
+      if (claimWritten && method === "GET" && url.pathname.endsWith(`/${warm.id}`)) {
+        return response({ sandbox: { ...warm.providerObservation, id: warm.id, state: "running", name: "paperclip-claim:another-worker" } });
+      }
+      return result;
+    }));
+    await setup(1);
+    await acquire("run-readback-seed", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.calls.some(call => call.method === "GET" && call.url.pathname === "/api/v1/sandboxes")).toBe(true));
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    const lease = await acquire("run-readback-mismatch", baseConfig, env, company);
+    expect(lease.providerLeaseId).not.toBe(warm.id);
+    expect(f.calls.filter(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:")).length).toBe(1);
+  });
+
+  it("refuses acquisitions and stops keeper activity as soon as shutdown begins", async () => {
+    const env = "environment-shutdown-claim", company = "company-shutdown-claim";
+    const f = fixture([inventorySpare({ company, environment: env, id: "bx_shutdown_spare" })]);
+    await setup(1);
+    await acquire("run-shutdown-seed", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.calls.some(call => call.method === "GET" && call.url.pathname === "/api/v1/sandboxes")).toBe(true));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const beforeShutdown = f.calls.length;
+
+    const shutdown = plugin.definition.onShutdown!();
+    await expect(acquire("run-after-shutdown", baseConfig, env, company)).rejects.toThrow(/shut(?:ting)? down/i);
+    await shutdown;
+    const afterShutdown = f.calls.slice(beforeShutdown);
+    expect(afterShutdown.some(call => call.method === "PATCH" && call.body?.name?.startsWith("paperclip-claim:"))).toBe(false);
+    expect(afterShutdown.some(call => call.method === "POST" && call.body?.labels?.purpose === "spare")).toBe(false);
+  });
+
+  it("starts no spare timer or inventory work when the company spare count is zero", async () => {
+    const f = fixture();
+    const timer = vi.spyOn(globalThis, "setInterval");
+    await setup(0);
+    await plugin.definition.onHealth!();
+    expect(timer).not.toHaveBeenCalled();
+    expect(f.calls).toEqual([]);
+    await plugin.definition.onShutdown?.();
   });
 
   it("never hands one spare to two concurrent acquires", async () => {
