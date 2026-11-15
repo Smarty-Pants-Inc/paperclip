@@ -443,9 +443,12 @@ function createSandboxBody(config: Config, ttlSeconds: number, labels: Record<st
     ...(config.boatEnvironment !== undefined ? { environment: config.boatEnvironment } : {}),
   };
 }
-function readySpareHash(config: Config, ttlSeconds: number, from: string | undefined): string {
+function readySpareHash(config: Config, ttlSeconds: number, from: string | undefined, snapshot?: ResolvedSnapshot | BoatSnapshotIdentity): string {
   return readySpareConfigHash({
     ...createSandboxBody(config, ttlSeconds, config.labels, from),
+    configuredSnapshot: config.snapshot ?? null,
+    resolvedSnapshot: snapshot ? { id: snapshot.id, name: snapshot.name, createdAt: snapshot.createdAt } : null,
+    pinnedSnapshotId: config.pinnedSnapshotId ?? null,
     accountFingerprint: createHash("sha256").update(`${API}\n${config.apiKey}`).digest("hex"),
   });
 }
@@ -567,6 +570,18 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
 }
 function queueSpareReconciliation(key: ReadySpareKey, desired: number, ttlSeconds: number, operations: ReadySpareOperations): void {
   const poolId = readySparePoolKey(key);
+  for (const [oldPoolId, oldPool] of knownSparePools) {
+    if (oldPool.key.companyId !== key.companyId || oldPool.key.environmentId !== key.environmentId
+        || oldPool.key.configHash === key.configHash || oldPool.desired === 0) continue;
+    oldPool.desired = 0;
+    // A create already in flight under the previous config may finish after the
+    // first retire pass. Reconcile again after it settles, but only if it left a
+    // cached candidate; claimed run leases are absent from that cache.
+    void readySpares.reconcile(oldPool.key, 0, oldPool.operations).catch(() => undefined).finally(() => {
+      if (readySpares.ready(oldPool.key).length) void readySpares.reconcile(oldPool.key, 0, oldPool.operations).catch(() => undefined);
+    });
+    knownSparePools.set(oldPoolId, oldPool);
+  }
   knownSparePools.set(poolId, { key, ttlSeconds, desired, operations });
   void readySpares.reconcile(key, desired, operations).catch(() => {
     duplexLogger?.warn("Boat ready spare reconciliation failed", { companyId: key.companyId, environmentId: key.environmentId });
@@ -726,10 +741,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const labels = { ...c.labels, owner: `paperclip:${params.companyId}`, purpose: params.purpose ?? "run", expiry: params.requestedExpiresAt ?? new Date(Date.now() + ttl * 1000).toISOString(), environment: params.environmentId, run: params.runId, ...(params.creationOperationId ? { creation: params.creationOperationId } : {}), "paperclip-acquire": attemptId };
     // Check outside allocation cleanup: no create was attempted on a failed pin check.
     // Lead measurement 11-12: create.from accepts a NAME, not the snapshot UUID.
+    let pinnedIdentity: BoatSnapshotIdentity | undefined;
     if (params.config.pinnedSnapshotId !== undefined) {
       if (!c.pinnedSnapshotId?.trim()) throw new Error("Boat pinnedSnapshotId must be a non-empty string.");
-      const identity = await resolveBoatSnapshotIdentity(params.config);
-      if (identity.id !== c.pinnedSnapshotId) throw new Error("Boat saved-snapshot identity changed: pinnedSnapshotId mismatch; sandbox creation refused.");
+      pinnedIdentity = await resolveBoatSnapshotIdentity(params.config);
+      if (pinnedIdentity.id !== c.pinnedSnapshotId) throw new Error("Boat saved-snapshot identity changed: pinnedSnapshotId mismatch; sandbox creation refused.");
     }
     const snapshot = c.snapshot === undefined ? undefined : await resolveSnapshotForCreate(c);
     const from = snapshot?.name ?? c.from;
@@ -738,7 +754,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       try { desiredSpares = readySpareCount(await pluginContext.config.get(params.companyId)); hasSpareSetting = true; }
       catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
-    const spareHash = readySpareHash(c, ttl, from);
+    const spareHash = readySpareHash(c, ttl, from, snapshot ?? pinnedIdentity);
     const spareKey: ReadySpareKey = { companyId: params.companyId, environmentId: params.environmentId, configHash: spareHash };
     const spareOperations = hasSpareSetting ? createReadySpareOperations(c, spareKey, ttl, from) : undefined;
     let id: string | undefined;
@@ -753,7 +769,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         adoptionTask = readySpares.adopt(spareKey, spareOperations).catch(() => undefined);
       }
       if (spareOperations && desiredSpares > 0) {
-        const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${attemptId}`;
+        const claimAttempt = `${encodeURIComponent(params.runId ?? "unknown")}:${encodeURIComponent(attemptId)}`;
         claimedSpare = await readySpares.claim(spareKey, claimAttempt, ttl, spareOperations);
         if (claimedSpare) {
           id = claimedSpare.id;

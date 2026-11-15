@@ -115,6 +115,16 @@ describe("Boat ready spare keeper", () => {
     await keeper.reconcile(secondKey, 1, second.ops);
     expect(second.ops.create).not.toHaveBeenCalled();
 
+    const failedCapKey = { ...key, companyId: "company-failed-cap" };
+    const failedCapKeeper = new ReadySpareKeeper(() => now, 1);
+    const failedCapOps = operations();
+    (failedCapOps.ops.create as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error("start failed"));
+    await expect(failedCapKeeper.reconcile(failedCapKey, 1, failedCapOps.ops)).rejects.toThrow("start failed");
+    const failedCapOtherEnvironment = { ...failedCapKey, environmentId: "env-cap-other" };
+    const capped = operations();
+    await failedCapKeeper.reconcile(failedCapOtherEnvironment, 1, capped.ops);
+    expect(capped.ops.create).not.toHaveBeenCalled();
+
     const failKey = { ...key, companyId: "company-b" };
     const retryKeeper = new ReadySpareKeeper(() => now, 12);
     const failing = operations();
