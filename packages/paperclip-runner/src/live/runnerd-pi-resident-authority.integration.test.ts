@@ -310,19 +310,22 @@ it.skipIf(process.platform !== "linux" || !pi)("FINAL AUTHORITY PROOF: real runn
       define: { "import.meta.dirname": "__dirname", "import.meta.url": "__paperclipVerifiedEntrypointUrl" },
     });
     const extension = await build({ ...common, entryPoints: ["src/drivers/pi/extension/index.ts"], outfile: "drivers/pi/extension/index.js", format: "esm" });
+    const childBridge = await build({ ...common, entryPoints: ["src/drivers/pi/extension/subagents/child-bridge.ts"], outfile: "drivers/pi/extension/child-bridge.js", format: "esm" });
     const builtins = new Set([...builtinModules, ...builtinModules.map(name => "node:" + name)]);
-    for (const result of [proxy, extension]) {
+    for (const result of [proxy, extension, childBridge]) {
       const entries = Object.values(result.metafile.outputs).filter(output => output.entryPoint !== undefined);
       if (entries.length !== 1 || entries[0].imports.some(dependency => !dependency.external || !builtins.has(dependency.path))) throw new Error("proof production bundle is not self-contained");
     }
-    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile }));
-  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; proxyMetafile: unknown; extensionMetafile: unknown };
+    process.stdout.write(JSON.stringify({ proxy: proxy.outputFiles[0].text, extension: extension.outputFiles[0].text, childBridge: childBridge.outputFiles[0].text, proxyMetafile: proxy.metafile, extensionMetafile: extension.metafile, childBridgeMetafile: childBridge.metafile }));
+  `], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024, timeout: 30_000 })) as { proxy: string; extension: string; childBridge: string; proxyMetafile: unknown; extensionMetafile: unknown; childBridgeMetafile: unknown };
   await mkdir(dirname(proxy), { recursive: true });
   await mkdir(dirname(extension), { recursive: true });
   await writeFile(join(root, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
   await writeFile(proxy, artifacts.proxy, { mode: 0o755 });
-  await writeFile(extension, artifacts.extension, { mode: 0o444 });
-  await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile }, null, 2)}\n`);
+  await writeFile(extension, artifacts.extension, { mode: 0o644 });
+  const childBridge = join(root, "drivers", "pi", "extension", "child-bridge.js");
+  await writeFile(childBridge, artifacts.childBridge, { mode: 0o644 });
+  await writeFile(join(root, "production-bundle-metafiles.json"), `${JSON.stringify({ proxy: artifacts.proxyMetafile, extension: artifacts.extensionMetafile, childBridge: artifacts.childBridgeMetafile }, null, 2)}\n`);
   Object.assign(proof, { proxySha256: digest(proxy), extensionSha256: digest(extension), piSha256: digest(executable), productionLayout: { proxy, extension } });
   const diagnostics: string[] = [];
   let runnerPid: number | null = null;
