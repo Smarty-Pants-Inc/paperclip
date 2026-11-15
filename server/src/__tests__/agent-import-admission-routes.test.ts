@@ -110,42 +110,34 @@ describePg("agent-actor import admission fence", () => {
   it.each(["command", "args", "cwd"])("R1 refuses submitted local host %s without writes", async key => {
     await refused(`R1:${key}`, [{ slug: "local-host", config: { [key]: key === "args" ? ["--untrusted"] : "/tmp/untrusted" } }]);
   });
-  it.each(["string", "plain"])("R2 refuses a %s credential without writes", async shape => {
-    const value = "sk-synthetic-fixture-not-a-real-credential";
-    const adapterConfig = { ...runnerHire.adapterConfig,
-      env: { OPENAI_API_KEY: shape === "plain" ? { type: "plain", value } : value } };
-    const f = await refused(`R2:${shape}`, [{ slug: "credential", adapterType: runnerHire.adapterType, config: adapterConfig }]);
-    const hired = await request(app(f.actor)).post(`/api/companies/${f.companyId}/agent-hires`)
-      .send({ ...runnerHire, name: "credential-hire", role: "engineer", adapterConfig });
-    const afterHire = await snapshot(f.companyId);
-    console.log(JSON.stringify({ row: `R2:${shape}:paired`, importStatus: f.response.status, hireStatus: hired.status,
-      hireError: hired.body.error, afterImport: f.after, afterHire }));
-    expect.soft([403, 422], JSON.stringify(hired.body)).toContain(hired.status);
-    expect.soft(f.response.status >= 200 && f.response.status < 300).toBe(hired.status >= 200 && hired.status < 300);
-    expect.soft(afterHire).toEqual(f.after);
-  });
-
+  // RFL 18:06Z: exactly the live report-env rule. Plain credentials are not
+  // classified or refused; secret references require the ACTOR's own access.
   it.each([
-    ["TZ string", { TZ: "UTC" }, true],
-    ["TZ plain binding", { TZ: { type: "plain", value: "UTC" } }, true],
-    ["credential string", { OPENAI_API_KEY: "sk-synthetic-fixture" }, false],
-    ["credential plain binding", { OPENAI_API_KEY: { type: "plain", value: "sk-synthetic-fixture" } }, false],
-    ["secret_ref", {}, true],
-  ] as const)("R2b import and hire have the same env answer: %s", async (label, suppliedEnv, allowed) => {
+    ["R2 credential string", { env: { OPENAI_API_KEY: "sk-synthetic-fixture" } }, true],
+    ["R2 credential plain binding", { env: { OPENAI_API_KEY: { type: "plain", value: "sk-synthetic-fixture" } } }, true],
+    ["R2b TZ string", { env: { TZ: "UTC" } }, true],
+    ["R2b TZ plain binding", { env: { TZ: { type: "plain", value: "UTC" } } }, true],
+    ["R2b accessible secret_ref", {}, true],
+    ["R2b inaccessible secret_ref", {}, false],
+    ["R2b command", { command: "/tmp/untrusted" }, false],
+    ["R2b args", { args: ["--untrusted"] }, false],
+    ["R2b cwd", { cwd: "/tmp/untrusted" }, false],
+  ] as const)("%s: import/hire/create share admission", async (label, suppliedConfig, allowed) => {
     const { companyId, actor } = await seed();
-    let env: Record<string, unknown> = suppliedEnv;
-    if (label === "secret_ref") {
-      // Real synthetic fixture secret, bound to the caller, not an invalid id
-      // that could turn a downstream missing-secret error into false evidence.
+    let adapterConfig: Record<string, unknown> = { ...runnerHire.adapterConfig, ...suppliedConfig };
+    let expectedError: string | undefined;
+    if (label.endsWith("secret_ref")) {
       const secrets = secretService(db);
       const secret = await secrets.create(companyId, { name: "import-fence-fixture", provider: "local_encrypted",
         value: "sk-synthetic-fixture-not-a-real-credential" });
-      await secrets.createBinding({ companyId, secretId: secret.id, targetType: "agent", targetId: actor.agentId!,
+      if (allowed) await secrets.createBinding({ companyId, secretId: secret.id, targetType: "agent", targetId: actor.agentId!,
         configPath: "env.OPENAI_API_KEY" });
-      env = { OPENAI_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" } };
+      adapterConfig = { ...adapterConfig, env: { OPENAI_API_KEY: { type: "secret_ref", secretId: secret.id, version: "latest" } } };
+      if (!allowed) expectedError = `Caller cannot resolve secret ${secret.id} for a report's environment`;
+    } else if (!allowed) {
+      expectedError = `Agent keys cannot configure host-executed local adapter settings (${label.split(" ").at(-1)}).`;
     }
     const instance = app(actor);
-    const adapterConfig = { ...runnerHire.adapterConfig, env };
     const beforeImport = await snapshot(companyId);
     const imported = await request(instance).post(`/api/companies/${companyId}/imports/apply`)
       .send(bundle(companyId, [{ slug: "env-import", adapterType: runnerHire.adapterType, config: adapterConfig }]));
@@ -154,19 +146,29 @@ describePg("agent-actor import admission fence", () => {
       ...runnerHire, name: "env-hire", role: "engineer", adapterConfig,
     });
     const afterHire = await snapshot(companyId);
-    const importAllowed = imported.status >= 200 && imported.status < 300;
-    const hireAllowed = hired.status >= 200 && hired.status < 300;
-    console.log(JSON.stringify({ row: `R2b:${label}`, importStatus: imported.status, hireStatus: hired.status,
-      importError: imported.body.error, hireError: hired.body.error, importAllowed, hireAllowed, expectedAllowed: allowed,
-      requestedAdapterType: runnerHire.adapterType, requestedProvider: runnerHire.adapterConfig.provider,
+    const created = await request(instance).post(`/api/companies/${companyId}/agents`).send({
+      ...runnerHire, name: "env-create", role: "engineer", adapterConfig,
+    });
+    const afterCreate = await snapshot(companyId);
+    console.log(JSON.stringify({ row: label, importStatus: imported.status, hireStatus: hired.status, createStatus: created.status,
+      importError: imported.body.error, hireError: hired.body.error, createError: created.body.error,
+      expectedAllowed: allowed, expectedError,
       importedAdapterType: (await db.select().from(agents).where(eq(agents.companyId, companyId)))
         .find(a => a.name === "env-import")?.adapterType,
-      beforeImport, afterImport, afterHire }));
-    if (!allowed) expect.soft(afterImport).toEqual(beforeImport);
-    if (!hireAllowed) expect.soft(afterHire).toEqual(afterImport);
-    expect.soft(importAllowed, JSON.stringify(imported.body)).toBe(allowed);
-    expect.soft(hireAllowed, JSON.stringify(hired.body)).toBe(allowed);
-    expect.soft(importAllowed).toBe(hireAllowed);
+      beforeImport, afterImport, afterHire, afterCreate }));
+    // Existing transport contracts are 200 for import and 201 for creation.
+    // Exact status AND exact error pairs, not merely a loose 2xx/4xx check.
+    expect.soft([imported.status, hired.status, created.status]).toEqual(allowed ? [200, 201, 201] : [403, 403, 403]);
+    expect.soft([imported.body.error, hired.body.error, created.body.error]).toEqual([expectedError, expectedError, expectedError]);
+    if (!allowed) {
+      expect.soft(afterImport).toEqual(beforeImport);
+      expect.soft(afterHire).toEqual(beforeImport);
+      expect.soft(afterCreate).toEqual(beforeImport);
+    } else {
+      expect.soft(afterImport.agents.length).toBe(beforeImport.agents.length + 1);
+      expect.soft(afterHire.agents.length).toBe(afterImport.agents.length + 1);
+      expect.soft(afterCreate.agents.length).toBe(afterHire.agents.length + 1);
+    }
   });
 
   it("R3 refuses an escalating package grant with a clear 422", async () => {
@@ -177,7 +179,7 @@ describePg("agent-actor import admission fence", () => {
     }]));
     console.log(JSON.stringify({ row: "R3", status: response.status, error: response.body.error }));
     expect.soft(response.status, JSON.stringify(response.body)).toBe(422);
-    expect.soft(response.body.error ?? "").toMatch(/grant|delegat|permission/i);
+    expect.soft(response.body.error ?? "").toContain("agents:configure");
     expect.soft(await snapshot(companyId)).toEqual(before);
   });
   it("R3b reports each stripped unknown grant and its reason in the result and activity", async () => {
