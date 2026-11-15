@@ -550,6 +550,43 @@ describe("Boat ready spare", () => {
     expect(f.calls.some(call => call.method === "POST" && call.url.pathname.endsWith("/stop"))).toBe(true);
   });
 
+  it("keeps claim queries out of the unscoped background maintenance timer", async () => {
+    let inInvocation = true;
+    let maintenanceTick: (() => void) | undefined;
+    const setInterval = vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, delay?: number) => {
+      if (delay === 15_000) maintenanceTick = callback as () => void;
+      return 1 as unknown as ReturnType<typeof globalThis.setInterval>;
+    }) as typeof globalThis.setInterval);
+    const db = fakeDatabase();
+    db.query.mockImplementation(async (_sql: string, params: unknown[] = []) => {
+      if (!inInvocation) throw new Error("Missing or unknown invocation scope");
+      const leaseId = String(params[0]);
+      return [];
+    });
+    const env = "environment-unscoped-maintenance", company = "company-unscoped-maintenance";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    const f = fixture();
+    await setup(1, [env], 60, db, 3, 10, company);
+    await acquire("run-unscoped-maintenance", baseConfig, env, company);
+    await emitActivity("issue.created", company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.state === "running")).toBe(true), { timeout: 2_000 });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    db.query.mockClear();
+    now += 61 * 60_000;
+    inInvocation = false;
+
+    expect(maintenanceTick).toBeDefined();
+    maintenanceTick!();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(db.query).not.toHaveBeenCalled();
+
+    inInvocation = true;
+    await plugin.definition.onHealth!();
+    expect(db.query).toHaveBeenCalledWith(expect.stringContaining("SELECT provider_lease_id"), expect.any(Array));
+    setInterval.mockRestore();
+  });
+
   it("refreshes a spare TTL while active but stops refreshing once idle", async () => {
     const env = "environment-idle-ttl", company = "company-idle-ttl";
     let now = Date.now();
