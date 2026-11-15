@@ -40,6 +40,8 @@ import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type Pr
 import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
 import { piToolLimitEntry, piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
 import { AGENT_OBSERVABILITY_ENV_KEYS } from "../agent-observability.js";
+import { configuredEnvironment, PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS } from "../../configured-environment.js";
+import { appendSensitiveValues, driverSensitiveValues } from "../sensitive-values.js";
 import { createOpenCodeCompanyObservability } from "../opencode/company-observability.js";
 import { createPiObservabilityEvents, PI_COMPANY_OBSERVABILITY } from "./pi-observability-events.js";
 
@@ -206,6 +208,17 @@ export class PiRpcDriver implements HarnessDriver {
     const args = ["--mode", "rpc", "--session", sessionFile, "--no-approve", "--no-themes"];
     if (this.#options.model) args.push("--model", this.#options.model);
     const environment = { ...(this.#options.environment ?? {}), ...nodeCompileCacheEnvironment(directory, { enableLocalCache: true }) };
+    // Capture before provider setup strips upstream keys from the child env.
+    // Protect all configured values, as OpenCode does, not only secret-like names.
+    const sensitiveValues = driverSensitiveValues({
+      identityKey: environment.PAPERCLIP_AGENT_PRIVATE_KEY,
+      taskEnvironment: configuredEnvironment(this.#options.environment),
+      values: [...PROVIDER_CREDENTIAL_ENVIRONMENT_KEYS,
+        "PAPERCLIP_AI_PROVIDER_KEY", "PAPERCLIP_NATIVE_MCP_TOKEN", "PAPERCLIP_API_KEY",
+        "PAPERCLIP_AGENT_MESSAGE_KEY", "PAPERCLIP_HARNESS_CHECKOUT_KEY", "PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY",
+        "PAPERCLIP_RUNNER_BOOTSTRAP_TICKET", "PAPERCLIP_GITHUB_BROKER_TOKEN", "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+      ].map(key => environment[key]),
+    });
     // Controller-owned launch material belongs only to the runner's exporter,
     // never to Pi's env, provider configuration files, callbacks or tools.
     for (const key of AGENT_OBSERVABILITY_ENV_KEYS) delete environment[key];
@@ -276,7 +289,8 @@ export class PiRpcDriver implements HarnessDriver {
         // Broker/models.json is the FIRST bind. INITIAL contains no provider
         // capability and prepares exactly one preallocated host turn, without IPC.
         await measure("runner.pi.open.provider_binding", async () => {
-          const provider = await createPiProviderBinding({ model: this.#options.model!, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration });
+          const provider = await createPiProviderBinding({ model: this.#options.model!, environment, thinkingLevel: config.piRpcThinkingLevel, modelConfiguration,
+            onSensitiveValues: values => appendSensitiveValues(sensitiveValues, values) });
           closeProvider = provider.close;
           bootstrapProvider = provider.provider;
           let privateDirectory: string | undefined;
@@ -289,6 +303,7 @@ export class PiRpcDriver implements HarnessDriver {
             const context = initialContext;
             callbacks = new PiHostCallbacks(input.normalizedSessionId, this.#options.dynamicToolHandler);
             const toolSocketPath = join(privateDirectory, "tool.sock");
+            appendSensitiveValues(sensitiveValues, [privateDirectory, socketPath, toolSocketPath]);
             // Listen BEFORE spawning Pi. Socket arrival is not an announcement.
             await callbacks.listen(toolSocketPath, this.#options.dynamicToolTimeoutMs);
             bootstrapToolsDeferred = provider.provider.api === "openai-completions" && context.tools.length > 0;
@@ -398,6 +413,7 @@ export class PiRpcDriver implements HarnessDriver {
       const session = new PiRpcHarnessSession({
         transport: transport!,
         observabilityEnvironment: this.#options.environment,
+        sensitiveValues,
         runId: input.runId,
         normalizedSessionId: input.normalizedSessionId,
         providerSessionId: identity.providerSessionId,
@@ -463,6 +479,7 @@ interface PiResidentState {
 interface PiSessionState {
   transport: PiRpcTransport;
   observabilityEnvironment?: NodeJS.ProcessEnv;
+  sensitiveValues: string[];
   runId: string;
   normalizedSessionId: string;
   providerSessionId: string;
@@ -567,6 +584,7 @@ class EventQueue implements AsyncIterable<PrpEvent> {
 export class PiRpcHarnessSession implements HarnessSession {
   readonly #transport: PiRpcTransport;
   readonly #companyObservability: ReturnType<typeof createOpenCodeCompanyObservability>;
+  readonly #sensitiveValues: string[];
   readonly #piObservabilityEvents = createPiObservabilityEvents();
   #runId: string;
   readonly #normalizedSessionId: string;
@@ -657,9 +675,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     this.#turnIdleTimeoutMs = state.turnIdleTimeoutMs ?? PI_TURN_IDLE_TIMEOUT_MS;
     this.#callbacks?.setActivityListener(() => this.#armTurnIdleTimer());
     this.#abortTimeoutMs = Number.isFinite(state.abortTimeoutMs) ? Math.max(1, Math.min(30_000, state.abortTimeoutMs!)) : 5000;
+    this.#sensitiveValues = state.sensitiveValues;
     this.#companyObservability = createOpenCodeCompanyObservability({
       environment: state.observabilityEnvironment, model: state.config.model, sessionId: state.providerSessionId,
-      sensitiveValues: [], profile: PI_COMPANY_OBSERVABILITY, onDiagnostic: message => console.warn(message),
+      sensitiveValues: this.#sensitiveValues, profile: PI_COMPANY_OBSERVABILITY, onDiagnostic: message => console.warn(message),
     });
     this.#emit("session.started", { context: this.#effectiveContext() });
     this.#recordAdmission(state.identity);
@@ -900,7 +919,8 @@ export class PiRpcHarnessSession implements HarnessSession {
     try {
       await this.#revokeBinding();
       signal?.throwIfAborted();
-      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
+      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration,
+        onSensitiveValues: values => appendSensitiveValues(this.#sensitiveValues, values) });
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
       resident.binding = { origin, close: broker.close, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,
