@@ -17,6 +17,7 @@ import {
   companySecrets,
   createDb,
   environments,
+  heartbeatRuns,
   approvals,
   principalPermissionGrants,
   userSecretDeclarations,
@@ -82,6 +83,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
   afterEach(async () => {
     await db.delete(approvals);
     await db.delete(activityLog);
+    await db.delete(heartbeatRuns);
     await db.delete(userSecretDeclarations);
     await db.delete(userSecretDefinitions);
     await db.delete(companySecretBindings);
@@ -138,6 +140,23 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       provider: "local_encrypted",
       value,
     });
+  }
+
+  async function runBoundAgentActor(companyId: string, agentId: string) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running" });
+    return { ...agentActor(companyId, agentId), runId };
+  }
+
+  async function hireSnapshot(companyId: string) {
+    const [agentRows, hireRows, approvalRows, bindings] = await Promise.all([
+      db.select().from(agents).where(eq(agents.companyId, companyId)).orderBy(agents.id),
+      // Hires are represented by agents plus agent.hire_created activity, not a separate table.
+      db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "agent.hire_created"))).orderBy(activityLog.id),
+      db.select().from(approvals).where(eq(approvals.companyId, companyId)).orderBy(approvals.id),
+      db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId)).orderBy(companySecretBindings.id),
+    ]);
+    return { agents: agentRows, hires: hireRows, approvals: approvalRows, bindings };
   }
 
   function secretRef(secretId: string, extra: Record<string, unknown> = {}) {
@@ -343,8 +362,14 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const parent = await seedParentAgent(companyId, "claude_local", {
       CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING },
     });
+    // RFL 18:06Z (2): the caller must be able to resolve the child's supplied ref.
+    // docs/api/secrets.md:40-42,95-96 documents env.* and access.* bindings.
+    // Use API-only access so the parent keeps only its fixed OAuth env credential.
+    await secretService(db).createBinding({ companyId, secretId: childSecret.id,
+      targetType: "agent", targetId: parent.id, configPath: "access.child_anthropic_api_key" });
+    const actor = await runBoundAgentActor(companyId, parent.id);
 
-    const res = await hire(agentActor(companyId, parent.id), companyId, {
+    const res = await hire(actor, companyId, {
       name: "Claude Child With Own Key",
       role: "engineer",
       adapterType: "claude_local",
@@ -355,6 +380,28 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     const childEnv = childEnvOf(res);
     expect(childEnv.ANTHROPIC_API_KEY).toMatchObject({ type: "secret_ref", secretId: childSecret.id });
     expect(childEnv.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+  });
+
+  it("RFL 18:06Z (2): refuses a child-supplied ANTHROPIC_API_KEY secret_ref the caller cannot resolve without persisting a hire", async () => {
+    const companyId = await seedCompany();
+    const childSecret = await createCompanySecret(companyId, "ant-child-key");
+    const parent = await seedParentAgent(companyId, "claude_local", {
+      CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING },
+    });
+    const actor = await runBoundAgentActor(companyId, parent.id);
+    const before = await hireSnapshot(companyId);
+    const res = await hire(actor, companyId, {
+      name: "Claude Child With Own Key",
+      role: "engineer",
+      adapterType: "claude_local",
+      adapterConfig: { env: { ANTHROPIC_API_KEY: secretRef(childSecret.id) } },
+    });
+    const after = await hireSnapshot(companyId);
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.error).toBe(`Caller cannot resolve secret ${childSecret.id} for a report's environment`);
+    expect(after).toEqual(before);
+    console.log(JSON.stringify({ row: "RFL 18:06Z (2) inaccessible child secret_ref", status: res.status,
+      error: res.body.error, before, after }));
   });
 
   it("does not inherit a plain environment value", async () => {
