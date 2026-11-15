@@ -392,8 +392,10 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       || row.state === "unavailable" && !row.processStoppedAt && row.location.startsWith("remote:") && isAgentDirectoryCopy(row));
   }
   function strandsAgent(row: Copy) {
-    return !settledStates.has(row.state) || !row.processStoppedAt || row.nextAttemptAt !== null
-      || Object.hasOwn(row.receipt ?? {}, "baseline") || row.receipt?.cleanupPending === true;
+    const handedOff = row.state === "superseded" && typeof row.receipt?.successorRunId === "string"
+      && row.receipt.successorRunId.trim().length > 0;
+    return !handedOff && (!settledStates.has(row.state) || !row.processStoppedAt || row.nextAttemptAt !== null
+      || Object.hasOwn(row.receipt ?? {}, "baseline") || row.receipt?.cleanupPending === true);
   }
   function onlyDefers(row: Copy, next: Copy) {
     const due = (copy: Copy) => copy.nextAttemptAt?.getTime() ?? 0;

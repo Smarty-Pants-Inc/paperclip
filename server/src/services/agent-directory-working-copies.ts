@@ -151,7 +151,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           const runtime = transports.get(key(current));
           if (runtime) transports.set(key(successor!), runtime);
           transports.delete(key(current));
-          await patch(current, { state: "superseded", receipt: { schema: AGENT_FILES_CONTRACT, warm: true, successorRunId: input.runId } });
+          await patch(current, { state: "superseded", nextAttemptAt: null, receipt: { schema: AGENT_FILES_CONTRACT, warm: true, successorRunId: input.runId } });
           return successor!;
         }); } catch (error) {
           // No process used this proposed owner. Remove it after the canonical
