@@ -15994,7 +15994,7 @@ export async function readRemoteRunnerState(input: {
     return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath,
       recoveryDeadline: input.recoveryDeadline, stall: input.stall });
   } catch (error) {
-    if (input.recoveryDeadline === undefined) throw error;
+    if (input.recoveryDeadline === undefined || readRemoteRunnerRecoveryError(error)) throw error;
     const invalid = error instanceof SyntaxError;
     const timedOut = Boolean((error as { timedOut?: boolean })?.timedOut);
     throw attachRemoteRunnerRecoveryDiagnostic(error,
