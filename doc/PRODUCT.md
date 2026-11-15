@@ -201,7 +201,13 @@ Tasks and project lists hide agent-created and system-created tasks by default.
 The Filters menu's **Show agent-created tasks** checkbox includes routine runs,
 recovery/watchdog tasks, chat-channel tasks, and other automation. Channel tasks
 remain bot-created for this filter even when a human starts the conversation. The choice is saved per company
-and collection; Clear filters restores the hidden default. Nested lists preserve
+and collection; Clear filters restores the hidden default. An instance admin can
+make these lists show agent-created tasks by default with the General setting
+**Show agent-created tasks in task lists by default**
+(`PATCH /api/instance/settings/general` with
+`{"taskListsShowAgentCreatedByDefault": true}`). A person's own choice in the
+Filters menu still wins, and Clear filters then restores the instance default.
+Choices saved before this setting existed are not treated as a choice. Nested lists preserve
 ancestors and expandable subtasks as context without promoting unrelated automated
 work to independent results. Agent profiles, routine histories, and task-detail
 subtasks retain their full history.
