@@ -52,6 +52,8 @@ mod unix_socket {
     const CONNECTION_QUEUE_CAPACITY: usize = 32;
     const HTTP_WORKER_COUNT: usize = 4;
     const ERROR_BODY_UNAVAILABLE: &[u8] = br#"{"error":"runner ingress unavailable"}"#;
+    const ERROR_BODY_METHOD_NOT_ALLOWED: &[u8] = br#"{"error":"Method not allowed"}"#;
+    const GITHUB_CREDENTIALS_PATH: &str = "/runtime-tools/github/credentials";
 
     pub struct GitHubAccessIngress {
         socket_path: PathBuf,
@@ -280,8 +282,12 @@ mod unix_socket {
                 return;
             }
         };
-        if !parsed.target.starts_with('/') {
+        if parsed.target != GITHUB_CREDENTIALS_PATH {
             write_http_error(stream, 404);
+            return;
+        }
+        if parsed.method != "POST" {
+            write_http_error(stream, 405);
             return;
         }
         if ["origin", "cookie", "sec-fetch-site"]
@@ -568,6 +574,8 @@ mod unix_socket {
     fn write_http_error(stream: &mut UnixStream, status: u16) {
         let body = if status == 404 {
             br#"{"error":"Not found"}"#.as_slice()
+        } else if status == 405 {
+            ERROR_BODY_METHOD_NOT_ALLOWED
         } else if status == 413 {
             br#"{"error":"Request body too large"}"#.as_slice()
         } else if status == 400 {
@@ -601,6 +609,7 @@ mod unix_socket {
             401 => "Unauthorized",
             403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
             409 => "Conflict",
             413 => "Payload Too Large",
             429 => "Too Many Requests",

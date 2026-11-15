@@ -129,7 +129,10 @@ fn private_socket_forwards_only_the_exact_github_credentials_route() {
         )
         .unwrap();
         let response = read_response(&mut client);
-        assert!(response.starts_with(&format!("HTTP/1.1 {expected_status} ")), "{method} {path}: {response}");
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {expected_status} ")),
+            "{method} {path}: {response}"
+        );
         let error = if expected_status == 405 {
             r#"{"error":"Method not allowed"}"#
         } else {
