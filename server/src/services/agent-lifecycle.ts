@@ -29,9 +29,39 @@ import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginEnvironmentRequiresAgent, pluginForAgentEnvironment } from "./plugin-environment-driver.js";
 import { isProviderApiSetupDraft } from "./native-runtime/provider-api-placement.js";
+import { redactSensitiveText } from "../redaction.js";
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
+
+export function lifecycleErrorDetail(error: unknown): string {
+  const details: Array<{ name: string; code?: string | number; message: string }> = [];
+  const seen = new Set<object>();
+  let current: unknown = error;
+  for (let depth = 0; depth <= 3 && current !== null && (typeof current === "object" || typeof current === "function"); depth++) {
+    const source = current as { cause?: unknown; code?: unknown; message?: unknown; constructor?: { name?: unknown } };
+    if (seen.has(source)) break;
+    seen.add(source);
+    const constructorName = typeof source.constructor?.name === "string" ? source.constructor.name : "Error";
+    const rawCode = typeof source.code === "string" || typeof source.code === "number" ? source.code : undefined;
+    const code = typeof rawCode === "string"
+      ? /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(rawCode) && !/[a-z0-9]{20,}/i.test(rawCode) && !/(?:sk-|ghp_|gho_|xox)/i.test(rawCode) ? rawCode : undefined
+      : rawCode;
+    const message = typeof source.message === "string" ? source.message : "";
+    const safeMessage = /^[a-z][a-z0-9_]{2,80}(:[ a-z0-9_.()-]{0,160})?$/.test(message)
+      && !/[a-z0-9]{20,}/.test(message)
+      && !/(?:sk-|ghp_|gho_|xox)/i.test(message)
+      ? redactSensitiveText(message) : "withheld";
+    details.push({ name: constructorName.slice(0, 80), ...(code === undefined ? {} : { code: typeof code === "string" ? code.slice(0, 80) : code }), message: safeMessage });
+    current = source.cause;
+  }
+  let serialized = JSON.stringify(details);
+  while (serialized.length > 512 && details.length > 1) {
+    details.pop();
+    serialized = JSON.stringify(details);
+  }
+  return serialized.length <= 512 ? serialized : "[]";
+}
 
 export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): lifecycle.LifecycleEffects {
   return {
@@ -74,7 +104,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     },
     reportFailure(context, error) {
       const code = lifecycle.lifecycleFailureCode(error);
-      logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
+      logger.warn({ ...context, failureCode: code ?? "unclassified", errorDetail: lifecycleErrorDetail(error) }, "Agent lifecycle operation failed");
     },
     transaction: withAccountingTransaction,
     deleteDependencies: deleteAgentDependencies,

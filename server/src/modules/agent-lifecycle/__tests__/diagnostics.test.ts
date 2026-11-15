@@ -210,7 +210,7 @@ describe("lifecycle failure diagnostics", () => {
     const log = vi.spyOn(logger, "warn").mockImplementation(() => {});
     const context = { stage: "host" as const, agentId: "agent", phase: "verifying" as const, operationId: "operation", version: 3 };
     createAgentLifecycleEffects().reportFailure(context, Object.assign(new Error("private provider detail"), details));
-    expect(log).toHaveBeenCalledExactlyOnceWith({ ...context, failureCode }, "Agent lifecycle operation failed");
+    expect(log).toHaveBeenCalledExactlyOnceWith({ ...context, failureCode, errorDetail: expect.any(String) }, "Agent lifecycle operation failed");
     expect(JSON.stringify(log.mock.calls)).not.toContain("private");
   });
 });

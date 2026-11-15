@@ -9,7 +9,8 @@ describe("lifecycleErrorDetail", () => {
     ["native_portable_task_ownership_pending", "native_portable_task_ownership_pending"],
     ["runner_harness_state_mismatch: provider_identity_changed", "runner_harness_state_mismatch: provider_identity_changed"],
   ])("keeps bounded diagnostic codes", (message, expected) => {
-    expect(lifecycleErrorDetail(new Error(message))).toMatchObject({ message: expected });
+    const detail = JSON.parse(lifecycleErrorDetail(new Error(message))) as Array<{ message: string }>;
+    expect(detail[0]?.message).toBe(expected);
   });
 
   it.each([
@@ -18,7 +19,8 @@ describe("lifecycleErrorDetail", () => {
     "deadbeefdeadbeefdeadbeefdeadbeef",
     "env LANGFUSE_SECRET_KEY=SENTINELsecret-9f8e7d6c5b4a3921 rejected",
   ])("withholds unsafe message %s", message => {
-    expect(lifecycleErrorDetail(new Error(message))).toMatchObject({ message: "withheld" });
+    const detail = JSON.parse(lifecycleErrorDetail(new Error(message))) as Array<{ message: string }>;
+    expect(detail[0]?.message).toBe("withheld");
   });
 
   it("limits cause depth, reports cause code, and bounds serialized detail", () => {
@@ -32,7 +34,14 @@ describe("lifecycleErrorDetail", () => {
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
     const error = new Error("safe outer");
     error.cause = new Error("env LANGFUSE_SECRET_KEY=SENTINELsecret-9f8e7d6c5b4a3921 rejected");
-    createAgentLifecycleEffects().reportFailure({ stage: "host", phase: "verifying" }, error);
+    const effects = createAgentLifecycleEffects();
+    effects.reportFailure({ stage: "host", phase: "verifying" }, error);
+    for (const message of [
+      "auth_failed: 3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a",
+      "auth_failed: sk-live-abc123",
+      "deadbeefdeadbeefdeadbeefdeadbeef",
+      "env LANGFUSE_SECRET_KEY=SENTINELsecret-9f8e7d6c5b4a3921 rejected",
+    ]) effects.reportFailure({ stage: "host", phase: "verifying" }, new Error(message));
     const logged = JSON.stringify(warn.mock.calls);
     for (const secret of ["SENTINEL", "3f9a8b7c6d5e", "sk-live", "deadbeefdeadbeef"]) {
       expect(logged).not.toContain(secret);
