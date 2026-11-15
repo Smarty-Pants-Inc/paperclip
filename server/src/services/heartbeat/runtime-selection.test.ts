@@ -872,8 +872,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(comment => comment.authorType === "system");
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain(`your skill change is in effect; ${f.agent.name} restarted its working thread`);
-    expect(notes[0].body).not.toContain("could not be safely restored");
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
   });
 
   it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {

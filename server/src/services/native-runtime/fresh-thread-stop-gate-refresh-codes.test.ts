@@ -6,7 +6,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { truncateTablesWithDeadlockRetry } from "../../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { ensureFreshContinuation, resetBacklogContinuationPacingForTests } from "../fresh-continuation-fallback.js";
 import { heartbeatService } from "../heartbeat.js";
-import { isInstructionRefreshPrepareCode, RUNNER_PREPARE_REFUSAL_CODES, NativeRunnerRefreshRequiredError } from "../../vendor/paperclip-runner/index.js";
+import { RUNNER_PREPARE_REFUSAL_CODES, NativeRunnerRefreshRequiredError } from "../../vendor/paperclip-runner/index.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import { FRESH_THREAD_STARTED_NOTE, freshThreadStartedNote } from "./fresh-thread-stop-gate.js";
 import { PI_CONVERSATION_KEY, selectPiConversation } from "./pi-conversation-record.js";
@@ -82,10 +82,6 @@ suite("fresh thread wording follows Runner instruction-refresh codes", () => {
     expect(notes).toHaveLength(1);
     expect(notes[0]).toMatchObject({ body: await freshThreadStartedNote(db, source),
       metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` } });
-    if (isInstructionRefreshPrepareCode(prepareCode)) {
-      expect(notes[0].body).toMatch(/your skill change is in effect/i);
-    } else {
       expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-    }
   });
 });

@@ -10,7 +10,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { truncateTablesWithDeadlockRetry } from "../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { ensureFreshContinuation, readFreshContinuationSessionBoundary, resetBacklogContinuationPacingForTests } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
-import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
+import { readFreshThreadStopProof, FRESH_THREAD_STARTED_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
 import * as processOwner from "./run-process-owner.js";
 import { freshThreadRefusalCode } from "./native-runtime/runner-reconciliation-refusal.js";
 import { runnerPrepareRefusalCode } from "../vendor/paperclip-runner/index.js";
@@ -127,7 +127,7 @@ suite("R513 independent allocation and instruction probes", () => {
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)); expect(notes).toHaveLength(1);
     appendFileSync(join(rflJudgeLogDir(), "independent-notes.jsonl"), JSON.stringify({ prepareCode, code, prepareRefusalCode, note: notes[0].body }) + "\n");
-    expect(notes[0].body).toMatch(/your skill change is in effect/i);
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
   });
   it("H generic provider_prepare_refused is neutral", async () => {
     const error = Object.assign(new Error("Generic prepare refusal"), { runnerCommandResult: { commandType: "run.prepare", status: "failed", result: { code: "command_execution_failed" } } });

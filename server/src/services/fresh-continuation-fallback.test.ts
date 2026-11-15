@@ -435,13 +435,7 @@ suite("fresh-continuation fallback", () => {
       await selectFreshSuccessor(f);
       const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
       expect(notes).toHaveLength(1);
-      if (code === "native_runner_refresh_required") {
-        expect(notes[0].body).toContain("your skill change is in effect; Coder restarted its working thread");
-        expect(notes[0].body).not.toContain("could not be safely restored");
-      } else {
-        expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
-        expect(notes[0].body).not.toMatch(/skill change/);
-      }
+      expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
     });
 
   it.each(["missing-allocation", "failed-process-read", "bound-remote"])("D10 cold restore backup_without_reusable_lease continues without positive stop proof (%s)", async shape => {

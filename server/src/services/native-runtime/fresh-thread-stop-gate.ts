@@ -1,5 +1,5 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, hasRestoredEndedLeaseStopReceipt, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
@@ -9,23 +9,12 @@ import { PENDING_CLEANUP_SWEEP_ATTEMPT_CAP } from "../environment-cleanup-state.
 import { isBuiltinSandboxProvider } from "../sandbox-provider-runtime.js";
 import { currentProcessSpaceHash } from "../controller-process-identity.js";
 import { hostname } from "node:os";
-import { isInstructionRefreshPrepareCode } from "../../vendor/paperclip-runner/index.js";
 
 export const FRESH_THREAD_STARTED_NOTE = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
 
-/** Only the typed instruction/skill refresh may claim the change took effect.
- * Environment loss and launch mismatch retain the generic truthful notice. */
-export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof heartbeatRuns.$inferSelect): Promise<string> {
-  const refusal = run.resultJson?.nativeFreshContinuationRefusal as { code?: unknown; prepareRefusalCode?: unknown } | undefined;
-  const code = freshThreadRefusalCode({ code: run.errorCode }) ?? freshThreadRefusalCode(refusal);
-  // Only the Runner's typed instruction-refresh channel proves a skill change.
-  // Generic prepare refusal and unrelated specific prepare refusals stay neutral.
-  if (code !== "native_runner_refresh_required"
-    || (refusal?.prepareRefusalCode != null
-      && !isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))) return FRESH_THREAD_STARTED_NOTE;
-  const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
-    eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
-  return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
+/** The stop gate cannot prove why a runner needs a fresh thread. */
+export async function freshThreadStartedNote(_db: Pick<Db, "select">, _run: typeof heartbeatRuns.$inferSelect): Promise<string> {
+  return FRESH_THREAD_STARTED_NOTE;
 }
 
 type ProofReader = Pick<Db, "select" | "selectDistinctOn">;

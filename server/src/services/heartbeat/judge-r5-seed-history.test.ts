@@ -46,6 +46,7 @@ import { heartbeatRunEvents } from "@paperclipai/db";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { answerWithNativePeer } from "../../__tests__/helpers/native-answer-peer.js";
 import { resolveNativeControllerRecovery } from "../native-runtime/native-controller-recovery.js";
+import { FRESH_THREAD_STARTED_NOTE } from "../native-runtime/fresh-thread-stop-gate.js";
 const rflJudgeLogDir = () => { const dir = join(process.env.RFL_JUDGE_LOG_DIR ?? process.env.TASK_OUT ?? tmpdir(), "logs"); mkdirSync(dir, { recursive: true }); return dir; };
 
 // Keep the real contract, session, and runtime-selection transactions. Replace only
@@ -939,8 +940,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(comment => comment.authorType === "system");
     expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain(`your skill change is in effect; ${f.agent.name} restarted its working thread`);
-    expect(notes[0].body).not.toContain("could not be safely restored");
+    expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
   });
 
   it("does not treat a forceFreshSession flag or forged recovery action id as provider-thread authority", async () => {
