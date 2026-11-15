@@ -6,18 +6,41 @@ import { hasReasoningHeadlines, reasoningSummarySections } from "./reasoning-sum
  * Provider reasoning summary as one bullet per summary part. Headlines lead
  * each bullet; any prose the provider wrote under a headline follows it in
  * muted text. Prose-only summaries (Claude) render as plain paragraphs.
+ *
+ * `plain` (inline reasoning in the turn): no bullets and no box; each section
+ * is plain paragraphs, the headline first, at the answer's size and left edge.
  */
 export function TaskChatReasoningSummary({
   text,
   streaming = false,
+  plain = false,
   className,
 }: {
   text: string;
   /** The last section is still being written. */
   streaming?: boolean;
+  /** Plain paragraphs in the flow of the turn (inline display). */
+  plain?: boolean;
   className?: string;
 }) {
   const sections = reasoningSummarySections(text);
+  if (plain) {
+    return (
+      <div className={cn("task-chat-reasoning-plain", className)} data-conversation-text="progress" data-testid="task-chat-reasoning-plain">
+        {hasReasoningHeadlines(sections) ? sections.map((section, index) => (
+          <div key={index} className="task-chat-reasoning-plain-section" data-reasoning-section={index}
+            data-current={streaming && index === sections.length - 1 ? "true" : undefined}>
+            {section.headline ? <p className="task-chat-reasoning-headline" data-reasoning-headline>{section.headline}</p> : null}
+            {section.body ? (
+              <MarkdownBody className="task-chat-reasoning-markdown" softBreaks linkIssueReferences>{section.body}</MarkdownBody>
+            ) : null}
+          </div>
+        )) : (
+          <MarkdownBody className="task-chat-reasoning-markdown" softBreaks linkIssueReferences>{text.trim()}</MarkdownBody>
+        )}
+      </div>
+    );
+  }
   if (!hasReasoningHeadlines(sections)) {
     return (
       <div className={className} data-conversation-text="progress" data-testid="task-chat-reasoning-prose">
@@ -40,7 +63,7 @@ export function TaskChatReasoningSummary({
             />
             <div className="flex min-w-0 flex-1 flex-col gap-0.5">
               {section.headline ? (
-                <span className="task-chat-reasoning-headline text-xs text-foreground" data-reasoning-headline>{section.headline}</span>
+                <span className="task-chat-reasoning-headline text-xs" data-reasoning-headline>{section.headline}</span>
               ) : null}
               {section.body ? (
                 <div className="text-xs text-muted-foreground">
