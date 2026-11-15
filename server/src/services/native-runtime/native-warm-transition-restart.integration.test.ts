@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import {
   chmod,
   cp,
@@ -16,11 +17,13 @@ import {
   companies,
   createDb,
   heartbeatRuns,
+  heartbeatRunEvents,
   issues,
   nativeRunFinalizations,
 } from "@paperclipai/db";
 import type { NativeExecutionInputV1 } from "@paperclipai/paperclip-runner";
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { registerLocalRuntimeApiServer } from "../../runtime-api.js";
 import { nativeSha256 } from "./canonical.js";
 import {
   nativeToolContractFingerprintForTarget,
@@ -45,6 +48,19 @@ const managedFixtureDirectory =
 const databaseUrl = process.env.PAPERCLIP_TEST_DATABASE_URL;
 const generated =
   fixtureDirectory && databaseUrl ? describe : describe.skip;
+const localRuntimeApiServer = createServer();
+registerLocalRuntimeApiServer(localRuntimeApiServer);
+beforeAll(async () => {
+  localRuntimeApiServer.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    localRuntimeApiServer.once("listening", resolve);
+    localRuntimeApiServer.once("error", reject);
+  });
+});
+afterAll(async () => {
+  localRuntimeApiServer.closeAllConnections();
+  await new Promise<void>(resolve => localRuntimeApiServer.close(() => resolve()));
+});
 
 type Identity = {
   runnerInstanceId: string;
@@ -824,6 +840,9 @@ generated(
             await db
               .delete(nativeRunFinalizations)
               .where(eq(nativeRunFinalizations.companyId, companyId));
+            await db
+              .delete(heartbeatRunEvents)
+              .where(eq(heartbeatRunEvents.companyId, companyId));
             await db
               .delete(heartbeatRuns)
               .where(eq(heartbeatRuns.companyId, companyId));
