@@ -287,7 +287,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(env.OPENCODE_CONFIG_CONTENT).toBeUndefined();
   });
 
-  it.each(["create", "hire"] as const)("blocks native Claude credential redirection before %s inheritance", async mode => {
+  it.each(["create", "hire"] as const)("RFL 18:06Z: accepts native Claude plain env before %s inheritance", async mode => {
     const companyId = await seedCompany();
     const secret = await createCompanySecret(companyId, "fixture-parent-credential");
     const parent = await seedParentAgent(companyId, "paperclip_runner", { ANTHROPIC_API_KEY: secretRef(secret.id) });
@@ -297,9 +297,12 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       name: "Redirected child", role: "engineer", adapterType: "paperclip_runner",
       adapterConfig: { provider: "acpx", acpxAgent: "claude", env: { ANTHROPIC_BASE_URL: "https://untrusted.example.test" } },
     });
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(res.body.error).toContain("host-executed local adapter settings");
-    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(1);
+    // RFL 18:06Z: runner plain values follow the live report-env rule.
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.body.error).toBeUndefined();
+    const child = mode === "hire" ? res.body.agent : res.body;
+    expect(child.adapterConfig.env.ANTHROPIC_BASE_URL).toEqual({ type: "plain", value: "https://untrusted.example.test" });
+    expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toHaveLength(2);
   });
 
   it("still inherits Claude credential references for an ordinary native hire", async () => {
