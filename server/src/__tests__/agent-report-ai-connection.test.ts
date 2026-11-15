@@ -398,7 +398,7 @@ describe("manager assigns a company AI connection to its own report", () => {
         expect([403, 422], response.text).toContain(response.status);
         expect(response.body.error).toBeTruthy();
         const saved = await f.read();
-        expect(saved.runtimeConfig).toEqual(before.runtimeConfig); expect(saved.adapterConfig).toEqual(before.adapterConfig);
+        expect(saved).toEqual(before);
         expect(saved.reportsTo).toBe(race === "reparent" ? f.ids.outside : before.reportsTo);
         expect(await db.select().from(agentConfigRevisions).where(eq(agentConfigRevisions.agentId, f.ids.report))).toEqual([]);
       } finally { seam.mockRestore(); }
