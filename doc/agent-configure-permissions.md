@@ -110,6 +110,45 @@ and the current strict reporting-subtree check: self, peers and unrelated agents
 keep the existing refusal. Both decisions are rechecked under the writer's
 company reporting-tree lock.
 
+To revoke **one hire's** runtime capability, its manager uses the existing
+`PATCH /api/agents/:id/permission-grants` route, with the hire's UUID as `:id`:
+
+```http
+PATCH /api/agents/11111111-1111-4111-8111-111111111111/permission-grants
+Content-Type: application/json
+
+{"permissionKey":"agents:configure-reports-runtime","enabled":false}
+```
+
+Use the manager's normal authenticated request context. The hire must be a
+current strict reporting descendant (direct or indirect) over which the manager
+has direct, target-scoped `agents:configure` authority. Revocation does not
+require the manager to hold `agents:configure-reports-runtime` itself. It removes
+the hire's ability to use this exception on **its own reports**; it does not
+remove the manager's grant or block the manager from configuring the hire.
+Read back `GET /api/agents/:id` under `access.grants` to confirm the removal.
+
+Implementation: [route and manager/board authorization](../server/src/routes/agent-permission-grants.ts#L16-L50)
+(`server/src/routes/agent-permission-grants.ts:16`),
+[strict descendant and direct configuration checks](../server/src/services/agent-subtree-management.ts#L13-L28)
+(`server/src/services/agent-subtree-management.ts:13`), and
+[single-agent grant deletion](../server/src/routes/agent-permission-grants.ts#L74-L80)
+(`server/src/routes/agent-permission-grants.ts:74`). The existing
+[grant-update instructions](#grant-updates) document `enabled: false` revocation.
+
+For the organization to turn this off for **all agents**, a board user with
+`users:manage_permissions` sends the same route and body once per agent,
+including primary agents and managers. The local implicit board actor retains
+its existing permission-management path. The route accepts one target agent
+UUID, not a bulk target; no separate bulk revoke path or company setting is
+provided. Revoking it for every agent in the company is the company-wide off.
+An agent manager cannot perform the all-agent operation across roots or on
+itself; use the board permission-management path cited above. **New standard
+hires get the grant by default**, even after the current roster's grants are
+revoked, so revoke each new hire's grant too to maintain the company-wide off.
+Existing revocations survive ordinary updates, startup and normal migration
+reruns; manually replaying a one-time backfill SQL file is not the revoke path.
+
 A referenced secret must also pass the caller's existing own-run secret binding
 and version admission; a run-bound caller additionally needs a currently running
 run and a direct or inherited runtime-manifest binding. A refusal names the
