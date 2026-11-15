@@ -1,4 +1,5 @@
 import { useCoordinatorWorkspaceEnabled } from "./hooks/useCoordinatorWorkspaceEnabled";
+import { ORGANIZATION_CREATION_HIDDEN } from "./lib/organization-creation";
 import { AgentChats } from "./pages/AgentChats";
 import { lazy, Suspense, useEffect, type ReactNode } from "react";
 import type { ToolConnectionCredentialSource } from "@paperclipai/shared";
@@ -523,6 +524,7 @@ function LegacySettingsRedirect() {
 
   if (!targetCompany) {
     if (
+      !ORGANIZATION_CREATION_HIDDEN &&
       shouldRedirectCompanylessRouteToOnboarding({
         pathname: location.pathname,
         hasCompanies: false,
@@ -616,7 +618,7 @@ export function OnboardingRoutePage() {
                   "Organizations are created in Paperclip Cloud. This instance can't reach it right now — try again from your Cloud portfolio.",
               })}
             </p>
-          ) : (
+          ) : matchedCompany || !ORGANIZATION_CREATION_HIDDEN ? (
             <Button
               onClick={() =>
                 matchedCompany
@@ -637,7 +639,7 @@ export function OnboardingRoutePage() {
             >
               {matchedCompany ? "Add Agent" : "Start Onboarding"}
             </Button>
-          )}
+          ) : null}
         </div>
       </div>
     </div>
@@ -655,6 +657,7 @@ function CompanyRootRedirect() {
   const targetCompany = selectedCompany ?? companies[0] ?? null;
   if (!targetCompany) {
     if (
+      !ORGANIZATION_CREATION_HIDDEN &&
       shouldRedirectCompanylessRouteToOnboarding({
         pathname: location.pathname,
         hasCompanies: false,
@@ -700,6 +703,7 @@ function UnprefixedBoardRedirect() {
   const targetCompany = selectedCompany ?? companies[0] ?? null;
   if (!targetCompany) {
     if (
+      !ORGANIZATION_CREATION_HIDDEN &&
       shouldRedirectCompanylessRouteToOnboarding({
         pathname: location.pathname,
         hasCompanies: false,
@@ -746,7 +750,7 @@ function NoCompaniesStartPage() {
                   "Organizations are created in Paperclip Cloud. This instance can't reach it right now — try again from your Cloud portfolio.",
               })}
             </p>
-          ) : (
+          ) : !ORGANIZATION_CREATION_HIDDEN ? (
             <Button
               onClick={() =>
                 cloudInstance && createStackUrl
@@ -756,7 +760,7 @@ function NoCompaniesStartPage() {
             >
               {t("app.noCompanies.newCompany", { defaultValue: "New Organization" })}
             </Button>
-          )}
+          ) : null}
         </div>
       </div>
     </div>

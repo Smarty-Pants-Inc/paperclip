@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCompany } from "../context/CompanyContext";
 import { useDialogActions } from "../context/DialogContext";
@@ -112,7 +113,7 @@ export function Companies() {
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-end">
-        {isCloud ? null : (
+        {ORGANIZATION_CREATION_HIDDEN || isCloud ? null : (
           <Button size="sm" onClick={() => openOnboarding()}>
             <Plus className="h-3.5 w-3.5 mr-1.5" />
             New Organization
