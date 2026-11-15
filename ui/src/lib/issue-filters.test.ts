@@ -6,7 +6,9 @@ import {
   applyIssueFilters,
   countActiveIssueFilters,
   defaultIssueFilterState,
+  issueCreationRequestFilters,
   normalizeIssueFilterState,
+  resolveAgentCreatedTasksDefault,
   resolveIssueFilterWorkspaceId,
   searchIssueFilterOptions,
   shouldIncludeIssueFilterWorkspaceOption,
@@ -301,5 +303,59 @@ describe("issue filters", () => {
     );
 
     expect(filtered).toEqual([]);
+  });
+
+  describe("instance default for agent-created tasks", () => {
+    // Stored filter shapes of the collections that offer the filter: the
+    // Tasks and project lists (task-collection v1 envelopes) and the
+    // inbox-style list (inbox issueFilters). None carries an explicit choice.
+    const storedWithoutChoice = {
+      tasks: { showAgentCreatedTasks: false, statuses: ["todo"], sortField: "created" },
+      project: { showAgentCreatedTasks: false, priorities: ["high"] },
+      inbox: { showAgentCreatedTasks: false, labels: ["label-1"], workspaces: [] },
+    };
+
+    it.each(Object.entries(storedWithoutChoice))("requests agent-created tasks for the %s list when the setting is on", (_name, stored) => {
+      const state = resolveAgentCreatedTasksDefault(normalizeIssueFilterState(stored), true);
+      expect(state.showAgentCreatedTasks).toBe(true);
+      expect(issueCreationRequestFilters(state, true)).toMatchObject({ includeAgentCreatedTasks: true });
+    });
+
+    it.each(Object.entries(storedWithoutChoice))("keeps the upstream hidden default for the %s list when the setting is off", (_name, stored) => {
+      const state = resolveAgentCreatedTasksDefault(normalizeIssueFilterState(stored), false);
+      expect(issueCreationRequestFilters(state, true)).toMatchObject({ includeAgentCreatedTasks: false });
+      // A v1 or legacy true without a recorded choice falls to the default too.
+      const legacyTrue = resolveAgentCreatedTasksDefault(normalizeIssueFilterState({ ...stored, showAgentCreatedTasks: true }), false);
+      expect(legacyTrue.showAgentCreatedTasks).toBe(false);
+    });
+
+    it("keeps other stored filters while resolving the default", () => {
+      const state = resolveAgentCreatedTasksDefault(normalizeIssueFilterState(storedWithoutChoice.tasks), true);
+      expect(state.statuses).toEqual(["todo"]);
+    });
+
+    it("lets an explicit choice win in both directions and survive a reload", () => {
+      const hidden = normalizeIssueFilterState(JSON.parse(JSON.stringify({ ...defaultIssueFilterState, showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true })));
+      expect(hidden.showAgentCreatedTasksExplicit).toBe(true);
+      expect(resolveAgentCreatedTasksDefault(hidden, true).showAgentCreatedTasks).toBe(false);
+      const shown = normalizeIssueFilterState({ showAgentCreatedTasks: true, showAgentCreatedTasksExplicit: true });
+      expect(resolveAgentCreatedTasksDefault(shown, false).showAgentCreatedTasks).toBe(true);
+    });
+
+    it("clears filters back to the setting's default", () => {
+      const explicit = { ...defaultIssueFilterState, statuses: ["done"], showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true };
+      // Every list's Clear merges defaultIssueFilterState over its state.
+      const cleared = { ...explicit, ...defaultIssueFilterState };
+      expect(cleared.statuses).toEqual([]);
+      expect(resolveAgentCreatedTasksDefault(cleared, true).showAgentCreatedTasks).toBe(true);
+      expect(resolveAgentCreatedTasksDefault(cleared, false).showAgentCreatedTasks).toBe(false);
+    });
+
+    it("counts the filter as active only when it differs from the setting's default", () => {
+      const onByDefault = resolveAgentCreatedTasksDefault(defaultIssueFilterState, true);
+      expect(countActiveIssueFilters(onByDefault, true, true)).toBe(0);
+      expect(countActiveIssueFilters({ ...onByDefault, showAgentCreatedTasks: false, showAgentCreatedTasksExplicit: true }, true, true)).toBe(1);
+      expect(countActiveIssueFilters({ ...defaultIssueFilterState, showAgentCreatedTasks: true }, true)).toBe(1);
+    });
   });
 });

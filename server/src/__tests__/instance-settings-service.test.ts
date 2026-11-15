@@ -1,15 +1,34 @@
 import { describe, expect, it, vi } from "vitest";
-import { INSTANCE_FEATURE_CATALOG, instanceExperimentalSettingsSchema, type InstanceExperimentalSettings } from "@paperclipai/shared";
+import {
+  INSTANCE_FEATURE_CATALOG,
+  instanceExperimentalSettingsSchema,
+  instanceGeneralSettingsSchema,
+  patchInstanceGeneralSettingsSchema,
+  type InstanceExperimentalSettings,
+} from "@paperclipai/shared";
 import {
   applyExperimentalSettingsPatch,
   applyCloudCatalogDefaults,
   applyManagedExperimentalOverlay,
   normalizeExperimentalSettings,
+  normalizeGeneralSettings,
   resolveWorktreeRunExecutionActivationState,
 } from "../services/instance-settings.js";
 import type { ManagedInstanceConfig } from "../services/managed-config.js";
 
 describe("instance settings service", () => {
+  it("keeps the task-list agent-created default off until an operator turns it on", () => {
+    expect(instanceGeneralSettingsSchema.parse({}).taskListsShowAgentCreatedByDefault).toBe(false);
+    expect(patchInstanceGeneralSettingsSchema.parse({ taskListsShowAgentCreatedByDefault: true }))
+      .toEqual({ taskListsShowAgentCreatedByDefault: true });
+    expect(patchInstanceGeneralSettingsSchema.parse({})).toEqual({});
+    for (const stored of [undefined, null, {}, { censorUsernameInLogs: true }]) {
+      expect(normalizeGeneralSettings(stored).taskListsShowAgentCreatedByDefault).toBe(false);
+    }
+    const enabled = normalizeGeneralSettings({ taskListsShowAgentCreatedByDefault: true, censorUsernameInLogs: true });
+    expect(enabled).toMatchObject({ taskListsShowAgentCreatedByDefault: true, censorUsernameInLogs: true });
+    expect(normalizeGeneralSettings(JSON.parse(JSON.stringify(enabled))).taskListsShowAgentCreatedByDefault).toBe(true);
+  });
   it("retains the legacy composer preference through saved and unrelated settings updates", () => {
     expect(normalizeExperimentalSettings({}).enableLegacyComposerSubmit).toBe(false);
     const enabled = applyExperimentalSettingsPatch({}, { enableLegacyComposerSubmit: true });

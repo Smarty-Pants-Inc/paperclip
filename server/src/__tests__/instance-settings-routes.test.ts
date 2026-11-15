@@ -584,6 +584,21 @@ describe("instance settings routes", () => {
     expect(mockLogActivity).toHaveBeenCalledTimes(2);
   });
 
+  it("accepts the task-list agent-created default on the documented general settings PATCH", async () => {
+    const app = await createApp(localAdminActor());
+    const patchRes = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ taskListsShowAgentCreatedByDefault: true });
+    expect(patchRes.status).toBe(200);
+    expect(mockInstanceSettingsService.updateGeneral).toHaveBeenCalledWith({
+      taskListsShowAgentCreatedByDefault: true,
+    });
+    const badRes = await request(app)
+      .patch("/api/instance/settings/general")
+      .send({ taskListsShowAgentCreatedByDefault: "yes" });
+    expect(badRes.status).toBe(400);
+  });
+
   it("allows non-admin board users to read general settings", async () => {
     const app = await createApp({
       type: "board",
