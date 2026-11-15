@@ -1,6 +1,10 @@
 // RFL row R / N-gating: deployed follow-up 562da3cc-5ad3-4bf8-acba-962e3c4c2c86.
 // Deployed row: RED on 74ccf170; GREEN on D-B1 + D-B2 + D-B4 + D-B5.
-// G-warm: Runner-accepted yielded result then replaced box (D-B6 target).
+// G1: governed wait + replaced box, Pi JSONL survives: history present, no notes.
+// G2: governed wait + truly replaced box, Pi JSONL renamed aside: no history,
+// exactly one real missing-file notice. Both await D-B8 v2 (it.fails).
+// G1/G2 task-session records use selectPiConversation, the heartbeat's real
+// writer (pi-conversation-record.ts:86,161-163; heartbeat/runtime-selection.ts:546).
 // G-warm-reviewer-shape: diagnostic rejected key, NOT an authorized GitHub wait.
 // SB-cold: keep-green same allocation/disk with killed Runner and Pi.
 // Real: DB resume admission, two OS controller processes with different bootIds,
@@ -8,8 +12,9 @@
 // preview, qualified Pi 1.5.2 and its JSONL, native history handoff and events.
 // Faked: provider allocation/RPC boundary and loopback Messages responses only.
 // The provider image swap moves the old disk aside, never deletes it, and mounts
-// an empty allocation at EXACTLY the same workspace path. No runner/provider
-// state or controller failover backup is removed to force the desired branch.
+// an empty allocation at EXACTLY the same workspace path. Runner state and
+// controller failover backups are never removed to force the branch. Only G2
+// renames the measured Pi JSONL aside; its original bytes remain in evidence.
 // This is not a Boat/SSH or container/PID-namespace qualification: both real
 // controller processes run in this test's host namespace (same hostHash).
 // Keep reason: deployed incident; crosses real controller/runner restore boundary.
@@ -26,11 +31,11 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
 import { fileURLToPath } from "node:url";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { expect, it, vi } from "vitest";
 import {
-  agents, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
+  agents, agentTaskSessions, closeRegisteredClients, companies, completionContracts, createDb, environmentLeases,
   environments, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueThreadInteractions, nativeRunFinalizations, nativeRunResults, plugins,
 } from "@paperclipai/db";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
@@ -48,6 +53,8 @@ import { prepareNativeWorkspaceSync } from "../services/native-runtime/native-wo
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
 import { prepareNativeHeartbeatRun } from "../services/native-runtime/prepare-native-run.js";
+import { nativeSha256 } from "../services/native-runtime/canonical.js";
+import { readPiConversation, selectPiConversation } from "../services/native-runtime/pi-conversation-record.js";
 import { buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget } from "../services/native-runtime/native-session-resume.js";
 import { materializeAsset } from "../services/native-runtime/runtime-context.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
@@ -189,6 +196,7 @@ type RecoveryCase = {
   failoverBackups: "present" | "absent"; control: "none" | "unfinished-goal" | "pending-request" | "active-turn";
   expected: ExpectedOutcome; box: "replaced" | "same-box-cold";
   responseWait?: "board" | "github-review-shape";
+  piConversationFile?: "present" | "absent";
   /** Expected red BY NAME (org 11:23Z): the piece it waits for, its image and owner. */
   awaits?: string;
 };
@@ -196,13 +204,16 @@ type RecoveryCase = {
 // path, opt-in gate, binary qualification, and non-skipping prerequisites.
 const recoveryCases: RecoveryCase[] = [{ name: "deployed: warm envelope + DB checkpoint, done, no established backup",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "replaced" },
-{ name: "G-warm: warm envelope + DB checkpoint, yielded response_wake, CREATED box",
-  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "answers-no-history", box: "replaced", responseWait: "board",
-  awaits: "D-B8: exit=66 classification at the Pi governed-wait read site, N+1, owner adopt-lead" },
+// RFL 12:59Z: on a replaced box the Pi JSONL (on the box disk) cannot survive, so
+// G1 is the governed wait on the SAME box with a COLD runner: the file survives.
+{ name: "G1: governed wait, SAME box with a COLD runner, Pi conversation file survives",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold", responseWait: "board", piConversationFile: "present" },
+{ name: "G2: governed wait, TRULY replaced box, Pi conversation file ABSENT",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "answers-no-history", box: "replaced", responseWait: "board", piConversationFile: "absent" },
 { name: "G-warm-reviewer-shape (diagnostic: no GitHub authority)",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "record", box: "replaced", responseWait: "github-review-shape" },
 { name: "SB-cold: warm envelope + DB checkpoint, done, same box with cold runner",
-  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-no-history", box: "same-box-cold" }];
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" }];
 const runRecoveryCase = async (scenario: RecoveryCase) => {
   const governedWait = scenario.priorRun === "yielded-response-wake";
   const reviewerShape = scenario.responseWait === "github-review-shape";
@@ -515,16 +526,29 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       return { ...handle, identity: record(initialized.result) };
     };
     const A = await startController();
+    // One production-shaped record/boundary owner for both G rows. Match the
+    // heartbeat's unmanaged, isolated-home defaults; never hand-insert a row or
+    // synthesize a recovery event/notice. Selection precedes native preparation.
+    const selectFixturePiConversation = (runId: string) => selectPiConversation(db!, {
+      companyId, agentId, issueId, runId,
+      boundary: { provider: "pi_rpc", cwd: localCwd, remoteCwd, workspaceId,
+        trust: nativeSha256({ trustPreset: null, trust: null, permissionMode: null, approvalPolicy: null,
+          sandboxMode: null, homeMode: "isolated", account: null }) },
+    });
     const seed = async (prompt: string, controller: Record<string, unknown>, normalizedSessionId?: string, wakeCommentId?: string) => {
       const runId = randomUUID();
       const [run] = await db!.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native", nativeIssueId: issueId,
         ...(normalizedSessionId ? { nativeSessionId: normalizedSessionId } : {}),
-        contextSnapshot: { issueId, ...(wakeCommentId ? { wakeCommentId } : {}) } }).returning();
+        contextSnapshot: { issueId, ...(wakeCommentId ? { wakeCommentId } : {}),
+          ...(scenario.piConversationFile ? { conversationSessionGeneration: issue!.conversationSessionGeneration } : {}) } }).returning();
       const acquired = await runtime.acquireRunLease({ companyId, environment, heartbeatRunId: runId, issueId, agentId,
         adapterType: "paperclip_runner", persistedExecutionWorkspace: null, warmRunnerIdleTimeoutMs: WARM_IDLE_MS });
       const lease = acquired.lease;
       expect(lease.metadata).toMatchObject({ sandboxProviderPlugin: true, pluginId, provider, remoteCwd });
-      const native = await prepareNativeHeartbeatRun({ db: db!, run: run!, issue: issue!, environmentLeaseId: lease.id });
+      const piConversation = scenario.piConversationFile ? await selectFixturePiConversation(runId) : null;
+      if (piConversation && normalizedSessionId) expect(piConversation.id, "production record retains C on follow-up").toBe(normalizedSessionId);
+      const native = await prepareNativeHeartbeatRun({ db: db!, run: { ...run!,
+        ...(piConversation ? { nativeSessionId: piConversation.id } : {}) }, issue: issue!, environmentLeaseId: lease.id });
       runnerMarkers.add(join(stagedRuntime, "sessions", createHash("sha256").update(native.normalizedSessionId).digest("hex"), "runner", "runner-process.identity"));
       await db!.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed", controllerBootId: String(controller.bootId),
         controllerGeneration: 0, controllerPid: Number(controller.pid), controllerProcessStartedAt: new Date(String(controller.processStartedAt)), leaseOwner: null, leaseExpiresAt: null });
@@ -621,6 +645,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     stage("actual Pi process command", { requestedBinary: process.env.PI_TEST_BINARY, actual: piBirths[0]!.command });
     const openingSessionFile = sessionFile(piBirths[0]!);
     expect(await readFile(openingSessionFile, "utf8")).toContain(fact);
+    stage("Pi JSONL located from admitted child environment", { openingSessionFile,
+      location: openingSessionFile.startsWith(`${remoteCwd}/`) ? "box workspace" : "controller runtime" });
     await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, first.runId));
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, first.runId));
     await firstOptions.sync.restoreWorkspace();
@@ -682,6 +708,15 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       // Stage 3: an external image swap, not product destruction. Stop measured
       // old-box births; retain the whole old disk; recreate the identical mount.
       await stopBoxProcesses(); allocations.set(allocationIds[0]!, "stopped"); leaseActive.set(allocationIds[0]!, false);
+      if (scenario.piConversationFile === "absent") {
+        // The actual child binding, not a guessed controller/box path. Preserve
+        // its bytes outside the disk swap after every old Pi writer has died.
+        const retainedSessionFile = join(root, "G2-pi-conversation-retained.jsonl");
+        await rename(openingSessionFile, retainedSessionFile);
+        expect(existsSync(openingSessionFile), "G2 removes only Pi's file by rename, never delete").toBe(false);
+        expect(await readFile(retainedSessionFile, "utf8")).toContain(fact);
+        stage("G2 Pi conversation file renamed aside", { openingSessionFile, retainedSessionFile });
+      }
       const oldDisk = join(root, "image-A-disk-retained"); await rename(remoteCwd, oldDisk); await mkdir(remoteCwd);
       expect(readdirSync(remoteCwd), "new allocation starts with an empty disk").toEqual([]);
       generation = 2;
@@ -692,6 +727,9 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         .where(eq(environments.id, environmentId)).returning(); environment = changedEnvironment as Environment;
       stage("image swap replaced box at same workspace path", { remoteCwd, oldDisk, oldProviderLeaseId: allocationIds[0], newProviderLeaseId: allocationIds[1] });
     }
+
+    // G1 (same box): the Pi JSONL survives on the kept disk (the SB prerequisite above).
+    if (scenario.piConversationFile === "absent") expect(existsSync(openingSessionFile), "G2 Pi JSONL remains absent before follow-up").toBe(false);
 
     // Stage 4: base harness's real acquisition -> prepare -> find/rebind/persist
     // checkpoint -> resolve target/workspace sync -> execute path, no checkpoint
@@ -749,6 +787,21 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       console.log(`E2E-PI-WARM-CURSOR: ${JSON.stringify({ runId: next.runId, localWarmCursor: localSnapshot.cursor ?? null,
         admittedCheckpointCursor: admission.checkpoint?.cursor ?? null })}`);
     }
+    const [taskSessionBeforeFollowup] = scenario.piConversationFile ? await db.select().from(agentTaskSessions).where(and(
+      eq(agentTaskSessions.companyId, companyId), eq(agentTaskSessions.agentId, agentId),
+      eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issueId))) : [];
+    const conversationBeforeFollowup = readPiConversation(taskSessionBeforeFollowup?.sessionParamsJson);
+    if (scenario.piConversationFile) {
+      const [boundRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
+      const [boundIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      // All materializePiSessionRecoveryNotice authority gates stay REAL.
+      expect(boundRun).toMatchObject({ companyId, agentId, status: "running", nativeIssueId: issueId,
+        nativeSessionId: first.native.normalizedSessionId, contextSnapshot: { conversationSessionGeneration: issue!.conversationSessionGeneration } });
+      expect(boundRun?.resultJson?.startupCancellation).toBeUndefined();
+      expect(boundIssue).toMatchObject({ companyId, conversationAgentId: agentId, conversationSessionGeneration: issue!.conversationSessionGeneration });
+      expect(conversationBeforeFollowup).toMatchObject({ schema: "paperclip.pi-conversation.v1", id: first.native.normalizedSessionId,
+        generation: 1, previousId: null, reason: "first_message", runId: first.runId });
+    }
     const outcome = await B.call("execute", nextOptions.input).catch(error => {
       if (!governedWait) throw error;
       return { error: String(error), stack: error instanceof Error ? error.stack : null } as Record<string, unknown>;
@@ -757,7 +810,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       // This witness is emitted by the child immediately before the REAL
       // executePaperclipNativeSession call, from the very target it passes.
       // Do not mistake parent-side workspace resolution for executor admission.
-      expect(targets.find(target => target.runId === next.runId)?.acquisition,
+      // G1 runs on the SAME box (a resumed allocation); the replaced-box rows get 'created'.
+      if (!sameBoxCold) expect(targets.find(target => target.runId === next.runId)?.acquisition,
         "G prerequisite: executor receives the CREATED-box acquisition required by scoped D-B6")
         .toMatchObject({ outcome: "created", providerLeaseId: allocationIds[1] });
     }
@@ -771,6 +825,12 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         : note.body.includes("stopping the earlier attempt") ? "server/src/services/native-runtime/fresh-thread-stop-gate.ts:17" : null,
       metadata: note.metadata })))}`);
     await writeFile(join(root, "notes.json"), JSON.stringify(notes, null, 2));
+    if (scenario.piConversationFile === "absent") console.log(`E2E-PI-G2: ${JSON.stringify({
+      notes: notes.map(note => ({ text: note.body, metadata: note.metadata })),
+      recordExistedBeforeFollowup: conversationBeforeFollowup?.id === first.native.normalizedSessionId,
+      messageRoles: requests.filter(request => request.runId === next.runId).map(request =>
+        (record(request.request).messages as Array<{ role: string }>).map(message => message.role)),
+    })}`);
     const throwSite = (stack: unknown) => typeof stack === "string" ? stack.split("\n").find(line => /^\s+at /.test(line))?.trim() ?? null : null;
     console.log(`E2E-PI-OUTCOME: ${JSON.stringify({ runId: next.runId, error: persisted?.error ?? outcome.error ?? null,
       errorCode: persisted?.errorCode ?? outcome.errorCode ?? null, throwSite: throwSite(outcome.stack), outcome, events })}`);
@@ -831,13 +891,21 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     expect(targets.find(target => target.runId === next.runId)?.acquisition).toMatchObject({ outcome: sameBoxCold ? "resumed" : "created", providerLeaseId: allocationIds[sameBoxCold ? 0 : 1] });
 
     if (governedWait) {
-      // G TARGET: answer, not a fresh-thread refusal, and WITH its history (RFL
-      // 12:31Z, every answer row): the pre-replacement fact is in the model request.
+      // G TARGETS: both answer, never a fresh-thread refusal. G1 resumes the
+      // surviving Pi history; G2 starts without history and explains it once.
       expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
       expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
       expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
-      expect(requests.filter(request => request.runId === next.runId)[0], "history present in the model request").toMatchObject({ containsFact: true });
       expect(notes.length).toBeLessThanOrEqual(1);
+      if (scenario.piConversationFile === "absent") {
+        expect(requests.filter(request => request.runId === next.runId)[0], "G2 history ABSENT in the model request").toMatchObject({ containsFact: false });
+        expect(notes, "G2 exactly one real Pi missing-file system note").toHaveLength(1);
+        expect(notes[0]?.body).toBe("My earlier conversation could not be restored: the saved Pi conversation file is missing on this computer. Starting a new one.");
+        expect(String(record(notes[0]?.metadata).authorizationReason)).toMatch(new RegExp(`^pi_session_file_missing:${first.native.normalizedSessionId}:`));
+      } else {
+        expect(requests.filter(request => request.runId === next.runId)[0], "G1 history PRESENT in the model request").toMatchObject({ containsFact: true });
+        expect(notes, "G1 preserved history needs no system notice").toHaveLength(0);
+      }
       expect(notes.filter(note => note.body.includes(FRESH_THREAD_STOPPING_NOTE))).toHaveLength(0);
       expect(notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toHaveLength(0);
     } else if (sameBoxCold) {
@@ -946,5 +1014,6 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
 it.skipIf(!enabled).each(recoveryCases.filter(scenario => !scenario.awaits))("RFL R: $name", runRecoveryCase, 600_000);
 // Expected red BY NAME: it.fails passes while the row is red and fails as soon as its
 // piece makes it green; that commit removes the .fails.
-(enabled ? it.fails : it.skip).each(recoveryCases.filter(scenario => scenario.awaits))(
+const awaitingCases = recoveryCases.filter(scenario => scenario.awaits);
+if (awaitingCases.length) (enabled ? it.fails : it.skip).each(awaitingCases)(
   "RFL R (expected red, awaits $awaits): $name", runRecoveryCase, 600_000);
