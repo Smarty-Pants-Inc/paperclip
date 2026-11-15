@@ -39,7 +39,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, writeFile } from "node:fs/promises";
 import { connect as netConnect, type AddressInfo } from "node:net";
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -191,7 +191,9 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
     await writeFile(join(credentialHome, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "synthetic-fixture" }), { mode: 0o600 });
     await writeFile(bridge, providerBridge);
   });
-  afterAll(async () => { await new Promise<void>(done => tlsProxy ? tlsProxy.close(() => done()) : done()); });
+  afterAll(async () => {
+    await new Promise<void>(done => tlsProxy ? tlsProxy.close(() => done()) : done());
+  });
 
   const nativeIt = process.platform === "win32" ? it.skip : it;
   nativeIt.each(SHAPES)("$title", async ({ row, policy, fakeArgs, opening: openingDisposition }) => {
@@ -385,20 +387,26 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
       await finalizeNativeRun({ db, runId: current.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
       const settled = await readRun(current.id);
       expect(settled).toMatchObject({ status: "succeeded", nativeSessionId: oldId });
-      const snapshot = settled.runnerProfileJson?.sessionCheckpoint as { providerSessionId?: string };
-      expect(snapshot.providerSessionId).toBeTruthy();
-      expect(snapshot.providerSessionId, "a fresh provider thread").not.toBe(previousProviderId);
+      // The checkpoint's providerSessionId is the fake provider's ACCOUNT session
+      // (constant), not its thread: the fresh thread is proven at the provider,
+      // where each provider process gets its own thread id.
+      expect((settled.runnerProfileJson?.sessionCheckpoint as { providerSessionId?: string }).providerSessionId).toBeTruthy();
       const turns = await readTurns();
       expect(turns).toHaveLength(2); // the opening answer + exactly one follow-up turn
-      expect(turns[1].providerId).not.toBe(turns[0].providerId);
+      expect(turns[1].providerId, "a fresh provider thread").not.toBe(turns[0].providerId);
       expect(JSON.stringify(turns[1].request.params)).toContain(FOLLOW_UP);
-      const answers = (await comments()).filter(c => c.authorType === "agent" && c.createdByRunId === current.id);
+      // The run's accepted result is the answer (chat presentation is a later step
+      // outside this executor-level row).
+      const [accepted] = await db.select().from(nativeRunResults).where(and(eq(nativeRunResults.runId, current.id),
+        eq(nativeRunResults.schemaStatus, "accepted")));
       if (row === "R") {
         // The answer USES the earlier conversation: ALDER was stated only before
         // the replacement, and the provider names it only if it was sent.
         expect(JSON.stringify(turns[1].request.params)).toContain("Remember ALDER as our conversation word.");
         expect(JSON.stringify(turns[1].request.params)).toContain(earlierAnswer);
-        expect(answers).toMatchObject([{ body: expect.stringContaining(ANSWER_WITH_HISTORY) }]);
+        expect(String((accepted?.resultJson as { result?: { summary?: unknown } } | undefined)?.result?.summary ?? ""),
+          `the answer names the earlier fact: ${JSON.stringify(accepted?.resultJson ?? null).slice(0, 600)}`)
+          .toContain(ANSWER_WITH_HISTORY);
       }
       expect(performance.now() - started).toBeLessThanOrEqual(
         FRESH_CONTINUATION_PENDING_BOUND_MS + coldAdmissionTimeoutMs("codex", undefined, false));
@@ -418,6 +426,11 @@ describeEmbeddedPostgres("follow-Paperclip n-fallback: real runner recovery on a
         eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'recoveryActionId' is not null`))).toHaveLength(0);
     } finally {
       await closeIdleWarmNativeSessionsForRestart();
+      // The runner materializes instruction files read-only; let the fixture's own
+      // cleanup of its temporary root remove the box disks this test created.
+      for (const entry of await readdir(runtimeRoot, { recursive: true, withFileTypes: true })) {
+        if (!entry.isSymbolicLink()) await chmod(join(entry.parentPath, entry.name), entry.isDirectory() ? 0o700 : 0o600).catch(() => undefined);
+      }
     }
   }, 180_000);
 });
