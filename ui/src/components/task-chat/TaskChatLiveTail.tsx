@@ -7,7 +7,7 @@ import { TaskChatUsageReadout } from "./TaskChatUsageReadout";
 import { TaskChatRunnerActivityGroup } from "./TaskChatRunnerActivityGroup";
 import { TaskChatThinking } from "./TaskChatThinking";
 import { TaskChatProtocolCard } from "./TaskChatProtocolCard";
-import { buildTurnTimelineRows, readReasoningDisplay, type ReasoningDisplay } from "./transcript-adapter";
+import { buildTurnTimelineRows, type ReasoningDisplay } from "./transcript-adapter";
 import { visibleTranscriptPlaceholder } from "./TaskChatShimmer";
 
 /**
@@ -25,7 +25,7 @@ export function TaskChatLiveTail({
   emptyMessage,
   excludeFinal = false,
   onRuntimeRequestDecision,
-  reasoningDisplay = readReasoningDisplay(),
+  reasoningDisplay = "fold",
 }: {
   items: readonly TaskChatItem[];
   /** Shown when nothing renderable has streamed yet (queued / pre-first-token). */
