@@ -314,7 +314,7 @@ import { reportRunFailure } from "../run-failure-report.js";
 import {
   REMOTE_RECOVERY_MARKER_READ_SCRIPT, REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT,
   REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, RemoteRunnerRecoveryError, attachRemoteRunnerRecoveryDiagnostic, boundRemoteRunnerExitEvidence,
-  describeExitedRemoteRunner, describeExitedRemoteRunnerReason, exitedRunnerRequestedFreshBootstrap, readRemoteRunnerRecoveryError,
+  describeExitedRemoteRunner, describeExitedRemoteRunnerReason, describeExitedRemoteRunnerRunLog, exitedRunnerRequestedFreshBootstrap, readRemoteRunnerRecoveryError,
   remoteRecoveryProbeReason, runnerStateRequestsFreshBootstrap,
 } from "./remote-runner-recovery-diagnostics.js";
 import { isPluginRpcTimeout, readRemoteRunnerRecoveryProbe, REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS, remoteRunnerPluginStall, type RemoteRunnerPluginStall } from "./remote-runner-recovery-probe.js";
@@ -14299,6 +14299,12 @@ async function executePaperclipNativeSessionAttempt(
             `[paperclip-runner] native session execution failed: ${executionFailureMessage}\n`,
           ),
         );
+        const runnerExitLog = remoteRunnerRecovery
+          ? describeExitedRemoteRunnerRunLog(remoteRunnerRecovery)
+          : null;
+        if (runnerExitLog) {
+          await attemptFailureStep(() => input.onLog?.("stderr", `[paperclip-runner] ${runnerExitLog}\n`));
+        }
         if (runnerSessionStartupScope) {
           await attemptFailureStep(() =>
             trace.end(runnerSessionStartupScope!, {
