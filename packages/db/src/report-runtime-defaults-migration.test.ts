@@ -9,6 +9,51 @@ const support = await getEmbeddedPostgresTestSupport();
 const permissionKey = "agents:configure-reports-runtime";
 
 (support.supported ? describe : describe.skip)("runner report runtime default migration", () => {
+  it("reruns the SQL without changing grants or audit rows and preserves revocation on migration reruns", async () => {
+    const database = await startEmbeddedPostgresTestDatabase("report-runtime-defaults-rerun-");
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    try {
+      const [company] = await sql`INSERT INTO companies (name, issue_prefix) VALUES ('Runtime rerun', 'RTR') RETURNING id`;
+      const id = randomUUID();
+      await sql`INSERT INTO agents (id, company_id, name) VALUES (${id}, ${company!.id}, 'Standard report')`;
+      await sql`INSERT INTO company_memberships (company_id, principal_type, principal_id, status, membership_role)
+        VALUES (${company!.id}, 'agent', ${id}, 'active', 'member')`;
+      const content = await readFile(new URL("./migrations/0488_report_runtime_defaults.sql", import.meta.url), "utf8");
+      const hash = createHash("sha256").update(content).digest("hex");
+      await sql`DELETE FROM drizzle.__drizzle_migrations WHERE hash = ${hash}`;
+      await applyPendingMigrations(database.connectionString);
+      const readGrants = async () => Array.from(await sql`SELECT * FROM principal_permission_grants ORDER BY id`);
+      const readActivity = async () => Array.from(await sql`SELECT * FROM activity_log ORDER BY id`);
+      const readHistory = async () => Array.from(await sql`SELECT * FROM drizzle.__drizzle_migrations ORDER BY id`);
+      const grants = await readGrants();
+      const activity = await readActivity();
+      const history = await readHistory();
+      expect(grants.filter(grant => grant.principal_id === id && grant.permission_key === permissionKey)).toHaveLength(1);
+      expect(activity.filter(row => row.actor_id === "migration:report-runtime-defaults" && row.entity_id === id)).toHaveLength(1);
+      expect(history.filter(row => row.hash === hash)).toHaveLength(1);
+
+      // Execute the SQL itself a second time, not just the migrator's already-applied fast path.
+      await sql.unsafe(content);
+      expect(await readGrants()).toEqual(grants);
+      expect(await readActivity()).toEqual(activity);
+      expect(await readHistory()).toEqual(history);
+
+      // Revocation deletes the grant; subsequent normal migration runs must not restore it.
+      await sql`DELETE FROM principal_permission_grants WHERE principal_id = ${id} AND permission_key = ${permissionKey}`;
+      const revokedGrants = await readGrants();
+      expect(revokedGrants).toHaveLength(grants.length - 1);
+      for (let rerun = 0; rerun < 2; rerun += 1) {
+        await applyPendingMigrations(database.connectionString);
+        expect(await readGrants()).toEqual(revokedGrants);
+        expect(await sql`SELECT id FROM principal_permission_grants WHERE principal_id = ${id} AND permission_key = ${permissionKey}`).toHaveLength(0);
+        expect(await readActivity()).toEqual(activity);
+        expect(await readHistory()).toEqual(history);
+      }
+    } finally {
+      await sql.end(); await database.cleanup();
+    }
+  }, 120_000);
+
   it("adds a revocable runtime grant once, preserving scopes and existing trust restrictions", async () => {
     const database = await startEmbeddedPostgresTestDatabase("report-runtime-defaults-");
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
