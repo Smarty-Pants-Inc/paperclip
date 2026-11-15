@@ -121,9 +121,9 @@ const mockTaskWatchdogService = vi.hoisted(() => ({
   disableForIssue: vi.fn(async () => null),
 }));
 const mockHeartbeatService = vi.hoisted(() => ({
-  wakeup: vi.fn(async () => undefined),
+  wakeup: vi.fn(async (_agentId: string) => undefined),
   reportRunActivity: vi.fn(async () => undefined),
-  getRun: vi.fn(async (): Promise<unknown> => null),
+  getRun: vi.fn(async (_runId: string): Promise<unknown> => null),
   getActiveRunForAgent: vi.fn(async (): Promise<unknown> => null),
   getQueuedAssignmentRunForIssue: vi.fn(async (): Promise<unknown> => null),
   cancelRun: vi.fn(async (): Promise<unknown> => null),
