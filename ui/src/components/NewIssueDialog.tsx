@@ -1604,7 +1604,7 @@ function AccountNewIssueDialog({ ignoreDefaults }: { ignoreDefaults: boolean }) 
                             onClick={() => {
                               if (durableCreate.pending?.idempotencyKey === item.idempotencyKey) durableCreate.resendNow();
                               else void durableCreate.submit(item.payload, { idempotencyKey: item.idempotencyKey });
-                            }}>Send</Button>
+                            }}>Send to {companies.find(company => company.id === item.payload.data.companyId)?.name ?? "another company"}</Button>
                           <Button type="button" size="sm" variant="ghost"
                             disabled={durableCreate.pending?.idempotencyKey === item.idempotencyKey && (durableCreate.status === "sending" || durableCreate.resending)}
                             onClick={() => discardCreate(item.idempotencyKey, item.payload)}>Discard</Button>
