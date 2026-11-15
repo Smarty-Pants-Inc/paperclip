@@ -280,6 +280,66 @@ describe("sandbox callback bridge", () => {
     }
   });
 
+  it.each(["pause", "stop"] as const)(
+    "ends the real command-managed empty long-poll promptly on %s",
+    async (action) => {
+      const remoteCwd = await mkdtemp(path.join(os.tmpdir(), "bridge-real-long-poll-"));
+      cleanupDirs.push(remoteCwd);
+      let started = 0;
+      let active = 0;
+      let listTimeoutMs = 0;
+      let signalStarted: (() => void) | undefined;
+      const startedPromise = new Promise<void>((resolve) => { signalStarted = resolve; });
+      const baseRunner = createExecRunner();
+      const runner = {
+        execute: async (input: Parameters<typeof baseRunner.execute>[0]) => {
+          if (input.args?.[1]?.includes("sleep 0.1") && input.args[1].includes("wait_checks=")) {
+            started += 1;
+            listTimeoutMs = input.timeoutMs ?? 0;
+            active += 1;
+            signalStarted?.();
+            try {
+              return await baseRunner.execute(input);
+            } finally {
+              active -= 1;
+            }
+          }
+          return baseRunner.execute(input);
+        },
+      };
+      const worker = await startSandboxCallbackBridgeWorker({
+        client: createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd, shellCommand: "sh" }),
+        queueDir: path.posix.join(remoteCwd, "queue"),
+        pollIntervalMs: 100,
+        idleBackoffMaxMs: 1_000,
+        startPaused: true,
+        handleRequest: async () => ({ status: 200, body: "ok" }),
+      });
+      try {
+        await worker.resume("generation-a");
+        await Promise.race([
+          startedPromise,
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("long-poll did not start")), 3_000)),
+        ]);
+        // Let the shell capture its initial run-state before changing it.
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        const began = Date.now();
+        await worker[action]();
+        const elapsed = Date.now() - began;
+        expect(elapsed).toBeLessThanOrEqual(500);
+        expect(listTimeoutMs).toBeGreaterThanOrEqual(9_000);
+        expect(listTimeoutMs).toBeLessThanOrEqual(600_000);
+        expect(active).toBe(0);
+        const startedAtReturn = started;
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        expect(started).toBe(startedAtReturn);
+      } finally {
+        await worker.stop({ drainTimeoutMs: 0 });
+      }
+    },
+    30_000,
+  );
+
   it("long-polls remote requests with low command volume and a healthy quiet watchdog", async () => {
     vi.useFakeTimers();
     const fake = createFakeRemoteBridgeRunner("/workspace/long-poll-quiet");
