@@ -237,6 +237,23 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn pi_observability_flag_cannot_be_spoofed_by_task_environment() {
+        for key in ["PAPERCLIP_OBSERVABILITY_PI", "paperclip_observability_pi"] {
+            let mut command = Command::new("unused");
+            assert!(apply_configured_environment(&mut command, |name| {
+                if name == MARKER {
+                    Some(serde_json::to_string(&[key]).unwrap())
+                } else if name == key {
+                    Some("1".into())
+                } else {
+                    None
+                }
+            }).is_err());
+            assert_eq!(command.get_envs().count(), 0);
+        }
+    }
+
+    #[test]
     fn managed_provider_route_cannot_be_projected_into_task_environment() {
         for name in [
             "PAPERCLIP_AI_PROVIDER_KEY",
