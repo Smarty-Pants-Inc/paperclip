@@ -3,9 +3,11 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { redactSensitiveText } from "../../redaction.js";
 import {
   REMOTE_RECOVERY_MARKER_READ_SCRIPT, REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, REMOTE_RUNNER_EXIT_EVIDENCE_MAX_CHARS,
   REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, RemoteRunnerRecoveryError, boundRemoteRunnerExitEvidence, describeExitedRemoteRunnerReason,
+  describeExitedRemoteRunnerRunLog,
   readRemoteRunnerRecoveryDiagnostic, readRemoteRunnerRecoveryError,
 } from "./remote-runner-recovery-diagnostics.js";
 
@@ -105,6 +107,30 @@ describe("remote recovery diagnostic shell receipts", () => {
 });
 
 describe("exited remote runner evidence", () => {
+  it("formats the identity-check exit and redacted stderr tail, or a truthful unavailable line", async () => {
+    const root = await mkdtemp(join(tmpdir(), "remote-startup-exit-log-"));
+    const directory = join(root, "diagnostics");
+    try {
+      await mkdir(directory);
+      await writeFile(join(directory, "runnerd.process-stderr.log"), "old line\\n");
+      try {
+        execFileSync("sh", ["-c", 'printf "%s\\n" "startup failed token=sk-abcdefghijklmnopqrstuvwx" "last known line" > "$1/runnerd.process-stderr.log"; exit 45', "fake-runner", directory], { stdio: "pipe" });
+        throw new Error("fake runner unexpectedly survived startup");
+      } catch (error) {
+        expect((error as { status?: number }).status).toBe(45);
+      }
+      const raw = execFileSync("sh", ["-c", REMOTE_RUNNER_EXIT_EVIDENCE_SCRIPT, "t", directory], { encoding: "utf8" });
+      const tail = boundRemoteRunnerExitEvidence(raw, redactSensitiveText)!;
+      const diagnostic = { stage: "process_verification" as const, reason: "process_not_running" as const, runnerExitEvidence: tail };
+      const message = describeExitedRemoteRunnerRunLog(diagnostic);
+      expect(message).toContain("runner process is not running (identity check exit 45); last lines:");
+      expect(message).toContain("last known line");
+      expect(message).not.toContain("sk-abcdefghijklmnopqrstuvwx");
+      expect(message).toContain("***REDACTED***");
+      expect(describeExitedRemoteRunnerRunLog({ stage: "process_verification", reason: "process_not_running" }))
+        .toBe("runner process is not running (identity check exit 45); last lines unavailable: runner stderr evidence is missing or unreadable");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
   it("prints bounded tails of the exit diagnostic and redirected stderr, never through a symlink", async () => {
     const root = await mkdtemp(join(tmpdir(), "remote-exit-evidence-"));
     const directory = join(root, "diagnostics");
