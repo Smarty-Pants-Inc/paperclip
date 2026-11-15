@@ -101,10 +101,22 @@ describe("inline reasoning is plain text in the turn", () => {
     expect(Number(plain![1])).toBeLessThanOrEqual(30);
   });
 
-  it("keeps the answer's size inside the Coordinator workspace (Paul's chat)", () => {
-    // The Coordinator workspace sizes progress text one step below the answer
-    // (`.coordinator-workspace [data-conversation-text="progress"]`). Plain
-    // inline reasoning must still read at the answer's size there.
+  it("uses the same typography tokens as the Markdown answer outside Coordinator", () => {
+    render(CODEX, true);
+    const plain = container.querySelector<HTMLElement>(".task-chat-reasoning-plain")!;
+    // jsdom keeps var() unresolved; real computed px equality is covered by
+    // tests/e2e/reasoning-size.spec.ts in both workspaces and both render paths.
+    expect(getComputedStyle(plain).fontSize).toBe("var(--markdown-body-size)");
+    expect(getComputedStyle(plain).lineHeight).toBe("var(--markdown-body-leading)");
+    const markdown = Array.from(indexCss.matchAll(/^\.paperclip-markdown \{([^}]+)\}/gm), (match) => match[1])
+      .find((rule) => rule.includes("font-size:"));
+    expect(markdown).toContain("font-size: var(--markdown-body-size)");
+    expect(markdown).toContain("line-height: var(--markdown-body-leading)");
+  });
+
+  it("uses the Coordinator answer's tokens rather than a copied size", () => {
+    // Plain reasoning must use the final answer's body tokens, even when
+    // Coordinator's later progress rule specifies its own typography.
     const coordinatorRules = indexCss.split("\n")
       .filter((line) => line.startsWith(".coordinator-workspace [data-conversation-text"))
       .join("\n");
@@ -118,11 +130,10 @@ describe("inline reasoning is plain text in the turn", () => {
       render(CODEX, true);
       const plain = container.querySelector<HTMLElement>('[data-reasoning-display="inline"] .task-chat-reasoning-plain')!;
       expect(plain).not.toBeNull();
-      const answerSize = reasoningLookCss().match(/\.task-chat-reasoning-plain[^{]*\{\s*font-size:\s*([^;]+);/);
-      expect(answerSize, "plain flow declares the answer's size").not.toBeNull();
-      // jsdom may resolve rem to px (root 16px); compare in px.
-      const px = (value: string) => value.trim().endsWith("rem") ? `${parseFloat(value) * 16}px` : value.trim();
-      expect(px(getComputedStyle(plain).fontSize)).toBe(px(answerSize![1]!));
+      expect(getComputedStyle(plain).fontSize).toBe("var(--coordinator-body-size)");
+      expect(getComputedStyle(plain).lineHeight).toBe("var(--coordinator-body-leading)");
+      expect(coordinatorRules).toContain("font-size: var(--coordinator-body-size)");
+      expect(coordinatorRules).toContain("line-height: var(--coordinator-body-leading)");
     } finally {
       coordinatorStyle.remove();
       container.className = "";
