@@ -40,6 +40,13 @@ suite("fresh thread wording follows Runner instruction-refresh codes", () => {
     return { issueId, runId, actionId: action.id };
   }
 
+  it("keeps refresh-required wording neutral when no prepare refusal proves an instruction change", async () => {
+    const f = await seed();
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const note = await freshThreadStartedNote(db, source);
+    expect(note).not.toMatch(/your skill change is in effect/i);
+  });
+
   // follow-Paperclip Cut B R2: recording is silent; actual selection owns one started note and one linked thread, including replay.
   it.each(RUNNER_PREPARE_REFUSAL_CODES)("%s writes its refresh wording once at actual session selection, not settlement", async prepareCode => {
     const error = new NativeRunnerRefreshRequiredError(false, prepareCode);
