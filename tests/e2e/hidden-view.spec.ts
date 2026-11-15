@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { expectHiddenTagLayout } from "./helpers/hidden-tag-layout";
 import { expect, test, type APIResponse } from "@playwright/test";
 
 async function json(response: APIResponse): Promise<Record<string, any>> {
@@ -54,11 +55,11 @@ for (const coordinator of [true, false]) for (const width of [1440, 390]) {
       await expect(row(task.id)).toBeVisible();
       await expect(row(other.id)).toHaveCount(0);
       await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toHaveText("Hidden");
-      await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toBeInViewport();
+      await expectHiddenTagLayout(row(task.id), testInfo, `hidden-${coordinator ? "coordinator" : "classic"}-${width}`);
       await page.reload();
       await expect(row(task.id)).toBeVisible({ timeout: 30_000 });
       await expect(row(other.id)).toHaveCount(0);
-      await expect(row(task.id).locator('[data-slot="hidden-task-badge"]')).toBeInViewport();
+      await expectHiddenTagLayout(row(task.id), testInfo, `hidden-reloaded-${coordinator ? "coordinator" : "classic"}-${width}`);
       await page.screenshot({ path: testInfo.outputPath(`${coordinator ? "" : "classic-"}hidden-view-${width}.png`) });
       await row(task.id).locator("a[data-inbox-issue-link]").first().click();
       const banner = page.getByTestId("hidden-task-banner");
