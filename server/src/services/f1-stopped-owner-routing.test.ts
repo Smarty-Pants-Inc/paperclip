@@ -115,10 +115,30 @@ describe.skipIf(!support.supported)("F1 stopped-owner continuation routing", () 
     await assertContinued(f, hold.id);
   });
 
+  it("does not directly continue the latest source past a board-user decision hold with full physical proof", async () => {
+    const f = await fixture(), hold = await stoppedWithOlderHold(f);
+    await db.update(issueRecoveryActions).set({ ownerUserId: f.userId }).where(eq(issueRecoveryActions.id, hold.id));
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0])
+      .toMatchObject({ status: "released", metadata: { remoteExecutionTermination: {
+        companyId: f.company.id, runId: f.owner.id, leaseId: f.lease.id,
+        provider: f.lease.provider, providerLeaseId: f.lease.providerLeaseId, state: "stopped",
+      } } });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.owner.id)))[0])
+      .toMatchObject({ status: "failed", nativePhase: "terminal_failure", finishedAt: f.now });
+    expect(await ensureFreshContinuation(db, { companyId: f.company.id, runId: f.source.id, trigger: "held_recovery", now: f.now }))
+      .toMatchObject({ kind: "person_owned", reason: "operator_decision_recorded" });
+    expect(await listFreshContinuations(db, { companyId: f.company.id, issueId: f.issue.id })).toHaveLength(0);
+    const [activeHold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id));
+    expect(activeHold).toMatchObject({ status: "active", ownerType: "board", ownerUserId: f.userId });
+    expect(activeHold.outcome).not.toBe("restored");
+  });
+
   it.each(["unsettled", "different_session", "different_generation", "newer_answer", "person_block", "human_hold"] as const)(
     "does not route past a distinct owner or decision: %s", async shape => {
       const f = await fixture();
       if (shape === "unsettled") {
+        await db.update(environmentLeases).set({ status: "active", cleanupStatus: null, releasedAt: null, metadata: {} })
+          .where(eq(environmentLeases.id, f.lease.id));
         await db.insert(issueRecoveryActions).values({ companyId: f.company.id, sourceIssueId: f.issue.id,
           kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", status: "active",
           ownerType: "board", returnOwnerAgentId: f.agent.id, fingerprint: `live-owner:${f.owner.id}`,
