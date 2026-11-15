@@ -156,7 +156,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // damage into owner edits when retirement invokes ordinary collection.
         const interrupted = await patch(current, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
           errorMessage: "Agent-file refresh did not complete. Canonical files were kept; retirement must not save transfer output.", nextAttemptAt: null,
-          receipt: { ...current.receipt, refreshConfinedCleanup: true } });
+          // A partial transfer may contain a genuine late owner edit. Retain
+          // everything by default, even if a later refusal/denial write fails.
+          // Only the successful refresh receipt (or proven no-write refusal)
+          // below can clear this durable denial again.
+          receipt: { ...current.receipt, refreshConfinedCleanup: true, refreshCleanupBlocked: true } });
         if (interrupted.state !== "unavailable" || interrupted.errorCode !== "AGENT_FILES_REFRESH_INCOMPLETE") return false;
         let runtime: PreparedAdapterExecutionTargetRuntime | undefined;
         try {
