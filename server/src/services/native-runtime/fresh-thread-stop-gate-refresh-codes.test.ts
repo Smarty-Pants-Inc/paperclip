@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, agentTaskSessions, authUsers, companies, createDb, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { truncateTablesWithDeadlockRetry } from "../../__tests__/helpers/truncate-with-deadlock-retry.js";
 import { ensureFreshContinuation, resetBacklogContinuationPacingForTests } from "../fresh-continuation-fallback.js";
 import { heartbeatService } from "../heartbeat.js";
 import { isInstructionRefreshPrepareCode, RUNNER_PREPARE_REFUSAL_CODES, NativeRunnerRefreshRequiredError } from "../../vendor/paperclip-runner/index.js";
 import { freshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
+import { FRESH_THREAD_STARTED_NOTE, freshThreadStartedNote } from "./fresh-thread-stop-gate.js";
+import { PI_CONVERSATION_KEY, selectPiConversation } from "./pi-conversation-record.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
@@ -38,19 +40,45 @@ suite("fresh thread wording follows Runner instruction-refresh codes", () => {
     return { issueId, runId, actionId: action.id };
   }
 
-  it.each(RUNNER_PREPARE_REFUSAL_CODES)("%s uses wording selected by Runner instruction-refresh admission", async prepareCode => {
+  // follow-Paperclip Cut B R2: recording is silent; actual selection owns one started note and one linked thread, including replay.
+  it.each(RUNNER_PREPARE_REFUSAL_CODES)("%s writes its refresh wording once at actual session selection, not settlement", async prepareCode => {
     const error = new NativeRunnerRefreshRequiredError(false, prepareCode);
     const code = freshThreadRefusalCode(error);
     expect(code).toBe("native_runner_refresh_required");
     const f = await seed();
     await db.update(heartbeatRuns).set({ resultJson: { nativeFreshContinuationRefusal: { code, prepareRefusalCode: prepareCode, waitForTurn: false } } }).where(eq(heartbeatRuns.id, f.runId));
-    expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" })).toMatchObject({ kind: "continued" });
+    const continued = await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" });
+    expect(continued).toMatchObject({ kind: "continued" });
+    if (continued.kind !== "continued") throw new Error("Expected recorded fresh continuation");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
+    const [source] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const boundary = { provider: "pi_rpc", cwd: null, workspaceId: null, trust: "default" };
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: f.issueId,
+      sessionParamsJson: { sessionId: source.nativeSessionId, [PI_CONVERSATION_KEY]: {
+        schema: "paperclip.pi-conversation.v1", id: source.nativeSessionId, generation: 1, boundary,
+        previousId: null, reason: "first_message", runId: f.runId,
+      } } });
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId,
+      nativeIssueId: f.issueId, runtimeMode: "native", status: "running", invocationSource: "assignment",
+      createdAt: new Date(Date.now() + 1000), contextSnapshot: { issueId: f.issueId,
+        recoveryActionId: continued.recoveryActionId,
+        ...(continued.isolation === "fresh_isolated_workspace" ? { freshContinuationIsolation: continued.recoveryActionId } : {}),
+      } }).returning();
+    const selection = { companyId, agentId, issueId: f.issueId, runId: successor.id, boundary };
+    const selected = await selectPiConversation(db, selection);
+    expect(selected).toMatchObject({ previousId: source.nativeSessionId, generation: 2,
+      reason: `fresh_continuation:${continued.recoveryActionId}`, runId: successor.id });
+    expect(selected.id).not.toBe(source.nativeSessionId);
+    expect(await selectPiConversation(db, selection)).toEqual(selected);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).toHaveLength(2);
     const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
     expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({ body: await freshThreadStartedNote(db, source),
+      metadata: { authorizationReason: `fresh_provider_thread:${continued.recoveryActionId}` } });
     if (isInstructionRefreshPrepareCode(prepareCode)) {
       expect(notes[0].body).toMatch(/your skill change is in effect/i);
     } else {
-      expect(notes[0].body).not.toMatch(/your skill change is in effect/i);
+      expect(notes[0].body).toBe(FRESH_THREAD_STARTED_NOTE);
     }
   });
 });
