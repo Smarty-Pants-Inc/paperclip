@@ -750,7 +750,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const snapshot = c.snapshot === undefined ? undefined : await resolveSnapshotForCreate(c);
     const from = snapshot?.name ?? c.from;
     let desiredSpares = 0, hasSpareSetting = false;
-    if (pluginContext) {
+    if (pluginContext?.config && typeof pluginContext.config.get === "function") {
       try { desiredSpares = readySpareCount(await pluginContext.config.get(params.companyId)); hasSpareSetting = true; }
       catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
@@ -792,7 +792,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       idleActivity.resource(activityKey(c, sb.id));
       const ready = await waitReady(c, sb.id);
       const ownershipObservation = c.setupScript !== undefined ? await waitSetup(c, sb.id) : ready;
-      return await finishAcquisition(params, c, sb.id, ownershipObservation, labels, remoteCwd, snapshot, null);
+      return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
     } catch (e) {
       // A lost reply can still have allocated: recover exact IDs before teardown.
       // If lookup is unavailable, the durable creation label remains inspectable.
