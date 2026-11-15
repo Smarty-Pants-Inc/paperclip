@@ -469,7 +469,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   // Keep reason: SMA-183's ambiguous-execution control must still refuse
   // exact recovery, but the existing isolated fresh-continuation decision is
   // authority to leave its dead provider thread, not its visible conversation.
-  it.each(["latest", "answered-since", "answered-after-admission", "answered-since-typed-upgrade", "unconfirmed-stop"] as const)("uses an authorized fresh continuation after start-intent without a snapshot, with history and ONE true note (%s)", async settlementState => {
+  it.each(["latest", "answered-since", "answered-after-admission", "answered-since-typed-upgrade", "unconfirmed-stop", "unconfirmed-stop-caller-owns-literal"] as const)("uses an authorized fresh continuation after start-intent without a snapshot, with history and ONE true note (%s)", async settlementState => {
     const f = await piFixture();
     f.input.workspace.executionWorkspace.cwd = instructionRoot;
     const first = await selectHeartbeatRuntime(db, f.input);
@@ -488,12 +488,27 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       issueId: f.issue.id, provider: "boat", providerLeaseId: `bx_legacy_${f.run.id}`, status: "expired",
       cleanupStatus: "success", acquiredAt: new Date(Date.now() - 1000), releasedAt: new Date(),
       metadata: { pluginId: "fixture-boat" } }).returning();
-    if (settlementState !== "unconfirmed-stop") {
+    if (!settlementState.startsWith("unconfirmed-stop")) {
       const confirmedAt = new Date().toISOString();
       await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(),
         metadata: { pluginId: "fixture-boat", remoteExecutionTermination: { schema: "paperclip.remote-termination.v1",
           companyId: oldLease.companyId, runId: f.run.id, leaseId: oldLease.id, provider: oldLease.provider,
           providerLeaseId: oldLease.providerLeaseId, state: "stopped", confirmedAt } } }).where(eq(environmentLeases.id, oldLease.id));
+    }
+    if (settlementState === "unconfirmed-stop-caller-owns-literal") {
+      // unreachable in production: no production caller uses caller_owns (RFL 18:28Z).
+      // The literal SEED02 fixture case, kept as a labelled record of what that test-only
+      // option does on this tree: it continues for the caller, writes no note, and leaves the task.
+      const continued = await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
+        trigger: "recovery_refused", delivery: "caller_owns" });
+      const [task] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      const literalNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+        .filter(comment => comment.authorType === "system");
+      console.log(`SEED02-LITERAL: ${JSON.stringify({ continued, taskStatus: task?.status, notes: literalNotes.map(note => note.body) })}`);
+      expect(continued).toMatchObject({ kind: "continued", delivery: "caller_owns" });
+      expect(literalNotes, "caller_owns writes no note").toHaveLength(0);
+      expect(task?.status, "caller_owns leaves the task in backlog").toBe("backlog");
+      return;
     }
     // HARNESS GAP SEED02: no production caller requests caller_owns on
     // this tree. That test-only option opts out of worker delivery and the old
