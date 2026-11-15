@@ -4,11 +4,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import { agents, authUsers, companies, createDb, environmentLeases, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "./heartbeat.js";
-import { freshThreadStopGate, inspectFreshThreadStopResources, readFreshThreadStopProof, FRESH_THREAD_STOPPING_NOTE, FRESH_THREAD_STOP_UNAVAILABLE_NOTE } from "./native-runtime/fresh-thread-stop-gate.js";
-import { readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { readFreshThreadStopProof } from "./native-runtime/fresh-thread-stop-gate.js";
+import { prepareInspectedSourceSandboxStop, readStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
 
-// Keep: F1-1 target E, a data-safety/trust boundary. Use the real persisted
-// lease, proof owner and cleanup sweep; fake only external provider transport.
+// Keep: F1-1 target E, a data-safety/trust boundary. Exercise the retained
+// stop-and-keep owner directly, not the removed fresh-admission stop producer.
+// Started-note cardinality lives at actual selection in fresh-thread-stop-gate-refresh-codes.test.ts.
 const support = await getEmbeddedPostgresTestSupport();
 describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
   let db: Db;
@@ -29,32 +30,23 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     const readStorage = async () => (await db.execute<{ row: Record<string, unknown> }>(sql`select to_jsonb(${environmentLeases}) as row from ${environmentLeases} where ${environmentLeases.id} = ${lease.id}`))[0]!.row;
     const storage = await readStorage();
     const notes = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.authorType, "system")));
-    const gate = () => db.transaction(tx => freshThreadStopGate(tx as unknown as Db, run, issue.id));
-    const inspector = (result: unknown) => vi.fn(async () => {
-      // External inspection must not hold the task lock.
-      await db.transaction(async tx => { await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issue.id)).for("update", { noWait: true }); });
-      if (result instanceof Error) throw result;
-      return result;
-    });
     const cleanup = (stop: ReturnType<typeof vi.fn>) => heartbeatService(db, { environmentRuntime: { retryPendingSandboxTeardown: stop } as unknown as NonNullable<Parameters<typeof heartbeatService>[1]>["environmentRuntime"] });
-    return { run, issue, lease, readLease, readStorage, storage, notes, gate, inspector, cleanup };
+    return { run, issue, lease, readLease, readStorage, storage, notes, cleanup };
   }
 
-  it.each(["error", "absent"] as const)("released no receipt + GET %s: unchanged row, one cannot-confirm note, bounded, no stop or run", async observation => {
+  // follow-Paperclip Cut B R5: absent/error observations confer no cleanup authority; no fresh-gate inspection or notice remains.
+  it.each(["error", "absent"] as const)("released no receipt + observation %s: cleanup preserves the row, with no stop or run", async observation => {
     const f = await fixture();
-    const inspect = f.inspector(observation === "error" ? new Error("provider GET failed") : undefined);
+    const result = observation === "error" ? new Error("provider GET failed") : undefined;
     const stop = vi.fn(async () => undefined), hb = f.cleanup(stop);
     for (let n = 0; n < 3; n++) {
-      await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
-      await f.gate();
+      expect(await prepareInspectedSourceSandboxStop(db, f.lease, result)).toBeNull();
       await hb.sweepPendingCleanupLeases();
       expect(await f.readLease()).toEqual(f.lease);
       expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     }
     expect(stop).not.toHaveBeenCalled();
-    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOP_UNAVAILABLE_NOTE }]);
-    expect(await f.notes()).toHaveLength(1);
-    expect(inspect).toHaveBeenCalledTimes(3); // one bounded read per disposition pass, never an inner retry
+    expect(await f.notes()).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
@@ -79,16 +71,15 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       remoteExecutionTermination: (restored.metadata as Record<string, unknown>).remoteExecutionTermination } });
   }
 
-  it("released no receipt + GET running: one waiting note, single stop, restored original plus new receipt, no proofless run", async () => {
-    const f = await fixture(), inspect = f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" });
+  // follow-Paperclip Cut B R5: move stop-and-keep/restoration safety to its cleanup owner; fresh admission no longer produces a stop or note.
+  it("released no receipt + running observation: cleanup stops once and restores the original plus receipt without launching a run", async () => {
+    const f = await fixture();
     const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "stopped" })), hb = f.cleanup(stop);
-    await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+    expect(await prepareInspectedSourceSandboxStop(db, f.lease, { providerLeaseId: f.lease.providerLeaseId!, state: "running" })).not.toBeNull();
     const pending = await f.readLease();
     expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
     expect(pending.status).toBe("pending_cleanup");
-    await f.gate();
-    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
-    expect(await f.notes()).toHaveLength(1);
+    expect(await f.notes()).toHaveLength(0);
     expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
     for (let n = 0; n < 3; n++) await hb.sweepPendingCleanupLeases();
@@ -99,17 +90,15 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
-  it("pending-cleanup-only owner alternative preserves COMPLETE ended evidence after its single confirmed stop", async () => {
+  // follow-Paperclip Cut B R5: retain complete ended-evidence and single-stop checks at the existing cleanup preparation seam.
+  it("pending-cleanup-only owner preserves COMPLETE ended evidence after its single confirmed stop", async () => {
     const f = await fixture();
-    const inspect = f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "active" });
-    await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+    expect(await prepareInspectedSourceSandboxStop(db, f.lease, { providerLeaseId: f.lease.providerLeaseId!, state: "active" })).not.toBeNull();
     const pending = await f.readLease();
     expect(pending.status).toBe("pending_cleanup");
     expect(readStopOnlyCleanup(pending)).not.toBeNull();
     expect(pending.metadata?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
-    await f.gate();
-    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
-    expect(await f.notes()).toHaveLength(1);
+    expect(await f.notes()).toHaveLength(0);
     expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
     const stop = vi.fn(async () => ({ providerLeaseId: f.lease.providerLeaseId!, state: "stopped" })), hb = f.cleanup(stop);
     await hb.sweepPendingCleanupLeases();
@@ -123,13 +112,12 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
   }, 60_000);
 
-  it.each([false, true])("an unconfirmed single stop uses bounded read-only sweeps (later proof: %s)", async laterProof => {
+  // follow-Paperclip Cut B R5: the persisted cleanup intent still has a single dispatch and bounded proof reads, without gate notices.
+  it.each([false, true])("an unconfirmed cleanup stop uses bounded read-only sweeps (later proof: %s)", async laterProof => {
     const f = await fixture(), t0 = Date.now();
-    await inspectFreshThreadStopResources(db, f.run, f.issue.id,
-      f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" }));
-    await f.gate();
-    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
-    expect(await f.notes()).toHaveLength(1);
+    expect(await prepareInspectedSourceSandboxStop(db, f.lease,
+      { providerLeaseId: f.lease.providerLeaseId!, state: "running" })).not.toBeNull();
+    expect(await f.notes()).toHaveLength(0);
     const stop = vi.fn(async () => undefined);
     let reads = 0;
     const inspect = vi.fn(async () => ++reads >= 3 && laterProof
@@ -140,7 +128,6 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
     for (let n = 0; n < 10; n++) {
       vi.setSystemTime(t0 + n * 1800_000);
       await hb.sweepPendingCleanupLeases();
-      await f.gate();
       expect(stop).toHaveBeenCalledOnce();
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id))).toHaveLength(1);
     }
@@ -149,27 +136,24 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       expectRestored(f.lease, await f.readLease());
       await expectStorageRestored(f);
       expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
-      expect(await f.notes()).toHaveLength(1);
+      expect(await f.notes()).toHaveLength(0);
     } else {
       const pending = await f.readLease();
       expect(pending.status).toBe("pending_cleanup");
       expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
       expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
-      const notes = await f.notes(), current = notes.filter(note => !note.metadata?.supersededByCommentId);
-      expect(current).toMatchObject([{ body: FRESH_THREAD_STOP_UNAVAILABLE_NOTE }]);
-      expect(current).toHaveLength(1);
-      expect(notes).toHaveLength(2); // one waiting history, one final cannot-confirm
+      expect(await f.notes()).toHaveLength(0); // cleanup cannot narrate a thread selection
     }
   }, 60_000);
 
+  // follow-Paperclip Cut B R5: restart safety belongs to the durable cleanup owner, not the removed fresh-thread gate.
   it("restart after the persisted rewrite recovers the exact original from its intent and restores it once", async () => {
-    const f = await fixture(), inspect = f.inspector({ providerLeaseId: f.lease.providerLeaseId!, state: "running" });
-    await inspectFreshThreadStopResources(db, f.run, f.issue.id, inspect);
+    const f = await fixture();
+    expect(await prepareInspectedSourceSandboxStop(db, f.lease, { providerLeaseId: f.lease.providerLeaseId!, state: "running" })).not.toBeNull();
     const pending = await f.readLease(), requestId = readStopOnlyCleanup(pending)!.requestId;
     expect(pending.status).toBe("pending_cleanup");
     expect((pending.metadata?.sandboxStopAndRetain as Record<string, unknown>)?.endedLeaseEvidence).toEqual(JSON.parse(JSON.stringify(f.lease)));
-    await f.gate();
-    expect(await f.notes()).toMatchObject([{ body: FRESH_THREAD_STOPPING_NOTE }]);
+    expect(await f.notes()).toHaveLength(0);
     // Nothing in memory is passed to the successor service. This is the crash
     // boundary after committed intent/rewrite and before dispatch/restoration.
     const restartedDb = createDb(database.connectionString);
@@ -188,7 +172,7 @@ describe.skipIf(!support.supported)("F1 ended inspection binding bar", () => {
       await expectStorageRestored(f);
       expect(readStopOnlyCleanup(restored)).toBeNull();
       expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(true);
-      expect(await f.notes()).toHaveLength(1);
+      expect(await f.notes()).toHaveLength(0);
       // Snapshot and time checks must not become a broad bad-time exception.
       await db.update(environmentLeases).set({ failureReason: "tampered" }).where(eq(environmentLeases.id, f.lease.id));
       expect((await readFreshThreadStopProof(db, f.run, f.issue.id)).gone).toBe(false);
