@@ -1,5 +1,7 @@
 import { notifyRetentionWork, writeJoinRequestChange } from "../services/retention-work-notifications.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { admitAgentActorHire } from "../services/agent-actor-admission.js";
+import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
 import {
   createHash,
   generateKeyPairSync,
@@ -4244,26 +4246,38 @@ export function accessRoutes(
           }))
         );
 
-        const created = await agentsLifecycle.requestHire(companyId, {
+        let adapter = {
+          adapterType: existing.adapterType ?? "process",
+          adapterConfig: existing.agentDefaultsPayload && typeof existing.agentDefaultsPayload === "object"
+            ? existing.agentDefaultsPayload as Record<string, unknown> : {},
+        };
+        if (req.actor.type === "agent") {
+          const [company] = await db.select().from(companies).where(eq(companies.id, companyId));
+          if (!company) throw notFound("Company not found");
+          const admission = await admitAgentActorHire(db, req.actor, company, adapter);
+          if (admission.requiresApproval) throw forbidden("Board approval is required to activate a joined agent");
+          adapter = await resolveNewAgentRunnerForCompany(db, companyId, adapter);
+          await admitAgentActorHire(db, req.actor, company, adapter);
+        }
+        const joinInput = {
           name: agentName,
           role: "general",
           title: null,
           status: "idle",
           reportsTo: managerId,
           capabilities: existing.capabilities ?? null,
-          adapterType: existing.adapterType ?? "process",
-          adapterConfig:
-            existing.agentDefaultsPayload &&
-            typeof existing.agentDefaultsPayload === "object"
-              ? (existing.agentDefaultsPayload as Record<string, unknown>)
-              : {},
+          ...adapter,
           runtimeConfig: {},
           budgetMonthlyCents: 0,
           spentMonthlyCents: 0,
           permissions: {},
           lastHeartbeatAt: null,
           metadata: null
-        });
+        };
+        const created = req.actor.type === "agent"
+          ? await agentsLifecycle.requestHire(companyId, joinInput, { runnerResolved: true,
+            createdByAgentId: req.actor.agentId, createdByAgentCompanyId: req.actor.companyId })
+          : await agentsLifecycle.requestHire(companyId, joinInput);
         createdAgentId = created.id;
         await access.ensureMembership(
           companyId,

@@ -1,10 +1,14 @@
 import { and, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, companyOnboardingSeeds, goals, issues, projects } from "@paperclipai/db";
+import { agents, companies, companyOnboardingSeeds, goals, issues, projects } from "@paperclipai/db";
 import type { ApplyOnboardingSeed } from "@paperclipai/shared";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { findActiveServerAdapter } from "../adapters/registry.js";
 import { agentService } from "./agents.js";
+import { admitAgentActorHire } from "./agent-actor-admission.js";
+import { resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
+import type { AuthorizationActor } from "./authorization.js";
+import { forbidden, notFound } from "../errors.js";
 import { createAgentLifecycle, scheduleAgentLifecycle } from "./agent-lifecycle.js";
 import { withDedicatedDbConnection } from "@paperclipai/db";
 import { PAPERCLIP_CORE_SKILL_KEYS } from "./company-skills.js";
@@ -181,7 +185,7 @@ export function onboardingSeedService(db: Db) {
     return created.id;
   }
 
-  async function prepareAgent(dbx: Db, companyId: string, seed: ApplyOnboardingSeed, audit?: OnboardingSeedAuditActor) {
+  async function prepareAgent(dbx: Db, companyId: string, seed: ApplyOnboardingSeed, audit?: OnboardingSeedAuditActor, actor?: AuthorizationActor) {
     const existing = await readRecord(dbx, companyId);
     if (existing?.revision === seed.revision) return existing.agentId;
     const agentSvc = agentService(dbx);
@@ -195,18 +199,28 @@ export function onboardingSeedService(db: Db) {
         await agentSvc.update(agentId, { name: agentName, title: agentRole });
       } else {
         const adapterType = seededAgentAdapterType();
+        let proposal = { adapterType, adapterConfig: seededAgentAdapterConfig(adapterType) };
+        if (actor?.type === "agent") {
+          const [company] = await dbx.select().from(companies).where(eq(companies.id, companyId));
+          if (!company) throw notFound("Company not found");
+          const admission = await admitAgentActorHire(dbx, actor, company, proposal);
+          if (admission.requiresApproval) throw forbidden("Board approval is required to create an onboarding agent");
+          proposal = await resolveNewAgentRunnerForCompany(dbx, companyId, proposal);
+          await admitAgentActorHire(dbx, actor, company, proposal);
+        }
         const created = await createAgentLifecycle(dbx).requestHire(companyId, {
           name: agentName,
           role: SEEDED_AGENT_ROLE,
           title: agentRole,
-          adapterType,
-          adapterConfig: seededAgentAdapterConfig(adapterType),
+          ...proposal,
           runtimeConfig: {},
           permissions: {},
           status: "idle",
           spentMonthlyCents: 0,
           lastHeartbeatAt: null,
-        }, { createdByUserId: audit?.actorType === "user" ? audit.actorId : null });
+        }, { createdByUserId: audit?.actorType === "user" ? audit.actorId : null,
+          ...(actor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.agentId, createdByAgentCompanyId: actor.companyId } : {}),
+        });
         agentId = created.id;
       }
     }
@@ -352,6 +366,7 @@ export function onboardingSeedService(db: Db) {
     companyId: string,
     seed: ApplyOnboardingSeed,
     audit?: OnboardingSeedAuditActor,
+    actor?: AuthorizationActor,
   ): Promise<OnboardingSeedApplication> {
     // Collected inside the transaction, published only after it commits: the
     // activity row is transactional but its realtime/plugin fan-out is not, and
@@ -363,7 +378,10 @@ export function onboardingSeedService(db: Db) {
     const lockKey = `paperclip:onboarding-seed:${companyId}`;
     return withDedicatedDbConnection(db, lockDb => lockDb.transaction(async lock => {
       await lock.execute(sql`select pg_advisory_xact_lock(hashtextextended(${lockKey}, 0))`);
-      const preparedAgentId = await prepareAgent(database, companyId, seed, audit);
+      const admissionActor = actor ?? (audit?.actorType === "agent"
+        ? { type: "agent" as const, agentId: audit.actorId, companyId, runId: audit.runId, source: audit.runId ? "agent_jwt" as const : "agent_key" as const }
+        : undefined);
+      const preparedAgentId = await prepareAgent(database, companyId, seed, audit, admissionActor);
       const result = await database.transaction(async (tx) => {
         const dbx = tx as unknown as Db;
         const applied = await applyWithin(dbx, companyId, seed, preparedAgentId);

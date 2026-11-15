@@ -1,5 +1,7 @@
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { admitAgentActorHire } from "./agent-actor-admission.js";
+import { currentPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import { and, eq, isNull, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -491,15 +493,31 @@ export function pluginManagedAgentService(
     const requiresApproval = company.requireBoardApprovalForNewAgents;
     const adapterType = await resolveManagedAdapterType(companyId, declaration);
     const initialStatus = requiresApproval ? "pending_approval" : declaration.status ?? "idle";
-    let created = await agentSvcLifecycle.requestHire(companyId, {
-      ...declarationPatch(declaration, { adapterType }),
+    // Worker invocation scope carries the agent that called the plugin tool.
+    // A plugin declaration is not authority to create a host command for it.
+    const origin = currentPluginInteractionOrigin();
+    const actor = origin ? { type: "agent" as const, agentId: origin.agentId, companyId: origin.companyId,
+      runId: origin.runId, source: origin.runId ? "agent_jwt" as const : "agent_key" as const } : undefined;
+    let proposal = declarationPatch(declaration, { adapterType });
+    if (actor) {
+      if (actor.companyId !== companyId) throw forbidden("Agent key cannot access another company");
+      await admitAgentActorHire(db, actor, company, proposal);
+      proposal = { ...proposal, ...await resolveNewAgentRunnerForCompany(db, companyId, proposal) };
+      await admitAgentActorHire(db, actor, company, proposal);
+    }
+    const hireInput = {
+      ...proposal,
       status: initialStatus,
       pauseReason: initialStatus === "paused" ? managedAgentPauseReason(options.pluginKey) : null,
       pausedAt: initialStatus === "paused" ? new Date() : null,
       metadata: managedMetadata(options.pluginId, options.pluginKey, declaration),
       spentMonthlyCents: 0,
       lastHeartbeatAt: null,
-    }) as Agent;
+    };
+    let created = (actor
+      ? await agentSvcLifecycle.requestHire(companyId, hireInput, { runnerResolved: true,
+        createdByAgentId: actor.agentId, createdByAgentCompanyId: actor.companyId })
+      : await agentSvcLifecycle.requestHire(companyId, hireInput)) as Agent;
     created = await materializeDeclaredInstructions(companyId, created, declaration, { replaceExisting: false });
 
     let approvalId: string | null = null;

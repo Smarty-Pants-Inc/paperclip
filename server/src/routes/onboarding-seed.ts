@@ -47,7 +47,9 @@ export function onboardingSeedRoutes(db: Db) {
       // and re-logs. Handling it here instead, as this route used to, could only
       // pick which half to lose: 500 and the retry reports `changed: false` and
       // never logs; 200 and Cloud stops retrying with the entry still absent.
-      const result = await svc.apply(companyId, req.body, getActorInfo(req));
+      const result = req.actor.type === "agent"
+        ? await svc.apply(companyId, req.body, getActorInfo(req), req.actor)
+        : await svc.apply(companyId, req.body, getActorInfo(req));
 
       res.status(200).json({
         companyId,

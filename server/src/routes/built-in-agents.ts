@@ -166,7 +166,9 @@ export function builtInAgentRoutes(db: Db) {
     const key = req.params.key as string;
     await assertBuiltInAgentsEnabled();
     await assertCanProvisionBuiltInAgents(req, companyId);
-    const state = await svc.ensure(companyId, key);
+    const state = req.actor.type === "agent"
+      ? await svc.ensure(companyId, key, {}, { admissionActor: req.actor })
+      : await svc.ensure(companyId, key);
     await logBuiltInAgentMutation(req, {
       companyId,
       action: "built_in_agent.reconcile",
@@ -190,6 +192,7 @@ export function builtInAgentRoutes(db: Db) {
       const result = await svc.provision(companyId, key, req.body, {
         requestedByAgentId: actor.actorType === "agent" ? actor.actorId : null,
         requestedByUserId: actor.actorType === "user" ? actor.actorId : null,
+        ...(req.actor.type === "agent" ? { admissionActor: req.actor } : {}),
       });
       const { state, approval } = result;
       await logBuiltInAgentMutation(req, {

@@ -1,4 +1,5 @@
 import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { admitAgentActorHire } from "./agent-actor-admission.js";
 import fs from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -76,6 +77,7 @@ export interface BuiltInAgentProvisionInput {
 }
 
 export interface BuiltInAgentProvisionActor {
+  admissionActor?: AuthorizationActor;
   requestedByAgentId?: string | null;
   requestedByUserId?: string | null;
 }
@@ -1743,10 +1745,10 @@ export function builtInAgentService(db: Db) {
     companyId: string,
     key: string,
     input: BuiltInAgentProvisionInput = {},
-    options: { isRaceRetry?: boolean; createdByUserId?: string | null; createdByAgentId?: string | null } = {},
+    options: { isRaceRetry?: boolean; createdByUserId?: string | null; createdByAgentId?: string | null; admissionActor?: AuthorizationActor } = {},
   ) {
     const definition = requireBuiltInAgentDefinition(key);
-    await ensureCompany(companyId);
+    const company = await ensureCompany(companyId);
     const existing = await findSingleAgent(companyId, definition);
     const existingPendingApproval = existing?.status === "pending_approval";
     const preserveExistingAdapter = Boolean(
@@ -1822,13 +1824,28 @@ export function builtInAgentService(db: Db) {
       return state(definition, await agentSvc.getById(existing.id) as Agent, resources);
     }
 
+    // Agent reconcile is a hire too; it cannot evade the company's pending
+    // approval path by using ensure instead of provision.
+    if (options.admissionActor?.type === "agent" && company.requireBoardApprovalForNewAgents) {
+      return (await provision(companyId, key, input, {
+        admissionActor: options.admissionActor,
+        requestedByAgentId: options.admissionActor.agentId,
+        requestedByUserId: options.createdByUserId,
+      })).state;
+    }
+    let proposal = definitionPatch(definition, resolvedInput);
+    if (options.admissionActor?.type === "agent") {
+      await admitAgentActorHire(db, options.admissionActor, company, proposal);
+      proposal = { ...proposal, ...await resolveNewAgentRunnerForCompany(db, companyId, proposal) };
+      await admitAgentActorHire(db, options.admissionActor, company, proposal);
+    }
     const reportsTo = definition.defaultManager === "single_root_agent"
       ? await findSingleRootManager(companyId)
       : null;
     let created: Agent;
     try {
       created = await agentSvcLifecycle().requestHire(companyId, {
-        ...definitionPatch(definition, resolvedInput),
+        ...proposal,
         status: definition.defaultStatus ?? "idle",
         pauseReason: definition.defaultStatus === "paused"
           ? `Built-in ${definition.displayName} is disabled until explicitly configured.`
@@ -1847,13 +1864,14 @@ export function builtInAgentService(db: Db) {
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
       }, { allowBuiltInAgentMetadata: true, createdByUserId: options.createdByUserId ?? null,
+        ...(options.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: options.admissionActor.agentId, createdByAgentCompanyId: options.admissionActor.companyId } : {}),
         ...(options.createdByUserId && resolvedInput.budgetMonthlyCents ? { initialBudgetPolicyUserId: options.createdByUserId } : {}) }) as Agent;
     } catch (error) {
       // Lost the provisioning race: a concurrent writer inserted the row first
       // and the partial unique index rejected ours. Re-run once; the winning
       // row now exists, so we take the update path instead of inserting again.
       if (!options.isRaceRetry && isBuiltInAgentMarkerConflict(error)) {
-        return ensure(companyId, key, input, { isRaceRetry: true, createdByUserId: options.createdByUserId, createdByAgentId: options.createdByAgentId });
+        return ensure(companyId, key, input, { ...options, isRaceRetry: true });
       }
       throw error;
     }
@@ -1886,7 +1904,7 @@ export function builtInAgentService(db: Db) {
     const definition = requireBuiltInAgentDefinition(key);
     const company = await ensureCompany(companyId);
     if (!company.requireBoardApprovalForNewAgents) {
-      return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null }), approval: null };
+      return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, admissionActor: actor.admissionActor }), approval: null };
     }
     await assertKnownBuiltInAgentModel(definition, input);
 
@@ -1918,7 +1936,7 @@ export function builtInAgentService(db: Db) {
       // it does when board approval is not required, instead of dead-ending on a
       // fresh board-approval requirement the operator can never satisfy.
       if (providesAdapterSetup && (existing.metadata?.paperclipBuiltInSetupRequired === true || !hasCompleteAdapterConfig(existing.adapterType, existing.adapterConfig))) {
-        return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null }), approval: null };
+        return { state: await ensure(companyId, key, input, { createdByUserId: actor.requestedByUserId ?? null, createdByAgentId: actor.requestedByAgentId ?? null, admissionActor: actor.admissionActor }), approval: null };
       }
 
       // Changing the adapter of an already-configured (`ready`/`paused`)
@@ -1934,13 +1952,19 @@ export function builtInAgentService(db: Db) {
       return { state: await state(definition, existing), approval: null };
     }
 
+    let proposal = definitionPatch(definition, input);
+    if (actor.admissionActor?.type === "agent") {
+      await admitAgentActorHire(db, actor.admissionActor, company, proposal);
+      proposal = { ...proposal, ...await resolveNewAgentRunnerForCompany(db, companyId, proposal) };
+      await admitAgentActorHire(db, actor.admissionActor, company, proposal);
+    }
     const reportsTo = definition.defaultManager === "single_root_agent"
       ? await findSingleRootManager(companyId)
       : null;
     let pending: Agent;
     try {
       pending = await agentSvcLifecycle().requestHire(companyId, {
-        ...definitionPatch(definition, input),
+        ...proposal,
         status: "pending_approval",
         reportsTo,
         metadata: {
@@ -1954,7 +1978,9 @@ export function builtInAgentService(db: Db) {
         permissions: definition.defaultPermissions ?? {},
         spentMonthlyCents: 0,
         lastHeartbeatAt: null,
-      }, { allowBuiltInAgentMetadata: true, createdByUserId: actor.requestedByUserId ?? null }) as Agent;
+      }, { allowBuiltInAgentMetadata: true, createdByUserId: actor.requestedByUserId ?? null,
+        ...(actor.admissionActor?.type === "agent" ? { runnerResolved: true, createdByAgentId: actor.admissionActor.agentId, createdByAgentCompanyId: actor.admissionActor.companyId } : {}),
+      }) as Agent;
     } catch (error) {
       // Lost the provisioning race: a concurrent writer inserted the row (and
       // its own hire approval) first, and the partial unique index rejected

@@ -399,7 +399,8 @@ describe("built-in agent routes", () => {
       companyId,
       "briefs",
       { adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } },
-      { requestedByAgentId: "manager-agent", requestedByUserId: null },
+      { requestedByAgentId: "manager-agent", requestedByUserId: null,
+        admissionActor: { type: "agent", agentId: "manager-agent", runId: "native-request-run", companyId, source: "agent_key" } },
     );
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,
