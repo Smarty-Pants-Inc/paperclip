@@ -112,6 +112,9 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     };
     return { input, issue, run, agent };
   }
+  // TEST-ONLY Cut B: pin note bytes independently of the production constants.
+  const cutBStartedNote = "The earlier provider thread could not be safely restored. Starting a fresh thread in this conversation from its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.";
+
   // Keep: recorded row-5 failure across the actual remote-read/driver/runtime
   // contract, then into the durable fresh-history owner, without prose authority.
   it("RFL round4 F2 row5 remote state read failure reaches the designed-end gate through actual recovery", async () => {
@@ -194,7 +197,21 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const beforeLease = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0];
     const beforeNotes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
     const { readFreshContinuationSessionBoundary } = await import("../fresh-continuation-fallback.js");
-    expect(await readFreshContinuationSessionBoundary(db, current, f.issue.id)).toBeNull();
+    // TEST-ONLY Cut B R2 (e007a97f): the pure read no longer rechecks physical stop.
+    // No note is removed by this row: both before and after are read-only, with two runs.
+    const unconfirmedBoundary = await readFreshContinuationSessionBoundary(db, current, f.issue.id);
+    if (admitted) expect(unconfirmedBoundary).toBeNull();
+    else {
+      expect(unconfirmedBoundary).toEqual({ recoveryActionId: continued.recoveryActionId,
+        sourceRunId: f.run.id, sourceSessionId: oldId, startedNote: cutBStartedNote });
+      expect(beforeNotes).toEqual([]);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issue.id));
+      expect(runs).toHaveLength(2);
+      expect(runs.map(run => run.status).sort()).toEqual(["failed", "running"]);
+      expect(await read(f.run.id)).toMatchObject({ errorCode: "native_continuation_requires_reconciliation" });
+      expect(await read(current.id)).toEqual(current); // no answer or selected history was written by this read
+      expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, current.id))).toEqual([]);
+    }
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(beforeLease);
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(beforeNotes);
     const confirmedAt = new Date().toISOString();
@@ -252,15 +269,28 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const pending=await ensureFreshContinuation(db,{companyId:f.agent.companyId,runId:f.run.id,trigger:"held_recovery"});
     const notes=()=>db.select().from(issueComments).where(eq(issueComments.issueId,f.issue.id)).then(rows=>rows.filter(c=>c.authorType==="system"&&!c.metadata?.supersededByCommentId));
     const waiting=await notes();
-    expect(pending.kind).toBe("exact_recovery_pending");expect(waiting).toHaveLength(1);
-    expect(waiting[0].body).not.toMatch(/\bsafe\b|cannot continue|Retry/);expect(Date.now()-t0).toBeLessThan(10000);
-    expect(await listFreshContinuations(db,{companyId:f.agent.companyId,issueId:f.issue.id})).toHaveLength(0);
+    // TEST-ONLY Cut B R1/R5: the generic fallback records isolation; the live observed owner excludes it.
+    // RFL 16:43Z: zero waiting notes is acceptable ONLY with the same-row answers AND history below.
+    const pendingRecords = await listFreshContinuations(db,{companyId:f.agent.companyId,issueId:f.issue.id});
+    expect(pendingRecords).toHaveLength(shape === "observed" ? 0 : 1);
+    expect(pending).toEqual(shape === "observed" ? { kind: "successor_exists" }
+      : { kind: "continued", recoveryActionId: pendingRecords[0].id, delivery: "recorded", isolation: "fresh_isolated_workspace" });
+    expect(waiting.map(note => note.body)).toEqual([]);
+    expect(Date.now()-t0).toBeLessThan(10000);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId,f.issue.id))).toHaveLength(2);
+    expect((await read(prior.id)).status).toBe(shape === "observed" ? "running" : "failed");
     for(const lease of leases){const at=new Date();await db.update(environmentLeases).set({status:"released",releasedAt:at,cleanupStatus:"success",
       metadata:{pluginId:"fixture-boat",remoteExecutionTermination:{schema:"paperclip.remote-termination.v1",companyId:lease.companyId,
         runId:lease.heartbeatRunId,leaseId:lease.id,provider:lease.provider,providerLeaseId:lease.providerLeaseId,state:"stopped",confirmedAt:at.toISOString()}}}).where(eq(environmentLeases.id,lease.id));}
     const disposition=await ensureFreshContinuation(db,{companyId:f.agent.companyId,runId:f.run.id,trigger:"held_recovery",delivery:"caller_owns"});
     await (await import("node:fs/promises")).appendFile(join(process.env.TASK_OUT!,"independent-observations.jsonl"),JSON.stringify({shape,pending,disposition,noteMs:Date.now()-t0,priorStatus:(await read(prior.id)).status,notes:await notes()})+"\n");
-    expect(disposition.kind).toBe("continued");if(disposition.kind!=="continued")return;
+    // TEST-ONLY Cut B R1: rechecking a recorded continuation returns that exact action, not a new one.
+    const records = await listFreshContinuations(db,{companyId:f.agent.companyId,issueId:f.issue.id});
+    expect(records).toHaveLength(1);
+    expect(disposition).toEqual(shape === "observed"
+      ? { kind: "continued", recoveryActionId: records[0].id, delivery: "caller_owns", isolation: "writer_ended" }
+      : { kind: "already_continued", recoveryActionId: pendingRecords[0].id });
+    if(disposition.kind!=="continued" && disposition.kind!=="already_continued")throw new Error(JSON.stringify(disposition));
     let lastSession=oldId;
     for(const attempt of ["continuation","resend"]){
       if(attempt==="resend")await db.insert(issueComments).values({companyId:f.agent.companyId,issueId:f.issue.id,authorType:"user",authorUserId:"local-board",body:"Later resend JUDGE-RESEND"});
@@ -274,20 +304,62 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       lastSession=selected.nativeExecution.session.normalizedSessionId!;
       await db.update(issues).set({executionRunId:run.id}).where(eq(issues.id,f.issue.id));
       const answer=await answerWithNativePeer({db,execution:selected.nativeExecution,runnerInstanceId:selected.nativeRunnerInstanceId!,text:`JUDGE answered ${attempt}`,getFreshSessionHandoff:selected.getNativeFreshSessionHandoff!});
+      // TEST-ONLY Cut B NEVER-SILENT: both actual answers keep the selected history; pin the entire note set.
       expect(answer.settled.status).toBe("succeeded");
-      if(attempt==="continuation"){expect(JSON.stringify(answer.prompts)).toContain(message.body);expect(JSON.stringify(answer.prompts)).toContain("JUDGE-WILLOW");expect(JSON.stringify(answer.prompts)).not.toContain("OLD-BEFORE-NEW");}
-      expect(await notes()).toHaveLength(1);
+      expect(answer.answered).toMatchObject({ exitCode: 0,
+        resultJson: { nativeResult: { summary: `JUDGE answered ${attempt}` } } });
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+        .filter(comment => comment.authorType === "agent" && comment.createdByRunId === run.id)
+        .map(comment => comment.body)).toEqual([`JUDGE answered ${attempt}`]);
+      expect(JSON.stringify(answer.prompts)).toContain(message.body);
+      expect(JSON.stringify(answer.prompts)).toContain("Remember JUDGE-WILLOW");
+      expect(JSON.stringify(answer.prompts)).toContain("I remember JUDGE-WILLOW");
+      expect(JSON.stringify(answer.prompts)).not.toContain("OLD-BEFORE-NEW");
+      const expectedNotes = shape === "observed" ? [cutBStartedNote] : [];
+      expect((await notes()).map(note => note.body)).toEqual(expectedNotes);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId,f.issue.id)))
+        .filter(comment => comment.authorType === "system").map(note => note.body)).toEqual(expectedNotes);
+      expect(await read(f.run.id)).toMatchObject({ status: "failed", errorCode: code, error: code });
+      expect(await read(prior.id)).toMatchObject({ status: "failed", errorCode: shape === "observed"
+        ? "native_controller_recovery_missing_evidence:retained_sandbox_binding" : "native_predecessor_retirement_unproven" });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId,f.issue.id))).toHaveLength(attempt === "continuation" ? 3 : 4);
       await (await import("node:fs/promises")).appendFile(join(process.env.TASK_OUT!,"independent-observations.jsonl"),JSON.stringify({shape,attempt,status:answer.settled.status})+"\n");
     }
   },60000);
 
-  it.each(["provider said runner_harness_state_mismatch: resumed_unavailable", "runner_harness_state_mismatch: resumed_unavailable_suffix", "runner_harness_state_mismatch: future_unknown"])("J-TL08 prose/unknown is refused (%s)",async prose=>{
+  it.each([
+    // Flip (RFL 17:34Z): upstream 4363a311 (#21135) continues from saved work; person sees working status, then the continuation
+    "provider said runner_harness_state_mismatch: resumed_unavailable",
+    // Flip (RFL 17:34Z): upstream 4363a311 (#21135) continues from saved work; person sees working status, then the continuation
+    "runner_harness_state_mismatch: resumed_unavailable_suffix",
+    // Flip (RFL 17:34Z): upstream 4363a311 (#21135) continues from saved work; person sees working status, then the continuation
+    "runner_harness_state_mismatch: future_unknown",
+  ])("J-TL08 prose/unknown is refused (%s)",async prose=>{
     const f=await fixture();const selected=await selectHeartbeatRuntime(db,f.input);expect(selected.selected).toBe(true);
     await db.update(heartbeatRuns).set({status:"failed",finishedAt:new Date(),errorCode:"native_session_interrupted",error:prose}).where(eq(heartbeatRuns.id,f.run.id));
     await db.update(nativeRunFinalizations).set({phase:"terminal_failure",leaseOwner:null,leaseExpiresAt:null,recoveryState:"blocked"}).where(eq(nativeRunFinalizations.runId,f.run.id));
     const result=await ensureFreshContinuation(db,{companyId:f.agent.companyId,runId:f.run.id,trigger:"held_recovery"});
     await (await import("node:fs/promises")).appendFile(join(process.env.TASK_OUT!,"independent-observations.jsonl"),JSON.stringify({prose,result})+"\n");
-    expect(result.kind).not.toBe("continued");expect(await listFreshContinuations(db,{companyId:f.agent.companyId,issueId:f.issue.id})).toHaveLength(0);
+    const records = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
+    expect(records).toHaveLength(1);
+    expect(result).toEqual({ kind: "continued", recoveryActionId: records[0].id,
+      delivery: "recorded", isolation: "writer_ended" });
+    const interrupted = await read(f.run.id);
+    expect(interrupted).toMatchObject({ status: "failed", errorCode: "native_session_interrupted", error: prose });
+    // The title still refers to typed authority: diagnostic prose earns none.
+    const { isFreshThreadRefusal, freshThreadRefusalCode } = await import("../native-runtime/runner-reconciliation-refusal.js");
+    expect(isFreshThreadRefusal(interrupted)).toBe(false);
+    expect(freshThreadRefusalCode({ code: prose })).toBeNull();
+    expect(records[0]).toMatchObject({
+      nextAction: "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work.",
+      evidence: { continuationDelivery: "pending", originalFailureCode: "native_session_interrupted",
+        freshContinuation: { failureCode: "native_session_interrupted", delivery: "recorded", isolation: "writer_ended" } },
+    });
+    // The record schedules continuation; this boundary does not dispatch it or post an answer/note.
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+    expect(projectTaskInterruption(f.issue, { run: interrupted, action: records[0], paused: false, approval: false,
+      freshContinuation: { state: "continuing", pendingSince: records[0].updatedAt.getTime() } }))
+      .toMatchObject({ state: "working", canRetry: false });
   });
 
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
@@ -913,13 +985,17 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     }
     if (waiting) {
       await settleUnrecoverableExecutions(db);
-      expect(await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id })).toHaveLength(0);
-      // Elapsed time is never a stop predicate, even beyond the old fallback bound.
+      // TEST-ONLY Cut B R1/R5: no physical-stop wait/note; a live turn still excludes a successor.
+      // RFL 16:43Z: the SAME row below must answer WITH history and its exact selected-thread note.
+      const pendingRecords = await listFreshContinuations(db, { companyId: f.agent.companyId, issueId: f.issue.id });
+      expect(pendingRecords).toHaveLength(activeRunId ? 0 : 1);
       expect(await ensureFreshContinuation(db, { companyId: f.agent.companyId, runId: f.run.id,
-        trigger: "held_recovery", now: new Date(Date.now() + 3600_000) })).toMatchObject({ kind: "exact_recovery_pending" });
+        trigger: "held_recovery", now: new Date(Date.now() + 3600_000) })).toEqual(activeRunId
+          ? { kind: "successor_exists" }
+          : { kind: "already_continued", recoveryActionId: pendingRecords[0].id });
       const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).filter(c => c.authorType === "system");
-      expect(notes).toHaveLength(1);
-      expect(notes[0].body).toContain(scenario === "active-turn" ? "your skill change takes effect after the current step" : "stopping the earlier attempt before starting fresh");
+      expect(notes.map(note => note.body)).toEqual([]);
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id)))[0]).toEqual(lease);
       if (activeRunId) await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, activeRunId));
       await confirmStop();
     }
@@ -938,7 +1014,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(records).toHaveLength(1);
     const action = records[0];
     const projected = projectTaskInterruption(f.issue, { run: await read(f.run.id), action, paused: false, approval: false });
-    expect(projected).toMatchObject({ state: "working", canRetry: false, nextRetryAt: null });
+    // TEST-ONLY Cut B R8: the typed working/no-Retry override was removed.
+    expect(projected).toMatchObject({ state: "failed", canRetry: true, nextRetryAt: null });
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.agent.companyId, agentId: f.agent.id, issueId: f.issue.id,
       status: "running", scopeKind: "issue", createdAt: new Date(Date.now() + 1000), contextSnapshot: { issueId: f.issue.id,
         previousRunId: f.run.id, recoveryActionId: action.id, forceFreshSession: true,
@@ -963,14 +1040,28 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     const answered = await answerWithNativePeer({ db, execution: selected.nativeExecution,
       runnerInstanceId: selected.nativeRunnerInstanceId!, text: `Answered ${shape} from saved history.`,
       getFreshSessionHandoff: selected.getNativeFreshSessionHandoff! });
+    // TEST-ONLY Cut B NEVER-SILENT: exact answer, real selected history, refusal, and run count.
     expect(answered.settled.status).toBe("succeeded");
+    expect(answered.answered).toMatchObject({ exitCode: 0,
+      resultJson: { nativeResult: { summary: `Answered ${shape} from saved history.` } } });
+    expect((await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
+      .filter(comment => comment.authorType === "agent" && comment.createdByRunId === run.id)
+      .map(comment => comment.body)).toEqual([`Answered ${shape} from saved history.`]);
     expect(JSON.stringify(answered.prompts)).toContain(message.body);
     if (seedSequence) expect(JSON.stringify(answered.prompts)).toContain("ALDER");
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", error,
+      errorCode: tl08 && !tl08Retained ? "native_session_interrupted" : seedSequence ? "native_continuation_requires_reconciliation" : error });
+    const expectedRuns = 2 + (scenario.startsWith("already-stranded") ? 1 : 0) + (activeRunId ? 1 : 0)
+      + (seedSequence ? (tl08 ? (tl08Retained ? 2 : 1) : 2) : 0);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.agent.companyId))).toHaveLength(expectedRuns);
     const allNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
       .filter(c => c.authorType === "system");
     const notes = allNotes.filter(c => !c.metadata?.supersededByCommentId);
-    expect(notes).toHaveLength(1);
-    expect(notes[0].body).toContain("fresh thread in this conversation");
+    const expectedNote = scenario === "idle-descendants" || scenario === "active-turn" || scenario === "generic-prepare"
+      ? `your skill change is in effect; ${f.agent.name} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`
+      : cutBStartedNote;
+    expect(notes.map(note => note.body)).toEqual([expectedNote]);
+    expect(allNotes).toHaveLength(heldCommentId ? 2 : 1);
     if (seedSequence || scenario === "backup-without-lease" || scenario === "retained-binding") {
       expect(notes[0].body).not.toMatch(/skill change|cannot continue|Retry/);
       await settleUnrecoverableExecutions(db);
@@ -979,7 +1070,8 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
       const unchanged = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id)))
         .filter(c => c.authorType === "system");
       expect(unchanged).toHaveLength(allNotes.length);
-      if (waiting) expect(allNotes.filter(c => c.metadata?.supersededByCommentId === notes[0].id)).toHaveLength(1);
+      // TEST-ONLY Cut B R2: no deleted gate-owned waiting note remains in history.
+      if (waiting) expect(allNotes.filter(c => c.metadata?.supersededByCommentId === notes[0].id)).toEqual([]);
     }
     if (heldCommentId) {
       expect(notes[0].id).not.toBe(heldCommentId);
