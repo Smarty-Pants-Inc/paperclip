@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { projectExecution } from "./execution-projection.js";
-import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/native-session-executor.js";
 import { startTaskDrain, stopTaskDrain } from "./task-admission.js";
 import { resetStartupRecoveryStateForTests, setStartupRecoveryPhase } from "../startup-recovery-state.js";
 
@@ -142,8 +141,9 @@ describe("execution truth projection", () => {
     if (status === "recovered") {
       expect(projectExecution({ ...source, status: "timed_out" }, coordinator({ phase: "terminal_failure" }), [], action, now)
         .nextAction).toBe("Saved work recovered.");
+      // follow-Paperclip Cut B R4: refusal diagnostics do not replace the saved-work projection.
       expect(projectExecution({ ...source, errorCode: "native_session_cleanup_quarantined" },
-        coordinator({ phase: "terminal_failure" }), [], action, now).nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+        coordinator({ phase: "terminal_failure" }), [], action, now).nextAction).toBe("Saved work recovered.");
     }
     expect(projectExecution(source, undefined, [], { ...action,
       evidence: { ...action.evidence, workspaceRecovery: { ...action.evidence.workspaceRecovery,
@@ -165,18 +165,6 @@ describe("execution truth projection", () => {
   };
   const ordinary = { errorCode: "native_continuation_requires_reconciliation", error: "Fixture failure" } as Partial<Run>;
 
-  it("shows the held conversation's notice on a recovered run instead of offering a message", () => {
-    const { source, action } = recoveredHold(ordinary);
-    const project = (held: boolean, status = "recovered") => projectExecution(source, coordinator({ phase: "terminal_failure" }),
-      [], action(status), now, undefined, false, undefined, false, held);
-    expect(project(true)).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"],
-      nextAction: HELD_PREDECESSOR_NOTICE });
-    // No standing notice (none, or superseded) and no refusal code: the ordinary wording.
-    expect(project(false).nextAction).toBe("Saved work recovered.");
-    // Files not yet recovered are not called kept.
-    expect(project(true, "recovering").nextAction).toBe("Recovering saved work…");
-  });
-
   it.each([
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_missing_evidence:retained_sandbox_binding" },
     { errorCode: "native_continuation_requires_reconciliation", error: "native_controller_recovery_unsupported:metadata_format" },
@@ -188,12 +176,13 @@ describe("execution truth projection", () => {
     { errorCode: "adapter_failed", error: "runner_state_identity_mismatch: legacy_prior_owner_terminal_state_indeterminate" },
     { errorCode: "native_runner_warm_attachment_runner_exited", error: "Fixture failure" },
     { errorCode: "adapter_failed", error: "native_runner_warm_attachment_runner_exited: runner process ended" },
-  ])("does not offer a message on a recovered run whose conversation was refused ($errorCode, $error)", values => {
+  ])("projects saved-work recovery independently of refusal diagnostics ($errorCode, $error)", values => {
     const { source, action } = recoveredHold(values as Partial<Run>);
     const projected = projectExecution(source, coordinator({ phase: "terminal_failure" }), [], action("recovered"), now);
     expect(projected).toMatchObject({ phase: "recovery_needed", label: "Stopped", permittedActions: ["inspect_run"] });
     expect(projected.nextAction).not.toMatch(/send a message to continue/i);
-    expect(projected.nextAction).toBe(HELD_PREDECESSOR_NOTICE);
+    // follow-Paperclip Cut B R4: error text is diagnostic, not a permanent conversation refusal.
+    expect(projected.nextAction).toBe("Saved work recovered.");
     // Files not yet recovered are not called kept.
     expect(projectExecution(source, undefined, [], action("recovering"), now).nextAction).toBe("Recovering saved work…");
   });
