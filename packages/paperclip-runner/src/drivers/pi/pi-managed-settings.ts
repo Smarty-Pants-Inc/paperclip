@@ -1,4 +1,4 @@
-import { mkdir, readFile } from "node:fs/promises";
+import { lstat, mkdir, readFile, symlink } from "node:fs/promises";
 import { join } from "node:path";
 import { writePrivateFile } from "../private-file.js";
 
@@ -36,11 +36,28 @@ export async function configurePiManagedCompaction(input: {
   const path = join(input.agentHome, "settings.json");
   const settings = await readSettings(path);
   if (explicitReserve(settings, input.model) !== undefined) return;
+  const hasSettings = await lstat(path).then(() => true, error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  });
   const original = input.originalAgentHome === input.agentHome ? settings
     : await readSettings(join(input.originalAgentHome, "settings.json"));
+  const base = !hasSettings && input.originalAgentHome !== input.agentHome ? original : settings;
   const reserveTokens = explicitReserve(original, input.model)
     ?? Math.min(100000, Math.floor(input.contextWindow * 0.25));
-  const compaction = record(settings.compaction) ? settings.compaction : {};
+  const compaction = record(base.compaction) ? base.compaction : {};
   await mkdir(input.agentHome, { recursive: true, mode: 0o700 });
-  await writePrivateFile(path, `${JSON.stringify({ ...settings, compaction: { ...compaction, reserveTokens } })}\n`);
+  await writePrivateFile(path, `${JSON.stringify({ ...base, compaction: { ...compaction, reserveTokens } })}\n`);
+}
+
+export async function linkPiNpmInstall(agentHome: string, originalAgentHome: string): Promise<void> {
+  if (agentHome === originalAgentHome) return;
+  const originalNpm = join(originalAgentHome, "npm");
+  if (!(await lstat(originalNpm).then(() => true, error => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }))) return;
+  try { await lstat(join(agentHome, "npm")); return; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  await symlink(originalNpm, join(agentHome, "npm"));
 }
