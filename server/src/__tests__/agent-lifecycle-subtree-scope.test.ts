@@ -7,11 +7,12 @@ import request from "supertest";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, companies, companyMemberships, createDb,
-  principalPermissionGrants, approvals, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  principalPermissionGrants, approvals, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { issueService } from "../services/issues.js";
 
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -150,6 +151,35 @@ describe("subtree-scoped agent lifecycle", () => {
         expect.soft(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual(events);
       }, 60_000);
     }
+  }
+
+  for (const via of ["POST", "PATCH"] as const) {
+    it(`#20389 gate row: retire via ${via} releases holds and returns open tasks, never another subtree`, async () => {
+      const f = await seed();
+      const workerId = await f.hire();
+      await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget" })
+        .where(eq(agents.id, workerId));
+      const task = await issueService(db).create(f.companyId, { title: "Unfinished worker task", status: "blocked", assigneeAgentId: workerId });
+      const done = await issueService(db).create(f.companyId, { title: "Completed worker task", status: "done", assigneeAgentId: workerId });
+      const unrelated = await f.current(f.ids.unrelated);
+      const denied = await f.post(f.ids.unrelated, "terminate");
+      expect(denied.status, denied.text).toBe(403);
+      expect(await f.current(f.ids.unrelated)).toEqual(unrelated);
+      // agentctl's stated retire sequence is pause then terminate, not DELETE.
+      const pause = await f.post(workerId, "pause");
+      expect(pause.status, pause.text).toBe(200);
+      await f.worker.process(workerId);
+      const response = via === "POST" ? await f.post(workerId, "terminate")
+        : await request(f.api).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`).send({ status: "terminated" });
+      expect(response.status, response.text).toBe(200);
+      await f.worker.process(workerId);
+      expect.soft(await f.current(workerId)).toMatchObject({ status: "terminated", lifecycleState: "terminated", lifecycleHolds: [], pauseReason: null });
+      const current = (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
+      expect.soft(current).toMatchObject({ assigneeAgentId: f.ids.lead });
+      // Preserve real task blockers and terminal history; retirement is not completion.
+      expect.soft(current.status).toBe("blocked");
+      expect.soft((await db.select().from(issues).where(eq(issues.id, done.id)))[0]).toMatchObject({ assigneeAgentId: workerId, status: "done" });
+    }, 60_000);
   }
 
   it("allows transitive descendants, but loses lifecycle authority after a worker leaves the subtree", async () => {
