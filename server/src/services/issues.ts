@@ -11513,6 +11513,8 @@ export function issueService(db: Db) {
             authorUserId: row.authorUserId ?? null,
             authorType: row.authorType,
             createdByRunId: null,
+            // Company-import provenance belongs on the inserted row, not in its source timestamp.
+            origin: "import" as const,
             body: redactCurrentUserText(row.body, {
               enabled: censorUsernameInLogs,
             }),

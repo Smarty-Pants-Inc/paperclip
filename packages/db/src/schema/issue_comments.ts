@@ -33,7 +33,7 @@ export const issueComments = pgTable(
     derivedAuthorSource: text("derived_author_source").$type<IssueCommentDerivedAuthorSource>(),
     clientRequestId: text("client_request_id"),
     conversationSessionGeneration: integer("conversation_session_generation"),
-    origin: text("origin").$type<"comment" | "fast_response">().notNull().default("comment"),
+    origin: text("origin").$type<"comment" | "fast_response" | "import">().notNull().default("comment"),
     fastResponseRequestId: uuid("fast_response_request_id"),
     body: text("body").notNull(),
     presentation: jsonb("presentation").$type<IssueCommentPresentation | null>(),

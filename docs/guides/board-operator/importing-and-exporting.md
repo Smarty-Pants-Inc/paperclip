@@ -210,6 +210,18 @@ The CLI commands use these API endpoints under the hood:
 
 Import apply requests accept `pauseAutomations: true` to create imported agents and routines in a paused state.
 
+### Imported comment history
+
+Both `new_company` and `existing_company` imports mark every inserted comment with
+`origin: "import"`. Imported person comments are history: they are not pending
+continuation input and do not receive unanswered-message notices, regardless of
+their preserved source timestamps or how many times the company is imported.
+Live comments written on the destination retain `origin: "comment"` and the
+normal continuation and notice rules. Imports made before this marker was added
+retain the existing arrival-time fallback: the task's first `issue.imported`
+record, or its company's first `company.imported` record for a `company_import`
+task. With neither a marker nor an arrival record, comments keep normal behavior.
+
 ### Imported comment authorship
 
 Import preview and apply requests optionally accept `userCommentAuthorEmail` in
