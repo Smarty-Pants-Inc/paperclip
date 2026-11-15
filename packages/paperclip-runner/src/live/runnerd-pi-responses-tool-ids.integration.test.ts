@@ -162,8 +162,8 @@ async function productionRuntime(root: string) {
   await mkdir(dirname(proxy), { recursive: true }); await mkdir(dirname(extension), { recursive: true });
   await writeFile(join(root, "package.json"), `${JSON.stringify({ private: true, type: "module" })}\n`);
   await writeFile(proxy, artifacts.proxy, { mode: 0o755 });
-  await writeFile(extension, artifacts.extension, { mode: 0o444 });
-  await writeFile(childBridge, artifacts.childBridge, { mode: 0o444 });
+  await writeFile(extension, artifacts.extension, { mode: 0o644 });
+  await writeFile(childBridge, artifacts.childBridge, { mode: 0o644 });
   // Preserve the production layout and exact manifest binding checked by the
   // real loader; this scoped fixture does not claim full provider-pack admission.
   const payload = { artifacts: { piChildBridge: { path: "dist/drivers/pi/extension/child-bridge.js", sha256: digest(childBridge) } } };
