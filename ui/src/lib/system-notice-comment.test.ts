@@ -51,6 +51,69 @@ describe("mapCommentMetadataToSystemNoticeSections", () => {
     ]);
   });
 
+  it.each([
+    ["waiting_to_start", "Waiting to start"],
+    ["agent_paused", "Agent paused"],
+  ])("presents waiting marker %s in words without changing other rows", (code, words) => {
+    const props = buildSystemNoticeProps({
+      presentation: { kind: "system_notice", tone: "info", detailsDefaultOpen: true },
+      metadata: {
+        version: 1,
+        sections: [{
+          title: "Status",
+          rows: [
+            { type: "key_value", label: "Waiting code", value: code },
+            { type: "key_value", label: "Next action", value: "No action is needed." },
+          ],
+        }],
+      },
+      body: "Your message is waiting to start.",
+    });
+
+    expect(props.metadata).toEqual([{ title: "Status", rows: [
+      { kind: "text", label: "Waiting on", value: words },
+      { kind: "text", label: "Next action", value: "No action is needed." },
+    ] }]);
+    expect(JSON.stringify(props.metadata)).not.toContain(code);
+    expect(JSON.stringify(props.metadata)).not.toContain("Waiting code");
+  });
+
+  it.each(["future_wait_reason", "toString", "constructor", "__proto__", ""])(
+    "omits unknown waiting marker %s and sections it empties",
+    (code) => {
+      const sections = mapCommentMetadataToSystemNoticeSections({
+        version: 1,
+        sections: [
+          { title: "Status", rows: [{ type: "key_value", label: "Waiting code", value: code }] },
+          { title: "Details", rows: [
+            { type: "key_value", label: "Waiting code", value: code },
+            { type: "key_value", label: "Status before", value: "in_progress" },
+          ] },
+        ],
+      });
+
+      expect(sections).toEqual([{ title: "Details", rows: [
+        { kind: "text", label: "Status before", value: "in_progress" },
+      ] }]);
+    },
+  );
+
+  it("leaves waiting-like values under other labels unchanged and preserves source metadata", () => {
+    const metadata = {
+      version: 1 as const,
+      sections: [{ rows: [
+        { type: "key_value" as const, label: "Waiting code", value: "waiting_to_start" },
+        { type: "key_value" as const, label: "Other code", value: "agent_paused" },
+      ] }],
+    };
+    const original = structuredClone(metadata);
+
+    expect(mapCommentMetadataToSystemNoticeSections(metadata)[0]?.rows[1]).toEqual({
+      kind: "text", label: "Other code", value: "agent_paused",
+    });
+    expect(metadata).toEqual(original);
+  });
+
   it("omits run href when no runAgentId is available", () => {
     const sections = mapCommentMetadataToSystemNoticeSections(
       {
