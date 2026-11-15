@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   agents, agentWakeupRequests, authUsers, companies, companyMemberships, createDb,
-  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, nativeRunFinalizations,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueComments, issues, nativeRunFinalizations,
   plugins, pluginCompanySettings, type Db,
 } from "@paperclipai/db";
 import type { PluginStatus } from "@paperclipai/shared";
@@ -116,7 +116,7 @@ describe.skipIf(!support.supported)("R4-a delta independent judge", () => {
     expect(runs.every(r => r.contextSnapshot?.pluginId !== disabled.id)).toBe(true);
   });
 
-  it("F1: a wake held during upgrade_pending must survive enable and a second sweep", async () => {
+  it("F1: a follow-up stopped during upgrade_pending stays cancelled after enable and a second sweep", async () => {
     const f = await seed(), p = await plugin();
     const r = await receipt(f, p, { idempotencyKey: "pre-upgrade-event" });
     const lifecycle = pluginLifecycleManager(db);
@@ -124,13 +124,18 @@ describe.skipIf(!support.supported)("R4-a delta independent judge", () => {
     expect((await db.select().from(plugins).where(eq(plugins.id, p.id)))[0].status).toBe("upgrade_pending");
     await f.queue.resumeQueuedRuns();
     const during = await readReceipt(r.id);
+    expect(during).toMatchObject({ status: "cancelled", error: "plugin_wakeup_origin_unavailable" });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+    expect(notes).toHaveLength(1);
+    expect(notes[0].metadata).toEqual({ authorizationReason: `plugin_wakeup_stopped:${r.id}` });
     expect(await queued(f)).toHaveLength(0);
     await lifecycle.enable(p.id);
     expect((await db.select().from(plugins).where(eq(plugins.id, p.id)))[0].status).toBe("ready");
     await f.queue.resumeQueuedRuns();
-    console.log("JUDGE F1 upgrade", JSON.stringify({ during, after: await readReceipt(r.id), queued: (await queued(f)).length }));
-    expect(await queued(f)).toHaveLength(1);
-    expect(await readReceipt(r.id)).toMatchObject({ status: "queued" });
+    expect(await queued(f)).toHaveLength(0);
+    expect(await readReceipt(r.id)).toEqual(during);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toEqual(notes);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.company.id))).toHaveLength(1);
   });
 
   it.each(["timer mutation", "foreign requester", "context key mismatch"])("F2 control: %s does not newly qualify", async kind => {

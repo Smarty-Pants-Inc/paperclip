@@ -294,22 +294,36 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           context.pluginId === pluginId && context.pluginKey === pluginKey &&
           row.requestedByActorType === "system" && row.requestedByActorId === pluginId;
         if (pluginWake) {
-          const [plugin] = await tx.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status })
+          const [plugin] = await tx.select({ id: plugins.id, pluginKey: plugins.pluginKey, status: plugins.status, manifestJson: plugins.manifestJson })
             .from(plugins).where(sql`${plugins.id}::text = ${pluginId}`);
           const [companySetting] = plugin ? await tx.select({ enabled: pluginCompanySettings.enabled })
             .from(pluginCompanySettings).where(and(eq(pluginCompanySettings.pluginId, plugin.id),
               eq(pluginCompanySettings.companyId, companyId))) : [];
-          // A plugin mid-install or awaiting upgrade approval keeps its wake for a later release.
-          if (plugin?.pluginKey === pluginKey && (plugin.status === "installed" || plugin.status === "upgrade_pending") &&
-              companySetting?.enabled !== false) {
-            locallyExcludedWakeIds.push(row.id);
-            continue;
-          }
           if (plugin?.pluginKey !== pluginKey || plugin.status !== "ready" || companySetting?.enabled === false) {
             const now = new Date();
-            await tx.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
+            const [cancelled] = await tx.update(agentWakeupRequests).set({ status: "cancelled", error: "plugin_wakeup_origin_unavailable",
               finishedAt: now, updatedAt: now }).where(and(eq(agentWakeupRequests.id, row.id),
-              eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)));
+              eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS)))
+              .returning({ id: agentWakeupRequests.id });
+            if (cancelled && plugin?.pluginKey === pluginKey && companySetting?.enabled !== false &&
+                (plugin.status === "installed" || plugin.status === "upgrade_pending")) {
+              const authorizationReason = `plugin_wakeup_stopped:${row.id}`;
+              const name = plugin.manifestJson.displayName?.trim() || plugin.pluginKey;
+              const explanation = plugin.status === "upgrade_pending"
+                ? "is waiting for an admin to approve its update" : "is still being set up";
+              const body = `${name} ${explanation}, so its follow-up here was stopped. [Plugin settings](/instance/settings/plugins/${plugin.id})`;
+              await notifyStatusCardIssueChange(tx, companyId);
+              // Only the cancellation winner writes a system notice. Direct insertion
+              // bypasses the comment route's issue_commented wake producer.
+              await tx.execute(sql`insert into ${issueComments}
+                (company_id, issue_id, author_type, body, presentation, metadata)
+                select ${companyId}::uuid, ${issueId}::uuid, 'system', ${body},
+                  ${JSON.stringify({ kind: "system_notice", tone: "warning", title: "Plugin follow-up stopped", density: "compact" })}::jsonb,
+                  ${JSON.stringify({ authorizationReason })}::jsonb
+                where not exists (select 1 from ${issueComments}
+                  where ${issueComments.companyId} = ${companyId} and ${issueComments.issueId} = ${issueId}
+                    and ${issueComments.metadata}->>'authorizationReason' = ${authorizationReason})`);
+            }
             continue;
           }
           if (row.idempotencyKey) {
