@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, lstat, symlink, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, lstat, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -54,6 +54,7 @@ it("keeps session settings and models separate while both use the shared npm tar
     await writeFile(join(home, "models.json"), id);
   }
   expect(await import("node:fs/promises").then(fs => fs.readlink(join(one, "npm")))).toBe(await import("node:fs/promises").then(fs => fs.readlink(join(two, "npm"))));
+  await writeFile(join(one, "settings.json"), `${JSON.stringify({ session: "one" })}\n`);
   expect(await readFile(join(one, "settings.json"), "utf8")).not.toBe(await readFile(join(two, "settings.json"), "utf8"));
   expect(await readFile(join(one, "models.json"), "utf8")).toBe("one");
   expect(await readFile(join(two, "models.json"), "utf8")).toBe("two");
