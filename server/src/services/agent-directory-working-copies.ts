@@ -15,7 +15,7 @@ import { HttpError, conflict, notFound } from "../errors.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import type { Environment, EnvironmentLease } from "@paperclipai/shared";
-import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
+import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, agentDirectoryConfinedCleanupProgram, observeLocalAgentDirectory, removeLocalAgentDirectoryConfined } from "./agent-directory-probe.js";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
 import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
@@ -39,6 +39,14 @@ const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.
 function sandboxTransferRoot(row: Copy, remoteCwd: string): string {
   const origin = typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId);
   return path.posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "agent-file-transfers", row.agentId, origin);
+}
+function cleanupCommand(row: Copy, paths: string[]): string {
+  const quote = (value: string) => `'${value.replaceAll("'", `'"'"'`)}'`;
+  if (row.receipt?.refreshConfinedCleanup !== true) return `rm -rf -- ${paths.map(quote).join(" ")}`;
+  // Missing physical authority must defer cleanup, not weaken it to rm -rf.
+  const identity = typeof row.receipt.materializationIdentity === "string" ? row.receipt.materializationIdentity : "unavailable";
+  const roots = paths.map(root => ({ root, ...(root === row.executionRoot ? { identity } : {}) }));
+  return `node -e ${quote(agentDirectoryConfinedCleanupProgram)} ${quote(JSON.stringify(roots))}`;
 }
 export function isAgentDirectoryCopy(row: Pick<Copy, "receipt"> | null): boolean {
   return row?.receipt?.schema === AGENT_FILES_CONTRACT;
@@ -98,6 +106,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     try {
       return await serial(row, current => store.locked(input.companyId, input.agentId, actor(current), false, async (_tx, agent, canonical) => {
         if (!await warmReusable(current, input.agentId) || current.location !== (input.target?.kind === "remote" ? `remote:${input.target.environmentId ?? ""}` : "local")) return false;
+        // Refusal also retires this owner. Preserve physical custody through
+        // that cleanup even when a later context or observation check refuses.
+        current = await patch(current, { receipt: { ...current.receipt, refreshConfinedCleanup: true } });
+        if (!await warmReusable(current, input.agentId) || current.receipt?.refreshConfinedCleanup !== true) return false;
         const status = await reuseStatus(current, deriveBundleState(agent).entryFile, canonical);
         if (status === "other" || !await input.canRefresh(canonical, current.entryFile)) return false;
         // Saved metadata proves a checkpoint, not that the live owner has made
@@ -113,7 +125,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         // crash, partial upload, or failed receipt CAS must never turn transfer
         // damage into owner edits when retirement invokes ordinary collection.
         const interrupted = await patch(current, { state: "unavailable", errorCode: "AGENT_FILES_REFRESH_INCOMPLETE",
-          errorMessage: "Agent-file refresh did not complete. Canonical files were kept; retirement must not save transfer output.", nextAttemptAt: null });
+          errorMessage: "Agent-file refresh did not complete. Canonical files were kept; retirement must not save transfer output.", nextAttemptAt: null,
+          receipt: { ...current.receipt, refreshConfinedCleanup: true } });
         if (interrupted.state !== "unavailable" || interrupted.errorCode !== "AGENT_FILES_REFRESH_INCOMPLETE") return false;
         let runtime: PreparedAdapterExecutionTargetRuntime | undefined;
         try {
@@ -121,7 +134,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
             adapterKey: "agent-files-mirror", workspaceLocalDir: canonical, workspaceRemoteDir: current.localRoot, workspaceRefreshGuard: mirror });
           await local.cleanupWorkspaceSnapshot?.();
           const values = { state: "warm_saved", errorCode: null, errorMessage: null,
-            baseHash: directorySnapshotSha256(snapshot), receipt: { ...current.receipt,
+            baseHash: directorySnapshotSha256(snapshot), receipt: { ...current.receipt, refreshConfinedCleanup: true,
               baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: checkpointBaseline(snapshot), storageWarning } };
           const next = { ...interrupted, ...values };
           runtime = input.target?.kind === "remote" ? await transport(next, input.target, false, live) : undefined;
@@ -618,8 +631,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const expected = path.posix.join(cleanupTarget.remoteCwd, ".paperclip-runtime", "agent-files", row.agentId, typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId));
       if (row.executionRoot !== expected) throw new Error("Agent directory cleanup path changed");
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
-      const quoted = paths.map(p => `'${p.replaceAll("'", `'"'"'`)}'`).join(" ");
-      const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
+      const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, cleanupCommand(row, paths),
         { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
     } else if (!destroyed && row.processStoppedAt && completed.has(row.state) && row.location !== "local") {
@@ -627,7 +639,10 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
     }
     if (completed.has(row.state) && row.processStoppedAt) {
-      try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
+      try {
+        if (row.receipt?.refreshConfinedCleanup === true) await removeLocalAgentDirectoryConfined(path.dirname(row.localRoot));
+        else await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true });
+      }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
         await patch(row, { receipt: { ...row.receipt, cleanupPending: true } });
@@ -636,6 +651,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
+        ...(row.receipt?.refreshConfinedCleanup ? { refreshConfinedCleanup: true, materializationIdentity: row.receipt.materializationIdentity } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }
@@ -713,7 +729,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const remoteCwd = cleanup?.remoteCwd ?? lease.metadata?.remoteCwd;
     if (typeof remoteCwd !== "string" || row.executionRoot !== path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", row.agentId, typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId))) return false;
     const paths = environment.driver === "sandbox" ? [row.executionRoot, sandboxTransferRoot(row, remoteCwd)] : [row.executionRoot];
-    const result = await environmentRuntime.execute({ environment: environment as Environment, lease: lease as EnvironmentLease, command: "rm", args: ["-rf", "--", ...paths],
+    const confined = row.receipt?.refreshConfinedCleanup === true;
+    const result = await environmentRuntime.execute({ environment: environment as Environment, lease: lease as EnvironmentLease,
+      command: confined ? "sh" : "rm", args: confined ? ["-c", cleanupCommand(row, paths)] : ["-rf", "--", ...paths],
       cwd: remoteCwd, env: {}, timeoutMs: 15_000, bypassSession: true });
     return result.exitCode === 0 && !result.timedOut;
   }

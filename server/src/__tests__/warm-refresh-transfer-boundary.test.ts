@@ -29,17 +29,19 @@ describe("warm refresh transfer boundary", () => {
       expect(await fs.readFile(path.join(f.root, "continuity.jsonl"), "utf8")).toBe("canonical ordinary agent file\n");
     } finally { await f.cleanup(); }
   }, 90_000);
-  it("refuses a root redirected after observation but before remote upload, including collection", async () => {
+  it.each(["root", "ancestor"])("refuses a %s redirected after observation but before remote upload, including collection", async redirected => {
     const { f, a, refresh } = await advancedFixture();
     const original = executionTargetTools.prepareAdapterExecutionTargetRuntime;
     const transfer = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime");
     try {
-      const pi = path.join(a.target.remoteCwd, ".paperclip-runtime/paperclip-runner/sessions/owned-session/pi");
+      const sessions = path.join(a.target.remoteCwd, ".paperclip-runtime/paperclip-runner/sessions");
+      const pi = path.join(sessions, a.copy.runId, "pi");
       await fs.mkdir(pi, { recursive: true }); await fs.writeFile(path.join(pi, "continuity.jsonl"), "ORIGINAL TRACE\n");
       transfer.mockImplementation(async input => {
         if (input.adapterKey === "agent-files" && input.workspaceRefreshGuard) {
-          await fs.rename(a.copy.executionRoot, a.copy.executionRoot + "-preserved");
-          await fs.symlink(pi, a.copy.executionRoot);
+          const alias = redirected === "root" ? a.copy.executionRoot : path.dirname(a.copy.executionRoot);
+          await fs.rename(alias, alias + "-preserved");
+          await fs.symlink(redirected === "root" ? pi : sessions, alias);
         }
         return original(input);
       });
@@ -48,7 +50,27 @@ describe("warm refresh transfer boundary", () => {
       expect(await fs.readFile(path.join(pi, "continuity.jsonl"), "utf8")).toBe("ORIGINAL TRACE\n");
       expect((await f.copies.collectStopped({ companyId: f.companyId, runId: a.copy.runId, target: a.target }))?.state).toBe("unavailable");
       expect(await fs.readFile(path.join(pi, "continuity.jsonl"), "utf8")).toBe("ORIGINAL TRACE\n");
+      const retained = await f.copies.get(f.companyId, a.copy.runId);
+      expect(retained?.receipt?.cleanupPending).toBe(true);
+      expect(retained?.receipt?.refreshConfinedCleanup).toBe(true);
+      expect(retained?.receipt?.materializationIdentity).toBe(a.copy.receipt?.materializationIdentity);
+      await f.copies.collectStopped({ companyId: f.companyId, runId: a.copy.runId, target: a.target });
+      expect(await fs.readFile(path.join(pi, "continuity.jsonl"), "utf8")).toBe("ORIGINAL TRACE\n");
     } finally { transfer.mockRestore(); await f.cleanup(); }
+  }, 90_000);
+  it("keeps initial physical-observation refusal confined through ordinary stopped collection", async () => {
+    const { f, a, refresh } = await advancedFixture();
+    try {
+      const sessions = path.join(a.target.remoteCwd, ".paperclip-runtime/paperclip-runner/sessions");
+      const pi = path.join(sessions, a.copy.runId, "pi");
+      await fs.mkdir(pi, { recursive: true }); await fs.writeFile(path.join(pi, "continuity.jsonl"), "ORIGINAL TRACE\n");
+      const ancestor = path.dirname(a.copy.executionRoot);
+      await fs.rename(ancestor, ancestor + "-preserved"); await fs.symlink(sessions, ancestor);
+      expect(await refresh()).toBe(false);
+      await f.copies.collectStopped({ companyId: f.companyId, runId: a.copy.runId, target: a.target });
+      expect(await fs.readFile(path.join(pi, "continuity.jsonl"), "utf8")).toBe("ORIGINAL TRACE\n");
+      expect((await f.copies.get(f.companyId, a.copy.runId))?.receipt?.cleanupPending).toBe(true);
+    } finally { await f.cleanup(); }
   }, 90_000);
   it("never publishes a real remote write interrupted after truncation and rename", async () => {
     const { f, a, refresh } = await advancedFixture();

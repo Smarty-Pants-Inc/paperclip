@@ -163,6 +163,53 @@ export function retireAgentDirectoryTransferScratch(root: string, modules = { fs
 
 export const agentDirectoryTransferCleanupProgram = `${childNameHelper} const retire=${retireAgentDirectoryTransferScratch.toString()}; retire(process.argv[1], {fs:require('node:fs'),path:require('node:path'),platform:process.platform})`;
 
+/** Cleanup is part of refresh custody too: never hand a refused alias back to
+ * rm -rf, which follows intermediate symlinks. All removals use pinned parents;
+ * a missing root is already clean, and an unsafe root stays cleanup-pending. */
+export const agentDirectoryConfinedCleanupProgram = String.raw`
+const fs=require('node:fs'),path=require('node:path');
+if(process.platform!=='linux')throw Error('Confined cleanup unavailable');
+const forbidden=p=>/(^|\/)paperclip-runner\/sessions(\/|$)/.test(p)||(/(^|\/)pi\//.test(p)&&p.endsWith('.jsonl'));
+for(const request of JSON.parse(process.argv[1])){
+  const root=request.root, expected=request.identity;
+  if(!path.isAbsolute(root)||path.resolve(root)!==root||root==='/'||root.includes('\0')||forbidden(root))throw Error('Unsafe cleanup root');
+  const pins=[], identity=s=>[s.dev,s.ino,s.birthtimeNs].join(':');
+  const at=(fd,name)=>'/proc/self/fd/'+fd+'/'+name;
+  const pin=name=>{const fd=fs.openSync(name,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);const s=fs.fstatSync(fd,{bigint:true});if(!s.isDirectory())throw Error('Unsafe cleanup directory');pins.push({fd,name,identity:identity(s)});return fd;};
+  const verify=()=>{for(const p of pins){const s=fs.lstatSync(p.name,{bigint:true});if(!s.isDirectory()||s.isSymbolicLink()||identity(s)!==p.identity||identity(fs.fstatSync(p.fd,{bigint:true}))!==p.identity)throw Error('Cleanup directory changed');}};
+  const forget=fd=>{const i=pins.findIndex(p=>p.fd===fd);fs.closeSync(fd);pins.splice(i,1);};
+  try{
+    let fd=pin('/'), missing=false;
+    for(const segment of root.split('/').filter(Boolean)){
+      try{fd=pin(at(fd,segment));}catch(error){if(error.code==='ENOENT'){missing=true;break;}throw error;}
+    }
+    if(missing)continue;
+    if(expected&&identity(fs.fstatSync(fd,{bigint:true}))!==expected)throw Error('Cleanup root replaced');
+    let count=0;
+    const remove=(directory,relative='')=>{
+      for(const name of fs.readdirSync('/proc/self/fd/'+directory)){
+        if(++count>100000)throw Error('Cleanup entry limit');
+        const next=relative?relative+'/'+name:name;if(forbidden(root+'/'+next))throw Error('Unsafe cleanup session path');
+        verify();const filename=at(directory,name),s=fs.lstatSync(filename,{bigint:true});
+        if(s.isSymbolicLink())throw Error('Unsafe cleanup link');
+        if(s.isDirectory()){
+          const child=pin(filename);remove(child,next);verify();fs.rmdirSync(filename);forget(child);
+        }else{if(!s.isFile())throw Error('Unsafe cleanup entry');verify();fs.unlinkSync(filename);}
+      }
+    };
+    verify();remove(fd);verify();const rootPin=pins.find(p=>p.fd===fd);fs.rmdirSync(rootPin.name);forget(fd);
+  }finally{for(const p of pins.reverse())fs.closeSync(p.fd);}
+}
+`;
+
+export async function removeLocalAgentDirectoryConfined(root: string) {
+  await new Promise<void>((resolve, reject) => {
+    childProcess.execFile(process.execPath, ["-e", agentDirectoryConfinedCleanupProgram, JSON.stringify([{ root }])], {
+      cwd: "/", env: {}, timeout: 15_000, maxBuffer: 4096, killSignal: "SIGKILL",
+    }, error => { if (error) reject(error); else resolve(); });
+  });
+}
+
 /** Bound child: no shell, inherited credentials, or event-loop hashing. */
 export async function observeLocalAgentDirectory(root: string, refresh = false) {
   const result = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
