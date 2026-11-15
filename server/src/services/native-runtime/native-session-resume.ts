@@ -653,6 +653,25 @@ export function nativeRuntimeContextsMatch(
     (toolRefreshOnResume === true && canonicalNativeRuntimeContextDigest({ ...previous, mcp: current.mcp }) === current.aggregateDigest);
 }
 
+/** The replacement policy a resumed checkpoint gets, derived from the prior
+ * run's own checkpoint. Shared by the durable rebind below and the warm
+ * controller checkpoint rebind, so one prior state gets one policy. */
+export function nativeProviderRecoveryPolicy(rawCheckpoint: Record<string, unknown>, refreshTools?: boolean) {
+  const priorSemanticResult = record(rawCheckpoint.semanticResult);
+  const priorContinuation = record(priorSemanticResult.continuation);
+  const rawGoal = rawCheckpoint.goal;
+  const hasUnfinishedGoal =
+    rawGoal !== null &&
+    rawGoal !== undefined &&
+    record(rawGoal).status !== "complete";
+  return hasUnfinishedGoal
+    ? ("same_session_only" as const)
+    : !refreshTools && priorSemanticResult.reportedWorkDisposition === "yielded" &&
+        priorContinuation.kind === "response_wake"
+      ? ("allow_replacement_after_governed_wait" as const)
+      : ("allow_replacement_after_resume_failure" as const);
+}
+
 /**
  * Rebind a completed prior run's provider checkpoint to a new heartbeat run.
  * The provider/driver session identity is retained, while every per-turn and
@@ -742,19 +761,7 @@ export function rebindNativeSessionCheckpoint(input: {
   )
     return null;
 
-  const priorSemanticResult = record(rawCheckpoint.semanticResult);
-  const priorContinuation = record(priorSemanticResult.continuation);
-  const rawGoal = rawCheckpoint.goal;
-  const hasUnfinishedGoal =
-    rawGoal !== null &&
-    rawGoal !== undefined &&
-    record(rawGoal).status !== "complete";
-  const providerRecoveryPolicy = hasUnfinishedGoal
-    ? ("same_session_only" as const)
-    : !input.refreshTools && priorSemanticResult.reportedWorkDisposition === "yielded" &&
-        priorContinuation.kind === "response_wake"
-      ? ("allow_replacement_after_governed_wait" as const)
-      : ("allow_replacement_after_resume_failure" as const);
+  const providerRecoveryPolicy = nativeProviderRecoveryPolicy(rawCheckpoint, input.refreshTools);
 
   return {
     ...(structuredClone(rawCheckpoint) as unknown as PersistedNativeSession),

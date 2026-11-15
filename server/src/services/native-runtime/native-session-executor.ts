@@ -305,7 +305,7 @@ import {
   renderNativeRunnerStagedAttachmentInput,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
-import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeProviderRecoveryPolicy, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { clearRunProviderStateUnsaved, markAcceptedRunProviderStateUnsaved } from "./native-provider-state-unsaved.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -8970,6 +8970,7 @@ function loadWarmNativeCheckpoint(
   execution: NativeExecutionInput,
   configDigest: string,
   executionTargetKind: "local" | "remote" = "local",
+  refreshTools?: boolean,
 ): PersistedNativeSession | null {
   const scopedPath = nativeSessionCheckpointPath(execution);
   const path = [
@@ -9038,6 +9039,8 @@ function loadWarmNativeCheckpoint(
         // A warm provider can be rebound only after the previous run settled.
         // Its provider identity survives, but run-scoped turn, result, and
         // request authority must not cross into the new heartbeat run.
+        // The prior result still decides replacement, as in the durable rebind.
+        providerRecoveryPolicy: nativeProviderRecoveryPolicy(record(envelope.snapshot), refreshTools),
         semanticResult: null,
         terminal: null,
         activeTurnId: null,
@@ -11493,7 +11496,7 @@ async function executePaperclipNativeSessionAttempt(
             const proof = releasedWarmRunner(readWarmNativeEnvelope(previous));
             if (proof) releasedSource = requireReleasedWarmScope(input, proof, identity);
           }
-          return loadWarmNativeCheckpoint(previous, nativeSessionConfigDigest(previous, "remote"), "remote");
+          return loadWarmNativeCheckpoint(previous, nativeSessionConfigDigest(previous, "remote"), "remote", input.refreshTools);
         },
         canReuseProcess: previous => !portableSource && !needsCoreGitHubAccess(input) &&
           nativeSessionConfigDigest(previous, "remote") === nativeSessionConfigDigest(input.execution, "remote") && canReuseNativeProcess(input,
@@ -12594,6 +12597,7 @@ async function executePaperclipNativeSessionAttempt(
           input.execution,
           warmConfigDigest,
           input.runnerExecutionTarget?.kind ?? "local",
+          input.refreshTools,
         );
       } else {
         if (entry.busy && entry.instructionPreparationRunId !== input.execution.binding.runId) throw new Error("native_session_supervisor_busy");
@@ -12641,6 +12645,7 @@ async function executePaperclipNativeSessionAttempt(
         input.execution,
         warmConfigDigest,
         input.runnerExecutionTarget?.kind ?? "local",
+        input.refreshTools,
       );
     }
   }
@@ -12843,7 +12848,7 @@ async function executePaperclipNativeSessionAttempt(
       retained.detach();
       existingWarmSession = undefined; remoteWarmRecovery = undefined; remoteWarmRecoveryPending = false;
       await finishStartupContextForFallback();
-      const checkpoint = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind);
+      const checkpoint = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools);
       if (!checkpoint?.providerSessionId || checkpoint.providerSessionId !== expected?.providerSessionId) {
         throw new Error("native_sandbox_cold_resume_unproven");
       }
@@ -12886,7 +12891,7 @@ async function executePaperclipNativeSessionAttempt(
         if (!suspendedController) throw new Error("native_runner_checkpoint_missing_after_suspension");
         const verifiedConfigDigest = nativeSessionConfigDigest(remoteWarmRecovery.previousExecution, "remote");
         persistWarmNativeCheckpoint(remoteWarmRecovery.previousExecution, verifiedConfigDigest, await recovered.session.snapshot());
-        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, verifiedConfigDigest, "remote");
+        persistedWarmSession = loadWarmNativeCheckpoint(input.execution, verifiedConfigDigest, "remote", input.refreshTools);
         runnerdBackend = await createRunnerdBackend({
           ...input,
           pluginTaskDescription: undefined,
@@ -12930,7 +12935,7 @@ async function executePaperclipNativeSessionAttempt(
       existingWarmSession = undefined;
       pluginTaskDescription = description;
       await finishStartupContextForFallback();
-      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind);
+      persistedWarmSession = loadWarmNativeCheckpoint(input.execution, warmConfigDigest, target.kind, input.refreshTools);
       runnerdBackend = await createExecutionBackend();
       remoteCleanupLease = await readRemoteCleanupLease();
       return true;
