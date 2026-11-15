@@ -533,7 +533,7 @@ export function IssueFiltersPopover({
                   <label className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
                     <Checkbox
                       checked={state.showAgentCreatedTasks}
-                      onCheckedChange={(checked) => onChange({ showAgentCreatedTasks: checked === true })}
+                      onCheckedChange={(checked) => onChange({ showAgentCreatedTasks: checked === true, showAgentCreatedTasksExplicit: true })}
                     />
                     <span className="text-sm">Show agent-created tasks</span>
                   </label>

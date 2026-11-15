@@ -33,8 +33,10 @@ import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObject
 import {
   applyIssueFilters,
   countActiveIssueFilters,
+  resolveAgentCreatedTasksDefault,
   type IssueFilterState,
 } from "../lib/issue-filters";
+import { useAgentCreatedTasksDefault } from "../hooks/useShowAgentCreatedTasks";
 import { collectLiveIssueIds, collectSubtreeLiveCounts, issueWaitingOf } from "../lib/liveIssueIds";
 import { formatAssigneeUserLabel } from "../lib/assignees";
 import { buildCompanyUserLabelMap, buildCompanyUserProfileMap } from "../lib/company-members";
@@ -720,7 +722,13 @@ export function Inbox() {
   const { dismissed: dismissedAlerts, dismiss: dismissAlert } = useDismissedInboxAlerts();
   const { dismissedAtByKey, dismiss: dismissInboxItem } = useInboxDismissals(selectedCompanyId);
   const { readItems, markRead: markItemRead, markUnread: markItemUnread } = useReadInboxItems();
-  const { allCategoryFilter, allApprovalFilter, issueFilters } = filterPreferences;
+  const { allCategoryFilter, allApprovalFilter } = filterPreferences;
+  // Show agent-created tasks: the person's explicit choice, else the instance default.
+  const agentCreatedTasksDefault = useAgentCreatedTasksDefault();
+  const issueFilters = useMemo(
+    () => resolveAgentCreatedTasksDefault(filterPreferences.issueFilters, agentCreatedTasksDefault),
+    [filterPreferences.issueFilters, agentCreatedTasksDefault],
+  );
 
   const pathSegment = location.pathname.split("/").pop() ?? "mine";
   const tab: InboxTab =
@@ -2278,7 +2286,7 @@ export function Inbox() {
   const unreadIssueIds = markAllReadIssues
     .map((issue) => issue.id);
   const canMarkAllRead = unreadIssueIds.length > 0;
-  const activeIssueFilterCount = countActiveIssueFilters(issueFilters, true);
+  const activeIssueFilterCount = countActiveIssueFilters(issueFilters, true, agentCreatedTasksDefault);
   const showGeneralIssueToolbarControls = tab !== "blocked";
   return (
     <div className="space-y-6">
