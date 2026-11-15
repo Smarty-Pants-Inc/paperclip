@@ -79,6 +79,7 @@ describe("provider trace channel integrity", () => {
       "rust_native",
       "typescript_runnerd_rehydration",
     ]);
+    expect(providerTraceRequiredChannels("pi_rpc")).toEqual([]);
     expect(providerTraceRequiredChannels("opencode")).toEqual(["typescript_opencode_native"]);
     expect(providerTraceRequiredChannels("acpx")).toEqual(["typescript_acpx_native"]);
   });
