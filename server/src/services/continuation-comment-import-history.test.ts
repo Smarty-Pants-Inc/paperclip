@@ -12,6 +12,9 @@ import { companyPortabilityService } from "./company-portability.js";
 import { logActivity } from "./activity-log.js";
 import { readContinuationCommentInput } from "./continuation-comment-input.js";
 import { settleUnansweredPersonMessage } from "./recovery/unanswered-person-message.js";
+import { issueService } from "./issues.js";
+import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 
@@ -84,6 +87,85 @@ describe.skipIf(!support.supported)("imported person comments are history: never
     return { kind: settled.kind, notes: notes.length };
   };
   const past = (minutesAgo: number) => new Date(Date.now() - minutesAgo * 60_000).toISOString();
+
+  // Consumer guards use only the real importer to create comments. Distinct source times
+  // make both chronological directions deterministic; bodies are small enough not to truncate.
+  const consumerHistory = (): BundleComment[] => [
+    { body: "Source person question.\n\nKeep **this Markdown** and café unchanged.", authorType: "user", createdAt: "2026-01-01T10:00:00.000Z" },
+    { body: "Source agent reply.\n- First finding\n- Second finding", authorType: "agent", createdAt: "2026-01-01T10:01:00.000Z" },
+    { body: "Source person follow-up — same thread.", authorType: "user", createdAt: "2026-01-01T10:02:00.000Z" },
+    { body: "Source agent final answer.", authorType: "agent", createdAt: "2026-01-01T10:03:00.000Z" },
+  ];
+
+  it("(RFL display) listComments returns every real-import comment with unchanged bodies, authors, order and import origin", async () => {
+    const userId = await importer();
+    const source = consumerHistory();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History display guard" }, "display-guard", source);
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, issue.companyId));
+    expect(agent).toBeDefined();
+    const expected = source.map(comment => ({
+      body: comment.body,
+      authorType: comment.authorType,
+      authorAgentId: comment.authorType === "agent" ? agent!.id : null,
+      authorUserId: comment.authorType === "user" ? userId : null,
+      createdAt: comment.createdAt,
+      origin: "import",
+    }));
+    const svc = issueService(db);
+    const chronological = await svc.listComments(issue.id, { companyId: issue.companyId, order: "asc" });
+    expect(chronological).toHaveLength(source.length);
+    expect(chronological.map(comment => ({
+      body: comment.body, authorType: comment.authorType,
+      authorAgentId: comment.authorAgentId, authorUserId: comment.authorUserId,
+      createdAt: comment.createdAt.toISOString(), origin: comment.origin,
+    }))).toEqual(expected);
+    // The issue-comments route defaults to newest first; provenance must not change either order.
+    const newestFirst = await svc.listComments(issue.id, { companyId: issue.companyId });
+    expect(newestFirst.map(comment => comment.id)).toEqual(chronological.map(comment => comment.id).reverse());
+  });
+
+  it("(RFL task context) run preparation includes every real-import comment unchanged, without acknowledgement or fast_response labels", async () => {
+    const userId = await importer();
+    const source = consumerHistory();
+    const { issue } = await runImport(userId, { mode: "new_company", newCompanyName: "History task context guard" }, "task-context-guard", source);
+    const imported = await commentsOf(issue.id);
+    expect(imported).toHaveLength(source.length);
+    expect(imported.map(comment => comment.origin)).toEqual(source.map(() => "import"));
+    const [agent] = await db.select().from(agents).where(eq(agents.companyId, issue.companyId));
+    expect(agent).toBeDefined();
+    const preparation = createHeartbeatRunPreparation(db);
+    const issueContext = await preparation.getIssueExecutionContext(issue.companyId, issue.id);
+    expect(issueContext).not.toBeNull();
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: issue.companyId, agentId: agent!.id, status: "queued", runtimeMode: "native", nativeIssueId: issue.id,
+    }).returning();
+    const context: Record<string, unknown> = {
+      issueId: issue.id, wakeCommentId: imported[0]!.id, wakeCommentIds: imported.map(comment => comment.id),
+    };
+    const prepared = await prepareHeartbeatTaskContext(db, {
+      run: run!, agent: agent!,
+      task: { issueRef: issueContext!, issueContext, context, taskSession: null },
+      policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+      services: { issuesSvc: issueService(db), getPinnedSkillTestContext: preparation.getPinnedSkillTestContext },
+    });
+    const comments = prepared.paperclipWakePayload!.comments;
+    expect(comments).toHaveLength(source.length);
+    expect(comments.map(comment => ({
+      id: comment.id, body: comment.body, authorType: comment.authorType,
+      author: comment.author, createdAt: comment.createdAt, bodyTruncated: comment.bodyTruncated,
+    }))).toEqual(source.map((comment, index) => ({
+      id: imported[index]!.id, body: comment.body, authorType: comment.authorType,
+      author: { type: comment.authorType, id: comment.authorType === "agent" ? agent!.id : userId },
+      createdAt: comment.createdAt, bodyTruncated: false,
+    })));
+    expect(prepared.safeWakeComments.map(comment => comment.body)).toEqual(source.map(comment => comment.body));
+    const markdown = String(context.paperclipTaskMarkdown);
+    for (const comment of source) expect(markdown).toContain(comment.body);
+    for (const body of [...comments.map(comment => String(comment.body)), ...prepared.safeWakeComments.map(comment => comment.body), markdown]) {
+      expect(body).not.toContain("[Paperclip acknowledgement; not agent work]");
+      expect(body).not.toContain("fast_response");
+    }
+  });
 
   it("(R1) new_company import: an imported person comment + an imported run-less agent reply -> not carried, not noticed", async () => {
     const userId = await importer();
