@@ -461,6 +461,22 @@ describe("createPreDrainShutdownBudget", () => {
     }
   });
 
+  it("lets steps after a 15-second restart close finish in the remaining shared budget", async () => {
+    vi.useFakeTimers();
+    try {
+      const budget = createPreDrainShutdownBudget({ signal: "SIGTERM", budgetMs: 20_000, log: stubLogger() });
+      const restartClose = budget.run("hot_restart_prepare", () => new Promise<void>(resolve => setTimeout(resolve, 15_000)));
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(restartClose).resolves.toMatchObject({ outcome: "completed" });
+
+      const afterRestart = budget.run("scheduler_idle", () => new Promise<void>(resolve => setTimeout(resolve, 5_000)));
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(afterRestart).resolves.toMatchObject({ outcome: "completed" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reaches the run drain within the budget when every pre-drain step hangs", async () => {
     vi.useFakeTimers();
     try {
