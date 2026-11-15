@@ -5006,7 +5006,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const originalLease = await environmentService(db).getLeaseById(first.lease.id);
     assertOriginalAtGet = async () => {
       expect(await environmentService(db).getLeaseById(first.lease.id)).toEqual(originalLease);
-      expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentInspectLease"]);
+      expect(vi.mocked(workerManager.call).mock.calls.map(call => call[1])).toEqual(["environmentInspectLease"]);
     };
     if (change === "stale lifecycle") vi.spyOn(workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentExecute"] } as never);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
@@ -5033,7 +5033,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         for (let pass = 0; pass < 8; pass++) await heartbeat.sweepPendingCleanupLeases();
         await heartbeat.drainActiveRunExecutions();
         await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toEqual(originalLease);
-        expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentAcquireLease"]);
+        expect(vi.mocked(workerManager.call).mock.calls.map(call => call[1])).toEqual(["environmentAcquireLease"]);
       } else {
         await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
           status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
@@ -5042,7 +5042,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
           } },
         });
         if (change === "released") {
-          expect(workerManager.call.mock.calls.map(call => call[1])).toEqual(["environmentInspectLease", "environmentAcquireLease"]);
+          expect(vi.mocked(workerManager.call).mock.calls.map(call => call[1])).toEqual(["environmentInspectLease", "environmentAcquireLease"]);
           const evidence = JSON.parse(JSON.stringify(originalLease));
           await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
             metadata: { endedLeaseEvidence: evidence, sandboxStopAndRetain: { endedLeaseEvidence: evidence } },
