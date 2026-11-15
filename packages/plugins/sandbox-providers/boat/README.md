@@ -1,5 +1,11 @@
 # Boat sandbox provider 0.1.16-spare (unreleased)
 
+## Boat lifecycle webhook (wake-only)
+
+The manifest registers the `boat-lifecycle` inbound endpoint (`POST /api/plugins/paperclip.boat-sandbox-provider/webhooks/boat-lifecycle`). Add `boatWebhookSigningSecret` in plugin instance settings as a Paperclip secret reference, using the `whsec_...` value returned once by Boat; do not paste the resolved secret into ordinary config or logs. The receiver verifies Boat's signed raw body, a 5-minute timestamp window, event type and delivery ID, ignores sandbox IDs not tracked by this worker, and only wakes `waitForBoatLifecycle` callers. It does not replace or bypass the authoritative Boat `GET`; waitReady and stop polling are unchanged.
+
+Registration helper `registerBoatLifecycleWebhook({ apiKey, url })` calls Boat's documented `POST https://boat.dev/api/v1/webhooks` for all six lifecycle events and returns the endpoint ID plus one-time signing secret. Operators must run it from a trusted environment with the Boat `account.admin` API key, persist the returned secret in Paperclip's secret manager, then set its reference in plugin settings. Never put the API key or returned secret in command-line arguments, shell history, or logs. Boat requires an HTTPS URL on port 443 resolving only to public IPs and permits at most 10 endpoint URLs/account. The helper is code-only and this change does not execute it.
+
 ## Ready spare pool
 
 The Boat plugin's company-scoped instance settings are `spares` (0–3, default 0),

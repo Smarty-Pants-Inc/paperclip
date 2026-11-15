@@ -15,6 +15,7 @@ import { acquireRunnerIngress, DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS, effectiveTtl
   privateRunnerEndpoint, resumeSentinelMetadata, runnerIngressGenerationStore, verifyWorkspaceSentinel,
   workspaceDirectory, writeWorkspaceSentinel, type RunnerConfig } from "./runner-support.js";
 import { definePlugin, PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
+import { createBoatLifecycleReceiver, trackBoatSandbox } from "./webhook.js";
 import type {
   PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDestroyLeaseParams, PluginEnvironmentExecuteParams,
   PluginEnvironmentExecuteResult, PluginEnvironmentLease, PluginEnvironmentProbeParams, PluginEnvironmentProbeResult,
@@ -1039,6 +1040,16 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     clearSpareRefreshTimerIfIdle();
   },
+  async onWebhook(input) {
+    if (input.endpointKey !== "boat-lifecycle") throw new Error("Unsupported Boat webhook endpoint.");
+    const receiver = createBoatLifecycleReceiver(async () => {
+      const config = await pluginContext?.config.get();
+      const reference = config?.boatWebhookSigningSecret;
+      if (!reference || !pluginContext?.secrets) throw new Error("secret unavailable");
+      return pluginContext.secrets.resolve(reference as any, { configPath: "boatWebhookSigningSecret" });
+    }, { logger: (message, details) => pluginContext?.logger.warn(message, details) });
+    await receiver(input);
+  },
   onDuplexChannelOpen: params => duplexChannels.open(params),
   onDuplexChannelWrite: params => duplexChannels.write(params),
   onDuplexChannelStop: params => duplexChannels.stop(params),
@@ -1244,7 +1255,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
     inFlightAcquisitions.add(countedWork);
-    return countedWork.finally(() => { inFlightAcquisitions.delete(countedWork); });
+    return countedWork.then(lease => { if (lease.providerLeaseId) trackBoatSandbox(lease.providerLeaseId); return lease; })
+      .finally(() => { inFlightAcquisitions.delete(countedWork); });
   },
   async onEnvironmentInspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation> {
     const c = parse(params.config);
@@ -1364,6 +1376,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       boatOrgId: _previousOrg, boatOwner: _previousOwner, ttlRefresh: _previousTtlRefresh, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
     const ownership = boatOwnershipForLease(sandbox, id);
+    trackBoatSandbox(id);
     return { providerLeaseId: id, expiresAt: ttlRefresh && ttlRefresh.status !== "failed" ? refreshExpiresAt : sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
         ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
