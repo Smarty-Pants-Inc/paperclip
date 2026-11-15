@@ -1858,6 +1858,28 @@ html:has(.paperclip-app-shell[data-keyboard-open="true"] [data-classic-task-shel
 .paperclip-markdown.task-chat-reasoning-markdown :is(em, code) {
   font-style: normal;
 }
+/* Inline reasoning is plain text in the turn (Paul 11-15 05:49Z): no box,
+   indent or bullet; the answer's size, line height and paragraph spacing, set
+   apart only by the italic and the muted tone. Its headline is the same italic
+   muted text, at most a touch less muted than the body. */
+.task-chat-reasoning-plain {
+  font-size: 0.9375rem;
+  line-height: 1.6;
+}
+
+.task-chat-reasoning-plain .task-chat-reasoning-headline,
+.task-chat-reasoning-plain .paperclip-markdown.task-chat-reasoning-markdown {
+  --task-chat-reasoning-headline-foreground: color-mix(in oklab, var(--foreground) 20%, var(--muted-foreground));
+}
+
+.task-chat-reasoning-plain .task-chat-reasoning-headline {
+  margin: 0;
+}
+
+.task-chat-reasoning-plain > * + *,
+.task-chat-reasoning-plain-section > * + * {
+  margin-top: 0.7rem;
+}
 /* reasoning-look:end */
 
 .task-chat-expanded-line-wrap,

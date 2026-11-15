@@ -37,12 +37,14 @@ export function TaskChatThinking({
   if (inline) {
     return (
       <div
-        className={cn("min-w-0 max-w-full rounded-md border border-border/70 bg-muted/30 px-3 py-2 text-xs text-muted-foreground", rowClassName)}
+        // Plain text in the flow of the turn: no box, indent or bullet. px-1 is
+        // the agent answer's own inset, so reasoning shares its left edge.
+        className={cn("min-w-0 max-w-full px-1", rowClassName)}
         data-testid="task-chat-thinking"
         data-state={active ? "streaming-inline" : "settled-inline"}
         data-reasoning-display="inline"
       >
-        <TaskChatReasoningSummary text={body || "Thinking…"} streaming={active} />
+        <TaskChatReasoningSummary text={body || "Thinking…"} streaming={active} plain />
       </div>
     );
   }
