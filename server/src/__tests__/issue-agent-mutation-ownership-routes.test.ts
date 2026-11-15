@@ -3287,6 +3287,34 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.update).not.toHaveBeenCalled();
       });
 
+      it("rejects request-changes from a stale run of the current reviewing agent", async () => {
+        const issue = reviewIssue([finalStage]);
+        const staleRunId = "77777777-7777-4777-8777-777777777777";
+        mockIssueService.getById.mockResolvedValue(issue);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+        let lockHolderStopped = false;
+        mockHeartbeatService.getRun.mockImplementation(async (id: string) =>
+          id === staleRunId ? { ...nativeRun, id: staleRunId } : id === ownerRunId
+            ? { ...nativeRun, status: lockHolderStopped ? "cancelled" : "running" } : null);
+        // Do not get a false 409 merely because the unrelated stop path fails.
+        mockHeartbeatService.cancelRun.mockImplementation(async () => {
+          lockHolderStopped = true;
+          return { ...nativeRun, status: "cancelled" };
+        });
+        const db = createRunContextDb({ issueId }, ownerAgentId, staleRunId);
+
+        const res = await request(createApp({ ...runActor(), runId: staleRunId }, db)).patch(`/api/issues/${issueId}`)
+          .send({ status: "in_progress", comment: "Reviewer decision: request changes - stale run must not decide." });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.details.code).toBe("native_run_status_reported_by_finish");
+        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(mockIssueService.addComment).not.toHaveBeenCalled();
+        expect(db.insert).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      });
+
       it("keeps the non-native request-changes path immediate", async () => {
         const issue = reviewIssue([finalStage]);
         mockIssueService.getById.mockResolvedValue(issue);
