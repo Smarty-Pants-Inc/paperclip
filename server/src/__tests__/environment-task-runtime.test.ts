@@ -433,6 +433,51 @@ describe("plugin-provided Runner execution", () => {
     await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: metadataOperation })).rejects.toThrow("not active");
     await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation: { kind: "stop" } })).resolves.toMatchObject({ kind: "accepted" });
   });
+  it("gives describe the configured setup budget while preserving its default deadline", async () => {
+    vi.useFakeTimers();
+    const result = { kind: "description", taskId: "attempt-1", runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+    state.plugin.manifestJson.environmentDrivers[0].sessionHandoffVersion = 1;
+    const value = row(); value.environment!.config.driverConfig = { setupTimeoutSeconds: 180 };
+    const workers = worker(result);
+    workers.call.mockImplementation(async (...args: any[]) => new Promise((resolve, reject) => {
+      setTimeout(() => resolve(result), 95_000);
+      setTimeout(() => reject(new Error("timeout")), args[3]);
+    }));
+    const described = executeEnvironmentTask(database(value).db, workers as never, {
+      companyId: "company", leaseId, operation: { kind: "describe" },
+    });
+    await vi.advanceTimersByTimeAsync(95_000);
+    await expect(described).resolves.toEqual(result);
+    expect((workers.call.mock.calls as unknown as any[][])[0]?.[3]).toBe(180_000);
+
+    const defaults = row();
+    const defaultWorkers = worker(result);
+    defaultWorkers.call.mockImplementation(async (...args: any[]) => new Promise((resolve, reject) => {
+      setTimeout(() => resolve(result), 95_000);
+      setTimeout(() => reject(new Error("timeout")), args[3]);
+    }));
+    const defaultDescription = executeEnvironmentTask(database(defaults).db, defaultWorkers as never, {
+      companyId: "company", leaseId, operation: { kind: "describe" },
+    }).then(value => ({ value }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(await defaultDescription).toMatchObject({ error: expect.any(Error) });
+    expect((defaultWorkers.call.mock.calls as unknown as any[][])[0]?.[3]).toBe(90_000);
+    vi.useRealTimers();
+  });
+  it("keeps the ownership deadline independent of setupTimeoutSeconds", async () => {
+    state.plugin.manifestJson.environmentDrivers[0].sessionHandoffVersion = 1;
+    const operation = { kind: "ensure_ownership" as const, operationId: leaseId, identity: {
+      runnerInstanceId: "runner", environmentLeaseId: leaseId, runId: "run", normalizedSessionId: "session", turnId: "turn", itemId: "item",
+    }, sourceTaskId: "source-task", sourceGeneration: "source-generation", targetGeneration: "target-generation", policy: "ordinary" as const };
+    const value = row();
+    value.environment!.config.driverConfig = { setupTimeoutSeconds: 180 };
+    Object.assign(value.lease.metadata, { providerMetadata: { ownershipGeneration: "target-generation" },
+      portableTaskPredecessor: { targetLeaseId: leaseId, operation } });
+    const workers = worker({ kind: "ownership", taskId: "attempt-1", operationId: leaseId,
+      targetGeneration: "target-generation", status: "ready" });
+    await expect(executeEnvironmentTask(database(value).db, workers as never, { companyId: "company", leaseId, operation })).resolves.toMatchObject({ kind: "ownership" });
+    expect((workers.call.mock.calls as unknown as any[][])[0]?.[3]).toBe(90_000);
+  });
   it("dispatches with host-derived scope and a persisted attempt identity", async () => {
     const { db, query } = database(); const workers = worker();
     await expect(executeEnvironmentTask(db, workers as never, { companyId: "company", leaseId, operation: submit })).resolves.toEqual({ kind: "accepted", taskId: "attempt-1" });
