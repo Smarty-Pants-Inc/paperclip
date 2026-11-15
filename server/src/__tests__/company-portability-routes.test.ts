@@ -942,7 +942,7 @@ describe("company portability routes", () => {
     expect(accepted.body.statusUrl).toMatch(/^\/api\/companies\/import\/jobs\/tenant-import-/);
     expect(accepted.body.retryAfterMs).toBe(1000);
     await waitForCondition(() => mockCompanyPortabilityService.importBundle.mock.calls.length === 1, "import job start");
-    expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(importRequest, "cloud-user-1", { pauseAutomations: false });
+    expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(importRequest, "cloud-user-1", { pauseAutomations: false, actor: cloudTenantActor() });
     expect(mockLogActivity).not.toHaveBeenCalled();
 
     resolveImport(createImportResult("updated"));
@@ -1067,7 +1067,7 @@ describe("company portability routes", () => {
     expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(
       { ...importRequest, pauseAutomations: true },
       "cloud-user-1",
-      { pauseAutomations: true },
+      { pauseAutomations: true, actor: cloudTenantActor() },
     );
   });
 
@@ -1091,7 +1091,7 @@ describe("company portability routes", () => {
     expect(accepted.body.statusUrl).toMatch(/^\/api\/companies\/import\/jobs\/import-/);
     expect(accepted.body.statusUrl).not.toMatch(/\/jobs\/tenant-import-/);
     await waitForCondition(() => mockCompanyPortabilityService.importBundle.mock.calls.length === 1, "board import start");
-    expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(importRequest, "board-user-a", { pauseAutomations: false });
+    expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(importRequest, "board-user-a", { pauseAutomations: false, actor: boardActor("board-user-a") });
 
     const fullResult = createImportResult("created");
     resolveImport(fullResult);
@@ -1268,7 +1268,7 @@ describe("company portability routes", () => {
     expect(mockCompanyPortabilityService.importBundle).toHaveBeenCalledWith(
       { ...importRequest, pauseAutomations: true },
       null,
-      { mode: "agent_safe", sourceCompanyId: companyId, actorAgentId: ceoAgentId, actorAgentCompanyId: companyId, pauseAutomations: true, assertCanCreateAgents: expect.any(Function) },
+      { mode: "agent_safe", sourceCompanyId: companyId, actorAgentId: ceoAgentId, actorAgentCompanyId: companyId, pauseAutomations: true, assertCanCreateAgents: expect.any(Function), actor: { type: "agent", agentId: ceoAgentId, companyId, source: "agent_key", runId: "run-1" } },
     );
   });
 
@@ -1311,7 +1311,7 @@ describe("company portability routes", () => {
     // consumes; the other import fields ride along from the JSON meta field.
     expect(call[0]).toEqual({ ...importMeta, source: { type: "inline", rootPath: "paperclip", files } });
     expect(call[1]).toBe("board-user-a");
-    expect(call[2]).toEqual({ pauseAutomations: false });
+    expect(call[2]).toEqual({ pauseAutomations: false, actor: boardActor("board-user-a") });
   });
 
   it("previews a company from a multipart zip upload", async () => {
