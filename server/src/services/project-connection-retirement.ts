@@ -176,6 +176,37 @@ function receiptReason(reason: string | undefined, action: string): string {
     ? reason : action.replace("tool_connection.", "");
 }
 
+/** Compose option-B first binding with the judged make-before-break exception.
+ * The create writer holds the project's lifecycle/identity locks and has just
+ * revalidated this exact ordinary source through the custody reader. Only an
+ * initially unowned project with real legacy reach may stage a pending draft;
+ * retained history (including archives) can never reset C2. No caller metadata
+ * chooses this exception, and no legacy install is changed here.
+ */
+export async function stageProjectConnectionMigration(
+  tx: Db | DbTransaction,
+  input: Readonly<{ companyId: string; projectId: string; sourceConnectionId: string; config: Record<string, unknown>; status: string; enabled: boolean }>,
+): Promise<Record<string, unknown>> {
+  const [history] = await tx.select({ id: toolConnections.id }).from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.companyId), eq(toolConnections.projectId, input.projectId),
+  )).limit(1);
+  if (history) return input.config;
+  const [legacy] = await tx.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.sourceConnectionId),
+  ));
+  if (!legacy || legacy.projectId !== null || legacy.status !== "active" || !legacy.enabled) return input.config;
+  const [install] = await tx.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+    eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, legacy.id),
+  )).limit(1);
+  if (!install) return input.config;
+  if (input.status !== "draft" || input.enabled) {
+    throw conflict("Verify and finish this project candidate before activating it.", { code: "project_connection_verification_required" });
+  }
+  const scope = readProjectConnectionScope({ projectId: input.projectId, config: input.config });
+  if (!scope) throw conflict("Project connection approval is unavailable", { code: "project_connection_scope_invalid" });
+  return { ...input.config, projectScope: { ...scope, migrationPending: true, legacyConnectionId: legacy.id } };
+}
+
 /** B's existing finish writer calls this only AFTER external verification, under its tx.
  * B also takes A's verified identity locks and compares the preflight token's
  * identity/repo/version facts. This helper never mints a token or removes legacy
