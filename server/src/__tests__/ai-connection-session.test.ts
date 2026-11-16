@@ -40,11 +40,19 @@ describe("AI pool session adoption", () => {
     const switchPool = revision("revision-3", { mode: "router", connectionId: "previous-pool" }, pool);
     expect((await decision({ agentRuntimeConfig: { aiConnection: binding }, agentConfigRevision: aiConnectionRevisionMetadata(first) }, { agentConfigRevision: aiConnectionRevisionMetadata(switchPool) }, { revisions: [switchPool, adoption, first] })).reset).toBe(false);
   });
-  it("retains resets when the same edit also changes unrelated configuration", async () => {
+  it("keeps the session when a binding edit also renames the agent (bookkeeping-only revision), and resets when it also changes a fingerprinted setting", async () => {
+    // SUPERSEDED BY REPLACEMENT (RFL 08:10Z 11-16, #20853 (b)): the old assertion pinned "a new revision id resets", the bug.
     const first = revision("revision-1", null, binding);
     const edit = revision("revision-2", binding, pool, { name: "Renamed agent" });
     expect(aiConnectionOnlyConfigRevision(edit)).toBe(false);
-    expect((await decision({ agentRuntimeConfig: { aiConnection: binding }, agentConfigRevision: aiConnectionRevisionMetadata(first) }, { agentConfigRevision: aiConnectionRevisionMetadata(edit) }, { revisions: [edit, first] })).reset).toBe(true);
+    // Same before/after input: the two revisions differ only in bookkeeping (id, changedKeys, createdAt) and a
+    // rename, which no fingerprint category carries (agent name/role/title are not session identity), so the binding edit keeps the session.
+    expect((await decision({ agentRuntimeConfig: { aiConnection: binding }, agentConfigRevision: aiConnectionRevisionMetadata(first) }, { agentConfigRevision: aiConnectionRevisionMetadata(edit) }, { revisions: [edit, first] })).reset).toBe(false);
+    // A binding edit together with a fingerprinted change (adapter env) still resets.
+    const changed = { ...config, env: { ...config.env, OTHER: "changed" } };
+    const fingerprintedEdit = revision("revision-2", binding, pool, { name: "Renamed agent", adapterConfig: { model: "gpt-5.6-sol", env: changed.env } });
+    expect(aiConnectionOnlyConfigRevision(fingerprintedEdit)).toBe(false);
+    expect((await decision({ agentRuntimeConfig: { aiConnection: binding }, agentConfigRevision: aiConnectionRevisionMetadata(first) }, { effectiveAdapterConfig: changed, agentConfigRevision: aiConnectionRevisionMetadata(fingerprintedEdit) }, { revisions: [fingerprintedEdit, first] })).reset).toBe(true);
   });
   it("does not bridge a stale revision over a newer runtime settings change", async () => {
     const first = revision("revision-1", null, binding);
