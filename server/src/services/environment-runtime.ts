@@ -1764,7 +1764,7 @@ function createSandboxEnvironmentDriver(
       if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
       chain = { tip: rows[0]!, predecessors: [] };
     }
-    const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip));
+    const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip), "cleanup");
     if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
       normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
     return stamp;
