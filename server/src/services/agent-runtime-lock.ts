@@ -15,3 +15,19 @@ import type { Db } from "@paperclipai/db";
 export async function lockCompanyAgentRuntime(tx: Pick<Db, "execute">, companyId: string) {
   await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended('paperclip.connector_runtime:' || ${companyId}::uuid::text, 0))`);
 }
+
+/**
+ * #20805 R3: the SHARED side of the same lock, for a production path that holds
+ * an agent row and needs company-wide runtime changes (connector, grant and
+ * membership writes) to wait until it commits. Take it RIGHT AFTER the agent row
+ * lock (rows, then this lock; the order of migration 0489). `noWait` mirrors a
+ * NOWAIT row lock: it returns false instead of waiting for an exclusive holder.
+ */
+export async function holdCompanyAgentRuntimeShared(tx: Pick<Db, "execute">, companyId: string, options: { noWait?: boolean } = {}) {
+  if (!options.noWait) {
+    await tx.execute(sql`select pg_advisory_xact_lock_shared(hashtextextended('paperclip.connector_runtime:' || ${companyId}::uuid::text, 0))`);
+    return true;
+  }
+  const [row] = await tx.execute(sql`select pg_try_advisory_xact_lock_shared(hashtextextended('paperclip.connector_runtime:' || ${companyId}::uuid::text, 0)) as held`);
+  return (row as { held?: boolean } | undefined)?.held === true;
+}

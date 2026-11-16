@@ -2,6 +2,7 @@ import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHash } from "node:crypto";
 
 import { and, desc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
+import { holdCompanyAgentRuntimeShared } from "../agent-runtime-lock.js";
 import type { SelectedFields } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import {
@@ -898,6 +899,14 @@ export async function resolveExternalChatResponseWaitAuthorizationInTransaction(
     : lockMode === "nonblocking"
       ? actorQuery.for("update", { noWait: true }).limit(1)
       : actorQuery.for("update").limit(1));
+  // #20805 R3: right after the actor row lock, the SHARED company runtime hold,
+  // so a company-wide connector, grant or membership change (EXCLUSIVE) cannot
+  // commit between this authorization check and the caller's commit. The final
+  // status committer (status-decision-committer.ts) checks in "nonblocking" mode:
+  // contention is the same retryable race as the NOWAIT row locks above.
+  if (actor && lockMode !== "read" && !await holdCompanyAgentRuntimeShared(tx, binding.companyId, { noWait: lockMode === "nonblocking" })) {
+    throw new ExternalChatWaitAuthorizationContentionError();
+  }
   const preserved = run && run.status !== "running"
     ? await readPreservedNativeResultFinalization(tx, binding) : null;
   if (
