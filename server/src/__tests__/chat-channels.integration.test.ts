@@ -62102,6 +62102,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         "An external message in this conversation was deleted.",
       ].sort(),
     );
+    // smarty-dev#20830: an edit notice quotes outside text, so it is written
+    // low-trust with its source named; the fixed delete notice stays platform text.
+    const edits = comments.filter(comment => comment.body.startsWith("An external message was edited:"));
+    expect(edits).toHaveLength(2);
+    for (const comment of edits) {
+      expect(comment.sourceTrust).toMatchObject({ preset: "low_trust_review", disposition: "quarantined", sourceIssueId: conversation.issueId });
+      expect(comment.metadata).toMatchObject({ externalSource: { channel: "slack" } });
+    }
+    expect(comments.find(comment => comment.body.endsWith("was deleted."))?.sourceTrust ?? null).toBeNull();
     expect(wakeup).toHaveBeenCalledTimes(2);
   });
 
