@@ -5,7 +5,8 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@
 import { SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY } from "../../agent-run-cancellation.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
-import { hasConfirmedSandboxStopAndRetain, SANDBOX_STOP_AND_RETAIN_KEY } from "../sandbox-stop-and-retain.js";
+import { sandboxLeaseSourceMatches } from "../sandbox-lease-config-compatibility.js";
+import { hasConfirmedSandboxStopAndRetain, readStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
 import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
@@ -42,6 +43,11 @@ export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string
  * older state after the restored lease moves on. An expired native reusable
  * source with a bound stopped receipt is the fourth class: the same idle proof
  * applies, and the runtime start fence keeps its stopped allocation retired.
+ *
+ * A source Paperclip stopped because the environment's boot source (image)
+ * changed is the fifth (`bootSourceChangeRetiresSource`). Each class is one
+ * predicate in `RETIRED_SOURCE_CLASSES`; a class whose sandbox could otherwise
+ * be resumed again is also claimed as superseded.
  */
 export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: {
   companyId: string;
@@ -65,9 +71,6 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   const lease = tips[0]!;
   const predecessors = retiredReusableLeasePredecessors(lease, source.filter(row => row.id !== lease.id));
   if (!predecessors) return false;
-  const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
-  const destroyed = ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
-    && termination?.state === "destroyed";
   // Warm handoffs leave stamps on their original owner rows, but owner order
   // does not establish checkpoint chronology. Select by completion time before
   // matching the manifest; conflicting latest-time stamps are ambiguous.
@@ -83,13 +86,43 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     || stamp.normalizedSessionId !== input.normalizedSessionId
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
-  const idleSource = !destroyed && !await sourceChangeStopRetiresSource(db, lease)
-    && !await settledRestoreHoldRetiresSource(db, lease);
-  if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
+  const retired = await retiredSourceClass(db, lease, input);
+  if (!retired) return false;
   // Provider work recorded after the checkpoint means the destroyed sandbox
   // held newer state than this backup. Restoring would silently rewind it.
   if (await nativeHarnessBackupHasLaterProviderWork(db, { ...input, completedAt: stamp.completedAt })) return false;
-  return !idleSource || await supersedeIdleWarmSource(db, lease, input);
+  return !retired.claim || await supersedeIdleWarmSource(db, lease, input);
+}
+
+type SourceLease = typeof environmentLeases.$inferSelect;
+type RetiredSourceInput = { companyId: string; currentRunId: string; targetProviderLeaseId?: string | null };
+
+/**
+ * The retired-source classes, in proof order. One predicate each; the caller's
+ * stamp, later-work and claim proofs still decide. `claim` marks a class whose
+ * sandbox still exists and could be resumed later (for example after the image
+ * is switched back): it is claimed as superseded before the restore.
+ */
+const RETIRED_SOURCE_CLASSES: ReadonlyArray<{
+  name: "destroyed" | "settled_restore_hold" | "boot_source_changed" | "idle_warm";
+  claim: boolean;
+  retires: (db: Db, lease: SourceLease, input: RetiredSourceInput) => Promise<boolean>;
+}> = [
+  { name: "destroyed", claim: false, retires: async (_db, lease) => destroyedSource(lease) },
+  { name: "settled_restore_hold", claim: false, retires: (db, lease) => settledRestoreHoldRetiresSource(db, lease) },
+  { name: "boot_source_changed", claim: true, retires: bootSourceChangeRetiresSource },
+  { name: "idle_warm", claim: true, retires: (db, lease, input) => idleWarmSourceRetiresBackup(db, lease, input.currentRunId) },
+];
+
+async function retiredSourceClass(db: Db, lease: SourceLease, input: RetiredSourceInput) {
+  for (const retiredClass of RETIRED_SOURCE_CLASSES) if (await retiredClass.retires(db, lease, input)) return retiredClass;
+  return null;
+}
+
+function destroyedSource(lease: SourceLease): boolean {
+  const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
+  return ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
+    && termination?.state === "destroyed";
 }
 
 /** Shared by backup restore and compatible environment draining: a valid old
@@ -167,28 +200,68 @@ async function idleWarmSourceRetiresBackup(db: Db, lease: typeof environmentLeas
     && (lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined)?.state === "stopped";
   if (lease.leasePolicy !== "reuse_by_environment" || (!stoppedNative && !["released", "retained"].includes(lease.status))
     || !lease.heartbeatRunId || lease.heartbeatRunId === currentRunId
-    || lease.metadata?.pendingCleanupInFlight === true
-    // A restore hold or a pending shutdown settlement still protects the files; reuse skips these too.
-    || Object.hasOwn(lease.metadata ?? {}, LEGACY_WORKSPACE_RECOVERY_KEY)
-    || (lease.metadata?.legacyShutdownWorkspaceSettlement as { state?: unknown } | undefined)?.state === "pending") return false;
-  const [run] = await db.select({ sourceRunStatus: heartbeatRuns.status }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
-  if (!run || !TERMINAL_SOURCE_RUN_STATUSES.has(run.sourceRunStatus)) return false;
+    || lease.metadata?.pendingCleanupInFlight === true || sourceFilesHeld(lease)) return false;
+  if (!await sourceRunEnded(db, lease)) return false;
   return !await nativeWorkspaceExportPendingForResource(db, lease, currentRunId);
 }
 
+/** A restore hold or a pending shutdown settlement still protects the files; reuse skips these too. */
+function sourceFilesHeld(lease: SourceLease): boolean {
+  return Object.hasOwn(lease.metadata ?? {}, LEGACY_WORKSPACE_RECOVERY_KEY)
+    || (lease.metadata?.legacyShutdownWorkspaceSettlement as { state?: unknown } | undefined)?.state === "pending";
+}
+
+/** Only a run does provider work in a sandbox; the source lease's own run has ended. */
+async function sourceRunEnded(db: Db, lease: SourceLease): Promise<boolean> {
+  if (!lease.heartbeatRunId) return false;
+  const [run] = await db.select({ sourceRunStatus: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
+  return !!run && TERMINAL_SOURCE_RUN_STATUSES.has(run.sourceRunStatus);
+}
+
 /**
- * An image (boot-source) change made Paperclip supersede this reusable source
- * and stop it under the stop-only contract (`sandbox_source_changed`). Reuse
- * never selects a source-mismatched lease again and the stop permits no provider
- * work, so the source is retired as soon as the stop is requested; the caller's
- * stamp and later-work proofs still decide. A pending export keeps it ambiguous.
+ * The environment's boot source (image, snapshot, rootfs) changed after this
+ * reusable source was admitted, so acquisition never selects it again
+ * (`sandboxLeaseSourceMatches`) and Paperclip stopped it under the stop-only
+ * contract instead of destroying it (Cut A). It is retired when:
+ * - its stop is CONFIRMED: released with the bound stop-and-retain receipt
+ *   (`hasConfirmedSandboxStopAndRetain`). The receipt carries no reason, so the
+ *   source change is read from the leases themselves. This also covers rows
+ *   stopped before any reason was recorded. Primary path.
+ * - or its stop is REQUESTED: `pending_cleanup` with the bound stop intent that
+ *   cleanup recorded for this source (`sandbox_source_changed`). The box may
+ *   still be running until the sweep confirms the stop, so this also needs the
+ *   source run to have ended (only a run does provider work) and the caller's
+ *   superseded claim, as an idle warm source does.
+ * Both need the CURRENT run's lease in the same environment to have booted a
+ * different source; a source that still matches is not retired by this class.
+ * Both also need no restore hold on the files and no pending workspace export.
+ * The caller's stamp and later-work proofs still decide.
  */
-async function sourceChangeStopRetiresSource(db: Db, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
-  const stop = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as { reason?: unknown; leaseId?: unknown; providerLeaseId?: unknown } | undefined;
-  return lease.leasePolicy === "reuse_by_environment" && stop?.reason === "sandbox_source_changed"
-    && stop.leaseId === lease.id && stop.providerLeaseId === lease.providerLeaseId
-    && !await nativeWorkspaceExportPendingForLease(db, lease);
+async function bootSourceChangeRetiresSource(db: Db, lease: SourceLease, input: RetiredSourceInput): Promise<boolean> {
+  if (lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId || lease.heartbeatRunId === input.currentRunId
+    || !lease.environmentId || !input.targetProviderLeaseId || sourceFilesHeld(lease)) return false;
+  const stopConfirmed = hasConfirmedSandboxStopAndRetain(lease);
+  const stopRequested = lease.status === "pending_cleanup"
+    && (readStopOnlyCleanup(lease) as { reason?: unknown } | null)?.reason === "sandbox_source_changed";
+  if (!stopConfirmed && !stopRequested) return false;
+  if (!await bootSourceChangedSince(db, lease, input)) return false;
+  if (!await sourceRunEnded(db, lease)) return false;
+  return !await nativeWorkspaceExportPendingForLease(db, lease)
+    && !await nativeWorkspaceExportPendingForResource(db, lease, input.currentRunId);
+}
+
+/** The current run's lease records the boot source that the environment's
+ * current configuration resolved to (the same keys acquisition compares). Every
+ * such lease in the source's environment must differ from the source's. */
+async function bootSourceChangedSince(db: Db, lease: SourceLease, input: RetiredSourceInput): Promise<boolean> {
+  const targets = (await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId),
+    eq(environmentLeases.providerLeaseId, input.targetProviderLeaseId!),
+    eq(environmentLeases.heartbeatRunId, input.currentRunId),
+  ))).filter(row => row.companyId === input.companyId && row.providerLeaseId === input.targetProviderLeaseId
+    && row.heartbeatRunId === input.currentRunId && row.environmentId === lease.environmentId);
+  return targets.length > 0 && targets.every(row => !sandboxLeaseSourceMatches(row.metadata ?? {}, lease.metadata ?? {}));
 }
 
 /**
