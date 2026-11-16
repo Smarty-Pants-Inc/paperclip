@@ -254,4 +254,9 @@ $$;
 CREATE TRIGGER paperclip_agent_runtime_files_changed BEFORE INSERT ON activity_log
   FOR EACH ROW EXECUTE FUNCTION paperclip_agent_runtime_files_changed();
 --> statement-breakpoint
+-- src11: drop the manager key-share prelock triggers and their function.
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_insert ON agents;
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_update ON agents;
+DROP FUNCTION IF EXISTS paperclip_agent_runtime_lock_manager();
+--> statement-breakpoint
 DROP FUNCTION IF EXISTS paperclip_lock_runtime_agents(uuid[]);
