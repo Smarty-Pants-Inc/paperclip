@@ -120,6 +120,15 @@ describe("#20389 RFL F4 retirement publication retry", () => {
         entityType: "issue_access_grant", entityId: grants[0]!.id,
         details: expect.objectContaining({ issueId: task.id, subjectType: "agent", subjectId: managerId, source: "assignment" }),
       })]);
+      const expectedActions = [
+        "agent.handover_completed",
+        "agent.terminated",
+        "issue.reassigned",
+        "issue.reassignment_failed",
+        "issue_access_grant.created",
+      ];
+      expect(rows.map(row => row.action).sort()).toEqual(expectedActions);
+      expect(events.map(event => event.action).sort()).toEqual(expectedActions);
       expect(events).toHaveLength(rows.length);
       expect(events.every(event => event.afterCommit)).toBe(true);
       for (const row of rows) expect(events.filter(event => event.action === row.action && event.entityId === row.entityId)).toHaveLength(1);
