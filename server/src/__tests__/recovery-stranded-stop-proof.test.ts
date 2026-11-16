@@ -35,7 +35,10 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
   async function task(id: string) { return (await db.select().from(issues).where(eq(issues.id, id)))[0]!; }
   async function untouched(f: Awaited<ReturnType<typeof fixture>>, before: Awaited<ReturnType<typeof task>>) {
     expect(await task(f.issueId)).toEqual(before);
-    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toEqual([]);
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(actions).toHaveLength(1);
+    expect(actions[0]).toMatchObject({ cause: "execution_stop_pending", status: "escalated", ownerType: "board",
+      attemptCount: 1, maxAttempts: 1, evidence: { stopPending: { owner: "recovery.stranded_assigned_issue", escalation: "board" } } });
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toEqual([]);
   }
 
@@ -58,7 +61,10 @@ describe("stranded recovery retains ownership until execution Stop is confirmed"
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, f.runId));
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(1);
     expect(await task(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId, checkoutRunId: null, executionRunId: null });
-    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId))).toHaveLength(1);
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(actions.filter(action => action.status === "active" || action.status === "escalated")).toHaveLength(1);
+    expect(actions.find(action => action.cause === "execution_stop_pending"))
+      .toMatchObject({ status: "resolved", outcome: "restored" });
     expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
   });
 

@@ -7,6 +7,7 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 import { seedCompanyWithBoardAccess, routeApp } from "./helpers/route-test-harness.js";
 import { issueRoutes } from "../routes/issues.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 
 // Keep reason: #20807 RFL F2's real PostgreSQL reproduction found a stable,
 // silent Stop hold on a 30-day unassigned task. Data safety requires retaining
@@ -96,6 +97,21 @@ describe("unproven task Stop is visibly escalated, never released by age", () =>
     const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, prior.id));
     expect(after).toMatchObject({ cause: prior.cause, status: prior.status, ownerType: prior.ownerType,
       attemptCount: 3, maxAttempts: 3, nextAction: prior.nextAction, evidence: prior.evidence });
+  });
+
+  it("does not let terminal task projection or generic recovery resolution hide an unproven Stop", async () => {
+    const f = await fixture();
+    await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, f.issueId));
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
+    const [held] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await recovery.reconcileActiveRecoveryActions();
+    expect(await issueRecoveryActionService(db).resolveActiveForIssue({ companyId: f.companyId, sourceIssueId: f.issueId,
+      actionId: held.id, status: "resolved", outcome: "restored", resolutionNote: "Task is closed, but Stop is unproven." })).toBeNull();
+    const app = routeApp(db, f.actor, issueRoutes);
+    expect((await request(app).get(`/api/issues/${f.issueId}`).expect(200)).body.activeRecoveryAction)
+      .toMatchObject({ id: held.id, cause: "execution_stop_pending", status: "escalated" });
+    expect(await task(f.issueId)).toMatchObject({ status: "cancelled", checkoutRunId: f.runId, executionRunId: f.runId });
   });
 
   it("never annotates a new claim using a stale sweep candidate", async () => {

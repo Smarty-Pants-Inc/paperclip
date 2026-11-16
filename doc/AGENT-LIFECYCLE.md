@@ -428,6 +428,25 @@ An accepted interaction keeps its existing retry or needs-attention disposition.
 Generic recovery does not create a replacement run while its executor cleans up.
 After cleanup, its saved needs-attention escalation repeats the Stop check.
 
+Task-scoped Stop checks are read-only. They do not settle a coordinator lease
+while holding run locks: native lease reacquisition locks the coordinator before
+the run. Expired coordinator settlement stays with the agent lifecycle owner.
+
+An unproven task Stop is not a silent or age-based hold. The first failed
+read-only inspection records `execution_stop_pending` in the task's existing
+`activeRecoveryAction`, visible through the issue API and recovery card, with the
+recovery source and both bound run IDs. Its automatic inspection budget is one:
+it immediately escalates to the board instead of starting another Stop worker.
+The board inspects the owning runs and uses the agent's existing Stop/cleanup
+controls (or its explicit Retry after inspecting parked Stop work). This
+inspection budget is separate from the lifecycle worker's five Stop attempts.
+Task status, assignment and claims are preserved; no replacement run is started.
+Repeated checks retain the same diagnostic without refreshing a budget or adding
+activity. Later positive Stop proof can release the claims and resolve this
+inspection record. A stronger existing recovery action retains its owner,
+evidence and budget; Stop adds a visible annotation and removes only that
+annotation after proof. Run, session, trace and prior recovery history remain.
+
 The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
 A database lease permits one active attempt for each agent.
