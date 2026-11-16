@@ -10,6 +10,9 @@ import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { logger } from "../middleware/logger.js";
+import { HttpError } from "../errors.js";
+import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "./transient-lock-contention.js";
+import { transactionRetryStats } from "./transaction-retry.js";
 import { agents, companies, type Db } from "@paperclipai/db";
 import type { AgentLifecycleRequester } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
@@ -22,7 +25,7 @@ import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { deleteAgentDependencies } from "./agent-deletion.js";
 import { lockAgentConfigurationInteractions, prepareAgentConfiguration, completeAgentConfiguration } from "./agent-configuration.js";
-import { prepareAgentHire, initializeAgentHire, prepareAgentHireApproval, completeAgentHireApproval } from "./agent-hiring.js";
+import { prepareAgentHire, initializeAgentHire, prepareAgentHireApproval, completeAgentHireApproval, isHireGrantStepContention } from "./agent-hiring.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { fenceActiveCompanyAgentStopsInTransaction as fenceActiveCompanyStops } from "../modules/agent-lifecycle/index.js";
 import { applyAgentPolicyHoldsInTransaction } from "../modules/agent-lifecycle/index.js";
@@ -189,7 +192,78 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, aut
         return work(tx, publications);
       });
   }
-  return lifecycle.createAgentLifecycle(db, effects);
+  const agentLifecycle = lifecycle.createAgentLifecycle(db, effects);
+  const requestHire = agentLifecycle.requestHire.bind(agentLifecycle);
+  agentLifecycle.requestHire = (...args) => requestHireWithContentionRetry(db, requestHire, ...args);
+  return agentLifecycle;
+}
+
+export const AGENT_HIRE_ATTEMPTS = 5;
+export const AGENT_HIRE_CONTENTION_CODE = "agent_hire_grant_contention";
+/** Named warning: the agent is complete; company default grants for built-in agents were deferred. */
+export const COMPANY_DEFAULT_GRANTS_DEFERRED = "company_default_grants_deferred";
+
+export const AGENT_HIRE_CONTENTION_MESSAGE = "Paperclip could not finish this hire because other updates to the same "
+  + "company kept conflicting with it. Nothing was saved. Retry the same request.";
+
+/** #20805: lock contention in the hire's GRANT step that survives every hire attempt.
+ * The hire transaction rolled back as a whole, so no agent row, membership or grant
+ * was kept. Same shape as AccountingContentionError: 503, `code` keeps the SQLSTATE,
+ * the database error stays only in `cause`. */
+export class AgentHireContentionError extends HttpError {
+  readonly code: string;
+  constructor(cause: unknown, readonly attempts: number) {
+    super(503, AGENT_HIRE_CONTENTION_MESSAGE, { code: AGENT_HIRE_CONTENTION_CODE, retryable: true });
+    this.name = "AgentHireContentionError";
+    this.code = postgresErrorCode(cause) ?? "40P01";
+    this.cause = cause;
+  }
+}
+
+type RequestHire = ReturnType<typeof lifecycle.createAgentLifecycle>["requestHire"];
+
+/** Carries a CREATE-step rollback past the grant retry unchanged (#20389: the
+ * create is the lifecycle's one attempt). No `code`/`cause`, so the retry never
+ * classifies it as contention. */
+class HireCreateStepContention {
+  constructor(readonly error: unknown) {}
+}
+
+/** The hire's ONE retry wrapper (#20805 x #20389 rule): the whole hire transaction
+ * (agent row, membership, grants) is the retried unit, so an attempt that rolls back
+ * leaves nothing behind. Only contention raised by the GRANT step
+ * (isHireGrantStepContention) is retried; exhausted, it is agent_hire_grant_contention.
+ * Contention anywhere else in the hire is the CREATE step's one attempt and reaches
+ * the caller as lifecycleTransaction's AccountingContentionError(attempts 1), which the
+ * hire routes name agent_hire_create_contention. Post-commit hints run once. */
+async function requestHireWithContentionRetry(db: Db, requestHire: RequestHire, ...args: Parameters<RequestHire>) {
+  let agent: Awaited<ReturnType<RequestHire>>;
+  try {
+    agent = await retryTransientLockContention(async () => {
+      try {
+        return await requestHire(...args);
+      } catch (error) {
+        if (isTransientLockContention(error) && !isHireGrantStepContention(error)) throw new HireCreateStepContention(error);
+        throw error;
+      }
+    }, AGENT_HIRE_ATTEMPTS, {
+      jitterMs: 50,
+      onRetry: (error, attempt) => {
+        transactionRetryStats.retried++;
+        logger.warn({ companyId: args[0], attempt, sqlState: postgresErrorCode(error) }, "Agent hire grant step hit lock contention; retrying the hire transaction");
+      },
+    });
+  } catch (error) {
+    if (error instanceof HireCreateStepContention) throw error.error;
+    if (!isTransientLockContention(error)) throw error;
+    throw new AgentHireContentionError(error, AGENT_HIRE_ATTEMPTS);
+  }
+  if (args[2]?.memberGrant) {
+    // The membership is committed: wake a pending Muse contact verification once,
+    // outside any attempt that could roll back.
+    await db.transaction(tx => notifyMuseContactVerification(tx as unknown as Db, { companyId: agent.companyId, agentId: agent.id }));
+  }
+  return agent;
 }
 
 export function initializeImportedAgentConfigurationInTransaction(tx: Db, publications: ActivityPublication[],
