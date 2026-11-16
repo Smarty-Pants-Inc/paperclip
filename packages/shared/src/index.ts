@@ -2924,7 +2924,7 @@ export { EXTERNAL_AGENT_TOOL_GUIDANCE, DOT_AGENT_TOOL_GUIDANCE, GROK_BOT_AGENT_T
 
 export { AGENT_LIFECYCLE_STATES, type AgentLifecycleState, type AgentLifecycleOperation } from "./types/agent-lifecycle.js";
 
-export type { AgentLifecycleRequest, AgentLifecycleResult } from "./types/agent-lifecycle.js";
+export type { AgentLifecycleRequest, AgentLifecycleResult, AgentLifecycleRequester, AgentHandoverMarker, AgentHandoverBlockedItem } from "./types/agent-lifecycle.js";
 
 export * from "./types/task-workspace.js";
 export * from "./validators/task-workspace.js";

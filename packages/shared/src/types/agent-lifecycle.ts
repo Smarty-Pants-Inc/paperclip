@@ -30,6 +30,35 @@ export interface AgentLifecycleOperation {
   /** Why a pause started: its holds and the company's pause reason at that moment. Runs the
    * pause stops record it, so a budget resume continues only work its own budget stopped. */
   pauseCause?: { holds: string[]; companyPauseReason: string | null };
+  /** Who asked for a termination. The terminal step's `agent.terminated` audit row names this caller. */
+  requestedBy?: AgentLifecycleRequester;
+  /** Written with the terminal state in the same transaction. The hand-over recovery worker clears it
+   * only when no open task and no live report remains on the retired agent. */
+  handover?: AgentHandoverMarker;
+}
+
+export interface AgentLifecycleRequester {
+  actorType: "user" | "agent" | "system" | "plugin";
+  actorId: string;
+  agentId?: string | null;
+  runId?: string | null;
+  agentApiKeyId?: string | null;
+}
+
+/** The named pending code a retired agent shows until its work and reports are handed over. */
+export interface AgentHandoverMarker {
+  code: "agent_handover_pending";
+  since: string;
+  /** Items the recovery worker could not move yet, each with why and when it tries again. */
+  blocked?: AgentHandoverBlockedItem[];
+}
+
+export interface AgentHandoverBlockedItem {
+  kind: "task" | "report";
+  id: string;
+  reason: string;
+  attempts: number;
+  retryAt?: string;
 }
 
 export interface AgentLifecycleRequest {
