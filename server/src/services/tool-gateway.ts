@@ -1643,8 +1643,6 @@ export function createToolGatewayService(
       inArray(toolConnections.transport, ["mcp_remote", "local_stdio", "rest_api"]),
       eq(toolConnections.status, "active"),
       eq(toolConnections.enabled, true),
-      // RFL C3: project-owned connections are never discovered on this image.
-      notProjectOwnedToolConnectionSql(),
       // A personal connection has no company-level credential to probe. A
       // credential-less health sweep can therefore mark it as errored even
       // while the responsible user's grant is valid. Keep its cached active
@@ -1715,6 +1713,9 @@ export function createToolGatewayService(
             and(
               inArray(toolConnections.id, connectionIds),
               connectedMcpConnectionFilter(companyId),
+              // RFL C3: filter ownership on the one-per-connection read, not
+              // the catalog query. The join below drops every excluded row.
+              notProjectOwnedToolConnectionSql(),
             ),
           );
         return { connectionRows, catalogRows };
