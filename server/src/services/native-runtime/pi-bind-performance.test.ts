@@ -34,4 +34,21 @@ describe("native Pi bind exchange reader persistence", () => {
     } });
     expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|nonce|prompt/);
   });
+  it("persists the budgeted admission deadline timeout code through the reader (F1)", async () => {
+    const events: RunEvent[] = [];
+    const traceContext: NonNullable<TraceInput["traceContext"]> = {
+      tracer: { startSpan: () => ({ setAttribute() {}, setStatus() {}, end() {} }) }, contextWithSpan: () => ({}),
+    };
+    const trace = createNativeRunTrace({ runId: "deadline-run", startedAtMs: 1000, traceContext, onEvent: async event => { events.push(event); } });
+    const spans = parseProviderPerformanceSpans({ code: "provider_performance_spans", spans: [{ name: "runner.pi.admission.set_model", startedAtMs: 1200, endedAtMs: 1320, outcome: "failed",
+      attributes: { timeoutCode: "pi_admission_deadline_exceeded", nonce: "PRIVATE" } }] }, 1400);
+    const execute = trace.start("native.session.execute", { startedAtMs: 1100 });
+    await recordNativeProviderPerformanceSpans(trace, spans);
+    await trace.end(execute, { endedAtMs: 1400 });
+    await trace.finish("ok");
+    const rows = events.filter(event => event.payload?.span === "runner.pi.admission.set_model");
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ level: "warn", payload: { parentSpan: "native.session.execute", outcome: "failed", timeoutCode: "pi_admission_deadline_exceeded" } });
+    expect(JSON.stringify(rows)).not.toMatch(/PRIVATE|nonce/);
+  });
 });
