@@ -109,8 +109,12 @@ Task lists, board columns, filters, search, recent navigation and task propertie
 use the same read-only display state. The task retains its execution lifecycle
 status, and the monitor banner shows when the next check is due.
 
-Automatic monitor checks pause when a task is blocked. A person can use Check now
-to request one check of a retained monitor through normal execution admission.
+Automatic monitor checks pause when a task is blocked or todo. Agent-owned tasks
+in either state can retain or schedule a monitor; issue responses expose
+`automaticMonitorChecksPaused` and the UI says **Automatic checks paused**, not
+an overdue countdown. Checks resume when the task returns to in_progress or
+in_review. A person can use Check now to request one check of a retained monitor
+through normal execution admission.
 Dependencies, recovery, pause, budgets and ownership still apply. Provider-usage
 recovery stays paused until the task resumes. A check that
 cannot start reports that result instead of claiming it was queued.

@@ -63,7 +63,7 @@ export function areAutomaticMonitorChecksPaused(issue: Pick<MonitorIssueLike, "s
 
 export function canCheckIssueMonitorNow(issue: Pick<MonitorIssueLike, "status">, serviceName?: string | null): boolean {
   return !areAutomaticMonitorChecksPaused(issue) ||
-    (issue.status === "blocked" && serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME);
+    ((issue.status === "blocked" || issue.status === "todo") && serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME);
 }
 
 function toTimestamp(value: MonitorDate): number {

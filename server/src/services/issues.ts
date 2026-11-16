@@ -212,6 +212,7 @@ import {
 } from "./native-runtime/native-chat-review-presentation.js";
 import {
   applyIssueExecutionPolicyTransition,
+  applyIssueMonitorPolicyTransition,
   buildInitialIssueMonitorFields,
   normalizeIssueExecutionPolicy,
 } from "./issue-execution-policy.js";
@@ -1980,6 +1981,7 @@ type IssueScheduledRetryRow = {
   errorCode?: string | null;
 };
 type IssueWithLabels = IssueRow & {
+  automaticMonitorChecksPaused: boolean;
   labels: IssueLabelRow[];
   labelIds: string[];
   watchdog?: IssueWatchdogSummary | null;
@@ -3395,6 +3397,7 @@ async function withIssueLabels(
     const issueLabels = labelsByIssueId.get(row.id) ?? [];
     return {
       ...row,
+      automaticMonitorChecksPaused: Boolean(row.monitorNextCheckAt) && !["in_progress", "in_review"].includes(row.status),
       labels: issueLabels,
       labelIds: issueLabels.map((label) => label.id),
       watchdog: watchdogByIssueId.get(row.id) ?? null,
@@ -12033,6 +12036,48 @@ export function issueService(db: Db) {
           throw conflict("The task's execution changed while this status change was checked. Read the task again and retry.", {
             code: "issue_execution_lock_changed",
           });
+        }
+        // Direct plugin/service writes must obey the same monitor transition as
+        // the route. Do not replay review-stage transitions or touch claims on
+        // unrelated edits. The locked row is authoritative for status/assignment.
+        const nextRawPolicy = issueData.executionPolicy === undefined ? receiptExisting.executionPolicy : issueData.executionPolicy;
+        const previousMonitor = parseObject(receiptExisting.executionPolicy).monitor ?? null;
+        const nextMonitor = parseObject(nextRawPolicy).monitor ?? null;
+        const monitorExplicitlyUpdated = issueData.executionPolicy !== undefined && !isDeepStrictEqual(
+          normalizeIssueExecutionPolicy(receiptExisting.executionPolicy)?.monitor ?? null,
+          normalizeIssueExecutionPolicy(nextRawPolicy)?.monitor ?? null,
+        );
+        const monitorIssueChanged = (patch.status !== undefined && patch.status !== receiptExisting.status)
+          || (patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== receiptExisting.assigneeAgentId)
+          || (patch.assigneeUserId !== undefined && patch.assigneeUserId !== receiptExisting.assigneeUserId);
+        if (monitorExplicitlyUpdated || (monitorIssueChanged && (previousMonitor || nextMonitor))) {
+          const monitorPatch = applyIssueMonitorPolicyTransition({
+            issue: receiptExisting,
+            policy: normalizeIssueExecutionPolicy(nextRawPolicy),
+            previousPolicy: normalizeIssueExecutionPolicy(receiptExisting.executionPolicy),
+            requestedStatus: patch.status,
+            requestedAssigneePatch: {
+              ...(patch.assigneeAgentId !== undefined ? { assigneeAgentId: patch.assigneeAgentId } : {}),
+              ...(patch.assigneeUserId !== undefined ? { assigneeUserId: patch.assigneeUserId } : {}),
+            },
+            actor: { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            monitorExplicitlyUpdated,
+          }).patch;
+          if (monitorPatch.executionPolicy !== undefined) {
+            // Clearing owns only the monitor, not forward-compatible policy keys.
+            const { monitor: _monitor, ...retainedPolicy } = parseObject(nextRawPolicy);
+            monitorPatch.executionPolicy = Object.keys(retainedPolicy).length ? retainedPolicy : null;
+          }
+          if (monitorPatch.executionState !== undefined && patch.executionState !== undefined) {
+            const suppliedState = parseObject(patch.executionState);
+            // Route/native callers may have already recorded why a monitor was
+            // cleared. Revalidation must not turn cancelled/done into manual.
+            const suppliedMonitor = parseObject(suppliedState.monitor);
+            const monitor = !nextMonitor && patch.monitorNextCheckAt === null && suppliedMonitor.status === "cleared"
+              ? suppliedMonitor : parseObject(monitorPatch.executionState).monitor;
+            monitorPatch.executionState = { ...suppliedState, monitor };
+          }
+          Object.assign(patch, monitorPatch);
         }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
