@@ -3348,10 +3348,11 @@ export function agentRoutes(
     });
     if (!selection) return undefined;
     const nativePi = adapterType === "paperclip_runner" && config.provider === "pi_rpc";
-    const checkModelCatalog = validateModelCatalog || nativePi;
     const modelHarness = nativePi ? "pi_runtime" : agentHarnessType(adapterType, config);
-    const routing = checkModelCatalog ? aiConnectionMetadataSchema.parse(selection.connection.config.ai).routing : undefined;
-    if (checkModelCatalog && routing?.models.length && !routing.models.some(model =>
+    // Catalog admission belongs to explicit default-model edits, not ordinary
+    // writes or hires inheriting a caller's already-selected runtime.
+    const routing = validateModelCatalog ? aiConnectionMetadataSchema.parse(selection.connection.config.ai).routing : undefined;
+    if (validateModelCatalog && routing?.models.length && !routing.models.some(model =>
       aiRoutingModel(routing, modelHarness, model.id) === config.model)) {
       const acceptedModels = routing.models.map(model => aiRoutingModel(routing, modelHarness, model.id));
       throw unprocessable(`Choose a default model available on the selected connection: ${acceptedModels.join(", ")}`);
