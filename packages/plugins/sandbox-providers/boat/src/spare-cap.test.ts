@@ -445,7 +445,7 @@ describe("Spare create cap: proof of use, refusal event and hourly ceiling", () 
     const [event] = cappedEvents(h, "churn_cap");
     expect(event, "an info-level create_capped event at the refusal").toBeDefined();
     expect(event.value).toMatchObject({ companyId: h.company, environmentId: h.env, reason: "churn_cap",
-      churnCreates: 12, churnCap: 12, ceiling: 60 });
+      churnCreates: 12, churnCap: 12, ceiling: 90 });
     expect(event.value).toHaveProperty("allCreates");
     expect(event.value).toHaveProperty("refusals");
   });

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createReadySpareClaimStore, MAX_READY_SPARES, ReadySpareKeeper, readySpareConfigHash, readySpareCount,
   readySpareDemandTarget, readySpareDemandWindowMinutes, readySpareEnvironmentIds, readySpareIdleMinutes,
-  readySpareMax, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
+  readyCreateCeilingPerHour, readySpareMax, readySparePoolKey, type ReadySpare, type ReadySpareKey, type ReadySpareOperations,
 } from "./ready-spares.js";
 
 const start = Date.parse("2026-11-15T00:00:00.000Z");
@@ -41,6 +41,11 @@ function operations(records: ReadySpare[] = []) {
 }
 
 describe("Boat ready spare keeper", () => {
+  // Keep: #20869 create-cap failure path; omitted company config must retain measured headroom.
+  it("defaults the create ceiling to 90 when company config omits it", () => {
+    expect(readyCreateCeilingPerHour({})).toBe(90);
+  });
+
   it("has a hard company-config bound and keys create-shaping fields independent of object order", () => {
     expect(MAX_READY_SPARES).toBe(5);
     expect(readySpareCount({ spares: 1 })).toBe(1);
