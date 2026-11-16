@@ -17,6 +17,7 @@ import { createAgentLifecycle as lifecycleWithEffects } from "../modules/agent-l
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { issueService } from "../services/issues.js";
+import { agentHandoverService } from "../services/agent-handover.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Only the external Stop delivery boundary is suspended. Production HTTP,
@@ -183,7 +184,8 @@ describe("#20389 RFL retirement regressions", () => {
     }, 60_000);
   }
 
-  it("retirement preserves a completed human wake receipt on an unfinished task", async () => {
+  // F3 withdrawn by RFL 05:43Z (upstream revokes human direction by design, #14775): replaced by upstream's intent.
+  it("retirement hand-over revokes the human direction: the moved task's completed receipt is cancelled, visibly", async () => {
     const f = await seed();
     const finishedAt = new Date("2026-11-01T12:00:00.000Z"), runId = randomUUID();
     const [run] = await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.workerId, status: "succeeded", finishedAt, contextSnapshot: { issueId: f.task.id } }).returning();
@@ -191,12 +193,18 @@ describe("#20389 RFL retirement regressions", () => {
       requestedByActorType: "user", requestedByActorId: f.userId, payload: { issueId: f.task.id }, finishedAt }).returning();
     const response = await f.terminate("PATCH");
     expect(response.status, response.text).toBe(200);
-    // Finish real lifecycle work too: a fix must not merely move the rewrite later.
     const worker = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runHost: async () => "complete", runPlugin: async () => "complete" });
     workers.push(worker);
     await worker.process(f.workerId);
     expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated" });
+    // Retirement itself does not touch the receipt; the hand-over reassigns the task, which revokes the direction.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id)))[0]).toEqual(receipt);
+    await agentHandoverService(db).processAgent(f.workerId);
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId });
+    const [revoked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id));
+    expect(revoked).toMatchObject({ status: "cancelled", runId, requestedByActorId: f.userId });
+    expect(revoked!.updatedAt.getTime()).toBeGreaterThan(receipt!.updatedAt.getTime());
+    // The run that served the direction is history and stays as it was.
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(run);
   }, 60_000);
 
@@ -309,7 +317,8 @@ describe("#20389 RFL retirement regressions", () => {
     expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId });
   }, 60_000);
 
-  it("ordinary assignment preserves all finished human receipts while cancelling pending direction", async () => {
+  // F3 withdrawn by RFL 05:43Z: ordinary reassignment revokes the human direction, finished receipts included.
+  it("ordinary assignment revokes human direction: finished and pending user receipts are cancelled, visibly", async () => {
     const f = await seed(), finishedAt = new Date("2026-11-01T12:00:00.000Z"), runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.workerId, status: "succeeded", finishedAt });
     const finished = await db.insert(agentWakeupRequests).values(
@@ -325,11 +334,10 @@ describe("#20389 RFL retirement regressions", () => {
       })),
     ).returning();
     await issueService(db).update(f.task.id, { assigneeAgentId: f.managerId, assigneeUserId: null });
-    for (const receipt of finished) {
-      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0]).toEqual(receipt);
-    }
-    for (const receipt of pending) {
-      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0]).toMatchObject({ status: "cancelled", finishedAt: expect.any(Date) });
+    for (const receipt of [...finished, ...pending]) {
+      const [after] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
+      expect(after).toMatchObject({ status: "cancelled", finishedAt: expect.any(Date), requestedByActorId: f.userId });
+      expect(after!.updatedAt.getTime()).toBeGreaterThan(receipt.updatedAt.getTime());
     }
   }, 60_000);
 });
