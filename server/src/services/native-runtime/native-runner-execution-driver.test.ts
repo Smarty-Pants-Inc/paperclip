@@ -206,7 +206,7 @@ describe("shared Runner execution driver", () => {
     expect(route.githubAccess!.getSessionBinding({ ...binding, runId: "foreign-run" })).toBeNull();
     const frame = { kind: "github_access.http", requestId: "request-1" };
     await route.githubAccess!.handleRequest(frame, binding);
-    expect(access.handleRunnerIngressHttpRequest).toHaveBeenCalledWith(frame, binding);
+    expect(access.handleRunnerIngressHttpRequest).toHaveBeenCalledWith(frame, binding, false);
     await registration.release();
   });
 
