@@ -1,6 +1,28 @@
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
 
+/** Shell transforms an agent used to print a bound PEM in the 11-14 gate (row 5.5). */
+export function pemTransformForms(privateKeyPem: string) {
+  const transform = (command: string, args: string[]) => execFileSync(command, args, {
+    input: privateKeyPem, encoding: "utf8",
+  });
+  return [
+    { name: "raw", text: privateKeyPem },
+    { name: "cut -c1-40", text: transform("cut", ["-c1-40"]) },
+    { name: "awk '{print}'", text: transform("awk", ["{print}"]) },
+    { name: "fold -w 20", text: transform("fold", ["-w", "20"]) },
+    { name: "fold -w 8", text: transform("fold", ["-w", "8"]) },
+    { name: "tr -d '\\n'", text: transform("tr", ["-d", "\n"]) },
+    { name: "JSON.stringify (json.dumps)", text: JSON.stringify(privateKeyPem) },
+  ];
+}
+
+/** Every 32-character window of a PEM body, the leak measure used at the gate. */
+export function pemBodyWindows(privateKeyPem: string) {
+  const body = privateKeyPem.split(/\r?\n/).filter(line => line && !line.startsWith("-----")).join("").replace(/=+$/, "");
+  return Array.from({ length: body.length - 31 }, (_, index) => body.slice(index, index + 32));
+}
+
 /** Disposable test identity, never an account credential. Shared with export tests. */
 export function agentIdentityRedactionVectors() {
   const privateKeyPem = generateKeyPairSync("rsa", { modulusLength: 1024 })
