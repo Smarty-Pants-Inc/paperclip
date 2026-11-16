@@ -468,7 +468,7 @@ describe("project connection writer admission (round-4 B)", () => {
     composeFinish(f); // This connection requests and verifies only A (101).
     const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor());
     expect(result.connection).toMatchObject({ status: "active", enabled: true });
-    expect(result.connection.config.projectScope).toMatchObject({ approvedRepositoryIds: [101, 102] });
+    expect(result.connection).toMatchObject({ config: { projectScope: { approvedRepositoryIds: [101, 102] } } });
     expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id)))
       .toMatchObject([{ details: { verifiedRepositoryIds: [101] } }]);
   });
