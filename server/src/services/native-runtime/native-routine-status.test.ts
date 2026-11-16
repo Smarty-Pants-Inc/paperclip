@@ -66,7 +66,7 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "arbitrating", resultId });
     return { issueId, invocationId, runId, assessmentId, priorStatusVersion: priorIssue.statusVersion, priorDecisionId: priorIssue.lastStatusDecisionId };
   }
-  async function commit(f: Awaited<ReturnType<typeof seed>>, status: "done" | "blocked" | "cancelled" | "in_progress" | "in_review", executor: Db = db) {
+  async function commit(f: Awaited<ReturnType<typeof seed>>, status: "done" | "blocked" | "cancelled" | "in_progress" | "in_review" | "todo", executor: Db = db) {
     const decision: NativeStatusDecision = { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status, toStatus: status,
       reasonCode: "routine_status_test", unblockDescriptor: null, effects: [] };
     return commitNativeStatusDecision({ db: executor, companyId, issueId: f.issueId, runId: f.runId, assessmentId: f.assessmentId,
@@ -201,7 +201,7 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
     expect((await db.select().from(routineRuns).where(eq(routineRuns.id, f.invocationId)))[0]).toEqual(before);
     expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("done");
   });
-  it.each(["blocked", "in_review"] as const)("handles a scheduled monitor when a native decision moves to %s", async status => {
+  it.each(["blocked", "todo", "in_review", "cancelled"] as const)("handles a scheduled monitor when a native decision moves to %s", async status => {
     const f = await seed();
     const nextCheckAt = new Date(Date.now() + 16 * 60_000);
     await db.update(issues).set({
@@ -220,12 +220,12 @@ if (!support.supported) console.warn(`Skipping native routine status tests: ${su
       eq(activityLog.entityType, "issue"),
       eq(activityLog.entityId, f.issueId),
     ));
-    if (status === "blocked") {
+    if (status === "cancelled") {
       expect(saved).toMatchObject({ monitorNextCheckAt: null, monitorWakeRequestedAt: null,
-        executionState: { monitor: { status: "cleared", clearReason: "invalid_status" } } });
+        executionState: { monitor: { status: "cleared", clearReason: "cancelled" } } });
       expect(clearEvents).toHaveLength(1);
       expect(clearEvents[0]).toMatchObject({ actorType: "system", actorId: "native-status-committer", runId: f.runId,
-        details: { reason: "invalid_status", previousNextCheckAt: nextCheckAt.toISOString(), notes: "Check status" } });
+        details: { reason: "cancelled", previousNextCheckAt: nextCheckAt.toISOString(), notes: "Check status" } });
     } else {
       expect(saved.monitorNextCheckAt).toEqual(nextCheckAt);
       expect(saved.executionState).toMatchObject({ monitor: { status: "scheduled", scheduledBy: "assignee" } });

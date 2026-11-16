@@ -128,8 +128,9 @@ describeEmbeddedPostgres("native task monitors", () => {
     expect((await value.read()).monitorNextCheckAt?.toISOString()).toBe(value.monitor.nextCheckAt);
   });
 
-  it("persists a monitor and its audit atomically while preserving review policy", async () => {
+  it.each(["in_progress", "blocked", "todo"] as const)("persists a monitor and its audit atomically on %s while preserving review policy", async status => {
     const value = await fixture();
+    await db.update(issues).set({ status }).where(eq(issues.id, value.issueId));
     const policy = { mode: "normal", commentRequired: false, stages: [{ id: randomUUID(), type: "review", approvalsNeeded: 1, participants: [{ type: "user", userId: "reviewer" }] }] };
     await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, value.issueId));
     const result = await value.call({ idempotencyKey: "schedule", monitor: value.monitor });
@@ -137,7 +138,7 @@ describeEmbeddedPostgres("native task monitors", () => {
     const saved = await value.read();
     expect(saved.executionPolicy).toMatchObject(policy);
     expect(saved.monitorNextCheckAt?.toISOString()).toBe(value.monitor.nextCheckAt);
-    expect(saved.status).toBe("in_progress");
+    expect(saved.status).toBe(status);
     const audits = await db.select().from(activityLog).where(and(eq(activityLog.entityId, value.issueId), eq(activityLog.action, "issue.monitor_scheduled")));
     expect(audits).toHaveLength(1);
     expect(audits[0]).toMatchObject({ runId: value.runId, agentId: value.agentId });
@@ -229,7 +230,7 @@ describeEmbeddedPostgres("native task monitors", () => {
     ]) await expect(value.call({ idempotencyKey: randomUUID(), monitor })).rejects.toThrow();
     await db.update(issues).set({ monitorAttemptCount: 1 }).where(eq(issues.id, value.issueId));
     await expect(value.call({ idempotencyKey: "exhausted", monitor: { ...value.monitor, maxAttempts: 1 } })).rejects.toThrow();
-    for (const status of ["blocked", "backlog", "done", "cancelled"] as const) {
+    for (const status of ["backlog", "done", "cancelled"] as const) {
       await db.update(issues).set({ status }).where(eq(issues.id, value.issueId));
       await expect(value.call({ idempotencyKey: randomUUID(), monitor: value.monitor })).rejects.toThrow();
     }

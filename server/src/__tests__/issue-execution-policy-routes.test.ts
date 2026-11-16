@@ -798,6 +798,26 @@ describe("issue execution policy routes", () => {
     );
   });
 
+  it.each(["blocked", "todo"] as const)("retains an explicitly scheduled monitor on a %s task", async status => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", companyId: "company-1", status,
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333", assigneeUserId: null,
+      createdByUserId: "local-board", identifier: "PAP-1006", title: "Paused monitor",
+      executionPolicy: null, executionState: null, monitorAttemptCount: 0,
+      monitorNextCheckAt: null, monitorLastTriggeredAt: null, monitorNotes: null, monitorScheduledBy: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch, updatedAt: new Date() }));
+    const res = await request(await createApp()).patch(`/api/issues/${issue.id}`)
+      .send({ executionPolicy: { monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z", notes: "External deploy" } } });
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe(status);
+    expect(res.body.executionPolicy.monitor).toMatchObject({ nextCheckAt: "2099-01-01T00:00:00.000Z", scheduledBy: "board" });
+    expect(mockIssueService.update).toHaveBeenCalledWith(issue.id,
+      expect.objectContaining({ monitorNextCheckAt: new Date("2099-01-01T00:00:00.000Z") }));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
   it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -1177,7 +1197,7 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
-  it.each(["in_progress", "blocked"])("triggers a scheduled monitor on an %s task from the dedicated route", async (status) => {
+  it.each(["in_progress", "blocked", "todo"])("triggers a scheduled monitor on an %s task from the dedicated route", async (status) => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",

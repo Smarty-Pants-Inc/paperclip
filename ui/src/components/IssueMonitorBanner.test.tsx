@@ -327,9 +327,9 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     flushSync(() => root.unmount());
   });
 
-  it("offers a manual check on a blocked task without promising an automatic wake", () => {
+  it.each(["blocked", "todo"] as const)("offers a manual check on a %s task without promising an automatic wake", status => {
     const onCheckNow = vi.fn();
-    const issue = { ...issueWithMonitor(new Date(NOW.getTime() - 12 * 60_000).toISOString()), status: "blocked" as const };
+    const issue = { ...issueWithMonitor(new Date(NOW.getTime() - 12 * 60_000).toISOString()), status };
     const root = createRoot(container);
     flushSync(() => root.render(<>
       <IssueMonitorBanner issue={issue} onCheckNow={onCheckNow} />
@@ -344,7 +344,7 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     flushSync(() => root.unmount());
   });
 
-  it.each(["backlog", "todo"] as const)("does not offer a monitor check on a %s task", (status) => {
+  it.each(["backlog"] as const)("does not offer a monitor check on a %s task", (status) => {
     const issue = { ...issueWithMonitor(NOW.toISOString()), status };
     const root = createRoot(container);
     flushSync(() => root.render(<>
@@ -357,8 +357,8 @@ describe("IssueMonitorBanner / IssueMonitorComposerStrip rendering", () => {
     flushSync(() => root.unmount());
   });
 
-  it("keeps blocked quota recovery paused until the task resumes", () => {
-    const issue = { ...issueWithMonitor(NOW.toISOString()), status: "blocked" as const };
+  it.each(["blocked", "todo"] as const)("keeps %s quota recovery paused until the task resumes", status => {
+    const issue = { ...issueWithMonitor(NOW.toISOString()), status };
     issue.executionState!.monitor!.serviceName = PROVIDER_QUOTA_MONITOR_SERVICE_NAME;
     const root = createRoot(container);
     flushSync(() => root.render(<>
