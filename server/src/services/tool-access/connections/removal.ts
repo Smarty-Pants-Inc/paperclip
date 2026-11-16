@@ -12,7 +12,7 @@ import { removeSlackRegistration } from "../../chat-slack-registration-cleanup.j
 import { activityLog, chatEndpoints } from "@paperclipai/db";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "../../project-connection-admission.js";
 import { lockProjectConnectionIdentities } from "../../project-connection-arbitration.js";
-import { assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../../project-connection-retirement.js";
+import { abortProjectConnectionMigration, assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../../project-connection-retirement.js";
 import { isBrowserUseConnection } from "../../browser-use-client.js";
 import { browserUseService } from "../../browser-use.js";
 import { emitConnectionUpdated } from "../../connector-telemetry.js";
@@ -397,6 +397,7 @@ async function removeConnection(
         oauthStatesDiscarded: oauthStates.length, tokenIssuanceHashesCleared: issuanceHashes.length, runtimeSlotsStopped: 0,
         gatewayTokensRevoked, gatewaySessionsRevoked, applicationArchived, externalCredentialCleanup: null,
       };
+      await abortProjectConnectionMigration(tx, { connection, actor });
       const { activityId } = await writeProjectConnectionReceipt(tx, { connection: archived, actor, action: "tool_connection.archived", reason: "project_retired" });
       const [activity] = await tx.update(activityLog).set({ details: sql`${activityLog.details} || ${JSON.stringify({ removal, projectDoneConfirmed: confirmation !== undefined })}::jsonb` }).where(and(
         eq(activityLog.companyId, connection.companyId), eq(activityLog.id, activityId),

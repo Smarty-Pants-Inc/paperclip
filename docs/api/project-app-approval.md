@@ -107,8 +107,15 @@ archiving it. Its receipt is still spent in the same transaction. A consumed
 predecessor reserves nothing for other writers and cannot receive a second
 approval. Only its own consuming connection may read custody from it. H may
 revoke it while live too, fencing later releases/refresh exactly as for an
-archived source. D owns eventual archival on migration completion or abort;
-no source is deleted. The custody branch's seam compatibility tests do not
+archived source. Under RFL's 09:36Z replacement, D archives S only after the
+last consumer completes: finish alone never archives a shared predecessor.
+The existing recipient-local legacy install cleanup is the completion boundary:
+S is archived atomically only when no legacy installs remain and its linked
+consumers are active, verified, non-pending connections. Credentials, grants and
+history remain readable; no source is deleted. Aborting a pending candidate
+instead releases only its own consumption in the retirement transaction, leaving
+S live, its genuine receipt unconsumed, and its reservation intact. A failed
+finish, cleanup, or abort transaction cannot commit half of this transition. The custody branch's seam compatibility tests do not
 substitute for the integration branch's full D migration/retirement suite.
 
 Only project-owned connections (`projectId` non-null) require this receipt:
