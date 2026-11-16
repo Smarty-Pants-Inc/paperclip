@@ -60,28 +60,13 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
 }): Promise<boolean> {
   if (!input.manifest.sourceProviderLeaseId || input.manifest.normalizedSessionId !== input.normalizedSessionId
     || input.manifest.sourceProviderLeaseId === input.targetProviderLeaseId) return false;
-  const leases = await db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, input.companyId),
-    eq(environmentLeases.providerLeaseId, input.manifest.sourceProviderLeaseId),
-  ));
-  const source = leases.filter(lease => lease.companyId === input.companyId
-    && lease.providerLeaseId === input.manifest.sourceProviderLeaseId);
-  const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
-  if (tips.length !== 1) return false;
-  const lease = tips[0]!;
-  const predecessors = retiredReusableLeasePredecessors(lease, source.filter(row => row.id !== lease.id));
-  if (!predecessors) return false;
-  // Warm handoffs leave stamps on their original owner rows, but owner order
-  // does not establish checkpoint chronology. Select by completion time before
-  // matching the manifest; conflicting latest-time stamps are ambiguous.
-  // Retirement and the supersession claim still belong exclusively to the tip.
-  const stamps = [lease, ...predecessors]
-    .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, lease.providerLeaseId!))
-    .filter(candidate => candidate !== null)
-    .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
-  const stamp = stamps[0];
-  if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
-    && !isDeepStrictEqual(candidate, stamp))) return false;
+  const chain = await loadNativeHarnessBackupLeaseChain(db, {
+    companyId: input.companyId, providerLeaseId: input.manifest.sourceProviderLeaseId });
+  if (!chain) return false;
+  const lease = chain.tip;
+  // Retirement and the supersession claim belong exclusively to the tip.
+  const stamp = newestNativeHarnessBackupStampOnChain(chain);
+  if (!stamp) return false;
   if (stamp.manifestSha256 !== input.manifestSha256
     || stamp.normalizedSessionId !== input.normalizedSessionId
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
@@ -95,6 +80,46 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
 }
 
 type SourceLease = typeof environmentLeases.$inferSelect;
+type NativeHarnessBackupLeaseChain = { tip: SourceLease; predecessors: SourceLease[] };
+
+/**
+ * The verified reusable-lease chain of one allocation in one company: its only
+ * tip (no outgoing handoff) and the retired predecessors that tip was handed
+ * from (`retiredReusableLeasePredecessors`). Null when the rows do not form one
+ * verified chain; callers then keep their single-row rule.
+ */
+export async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
+  companyId: string; providerLeaseId: string;
+}): Promise<NativeHarnessBackupLeaseChain | null> {
+  if (!input.providerLeaseId) return null;
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId),
+    eq(environmentLeases.providerLeaseId, input.providerLeaseId),
+  ));
+  const source = leases.filter(lease => lease.companyId === input.companyId
+    && lease.providerLeaseId === input.providerLeaseId);
+  const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
+  if (tips.length !== 1) return null;
+  const tip = tips[0]!;
+  const predecessors = retiredReusableLeasePredecessors(tip, source.filter(row => row.id !== tip.id));
+  return predecessors ? { tip, predecessors } : null;
+}
+
+/**
+ * Warm handoffs leave stamps on their original owner rows, but owner order
+ * does not establish checkpoint chronology. The newest stamp for the chain's
+ * allocation by completion time; conflicting latest-time stamps are ambiguous.
+ */
+export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain) {
+  const stamps = [chain.tip, ...chain.predecessors]
+    .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, chain.tip.providerLeaseId!))
+    .filter(candidate => candidate !== null)
+    .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
+  const stamp = stamps[0];
+  if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
+    && !isDeepStrictEqual(candidate, stamp))) return null;
+  return stamp;
+}
 type RetiredSourceInput = { companyId: string; currentRunId: string; targetProviderLeaseId?: string | null };
 
 /**
@@ -128,7 +153,8 @@ function destroyedSource(lease: SourceLease): boolean {
 /** Shared by backup restore and compatible environment draining: a valid old
  * archive is not a checkpoint of provider work that happened after it. */
 export async function nativeHarnessBackupHasLaterProviderWork(db: Db, input: {
-  companyId: string; currentRunId: string; normalizedSessionId: string; completedAt: string;
+  /** Omitted when no run is excluded (custody for destroying a source). */
+  companyId: string; currentRunId?: string | null; normalizedSessionId: string; completedAt: string;
 }): Promise<boolean> {
   const later = await db.select({ runId: heartbeatRunEvents.runId }).from(heartbeatRunEvents)
     .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, heartbeatRunEvents.runId))
@@ -136,7 +162,7 @@ export async function nativeHarnessBackupHasLaterProviderWork(db: Db, input: {
       eq(heartbeatRunEvents.companyId, input.companyId),
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.nativeSessionId, input.normalizedSessionId),
-      ne(heartbeatRuns.id, input.currentRunId),
+      input.currentRunId ? ne(heartbeatRuns.id, input.currentRunId) : undefined,
       inArray(heartbeatRunEvents.eventType, [...NATIVE_PROVIDER_DURABLE_EVENT_TYPES]),
       gt(heartbeatRunEvents.createdAt, new Date(input.completedAt)),
     )).limit(1);
