@@ -198,6 +198,10 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   it("does not post a Slack reply locally from the durable finalizer's terminal projection", async () => {
     const f = await reviewerRun("slack", "owns_terminal_projection");
     expect(await replies(f.issueId, f.runId)).toEqual([]);
+    // The refusal is named on the run, never silent.
+    expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.runId),
+      eq(heartbeatRunEvents.eventType, "run.response_publication.refused"))))
+      .toEqual([expect.objectContaining({ payload: { reason: "external_chat_context", source: "chat:slack" } })]);
     expect(await db.select().from(chatPublications).where(eq(chatPublications.endpointId, f.endpointId))).toEqual([]);
   });
 

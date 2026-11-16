@@ -72,6 +72,7 @@ import {
   heldByAnotherRun,
 } from "./status-arbiter.js";
 import { recordNativeWorkAssessment } from "./work-assessments.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import {
   commitNativeStatusDecision,
   NativeStatusRaceError,
@@ -1201,8 +1202,16 @@ async function recoverCommittedNativeChatResponseInScope(
         && run.contextSnapshot.conversationSessionGeneration === issue.conversationSessionGeneration;
       // A deferred ordinary-task review still needs its recorded final reply.
       // Publishing that reply must not resolve the interaction or the task.
+      // GitHub replies are authored through task-scoped tools, so a GitHub-only
+      // chat run's final prose on an ordinary task is an internal agent write,
+      // exactly as heartbeat's live completion presents it. A real external
+      // chat reply (Slack, email) keeps its own presentation path.
+      const externalChatContext = isExternalChatPresentationContext(run.contextSnapshot);
+      const githubTaskReply = externalChatContext && !conversation &&
+        record(run.contextSnapshot).source === "chat:github" &&
+        (await resolveChatRunPresentationAuthorizationReason(tx, input)) === "internal_agent_write";
       const ordinaryTaskReply = (!conversation || currentConversation) &&
-        !isExternalChatPresentationContext(run.contextSnapshot) &&
+        (!externalChatContext || githubTaskReply) &&
         ((result.reportedWorkDisposition === "done" && terminal.reportedWorkDisposition === "done") ||
           (!conversation && result.reportedWorkDisposition === "needs_review" && terminal.reportedWorkDisposition === "needs_review") ||
           // A conversation turn can yield while an approval, an execution
@@ -1213,6 +1222,15 @@ async function recoverCommittedNativeChatResponseInScope(
         terminal.runTerminalState === "succeeded" &&
         terminal.turnTerminalState === "completed" &&
         (ordinaryTaskReply || blockedTaskReply);
+      if (!taskReplyEligible && externalChatContext && ["done", "needs_review"].includes(String(result.reportedWorkDisposition))) {
+        // Never refuse an accepted task reply silently: name why on the run.
+        await appendHeartbeatRunEvent(tx, {
+          companyId: input.companyId, runId: run.id, agentId: run.agentId,
+          eventType: "run.response_publication.refused", stream: "system", level: "warn",
+          message: "The accepted final reply was not presented on the task: its run answers an external chat",
+          payload: { reason: "external_chat_context", source: String(record(run.contextSnapshot).source ?? "") },
+        });
+      }
       const replyAuthorization = taskReplyEligible ? await resolveChatRunPresentationAuthorizationReason(tx, input) : null;
       const externalChatReply = blockedTaskReply &&
         isExternalChatPresentationContext(run.contextSnapshot, replyAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON);
