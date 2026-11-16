@@ -34,6 +34,23 @@ export class AgentDirectoryOperationBusyError extends HttpError {
 }
 const completed = new Set(["saved", "unchanged", "resolved", "unavailable"]);
 const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
+// Service facades and recovery collectors share these in-process saves. Track
+// the whole operation (including queued locks and receipt/cleanup writes), not
+// the native run: a detached provider may keep running on the next controller.
+const pendingAgentFileCheckpoints = new Set<Promise<void>>();
+export function trackAgentFileCheckpoint<T>(operation: Promise<T>): Promise<T> {
+  const settled = operation.then(() => undefined, () => undefined);
+  pendingAgentFileCheckpoints.add(settled);
+  void settled.then(() => pendingAgentFileCheckpoints.delete(settled));
+  return operation;
+}
+
+/** Join only saves already started; never collect, stop or finalize a run. */
+export async function drainAgentFileCheckpoints(): Promise<void> {
+  while (pendingAgentFileCheckpoints.size > 0) {
+    await Promise.all([...pendingAgentFileCheckpoints]);
+  }
+}
 const key = (row: Pick<Copy, "companyId" | "runId">) => `${row.companyId}:${row.runId}`;
 function sandboxTransferRoot(row: Copy, remoteCwd: string): string {
   const origin = typeof row.receipt?.materializationRunId === "string" ? row.receipt.materializationRunId : String(row.receipt?.directoryRunId ?? row.runId);
@@ -679,8 +696,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable,
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
-    checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint"),
-    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => serial(row, current => collectStopped(current, target), "agent_directory_collect"),
+    checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint")),
+    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => collectStopped(current, target), "agent_directory_collect")),
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);
       if (!current) return;
