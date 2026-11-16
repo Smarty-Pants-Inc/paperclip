@@ -120,6 +120,9 @@ async function assertRecipients(db: Database, companyId: string, projectId: stri
   }
 }
 
+/** Workspace metadata is editable by project workers. These IDs are only
+ * current repository hints; every caller must intersect them with the saved
+ * primary approval (never turn this result into approvedRepositoryIds). */
 export async function projectConnectionRepositoryIds(db: Database, companyId: string, projectId: string, names?: readonly string[]): Promise<number[]> {
   const workspaces = await db.select().from(projectWorkspaces).where(and(eq(projectWorkspaces.companyId, companyId), eq(projectWorkspaces.projectId, projectId)));
   const saved = workspaces.flatMap(w => {
@@ -199,7 +202,25 @@ export async function assertProjectConnectionAdmission(
     );
   } else if (!input.targetAgentIds?.length) throw forbidden("Project credential use requires an explicit server-derived recipient", { code: "project_connection_target_outside_project" });
   await assertRecipients(db, companyId, projectId, lead.id, input.targetAgentIds ?? []);
-  if (!scope) return; // First-bind authority checked; trusted custody is required by preflight below.
+  if (!scope) {
+    // A new take must not launder a lead/worker's workspace edit into approval.
+    // The primary's original server-written snapshot survives archive. Match
+    // one approval, not a union of historical or other-project repository sets.
+    // First binding (no history) still requires the trusted human handoff at
+    // preflight; this preliminary evaluator cannot create that evidence.
+    if (input.proposedRepositoryIds !== undefined) {
+      const requested = input.proposedRepositoryIds;
+      if (!repositoryIds(requested)) throw forbidden("Project connections require a non-empty approved repository subset", { code: "project_connection_repository_not_approved" });
+      const retained = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.projectId, projectId)));
+      const approvals = retained.map(row => readProjectConnectionScope(row)!);
+      if (retained.length && !approvals.some(approval => approval.responsibleUserId === human
+        && approval.approvedByAgentId === primary.id && approval.approvedLeadAgentId === lead.id
+        && requested.every(id => approval.approvedRepositoryIds.includes(id)))) {
+        throw forbidden("Workspace edits do not change this project's primary-ratified repository IDs. A new primary approval is required.", { code: "project_connection_repository_not_approved" });
+      }
+    }
+    return;
+  }
   if (operation === "use" && (scope.migrationPending || connection!.status !== "active" || !connection!.enabled)) throw conflict("Verify and finish this active project candidate before using it.", { code: "project_connection_migration_pending" });
   const app = parseGitHubAppConfig(connection!.config.methodConfig);
   if (`github.com/github-app-installation/${app.installationId}` !== scope.installationKey
