@@ -1,9 +1,10 @@
-import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import type { HarnessDriver, PersistedHarnessSession } from "../../contracts/harness-driver.js";
 import { PiRpcDriver } from "./pi-rpc-driver.js";
+import { bindContent, type PiBindCommand, type PiBindResponse } from "./pi-bind-protocol.js";
 import { quarantineInvalidPiSessionFile } from "./pi-session-file.js";
 import type { PiRpcRecord, PiRpcTransport, PiRpcTransportOptions } from "./pi-rpc-transport.js";
 
@@ -146,5 +147,89 @@ describe("Pi driver verified cold recovery", () => {
       expect(f.transport.exited).toBe(true); expect(f.requests).not.toContain("prompt");
       expect(await readFile(f.file, "utf8")).toBe(f.content);
     } finally { await f.cleanup(); }
+  });
+
+  it("re-links the original npm package and admitted company skills after managed Pi recovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-managed-restore-links-"));
+    const originalPiHome = join(root, "original-pi");
+    const workspace = join(root, "workspace");
+    const runtime = join(root, "replacement", "filesystem", "pi");
+    const agentHome = join(root, "replacement", "filesystem", "pi-agent");
+    const bundle = join(root, "company-bundle");
+    const sessionId = "restored-native-session";
+    const normalizedSessionId = "restored-session";
+    const sessionFile = join(runtime, `${normalizedSessionId}.jsonl`);
+    const timestamp = "2026-11-16T00:00:00.000Z";
+    let closed = false;
+    let wake: (() => void) | undefined;
+    let launch: PiRpcTransportOptions | undefined;
+    let recoveredSession: Awaited<ReturnType<NonNullable<HarnessDriver["recoverSession"]>>>["session"];
+    await mkdir(join(originalPiHome, "npm", "restore-proof-package"), { recursive: true });
+    await mkdir(workspace, { recursive: true });
+    await mkdir(runtime, { recursive: true });
+    await mkdir(agentHome, { recursive: true });
+    await mkdir(bundle, { recursive: true });
+    await writeFile(join(originalPiHome, "npm", "restore-proof-package", "package.json"), JSON.stringify({ name: "restore-proof-package", version: "1.0.0" }));
+    await writeFile(join(bundle, "SKILL.md"), "---\nname: restore-proof\ndescription: Restore proof.\n---\nRead this admitted skill.\n");
+    await writeFile(sessionFile, [
+      { type: "session", version: 3, id: sessionId, timestamp, cwd: workspace },
+      { type: "message", id: "prior-user", parentId: null, timestamp, message: { role: "user", content: [{ type: "text", text: "Remember the restored conversation." }] } },
+    ].map(row => JSON.stringify(row)).join("\n") + "\n", { mode: 0o600 });
+    vi.stubEnv("PI_CODING_AGENT_DIR", originalPiHome);
+    vi.stubEnv("HOME", root);
+    const native = {
+      pid: null as number | null,
+      get exited() { return closed; },
+      async request(type: string) {
+        return { data: type === "get_state" ? { sessionId, sessionFile, model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+          : type === "set_model" ? { provider: "paperclip", id: "faux" }
+          : type === "get_available_models" ? { models: [{ provider: "paperclip", id: "faux", contextWindow: 200000, maxTokens: 8192, reasoning: true }] }
+          : type === "get_available_thinking_levels" ? { levels: ["off"] } : undefined };
+      },
+      async *events() { while (!closed) await new Promise<void>(resolve => { wake = resolve; }); },
+      async close() { closed = true; wake?.(); },
+    };
+    const bindRequest = async <C extends PiBindCommand>(_path: string, request: C): Promise<PiBindResponse<C>> => {
+      const envelope = { schema: 1, type: request.type, nonce: request.nonce, sessionId: request.sessionId };
+      if (request.type === "bind") return { ...envelope, epoch: request.epoch, runId: request.runId,
+        provider: request.provider.name, model: request.model, thinkingLevel: request.thinkingLevel, ...bindContent(request) } as PiBindResponse<C>;
+      if (request.type === "tool_inventory") return { ...envelope, nativeTools: [] } as PiBindResponse<C>;
+      if (request.type === "park_ready") return { ...envelope, ready: true, reasons: [] } as PiBindResponse<C>;
+      if (request.type === "stop_children") return { ...envelope, settled: [], uncertain: [] } as PiBindResponse<C>;
+      return { ...request, ack: true } as PiBindResponse<C>;
+    };
+    const snapshot: PersistedHarnessSession = { driverKind: "pi_rpc", driverSessionId: sessionId, providerSessionId: sessionId,
+      runId: "restored-run", normalizedSessionId, workingDirectory: workspace, activeTurnId: null, lastSourceSequence: 40 };
+    try {
+      // This is the driver's real recoverSession -> #open -> #openMeasured path.
+      // Only the Pi RPC process is a controlled test peer; managed broker setup,
+      // agent-home preparation, npm linking and skills synchronization are real.
+      const driver = new PiRpcDriver({ command: process.execPath, model: "paperclip/faux", piRpcThinkingLevel: "off", runtimeDirectory: runtime,
+        runtimeContext: { skills: [{ bundle: { rootPath: bundle } }] }, environment: { HOME: root, PI_CODING_AGENT_DIR: agentHome, PI_OFFLINE: "1",
+          PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1/v1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "chat", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+        transportFactory: options => { launch = options; return native as unknown as PiRpcTransport; }, bindRequest });
+      const recovered = await driver.recoverSession!(snapshot, { signal: new AbortController().signal });
+      expect(recovered.recovered).toBe(true);
+      recoveredSession = recovered.session;
+      expect(launch?.args?.slice(0, 4)).toEqual(["--mode", "rpc", "--session", sessionFile]);
+      expect(launch?.env?.PI_CODING_AGENT_DIR).toBe(agentHome);
+      expect(recoveredSession!.ids()).toMatchObject({ driverSessionId: sessionId, providerSessionId: sessionId });
+      const npmLink = join(agentHome, "npm");
+      expect((await lstat(npmLink)).isSymbolicLink()).toBe(true);
+      expect(await readlink(npmLink)).toBe(join(originalPiHome, "npm"));
+      expect(JSON.parse(await readFile(join(npmLink, "restore-proof-package", "package.json"), "utf8")))
+        .toEqual({ name: "restore-proof-package", version: "1.0.0" });
+      const namespace = join(agentHome, "skills", "paperclip-company-skills");
+      expect(await readFile(join(namespace, ".owner"), "utf8")).toBe("paperclip.pi.company-skills.v1\n");
+      const skillLink = (await readdir(namespace)).find(name => name.startsWith("bundle-"));
+      expect(skillLink).toBeDefined();
+      expect((await lstat(join(namespace, skillLink!))).isSymbolicLink()).toBe(true);
+      expect(await readlink(join(namespace, skillLink!))).toBe(bundle);
+      expect(await readFile(join(namespace, skillLink!, "SKILL.md"), "utf8")).toContain("Read this admitted skill.");
+    } finally {
+      await recoveredSession?.close({ reason: "managed recovery test" });
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

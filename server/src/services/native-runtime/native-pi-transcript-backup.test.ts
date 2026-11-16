@@ -1,6 +1,7 @@
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { access, chmod, cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, cp, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -24,12 +25,21 @@ describe("Pi conversation transcript sandbox backups", () => {
       const live = join(root, "old-sandbox");
       const replacement = join(root, "fresh-sandbox");
       const controller = join(root, "controller");
+      const workspace = join(root, "workspace");
+      const originalPiHome = join(root, "original-pi");
       const backupRoot = join(controller, "failover-backups", "current");
+      await mkdir(workspace);
+      const npmPackage = join(originalPiHome, "npm", "restore-proof-package");
+      await mkdir(npmPackage, { recursive: true });
+      await writeFile(join(npmPackage, "package.json"), JSON.stringify({ name: "restore-proof-package", version: "1.0.0" }));
+      const companyBundle = join(root, "company-skill");
+      await mkdir(companyBundle);
+      await writeFile(join(companyBundle, "SKILL.md"), "---\nname: restore-proof\ndescription: Restore proof.\n---\nRestored company skill.\n");
       const runtimePath = (sandbox: string, directory: { name: string; location: string }) =>
         directory.location === "runner" ? join(sandbox, "runner") : join(sandbox, "filesystem", directory.name);
       const transcriptPath = (sandbox: string) => join(sandbox, "filesystem", "pi", `${sessionId}.jsonl`);
       const transcript = Buffer.from([
-        { type: "session", version: 3, id: sessionId, timestamp: "2026-11-12T20:00:00.000Z", cwd: "/workspace" },
+        { type: "session", version: 3, id: sessionId, timestamp: "2026-11-12T20:00:00.000Z", cwd: workspace },
         { type: "message", id: "user-1", parentId: null, timestamp: "2026-11-12T20:00:01.000Z",
           message: { role: "user", content: [{ type: "text", text: "Remember the Pi-only fact: violet π." }], timestamp: 1 } },
         { type: "message", id: "assistant-1", parentId: "user-1", timestamp: "2026-11-12T20:00:02.000Z",
@@ -45,6 +55,13 @@ describe("Pi conversation transcript sandbox backups", () => {
       for (const path of [join(live, "runner"), join(live, "filesystem", "pi-agent"), join(live, "filesystem", "pi")])
         await mkdir(path, { recursive: true, mode: 0o700 });
       await writeFile(transcriptPath(live), transcript, { mode: 0o600 });
+      const liveAgentHome = join(live, "filesystem", "pi-agent");
+      await symlink(join(originalPiHome, "npm"), join(liveAgentHome, "npm"), "dir");
+      const companySkills = join(liveAgentHome, "skills", "paperclip-company-skills");
+      await mkdir(companySkills, { recursive: true });
+      await writeFile(join(companySkills, ".owner"), "paperclip.pi.company-skills.v1\n");
+      const bundleName = `bundle-${createHash("sha256").update(companyBundle).digest("hex")}`;
+      await symlink(companyBundle, join(companySkills, bundleName), "dir");
       await writeFile(join(live, "runner", "runner-state.json"), JSON.stringify({ lifecycle: "suspended" }), { mode: 0o600 });
       const launchFiles = ["auth.json", "auth.json.lock", "models.json", "settings.json"];
       for (const name of launchFiles)
@@ -68,6 +85,9 @@ describe("Pi conversation transcript sandbox backups", () => {
       };
       const runner = { execute, ...(transfer === "sync" ? { syncIn: copy, syncOut: copy } : {}) };
       const profile = resolveNativeHarnessPersistenceProfile(execution);
+      const agentExclusions = profile.directories.find(directory => directory.name === "pi-agent")!.excludeEntries;
+      expect(await readlink(join(liveAgentHome, "npm"))).toBe(join(originalPiHome, "npm"));
+      expect(await readlink(join(companySkills, bundleName))).toBe(companyBundle);
       for (const directory of profile.directories)
         await syncRemoteRunnerDirectoryOut({ runner: runner as never, sourcePath: runtimePath(live, directory),
           targetPath: join(backupRoot, directory.name), mode: 0o700, excludeEntries: directory.excludeEntries });
@@ -86,23 +106,50 @@ describe("Pi conversation transcript sandbox backups", () => {
         await expect(access(join(backupRoot, "pi-agent", name))).rejects.toMatchObject({ code: "ENOENT" });
         await expect(access(join(replacement, "filesystem", "pi-agent", name))).rejects.toMatchObject({ code: "ENOENT" });
       }
+      for (const path of [join(backupRoot, "pi-agent", "npm"), join(backupRoot, "pi-agent", "skills", "paperclip-company-skills"),
+        join(replacement, "filesystem", "pi-agent", "npm"), join(replacement, "filesystem", "pi-agent", "skills", "paperclip-company-skills")])
+        await expect(access(path)).rejects.toMatchObject({ code: "ENOENT" });
+      expect(agentExclusions).toContain("npm");
+      expect(agentExclusions).toContain("skills/paperclip-company-skills");
       expect(await readFile(join(replacement, "filesystem", "pi-agent", "retained.txt"), "utf8")).toBe("agent home state");
-      const stoppedAtOpen = new Error("checked Pi cold-open boundary");
+      const restoredSessionFile = transcriptPath(replacement);
       let openedPath: string | undefined;
+      const native = {
+        pid: null as number | null,
+        exited: false,
+        wake: undefined as (() => void) | undefined,
+        async request(type: string) {
+          return { data: type === "get_state" ? { sessionId, sessionFile: restoredSessionFile,
+            model: { provider: "neutral", id: "model" }, thinkingLevel: "high", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+            : type === "set_model" ? { provider: "neutral", id: "model" }
+            : type === "get_available_models" ? { models: [{ provider: "neutral", id: "model" }] }
+            : type === "get_available_thinking_levels" ? { levels: ["high"] } : undefined };
+        },
+        async *events() { while (!this.exited) await new Promise<void>(resolve => { this.wake = resolve; }); },
+        async close() { this.exited = true; this.wake?.(); },
+      };
       const driver = new PiRpcDriver({ runtimeDirectory: join(replacement, "filesystem", "pi"),
         model: "neutral/model", piRpcThinkingLevel: "high",
         environment: { PI_CODING_AGENT_DIR: join(replacement, "filesystem", "pi-agent") },
         transportFactory: options => {
           openedPath = options.args![options.args!.indexOf("--session") + 1];
-          expect(openedPath).toBe(transcriptPath(replacement));
+          expect(openedPath).toBe(restoredSessionFile);
           expect(readFileSync(openedPath!)).toEqual(transcript);
-          // No native process or model needed: inspect before transport startup.
-          throw stoppedAtOpen;
+          // The actual driver recovery/open path sees the restored bytes; only Pi's RPC peer is controlled.
+          return native as never;
         },
       });
-      await expect(driver.openSession({ runId: "follow-up", normalizedSessionId: sessionId, workingDirectory: replacement }))
-        .rejects.toBe(stoppedAtOpen);
-      expect(openedPath).toBe(transcriptPath(replacement));
+      const snapshot = { driverKind: "pi_rpc", driverSessionId: sessionId, providerSessionId: sessionId,
+        runId: "follow-up", normalizedSessionId: sessionId, workingDirectory: workspace, activeTurnId: null, lastSourceSequence: 40 } as never;
+      const recovered = await driver.recoverSession(snapshot, { signal: new AbortController().signal });
+      expect(recovered.recovered).toBe(true);
+      expect(recovered.session!.ids()).toMatchObject({ driverSessionId: sessionId, providerSessionId: sessionId });
+      expect((await recovered.session!.snapshot())).toMatchObject({ normalizedSessionId: sessionId, driverSessionId: sessionId,
+        providerSessionId: sessionId, sessionFile: restoredSessionFile });
+      await recovered.session!.close({ reason: "backup recovery test" });
+      expect(openedPath).toBe(restoredSessionFile);
+      expect(await readFile(restoredSessionFile)).toEqual(transcript);
+      expect(await readFile(restoredSessionFile, "utf8")).toContain("Remember the Pi-only fact: violet π.");
       expect(await readFile(join(backupRoot, "pi", `${sessionId}.jsonl`))).toEqual(transcript);
       expect((await stat(join(replacement, "filesystem", "pi"))).mode & 0o777).toBe(0o700);
       const restored = await stat(transcriptPath(replacement));
