@@ -35,7 +35,8 @@ async function test(configOverride = config, executionTarget: AdapterEnvironment
 }
 beforeEach(() => {
   mocks.probe.mockImplementation(async options => options.admissionOnly ? { ...receipt, helloProbePassed: false, admissionOnly: true, sessionAdmissionPassed: true, piMetadata: { version: "1.5.2", providers: ["paperclip"], credentialMode: "env", promptSent: false } } : receipt);
-  runner.execute.mockResolvedValue({ exitCode: 0, timedOut: false, stdout: "", stderr: "" });
+  runner.execute.mockImplementation(async (input: { args?: string[] }) => ({ exitCode: 0, timedOut: false,
+    stdout: input.args?.[1]?.includes("wc -c < ") ? "count 0\n" : "", stderr: "" }));
   mocks.prepare.mockResolvedValue({ root: "/selected/remote-pack" });
   mocks.sync.mockReset().mockResolvedValue(undefined);
   mocks.launch.mockReturnValue(vi.fn());
@@ -76,9 +77,10 @@ describe("native managed Pi Setup Test", () => {
       await writeFile(join(targetPath, "pi", "history.jsonl"), bytes, { mode: 0o600 });
     });
     let removals = 0;
-    runner.execute.mockImplementation(async (input: { command: string }) => {
+    runner.execute.mockImplementation(async (input: { command: string; args?: string[] }) => {
       if (input.command === "rm") { removals++; expect(await retained(state)).toBe(true); }
-      return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      return { exitCode: 0, timedOut: false,
+        stdout: input.args?.[1]?.includes("wc -c < ") ? "count 0\n" : "", stderr: "" };
     });
     mocks.probe.mockImplementation(async options => {
       await options.onCleanupConfirmed();
