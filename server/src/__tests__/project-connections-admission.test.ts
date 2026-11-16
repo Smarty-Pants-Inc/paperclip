@@ -418,6 +418,33 @@ describe("project connection writer admission (round-4 B)", () => {
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
 
+  it("J05-positive: finish permits a requested shard inside a larger primary approval", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
+    await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.a.id, name: "Second approved repository", repoUrl: "https://github.com/owner/A2.git", metadata: { githubRepositoryId: 102 } });
+    const config = { ...connection.config, projectScope: { ...f.scope(), approvedRepositoryIds: [101, 102] } };
+    await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connection.id));
+    composeFinish(f); // This connection requests and verifies only A (101).
+    const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor());
+    expect(result.connection).toMatchObject({ status: "active", enabled: true });
+    expect(result.connection.config.projectScope).toMatchObject({ approvedRepositoryIds: [101, 102] });
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id)))
+      .toMatchObject([{ details: { verifiedRepositoryIds: [101] } }]);
+  });
+
+  it("M01-positive: verified finish activates and installs a pending candidate without removing legacy", async () => {
+    const f = await projectConnectionFixture(db);
+    const legacy = await f.seedConnection(null);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
+    composeFinish(f);
+    const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor());
+    expect(result.connection).toMatchObject({ status: "active", enabled: true, config: { projectScope: { migrationPending: false } } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toMatchObject([{ targetId: f.worker.id }]);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.connection.id))).toMatchObject([{ targetId: f.leadA.id }]);
+    expect((await storedConnection(db, legacy.connection.id)).enabled).toBe(true);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(1);
+  });
+
   it("A12/W7: project deletion cannot strand retained owned history", async () => {
     const f = await projectConnectionFixture(db);
     await f.seedConnection(f.a, { status: "archived", installed: false });

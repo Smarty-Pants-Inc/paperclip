@@ -221,6 +221,7 @@ export async function assertProjectConnectionAdmission(
     }
     return;
   }
+  if (operation === "install" && scope.migrationPending) throw conflict("Verify and finish this project candidate before installing it.", { code: "project_connection_migration_pending" });
   if (operation === "use" && (scope.migrationPending || connection!.status !== "active" || !connection!.enabled)) throw conflict("Verify and finish this active project candidate before using it.", { code: "project_connection_migration_pending" });
   const app = parseGitHubAppConfig(connection!.config.methodConfig);
   if (`github.com/github-app-installation/${app.installationId}` !== scope.installationKey
@@ -234,8 +235,10 @@ export async function assertProjectConnectionAdmission(
     if (!secret || secret.scope !== "company" || secret.status !== "active" || secret.deletedAt) throw forbidden("The approved project reference is unavailable", { code: "project_connection_reference_not_approved" });
   }
   const savedIds = await projectConnectionRepositoryIds(db, companyId, projectId);
-  const requested = input.proposedRepositoryIds ?? await projectConnectionRepositoryIds(db, companyId, projectId, parseGitHubAppConfig(connection!.config.methodConfig).repositories);
-  if (!repositoryIds(requested) || !requested.every(id => savedIds.includes(id) && scope.approvedRepositoryIds.includes(id))) {
+  const connectionRequested = await projectConnectionRepositoryIds(db, companyId, projectId, app.repositories);
+  const requested = input.proposedRepositoryIds ?? connectionRequested;
+  if (!repositoryIds(requested) || requested.length !== connectionRequested.length
+    || !requested.every(id => connectionRequested.includes(id) && savedIds.includes(id) && scope.approvedRepositoryIds.includes(id))) {
     throw forbidden("The requested repository IDs must be a non-empty subset of this project's current primary approval.", { code: "project_connection_repository_not_approved" });
   }
   const grants = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, companyId), eq(connectionGrants.connectionId, connection!.id)));
@@ -263,6 +266,9 @@ export function assertProjectConnectionPatch(connection: Connection, input: Reco
     const proposed = input[key];
     if (record(proposed) && record(proposed.projectScope) && !scope.exclusive && proposed.projectScope.exclusive === true) throw conflict("Live shared to EXCLUSIVE promotion is not supported. Create a new approved exclusive connection.", { code: "project_connection_exclusive_promotion_unsupported" });
     if (!isDeepStrictEqual(proposed, connection[key])) throw conflict("Project approval metadata and verified App configuration cannot be replaced or erased.", { code: "project_connection_scope_protected" });
+  }
+  if ((connection.status === "draft" || scope.migrationPending) && (input.enabled === true || input.status === "active")) {
+    throw conflict("Verify and finish this project candidate before activating it. Generic PATCH cannot grant unverified access.", { code: "project_connection_verification_required" });
   }
   if (Object.hasOwn(input, "exclusive")) throw conflict("EXCLUSIVE is a create-only request", { code: "project_connection_exclusive_promotion_unsupported" });
   for (const key of ["credentialRefs", "credentialSecretRefs", "credentialPolicy", "transport", "connectionPurpose", "ownership", "connectionKind"] as const) {
