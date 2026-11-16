@@ -32,6 +32,8 @@ async function fixture(primary: unknown, user: unknown, originalPiDir = false, m
   const home = join(root, "home", "user"), runtime = join(root, "run"), agent = join(runtime, "agent");
   const original = originalPiDir ? join(root, "original-pi") : join(home, ".pi", "agent");
   await mkdir(agent, { recursive: true }); await mkdir(original, { recursive: true });
+  await mkdir(join(agent, "local-package"));
+  await mkdir(join(original, "do-not-import"));
   const agentFile = join(agent, "models.json"), userFile = join(original, "models.json");
   await writeFile(agentFile, JSON.stringify(primary));
   if (settings?.managed !== undefined) await writeFile(join(agent, "settings.json"), JSON.stringify(settings.managed));
@@ -112,11 +114,11 @@ it.each([0, 42000, 120000])("preserves an explicit managed-home reserve of %i", 
   expect(f.settings).toEqual(settings);
 });
 
-// SUPERSEDE REQUESTED (RFL): row A carries packages by design
+// SUPERSEDED BY REPLACEMENT, RFL 05:46Z 11-16: packages carried by design
 it("respects the user's original Pi reserve without importing unrelated settings", async () => {
   const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
     { user: { compaction: { reserveTokens: 54321 }, packages: ["do-not-import"] } });
-  expect(f.settings).toEqual({ packages: ["do-not-import"], compaction: { reserveTokens: 54321 } });
+  expect(f.settings).toEqual({ packages: [join(f.root, "original-pi", "do-not-import")], compaction: { reserveTokens: 54321 } });
 });
 
 it("keeps managed settings ahead of the original user's reserve", async () => {

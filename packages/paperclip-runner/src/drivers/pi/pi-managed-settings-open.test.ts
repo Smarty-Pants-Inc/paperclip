@@ -61,11 +61,11 @@ class SettingsTransport {
   async close() { this.closed = this.exited = true; this.wake?.(); }
 }
 
-async function fixture() {
+async function fixture(localSource?: string, filtered = false) {
   const root = await mkdtemp(join(tmpdir(), "pi-image-settings-")); roots.push(root);
   const home = join(root, "non-default-box-home"), imageHome = join(home, ".pi", "agent"), workspace = join(root, "workspace");
-  const packageRoots = packageNames.map((name, index) => index === 3
-    ? join(imageHome, "npm", "node_modules", name) : join(root, "opt", "pi-packages", name));
+  const packageRoots = packageNames.map((name, index) => index === 0 && localSource ? join(imageHome, localSource)
+    : index === 3 ? join(imageHome, "npm", "node_modules", name) : join(root, "opt", "pi-packages", name));
   for (const [index, packageRoot] of packageRoots.entries()) {
     await mkdir(join(packageRoot, "extensions"), { recursive: true });
     await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: packageNames[index], version: index === 3 ? "0.7.4" : "1.0.0",
@@ -76,7 +76,8 @@ async function fixture() {
   // A command that fails if Pi tries an install, in addition to offline mode and
   // an unreachable registry. The same-home control must load its cached npm root.
   const npmCommand = [process.execPath, "-e", "throw new Error('registry access forbidden')"];
-  const source = { packages: [...packageRoots.slice(0, 3), "npm:@lll9p/pi-better-compaction@0.7.4"],
+  const firstPackage = localSource ? filtered ? { source: localSource, extensions: ["extensions/index.js"], skills: [] } : localSource : packageRoots[0];
+  const source = { packages: [firstPackage, ...packageRoots.slice(1, 3), "npm:@lll9p/pi-better-compaction@0.7.4"],
     defaultProvider: "image-provider", defaultModel: "image-model", compaction: { reserveTokens: 321, keepRecentTokens: 654 },
     retry: { enabled: false }, npmCommand };
   const bytes = `${JSON.stringify(source, null, 2)}\n`;
@@ -151,6 +152,22 @@ it.each(["run", "probe"] as const)("R12 %s keeps managed loopback defaults above
   expect(models.providers.paperclip.models[0].id).toBe("faux");
   expect(models.providers.paperclip.baseUrl).toBe("http://127.0.0.1:1");
   expect(await readFile(join(f.imageHome, "settings.json"), "utf8")).toBe(f.bytes);
+});
+
+// Keep: RFL F1/F3 real-loader catch: a copied relative package silently lost its extension.
+it.each([
+  ["do-not-import", false], ["./pi-tools", false], ["./filtered-tools", true],
+] as const)("loads image-relative local package %s (filtered=%s) from the managed home", async (source, filtered) => {
+  const f = await fixture(source, filtered);
+  const control = await f.open("run", true);
+  expect(control.loaded.sort()).toEqual([...packageNames].sort());
+  for (const kind of ["run", "probe"] as const) {
+    const opened = await f.open(kind);
+    expect.soft(opened.loaded.sort()).toEqual(control.loaded);
+    const firstPackage = filtered ? { source: f.packageRoots[0], extensions: ["extensions/index.js"], skills: [] } : f.packageRoots[0];
+    expect.soft(opened.settings).toEqual({ packages: [firstPackage, ...f.packageRoots.slice(1)], compaction: { reserveTokens: 32000 } });
+    expect(await readFile(join(f.imageHome, "settings.json"), "utf8")).toBe(f.bytes);
+  }
 });
 
 it("R11 keeps the same image home's settings bytes and npm declarations unchanged", async () => {
