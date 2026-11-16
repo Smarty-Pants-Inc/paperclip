@@ -114,9 +114,14 @@ describe("ordinary recovery writers cannot replace an unproved task Stop", () =>
         timer = setTimeout(() => reject(new Error("ordinary writer did not reach the action read")), 5_000);
       })]);
       held = await hold(f.companyId, f.issueId);
-    } finally { clearTimeout(timer); release(); }
+    } finally {
+      clearTimeout(timer); release();
+      await Promise.allSettled([job]);
+    }
     const result = await job;
     expect(result.id).toBe(held!.id);
+    expect(result.evidence.stopPending).toEqual(held!.evidence.stopPending);
+    expect(result.nextAction).toBe(held!.nextAction);
     expect(await active(f.issueId)).toEqual(held);
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(1);
   });
