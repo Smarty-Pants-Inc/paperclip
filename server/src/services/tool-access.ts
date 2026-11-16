@@ -1,4 +1,7 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
+import { assertKnownProjectConnectionCreateAliases, assertProjectConnectionAvailability, lockProjectConnectionIdentities, mapProjectConnectionUniquenessError, projectConnectionIdentityForConnection } from "./project-connection-arbitration.js";
+import { assertProjectConnectionAdmission } from "./project-connection-admission.js";
+import { lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { RepositoryCatalogUnavailableError, findRepositoryCatalogUnavailableError } from "./repository-catalog-unavailable-error.js";
 import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
 import { notifyToolConnectionHealth, writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
@@ -4736,30 +4739,58 @@ export function toolAccessService(
             "Connection transport must match application type",
           );
         }
-      } else {
-        const [app] = await db
-          .insert(toolApplications)
-          .values({
+      }
+      await actor?.managementContext?.reauthorize();
+      const connectionId = randomUUID();
+      const binding = actorBinding(actor);
+      // Forward DTO contract until B's shared types are composed. Never infer an
+      // owner from config, application, grant or a recipient.
+      const projectId = (input as CreateToolConnection & { projectId?: string | null }).projectId ?? null;
+      const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
+        // This is a refusal check against known saved identities, not provider
+        // verification or approval of submitted App/client spelling.
+        await assertKnownProjectConnectionCreateAliases(tx, { companyId, projectId, config,
+          exclusive: (input as CreateToolConnection & { exclusive?: boolean }).exclusive === true });
+        if (projectId !== null) {
+          // B must prepare the protected envelope from authorized, reference-only
+          // provider preflight BEFORE this transaction. Raw request JSON is not
+          // that proof. Until B supplies it this writer fails closed, not null.
+          if ([input.config, input.transportConfig].some(value => value && Object.hasOwn(value, "projectScope"))) {
+            throw forbidden("Project approval metadata is server-written", { code: "project_connection_scope_protected" });
+          }
+          await assertProjectConnectionAdmission(tx, { companyId, projectId, operation: "create", actor,
+            proposedSecretRefs: input.credentialSecretRefs ?? [] });
+          const identity = projectConnectionIdentityForConnection({ companyId, projectId, config });
+          if (!identity) throw unprocessable("Verified project connection identity is required", { code: "project_connection_identity_invalid" });
+          await lockProjectConnectionLifecycle(tx, { companyId, projectId });
+          await lockProjectConnectionIdentities(tx, [identity]);
+          // Fresh statements after the lifecycle AND advisory waits. No provider
+          // I/O here and no application/grant/binding row written before deciding.
+          await actor?.managementContext?.reauthorize();
+          await assertProjectConnectionAdmission(tx, { companyId, projectId, operation: "create", actor,
+            proposedSecretRefs: input.credentialSecretRefs ?? [] });
+          await assertProjectConnectionAvailability(tx, { identity, projectId,
+            exclusive: asRecord(config.projectScope).exclusive === true });
+        }
+        let transactionApplicationId = applicationId;
+        if (!transactionApplicationId) {
+          const [app] = await tx.insert(toolApplications).values({
             companyId,
             applicationKey: normalizeKey(input.applicationName ?? input.name),
             name: input.applicationName ?? input.name,
             type: isBrowserUseConnection({ transport, config }) || nativeProviderCatalogFor({ transport, config }) || restConnectorFor({ transport, config }) ? "rest_api" : transport === "mcp_remote" ? "mcp_http" : "mcp_stdio",
             status: "active",
             metadata: {},
-          })
-          .returning();
-        applicationId = app.id;
-      }
-      await actor?.managementContext?.reauthorize();
-      const connectionId = randomUUID();
-      const binding = actorBinding(actor);
-      const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
+          }).returning();
+          transactionApplicationId = app.id;
+        }
         const [row] = await tx
           .insert(toolConnections)
           .values({
             id: connectionId,
             companyId,
-            applicationId,
+            projectId,
+            applicationId: transactionApplicationId,
             name: input.name,
             uid: connectionUid(applicationNamespace, input.name, connectionId),
             connectionKind: input.connectionKind ?? "managed",
@@ -4785,11 +4816,14 @@ export function toolAccessService(
             createdByUserId: connectionActorUserId(actor),
           })
           .returning();
-        await ensureDefaultOrganizationGrant(row, tx);
+        await ensureDefaultOrganizationGrant(row, tx, undefined, undefined, actor);
         await syncCredentialBindings(row, [], tx);
         await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(row);
+        if (projectId !== null) await writeProjectConnectionReceipt(tx, {
+          connection: row, actor, action: "tool_connection.project_taken", reason: "project_connection_created",
+        });
         return row;
-      });
+      }).catch(error => { throw mapProjectConnectionUniquenessError(error); });
       emitConnectionCreated(row, "api");
       return toConnection(row);
     },
