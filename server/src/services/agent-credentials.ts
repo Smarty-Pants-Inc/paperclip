@@ -99,11 +99,15 @@ export function agentCredentialService(db: Db) {
    * parent agent inside this transaction and permits the bind only when the
    * parent exists, is in the same company, is a `claude_local` agent, and its
    * current reference matches the child's copied reference exactly, including
-   * the version selector. The gate locks the parent row with `SELECT ...
-   * FOR UPDATE` before it reads the reference. The lock blocks a concurrent
-   * credential rotation on the same parent row until this transaction
-   * commits or rolls back, so the compare-and-bind check stays atomic with
-   * the parent's current state. The route derives the parent identifier
+   * the version selector. The caller locks the parent row with `SELECT ...
+   * FOR UPDATE` (lockClaudeOAuthInheritanceParent) and passes the locked row
+   * as `inheritanceParent`; the gate reads the reference from that row. The
+   * lock blocks a concurrent credential rotation on the same parent row until
+   * this transaction commits or rolls back, so the compare-and-bind check
+   * stays atomic with the parent's current state. #20805 R2: the hire takes
+   * that lock with its other agent rows, BEFORE the company runtime lock
+   * (server/src/services/agent-runtime-lock.ts), so the gate takes no row
+   * lock of its own. Without a locked parent row the claim is rejected. The route derives the parent identifier
    * from the authenticated agent actor, never from the request body, so the
    * gate treats it as a claim to verify, not a trusted value.
    *
@@ -127,6 +131,9 @@ export function agentCredentialService(db: Db) {
        * parent's current reference.
        */
       childAdapterConfig?: unknown;
+      /** The `inheritedFromAgentId` parent, already locked FOR UPDATE by the
+       * caller (lockClaudeOAuthInheritanceParent), before its company lock. */
+      inheritanceParent?: ClaudeOAuthInheritanceParent;
     },
   ): Promise<void> {
     const ownerUserId = input.claudeLogin?.ownerUserId ?? null;
@@ -153,16 +160,8 @@ export function agentCredentialService(db: Db) {
         // a concurrent version change on the parent cannot leave the child
         // bound to a stale version.
         const parentId = input.claudeLogin.inheritedFromAgentId;
-        const parent = await txDb
-          .select({
-            companyId: agents.companyId,
-            adapterType: agents.adapterType,
-            adapterConfig: agents.adapterConfig,
-          })
-          .from(agents)
-          .where(eq(agents.id, parentId))
-          .for("update")
-          .then((rows) => rows[0] ?? null);
+        if (input.inheritanceParent?.id !== parentId) throw claudeOAuthClaimRejectedError();
+        const parent = input.inheritanceParent.row;
         const parentBinding = readClaudeOAuthBinding(parent?.adapterConfig ?? null);
         const childBinding = readClaudeOAuthBinding(input.childAdapterConfig ?? null);
         if (
@@ -196,4 +195,30 @@ export function agentCredentialService(db: Db) {
   }
 
   return { syncAgentSecretBindings, enforceClaudeOAuthBindingClaim };
+}
+
+export interface ClaudeOAuthInheritanceParent {
+  id: string;
+  row: { companyId: string; adapterType: string; adapterConfig: unknown } | null;
+}
+
+/**
+ * #20805 R2: the hire-inheritance parent row lock. `SELECT ... FOR UPDATE` on
+ * the named parent, the one lock the inheritance claim relies on. Lock order
+ * (agent-runtime-lock.ts): agent rows, then the company runtime lock, so a
+ * hire calls this with its other row locks, before lockCompanyAgentRuntime,
+ * and passes the result to enforceClaudeOAuthBindingClaim.
+ */
+export async function lockClaudeOAuthInheritanceParent(txDb: Db, parentId: string): Promise<ClaudeOAuthInheritanceParent> {
+  const row = await txDb
+    .select({
+      companyId: agents.companyId,
+      adapterType: agents.adapterType,
+      adapterConfig: agents.adapterConfig,
+    })
+    .from(agents)
+    .where(eq(agents.id, parentId))
+    .for("update")
+    .then((rows) => rows[0] ?? null);
+  return { id: parentId, row };
 }

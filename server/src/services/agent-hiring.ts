@@ -19,7 +19,7 @@ import { CEO_HIRING_DENIAL_KEY, normalizeAgentPermissions, permissionsImplyLowTr
   newStandardAgentGrantScope } from "../lib/agent-permissions.js";
 import { readBuiltInAgentMarker } from "../lib/built-in-agent-metadata.js";
 import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
-import { agentCredentialService } from "./agent-credentials.js";
+import { agentCredentialService, lockClaudeOAuthInheritanceParent } from "./agent-credentials.js";
 import { agentIdentityService } from "./agent-identity.js";
 import { initializePrimaryAgent } from "./primary-agent.js";
 import { resolveAgentRunnerTaskDriverForCompany, resolveNewAgentRunnerForCompany } from "./agent-runner-selection.js";
@@ -35,6 +35,11 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   // the manager row. Take it here, before the company lock, so the hire never
   // waits for an existing agent row while it holds the exclusive lock.
   if (input.reportsTo) await db.select({ id: agents.id }).from(agents).where(eq(agents.id, input.reportsTo)).for("key share");
+  // #20805 R2 (src10): the hire-inheritance claim locks the parent FOR UPDATE.
+  // Take it here with the other agent rows, before the company lock; the claim
+  // below reads this locked row and takes no row lock after the company lock.
+  const inheritedFromAgentId = options?.claudeLogin?.inheritedFromAgentId;
+  const inheritanceParent = inheritedFromAgentId ? await lockClaudeOAuthInheritanceParent(db, inheritedFromAgentId) : undefined;
   // #20805: after the hirer (and setup draft, records.ts) row locks, before the
   // agent row write and the grant writes. One lock, independent of company size.
   await lockCompanyAgentRuntime(db, companyId);
@@ -81,7 +86,7 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   }
   await agentCredentialService(db).enforceClaudeOAuthBindingClaim(db, {
     companyId, consume: true, environmentId: data.defaultEnvironmentId ?? null,
-    childAdapterConfig: adapterConfig, claudeLogin: options?.claudeLogin,
+    childAdapterConfig: adapterConfig, claudeLogin: options?.claudeLogin, inheritanceParent,
     decision: assertClaudeOAuthBindingInvariant({ adapterType, nextConfig: adapterConfig }),
   });
   if (options?.setupAgentId) await notifySkillVersionRetention(db, companyId);
