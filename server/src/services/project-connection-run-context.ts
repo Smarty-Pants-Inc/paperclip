@@ -87,7 +87,7 @@ async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission:
     if (input.issueId && input.issueId !== issueId) throw invalid();
     // Credential/cache reads validate an already admitted pair without taking the
     // admission lifecycle lock (or reinterpreting a later task move as admission).
-    if (Object.hasOwn(initial.contextSnapshot ?? {}, SNAPSHOT_KEY)) {
+    if (!atAdmission && Object.hasOwn(initial.contextSnapshot ?? {}, SNAPSHOT_KEY)) {
       const saved = savedBinding(initial.contextSnapshot![SNAPSHOT_KEY]);
       if (saved.issueId !== issueId || saved.projectId !== await taskProject(tx, input.companyId, issueId)) throw invalid();
       return { companyId: input.companyId, agentId: input.agentId, heartbeatRunId: initial.id, ...saved };

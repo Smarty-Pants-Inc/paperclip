@@ -521,7 +521,9 @@ export async function resolveManagedGitHubIdentitySelection(
     return {
       configured: true, identitySource,
       error: candidates.length === 0
-        ? "No managed GitHub identity is available for this run"
+        ? managedRequired
+          ? "project_connection_unavailable: This project's managed GitHub scope does not match the requested grant"
+          : "No managed GitHub identity is available for this run"
         : "More than one managed GitHub identity matches this run",
     };
   }

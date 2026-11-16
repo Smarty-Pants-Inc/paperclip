@@ -5,7 +5,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { and, eq, sql } from "drizzle-orm";
 import { connectionGrants, createDb, heartbeatRuns, issues, projects, userCompanyPreferences, toolCatalogEntries, toolPolicies, toolGatewaySessions, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture as seedProjectConnectionFixture } from "./helpers/project-connections-fixture.js";
 
 const provider = vi.hoisted(() => ({ acquire: vi.fn(async (_db: unknown, connection: { id: string }) => ({
   token: `synthetic-installation-token-${connection.id}`, expiresAt: Date.now() + 3_600_000,
@@ -29,6 +29,22 @@ describe("project connection task-derived selection and no legacy fallback (roun
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-project-runtime-"); db = createDb(database.connectionString); }, 60_000);
   beforeEach(() => { provider.acquire.mockClear(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
+
+  // Credential-level fixtures start from a server-admitted pair. This is seed
+  // state (like seedConnection), NOT proof that the outside-C queue captures it.
+  async function projectConnectionFixture(_db: typeof db, sharedLead = false) {
+    const f = await seedProjectConnectionFixture(db, sharedLead);
+    return { ...f, run: async (...args: Parameters<typeof f.run>) => {
+      const bound = await f.run(...args);
+      const [task] = await db.select({ projectId: issues.projectId }).from(issues).where(and(
+        eq(issues.id, bound.issue.id), eq(issues.companyId, f.companyId),
+      ));
+      const contextSnapshot = { ...bound.run.contextSnapshot,
+        projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: task!.projectId } };
+      await db.update(heartbeatRuns).set({ contextSnapshot }).where(eq(heartbeatRuns.id, bound.run.id));
+      return { ...bound, run: { ...bound.run, contextSnapshot } };
+    } };
+  }
 
   async function shared() {
     const f = await projectConnectionFixture(db, true);
@@ -231,8 +247,13 @@ describe("project connection task-derived selection and no legacy fallback (roun
 
   it.each(["lead_removed", "lead_replaced", "primary_replaced", "project_archived"] as const)("J02/J03: stale approval after %s cannot release a credential", async change => {
     const f = await projectConnectionFixture(db);
-    await f.seedConnection(f.a);
+    const owned = await f.seedConnection(f.a);
     const bound = await f.run();
+    const before = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, {
+      agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id,
+    });
+    expect(before.credential?.connectionId).toBe(owned.connection.id);
+    provider.acquire.mockClear();
     if (change === "lead_removed") await db.update(projects).set({ leadAgentId: null }).where(eq(projects.id, f.a.id));
     if (change === "lead_replaced") await db.update(projects).set({ leadAgentId: f.leadB.id }).where(eq(projects.id, f.a.id));
     if (change === "primary_replaced") await db.update(userCompanyPreferences).set({ primaryAgentId: f.leadB.id }).where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
@@ -256,8 +277,8 @@ describe("project connection task-derived selection and no legacy fallback (roun
 
   it("J17: task A overrides a conflicting snapshot B and a forged persisted MCP session B", async () => {
     const { f, a, b, bound, context } = await shared();
-    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: bound.issue.id, projectId: f.b.id,
-      paperclipIssue: { id: bound.issue.id, projectId: f.b.id } } }).where(eq(heartbeatRuns.id, bound.run.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: projectConnectionRunSnapshot({ issueId: bound.issue.id, projectId: f.b.id,
+      paperclipIssue: { id: bound.issue.id, projectId: f.b.id } }) }).where(eq(heartbeatRuns.id, bound.run.id));
     const captured = await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: bound.run.id });
     expect(captured.projectId).toBe(f.a.id);
     const selected = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, context);
@@ -337,7 +358,9 @@ describe("project connection task-derived selection and no legacy fallback (roun
         await tx.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, a.connection.id));
       });
       await ready;
-      waiting = resolveManagedGitHubCredential(reader, detectableFallback(), f.companyId, context);
+      waiting = captureProjectConnectionRunContext(reader, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: bound.run.id })
+        .then(() => resolveManagedGitHubCredential(reader, detectableFallback(), f.companyId, context));
+      void waiting.catch(() => undefined); // retain rejection for the intended assertion, not an unhandled promise
       await vi.waitFor(async () => {
         const result = await db.execute(sql`select count(*)::int as n from pg_stat_activity
           where application_name = ${`projconn-${bound.run.id}`} and wait_event_type = 'Lock'`);
@@ -351,8 +374,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
       expect(provider.acquire).not.toHaveBeenCalled();
     } finally {
       release?.();
-      await writer;
-      await waiting;
+      await Promise.allSettled([writer, waiting]);
       await reader.$client.end({ timeout: 1 });
     }
   });
@@ -363,13 +385,16 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, lied);
     expect(selected.connection?.id).not.toBe(b.connection.id);
     expect(selected.connection?.id === a.connection.id || Boolean(selected.error)).toBe(true);
+    expect(selected.error).toContain("project_connection_unavailable");
     const result = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, lied);
     expect(result.credential?.connectionId).not.toBe(b.connection.id);
+    expect(result.error).toContain("project_connection_unavailable");
   });
 
   it("J10: taskless snapshot/workspace B cannot cure two-project ambiguity", async () => {
     const { f, b } = await shared();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, status: "running", contextSnapshot: { projectId: f.b.id } }).returning();
+    await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: run!.id });
     const context = { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: run!.id, projectId: f.b.id, explicitGrantId: b.grant.id };
     const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
     expect(selected.configured).toBe(true);
@@ -394,6 +419,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const run = mode === "taskless"
       ? (await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, status: "running", contextSnapshot: { projectId: f.b.id } }).returning())[0]!
       : (await f.run(null, f.leadA.id, { projectId: f.b.id })).run;
+    if (mode === "taskless") await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: run.id });
     const session = await createToolGatewayService(db).createSession({ companyId: f.companyId, agentId: f.leadA.id, runId: run.id });
     expect(session.projectId).toBeNull();
   });
@@ -401,9 +427,10 @@ describe("project connection task-derived selection and no legacy fallback (roun
   it("J18 MCP: taskless explicit session body project B cannot select a project", async () => {
     const f = await projectConnectionFixture(db, true);
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, status: "running", contextSnapshot: {} }).returning();
+    await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: run!.id });
     let session;
     try { session = await createToolGatewayService(db).createSession({ companyId: f.companyId, agentId: f.leadA.id, runId: run!.id, projectId: f.b.id }); }
-    catch (error) { expect(error).toMatchObject({ status: 403 }); return; }
+    catch (error) { expect(error).toMatchObject({ status: 403, reasonCode: "run_context_mismatch" }); return; }
     expect(session.projectId).toBeNull();
   });
 
@@ -416,8 +443,9 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
     expect(selected.configured).toBe(true);
     expect(selected.grant).toBeUndefined();
+    expect(selected.error).toContain("project_connection_unavailable");
     const git = createGitRemoteAuthProvider(db, f.companyId, context, { secrets, env: { GITHUB_TOKEN: "synthetic-env-token" } });
-    await expect(git("https://github.com/owner/A.git")).rejects.toThrow();
+    await expect(git("https://github.com/owner/A.git")).rejects.toThrow("project_connection_unavailable");
     expect(secrets.getByName).not.toHaveBeenCalled();
     expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
     expect(provider.acquire).not.toHaveBeenCalled();
@@ -444,12 +472,12 @@ describe("project connection task-derived selection and no legacy fallback (roun
       try {
         const git = createGitRemoteAuthProvider(db, ${JSON.stringify(f.companyId)}, ${JSON.stringify(context)}, { secrets,
           env: { GITHUB_TOKEN: "synthetic-env-canary", GH_TOKEN: "synthetic-host-canary", SSH_AUTH_SOCK: "synthetic-ssh-agent" } });
-        const refused = [];
+        const refused = [], reasons = [];
         for (const remote of ["https://github.com/owner/A.git", "git@github.com:owner/A.git", "ssh://git@github.com/owner/A.git",
           "https://inline:synthetic-inline-canary@github.com/owner/A.git"]) {
-          try { await git(remote); refused.push(false); } catch { refused.push(true); }
+          try { await git(remote); refused.push(false); } catch (error) { refused.push(true); reasons.push(error.message); }
         }
-        console.log(JSON.stringify({ pid: process.pid, refused, fallbackLookups, providerCalls }));
+        console.log(JSON.stringify({ pid: process.pid, refused, reasons, fallbackLookups, providerCalls }));
       } finally { await db.$client.end({ timeout: 1 }); }
     `;
     const { stdout } = await promisify(execFile)(process.execPath,
@@ -457,9 +485,11 @@ describe("project connection task-derived selection and no legacy fallback (roun
         timeout: 30_000, maxBuffer: 100_000,
         env: { ...process.env, PROJECT_TEST_DATABASE_URL: database.connectionString, GH_TOKEN: "", GITHUB_TOKEN: "" },
       });
-    const restarted = JSON.parse(stdout.trim().split("\n").at(-1)!) as { pid: number; refused: boolean[]; fallbackLookups: number; providerCalls: number };
+    const restarted = JSON.parse(stdout.trim().split("\n").at(-1)!) as { pid: number; refused: boolean[]; reasons: string[]; fallbackLookups: number; providerCalls: number };
     expect(restarted.pid).not.toBe(process.pid);
     expect(restarted.refused).toEqual([true, true, true, true]);
+    expect(restarted.reasons).toHaveLength(4);
+    expect(restarted.reasons.every(reason => reason.startsWith("project_connection_unavailable"))).toBe(true);
     expect(restarted.fallbackLookups).toBe(0);
     expect(restarted.providerCalls).toBe(0);
     expect(provider.acquire).not.toHaveBeenCalled();
@@ -482,8 +512,9 @@ describe("project connection task-derived selection and no legacy fallback (roun
         github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } };
     });
     const selected = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, context);
+    expect(provider.acquire).toHaveBeenCalledTimes(1);
     expect(selected.credential).toBeUndefined();
-    expect(selected.error).toBeTruthy();
+    expect(selected.error).toBe("project_connection_run_context_invalid");
     expect(selected.credential?.connectionId).not.toBe(b.connection.id);
   });
 
