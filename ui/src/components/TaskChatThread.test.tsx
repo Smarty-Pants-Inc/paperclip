@@ -1388,6 +1388,7 @@ describe.each(["legacy", "native"] as const)("%s task history readiness", (runti
     expect(container.querySelector(".tc-turn-fold")).toBeNull();
   }
   it.runIf(runtimeMode === "native")("shows a native paperclip_runner run's reasoning inline with no stored choice, live, settled and after a cold remount", async () => {
+    localStorage.setItem("paperclip:task-chat:reasoning-display:v1", "fold");
     expect(reasoningPreferenceState.byAgent).toEqual({});
     const run = reasoningRun("registered");
     try {
