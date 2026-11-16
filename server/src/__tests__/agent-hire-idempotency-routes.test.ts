@@ -363,6 +363,104 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     expect(transactionRetryStats.retried - retryCountBefore).toBe(4);
   });
 
+  it("does not duplicate a direct hire when an exhausted grant request is retried", async () => {
+    const { company, hiringAgent, run } = await seedHiringFixture(db);
+    await authorizeAgentToCreate(db, company.id, hiringAgent.id);
+    const rootCeo = await seedRootCeo(db, company.id);
+    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
+    const url = `/api/companies/${company.id}/agents`;
+    const payload = {
+      name: "Retry after grant exhaustion",
+      role: "engineer",
+      reportsTo: hiringAgent.id,
+      adapterType: "process" as const,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    };
+
+    const exhausted = await request(app).post(url).send(payload);
+    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(422);
+    expect(exhausted.body.code).toBe("agent_hire_grant_contention");
+    const retried = await request(app).post(url).send(payload);
+    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+    expect(retried.body.idempotent).toBe(true);
+
+    const hires = await db.select({ id: agents.id }).from(agents).where(and(
+      eq(agents.companyId, company.id),
+      eq(agents.name, payload.name),
+    ));
+    expect(hires.map(row => row.id)).toEqual([retried.body.id]);
+    expect(await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalType, "agent"),
+      eq(companyMemberships.principalId, retried.body.id),
+    ))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, company.id),
+      eq(principalPermissionGrants.principalType, "agent"),
+      eq(principalPermissionGrants.principalId, retried.body.id),
+      eq(principalPermissionGrants.permissionKey, "tasks:assign"),
+    ))).toHaveLength(1);
+  });
+
+  it("keeps a setupId hire on its existing row after grant exhaustion and retry", async () => {
+    const { company } = await seedHiringFixture(db);
+    const boardUserId = "hire-setup-board";
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      membershipRole: "owner",
+      status: "active",
+    });
+    await db.insert(principalPermissionGrants).values({
+      companyId: company.id,
+      principalType: "user",
+      principalId: boardUserId,
+      permissionKey: "agents:create",
+    });
+    const boardActor: Express.Request["actor"] = {
+      type: "board",
+      userId: boardUserId,
+      companyIds: [company.id],
+      memberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }],
+      source: "session",
+    };
+    const app = createApp(db, boardActor);
+    const setupId = randomUUID();
+    const setup = await request(app).post(`/api/companies/${company.id}/agents`).send({
+      setupId,
+      name: "Setup retry hire",
+      adapterType: "process",
+    });
+    expect(setup.status, JSON.stringify(setup.body)).toBe(201);
+    const rootCeo = await seedRootCeo(db, company.id);
+    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    const hireUrl = `/api/companies/${company.id}/agent-hires`;
+    const payload = {
+      setupAgentId: setupId,
+      name: "Setup retry hire",
+      role: "engineer",
+      adapterType: "process" as const,
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    };
+
+    const exhausted = await request(app).post(hireUrl).send(payload);
+    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(422);
+    expect(exhausted.body.code).toBe("agent_hire_grant_contention");
+    const retried = await request(app).post(hireUrl).send(payload);
+    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
+    expect(retried.body.idempotent).toBe(true);
+    expect(retried.body.agent?.id).toBe(setupId);
+
+    expect(await db.select({ id: agents.id }).from(agents).where(and(
+      eq(agents.companyId, company.id),
+      eq(agents.id, setupId),
+    ))).toHaveLength(1);
+  });
+
   it("creates ten agents concurrently with membership and tasks:assign in five trials", async () => {
     const trials: Array<{ statuses: number[]; errors: unknown[] }> = [];
     const failures: Array<{ trial: number; statuses: number[]; errors: unknown[] }> = [];
