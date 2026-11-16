@@ -1345,6 +1345,50 @@ describe("native provider startup retry", () => {
         await expectExactResume(seeded);
       });
 
+      // A fresh same-run Pi open restarts its harness sourceSeq at 1 under the
+      // same runner instance and run id (codex-app-server-driver-impl.ts
+      // openSession sourceSequence 0; codex-session-state.ts emit). Its first
+      // event must not collide with attempt 1's durable sourceSeq 1.
+      it("accepts the fresh attempt-2 session's own sourceSeq 1 events", async () => {
+        type ProbeControlPlane = { openRun(input: unknown): Promise<unknown>;
+          appendEvent(event: unknown): Promise<{ disposition: string }> };
+        const seeded = await seedPiRun();
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+        const openInput = { identity: { companyId, issueId: seeded.issueId, runId: seeded.runId, agentId: seeded.agentId,
+          sessionId: run!.nativeSessionId! }, backendKind: "runner" as const, sourceInstanceId: seeded.runnerInstanceId };
+        const modelItem = (providerSessionId: string) => ({ schema: "paperclip.prp.event.v1" as const, runId: seeded.runId,
+          normalizedSessionId: run!.nativeSessionId!, sourceInstanceId: seeded.runnerInstanceId,
+          sourceEventId: `${seeded.runnerInstanceId}:${seeded.runId}:1`, sourceSeq: 1, sourceKind: "runner" as const,
+          itemId: `${providerSessionId}:model`, eventType: "item.completed" as const, schemaVersion: 1, priority: 1 as const,
+          emittedAt: new Date().toISOString(), payload: { kind: "model", text: "paperclip/model (paperclip)" } });
+        provider.execute.mockReset().mockImplementation(async (options: { controlPlane: ProbeControlPlane }) => {
+          await options.controlPlane.openRun(openInput);
+          expect((await options.controlPlane.appendEvent(modelItem(openedPiSessionId))).disposition).toBe("committed");
+          await db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+            || ${JSON.stringify({ sessionCheckpoint: { backendKind: "runner", driverKind: "pi_rpc", sessionId: openedPiSessionId,
+              identity: openInput.identity, providerSessionId: openedPiSessionId, cursor: "1", semanticResult: null, terminal: null,
+              activeTurnId: null, terminalTurns: [], pendingRuntimeRequests: [], goal: null, lineage: [rootLineage(openedPiSessionId)] } })}::jsonb` })
+            .where(eq(heartbeatRuns.id, seeded.runId));
+          throw new Error(turnStartFailure);
+        });
+        await expect(executePaperclipNativeSession({ db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+          backend: { descriptor: async () => { throw new Error("x"); }, openSession: async () => { throw new Error("x"); } },
+        })).rejects.toThrow("PRP command turn.start failed");
+        expect((await read(seeded)).coordinator.failureDetail).toMatchObject({ recoveryMode: "bootstrap_retry" });
+        const observed: { error?: unknown } = {};
+        provider.execute.mockReset().mockImplementation(async (options: { controlPlane: ProbeControlPlane }) => {
+          await options.controlPlane.openRun(openInput);
+          // The fresh Pi session: new provider id, harness sequence restarted.
+          await options.controlPlane.appendEvent(modelItem("fresh-pi-session")).catch((error: unknown) => { observed.error = error; });
+          throw new Error("transport_reconnect_grace_exceeded: second attempt observed");
+        });
+        await expect(executePaperclipNativeSession({ db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+          leaseOwner: await claimRetry(seeded),
+          backend: { descriptor: async () => { throw new Error("x"); }, openSession: async () => { throw new Error("x"); } },
+        })).rejects.toThrow("second attempt observed");
+        expect(String(observed.error ?? "accepted")).toBe("accepted");
+      });
+
       it("leaves a codex checkpoint of the same shape on exact resume", async () => {
         const seeded = await seedPiRun("codex");
         await failAfterObservedPiOpen(seeded, { provider: "codex" });
