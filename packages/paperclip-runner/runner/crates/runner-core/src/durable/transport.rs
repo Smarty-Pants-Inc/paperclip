@@ -26,6 +26,8 @@ use super::{
 mod listener;
 #[cfg(test)]
 mod listener_tests;
+#[cfg(test)]
+mod test_clock;
 use listener::{ListenerIngress, ListenerSocket};
 
 const SECURE_FRAME_SCHEMA: &str = "paperclip.runner.secure-frame.v1";
@@ -1749,6 +1751,7 @@ mod tests {
     include!("tests/listener_waiter.rs");
     include!("tests/listener_abandoned_flood.rs");
     include!("tests/indeterminate_terminal_ack.rs");
+    include!("tests/inbound_liveness.rs");
 
     use std::net::{IpAddr, Ipv4Addr, TcpListener};
     use std::path::PathBuf;
