@@ -15,6 +15,8 @@ import { errorHandler } from "../../middleware/index.js";
 import type { ActorInfo } from "../../services/tool-access/types.js";
 import { connectionManagementService } from "../../services/connection-management.js";
 import { ensureHumanRoleDefaultGrants } from "../../services/principal-access-compatibility.js";
+import { captureProjectConnectionRunContext } from "../../services/project-connection-run-context.js";
+import { lockProjectConnectionLifecycle } from "../../services/project-connection-retirement.js";
 
 // Type-only forward contract: BASE deliberately has no projectId in these types.
 // No missing runtime module, fake implementation, or test-only database DDL.
@@ -101,11 +103,17 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
     if (options.installed !== false) await db.insert(toolConnectionInstalls).values({ companyId, connectionId: connection!.id, targetType: "agent", targetId: leadA.id });
     return { connection: connection!, grant: grant! };
   };
-  const run = async (project: typeof a | null = a, agentId = leadA.id, snapshot: Record<string, unknown> = {}) => {
-    const [issue] = await db.insert(issues).values({ companyId, title: "Project-scoped work", assigneeAgentId: agentId, projectId: project?.id ?? null, responsibleUserId: human }).returning();
-    const [heartbeat] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: issue!.id, status: "running", contextSnapshot: { issueId: issue!.id, projectId: project?.id ?? null, ...snapshot } }).returning();
-    return { issue: issue!, run: heartbeat! };
-  };
+  const run = async (project: typeof a | null = a, agentId = leadA.id, snapshot: Record<string, unknown> = {}) => db.transaction(async tx => {
+    const [issue] = await tx.insert(issues).values({ companyId, title: "Project-scoped work", assigneeAgentId: agentId, projectId: project?.id ?? null, responsibleUserId: human }).returning();
+    if (issue!.projectId) await lockProjectConnectionLifecycle(tx, { companyId, projectId: issue!.projectId });
+    const { projectConnectionRunContext: _callerPair, ...hints } = snapshot;
+    const [heartbeat] = await tx.insert(heartbeatRuns).values({ companyId, agentId, issueId: issue!.id, status: "running", contextSnapshot: { issueId: issue!.id, projectId: project?.id ?? null, ...hints } }).returning();
+    // Model real queue admission, never lazy credential-use capture or a pair
+    // taken from optional caller snapshot hints. No assertion is relaxed.
+    await captureProjectConnectionRunContext(tx, { companyId, agentId, heartbeatRunId: heartbeat!.id });
+    const [admitted] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, heartbeat!.id));
+    return { issue: issue!, run: admitted! };
+  });
   const route = (who: "board" | string = "board") => {
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => {
