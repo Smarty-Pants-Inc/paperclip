@@ -8,7 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations,
+  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations, issueComments,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -27,6 +27,8 @@ import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import {
   findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementUnprovenError,
 } from "./predecessor-retirement.js";
+import * as refusalCodes from "./runner-reconciliation-refusal.js";
+import { PRIOR_OWNER_FENCE_REFUSED } from "../native-local-process-stop.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
@@ -221,9 +223,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     });
     const failures: unknown[] = [];
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
-      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false) => createRunnerdBackend({
+      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false,
+      // The executor's own admission passes the same-run fresh-thread floor;
+      // direct backend construction (every upstream row) keeps the hold.
+      floor?: { onSameRunFreshThread: (proof: Record<string, unknown>) => Promise<void> }) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
+      ...(floor ? { onSameRunFreshThread: floor.onSameRunFreshThread } : {}),
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona", environmentId,
         leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
@@ -1160,6 +1166,111 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
         status, releasedAt: status === "retained" ? null : new Date(), metadata: { remoteCwd: "/workspace" } });
     }
     expect(await followUp.start()).toBe(outcome);
+  }, 60_000);
+
+  // SMA-66 (fresh, 11-16): a restart cut the prior per-turn owner's close
+  // after its committed result, so its journal still holds a runner.suspend that
+  // its Runner never acknowledged, and its stopped-and-kept box ("retained") may
+  // still exist. Upstream keeps that owner held (row above, unchanged). Today
+  // the run fails, its root is quarantined, and an automatic retry answers on
+  // a fresh thread. The floor (member b of FRESH_THREAD_REFUSAL_CODES) does the
+  // same in the SAME run: the old thread is set aside, never resumed; a fresh
+  // thread is recorded and the person sees one continuation note. Pi's retry
+  // keeps conversation C, so its same run is exactly that retry; another
+  // provider's retry mints a new conversation, so it keeps the typed refusal.
+  async function seedSuspendNeverFinished(status: "retained" | "active" | "pending_cleanup" | "expired",
+    options: { control?: "pending-command" | "pending-attach" | "pending-tool-result" | "unanswered-tool"; sameSandbox?: boolean;
+      recorded?: boolean; provider?: "pi_rpc" | "acpx" } = {}) {
+    const prior = await seedRecoveredPriorRun(options.control ?? "pending-command", { provider: options.provider ?? "pi_rpc" });
+    const followUp = await admitFollowUp(prior);
+    if (options.recorded !== false) {
+      await db.insert(environments).values({ id: followUp.environmentId, name: `kept-${followUp.environmentId}`, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
+        heartbeatRunId: prior.runId, provider: "daytona",
+        providerLeaseId: options.sameSandbox ? followUp.providerLeaseId : `sandbox-${prior.runId}`,
+        status, releasedAt: status === "expired" ? new Date() : null, metadata: { remoteCwd: "/workspace" } });
+    }
+    const proofs: Record<string, unknown>[] = [];
+    const floor = { onSameRunFreshThread: async (proof: Record<string, unknown>) => { proofs.push(proof); } };
+    return { prior, followUp, proofs, floor };
+  }
+
+  async function fenceRefusals(runId: string) {
+    return db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents)
+      .where(sql`${heartbeatRunEvents.runId} = ${runId} and ${heartbeatRunEvents.eventType} = ${PRIOR_OWNER_FENCE_REFUSED}`);
+  }
+
+  it.each(["created", "replacement"] as const)(
+    "answers SMA-66's unacknowledged-suspend owner on a kept sandbox on the FIRST run in a recorded fresh thread (%s)", async outcome => {
+      const { prior, followUp, proofs, floor } = await seedSuspendNeverFinished("retained");
+      expect(await followUp.start(outcome, undefined, false, floor)).toBe(ADMITTED);
+      // One recorded fresh thread, naming the closed-set member and the set-aside owner.
+      expect(proofs).toEqual([expect.objectContaining({ code: refusalCodes.PRIOR_OWNER_LIFECYCLE_UNSETTLED, priorRunId: prior.runId,
+        previousProviderSessionId: "provider-session-before-recovery" })]);
+      expect(refusalCodes.FRESH_THREAD_REFUSAL_CODES).toContain(refusalCodes.PRIOR_OWNER_LIFECYCLE_UNSETTLED);
+      // The old thread is set aside exactly as today's retry finds it (one
+      // quarantined copy), never resumed: no live root carries the prior owner.
+      expect(await quarantined()).toHaveLength(1);
+      const live = (await readdir(stateDirectory)).filter(name => /^[a-f0-9]{64}$/.test(name));
+      for (const name of live) {
+        const path = join(stateDirectory, name, "control-plane", "control-plane-state.json");
+        if (existsSync(path)) expect(JSON.parse(await readFile(path, "utf8")).identity?.runId).not.toBe(prior.runId);
+      }
+      expect(followUp.logs.join("")).toContain("provider session continuity break: prior owner");
+      // 0 failed runs: this run started; nothing recorded it as refused.
+      expect(await fenceRefusals(followUp.runId)).toEqual([]);
+      const runs = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.nativeIssueId, prior.issueId));
+      expect(runs.filter(run => run.status === "failed")).toEqual([]);
+      // The person reads one continuation note for this fresh thread.
+      const notes = await db.select({ body: issueComments.body, metadata: issueComments.metadata }).from(issueComments)
+        .where(eq(issueComments.issueId, prior.issueId));
+      expect(notes).toHaveLength(1);
+      expect(String(notes[0]!.metadata?.authorizationReason)).toBe(`fresh_provider_thread:prior_owner_lifecycle_unsettled:${prior.runId}`);
+      // A replay of the same admission adds no second note.
+      expect(await followUp.start(outcome, undefined, false, floor)).toBe(ADMITTED);
+      expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, prior.issueId))).toHaveLength(1);
+    }, 60_000);
+
+  it.each([
+    { label: "its prior lease is still active", status: "active" as const },
+    { label: "it ended on this very sandbox", status: "expired" as const, sameSandbox: true },
+    { label: "its lease was never recorded", status: "expired" as const, recorded: false },
+  ])("keeps SMA-66's owner held, with no fresh thread, when $label", async ({ status, sameSandbox, recorded }) => {
+    const { followUp, proofs, floor } = await seedSuspendNeverFinished(status, { sameSandbox, recorded });
+    expect(await followUp.start("created", undefined, false, floor)).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    expect(proofs).toEqual([]);
+    expect(refusalCodes.freshThreadRefusalCode(followUp.failures.at(-1))).toBeNull();
+    expect(await fenceRefusals(followUp.runId)).toHaveLength(1);
+  }, 60_000);
+
+  it.each([
+    { control: "pending-attach" as const, refused: "journal_commands_unsettled(run.attach.pending)" },
+    { control: "pending-tool-result" as const, refused: "journal_commands_unsettled(semantic_tool.result.pending)" },
+    { control: "unanswered-tool" as const, refused: "journal_tool_input_unanswered" },
+  ])("keeps an owner on a kept sandbox held when its journal still holds a $control", async ({ control, refused }) => {
+    const { followUp, proofs, floor } = await seedSuspendNeverFinished("retained", { control });
+    expect(await followUp.start("created", undefined, false, floor)).toBe(stranded(refused));
+    expect(proofs).toEqual([]);
+    expect(refusalCodes.freshThreadRefusalCode(followUp.failures.at(-1))).toBeNull();
+  }, 60_000);
+
+  it("keeps a non-Pi SMA-66 owner's run failing with the closed-set member, for the existing fresh continuation", async () => {
+    const { followUp, proofs, floor } = await seedSuspendNeverFinished("retained", { provider: "acpx" });
+    expect(await followUp.start("created", undefined, false, floor)).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    expect(proofs).toEqual([]);
+    expect(refusalCodes.freshThreadRefusalCode(followUp.failures.at(-1))).toBe(refusalCodes.PRIOR_OWNER_LIFECYCLE_UNSETTLED);
+    expect(await quarantined()).toHaveLength(1);
+  }, 60_000);
+
+  it("types SMA-66's refusal as the closed-set member when the backend is constructed directly", async () => {
+    const { followUp, proofs } = await seedSuspendNeverFinished("retained");
+    // Upstream's exact message stays (row above); the closed code routes the
+    // failed run to the existing fresh-thread continuation.
+    expect(await followUp.start("created")).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    expect(proofs).toEqual([]);
+    expect(refusalCodes.freshThreadRefusalCode(followUp.failures.at(-1))).toBe(refusalCodes.PRIOR_OWNER_LIFECYCLE_UNSETTLED);
+    expect(await quarantined()).toHaveLength(1);
   }, 60_000);
 
   // Staging PAP-4196 (run.attach) and PAP-3443 (semantic_tool.result): the
