@@ -672,6 +672,21 @@ export function nativeProviderRecoveryPolicy(rawCheckpoint: Record<string, unkno
       : ("allow_replacement_after_resume_failure" as const);
 }
 
+/** A same-run checkpoint is the runner's own session snapshot, which never
+ * carries a policy, so a retry attempt >= 2, a restart recovery or a first-turn
+ * fresh open lost it and its definite-absence recovery could never be replaced
+ * (gate 6, prp-resume-unavailable). Fill an ABSENT policy with the same
+ * computation the rebind uses; a present policy is kept as is. Applied only
+ * where a same-run checkpoint is loaded: the warm controller's same-run branch
+ * and the control plane's DB load. */
+export function withSameRunProviderRecoveryPolicy<T extends { providerRecoveryPolicy?: PersistedNativeSession["providerRecoveryPolicy"] }>(
+  snapshot: T,
+  refreshTools?: boolean,
+): T {
+  if (snapshot.providerRecoveryPolicy !== undefined) return snapshot;
+  return { ...snapshot, providerRecoveryPolicy: nativeProviderRecoveryPolicy(record(snapshot), refreshTools) };
+}
+
 /**
  * Rebind a completed prior run's provider checkpoint to a new heartbeat run.
  * The provider/driver session identity is retained, while every per-turn and

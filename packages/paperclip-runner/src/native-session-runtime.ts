@@ -446,6 +446,8 @@ export interface ExecuteNativeSessionOptions {
     previousProviderSessionId: string | null;
     replacementDriverSessionId: string;
     replacementProviderSessionId: string | null;
+    /** Set when the Runner proved its saved state definitely absent. */
+    identityChangeReason?: NativeSessionRecoveryResult["identityChangeReason"];
   }) => Promise<void> | void;
   /**
    * Control-plane policy seam for a provider turn that completed after
@@ -2106,6 +2108,33 @@ async function governedWaitFollowUpMayStartFresh(input: {
   }
 }
 
+/** A checkpointed turn whose outcome is unknown: active and not terminal. */
+function persistedTurnInFlight(checkpoint: PersistedNativeSession): boolean {
+  return Boolean(checkpoint.activeTurnId)
+    && !(checkpoint.terminalTurns ?? []).some((terminal) => terminal.turnId === checkpoint.activeTurnId);
+}
+
+const IN_FLIGHT_TOOL_WORK_PROOF_TIMEOUT_MS = 30_000;
+
+/** A proof that fails, expires or is unavailable is no proof. */
+async function inFlightTurnRecordedNoToolWork(input: {
+  controlPlane: ControlPlanePort;
+  timeoutMs: number;
+}): Promise<boolean> {
+  const controlPlane = input.controlPlane;
+  if (!controlPlane.provesNoRunToolWork) return false;
+  const timeoutMs = Math.min(input.timeoutMs, IN_FLIGHT_TOOL_WORK_PROOF_TIMEOUT_MS);
+  try {
+    return await runAbortableOperationWithin({
+      timeoutMs,
+      timeoutMessage: `native session tool-work proof timed out after ${timeoutMs}ms`,
+      operation: (signal) => controlPlane.provesNoRunToolWork!({ signal }),
+    }) === true;
+  } catch {
+    return false;
+  }
+}
+
 async function reconcileRecoveryCheckpoint(input: {
   controlPlane: ControlPlanePort;
   checkpoint: PersistedNativeSession;
@@ -2591,6 +2620,7 @@ export async function executeNativeSession(
     reason: string;
     previousDriverSessionId: string;
     previousProviderSessionId: string | null;
+    identityChangeReason?: NativeSessionRecoveryResult["identityChangeReason"];
   } | null = null;
   let reconciledRecoveryCheckpoint: PersistedNativeSession | null = null;
   const checkpointedInterruption = persistedSession && nativeRestartInterruptedTurnId(persistedSession);
@@ -2719,6 +2749,24 @@ export async function executeNativeSession(
       if (recovery.failureClass === PROVIDER_REFRESH_REQUIRED) {
         throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
       }
+      // The Runner proved its saved state definitely absent while this run's
+      // turn was in flight (a replaced box, or lost controller state). Every
+      // retry reads the same empty state, so it is never a bare retryable
+      // interruption. A replacement could repeat or lose that turn's external
+      // effect, so it is allowed only by the replacement policy AND a durable
+      // proof that the run recorded no tool call; otherwise it is named, and the
+      // person's Retry continues in a fresh provider session.
+      if (
+        recovery.failureClass === PROVIDER_STATE_INCOMPATIBLE &&
+        recovery.resumeStateUnavailable === true &&
+        persistedTurnInFlight(providerRecoveryCheckpoint) &&
+        !(replacementAllowed && await inFlightTurnRecordedNoToolWork({
+          controlPlane: options.controlPlane,
+          timeoutMs: recoveryTimeoutMs,
+        }))
+      ) {
+        throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
+      }
       const governedWaitFollowUpLostState = !replacementAllowed && await governedWaitFollowUpMayStartFresh({
         input,
         checkpoint: providerRecoveryCheckpoint,
@@ -2753,6 +2801,8 @@ export async function executeNativeSession(
         previousDriverSessionId: providerRecoveryCheckpoint.sessionId,
         previousProviderSessionId:
           providerRecoveryCheckpoint.providerSessionId ?? null,
+        ...(recovery.resumeStateUnavailable === true && recovery.identityChangeReason
+          ? { identityChangeReason: recovery.identityChangeReason } : {}),
       };
       const replacementInput = {
         identity,
