@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 
 export const MAX_READY_SPARES = 5;
 export const MAX_CONFIGURED_READY_SPARES = 3;
@@ -69,10 +69,20 @@ export type ReadySpareOperations = {
    * Optional provider-side hourly check; fail closed on an unknown result.
    * `false` refuses (churn_cap). An object reports the durable count of spare
    * creates in the last hour (the provider inventory, which survives worker
-   * restarts) and the keeper applies the churn cap and ceiling to it.
+   * restarts) and the keeper applies the churn cap and ceiling to it. With
+   * `createdAt` it also reports the creation times of this company's spare and
+   * RUN boxes in the last hour, which the keeper keeps as the durable all-create
+   * ledger (see `observeProviderCreates`).
    */
-  allowCreate?(): Promise<boolean | { recentSpareCreates: number }>;
+  allowCreate?(): Promise<boolean | { recentSpareCreates: number; createdAt?: ProviderCreateTimes }>;
 };
+
+/**
+ * One company's Boat boxes created in the last hour, from Boat's inventory:
+ * spare creation times (ms), and run creation times with the run's
+ * `paperclip-acquire` label (the acquisition attempt that created it).
+ */
+export type ProviderCreateTimes = { spare: readonly number[]; run: readonly { createdAt: number; attempt?: string }[] };
 
 export type CreateCapReason = "churn_cap" | "ceiling";
 
@@ -248,6 +258,17 @@ export class ReadySpareKeeper {
   private readonly runCreates = new Map<string, Map<string, number>>();
   /** Claimed spares whose bound run reached a step on the box, keyed by box ID: one credit per box. */
   private readonly usedCredits = new Map<string, Map<string, number>>();
+  /**
+   * Boat's durable create inventory per company (smarty-dev#20869, judge F1):
+   * the creation times of its purpose=spare and purpose=run boxes, observed at
+   * `observedAt`. A restarted worker's local ledgers are empty; this keeps the
+   * hour's creates made before the restart (or by another worker) counted.
+   */
+  private readonly providerCreates = new Map<string, { spare: number[]; run: Array<{ createdAt: number; attempt?: string }>; observedAt: number; mark: number }>();
+  /** Order of local create-ledger entries; their tokens are `create:<order>`. */
+  private createOrder = 0;
+  /** Spare reservations still awaiting the provider verdict: not yet creates for a run's count. */
+  private readonly tentativeCreates = new Set<string>();
   private readonly createCeilings = new Map<string, number>();
   private readonly capped = new Map<string, { refusal: CreateCapRefusal; until: number; loggedAt: number; suppressed: number }>();
   private readonly refusalCounts = new Map<string, Record<CreateCapReason, number>>();
@@ -279,10 +300,58 @@ export class ReadySpareKeeper {
     return entries;
   }
 
-  /** This worker's rolling-hour create counts for one company. */
-  createCounts(companyId: string): { spareCreates: number; runCreates: number; usedCredits: number; churnCreates: number; allCreates: number } {
-    const spareCreates = this.windowed(this.recentCreates, companyId).size;
-    const runCreates = this.windowed(this.runCreates, companyId).size;
+  private nextCreateToken(): string { return `create:${++this.createOrder}`; }
+  /** Taken immediately before a Boat inventory read; local creates recorded after it are not in that read. */
+  createLedgerMark(): { at: number; mark: number } { return { at: this.now(), mark: this.createOrder }; }
+  /**
+   * Record Boat's inventory of this company's creates, read after `begun`
+   * (`createLedgerMark()`): local creates recorded after that mark are not yet
+   * in it and are counted on top of it.
+   */
+  observeProviderCreates(companyId: string, createdAt: ProviderCreateTimes, begun = this.createLedgerMark()): void {
+    const recent = (at: number) => Number.isFinite(at) && this.now() - at < CREATE_WINDOW_MS;
+    const previous = this.providerCreates.get(companyId);
+    if (previous && previous.mark > begun.mark) return; // A slower, older read never replaces a newer one.
+    this.providerCreates.set(companyId, { spare: createdAt.spare.filter(recent), run: createdAt.run.filter(entry => recent(entry.createdAt)).map(entry => ({ ...entry })),
+      observedAt: begun.at, mark: begun.mark });
+  }
+  /** When Boat's create inventory for this company was last read, if ever by this worker. */
+  providerCreatesObservedAt(companyId: string): number | undefined { return this.providerCreates.get(companyId)?.observedAt; }
+
+  /**
+   * Rolling-hour spare creates: this worker's ledger, or Boat's durable
+   * inventory plus the local creates recorded since it was read, whichever is
+   * more. (A local create still in flight at the read is counted again from
+   * Boat at the next read.)
+   */
+  private mergedCreates(local: Map<string, number>, provider: readonly number[] | undefined, mark: number | undefined, settledOnly = false): number {
+    let size = 0, since = 0;
+    for (const token of local.keys()) {
+      if (settledOnly && this.tentativeCreates.has(token)) continue;
+      size++;
+      if (mark !== undefined && Number(token.slice("create:".length)) > mark) since++;
+    }
+    if (provider === undefined || mark === undefined) return size;
+    const durable = provider.filter(at => this.now() - at < CREATE_WINDOW_MS).length;
+    return Math.max(size, durable + since);
+  }
+
+  /**
+   * Rolling-hour create counts for one company: this worker's ledgers merged
+   * with Boat's inventory. `settledOnly` leaves out spare reservations still
+   * awaiting their provider verdict (a run's count is of creates, not bids).
+   */
+  createCounts(companyId: string, settledOnly = false): { spareCreates: number; runCreates: number; usedCredits: number; churnCreates: number; allCreates: number } {
+    const provider = this.providerCreates.get(companyId);
+    const spareCreates = this.mergedCreates(this.windowed(this.recentCreates, companyId), provider?.spare, provider?.mark, settledOnly);
+    // Runs: this worker's admitted run creates (keyed by acquisition attempt,
+    // pending or failed ones too) united with Boat's run boxes; a box carrying
+    // a local attempt's label is that create, counted once.
+    const localRuns = this.windowed(this.runCreates, companyId);
+    let runCreates = localRuns.size;
+    for (const box of provider?.run ?? []) {
+      if (this.now() - box.createdAt < CREATE_WINDOW_MS && !(box.attempt !== undefined && localRuns.has(`run:${box.attempt}`))) runCreates++;
+    }
     const usedCredits = this.windowed(this.usedCredits, companyId).size;
     return { spareCreates, runCreates, usedCredits, churnCreates: Math.max(0, spareCreates - usedCredits), allCreates: spareCreates + runCreates };
   }
@@ -361,15 +430,28 @@ export class ReadySpareKeeper {
    * only spares; an over-ceiling run still reports the event/counter and keeps
    * health degraded, but must never leave a person's message unanswered.
    */
-  admitRunCreate(companyId: string, environmentId: string): void {
+  admitRunCreate(companyId: string, environmentId: string, attemptId: string): void {
     const capId = JSON.stringify([companyId, environmentId, "run"]);
-    const counts = this.createCounts(companyId);
+    const counts = this.createCounts(companyId, true);
     if (counts.allCreates >= this.createCeiling(companyId)) {
       this.refuse(capId, { companyId, environmentId, kind: "run" }, "ceiling", "local", counts);
     } else {
       this.capped.delete(capId);
     }
-    this.windowed(this.runCreates, companyId).set(randomUUID(), this.now());
+    const runs = this.windowed(this.runCreates, companyId);
+    if (!runs.has(`run:${attemptId}`)) runs.set(`run:${attemptId}`, this.now());
+  }
+  /**
+   * After Boat's inventory lands for a company: if the hour's settled creates
+   * now exceed the ceiling, the last run admitted was over it under a stale
+   * count. Report it once (kind=run, source=provider) unless already reported.
+   */
+  recheckRunCeiling(companyId: string, environmentId: string): void {
+    const capId = JSON.stringify([companyId, environmentId, "run"]);
+    const counts = this.createCounts(companyId, true);
+    if (counts.allCreates > this.createCeiling(companyId) && !this.isCapped(capId)) {
+      this.refuse(capId, { companyId, environmentId, kind: "run" }, "ceiling", "provider", counts);
+    }
   }
   start(): void { this.stopping = false; }
   stop(): void { this.stopping = true; }
@@ -379,7 +461,7 @@ export class ReadySpareKeeper {
     this.pools.clear(); this.inFlightCreates.clear(); this.reconciling.clear(); this.activeDesired.clear();
     this.pendingReconciliations.clear(); this.adopting.clear(); this.claiming.clear(); this.inFlightClaims.clear(); this.recentCreates.clear(); this.failures.clear(); this.demandEvents.clear();
     this.stoppingSpares.clear();
-    this.runCreates.clear(); this.usedCredits.clear(); this.createCeilings.clear(); this.capped.clear(); this.refusalCounts.clear();
+    this.runCreates.clear(); this.usedCredits.clear(); this.providerCreates.clear(); this.tentativeCreates.clear(); this.createCeilings.clear(); this.capped.clear(); this.refusalCounts.clear();
     this.refusalListener = undefined;
   }
 
@@ -674,12 +756,14 @@ export class ReadySpareKeeper {
       if (local.allCreates >= ceiling) { this.refuse(poolId, scope, "ceiling", "local", local); break; }
       if (local.churnCreates >= this.maxCreatesPerHour) { this.refuse(poolId, scope, "churn_cap", "local", local); break; }
       const recent = this.windowed(this.recentCreates, key.companyId);
-      const reservation = randomUUID();
+      const reservation = this.nextCreateToken();
       recent.set(reservation, this.now());
       if (operations.allowCreate) {
-        let verdict: boolean | { recentSpareCreates: number } = false;
+        let verdict: boolean | { recentSpareCreates: number; createdAt?: ProviderCreateTimes } = false;
         let known = true;
-        try { verdict = await operations.allowCreate(); } catch { known = false; }
+        const begun = this.createLedgerMark();
+        this.tentativeCreates.add(reservation);
+        try { verdict = await operations.allowCreate(); } catch { known = false; } finally { this.tentativeCreates.delete(reservation); }
         if (this.stopping || !known) { recent.delete(reservation); break; } // Unknown inventory fails closed, but is not a cap.
         if (verdict === false) {
           recent.delete(reservation);
@@ -689,6 +773,8 @@ export class ReadySpareKeeper {
         if (typeof verdict === "object" && verdict !== null) {
           // Boat's inventory survives restarts and other workers' creates; it
           // does not yet hold this reservation. Credits are this worker's.
+          // Its run boxes keep the hour's run creates counted across restarts.
+          if (verdict.createdAt) this.observeProviderCreates(key.companyId, verdict.createdAt, begun);
           const counts = this.createCounts(key.companyId);
           const providerSpare = Number.isFinite(verdict.recentSpareCreates) ? Math.max(0, Math.trunc(verdict.recentSpareCreates)) : Number.POSITIVE_INFINITY;
           const providerChurn = Math.max(0, providerSpare - counts.usedCredits);

@@ -86,6 +86,13 @@ Two hourly limits bound what spares can cost (smarty-dev#20869):
   admitted and counted, even above the ceiling (RFL ruling A). A person's run
   must not be left unanswered by a create-cap refusal. 60 fits a 50-task burst:
   one run box per task (claimed spare or cold) plus at most five spares is 55.
+  The count survives worker restarts: Boat's inventory of this company's
+  `purpose=spare` and `purpose=run` boxes created in the last hour (any
+  environment, any state) is read at each spare create and, in the background,
+  after the first run create of a worker and at most once a minute after that.
+  A run never waits for that read; when it lands, a run admitted under the
+  stale count is reported over the ceiling. A Boat run box carrying a local
+  attempt's `paperclip-acquire` label is that create, counted once.
 
 At each spare refusal or over-ceiling run create the plugin logs an info-level
 `[boat] create_capped reason=...` event (`reason` is `churn_cap` or `ceiling`)
