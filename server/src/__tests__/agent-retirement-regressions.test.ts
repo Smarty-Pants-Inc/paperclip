@@ -17,7 +17,6 @@ import { createAgentLifecycle as lifecycleWithEffects } from "../modules/agent-l
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { issueService } from "../services/issues.js";
-import { agentHandoverService } from "../services/agent-handover.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Only the external Stop delivery boundary is suspended. Production HTTP,
@@ -199,7 +198,14 @@ describe("#20389 RFL retirement regressions", () => {
     expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated" });
     // Retirement itself does not touch the receipt; the hand-over reassigns the task, which revokes the direction.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id)))[0]).toEqual(receipt);
-    await agentHandoverService(db).processAgent(f.workerId);
+    // Keep the suite collectable before the worker exists, so the F3 receipt
+    // assertions can expose behaviour at base instead of failing module loading.
+    const handover = await import("../services/agent-handover.js").catch(error => {
+      if (["ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"].includes(error.code)
+        && error.message.includes("/services/agent-handover.")) return null;
+      throw error;
+    });
+    await handover?.agentHandoverService(db).processAgent(f.workerId);
     expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId });
     const [revoked] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id));
     expect(revoked).toMatchObject({ status: "cancelled", runId, requestedByActorId: f.userId });
