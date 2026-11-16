@@ -78,6 +78,7 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, source: `chat:${provider}`,
       chatConversationId: conversationId, endpointId, wakeCommentId: sourceCommentId, wakeCommentIds: [sourceCommentId] } })
       .where(eq(heartbeatRuns.id, f.runId));
+    return { conversationId, endpointId, sourceCommentId };
   }
   const comments = (runId: string) => db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId));
   const run = async (runId: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
@@ -200,7 +201,9 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
     expect(((await run(f.runId)).resultJson as Record<string, any>).presentationDecision.commentId).toEqual(expect.any(String));
     // Idempotent: nothing left to publish and a repeated check never double-posts.
     expect(await work.load({ companyId: f.companyId, issueId: f.issueId })).toEqual([]);
-    await expect(work.check(due)).resolves.toBeNull();
+    // A second due recovery pass after success must observe the durable decision,
+    // not write a duplicate task comment.
+    await expect(work.check({ ...due, dueAt: 0 })).resolves.toBeNull();
     expect(await comments(f.runId)).toHaveLength(1);
   });
 
@@ -307,6 +310,21 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
   it("does not publish a non-GitHub external chat run locally", async () => {
     const f = await fixture();
     await chatOrigin(f, "slack");
+    await f.saveFinalReply();
+    const work = nativeResponsePresentationWork(db);
+    const [entry] = await work.load({ companyId: f.companyId, issueId: f.issueId });
+    await work.check(entry);
+    expect(await comments(f.runId)).toEqual([]);
+  });
+
+  it("does not locally publish a run with mixed GitHub and non-GitHub bindings", async () => {
+    const f = await fixture();
+    const github = await chatOrigin(f, "github");
+    const slack = await chatOrigin(f, "slack");
+    await db.update(heartbeatRuns).set({ contextSnapshot: {
+      issueId: f.issueId, source: "chat:github", chatConversationId: github.conversationId,
+      wakeCommentId: github.sourceCommentId, wakeCommentIds: [github.sourceCommentId, slack.sourceCommentId],
+    } }).where(eq(heartbeatRuns.id, f.runId));
     await f.saveFinalReply();
     const work = nativeResponsePresentationWork(db);
     const [entry] = await work.load({ companyId: f.companyId, issueId: f.issueId });
