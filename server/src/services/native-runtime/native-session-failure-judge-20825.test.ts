@@ -1,5 +1,5 @@
 // RFL judge probe 08:31Z (#20825 check 4: what run-level recovery does with B's failure), copied from
-// /srv/scratch/paul/tasks/direct/rfl-loopfix-judge/artifacts/judge-probe-20825-classify.test.ts.
+// Ported from RFL loopfix judge probe judge-probe-20825-classify.test.ts. (2026-11-16).
 // Change from the probe: "B edge (head)" now asserts the RED (never a permanent
 // terminal_failure); every other case keeps the probe's report-only assertion.
 import { appendFileSync } from "node:fs";
