@@ -631,3 +631,48 @@ describe("Judge F1/F2: the all-create count survives a restart; unbound use and 
     h.boat.record({ kind: "event", note: "CEILING-RUN-HEAVY", value: { run: runEvents[0].value, spare: spareEvents[0].value, health } });
   });
 });
+
+// Keep: recorded review-fleet-2 JUDGE-C2 catch (#20869). With spares off,
+// no refill can mask a missing background run-ledger observation after restart.
+const counts = (h: Harness) => ({ spareCreates: h.boat.creates().length, runCreates: h.boat.creates("run").length,
+  totalCreates: h.boat.creates().length + h.boat.creates("run").length, elapsedMs: Date.now() - START });
+
+it("JUDGE-C2 run-only restart: background inventory observation cannot be masked by a spare refill", async () => {
+  const h = await harness("judge-background-run-only", 3, { spares: 0, spareIdleMinutes: 60 });
+  for (let n = 0; n < 95; n++) {
+    const lease = await settle(h.acquire(`before-${n}`));
+    await execute(h, lease.providerLeaseId!); await release(h, lease.providerLeaseId!);
+  }
+  expect(h.boat.creates()).toHaveLength(0);
+  expect(h.boat.creates("run")).toHaveLength(95);
+  // restart() normally enables spares; change only its config handoff for this independent run-only probe.
+  await settle(Promise.resolve(plugin.definition.onShutdown?.())); eventHandlers.clear();
+  const instanceConfig = { spares: 0, spareMax: 3, spareEnvironmentIds: [h.env], spareIdleMinutes: 60 };
+  await plugin.definition.setup({ config: { get: async () => instanceConfig },
+    logger: { info: vi.fn((message, meta) => h.boat.record({ kind: "event", note: `info: ${message}`, value: meta })), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    db: { namespace: "boat_sandbox_provider", execute: async () => ({ rowCount: 1 }) },
+    events: { on: (type: string, _filter: unknown, handler: (event: unknown) => Promise<void>) => { eventHandlers.set(type, handler); return () => eventHandlers.delete(type); } },
+    state: { get: async () => null, set: async () => undefined },
+  } as any);
+  await plugin.definition.onConfigChanged!(instanceConfig, { companyId: h.company } as any);
+  const restartSeq = h.boat.record({ kind: "event", note: "JUDGE-C2-RESTARTED" }).seq;
+  const samples: Array<{pluginCount: number; boatCount: number}> = [];
+  const original = ReadySpareKeeper.prototype.recheckRunCeiling;
+  const spy = vi.spyOn(ReadySpareKeeper.prototype, "recheckRunCeiling").mockImplementation(function(this: ReadySpareKeeper, company, environment) {
+    original.call(this, company, environment);
+    samples.push({ pluginCount: this.createCounts(company, true).allCreates, boatCount: counts(h).totalCreates });
+  });
+  try {
+    const lease = await settle(h.acquire("after-restart"));
+    await execute(h, lease.providerLeaseId!); await release(h, lease.providerLeaseId!);
+    await advance(5_000);
+    const events = h.boat.log.filter(e => e.seq > restartSeq && e.note?.startsWith("info:") && (e.value as any)?.kind === "run" && (e.value as any)?.reason === "ceiling");
+    console.log("JUDGE_C2_RESULT", JSON.stringify({ samples, actual: counts(h), events }));
+    expect(samples).toHaveLength(1);
+    expect(samples[0].pluginCount, "the background read restores 95 old runs and the new run").toBe(96);
+    expect(samples[0].pluginCount).toBe(samples[0].boatCount);
+    expect(events).toHaveLength(1);
+    expect(events[0].value).toMatchObject({ kind: "run", reason: "ceiling", source: "provider", ceiling: 90, allCreates: 96 });
+    expect(h.boat.creates()).toHaveLength(0);
+  } finally { spy.mockRestore(); }
+});
