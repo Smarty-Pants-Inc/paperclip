@@ -705,6 +705,11 @@ export function routineService(
     eq(routineTriggers.archived, false),
     eq(routines.status, "active"),
     eq(companies.status, "active"),
+    // A retired (or retiring) default agent can never take the run. Skip it
+    // instead of claiming the tick and failing dispatch on every firing; the
+    // hand-over worker pauses such routines with an audit row (#20389, #11407).
+    sql`not exists (select 1 from agents retired_assignee where retired_assignee.id = ${routines.assigneeAgentId}
+      and (retired_assignee.status = 'terminated' or retired_assignee.lifecycle_state in ('terminating', 'cleaning_up', 'terminated')))`,
     isNotNull(routineTriggers.nextRunAt),
     isNotNull(routineTriggers.cronExpression),
     isNotNull(routineTriggers.timezone),
