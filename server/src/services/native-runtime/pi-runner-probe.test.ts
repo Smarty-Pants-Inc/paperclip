@@ -533,6 +533,7 @@ describe("Pi persistence profile checkpoint run-path symlinks", () => {
     } catch (error) {
       observedError = error instanceof Error ? error.message : String(error);
     }
+    console.info(`[PI_AGENTDIR_PATH_RED] ${observedError}`);
     expect(observedError).toBe("runner_remote_checkpoint_archive_unsafe_entry");
   });
 });
