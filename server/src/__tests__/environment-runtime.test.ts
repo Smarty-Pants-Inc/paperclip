@@ -5718,6 +5718,139 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
   });
 
+  // J3-26 (B) g4 (review-fleet-3 C1, 11-16): a box that still holds unexported
+  // workspace files is never admitted for retirement, whichever way the closed
+  // tip would otherwise be routed (verified custody destroys it; otherwise it
+  // is stopped and kept). Files held on the tip (sourceFilesHeld) or a pending
+  // native workspace export of the tip's run on that lease keep the tip exactly
+  // as it is: the lease row unchanged, nothing stopped, nothing destroyed.
+  // M7: nor is a closed tip whose boot source the environment still boots.
+  // Keep: never-OK data loss (a destroy would delete the unexported files).
+  it.each([
+    ["files held", "custody verifiable"], ["files held", "custody not verifiable"],
+    ["pending native workspace export", "custody verifiable"], ["pending native workspace export", "custody not verifiable"],
+    ["boot source still matches", "custody verifiable"], ["boot source still matches", "custody not verifiable"],
+  ] as const)(
+    "previous-boot active tip: never admitted for retirement while its box holds unexported workspace files or its boot source matches: %s, %s", async (hold, custody) => {
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
+    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Warm Pi chat", status: "in_progress", assigneeAgentId: agentId });
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
+      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Active tip files fixture", supportsReusableLeases: true,
+      configSchema: { type: "object" },
+    }] });
+    let acquisitions = 0;
+    const calls: { method: string; providerLeaseId: unknown }[] = [];
+    const workerManager = {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        calls.push({ method, providerLeaseId: params?.providerLeaseId ?? params?.lease?.providerLeaseId });
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: `active-tip-files-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentResumeLease") return {
+          providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        if (method === "environmentDestroyLease") return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected active-tip method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquire = (selectedEnvironment: Environment, selectedRunId: string) => runtimeWithPlugin.acquireRunLease({
+      companyId, environment: selectedEnvironment, issueId, agentId, adapterType: "paperclip_runner",
+      heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
+    });
+    const normalizedSessionId = randomUUID(), runnerInstanceId = "active-tip-runner", sessionScopeId = `active-tip-scope-${randomUUID()}`;
+
+    // L1: the warm owner's admission; its run settles normally.
+    const admitted = await acquire(environment, runId);
+    const providerLeaseId = admitted.lease.providerLeaseId!;
+    await runtimeWithPlugin.releaseRunLeases(runId);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date(Date.now() - 20 * 60_000),
+      runtimeMode: "native", nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, runId));
+    // L2: a later turn resumed the SAME box as the chain tip; its run ended but
+    // never settled its lease: L2 stays ACTIVE.
+    const tipRunId = randomUUID();
+    await insertRunningManualRun(tipRunId, companyId, agentId);
+    const resumed = await acquire(environment, tipRunId);
+    expect(resumed.lease.providerLeaseId).toBe(providerLeaseId);
+    expect(resumed.lease.status).toBe("active");
+    const runEndedAt = new Date(Date.now() - 10 * 60_000);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: runEndedAt,
+      runtimeMode: "native", nativeSessionId: normalizedSessionId }).where(eq(heartbeatRuns.id, tipRunId));
+
+    const backupBase = await mkdtemp(path.join(os.tmpdir(), "active-tip-files-backup-"));
+    const emptyStateDirectory = await mkdtemp(path.join(os.tmpdir(), "active-tip-files-empty-"));
+    const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = backupBase;
+    try {
+      const current = path.join(backupBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+      await mkdir(path.join(current, "runner"), { recursive: true });
+      await mkdir(path.join(current, "pi"), { recursive: true });
+      await mkdir(path.join(current, "pi-agent"), { recursive: true });
+      await writeFile(path.join(current, "runner", "runner-state.json"), "warm owner checkpoint");
+      await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"hello"}\n');
+      const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
+        sourceProviderLeaseId: providerLeaseId, providerSessionIdentity: { providerSessionId: "pi-thread" },
+        execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId: tipRunId, issueId, agentId, executionWorkspaceId: null },
+          workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+          session: { normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
+        } as never });
+      const manifestPath = path.join(current, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      // The stop's close stamp on the admission row L1: g1-g3 all hold.
+      const stamp = createNativeHarnessBackupStamp({ manifestPath, sessionScopeId,
+        normalizedSessionId, runnerInstanceId, authorizedProviderLeaseId: providerLeaseId, completedAt: manifest.completedAt });
+      await environmentService(db).updateLeaseMetadata(admitted.lease.id, {
+        ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata, nativeHarnessBackup: stamp });
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: tipRunId, seq: 1, eventType: "provider.event",
+        createdAt: new Date(runEndedAt.getTime() - 5 * 60_000) });
+      // The stop: that boot is gone. Its holder stamp names a previous boot.
+      const tipRow = (await environmentService(db).getLeaseById(resumed.lease.id))!;
+      expect(tipRow.metadata?.leaseController).toBeTruthy();
+      await environmentService(db).updateLeaseMetadata(resumed.lease.id, { ...tipRow.metadata,
+        leaseController: { ...(tipRow.metadata!.leaseController as Record<string, unknown>), bootId: randomUUID(), pid: 2_147_000_000 },
+        // (1) The tip's box holds files: a legacy shutdown workspace settlement is still pending.
+        ...(hold === "files held" ? { legacyShutdownWorkspaceSettlement: { state: "pending" } } : {}) });
+      if (hold === "pending native workspace export") {
+        // (2) The tip run prepared a native workspace sync on this lease and box that was never finalized.
+        await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeWorkspaceSync: {
+          schema: "paperclip.native-workspace-sync/v3", state: "prepared", descriptorSha256: "a".repeat(64),
+          baselineSha256: "b".repeat(64), workspaceId: randomUUID(), leaseId: resumed.lease.id, providerLeaseId, remoteCwd: "/workspace",
+        } } }).where(eq(heartbeatRuns.id, tipRunId));
+      }
+      // Without custody, the tip would be stopped and kept instead of destroyed.
+      if (custody === "custody not verifiable") process.env.PAPERCLIP_RUNNER_STATE_DIR = emptyStateDirectory;
+      const before = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, resumed.lease.id)))[0]!;
+      expect(before.status).toBe("active");
+      const callsBefore = calls.length;
+
+      // The image swap (none while the boot source still matches), then the chat's FIRST recall message.
+      const changed = hold === "boot source still matches" ? environment
+        : { ...environment, config: { ...providerConfig, from: "snapshot-b" } };
+      if (changed !== environment) await environmentService(db).update(environment.id, { config: changed.config });
+      const recallRunId = randomUUID();
+      await insertRunningManualRun(recallRunId, companyId, agentId);
+      const recall = await acquire(changed, recallRunId);
+      expect(recall.lease.providerLeaseId).not.toBe(providerLeaseId);
+      // NOT admitted: the lease row is unchanged, nothing stopped, nothing destroyed.
+      const tip = (await db.select().from(environmentLeases).where(eq(environmentLeases.id, resumed.lease.id)))[0]!;
+      expect(tip).toEqual(before);
+      expect(tip.metadata).not.toHaveProperty("sandboxStopAndRetain");
+      expect(calls.slice(callsBefore).map(call => call.method)).not.toContain("environmentDestroyLease");
+      expect(calls.slice(callsBefore).filter(call => call.providerLeaseId === providerLeaseId)).toEqual([]);
+    } finally {
+      if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+      await rm(backupBase, { recursive: true, force: true });
+      await rm(emptyStateDirectory, { recursive: true, force: true });
+    }
+  });
+
   // Compatible sizing changes still preserve a warm conversation until its
   // checkpoint is verifiable. Keep: provider-state data safety.
   it.each(["active", "released", "legacy active", "legacy released", "old identity", "stale checkpoint", "source changed during create"])(
