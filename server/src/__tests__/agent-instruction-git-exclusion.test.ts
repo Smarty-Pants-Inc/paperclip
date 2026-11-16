@@ -99,7 +99,7 @@ raceFs.mkdirSync=(name,options)=>{
     await expect(result).resolves.toMatchObject({ stderr: "" });
     await assertPrivateFilesIgnored(root);
   } else {
-    await expect(result).rejects.toThrow("Unsafe runtime exclusion directory");
+    await expect(result).rejects.toMatchObject({ stderr: expect.stringContaining("\nError: Unsafe runtime exclusion directory") });
     expect(await fs.readFile(path.join(outside, ".gitignore"), "utf8")).toBe("untouched\n");
   }
 });
