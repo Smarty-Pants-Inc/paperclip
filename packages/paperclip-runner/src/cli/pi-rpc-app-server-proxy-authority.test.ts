@@ -610,4 +610,27 @@ describe("Pi RPC proxy captured run authority", () => {
     expect(await h.request("session.reconnect")).toMatchObject({ result: true });
     expect(h.session.reconnects).toBe(1);
   });
+  it("brackets turn/start's run attach and turn in one admission, and leaves run.attach and plain turns alone (F7)", async () => {
+    const h = await setup();
+    const order: string[] = [];
+    const attach = h.session.attachRun.bind(h.session);
+    const start = h.session.startTurn.bind(h.session);
+    Object.assign(h.session, {
+      beginTurnAdmission: () => { order.push("begin"); },
+      endTurnAdmission: () => { order.push("end"); },
+      attachRun: async (input: Record<string, unknown>) => { order.push(`attach:${String(input.runId)}`); await attach(input); },
+      startTurn: async (input: unknown) => { order.push("turn"); return start(input); },
+    });
+    await h.request("turn/start", { paperclipRunId: "run-2", input: [{ type: "text", text: "next" }] });
+    expect(order).toEqual(["begin", "attach:run-2", "turn", "end"]);
+    order.length = 0;
+    await h.request("run.attach", { runId: "run-3" });
+    await h.request("turn/start", { input: [{ type: "text", text: "plain" }] });
+    expect(order).toEqual(["attach:run-3", "turn"]);
+    order.length = 0;
+    // A refusal between attach and turn still ends the admission.
+    expect(await h.request("turn/start", { paperclipRunId: "run-4", model: "other/model", input: [{ type: "text", text: "x" }] }))
+      .toMatchObject({ error: { message: "Pi turn model differs from the admitted session" } });
+    expect(order).toEqual(["begin", "attach:run-4", "end"]);
+  });
 });
