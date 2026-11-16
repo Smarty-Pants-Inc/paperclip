@@ -1,14 +1,16 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmod, cp, mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, posix } from "node:path";
 import { promisify } from "node:util";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import { QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION } from "../../vendor/paperclip-runner/index.js";
+import { PI_RPC_DISTRIBUTION } from "@paperclipai/paperclip-runner";
+import { QUALIFIED_ACPX_PROFILES, QUALIFIED_ACPX_VERSION, QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
 import { prepareRemoteProviderPackOnTarget, resolveRemoteProviderPackSource, sha256DirectoryTree } from "./native-session-executor.js";
 import { canonicalProviderPackJson } from "./remote-provider-pack-verification.js";
+import { prepareNativePiProbeRemote } from "./pi-runner-probe.js";
 
 const exec = promisify(execFile);
 const EXECUTE_LATENCY_MS = 150;
@@ -184,5 +186,178 @@ describe("provider pack selection harness", () => {
     } else {
       expect(current.prepared.manifest).toEqual(server.manifest);
     }
+  }, 120_000);
+});
+
+// Native Pi setup probe (smarty-dev#20791). A sealed image pack is admitted by
+// the Runner daemon's protected-manifest inventory, as task runs do (#17749):
+// no pack walk, no version command and no full-verification fallback.
+// docker/daytona-runner/README.md:99-101: "It does not scan the pack".
+const IMAGE_PACK_ROOT = "/opt/paperclip-runner/provider-pack";
+const PI_PATHS = {
+  piRpcProxy: "dist/cli/pi-rpc-app-server-proxy.cjs",
+  piRpcExecutable: "provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
+};
+
+/** The harness pack plus the native Pi entries the Pi probe requires. */
+async function writePiPack(root: string, revision: string, large: Buffer, distSuffix = "") {
+  await writePack(root, revision, large, distSuffix);
+  for (const [name, path] of Object.entries(PI_PATHS)) {
+    await mkdir(dirname(join(root, path)), { recursive: true });
+    await writeFile(join(root, path), `pi fixture ${name}${distSuffix}\n`);
+  }
+  const manifest = JSON.parse(await readFile(join(root, "provider-pack.json"), "utf8"));
+  const payload = manifest.payload;
+  payload.distDigest = sha256DirectoryTree(join(root, "dist"));
+  payload.bridgeDigest = `sha256:${createHash("sha256").update(payload.artifacts.opencodeProxy.sha256).update("\n")
+    .update(payload.artifacts.acpxSidecar.sha256).update("\n").update(payload.distDigest).digest("hex")}`;
+  for (const [name, path] of Object.entries(PI_PATHS)) {
+    payload.artifacts[name] = { path, sha256: sha(await readFile(join(root, path))) };
+  }
+  payload.pins.piRpc = QUALIFIED_PI_RPC_PROFILE.runtimeVersion;
+  payload.piRpcProfileDigest = QUALIFIED_PI_RPC_PROFILE.commandDigest;
+  payload.nativeProviders = { pi_rpc: { version: QUALIFIED_PI_RPC_PROFILE.runtimeVersion, profileDigest: QUALIFIED_PI_RPC_PROFILE.commandDigest,
+    closureDigest: PI_RPC_DISTRIBUTION.targets["linux-x64"].closureSha256, path: "provider-assets/pi_rpc/linux-x64",
+    sha256: sha256DirectoryTree(join(root, "provider-assets/pi_rpc/linux-x64")) } };
+  await writeFile(join(root, "provider-pack.json"), JSON.stringify({ schema: manifest.schema,
+    digest: sha(canonicalProviderPackJson(payload)), payload }));
+}
+
+/** A Runner daemon double. Root ownership cannot be produced in a unit test, so
+ * the double reports the publisher seal the real daemon reads from path metadata
+ * (paperclip-runnerd.rs: "Check only path metadata at startup"). */
+async function writeRunnerDaemon(path: string, packs: Record<string, { directory: string; immutable: boolean }>) {
+  const metadata = { schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+    packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+    durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"],
+    prpTransportModes: ["dial_ws_loopback", "dial_wss", "listen_ws"] };
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, `#!${process.execPath}
+const fs = require("node:fs"), args = process.argv.slice(2), packs = ${JSON.stringify(packs)};
+if (args[0] !== "--build-metadata") process.exit(17);
+const providerPacks = [];
+for (let index = 1; index < args.length; index += 2) {
+  if (args[index] !== "--provider-pack-root") process.exit(2);
+  const pack = packs[args[index + 1]];
+  if (!pack) continue;
+  try { providerPacks.push({ root: args[index + 1], immutable: pack.immutable,
+    manifest: JSON.parse(fs.readFileSync(pack.directory + "/provider-pack.json", "utf8")) }); } catch {}
+}
+process.stdout.write(JSON.stringify({ ...${JSON.stringify(metadata)}, ...(args.length > 1 ? { providerPacks } : {}) }));
+`, { mode: 0o755 });
+}
+
+type ProbeCommand = "daemon" | "scan" | "memo_walk" | "byte_verify" | "version" | "discover" | "other";
+function classifyProbeCommand(request: Parameters<CommandManagedRuntimeRunner["execute"]>[0]): ProbeCommand {
+  const args = request.args ?? [];
+  const text = args.join("\n");
+  if (args[0] === "--build-metadata") return "daemon";
+  if (text.includes("paperclip-snapshot-pack")) return "scan";
+  if (text.includes("paperclip-provider-pack-immutable-v1")) return "memo_walk";
+  if (args[0] === "-e" && text.includes("provider-pack.json")) return "byte_verify";
+  if (args[0] === "--version") return "version";
+  if (text.includes("for candidate in /opt/paperclip-runner/provider-pack")) return "discover";
+  return "other";
+}
+const PACK_WALKS: ProbeCommand[] = ["scan", "memo_walk", "byte_verify"];
+
+type ProbeScenario = "sealed" | "sealed_manifest_mismatch" | "unsealed_tampered" | "daemon_timeout";
+
+describe("native Pi setup probe pack admission", () => {
+  let root: string;
+  let large: Buffer;
+  let server: ReturnType<typeof resolveRemoteProviderPackSource>;
+  const rows: string[] = [];
+  beforeAll(async () => {
+    root = await mkdtemp(join(tmpdir(), "pi-probe-pack-harness-"));
+    large = randomBytes(LARGE_ARTIFACT_BYTES);
+    await writePiPack(join(root, "server-pack"), "b", large);
+    server = resolveRemoteProviderPackSource(join(root, "server-pack"));
+  });
+  afterAll(async () => {
+    if (rows.length) process.stdout.write(`\nnative Pi probe pack admission (execute ${EXECUTE_LATENCY_MS} ms)\n${rows.join("\n")}\n`);
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const probe = async (scenario: ProbeScenario) => {
+    const sandbox = await mkdtemp(join(root, `${scenario}-`));
+    const home = join(sandbox, "home"), workspace = join(sandbox, "workspace");
+    await mkdir(workspace, { recursive: true });
+    // The image pack is also discoverable at the home candidate, so the old
+    // selection path can find and fully verify the same bytes.
+    const image = join(home, ".local/share/paperclip-runner/provider-pack");
+    if (scenario === "sealed_manifest_mismatch") await writePiPack(image, "a", large, "-older");
+    else await writePiPack(image, "b", large);
+    if (scenario === "unsealed_tampered") await writeFile(join(image, "dist/cli/acpx-runtime-sidecar.cjs"), "tampered\n");
+    const controllerRunnerBinary = join(sandbox, "controller-paperclip-runnerd");
+    const daemonPacks = { [IMAGE_PACK_ROOT]: { directory: image, immutable: scenario !== "unsealed_tampered" } };
+    await writeRunnerDaemon(controllerRunnerBinary, daemonPacks);
+    await writeRunnerDaemon(join(home, ".local/bin/paperclip-runnerd"), daemonPacks);
+    const { runner: fake, usage } = simulatedSandbox(home, workspace);
+    const commands: ProbeCommand[] = [];
+    const runner: CommandManagedRuntimeRunner = { ...fake, execute: async request => {
+      commands.push(classifyProbeCommand(request));
+      if (scenario === "daemon_timeout" && request.args?.includes("--provider-pack-root")) {
+        usage.executes += 1;
+        usage.simulatedMs += 30_000;
+        return { exitCode: null, signal: null, pid: null, startedAt: null, timedOut: true, stdout: "", stderr: "" };
+      }
+      return fake.execute(request);
+    } };
+    const remoteRuntimeRoot = join(workspace, ".paperclip-runtime", "setup-harness");
+    await mkdir(join(remoteRuntimeRoot, "bin"), { recursive: true });
+    vi.stubEnv("PAPERCLIP_RUNNER_REMOTE_BINARY_PATH", "");
+    const startedAt = performance.now();
+    let outcome: Awaited<ReturnType<typeof prepareNativePiProbeRemote>> | Error;
+    try {
+      outcome = await prepareNativePiProbeRemote({
+        target: { kind: "remote", transport: "sandbox", remoteCwd: workspace, runner } as never, runner,
+        remoteBinary: join(remoteRuntimeRoot, "bin", "paperclip-runnerd"), controllerRunnerBinary, remoteRuntimeRoot,
+        source: server, requiredMode: "dial_wss",
+      });
+    } catch (error) {
+      outcome = error as Error;
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    const modelledSeconds = (performance.now() - startedAt + usage.simulatedMs) / 1000;
+    const walks = commands.filter(command => PACK_WALKS.includes(command)).length;
+    const fallback = commands.some(command => command === "discover" || command === "byte_verify");
+    rows.push(`${scenario.padEnd(26)} ${outcome instanceof Error ? `error=${outcome.message.slice(0, 70)}` : `source=${outcome.source} root=${outcome.root}`} `
+      + `commands=${usage.executes} packWalks=${walks} fallback=${fallback} modelled=${modelledSeconds.toFixed(2)}s [${commands.join(",")}]`);
+    return { outcome, commands, walks, fallback, usage, modelledSeconds };
+  };
+
+  it("(a) admits a sealed image pack on a cold box through the Runner daemon with zero pack walks and no fallback", async () => {
+    const result = await probe("sealed");
+    if (result.outcome instanceof Error) throw result.outcome;
+    expect(result.outcome).toMatchObject({ root: IMAGE_PACK_ROOT, source: "preinstalled" });
+    expect(result.outcome.manifest).toEqual(server.manifest);
+    expect(result.walks).toBe(0);
+    expect(result.fallback).toBe(false);
+    expect(result.commands).not.toContain("version");
+    expect(result.commands.filter(command => command === "daemon")).toHaveLength(2);
+  }, 120_000);
+
+  it.each<[ProbeScenario, string]>([
+    ["sealed_manifest_mismatch", "a sealed pack whose manifest is not the server's"],
+    ["unsealed_tampered", "an unsealed pack with a tampered file"],
+  ])("(b) %s: %s still gets the full byte verification", async scenario => {
+    const result = await probe(scenario);
+    if (result.outcome instanceof Error) throw result.outcome;
+    expect(result.commands).toContain("byte_verify");
+    // Neither pack may be used: the mismatch differs in content, the tamper fails its digest.
+    expect(result.outcome.source).toBe("uploaded");
+    expect(result.outcome.manifest).toEqual(server.manifest);
+    expect(result.usage.bytesUploaded).toBeGreaterThan(LARGE_ARTIFACT_BYTES);
+  }, 120_000);
+
+  it("(c) reports an interrupted Runner daemon inventory as unavailable, never incompatible", async () => {
+    const result = await probe("daemon_timeout");
+    expect(result.outcome).toBeInstanceOf(Error);
+    const message = (result.outcome as Error).message;
+    expect(message).toMatch(/^runner_remote_provider_verification_unavailable:/);
+    expect(message).not.toMatch(/incompatible/);
+    expect(result.walks).toBe(0);
   }, 120_000);
 });
