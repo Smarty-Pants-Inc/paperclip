@@ -95,6 +95,7 @@ export function gitExclusionRetryContract(
       expect(JSON.stringify(warnings.mock.calls)).not.toContain(secret);
       // The existing durable failure/release path queues exactly one next try.
       // Its preparation is a separate call, never a third attempt in this one.
+      if (!(error instanceof Error)) throw new Error("Expected a failed exclusion before scheduling its next try");
       const successorRunId = await nextTry(runId, error);
       expect(exec.count()).toBe(2);
       await expect(prepare(successorRunId, target)).resolves.toMatchObject({ state: "prepared" });
