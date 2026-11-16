@@ -5149,7 +5149,8 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // stamped L1. The recall's obsolete cleanup must read the newest stamp on the
   // lease CHAIN for that box (native-retired-backup-source's rule), and the
   // writer must stamp the chain tip. Keep: place-losing custody bug.
-  it.each(["kept", "writer stamps tip", "other box stamp", "other company stamp", "later provider work", "no stamp", "irregular chain"] as const)(
+  it.each(["kept", "writer stamps tip", "other box stamp", "other company stamp", "later provider work", "no stamp", "irregular chain",
+    "irregular chain + tip stamp", "other session tip", "writer other session", "unverifiable stamp", "single row"] as const)(
     "stamp chain: obsolete cleanup reads the newest stamp across a resumed lease chain: %s", async scenario => {
     const pluginId = randomUUID();
     const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
@@ -5185,8 +5186,11 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
     });
     const normalizedSessionId = randomUUID(), runnerInstanceId = "stamp-chain-runner", sessionScopeId = `stamp-chain-scope-${randomUUID()}`;
-    const settle = (settledRunId: string) => db.update(heartbeatRuns)
-      .set({ status: "succeeded", finishedAt: new Date(), runtimeMode: "native", nativeSessionId: normalizedSessionId })
+    // The tip L2 serves S2 in the cross-session cases: the reuse scope has no session (gold #20879 (a)).
+    const otherSession = scenario === "other session tip" || scenario === "writer other session";
+    const tipSessionId = otherSession ? randomUUID() : normalizedSessionId;
+    const settle = (settledRunId: string, sessionId = normalizedSessionId) => db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), runtimeMode: "native", nativeSessionId: sessionId })
       .where(eq(heartbeatRuns.id, settledRunId));
 
     // L1: the warm owner's ADMISSION.
@@ -5194,13 +5198,16 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const providerLeaseId = admitted.lease.providerLeaseId!;
     await runtimeWithPlugin.releaseRunLeases(runId);
     await settle(runId);
-    // L2: a later turn resumes the SAME box as a NEW lease row.
+    // L2: a later turn resumes the SAME box as a NEW lease row ("single row": none; L1 is the box's only row).
     const refreshRunId = randomUUID();
     await insertRunningManualRun(refreshRunId, companyId, agentId);
-    const resumed = await acquire(environment, refreshRunId);
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeSessionId: tipSessionId }).where(eq(heartbeatRuns.id, refreshRunId));
+    const resumed = scenario === "single row" ? admitted : await acquire(environment, refreshRunId);
     expect(resumed.lease.providerLeaseId).toBe(providerLeaseId);
-    expect(resumed.lease.id).not.toBe(admitted.lease.id);
-    expect(resumed.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed" });
+    if (scenario !== "single row") {
+      expect(resumed.lease.id).not.toBe(admitted.lease.id);
+      expect(resumed.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed" });
+    }
     expect(resumed.lease.metadata?.nativeHarnessBackup).toBeUndefined();
 
     const backupBase = await mkdtemp(path.join(os.tmpdir(), "stamp-chain-backup-"));
@@ -5226,12 +5233,22 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       const stamp = stampFor(providerLeaseId);
 
       // The stop's close. The warm owner's backend still names L1.
-      if (scenario === "writer stamps tip") {
+      if (scenario === "writer stamps tip" || scenario === "writer other session") {
         const { recordNativeHarnessBackupStampOnLeaseChain } = await import("../services/native-runtime/native-retired-backup-source.ts") as any;
         expect(typeof recordNativeHarnessBackupStampOnLeaseChain).toBe("function");
         await recordNativeHarnessBackupStampOnLeaseChain(db, { leaseId: admitted.lease.id, companyId, providerLeaseId, stamp });
-        // The current lease at the stop carries the stamp for the recall.
-        expect((await environmentService(db).getLeaseById(resumed.lease.id))?.metadata?.nativeHarnessBackup).toEqual(stamp);
+        if (scenario === "writer stamps tip") {
+          // The current lease at the stop carries the stamp for the recall.
+          expect((await environmentService(db).getLeaseById(resumed.lease.id))?.metadata?.nativeHarnessBackup).toEqual(stamp);
+        } else {
+          // L2 serves S2: S1's close never stamps it; the named row L1 keeps S1's stamp.
+          expect((await environmentService(db).getLeaseById(resumed.lease.id))?.metadata?.nativeHarnessBackup).toBeUndefined();
+          expect((await environmentService(db).getLeaseById(admitted.lease.id))?.metadata?.nativeHarnessBackup).toEqual(stamp);
+        }
+      } else if (scenario === "irregular chain + tip stamp") {
+        // Commit C's writer shape: the close's stamp lands on the TIP L2.
+        await environmentService(db).updateLeaseMetadata(resumed.lease.id, { ...(await environmentService(db).getLeaseById(resumed.lease.id))!.metadata,
+          nativeHarnessBackup: stamp });
       } else if (scenario === "other box stamp") {
         await environmentService(db).updateLeaseMetadata(admitted.lease.id, { ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata,
           nativeHarnessBackup: stampFor("another-box") });
@@ -5249,8 +5266,23 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }
       await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refreshRunId, seq: 1, eventType: "provider.event",
         createdAt: new Date(Date.parse(stamp.completedAt) + (scenario === "later provider work" ? 1000 : -1000)) });
-      await runtimeWithPlugin.releaseRunLeases(refreshRunId);
-      await settle(refreshRunId);
+      if (scenario !== "single row") await runtimeWithPlugin.releaseRunLeases(refreshRunId);
+      await settle(refreshRunId, tipSessionId);
+      if (scenario === "unverifiable stamp") {
+        // The stamp is well formed, but its backup no longer verifies
+        // (verifyRecoverableNativeHarnessBackup false): never custody.
+        await writeFile(path.join(current, "runner", "runner-state.json"), "tampered after the checkpoint");
+      }
+      if (scenario === "irregular chain + tip stamp") {
+        const predecessor = (await environmentService(db).getLeaseById(admitted.lease.id))!;
+        const tip = (await environmentService(db).getLeaseById(resumed.lease.id))!;
+        expect(tip.metadata?.nativeHarnessBackup).toEqual(stamp);
+        expect(retiredReusableLeasePredecessors(tip, [predecessor])).not.toBeNull();
+        const [failedPredecessor] = await db.update(environmentLeases).set({ cleanupStatus: "failed" })
+          .where(eq(environmentLeases.id, predecessor.id)).returning();
+        // The chain is now null; the box still has another row, so the tip's own stamp is no custody.
+        expect(retiredReusableLeasePredecessors(tip, [failedPredecessor!])).toBeNull();
+      }
       if (scenario === "irregular chain") {
         const predecessor = (await environmentService(db).getLeaseById(admitted.lease.id))!;
         const tip = (await environmentService(db).getLeaseById(resumed.lease.id))!;
@@ -5272,7 +5304,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       const recall = await acquire(changed, recallRunId);
       expect(recall.lease.providerLeaseId).not.toBe(providerLeaseId);
       const l2 = await environmentService(db).getLeaseById(resumed.lease.id);
-      if (scenario === "kept" || scenario === "writer stamps tip") {
+      if (scenario === "kept" || scenario === "writer stamps tip" || scenario === "single row") {
         expect(calls).toContain("environmentDestroyLease");
         expect(l2).toMatchObject({ status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch" });
         // KEPT: the backup restores onto the new box through the existing 'destroyed' class.
@@ -5284,10 +5316,16 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         expect(calls).not.toContain("environmentDestroyLease");
         expect(l2?.failureReason).not.toBe("lease_fingerprint_mismatch");
         expect(l2?.status).not.toBe("expired");
-        if (scenario === "irregular chain") {
+        if (scenario === "irregular chain" || scenario === "irregular chain + tip stamp") {
           // The safety floor is stop-and-keep, never destroyed-then-fresh.
           await expect(retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId: recallRunId, normalizedSessionId,
             manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId },
+            manifestSha256: stamp.manifestSha256, targetProviderLeaseId: recall.lease.providerLeaseId })).resolves.toBe(false);
+        }
+        if (otherSession) {
+          // S2's recall has no S2 stamp on the box: no restore authority from S1's stamp.
+          await expect(retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId: recallRunId, normalizedSessionId: tipSessionId,
+            manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId: tipSessionId },
             manifestSha256: stamp.manifestSha256, targetProviderLeaseId: recall.lease.providerLeaseId })).resolves.toBe(false);
         }
       }
