@@ -958,3 +958,378 @@ describe("runner provider-ingress WebSocket wire", () => {
     }
   });
 });
+
+// #20825: an idle warm session's listen_ws wire died server-side without the
+// box seeing a FIN. runnerd's single listener admission slot stayed held by the
+// dead socket until its next write (renewal at T1), so every redial inside the
+// 7-min budget failed (503 / handshake timeout). The handle then went terminal
+// and never dialed again; at T1 the slot freed but no dialer existed, and the
+// lease died at T1+30. These fixtures model that box and the control plane's
+// observable contract: the lease expiry it holds (store.state.lastLeaseExpiresAt,
+// CP:227, written at welcome CP:4167 and renewal CP:3636) and its renewal reply.
+describe("idle warm owner redial after the recovery budget (#20825)", () => {
+  const MIN = 60_000;
+  type Dial = { at: number; socket: FakeSocket; opened: boolean };
+  type BoxFailure = "503" | "handshake_timeout" | "refused";
+
+  /** A live runnerd answers every protocol ping. */
+  function liveSocket(): FakeSocket {
+    const socket = new FakeSocket();
+    socket.ping = vi.fn(() => { queueMicrotask(() => socket.emit("pong", Buffer.alloc(0))); });
+    return socket;
+  }
+
+  /** A runnerd listener with ONE admission slot. While the slot is held, a
+   * dial waits ~15 s and gets 503 (or the server's handshake timeout fires
+   * first). A refused box fails at once. */
+  function box(input: { failure: BoxFailure; slotFreeAt: number; down?: () => boolean }) {
+    const dials: Dial[] = [];
+    const create = (options: { handshakeTimeout: number }) => {
+      const now = Date.now();
+      if (now >= input.slotFreeAt && !input.down?.()) {
+        const socket = openingSocket(liveSocket());
+        dials.push({ at: now, socket, opened: true });
+        return socket;
+      }
+      const socket = new FakeSocket();
+      socket.readyState = WebSocket.CONNECTING;
+      dials.push({ at: now, socket, opened: false });
+      if (input.failure === "refused") {
+        queueMicrotask(() => {
+          socket.readyState = WebSocket.CLOSED;
+          socket.emit("error", Object.assign(new Error("connect ECONNREFUSED 10.0.0.1:443"), { code: "ECONNREFUSED", errno: -111, syscall: "connect" }));
+          socket.emit("close", 1006, Buffer.alloc(0));
+        });
+      } else if (input.failure === "503") {
+        setTimeout(() => {
+          if (socket.readyState !== WebSocket.CONNECTING) return;
+          socket.emit("unexpected-response", {}, { statusCode: 503, resume() {} });
+        }, Math.max(1, Math.min(14_900, options.handshakeTimeout - 1)));
+      } else {
+        setTimeout(() => {
+          if (socket.readyState !== WebSocket.CONNECTING) return;
+          socket.readyState = WebSocket.CLOSED;
+          // ws's own handshake-timeout error carries no errno code.
+          socket.emit("error", new Error("Opening handshake has timed out"));
+          socket.emit("close", 1006, Buffer.alloc(0));
+        }, options.handshakeTimeout);
+      }
+      return socket;
+    };
+    return { dials, create };
+  }
+
+  /** The control plane's observable contract for one session: lease-credential
+   * re-auth keeps the SAME lease expiry (CP:3654-3698, 4124-4186); a
+   * lease_renew on the authenticated connection is answered and extends it
+   * (CP:3593-3651). `refuseAuth` models a welcome whose checkpoint flush fails
+   * the owner fence: CP closes the socket before authentication. */
+  function controlPlane(input: { leaseExpiresAt: number; refuseAuthAfter?: number }) {
+    const state = { lastLeaseExpiresAt: new Date(input.leaseExpiresAt).toISOString() as string | null, connectionCount: 0 };
+    const renewals: number[] = [];
+    let attaches = 0;
+    const attachWireConnection = vi.fn((wire: WsJsonWireConnection) => {
+      attaches += 1;
+      if (input.refuseAuthAfter !== undefined && attaches > input.refuseAuthAfter) {
+        queueMicrotask(() => wire.close(1008));
+        return { isAuthenticated: () => false };
+      }
+      state.connectionCount += 1;
+      const connectionId = `connection_${state.connectionCount}`;
+      wire.onJson(value => {
+        const frame = value as { kind?: string };
+        if (frame.kind !== "lease_renew") return;
+        const expiresAt = Date.now() + 60 * MIN;
+        state.lastLeaseExpiresAt = new Date(expiresAt).toISOString();
+        renewals.push(expiresAt);
+        wire.sendJson({ kind: "lease_renewed", connectionId, payload: { connectionLeaseExpiresAtUnixMs: expiresAt } });
+      });
+      return { isAuthenticated: () => true };
+    });
+    const authority = { attachWireConnection, store: { state }, activeRunnerConnectionCount: () => 0,
+      get connectionLeaseFailure() { return null; } } as unknown as DurablePrpControlPlane;
+    return { authority, state, renewals, attachWireConnection, connectionCount: () => state.connectionCount };
+  }
+
+  const endpointFixture = () => {
+    const endpoint = { kind: "authenticated_websocket" as const,
+      websocketUrl: "wss://preview.invalid/api/runner/v1/connect/run-idle-warm", secretHeaders: [], generation: "idle-warm",
+      refresh: vi.fn(async () => endpoint), close: vi.fn(async () => {}) };
+    return endpoint;
+  };
+  const ingressLines = (warn: { mock: { calls: unknown[][] } }) => warn.mock.calls
+    .map(call => call[0] as Record<string, unknown>)
+    .filter(line => typeof line?.event === "string" && (line.event as string).startsWith("runner_ingress"));
+  const renew = (socket: FakeSocket) => socket.emit("message", Buffer.from(JSON.stringify({ kind: "lease_renew" })), false);
+  type IdleWarmHandle = ReturnType<typeof connectRunnerPrpIngress> & { redialNow?: () => void };
+
+  it.each(["503", "handshake_timeout"] as const)("R-slot: keeps dialing a held single slot (%s) past the budget, reconnects after T1, and the next renewal is answered", async failure => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const T1 = t0 + 30 * MIN;
+    const leaseExpiresAt = t0 + 60 * MIN;
+    const cp = controlPlane({ leaseExpiresAt });
+    const first = liveSocket();
+    let opens = 0;
+    const theBox = box({ failure, slotFreeAt: T1 });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const endpoint = endpointFixture();
+    const failed = vi.fn();
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint, random: () => 0.5,
+      idleWarm: { isIdle: () => true } } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      // ~03:47Z: the server leg dies; the box keeps its slot (no FIN).
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      first.terminate();
+      // Past the 7-min budget the handle must still be dialing.
+      await vi.advanceTimersByTimeAsync(9 * MIN);
+      const dialsAtBudgetEnd = theBox.dials.length;
+      await vi.advanceTimersByTimeAsync(10 * MIN);
+      expect(failed).not.toHaveBeenCalled();
+      expect(theBox.dials.length).toBeGreaterThan(dialsAtBudgetEnd);
+      // Capped backoff: no gap between dials longer than 60 s plus one handshake.
+      const gaps = theBox.dials.slice(1).map((dial, index) => dial.at - theBox.dials[index]!.at);
+      expect(Math.max(...gaps)).toBeLessThanOrEqual(60_000 + 15_000);
+      // T1: runnerd's write fails, freeing the slot. The next dial lands.
+      await vi.advanceTimersByTimeAsync(T1 - Date.now() + 76_000);
+      const landed = theBox.dials.find(dial => dial.opened);
+      expect(landed).toBeDefined();
+      expect(cp.connectionCount()).toBe(2);
+      // runnerd re-arms its renewal from the welcome and renews on the new connection.
+      renew(landed!.socket);
+      expect(landed!.socket.send).toHaveBeenCalledWith(expect.stringContaining("lease_renewed"));
+      expect(Date.parse(cp.state.lastLeaseExpiresAt!)).toBeGreaterThan(leaseExpiresAt);
+      // No lease death and no retirement at the old expiry.
+      await vi.advanceTimersByTimeAsync(leaseExpiresAt - Date.now() + MIN);
+      expect(failed).not.toHaveBeenCalled();
+      expect(landed!.socket.terminate).not.toHaveBeenCalled();
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("R-a: a reconnect that succeeds is answered on its next renewal and the lease extends", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const leaseExpiresAt = t0 + 60 * MIN;
+    const cp = controlPlane({ leaseExpiresAt });
+    const first = liveSocket();
+    let opens = 0;
+    const theBox = box({ failure: "refused", slotFreeAt: t0 + 3 * MIN });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      idleWarm: { isIdle: () => true } } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    const failed = vi.fn();
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      first.terminate();
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      const landed = theBox.dials.find(dial => dial.opened)!;
+      expect(landed).toBeDefined();
+      renew(landed.socket);
+      expect(landed.socket.send).toHaveBeenCalledWith(expect.stringContaining("lease_renewed"));
+      expect(cp.renewals).toHaveLength(1);
+      expect(Date.parse(cp.state.lastLeaseExpiresAt!)).toBeGreaterThan(leaseExpiresAt);
+      expect(failed).not.toHaveBeenCalled();
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("R-b: a second drop after a successful reconnect is redialed with a fresh budget and one log line per window", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const cp = controlPlane({ leaseExpiresAt: t0 + 60 * MIN });
+    let down = false;
+    const theBox = box({ failure: "refused", slotFreeAt: t0, down: () => down });
+    sockets.create = options => theBox.create(options);
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5 });
+    const failed = vi.fn();
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      const first = theBox.dials.find(dial => dial.opened)!;
+      down = true;
+      first.socket.terminate();
+      await vi.advanceTimersByTimeAsync(6 * MIN);
+      down = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(cp.connectionCount()).toBe(2);
+      const second = theBox.dials.filter(dial => dial.opened)[1]!;
+      expect(ingressLines(warn).filter(line => line.event !== "runner_ingress_reconnected")).toHaveLength(1);
+      // Second drop. 6.5 minutes into the old budget: only a reset budget can redial for 6 more minutes.
+      down = true;
+      second.socket.terminate();
+      await vi.advanceTimersByTimeAsync(6 * MIN);
+      down = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(cp.connectionCount()).toBe(3);
+      expect(failed).not.toHaveBeenCalled();
+      expect(ingressLines(warn).filter(line => line.event !== "runner_ingress_reconnected")).toHaveLength(2);
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("R-c: an idle warm reconnect the control plane refuses retires at the FIRST failed handshake with a named code", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    // The welcome's checkpoint flush fails the owner fence: CP closes before auth.
+    const cp = controlPlane({ leaseExpiresAt: t0 + 60 * MIN, refuseAuthAfter: 1 });
+    const first = liveSocket();
+    let opens = 0;
+    const theBox = box({ failure: "refused", slotFreeAt: t0 });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      idleWarm: { isIdle: () => true } } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    const failed = vi.fn();
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      first.terminate();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(theBox.dials).toHaveLength(1);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ code: "native_runner_ingress_unreachable",
+        causeSummary: expect.objectContaining({ failure: "runner_ingress_auth_failed" }) }));
+      await vi.advanceTimersByTimeAsync(30 * MIN);
+      expect(theBox.dials).toHaveLength(1);
+      expect(ingressLines(warn).some(line => line.event === "runner_ingress_retired"
+        && line.code === "native_runner_ingress_unreachable" && line.failure === "runner_ingress_auth_failed")).toBe(true);
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("R-retire: dropped past lease expiry minus margin retires once with native_runner_ingress_unreachable and stops dialing", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const leaseExpiresAt = t0 + 60 * MIN;
+    const cp = controlPlane({ leaseExpiresAt });
+    const first = liveSocket();
+    let opens = 0;
+    // The old box never comes back.
+    const theBox = box({ failure: "handshake_timeout", slotFreeAt: Number.POSITIVE_INFINITY });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const states: Array<[string, string | undefined]> = [];
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      idleWarm: { isIdle: () => true, marginMs: 2 * MIN }, onStateChange: (state, code) => states.push([state, code]) } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    const failed = vi.fn();
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      first.terminate();
+      await vi.advanceTimersByTimeAsync(leaseExpiresAt - 2 * MIN - Date.now() - 60_000);
+      expect(failed).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2 * MIN);
+      expect(failed).toHaveBeenCalledOnce();
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ code: "native_runner_ingress_unreachable" }));
+      expect(states).toContainEqual(["failed", "native_runner_ingress_unreachable"]);
+      expect(Date.now()).toBeLessThan(leaseExpiresAt);
+      const dialsAtRetire = theBox.dials.length;
+      expect(theBox.dials.at(-1)!.at).toBeLessThanOrEqual(leaseExpiresAt - 2 * MIN);
+      await vi.advanceTimersByTimeAsync(30 * MIN);
+      expect(theBox.dials.length).toBe(dialsAtRetire);
+      expect(ingressLines(warn).filter(line => line.event === "runner_ingress_retired")).toEqual([
+        expect.objectContaining({ code: "native_runner_ingress_unreachable", failure: "handshake_timeout" }),
+      ]);
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("a BUSY owner keeps the fixed recovery budget (an active turn still fails at 7 min)", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const cp = controlPlane({ leaseExpiresAt: t0 + 60 * MIN });
+    const first = liveSocket();
+    let opens = 0;
+    const theBox = box({ failure: "refused", slotFreeAt: Number.POSITIVE_INFINITY });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      idleWarm: { isIdle: () => false } } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    const failed = vi.fn();
+    void handle.failure.catch(failed);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      first.terminate();
+      await vi.advanceTimersByTimeAsync(7 * MIN + 30_000);
+      expect(failed).toHaveBeenCalledWith(expect.objectContaining({ code: "runner_ingress_unavailable" }));
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it.each([
+    ["refused", "ECONNREFUSED"], ["503", "upgrade_503"], ["handshake_timeout", "handshake_timeout"],
+  ] as const)("R-log: 30+ failed dials (%s) in one recovery window log exactly ONE bounded line naming %s", async (failure, code) => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const cp = controlPlane({ leaseExpiresAt: t0 + 60 * MIN });
+    const first = liveSocket();
+    let opens = 0;
+    const theBox = box({ failure, slotFreeAt: Number.POSITIVE_INFINITY });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    // The handshake budget is the 15 s ws limit; run long enough for 30 slow dials.
+    const windowMs = failure === "refused" ? 7 * MIN : 12 * MIN;
+    const handle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      recoveryGraceMs: windowMs });
+    void handle.failure.catch(() => undefined);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      warn.mockClear();
+      first.terminate();
+      await vi.advanceTimersByTimeAsync(windowMs - 30_000);
+      expect(theBox.dials.length).toBeGreaterThanOrEqual(30);
+      const lines = ingressLines(warn);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({ failure: code });
+      expect(lines[0]!.failure).not.toBe("other");
+      expect(JSON.stringify(lines[0]).length).toBeLessThan(600);
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("R-turn: a turn arriving during the capped backoff redials at once", async () => {
+    vi.useFakeTimers();
+    const create = sockets.create;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const t0 = Date.now();
+    const cp = controlPlane({ leaseExpiresAt: t0 + 60 * MIN });
+    const first = liveSocket();
+    let opens = 0;
+    let down = true;
+    const theBox = box({ failure: "refused", slotFreeAt: t0, down: () => down });
+    sockets.create = options => (++opens === 1 ? openingSocket(first) : theBox.create(options));
+    const handle: IdleWarmHandle = connectRunnerPrpIngress({ authority: cp.authority, endpoint: endpointFixture(), random: () => 0.5,
+      idleWarm: { isIdle: () => true } } as Parameters<typeof connectRunnerPrpIngress>[0]);
+    void handle.failure.catch(() => undefined);
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      await handle.ready;
+      first.terminate();
+      // Well into the extension: the backoff is now long (capped at 60 s).
+      await vi.advanceTimersByTimeAsync(15 * MIN);
+      const before = theBox.dials.length;
+      down = false;
+      const turnAt = Date.now();
+      handle.redialNow?.();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(theBox.dials.length).toBe(before + 1);
+      expect(theBox.dials.at(-1)!.at - turnAt).toBeLessThan(100);
+      expect(cp.connectionCount()).toBe(2);
+    } finally { await handle.close(); sockets.create = create; warn.mockRestore(); vi.useRealTimers(); }
+  });
+});

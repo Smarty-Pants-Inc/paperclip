@@ -332,3 +332,79 @@ it("validates connectivity before resolving provider artifacts without acquiring
   expect(prepare).toHaveBeenCalledExactlyOnceWith("listen_ws");
   expect(transport.connect).not.toHaveBeenCalled();
 });
+
+// #20825: the owner of an idle warm listen_ws route.
+describe("idle warm ingress owner (#20825)", () => {
+  type Registration = Awaited<ReturnType<NonNullable<ReturnType<typeof createNativeRunnerExecutionDriver>["controlPlaneRegistration"]>>>;
+  const core = (state: { lastLeaseExpiresAt: string | null; commands: Array<{ status: string }> }, connections = () => 0) =>
+    ({ activeRunnerConnectionCount: connections, store: { state } }) as unknown as typeof authority;
+  const open = async (input: { core: typeof authority; onIngressUnreachable?: (error: Error) => void }) => {
+    const driver = createNativeRunnerExecutionDriver({ binding, runnerIngressAuthorized: true, prepareRemote: async () => {},
+      processStarted: Promise.resolve(), target: { ...sandbox(), getRunnerIngressEndpoint: async () => endpoint() } as AdapterExecutionTarget,
+      ...(input.onIngressUnreachable ? { onIngressUnreachable: input.onIngressUnreachable } : {}) } as Parameters<typeof createNativeRunnerExecutionDriver>[0]);
+    const registration: Registration = await driver.controlPlaneRegistration!(input.core);
+    return registration;
+  };
+
+  it("opens the route as an idle warm owner reading the control plane's lease expiry and command state", async () => {
+    const expiry = Date.now() + 3_600_000;
+    const state: { lastLeaseExpiresAt: string | null; commands: Array<{ status: string }> } = {
+      lastLeaseExpiresAt: new Date(expiry).toISOString(), commands: [{ status: "completed" }] };
+    const registration = await open({ core: core(state) });
+    registration.activate!(); await registration.ready!();
+    const options = transport.connect.mock.calls[0]![0] as { idleWarm?: { isIdle(): boolean; leaseExpiresAtUnixMs(): number | null } };
+    expect(options.idleWarm).toBeDefined();
+    expect(options.idleWarm!.leaseExpiresAtUnixMs()).toBe(expiry);
+    expect(options.idleWarm!.isIdle()).toBe(true);
+    state.commands.push({ status: "pending" });
+    expect(options.idleWarm!.isIdle()).toBe(false);
+    state.lastLeaseExpiresAt = null;
+    expect(options.idleWarm!.leaseExpiresAtUnixMs()).toBeNull();
+    await registration.release();
+  });
+
+  it("exposes a failure promise right after activate() and reports an unreachable idle owner once", async () => {
+    let rejectFailure!: (error: Error) => void;
+    const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
+    void failure.catch(() => undefined);
+    let started!: () => void;
+    const processStarted = new Promise<void>(resolve => { started = resolve; });
+    transport.connect.mockReturnValue({ ready: Promise.resolve(), failure, quiesce: vi.fn(), close: vi.fn(async () => {}) });
+    const onIngressUnreachable = vi.fn();
+    const driver = createNativeRunnerExecutionDriver({ binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted,
+      target: { ...sandbox(), getRunnerIngressEndpoint: async () => endpoint() } as AdapterExecutionTarget,
+      onIngressUnreachable } as Parameters<typeof createNativeRunnerExecutionDriver>[0]);
+    const registration = await driver.controlPlaneRegistration!(core({ lastLeaseExpiresAt: null, commands: [] }));
+    registration.activate!();
+    // The runnerd transport reads `failure` right after activate(), before the route exists.
+    const observed = registration.failure;
+    expect(observed).toBeInstanceOf(Promise);
+    const seen = vi.fn();
+    void observed!.catch(seen);
+    started();
+    await registration.ready!();
+    rejectFailure(Object.assign(new Error("native_runner_ingress_unreachable: retired"), { code: "native_runner_ingress_unreachable" }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(seen).toHaveBeenCalledWith(expect.objectContaining({ code: "native_runner_ingress_unreachable" }));
+    expect(onIngressUnreachable).toHaveBeenCalledOnce();
+    await registration.release();
+  });
+
+  it("a turn arriving while the idle route is redialing redials that route at once instead of closing it", async () => {
+    let connections = 0;
+    const redialNow = vi.fn(() => { setTimeout(() => { connections = 1; }, 5); return true; });
+    const close = vi.fn(async () => {});
+    transport.connect.mockReturnValue({ ready: Promise.resolve(), failure: new Promise<never>(() => {}), quiesce: vi.fn(), close, redialNow });
+    const ingress = endpoint();
+    const driver = createNativeRunnerExecutionDriver({ binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+      target: { ...sandbox(), getRunnerIngressEndpoint: async () => ingress } as AdapterExecutionTarget });
+    const registration = await driver.controlPlaneRegistration!(core({ lastLeaseExpiresAt: null, commands: [] }, () => connections));
+    registration.activate!(); await registration.ready!();
+    await registration.ensureConnected!({ deadline: Date.now() + 1_000, signal: new AbortController().signal });
+    expect(redialNow).toHaveBeenCalledOnce();
+    expect(close).not.toHaveBeenCalled();
+    expect(ingress.refresh).not.toHaveBeenCalled();
+    expect(transport.connect).toHaveBeenCalledOnce();
+    await registration.release();
+  });
+});
