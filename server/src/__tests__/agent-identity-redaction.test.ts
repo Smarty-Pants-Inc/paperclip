@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
+import { createHash, createPrivateKey, generateKeyPairSync, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { addRunSecretMaterial, createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
 import { canonicalNativeRunLogRedactionForms, redactCanonicalNativeRunLogChunk } from "../services/heartbeat/run-log.js";
@@ -324,3 +324,58 @@ describe("run secret material: only the run's own ids are skipped (redact-meta4)
     expect(redactRegisteredSecretValues({ ordinary, text: `pin ${pin}.` }, [pin])).toEqual({ ordinary, text: "pin ***REDACTED***." });
   });
 });
+
+// redact-sec3 C1: the key-material hold must never split a known value across
+// committed output. A fixed Ed25519 identity seed makes the split deterministic:
+// the seed "redact-sec3-identity-1" gives a key whose body has a 32-character
+// window starting with "5", the pin's last digit.
+describe("a known value is never split across committed output (redact-sec3 C1)", () => {
+  const pin = "482916375"; // test-only
+  const identityPem = fixedIdentityPem("redact-sec3-identity-1");
+  const body = identityPem.split(/\r?\n/).filter(line => line && !line.startsWith("-----")).join("");
+
+  it("the fixed identity key has a material window starting with the pin's last digit", () => {
+    const starts = Array.from({ length: body.length - 31 }, (_, index) => body[index]);
+    expect(starts).toContain(pin.at(-1));
+  });
+
+  it("a 9-digit secret ending a chunk is masked whole when its last digit starts an identity-key window", () => {
+    const redactor = createAgentIdentityRedactor(identityPem);
+    addRunSecretMaterial(redactor, [pin]);
+    const parts = [redactor.chunk("stdout", "agent reported; took 1763297669123 ms\n"), redactor.chunk("stdout", `pin ${pin}\n`)];
+    const output = parts.join("") + redactor.finish("stdout");
+    expect(output.includes(pin)).toBe(false);
+    expect(output).toBe("agent reported; took 1763297669123 ms\npin ***REDACTED***\n");
+  });
+
+  it("a 9-digit secret split 4/5 across two newline-ended pieces is masked", () => {
+    const redactor = createAgentIdentityRedactor(identityPem);
+    addRunSecretMaterial(redactor, [pin]);
+    const output = redactor.chunk("tool", "pin 4829") + redactor.chunk("tool", "16375\n") + redactor.finish("tool");
+    expect(output.includes(pin)).toBe(false);
+    expect(output).toBe("pin ***REDACTED***\n");
+  });
+
+  it("a short non-digit secret ending a chunk is masked whole when its last character starts an identity-key window", () => {
+    const secret = `Xq7tok9${body[0]}`; // test-only, 8 characters
+    const redactor = createAgentIdentityRedactor(identityPem);
+    addRunSecretMaterial(redactor, [secret]);
+    const output = redactor.chunk("stdout", `token ${secret}\n`) + redactor.finish("stdout");
+    expect(output.includes(secret)).toBe(false);
+    expect(output).toBe("token ***REDACTED***\n");
+  });
+
+  it("a value is not cut where a later value's prefix is held", () => {
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, ["secretvalue1", "value1-next-token"]);
+    const output = redactor.chunk("stdout", "x secretvalue1-ne") + redactor.chunk("stdout", "xt\n") + redactor.finish("stdout");
+    expect(output.includes("secretvalue1")).toBe(false);
+    expect(output.includes("***REDACTED***")).toBe(true);
+  });
+});
+
+function fixedIdentityPem(seed: string) {
+  // Ed25519 PKCS#8 DER: a fixed 16-byte header and a 32-byte private seed.
+  const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), createHash("sha256").update(seed).digest()]);
+  return createPrivateKey({ key: der, format: "der", type: "pkcs8" }).export({ type: "pkcs8", format: "pem" }).toString();
+}
