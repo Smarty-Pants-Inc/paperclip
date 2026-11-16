@@ -3078,13 +3078,16 @@ See `tests/e2e/instruction-working-copy/README.md` for isolated browser acceptan
 
 Remote Git exclusion for both working-copy formats is owned by
 `server/src/services/agent-instruction-git-exclusion.ts`. Each execution retains
-its 15-second timeout. A timeout or non-zero exit gets one retry after one second,
-except an unsafe-path failure, which is never retried. Two timeouts therefore
-spend approximately 31 seconds in this step (16 seconds more than before).
+its 15-second command timeout. A timeout, non-zero exit, or rejected execution
+RPC gets one retry after one second, except an unsafe-path failure, which is never
+retried. The worst case is about 31 s plus RPC overhead, not a hard 31 s bound:
+each plugin execute call has a 45-second RPC envelope for this command timeout.
 `AgentInstructionGitExclusionError` retains the run ID and both attempts' timeout,
 exit, signal, and duration fields. Warnings carry the same bounded diagnostics;
 stderr is classified as `unsafe`, `eexist`, `enoent`, or `other`, never logged or
-retained verbatim. Directory creation tolerates a concurrent creator only after
+retained verbatim. RPC rejections use `transport`, a measured duration, and null
+exit/signal fields; provider error text and causes are discarded, not classified
+as unsafe or retained. Directory creation tolerates a concurrent creator only after
 rechecking that the runtime path is a directory, not a symlink. Existing run
 failure, cleanup, and next-try policy remains unchanged.
 
