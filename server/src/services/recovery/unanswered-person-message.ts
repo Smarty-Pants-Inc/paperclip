@@ -135,7 +135,7 @@ const SHOWN_CODES = new Set([
   "native_execution_ownership_unverified", "native_controller_detached_for_restart", "native_provider_terminal_failed",
   "native_provider_model_rejected", "native_provider_approval_required", "native_provider_usage_limit",
   "native_provider_runtime_missing", "native_permission_declined", "native_runner_process_exited",
-  "runner_ingress_acquisition_failed", "runner_ingress_access_rejected", "runner_task_admission_rejected",
+  "runner_ingress_acquisition_failed", "runner_ingress_access_rejected", "runner_ingress_startup_failed", "runner_task_admission_rejected",
   "runner_remote_provider_artifact_incompatible", "runner_remote_provider_verification_unavailable",
   "provider_process_exited", "provider_initialize_timeout", "provider_request_timeout", "provider_transport_failed",
   "provider_session_open_rejected", "provider_session_open_timeout",
@@ -596,6 +596,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         if (wait) return wait;
       } else if (coordinator.phase === "retryable_failure"
         && (!coordinator.nextAttemptAt || coordinator.nextAttemptAt.getTime() + OVERDUE_NATIVE_RETRY_MS > now.getTime())) {
+        // A first start whose Runner never connected retries on the same run
+        // (at most 3 attempts, jittered ~30 s then ~60 s apart, plus each
+        // attempt's own startup wait), which can outlast the 120 s bound. Its
+        // scheduled retry is a real further attempt: wait for it; after
+        // exhaustion the executor's note explains the message (rf4).
+        if (run.errorCode === "runner_ingress_startup_failed" && coordinator.nextAttemptAt) {
+          return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, coordinator.nextAttemptAt.getTime()) };
+        }
         const wait = await bounded(Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS));
         if (wait) return wait;
       }

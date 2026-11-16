@@ -333,6 +333,7 @@ import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { documentService } from "../documents.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueService } from "../issues.js";
+import { buildStrandedRecoveryEscalationNotice } from "../recovery/stranded-notice.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -14428,7 +14429,7 @@ async function executePaperclipNativeSessionAttempt(
         // The hold's reset deadline belongs to the provider-limit owner.
         if (providerLimit?.plan.automatic) await notifyDeliveryWork(tx, DELIVERY_QUEUES.providerLimitResume,
           JSON.stringify({ companyId: input.execution.binding.companyId }));
-        await issueRecoveryActionService(
+        const failureRecoveryAction = await issueRecoveryActionService(
           tx as unknown as Db,
         ).upsertSourceScoped({
           companyId: input.execution.binding.companyId,
@@ -14513,6 +14514,27 @@ async function executePaperclipNativeSessionAttempt(
           supersedeOnIdentityChange:
             recoveryProjection.supersedeOnIdentityChange,
         });
+        // A first start whose Runner never connected used up its bounded
+        // same-run retries. Say so once, in the task thread, with the same
+        // truthful next step the recovery record holds (and its Retry); no
+        // provider thread ever existed, so nothing is "restored" (rf4).
+        if (startupRetryExhausted && sourceFailureCode === "runner_ingress_startup_failed"
+          && recoveryEvidence.providerSessionEstablished === false && !recoveryEvidence.providerEventsExist
+          && !recoveryEvidence.checkpointExists && failureRecoveryAction?.nextAction) {
+          const notice = buildStrandedRecoveryEscalationNotice({
+            seed: { title: "The agent's computer did not connect", body: failureRecoveryAction.nextAction, tone: "danger",
+              nextAction: "Press Retry to start it again." },
+            recoveryActionId: failureRecoveryAction.id,
+            recoveryOwner: null,
+            recoveryResponsibility: "user",
+            sourceRun: { id: input.execution.binding.runId, agentId: input.execution.binding.agentId, status: "failed",
+              errorCode: sourceFailureCode },
+          });
+          await issueService(tx as unknown as Db).addComment(input.execution.binding.issueId, notice.body, {}, {
+            authorType: "system", presentation: notice.presentation,
+            metadata: { ...notice.metadata, authorizationReason: `native_startup_never_connected:${input.execution.binding.runId}` },
+          }, tx);
+        }
       }).catch(async (failure: unknown) => {
         // Emit after rollback so the diagnostic sink cannot deadlock on the
         // coordinator transaction. Reporting failure cannot change fencing.
