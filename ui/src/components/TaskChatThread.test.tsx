@@ -185,6 +185,21 @@ async function settleThreadLayout() {
   });
 }
 
+it("renders a non-owner conversation read-only without requesting owner-only metadata", async () => {
+  const fetches: string[] = [];
+  vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+    const url = String(input); fetches.push(url);
+    return new Response(JSON.stringify(url.includes("pending-questions") ? { questions: [] } : { items: [], nextCursor: null }), { status: 200, headers: { "content-type": "application/json" } });
+  });
+  render(<TaskChatThread issueId="member-chat" conversationMode conversationOwnerId="member-b"
+    currentUserId="owner-a" userLabelMap={new Map([["member-b", "Member B"]])}
+    comments={[]} onAdd={vi.fn()} />);
+  await settleThreadLayout();
+  expect(container.textContent).toContain("Only Member B can send in this conversation.");
+  expect(container.querySelector('[data-testid="mock-editor"]')).toBeNull();
+  expect(fetches.filter(url => /chat-handoffs|pending-questions|decision-receipts/.test(url))).toEqual([]);
+});
+
 describe.each(["legacy", "native"] as const)("historical %s system status", (runtimeMode) => {
   const run = (id: string, status: string, minute: number) => ({
     runId: id, status, runtimeMode, agentId: "agent", agentName: "Assistant",
