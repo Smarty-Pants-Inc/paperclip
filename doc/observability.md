@@ -60,6 +60,11 @@ reservation and owner acknowledgement. Acquisition duration is not a pure
 PostgreSQL lock-wait measurement: it can include network and Node scheduling.
 Enforcement spans cover asynchronous evaluation/delivery; cancellation delivery
 covers the external Stop attempt, separate from provider inference.
+`budget.accounting.recover` is a completion-time summary only for a pass that
+commits accounting progress (including receipt replay, service recovery or
+pending-marker repair), contains an item failure, or throws. Empty inspections
+emit no recovery span. The summary retains the pass's start/end times but is
+not an active parent of settlement/transaction spans.
 
 The closed attribute list is `budget.policy_count` (applicable policy count),
 `budget.enforcement.queue_delay_ms` (time since pending intent/retry), and

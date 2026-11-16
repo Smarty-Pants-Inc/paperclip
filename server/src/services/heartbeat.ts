@@ -1021,6 +1021,7 @@ export function heartbeatService(
     ]);
     const failed = outcomes.find(outcome => outcome.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
+    return outcomes.reduce((count, outcome) => count + (outcome.status === "fulfilled" ? outcome.value : 0), 0);
   });
   const budgets = budgetService(db, budgetHooks);
   const recovery = recoveryService(db, {

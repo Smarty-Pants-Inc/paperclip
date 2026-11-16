@@ -102,7 +102,10 @@ export function registerCostAccountingWork(db: Db, coordinator: Coordinator, rec
     runDuringDrain: true,
     async run(signal) {
       if (signal.aborted) return;
-      await withBudgetSpan("budget.accounting.recover", reconcile);
+      await withBudgetSpan("budget.accounting.recover", reconcile, undefined, result => {
+        const progress = result as { changed?: number; failed?: number } | undefined;
+        return Boolean(progress && ((progress.changed ?? 0) > 0 || (progress.failed ?? 0) > 0));
+      });
     },
     async hasPending() {
       const work = await readCostAccountingWork(db);

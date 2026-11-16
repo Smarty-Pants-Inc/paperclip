@@ -15,9 +15,34 @@ type BudgetAttributes = {
   "budget.policy_count"?: number;
 };
 
-export function withBudgetSpan<T>(name: BudgetOperation, work: () => Promise<T>, attributes?: BudgetAttributes) {
+export function withBudgetSpan<T>(name: BudgetOperation, work: () => Promise<T>, attributes?: BudgetAttributes,
+  shouldTrace?: (result: T) => boolean) {
   return withDatabaseOperation(name, async () => {
     if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim()) return work();
+    // Recovery notifications are inspection hints, not proof of work. Decide
+    // after completion so an idle pass never creates/exports a span. Keep the
+    // real interval; this deferred summary is not an active parent span.
+    if (shouldTrace) {
+      const startTime = Date.now();
+      let emit = false, failed = true;
+      try {
+        const result = await work();
+        failed = false;
+        try { emit = shouldTrace(result); } catch { /* Diagnostics cannot change accounting. */ }
+        return result;
+      } finally {
+        const endTime = Date.now();
+        if (emit || failed) {
+          try {
+            const traced = trace.getTracer("paperclip.budgets").startActiveSpan(name, { attributes, startTime }, span => {
+              try { if (failed) span.setStatus({ code: 2 }); }
+              finally { span.end(endTime); }
+            });
+            void Promise.resolve(traced).catch(() => undefined);
+          } catch { /* Preserve the result/error even if the tracer fails. */ }
+        }
+      }
+    }
     let operation: Promise<T> | undefined;
     const run = (span?: Span) => operation ??= Promise.resolve().then(work).finally(() => {
       try { span?.end(); } catch { /* Diagnostics cannot change accounting. */ }
