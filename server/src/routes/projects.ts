@@ -14,8 +14,8 @@ import { normalizeProjectRepositoryUrl, resolveProjectRepositorySelection } from
 import { toolAccessService } from "../services/tool-access.js";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { agents, authUsers, companyMemberships, instanceUserRoles, projectAccessMembers } from "@paperclipai/db";
-import { inArray } from "drizzle-orm";
+import { agents, authUsers, companyMemberships, companySecrets, instanceUserRoles, projectAccessMembers } from "@paperclipai/db";
+import { inArray, ne } from "drizzle-orm";
 import {
   addProjectAccessMemberSchema,
   createProjectSchema,
@@ -163,6 +163,21 @@ export function projectRoutes(db: Db) {
       throw conflict("Project shortname is ambiguous in this company. Use the project ID.");
     }
     return matches[0]?.id ?? rawId;
+  }
+
+  /**
+   * W1 (j), adopt-lead 00:32Z: a project that anchors a live plugin instance secret is the
+   * credential's owner. An agent must not archive or delete it; board sessions keep their behaviour.
+   */
+  async function assertAgentMayRetireProject(req: Request, project: { id: string; companyId: string }) {
+    if (req.actor.type !== "agent") return;
+    const [anchor] = await db.select({ id: companySecrets.id }).from(companySecrets).where(and(
+      eq(companySecrets.companyId, project.companyId), eq(companySecrets.scope, "instance"),
+      eq(companySecrets.ownerProjectId, project.id), ne(companySecrets.status, "deleted"))).limit(1);
+    if (anchor) {
+      throw forbidden("This project holds a plugin's private credential and can't be archived or deleted by an agent.",
+        { code: "project_anchors_instance_secret" });
+    }
   }
 
   async function assertProjectReadAllowed(req: Request, res: Response, project: { id: string; companyId: string }) {
@@ -533,6 +548,7 @@ export function projectRoutes(db: Db) {
       collectProjectExecutionWorkspaceCommandPaths(body.executionWorkspacePolicy),
     );
     await assertProjectDecisionOwner(req, existing.companyId, body.decisionOwnerUserId, existing.decisionOwnerUserId ?? null);
+    if (body.archivedAt) await assertAgentMayRetireProject(req, existing);
     if (typeof body.archivedAt === "string") {
       body.archivedAt = new Date(body.archivedAt);
     }
@@ -1076,6 +1092,7 @@ export function projectRoutes(db: Db) {
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Project not found");
     if (!existing) return;
     if (!(await assertProjectReadAllowed(req, res, existing))) return;
+    await assertAgentMayRetireProject(req, existing);
     const project = await svc.remove(id);
     if (!project) {
       res.status(404).json({ error: "Project not found" });
