@@ -1,5 +1,6 @@
 import { lstat, mkdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { writePrivateFile } from "../private-file.js";
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -26,10 +27,6 @@ function explicitReserve(settings: Record<string, unknown>, model: string): unkn
   return override.reserveTokens ?? compaction.reserveTokens;
 }
 
-/** V2-R2 row 1: match v1's 100k headroom on large windows, without
- * exceeding a quarter of a small model's context. Leave Pi's other defaults alone.
- * Managed-home settings win; otherwise honor the original user's explicit reserve.
- */
 function packageNotInstalled(source: string): Error & { code: string } {
   return Object.assign(new Error(`Pi managed npm package ${JSON.stringify(source)} is not installed under the original agent home`), {
     code: "pi_managed_package_not_installed",
@@ -92,13 +89,24 @@ export async function configurePiManagedCompaction(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   });
-  const sameHome = resolve(input.originalAgentHome) === resolve(input.agentHome);
-  const original = sameHome ? settings : await readSettings(join(input.originalAgentHome, "settings.json"));
-  const base = !hasSettings && !sameHome ? original : settings;
+  // A no-env RUN already has the server's per-session PI_CODING_AGENT_DIR in
+  // process.env, so its "original" home can be the empty managed home. In that
+  // case only, read the image's default Pi home. Resolve it at call time exactly
+  // like Pi 1.5.2 dist/config.js:510-515 (homedir, not a projected child HOME).
+  // Docs: configuration.md:3,9-13; environment-variables.md:81. Never write there.
+  const originalAgentHome = !hasSettings && resolve(input.originalAgentHome) === resolve(input.agentHome)
+    ? join(homedir(), ".pi", "agent") : input.originalAgentHome;
+  const sameHome = resolve(originalAgentHome) === resolve(input.agentHome);
+  const original = sameHome ? settings : await readSettings(join(originalAgentHome, "settings.json"));
+  const inherited = !hasSettings && !sameHome;
+  // Image defaults are not authority to route a managed session away from its
+  // loopback provider. Pi 1.5.2 settings.md:13-14 defines these startup defaults.
+  const base = inherited ? { ...original, ...(input.model.startsWith("paperclip/")
+    ? { defaultProvider: "paperclip", defaultModel: input.model.slice("paperclip/".length) } : {}) } : settings;
   // Validate every package before creating or writing the managed home: Pi must
   // never fall back to installing a missing npm source during startup.
   const rewritten = sameHome ? { settings: base, changed: false }
-    : await rewriteManagedPackages(base, input.originalAgentHome);
+    : await rewriteManagedPackages(base, originalAgentHome);
   const hasExplicitReserve = explicitReserve(settings, input.model) !== undefined;
   if (hasExplicitReserve) {
     if (!rewritten.changed) return;
