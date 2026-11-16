@@ -27,7 +27,6 @@ const GITHUB_ACCESS_KIND = "github_access.http";
 const GITHUB_ACCESS_CREDENTIALS_PATH = "/runtime-tools/github/credentials";
 const GITHUB_ACCESS_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const GITHUB_ACCESS_HEADER_ALLOWLIST = new Set<string>(DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST);
-const GITHUB_ACCESS_SESSION_REQUEST_LIMIT = 65_536;
 
 type GithubAccessBinding = { companyId: string; agentId: string; issueId: string; runId: string };
 type GithubAccessReply = { requestId: string; status: number; headers: Record<string, string>; bodyBase64: string };
@@ -433,16 +432,10 @@ function normalizeGithubAccessReply(value: unknown, requestId: string): GithubAc
 }
 
 function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
-  const inFlight = new Set<string>();
-  const seen = new Set<string>();
+  const inFlight = new Set<symbol>();
   return async (value: unknown, identity: DurableRecoveryIdentity): Promise<GithubAccessReply> => {
     const requestId = githubAccessFrameRequestId(value);
     if (requestId === null) return githubAccessResponse("invalid-request", 403, { error: "GitHub ingress request refused" });
-    if (seen.has(requestId)) return githubAccessResponse(requestId, 409, { error: "GitHub ingress request already used" });
-    if (seen.size >= GITHUB_ACCESS_SESSION_REQUEST_LIMIT) {
-      return githubAccessResponse(requestId, 503, { error: "GitHub ingress request capacity unavailable" });
-    }
-    seen.add(requestId);
     if (inFlight.size >= DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_IN_FLIGHT) {
       return githubAccessResponse(requestId, 503, { error: "GitHub ingress request capacity unavailable" });
     }
@@ -453,7 +446,8 @@ function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
     }
     const binding = handler.getSessionBinding(identity);
     if (!binding) return githubAccessResponse(requestId, 403, { error: "No active GitHub run" });
-    inFlight.add(requestId);
+    const inFlightRequest = Symbol(requestId);
+    inFlight.add(inFlightRequest);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const request = Promise.resolve().then(() => handler.handleRequest(value, binding));
@@ -477,7 +471,7 @@ function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
         { error: timeout ? "GitHub credential request timed out" : "GitHub credentials unavailable" });
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      inFlight.delete(requestId);
+      inFlight.delete(inFlightRequest);
     }
   };
 }

@@ -2265,7 +2265,7 @@ export class DurablePrpControlPlane {
     reject: (error: Error) => void;
     timer: ReturnType<typeof setTimeout>;
   }>();
-  #githubAccessRequestIds = new Set<string>();
+  #githubAccessRequestIds = new WeakMap<AuthorityConnection, Set<string>>();
   #githubAccessInFlight = new Set<string>();
 
   constructor(options: DurablePrpControlPlaneOptions) {
@@ -3620,20 +3620,26 @@ export class DurablePrpControlPlane {
       sendFailure(403, "GitHub ingress request refused");
       return;
     }
-    if (this.#githubAccessRequestIds.has(requestId)) {
+    let sessionRequestIds = this.#githubAccessRequestIds.get(connection);
+    if (sessionRequestIds?.has(requestId)) {
       sendFailure(409, "GitHub ingress request already used");
       return;
     }
-    if (this.#githubAccessRequestIds.size >= maxGithubAccessRequestIds) {
+    if (sessionRequestIds && sessionRequestIds.size >= maxGithubAccessRequestIds) {
       sendFailure(503, "GitHub ingress request capacity unavailable");
       return;
     }
-    this.#githubAccessRequestIds.add(requestId);
+    if (!sessionRequestIds) {
+      sessionRequestIds = new Set<string>();
+      this.#githubAccessRequestIds.set(connection, sessionRequestIds);
+    }
+    sessionRequestIds.add(requestId);
     if (this.#githubAccessInFlight.size >= maxGithubAccessInFlight) {
       sendFailure(503, "GitHub ingress request capacity unavailable");
       return;
     }
-    this.#githubAccessInFlight.add(requestId);
+    const inFlightId = `${connectionId}:${requestId}`;
+    this.#githubAccessInFlight.add(inFlightId);
     const capturedIdentity = structuredClone(identity);
     const capturedLeaseId = lease.leaseId;
     const capturedConnectionId = connectionId;
@@ -3650,7 +3656,7 @@ export class DurablePrpControlPlane {
     } catch {
       reply = failure(503, "GitHub ingress is unavailable");
     } finally {
-      this.#githubAccessInFlight.delete(requestId);
+      this.#githubAccessInFlight.delete(inFlightId);
     }
     // A handoff, lease revocation, reconnect, or close while an operation was
     // pending invalidates its result. In particular, never return credentials
