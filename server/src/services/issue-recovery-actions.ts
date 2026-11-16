@@ -1,6 +1,6 @@
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
-import { STOP_PENDING_SCHEMA } from "./recovery/stop-pending.js";
+import { hasTaskStopPending, STOP_PENDING_SCHEMA } from "./recovery/stop-pending.js";
 import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
@@ -22,6 +22,9 @@ import { exhaustedSystemRecoveryAction, readSystemRecovery } from "./system-reco
 
 const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 const MAX_UPSERT_RETRIES = 3;
+// Recheck at every ordinary write: the guarded Stop owner may have annotated
+// the action after this writer's read. A stale snapshot cannot hide that hold.
+const noTaskStopPending = sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`;
 
 type IssueRecoveryActionRow = typeof issueRecoveryActions.$inferSelect;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -363,6 +366,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           .where(
             and(
               eq(issueRecoveryActions.id, priorActionId),
+              noTaskStopPending,
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
             ),
           )
@@ -390,7 +394,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   ): Promise<IssueRecoveryAction> {
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
-    if (existing && input.createOnly) return existing;
+    // Stop is an independent data-safety obligation, not this writer's failure
+    // identity. Keep its action, owner and spent budget authoritative until the
+    // guarded release proves Stop. The ordinary producer can retry afterwards.
+    if (existing && (input.createOnly || hasTaskStopPending(existing))) return existing;
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
     if (existing) {
       // A distinct failure identity must not overwrite the active action of a
@@ -418,8 +425,10 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           const [updated] = await writeExecutionControl(db, [DELIVERY_QUEUES.executionDisposition, DELIVERY_QUEUES.executionContinuation], tx => tx.update(issueRecoveryActions).set({ nextAction: input.nextAction, updatedAt: now })
             .where(and(eq(issueRecoveryActions.id, existing.id),
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+              noTaskStopPending,
               sql`${issueRecoveryActions.evidence}->'workspaceOwnerStop' is null`)).returning(), { companyId: input.companyId });
-          if (updated) return toReadModel(updated);
+          if (!updated) return retryUpsertSourceScoped(input, retryCount);
+          return toReadModel(updated);
         }
         return existing;
       }
@@ -488,6 +497,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
             .where(
               and(
                 eq(issueRecoveryActions.id, existing.id),
+                noTaskStopPending,
                 inArray(issueRecoveryActions.status, [
                   ...ACTIVE_RECOVERY_ACTION_STATUSES,
                 ]),
@@ -563,6 +573,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           .where(
             and(
               eq(issueRecoveryActions.id, existing.id),
+              noTaskStopPending,
               inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
             ),
           )
@@ -608,7 +619,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
       // A new task path, terminal task or generic board disposition is not
       // Stop proof. Only the guarded task release removes this diagnostic.
-      sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`,
+      noTaskStopPending,
     ];
     if (input.actionId) {
       predicates.push(eq(issueRecoveryActions.id, input.actionId));
