@@ -903,20 +903,62 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     async allowCreate() {
       // Every spare-labelled box created in the last hour, claimed or not, in
       // any state: labels are immutable, so a claimed box still says spare.
-      // The keeper subtracts this worker's proofs of use (#20869).
-      const inventory = await listBoatSandboxes(config, [["owner", `paperclip:${key.companyId}`], ["purpose", "spare"]]);
-      const cutoff = Date.now() - 60 * 60 * 1000;
-      let recent = 0;
-      for (const sandbox of inventory) {
-        if (sandbox.labels.owner !== `paperclip:${key.companyId}` || sandbox.labels.purpose !== "spare") throw new Error("Boat hourly spare inventory returned foreign ownership");
-        const createdAt = Date.parse(sandbox.createdAt);
-        // Unknown is not a count: fail closed without reporting a cap.
-        if (!Number.isFinite(createdAt)) throw new Error("Boat hourly spare inventory omitted createdAt");
-        if (createdAt >= cutoff) recent++;
-      }
-      return { recentSpareCreates: recent };
+      // The keeper subtracts this worker's proofs of use (#20869). The run
+      // boxes keep the all-create ceiling's run count across restarts.
+      const createdAt = await listHourlyCreates(config, key.companyId);
+      return { recentSpareCreates: createdAt.spare.length, createdAt };
     },
   };
+}
+/**
+ * Boat's durable record of this company's creates in the last hour: the
+ * creation times of its purpose=spare and purpose=run boxes, in any state and
+ * any environment (the ceiling is per company). Unknown is not a count: an
+ * incomplete record throws.
+ */
+async function listHourlyCreates(config: Config, companyId: string): Promise<{ spare: number[]; run: Array<{ createdAt: number; attempt?: string }> }> {
+  const owner = `paperclip:${companyId}`;
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  const [spare, run] = await Promise.all((["spare", "run"] as const).map(async purpose => {
+    const inventory = await listBoatSandboxes(config, [["owner", owner], ["purpose", purpose]]);
+    const recent: Array<{ createdAt: number; attempt?: string }> = [];
+    for (const sandbox of inventory) {
+      if (sandbox.labels.owner !== owner || sandbox.labels.purpose !== purpose) throw new Error(`Boat hourly ${purpose} inventory returned foreign ownership`);
+      const createdAt = Date.parse(sandbox.createdAt);
+      if (!Number.isFinite(createdAt)) throw new Error(`Boat hourly ${purpose} inventory omitted createdAt`);
+      const attempt = sandbox.labels["paperclip-acquire"];
+      if (createdAt >= cutoff) recent.push({ createdAt, ...(typeof attempt === "string" && attempt ? { attempt } : {}) });
+    }
+    return recent;
+  }));
+  return { spare: spare.map(entry => entry.createdAt), run };
+}
+/** How long a company's observed Boat create inventory serves run admissions before it is read again. */
+const RUN_CREATE_LEDGER_REFRESH_MS = 60_000;
+const runCreateLedgerReads = new Map<string, { at: number; work?: Promise<void> }>();
+/**
+ * After a run create is admitted, keep the company's all-create count anchored
+ * to Boat's durable inventory (judge F1): the first run after a worker start,
+ * and at most once a minute after that, reads it in the background. A run never
+ * waits on it and is never refused (ruling A). When the read lands, a run that
+ * the stale count admitted under the ceiling is reported over it (kind=run).
+ * An unreadable inventory leaves this worker's count; the next minute retries.
+ */
+function refreshRunCreateLedger(config: Config, companyId: string, environmentId: string): void {
+  const last = runCreateLedgerReads.get(companyId);
+  if (last?.work || shuttingDown) return;
+  const observedAt = readySpares.providerCreatesObservedAt(companyId);
+  if (Date.now() - Math.max(last?.at ?? Number.NEGATIVE_INFINITY, observedAt ?? Number.NEGATIVE_INFINITY) < RUN_CREATE_LEDGER_REFRESH_MS) return;
+  const startedAt = Date.now();
+  const begun = readySpares.createLedgerMark();
+  const work: Promise<void> = listHourlyCreates(config, companyId)
+    .then(createdAt => {
+      if (shuttingDown) return;
+      readySpares.observeProviderCreates(companyId, createdAt, begun);
+      readySpares.recheckRunCeiling(companyId, environmentId);
+    }, () => { duplexLogger?.warn("Boat hourly create inventory unreadable; counting this worker's creates only", { companyId }); })
+    .finally(() => { if (runCreateLedgerReads.get(companyId)?.work === work) runCreateLedgerReads.set(companyId, { at: startedAt }); });
+  runCreateLedgerReads.set(companyId, { at: last?.at ?? Number.NEGATIVE_INFINITY, work });
 }
 function clearSpareRefreshTimerIfIdle(): void {
   if ([...knownSparePools.values()].some(pool => pool.desired > 0)) return;
@@ -1073,6 +1115,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.setRefusalListener(reportCreateCapRefusal);
     knownSparePools.clear();
     claimedSpareLeases.clear();
+    runCreateLedgerReads.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -1165,6 +1208,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     try {
       try {
         await Promise.allSettled([...inFlightAcquisitions]);
+        await Promise.allSettled([...runCreateLedgerReads.values()].map(read => read.work));
         if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
         await readySpares.drain();
         await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values()].map(write => write.catch(() => undefined)));
@@ -1175,6 +1219,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       readySpares.reset();
       knownSparePools.clear();
       claimedSpareLeases.clear();
+      runCreateLedgerReads.clear();
       spareClaimStore = undefined;
       duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
       // The host process exits after this hook. Clearing the transition flag
@@ -1272,8 +1317,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
       if (shuttingDown) throw new Error("Boat provider is shutting down");
-      // Runs always proceed; the spare-only ceiling still counts and reports them.
-      readySpares.admitRunCreate(params.companyId, params.environmentId);
+      // Runs always proceed; the spare-only ceiling still counts and reports
+      // them, including the hour's creates Boat holds from before a restart.
+      readySpares.admitRunCreate(params.companyId, params.environmentId, attemptId);
+      if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
