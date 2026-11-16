@@ -126,7 +126,8 @@ import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-loc
 import type { TrustPresetResolution } from "../trust-preset-resolver.js";
 import { logger } from "../../middleware/logger.js";
 import { publishActivity, type ActivityPublication } from "../activity-log.js";
-import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "../transient-lock-contention.js";
+import { isTransientLockContention, postgresErrorCode } from "../transient-lock-contention.js";
+import { retryRunPreparationLockContention } from "../run-preparation-lock-retry.js";
 
 const EXTERNAL_ATTACHMENT_OMISSIONS_KEY = "externalAttachmentOmissions";
 
@@ -1074,7 +1075,7 @@ export async function buildPaperclipRuntimeMcpServers(input: {
   // Retry only after the entire failed transaction has rolled back. Profile,
   // entries, gateway, binding, audit and token either all commit or all disappear.
   // External delivery diagnostics stay outside this replayable SQL boundary.
-  const prepared = await retryTransientLockContention(() => input.db.transaction(async tx => {
+  const prepared = await retryRunPreparationLockContention(() => input.db.transaction(async tx => {
   const publications: ActivityPublication[] = [];
   const db = tx as unknown as Db;
   const service = createToolGatewayService(db);
