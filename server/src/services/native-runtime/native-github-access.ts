@@ -18,6 +18,7 @@ import { githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launc
 type Binding = { companyId: string; agentId: string; issueId: string; runId: string };
 type LauncherInput = Parameters<typeof prepareGitHubOperationLaunchers>[0];
 type AccessTransport = "callback_bridge" | "runner_ingress";
+type GitHubAccessFallbackReason = "capability_absent" | "ingress_unready" | "disconnect";
 export type NativeGitHubAccessHttpRequest = {
   kind: "github_access.http";
   requestId: string;
@@ -114,6 +115,7 @@ export async function createNativeGitHubAccess(input: {
   env: NodeJS.ProcessEnv;
   resolveCredentials: (binding: Binding) => Promise<unknown>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  fallbackReason?: GitHubAccessFallbackReason;
   /** Explicit executor selection; an absent value supports direct legacy callers. */
   transport?: AccessTransport;
 }, startBridge = startAdapterExecutionTargetPaperclipBridge) {
@@ -125,6 +127,9 @@ export async function createNativeGitHubAccess(input: {
   }
   const duplexRequested = adapterExecutionTargetEnablesSandboxDuplexBridge(input.target);
   const token = randomBytes(32).toString("hex");
+  const redactLogValue = (value: string) => value
+    .replaceAll(token, "[redacted]")
+    .replaceAll(Buffer.from(token).toString("base64"), "[redacted]");
   const location = { runId: `native-session-${randomUUID()}`, target: input.target };
   let active: Binding | null = null;
   let activeGeneration: string | null = null;
@@ -175,16 +180,26 @@ export async function createNativeGitHubAccess(input: {
       if (bodyBytes > DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES) oversized = true;
     });
     req.resume();
-    const reply = (response: HttpReply) => {
+    const recordRequest = async (response: HttpReply) => {
+      const record = {
+        method: redactLogValue(req.method ?? ""), path: redactLogValue(req.url ?? ""), status: response.status,
+        responseSize: response.body.byteLength, requestId: randomUUID(), transport: "bridge",
+        ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
+      };
+      const line = `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`;
+      await Promise.resolve(input.onLog?.("stderr", line)).catch(() => undefined);
+    };
+    const reply = async (response: HttpReply) => {
+      await recordRequest(response);
       res.writeHead(response.status, response.headers);
       res.end(response.body);
     };
     if (req.headers.origin || req.headers.cookie || req.headers["sec-fetch-site"] || !sameBearer(req.headers.authorization, token)) {
-      reply(jsonReply(403, { error: "GitHub session authentication required" }));
+      await reply(jsonReply(403, { error: "GitHub session authentication required" }));
       return;
     }
     if (req.method !== "POST" || req.url !== CREDENTIALS_PATH) {
-      reply(jsonReply(404, { error: "Unknown GitHub session operation" }));
+      await reply(jsonReply(404, { error: "Unknown GitHub session operation" }));
       return;
     }
     const binding = active;
@@ -193,24 +208,24 @@ export async function createNativeGitHubAccess(input: {
     const bridgedRequest = typeof req.headers["x-paperclip-run-id"] === "string";
     const queueTransport = req.headers["x-paperclip-bridge-transport"] === "queue_v1";
     if (!binding || stopped) {
-      reply(jsonReply(403, { error: "No active GitHub run" }));
+      await reply(jsonReply(403, { error: "No active GitHub run" }));
       return;
     }
     if ((bridgedRequest || queueTransport) && typeof requestGeneration !== "string") {
-      reply(jsonReply(403, { error: "GitHub bridge request has no run generation" }));
+      await reply(jsonReply(403, { error: "GitHub bridge request has no run generation" }));
       return;
     }
     await bodyComplete;
     if (oversized) {
-      reply(jsonReply(413, { error: "GitHub request body exceeds the configured size limit" }));
+      await reply(jsonReply(413, { error: "GitHub request body exceeds the configured size limit" }));
       return;
     }
     if (!current(binding, capturedGeneration!) ||
         ((bridgedRequest || queueTransport) && requestGeneration !== capturedGeneration)) {
-      reply(jsonReply(403, { error: "GitHub bridge request belongs to an inactive run generation" }));
+      await reply(jsonReply(403, { error: "GitHub bridge request belongs to an inactive run generation" }));
       return;
     }
-    reply(await acquireCredentials(binding, capturedGeneration!));
+    await reply(await acquireCredentials(binding, capturedGeneration!));
   } : null;
 
   const server = httpHandler ? createServer(httpHandler) : null;
@@ -296,30 +311,39 @@ export async function createNativeGitHubAccess(input: {
         const parsed = parseIngressRequest(frame);
         const requestId = typeof frame === "object" && frame !== null && typeof (frame as { requestId?: unknown }).requestId === "string"
           ? (frame as { requestId: string }).requestId : "invalid-request";
-        if (!parsed) return responseFrame(requestId, jsonReply(403, { error: "GitHub ingress request refused" }));
+        const respond = async (response: HttpReply) => {
+          const record = {
+            method: redactLogValue(parsed?.method ?? ""), path: redactLogValue(parsed?.path ?? ""), status: response.status,
+            responseSize: response.body.byteLength, requestId: redactLogValue(parsed?.requestId ?? requestId),
+            transport: "prp",
+          };
+          await Promise.resolve(input.onLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
+          return responseFrame(requestId, response);
+        };
+        if (!parsed) return respond(jsonReply(403, { error: "GitHub ingress request refused" }));
         const body = decodeBody(parsed.bodyBase64);
-        if (!body) return responseFrame(parsed.requestId, jsonReply(413, { error: "GitHub request body exceeds the configured size limit" }));
+        if (!body) return respond(jsonReply(413, { error: "GitHub request body exceeds the configured size limit" }));
         // Retain the launcher's existing per-request capability check; the
         // authenticated PRP identity below adds session authority, not a substitute.
         if (!sameToken(parsed.headers[INGRESS_CAPABILITY_HEADER], token)) {
-          return responseFrame(parsed.requestId, jsonReply(403, { error: "GitHub session authentication required" }));
+          return respond(jsonReply(403, { error: "GitHub session authentication required" }));
         }
         if (sessionBinding.companyId !== input.scope.companyId || sessionBinding.agentId !== input.scope.agentId ||
             sessionBinding.issueId !== input.scope.issueId) {
-          return responseFrame(parsed.requestId, jsonReply(403, { error: "GitHub session scope mismatch" }));
+          return respond(jsonReply(403, { error: "GitHub session scope mismatch" }));
         }
         const binding = active;
         const generation = activeGeneration;
         if (!binding || stopped || binding.runId !== sessionBinding.runId) {
-          return responseFrame(parsed.requestId, jsonReply(403, { error: "No active GitHub run" }));
+          return respond(jsonReply(403, { error: "No active GitHub run" }));
         }
         if (parsed.method !== "POST" || parsed.path !== CREDENTIALS_PATH) {
-          return responseFrame(parsed.requestId, jsonReply(404, { error: "Unknown GitHub session operation" }));
+          return respond(jsonReply(404, { error: "Unknown GitHub session operation" }));
         }
         if (!current(binding, generation!)) {
-          return responseFrame(parsed.requestId, jsonReply(403, { error: "GitHub request belongs to an inactive run generation" }));
+          return respond(jsonReply(403, { error: "GitHub request belongs to an inactive run generation" }));
         }
-        return responseFrame(parsed.requestId, await acquireCredentials(binding, generation!));
+        return respond(await acquireCredentials(binding, generation!));
       },
       getSessionBinding(sessionBinding: Binding): Binding | null {
         const binding = active;

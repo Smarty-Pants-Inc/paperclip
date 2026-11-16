@@ -24,6 +24,7 @@ const DEFAULT_RECOVERY_GRACE_MS = REMOTE_RUNNER_RECONNECT_GRACE_MS;
 const MAX_FRAME_BYTES = Math.max(32 * 1024 * 1024,
   2 * (4 * Math.ceil(DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_BODY_BYTES / 3) + 64 * 1024));
 const GITHUB_ACCESS_KIND = "github_access.http";
+const GITHUB_ACCESS_CREDENTIALS_PATH = "/runtime-tools/github/credentials";
 const GITHUB_ACCESS_REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const GITHUB_ACCESS_HEADER_ALLOWLIST = new Set<string>(DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST);
 const GITHUB_ACCESS_SESSION_REQUEST_LIMIT = 65_536;
@@ -442,6 +443,9 @@ function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
     }
     if (!validGithubAccessFrame(value)) return githubAccessResponse(requestId, 403, { error: "GitHub ingress request refused" });
     if (!decodeGithubAccessBody(value.bodyBase64)) return githubAccessResponse(requestId, 413, { error: "GitHub request body exceeds the configured size limit" });
+    if (value.method !== "POST" || value.path !== GITHUB_ACCESS_CREDENTIALS_PATH) {
+      return githubAccessResponse(requestId, 404, { error: "Unknown GitHub session operation" });
+    }
     const binding = handler.getSessionBinding(identity);
     if (!binding) return githubAccessResponse(requestId, 403, { error: "No active GitHub run" });
     inFlight.add(requestId);

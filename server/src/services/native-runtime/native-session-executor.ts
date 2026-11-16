@@ -8958,6 +8958,28 @@ function runnerIngressGitHubAccessSelected(input: Pick<Parameters<typeof execute
     target.effectiveCapabilities?.runnerWebSocketIngress === true;
 }
 
+function nativeGitHubAccessTransport(input: Parameters<typeof executePaperclipNativeSession>[0]): "runner_ingress" | "callback_bridge" {
+  // Transport choice belongs to the provider session, not to a transient route
+  // observation. Reusing an ingress-owned session may reconnect PRP, but must
+  // never turn a route outage into a second callback-bridge transport.
+  const warmSessionId = input.execution.session?.lifecyclePolicy.mode === "warm"
+    ? nativeSessionScopeKey(input.execution) : null;
+  const retained = warmSessionId ? warmNativeSessions.get(warmSessionId)?.githubAccess : undefined;
+  if (retained?.transport === "runner_ingress") return "runner_ingress";
+  return runnerIngressGitHubAccessSelected(input) ? "runner_ingress" : "callback_bridge";
+}
+
+function nativeGitHubAccessFallbackReason(input: Pick<Parameters<typeof executePaperclipNativeSession>[0],
+  "execution" | "runnerExecutionTarget" | "runnerIngressAuthorized" | "runnerIngressFallbackReason">,
+  transport: "runner_ingress" | "callback_bridge"): "capability_absent" | "ingress_unready" | "disconnect" | undefined {
+  if (transport !== "callback_bridge") return undefined;
+  if (input.runnerIngressFallbackReason) return input.runnerIngressFallbackReason;
+  const target = input.runnerExecutionTarget;
+  if (input.execution.provider.kind !== "pi_rpc" || target?.kind !== "remote" || target.transport !== "sandbox") return undefined;
+  if (target.effectiveCapabilities?.runnerWebSocketIngress !== true) return "capability_absent";
+  return input.runnerIngressAuthorized === true ? undefined : "ingress_unready";
+}
+
 function pluginTaskConfiguredEnvironment(environment: NodeJS.ProcessEnv | undefined): Record<string, string> {
   return Object.fromEntries(Object.entries(configuredEnvironment(environment)).flatMap(([key, value]) =>
     key !== CONFIGURED_ENVIRONMENT_KEYS && typeof value === "string" ? [[key, value]] : []));
@@ -8979,7 +9001,7 @@ function nativeProcessReuseKey(input: Parameters<typeof executePaperclipNativeSe
     networkAccess: environment?.PAPERCLIP_RUNNER_NETWORK_ACCESS === "enabled",
     coreGitHubAccess: needsCoreGitHubAccess(input),
     coreGitHubAccessTransport: needsCoreGitHubAccess(input)
-      ? runnerIngressGitHubAccessSelected(input) ? "runner_ingress" : "callback_bridge"
+      ? nativeGitHubAccessTransport(input)
       : null,
     instructionRoot: input.instructionWorkingCopy?.root ?? null,
   });
@@ -10803,6 +10825,8 @@ async function executePaperclipNativeSessionUnnoticed(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */
   runnerIngressAuthorized?: boolean;
+  /** Why an ingress-capable session is using the callback bridge. */
+  runnerIngressFallbackReason?: "capability_absent" | "ingress_unready" | "disconnect";
   runnerPublicUrl?: string | null;
   runnerCaBundlePath?: string | null;
   runnerRemoteBinaryPath?: string | null;
@@ -12600,7 +12624,7 @@ async function executePaperclipNativeSessionAttempt(
           && Object.keys(pluginTaskConfiguredEnvironment(input.runnerEnvironment)).length > 0) ||
         Boolean(entry.githubAccess) !== needsCoreGitHubAccess(input) ||
         entry.githubAccess?.ready === false ||
-        (entry.githubAccess !== undefined && entry.githubAccess.transport !== (runnerIngressGitHubAccessSelected(input) ? "runner_ingress" : "callback_bridge")) ||
+        (entry.githubAccess !== undefined && entry.githubAccess.transport !== nativeGitHubAccessTransport(input)) ||
         (entry.githubAccess !== undefined && entry.githubAccess.duplexRequested !== adapterExecutionTargetEnablesSandboxDuplexBridge(input.runnerExecutionTarget))
       ) {
         await finishStartupContextForFallback();
@@ -12787,7 +12811,7 @@ async function executePaperclipNativeSessionAttempt(
   if (!leaseRenewal) throw new Error("native_session_renewal_owner_missing");
   try {
     const usesPluginTask = input.runnerExecutionTarget?.kind === "remote" && input.runnerExecutionTarget.transport === "sandbox" && !!input.runnerExecutionTarget.runnerTask;
-    const runnerIngressGitHubAccessIsSelected = runnerIngressGitHubAccessSelected(input);
+    const runnerIngressGitHubAccessIsSelected = githubAccess?.transport === "runner_ingress" || nativeGitHubAccessTransport(input) === "runner_ingress";
     const prepareRunnerEnvironment = async () => {
       if (input.prepareGitHubEnvironment) {
         const environment = await timeController("github_environment", input.prepareGitHubEnvironment);
@@ -12803,14 +12827,12 @@ async function executePaperclipNativeSessionAttempt(
           env: resolveNativeProviderEnvironment(input.execution.provider, input.runnerEnvironment),
           resolveCredentials: (binding) => resolveGitHubOperationCredentials(input.db, binding),
           onLog: input.onLog,
+          fallbackReason: nativeGitHubAccessFallbackReason(input,
+            runnerIngressGitHubAccessIsSelected ? "runner_ingress" : "callback_bridge"),
           transport: runnerIngressGitHubAccessIsSelected ? "runner_ingress" : "callback_bridge",
         }));
         const githubTransport = githubAccess.transport === "runner_ingress" ? "prp" : "bridge";
-        const ingressEligible = input.execution.provider.kind === "pi_rpc" && input.runnerExecutionTarget?.kind === "remote" &&
-          input.runnerExecutionTarget.transport === "sandbox" && input.runnerExecutionTarget.effectiveCapabilities?.runnerWebSocketIngress === true;
-        const fallbackReason = githubTransport === "bridge"
-          ? ingressEligible && input.runnerIngressAuthorized !== true ? "ingress_unready" : "capability_absent"
-          : undefined;
+        const fallbackReason = nativeGitHubAccessFallbackReason(input, githubAccess.transport);
         await input.onLog?.("stderr", `[paperclip-runner] github_access transport=${githubTransport}${fallbackReason ? ` fallback_reason=${fallbackReason}` : ""}\n`).catch(() => undefined);
         executionContext?.assertOpen();
         releaseGitHubRun = await githubAccess.activate(input.execution.binding);
