@@ -35,6 +35,16 @@ export type FreshThreadRefusalCode = typeof FRESH_THREAD_REFUSAL_CODES[number];
  * unrecorded runner-internal Pi fresh thread join here, each with its RED. */
 export const SAME_RUN_FRESH_THREAD_REFUSAL_CODES = [
   PRIOR_OWNER_LIFECYCLE_UNSETTLED,
+  // Member (a), J3-22 (SMA-60): host preparation on a created box refused the
+  // backup because its source is not provably retired (NSE created branch). Its
+  // automatic retry already goes fresh: fresh-continuation-fallback.ts
+  // BACKLOG_CONTINUATION_SOURCE_CODES / heldExecutionWhere select it, and
+  // selectPiConversation / selectFreshContinuationThread mint the fresh thread
+  // (pi-conversation-record.ts). A failed workspace restore after it
+  // (workspaceRestoreFailure='restore_failed') is that failed run's retained
+  // workspace, so the same member covers it. Taken by the managed runnerd
+  // backend (NSE takeSameRunFreshThread), for the open and the recovery path.
+  "runner_harness_state_mismatch: backup_without_reusable_lease",
 ] as const satisfies readonly FreshThreadRefusalCode[];
 export type SameRunFreshThreadRefusalCode = typeof SAME_RUN_FRESH_THREAD_REFUSAL_CODES[number];
 
@@ -57,6 +67,16 @@ export function freshThreadRefusalCode(error: unknown, depth = 0): FreshThreadRe
   if (failureClass === "provider_refresh_required") return "native_runner_refresh_required";
   if (failureClass === PROVIDER_LAUNCH_PROFILE_MISMATCH) return "native_runner_launch_profile_mismatch";
   return freshThreadRefusalCode(value.cause, depth + 1);
+}
+
+/** The person-visible, named reason of the floor's continuation note. */
+export const SAME_RUN_FRESH_THREAD_REASON = "restore_unavailable_on_new_box" as const;
+
+/** The floor member carried by a structured error, or by a recovery result's
+ * exact code. Prose never authorizes it. */
+export function sameRunFreshThreadCode(value: unknown): SameRunFreshThreadRefusalCode | null {
+  const code = typeof value === "string" ? (isCode(value) ? value : null) : freshThreadRefusalCode(value);
+  return code && (SAME_RUN_FRESH_THREAD_REFUSAL_CODES as readonly string[]).includes(code) ? code as SameRunFreshThreadRefusalCode : null;
 }
 
 export function isFreshThreadRefusal(run: { errorCode?: string | null; error?: string | null; resultJson?: Record<string, unknown> | null }): boolean {
