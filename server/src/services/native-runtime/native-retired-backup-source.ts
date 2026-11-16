@@ -6,7 +6,7 @@ import { SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY } from "../../agent-run-cancellati
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { sandboxLeaseSourceMatches } from "../sandbox-lease-config-compatibility.js";
-import { hasConfirmedSandboxStopAndRetain, readStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
+import { hasConfirmedSandboxStopAndRetain, hasStopOnlyCleanup, readStopOnlyCleanup } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
 import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
@@ -16,6 +16,54 @@ export { NATIVE_PROVIDER_DURABLE_EVENT_TYPES } from "./native-provider-work-proo
 
 export function nativeHarnessBackupManifestSha256(manifestBytes: Buffer | string): string {
   return `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`;
+}
+
+/** J3-22 primary (RFL): the longest one run waits for its backup's source to
+ * finish stopping before it falls to the same-run fresh thread. */
+export const NATIVE_BACKUP_SOURCE_STOP_WAIT_MS = 60_000;
+const NATIVE_BACKUP_SOURCE_STOP_POLL_MS = 500;
+
+/**
+ * The backup's source allocation is being STOPPED (never destroyed) under the
+ * stop-only contract: its configuration no longer matched (an env, skill or
+ * instructions write), so this run's own acquisition armed the stop seconds
+ * earlier (environment-runtime cleanupObsoleteReusableSandboxLeases ->
+ * prepareSupersededWarmSandboxStop: pending_cleanup with a stop-only intent).
+ * While it is stopping, no retired-source class matches and nothing may be
+ * restored: the source may still run. Wait, bounded, until that one stop
+ * settles (SSR settleStopOnlyCleanup: released + a stopped receipt); the caller
+ * then asks retiredSourceAuthorizesNativeBackupRestore AGAIN, whose existing
+ * classes and supersede claim decide. No new authorization class.
+ *
+ * Returns true only when the source WAS stopping and its single tip is no
+ * longer pending_cleanup. Any other state returns false at once (no wait).
+ */
+export async function waitForStoppingBackupSource(db: Db, input: {
+  companyId: string; sourceProviderLeaseId: string; deadlineAtMs: number; pollMs?: number;
+}): Promise<boolean> {
+  let waited = false;
+  for (;;) {
+    const rows = await db.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, input.companyId),
+      eq(environmentLeases.providerLeaseId, input.sourceProviderLeaseId)));
+    const tips = rows.filter(row => row.companyId === input.companyId && row.providerLeaseId === input.sourceProviderLeaseId
+      && !Object.hasOwn(row.metadata ?? {}, "reusableLeaseSuccessor"));
+    if (tips.length !== 1) return false;
+    const tip = tips[0]!;
+    if (!backupSourceIsStopping(tip)) return waited && tip.status !== "pending_cleanup";
+    if (Date.now() >= input.deadlineAtMs) return false;
+    waited = true;
+    await new Promise(resolve => setTimeout(resolve, input.pollMs ?? NATIVE_BACKUP_SOURCE_STOP_POLL_MS));
+  }
+}
+
+/** A reusable source whose stop-only stop is in flight (claimed and dispatched
+ * by its stop owner) and not confirmed yet. An armed stop that no owner has
+ * claimed is not waited for: nothing here drives it, so the run does not block
+ * on it (the refusal and the same-run fresh thread stand). */
+function backupSourceIsStopping(lease: Pick<typeof environmentLeases.$inferSelect, "status" | "leasePolicy" | "metadata">): boolean {
+  return lease.status === "pending_cleanup" && lease.leasePolicy === "reuse_by_environment" && hasStopOnlyCleanup(lease)
+    && lease.metadata?.pendingCleanupInFlight === true;
 }
 
 /**
@@ -57,6 +105,10 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   manifestSha256: string;
   /** The allocation the backup restores into. Its own missing state never proves a retired source. */
   targetProviderLeaseId?: string | null;
+  /** J3-22: told when every proof but the retired class holds and the source is
+   * still stopping (stop-only, pending_cleanup), so asking again after that stop
+   * settles may succeed. Grants nothing: the answer here stays false. */
+  onSourceStopping?: () => void;
 }): Promise<boolean> {
   if (!input.manifest.sourceProviderLeaseId || input.manifest.normalizedSessionId !== input.normalizedSessionId
     || input.manifest.sourceProviderLeaseId === input.targetProviderLeaseId) return false;
@@ -87,7 +139,11 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
   const retired = await retiredSourceClass(db, lease, input);
-  if (!retired) return false;
+  if (!retired) {
+    if (input.onSourceStopping && backupSourceIsStopping(lease)
+      && !await nativeHarnessBackupHasLaterProviderWork(db, { ...input, completedAt: stamp.completedAt })) input.onSourceStopping();
+    return false;
+  }
   // Provider work recorded after the checkpoint means the destroyed sandbox
   // held newer state than this backup. Restoring would silently rewind it.
   if (await nativeHarnessBackupHasLaterProviderWork(db, { ...input, completedAt: stamp.completedAt })) return false;
