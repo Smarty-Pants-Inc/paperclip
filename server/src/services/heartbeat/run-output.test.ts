@@ -641,7 +641,7 @@ describe("adapter event receipt stamp", () => {
     for (const value of [pin, dateSecret]) expect(JSON.stringify(tools.map(event => event.message))).not.toContain(value);
   });
 
-  it("(3) a replayed event (same source event id) keeps its first stamp and stays one row", async () => {
+  it("(3) a replay (same sourceEventId) gets a new, larger index; the first keeps its index; both rows are stored as before", async () => {
     const secret = "synthetic-secret-token-0003"; // test-only
     vi.useFakeTimers({ toFake: ["Date"] });
     const { stored, handlers } = await recorder([secret]);
@@ -664,12 +664,16 @@ describe("adapter event receipt stamp", () => {
     await deliver("2026-11-16T19:00:07.000Z", { eventType: "tool.output", stream: "stdout", message: "A2",
       payload: { sourceEventId: "src-a2", toolCallId: "A", output: "-token-0003 A2\n" } });
     await handlers.finishAdapterEvents();
-    expect(stored.map(event => event.message).sort()).toEqual(["A1", "A2", "B1", "N1"]);
+    expect(stored).toHaveLength(7);
+    expect(stored.map(event => event.message).sort()).toEqual(["A1", "A1", "A2", "B1", "B1", "N1", "N1"]);
     expect(byIndex(stored).map(event => [event.message, stamp(event)])).toEqual([
       ["A1", { receivedAt: "2026-11-16T19:00:01.000Z", adapterEventIndex: 1 }],
       ["B1", { receivedAt: "2026-11-16T19:00:02.000Z", adapterEventIndex: 2 }],
       ["N1", { receivedAt: "2026-11-16T19:00:03.000Z", adapterEventIndex: 3 }],
-      ["A2", { receivedAt: "2026-11-16T19:00:07.000Z", adapterEventIndex: 4 }],
+      ["A1", { receivedAt: "2026-11-16T19:00:04.000Z", adapterEventIndex: 4 }],
+      ["B1", { receivedAt: "2026-11-16T19:00:05.000Z", adapterEventIndex: 5 }],
+      ["N1", { receivedAt: "2026-11-16T19:00:06.000Z", adapterEventIndex: 6 }],
+      ["A2", { receivedAt: "2026-11-16T19:00:07.000Z", adapterEventIndex: 7 }],
     ]);
     expect(JSON.stringify(stored)).not.toContain(secret);
   });
