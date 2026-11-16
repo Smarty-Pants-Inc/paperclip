@@ -19687,8 +19687,11 @@ async function createRunnerdBackendWithinSessionClaim(
   const diagnosticOwner = { companyId: input.execution.binding.companyId,
     runId: input.execution.binding.runId, sessionScope: nativeSessionScopeKey(input.execution) };
   const diagnostics = new NativeSessionDiagnostics(diagnosticOwner, diagnosticOwner,
-    (owner, diagnosticKind) => logger.info({ companyId: owner.companyId, runId: owner.runId, diagnosticKind }, "Native session diagnostic without an active run recorder"),
-    owner => logger.warn({ companyId: owner.companyId, runId: owner.runId }, "Native session diagnostic recording failed"));
+    // Only the bounded reason code is logged, never the diagnostic text (#20825).
+    (owner, diagnosticKind, reason) => logger.info({ companyId: owner.companyId, runId: owner.runId, diagnosticKind, reason },
+      "Native session diagnostic without an active run recorder"),
+    owner => logger.warn({ companyId: owner.companyId, runId: owner.runId }, "Native session diagnostic recording failed"),
+    { idleReasonCode: true });
   const diagnosticLease = diagnostics.activate(diagnosticOwner, input.onLog, input.trace);
   input.onDiagnosticLease?.(diagnosticLease);
   const credentialProvider = input.execution.provider.kind === "codex" ? "codex"

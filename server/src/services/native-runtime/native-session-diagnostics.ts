@@ -13,6 +13,23 @@ export interface NativeDiagnosticLease {
 export type NativeIdleDiagnosticKind = "transport_close_requested" | "session_diagnostic";
 
 type Sink = (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+
+const IDLE_REASON_CODE = /^[a-z]+(?:_[a-z]+){1,12}$/;
+const IDLE_REASON_SCAN_TOKENS = 64;
+
+/**
+ * The bounded code an idle diagnostic is logged under: its first
+ * whitespace-separated token (trailing `:` `,` `;` `.` removed) shaped like a
+ * code, else "other". Never message text, paths or stderr (#20825).
+ */
+export function nativeIdleDiagnosticReason(chunk: string): string {
+  const tokens = chunk.slice(0, 4_096).split(/\s+/, IDLE_REASON_SCAN_TOKENS);
+  for (const token of tokens) {
+    const candidate = token.replace(/[:,;.]+$/, "");
+    if (candidate.length <= 128 && IDLE_REASON_CODE.test(candidate)) return candidate;
+  }
+  return "other";
+}
 type Epoch = { owner: NativeDiagnosticOwner; sink?: Sink; trace?: NativeRunTrace };
 const sessions = new WeakMap<object, NativeSessionDiagnostics>();
 
@@ -23,8 +40,10 @@ export class NativeSessionDiagnostics {
   constructor(
     private readonly scope: Pick<NativeDiagnosticOwner, "companyId" | "sessionScope">,
     initialOwner: NativeDiagnosticOwner,
-    private readonly idle: (owner: NativeDiagnosticOwner, kind: NativeIdleDiagnosticKind) => void,
+    private readonly idle: (owner: NativeDiagnosticOwner, kind: NativeIdleDiagnosticKind, reason?: string) => void,
     private readonly failed: (owner: NativeDiagnosticOwner) => void,
+    /** Also pass `idle` the bounded reason code (nativeIdleDiagnosticReason). */
+    private readonly options: { idleReasonCode?: boolean } = {},
   ) {
     if (!initialOwner.runId || initialOwner.companyId !== scope.companyId || initialOwner.sessionScope !== scope.sessionScope)
       throw new Error("native_diagnostic_owner_scope_mismatch");
@@ -63,7 +82,9 @@ export class NativeSessionDiagnostics {
     if (!epoch?.sink) {
       const kind = chunk.startsWith("[paperclip-runner] runnerd diagnostic: runner transport close requested:")
         ? "transport_close_requested" : "session_diagnostic";
-      this.report(() => this.idle(epoch?.owner ?? this.lastOwner, kind));
+      const owner = epoch?.owner ?? this.lastOwner;
+      this.report(() => this.options.idleReasonCode
+        ? this.idle(owner, kind, nativeIdleDiagnosticReason(chunk)) : this.idle(owner, kind));
       return;
     }
     try {
