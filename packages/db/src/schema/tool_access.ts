@@ -112,6 +112,8 @@ export const toolConnections = pgTable(
   {
     id: uuid("id").primaryKey().defaultRandom(),
     companyId: uuid("company_id").notNull().references(() => companies.id, { onDelete: "cascade" }),
+    // Nullable, provider-neutral owner. No FK or history/backfill is added here.
+    projectId: uuid("project_id"),
     // NO ACTION (not CASCADE) so the database itself refuses to delete an application that still
     // has connections. This closes the delete-vs-create race in DELETE
     // /tool-applications/:applicationId: a connection inserted concurrently takes a FOR KEY SHARE
@@ -172,6 +174,9 @@ export const toolConnections = pgTable(
     index("tool_connections_application_idx").on(table.applicationId),
     index("tool_connections_company_enabled_idx").on(table.companyId, table.enabled),
     uniqueIndex("tool_connections_company_uid_uq").on(table.companyId, table.uid),
+    uniqueIndex("tool_connections_project_live_installation_uq")
+      .on(table.companyId, table.projectId, sql`(${table.config} #>> '{projectScope,installationKey}')`)
+      .where(sql`${table.projectId} IS NOT NULL AND ${table.status} <> 'archived' AND (${table.config} #>> '{projectScope,installationKey}') IS NOT NULL`),
     unique("tool_connections_company_id_uq").on(table.companyId, table.id),
   ],
 );

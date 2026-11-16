@@ -3375,6 +3375,13 @@
       "when": 1794830400042,
       "tag": "0492_agent_reasoning_display",
       "breakpoints": true
+    },
+    {
+      "idx": 493,
+      "version": "7",
+      "when": 1794845511421,
+      "tag": "0493_furry_the_watchers",
+      "breakpoints": true
     }
   ]
 }
