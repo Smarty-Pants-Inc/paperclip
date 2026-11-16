@@ -15,6 +15,7 @@ export function sandboxLeaseSourceMatches(
 const COMPATIBLE_SCALAR_KEYS = new Set([
   "cpu", "memory", "disk", "gpu", "size", "shape",
   "timeoutMs", "bridgeRequestTimeoutMs", "livenessTimeoutMs", "ttlMinutes",
+  "ttlSeconds", "runnerReconnectGraceMs", // Timing knobs, like ttlMinutes; J3-24.
   "autoStopInterval", "autoArchiveInterval", "autoDeleteInterval", "runnerIdleTimeoutMs",
 ]);
 const RESOURCE_SIZE_KEYS = new Set(["cpu", "memory", "disk", "gpu"]);
