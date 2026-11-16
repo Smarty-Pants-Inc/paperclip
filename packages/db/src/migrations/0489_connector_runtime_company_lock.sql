@@ -334,3 +334,22 @@ DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_update ON agents;
 CREATE TRIGGER paperclip_agent_runtime_lock_manager_update BEFORE UPDATE OF reports_to ON agents
   FOR EACH ROW WHEN (NEW.reports_to IS NOT NULL AND NEW.reports_to IS DISTINCT FROM OLD.reports_to)
   EXECUTE FUNCTION paperclip_agent_runtime_lock_manager();
+--> statement-breakpoint
+-- #20805 R2 (src11, review-fleet-4 F1d): the instance-wide skill-pin fanout locks
+-- every candidate agent row of EVERY company first (company, then id order, as
+-- paperclip_environment_runtimes_changed does), then fans out company by company.
+-- Before this it held the shared hold of each earlier company while it waited for
+-- a later company's agent row. Same companies, same order, same revision rows.
+CREATE OR REPLACE FUNCTION paperclip_skill_pins_runtime_changed() RETURNS trigger
+LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+DECLARE company uuid;
+BEGIN
+  IF coalesce(OLD.experimental->'enableBetaSkills', 'false'::jsonb) IS DISTINCT FROM coalesce(NEW.experimental->'enableBetaSkills', 'false'::jsonb) THEN
+    PERFORM 1 FROM agents WHERE status NOT IN ('pending_approval', 'terminated') ORDER BY company_id, id FOR NO KEY UPDATE;
+    FOR company IN SELECT DISTINCT company_id FROM agents ORDER BY company_id LOOP
+      PERFORM paperclip_invalidate_company_agent_runtimes(company);
+    END LOOP;
+  END IF;
+  RETURN NEW;
+END;
+$$;
