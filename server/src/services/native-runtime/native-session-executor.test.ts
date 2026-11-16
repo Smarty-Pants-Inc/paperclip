@@ -21195,6 +21195,205 @@ describe("runnerd provider runtime wiring", () => {
     }
   });
 
+  describe("provider identity newer than the newest backup (#20787 J3-17)", () => {
+    // SMA-67 on fresh: backup run f548f509 saved thread 01a1e203; a later run
+    // started 01a1e2e9 on another box and it was never backed up. After a
+    // same-image restart, host preparation refused the newer thread with
+    // provider_identity_changed. These identities are the exact objects NSE
+    // compares (providerSessionIdentityFromDurableProviderState output).
+    const identityOf = (threadId: string) =>
+      ({ providerSessionId: threadId, providerBackendSessionId: null, providerSessionIdentity: null });
+    const step = (current: NativeExecutionInputV1, generation: number, from: string, to: string,
+      overrides: Record<string, unknown> = {}) => ({
+      schema: "paperclip.provider-identity-reset.v1", generation, companyId: current.binding.companyId,
+      taskKey: current.binding.issueId, normalizedSessionId: current.session.normalizedSessionId!,
+      previousIdentity: identityOf(from), identity: identityOf(to), reason: "resume_failed_on_new_box",
+      recordedAt: "2026-11-16T05:51:00.000Z", runId: null, ...overrides,
+    });
+
+    /** leaseDb plus the conversation's task-session row (agent_task_sessions). */
+    async function withConversationRow(base: Db, row: { id: string; sessionParamsJson: Record<string, unknown> }) {
+      const { agentTaskSessions } = await import("@paperclipai/db");
+      const wrap = (db: Record<string, any>): Record<string, any> => ({
+        ...db,
+        select: (fields?: unknown) => ({
+          from: (table: unknown) => {
+            if (table !== agentTaskSessions) return db.select(fields).from(table);
+            const query: Record<string, unknown> = {
+              then: (resolve: (rows: unknown[]) => unknown, reject?: (error: unknown) => unknown) =>
+                Promise.resolve([structuredClone(row)]).then(resolve, reject),
+            };
+            for (const method of ["where", "for", "limit", "orderBy"]) query[method] = () => query;
+            return query;
+          },
+        }),
+        update: (table: unknown) => table !== agentTaskSessions ? db.update(table) : {
+          set: (values: Record<string, unknown>) => ({ where: async () => { Object.assign(row, values); return []; } }),
+        },
+        transaction: async (operation: (tx: unknown) => Promise<unknown>) =>
+          db.transaction((tx: Record<string, any>) => operation(wrap(tx))),
+      });
+      return wrap(base as unknown as Record<string, any>) as unknown as Db;
+    }
+
+    async function resumedSandboxWithStaleBackup(input: {
+      label: string; boxThread: string; backupThread: string; resets: unknown[];
+    }) {
+      const remoteCwd = join(isolatedStateDirectory, `remote-identity-lineage-${input.label}`);
+      const current: NativeExecutionInputV1 = { ...execution,
+        binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() },
+        session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+      };
+      const runnerInstanceId = `identity-lineage-runner-${input.label}`;
+      const priorIdentity = { runnerInstanceId, environmentLeaseId: `lease-lineage-${input.label}`, runId: randomUUID(),
+        normalizedSessionId: current.session.normalizedSessionId!, turnId: "turn-prior", itemId: "item-prior" };
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        }) };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
+        if (command.args?.[1]?.includes("base64")) {
+          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+          catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+        }
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      });
+      const syncIn = vi.fn(async () => undefined);
+      const controllerArtifact = join(isolatedStateDirectory, `identity-lineage-runnerd-${input.label}`);
+      await writeFile(controllerArtifact, "fixture bootstrap artifact");
+      const conversation = { id: randomUUID(), sessionParamsJson: {
+        sessionId: current.session.normalizedSessionId,
+        __paperclipPiConversation: { schema: "paperclip.pi-conversation.v1", id: current.session.normalizedSessionId,
+          generation: 1, boundary: { provider: "codex", cwd: null, workspaceId: null, trust: "trusted" },
+          previousId: null, reason: "first_message", runId: priorIdentity.runId, providerIdentityResets: input.resets },
+      } as Record<string, unknown> };
+      const db = await withConversationRow(leaseDb(current), conversation);
+      const backend = async () => {
+        await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
+          runnerRemoteBinaryPath: controllerArtifact, runnerRemoteCodexPath: controllerArtifact,
+          runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
+            leaseId: priorIdentity.environmentLeaseId, providerKey: "daytona", reusableLeaseConfigured: true,
+            effectiveCapabilities: { runnerWebSocketIngress: true },
+            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: `retained-${input.label}` },
+            runner: { execute: remoteExecute, syncIn },
+            getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+              secretHeaders: [{ name: "Authorization", value: "fixture-ingress" }], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+          } as never,
+        });
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        return state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+          prepareExternalRunnerState: () => Promise<void>;
+          controlPlaneRegistration: NonNullable<import("../../vendor/paperclip-runner/index.js").RunnerExecutionDriver["controlPlaneRegistration"]>;
+        };
+      };
+      const options = await backend();
+      // The retained box holds the conversation's suspended Runner and its NEWER provider thread.
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+        createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
+      const runnerState = durableRunnerState(priorIdentity, "suspended");
+      await mkdir(join(remoteSession, "runner"), { recursive: true });
+      await mkdir(join(remoteSession, "filesystem/codex-home"), { recursive: true });
+      await writeFile(join(remoteSession, "runner/runner-state.json"), JSON.stringify(runnerState));
+      await writeFile(join(remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: input.boxThread,
+        providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+      }));
+      // The newest (and only) backup still names the OLDER thread.
+      const backupRoot = join(options.stateDirectory!, "failover-backups/current");
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(join(backupRoot, directory.name), { recursive: true });
+      await writeFile(join(backupRoot, "runner/runner-state.json"), JSON.stringify(runnerState));
+      await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+        backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "backup-box",
+        providerSessionIdentity: identityOf(input.backupThread),
+      })));
+      return { current, options, backend, remoteSession, syncIn, conversation };
+    }
+
+    it("(a) resumes a recorded newer thread in place after a restart, with no provider_identity_changed", async () => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: "a", boxThread: "01a1e2e9", backupThread: "01a1e203",
+        resets: [] });
+      const resets = [step(fixture.current, 1, "01a1e203", "01a1e2e9")];
+      (fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>).providerIdentityResets = resets;
+      await expect(fixture.options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      // Resumed in place: the stale backup was not restored over the newer thread.
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
+        .toBe("01a1e2e9");
+    });
+
+    it("(c) still refuses an UNRECORDED identity change", async () => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: "c", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [] });
+      await expect(fixture.options.prepareExternalRunnerState()).rejects.toThrow("runner_harness_state_mismatch: provider_identity_changed");
+    });
+
+    it.each([
+      ["a one-step chain passes", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e329")], true],
+      ["a two-step chain passes", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e2e9"), step(c, 2, "01a1e2e9", "01a1e329")], true],
+      ["a gap in the identities refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e2e9"), step(c, 2, "01a1e300", "01a1e329")], false],
+      ["a gap in the generations refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e2e9"), step(c, 3, "01a1e2e9", "01a1e329")], false],
+      ["a record from another session refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e329", { normalizedSessionId: randomUUID() })], false],
+      ["a record from another task refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e329", { taskKey: randomUUID() })], false],
+      ["a record from another company refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e329", { companyId: randomUUID() })], false],
+      ["a box on a superseded thread of the chain refuses", (c: NativeExecutionInputV1) => [step(c, 1, "01a1e203", "01a1e329"), step(c, 2, "01a1e329", "01a1e400")], false],
+    ] as const)("%s at host preparation", async (label, resets, allowed) => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: label.replaceAll(" ", "-"), boxThread: "01a1e329",
+        backupThread: "01a1e203", resets: [] });
+      (fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>).providerIdentityResets =
+        resets(fixture.current);
+      const prepared = fixture.options.prepareExternalRunnerState();
+      if (allowed) await expect(prepared).resolves.toBeUndefined();
+      else await expect(prepared).rejects.toThrow("runner_harness_state_mismatch: provider_identity_changed");
+    });
+
+    it("(b) a same-run replacement is recorded at the idle close, so the restart after it resumes the new thread", async () => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: "b", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [] });
+      // restart-up's same-run replacement opened 01a1e2e9 (NSE onContinuityBreak notes it).
+      // (At the RED commit the writer does not exist, so nothing is noted.)
+      const lineage = await import("./provider-identity-lineage.js").catch(() => null);
+      lineage?.noteProviderIdentityBreak({ companyId: fixture.current.binding.companyId, agentId: fixture.current.binding.agentId,
+        taskKey: fixture.current.binding.issueId, normalizedSessionId: fixture.current.session.normalizedSessionId! },
+      "resume_failed_on_new_box", fixture.current.binding.runId);
+      // Idle close: the close checkpoint reads the suspended box and must not refuse the new thread.
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(fixture.options.stateDirectory!, "control-plane"),
+        identity: fixture.options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "identity-lineage-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      let registration: Awaited<ReturnType<typeof fixture.options.controlPlaneRegistration>> | undefined;
+      onTestFinished(async () => { await registration?.release(); await controller.stop(); });
+      registration = await fixture.options.controlPlaneRegistration(controller);
+      const closed = await Promise.resolve(registration.checkpoint!("settled")).then(() => null, (error: unknown) => error);
+      expect(String(closed ?? "")).not.toContain("provider_identity_changed");
+      const stored = (fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>)
+        .providerIdentityResets as Array<Record<string, unknown>>;
+      expect(stored).toEqual([expect.objectContaining({ generation: 1, reason: "resume_failed_on_new_box",
+        normalizedSessionId: fixture.current.session.normalizedSessionId, taskKey: fixture.current.binding.issueId,
+        companyId: fixture.current.binding.companyId,
+        previousIdentity: identityOf("01a1e203"), identity: identityOf("01a1e2e9") })]);
+      // Restart: the in-process note is gone; the durable record alone lets the
+      // next host preparation resume the new thread in place.
+      lineage?.clearPendingProviderIdentityBreaksForTest();
+      fixture.syncIn.mockClear();
+      await expect(fixture.options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+      expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
+        .toBe("01a1e2e9");
+      expect(lineage).not.toBeNull();
+    });
+
+    it("(b) without a recorded break, the same idle close still refuses the newer thread", async () => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: "b-unrecorded", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [] });
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(fixture.options.stateDirectory!, "control-plane"),
+        identity: fixture.options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "identity-lineage-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      let registration: Awaited<ReturnType<typeof fixture.options.controlPlaneRegistration>> | undefined;
+      onTestFinished(async () => { await registration?.release(); await controller.stop(); });
+      registration = await fixture.options.controlPlaneRegistration(controller);
+      await expect(registration.checkpoint!("settled")).rejects.toThrow("runner_harness_state_mismatch: provider_identity_changed");
+    });
+  });
+
   it.each([
     ["a per-turn sandbox", false, true],
     ["a retained sandbox", true, false],
