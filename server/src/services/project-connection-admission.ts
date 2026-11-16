@@ -9,6 +9,7 @@ import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import type { ActorInfo, DbTransaction } from "./tool-access/types.js";
 import { isGitHubAppConnection, parseGitHubAppConfig } from "./github-app-client.js";
 import { connectionManagementService } from "./connection-management.js";
+import { assertProjectAppReceiptInput, readProjectAppCustody } from "./project-app-custody.js";
 
 /** Server-written approval. A request's projectScope is never an authority source. */
 export type ProjectConnectionScope = Readonly<{
@@ -189,6 +190,11 @@ export async function assertProjectConnectionAdmission(
     if (!membership || membership.membershipRole === "viewer") throw forbidden("An active company manager is required");
     return;
   }
+  if (connection && scope) {
+    const requested = input.proposedRepositoryIds ?? await projectConnectionRepositoryIds(db, companyId, projectId, parseGitHubAppConfig(connection.config.methodConfig).repositories);
+    await readProjectAppCustody(db, { companyId, projectId, config: connection.config,
+      refs: input.proposedSecretRefs ?? connection.credentialSecretRefs, registrationId: scope.registrationId, repositoryIds: requested });
+  }
   const { project, human, primary } = await currentAuthority(db, companyId, projectId);
   if (project.archivedAt && !["retire", "disable", "project_update"].includes(operation)) {
     throw conflict("This project is archived. Its connection cannot grant or release new access.", { code: "project_connection_project_archived" });
@@ -270,6 +276,7 @@ export async function assertProjectConnectionAdmission(
 /** Request protection before normalization. Keep attempts visible rather than
  * silently dropping projectId, envelope fields, archive, or new ref IDs. */
 export function assertProjectConnectionPatch(connection: Connection, input: Record<string, unknown>) {
+  assertProjectAppReceiptInput(input, connection);
   if (Object.hasOwn(input, "projectId") && input.projectId !== connection.projectId) throw conflict("A connection's project owner cannot be adopted, cleared or changed.", { code: "project_connection_owner_immutable" });
   if (!connection.projectId) {
     for (const key of ["config", "transportConfig"] as const) if (record(input[key]) && Object.hasOwn(input[key], "projectScope")) throw forbidden("Project approval metadata is server-written", { code: "project_connection_scope_protected" });
