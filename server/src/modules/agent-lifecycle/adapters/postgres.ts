@@ -5,7 +5,7 @@ import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
-import { lifecycleRetryDelay } from "../application/retry.js";
+import { lifecycleRetryDelay, LIFECYCLE_STOP_RETRY_REQUIRED } from "../application/retry.js";
 
 export function assertRootDatabase(db: Db) {
   if ("nestedIndex" in db) throw new AgentLifecycleConflict("Lifecycle commands require the root database connection");
@@ -52,7 +52,7 @@ export async function surfaceAgentLifecycleStopParkInTransaction(
 ): Promise<boolean> {
   if (!("nestedIndex" in tx)) throw new AgentLifecycleConflict("Lifecycle park diagnostics require the producer transaction");
   const rows = await tx.update(agents).set({
-    lifecycleError: sql`'Automatic stop work is paused in ' || ${agents.lifecycleState}
+    lifecycleError: sql`${LIFECYCLE_STOP_RETRY_REQUIRED}::text || ': Automatic stop work is paused in ' || ${agents.lifecycleState}
       || ' (lifecycle operation ' || coalesce(nullif(${agents.lifecycleOperation}->>'id', ''), 'unknown')
       || '). Recheck the outstanding stop or cleanup evidence, then use Retry.'`,
   }).where(and(eq(agents.id, input.agentId), eq(agents.companyId, input.companyId),

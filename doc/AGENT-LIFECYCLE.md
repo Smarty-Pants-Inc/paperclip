@@ -371,8 +371,9 @@ Stop work (`pausing`, `terminating`, `cleaning_up`) counts incomplete host or
 required-plugin attempts in the saved operation's `stopFailures`. Both `pending`
 and failed attempts use the same growing backoff helper as verification. After
 five incomplete attempts the operation parks with `retryRequired: true`, no
-`retryAt`, and a visible `lifecycleError` naming the blocking invocation when the
-stop evidence identifies one, or the required plugin for pending plugin work.
+`retryAt`, and a visible `lifecycleError` with the stable code
+`lifecycle_stop_retry_required`, naming the blocking invocation when the stop
+evidence identifies one, or the required plugin for pending plugin work.
 When no invocation can be identified, the error names the lifecycle operation
 and the unresolved stop/cleanup proof rather than inventing an invocation ID.
 The phase and all unfinished resources are retained; parking is not stop proof.
