@@ -1,4 +1,5 @@
 import request from "supertest";
+import { randomBytes } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, agents, companySecrets, companySecretVersions, connectionGrants, createDb, heartbeatRuns, issues, projects, toolApplications, toolConnectionInstalls, toolConnections, userCompanyPreferences } from "@paperclipai/db";
@@ -8,7 +9,9 @@ import * as activityService from "../services/activity-log.js";
 import { activateProjectConnectionMigration, assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../services/project-connection-retirement.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
+import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
+import { createLocalEncryptedCipher } from "../secrets/local-encrypted-provider.js";
+import { connectionManagementService } from "../services/connection-management.js";
 
 const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
@@ -16,6 +19,12 @@ const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthe
   token: `synthetic-project-token-${connection.id}`, expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] },
 })) }));
+// Owned finish now uses the normalized provider seam. Preserve that REAL seam
+// and replace only the external App-client acquisition, as for legacy refresh.
+vi.mock("../services/github-app-client.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/github-app-client.js")>(),
+  createGitHubAppClient: () => ({ acquire: async () => ({ ...await provider.verify(), verifiedRegistrationId: "123" }) }),
+}));
 vi.mock("../services/github-app-credentials.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/github-app-credentials.js")>(),
   refreshGitHubAppAccess: provider.verify, resolveGitHubAppCredential: provider.acquire,
@@ -35,12 +44,35 @@ async function restoreReceipt(db: ReturnType<typeof createDb>) {
 describe("project connection make-before-break and local retirement (round-4 D)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
-  beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-project-retire-"); db = createDb(database.connectionString); }, 60_000);
+  beforeAll(async () => {
+    // Synthetic, process-local test key: no host credential/key-file access.
+    vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", randomBytes(32).toString("base64"));
+    database = await startEmbeddedPostgresTestDatabase("paperclip-project-retire-"); db = createDb(database.connectionString);
+  }, 60_000);
   beforeEach(() => { provider.verify.mockClear(); provider.acquire.mockClear(); });
-  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
+  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); vi.unstubAllEnvs(); }, 60_000);
+
+  async function versionOne(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
+    await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
+      material: createLocalEncryptedCipher("write").encrypt(CANARY),
+      valueSha256: "synthetic-retirement-version", fingerprintSha256: "synthetic-retirement-version" });
+  }
+
+  // Explicit service-call fixture authentication. This models the existing
+  // board route's adapter, never product inference from actorType/user ID.
+  async function authenticateBoardRemoval(f: Awaited<ReturnType<typeof projectConnectionFixture>>, connectionId: string) {
+    const managementContext = await connectionManagementService(db).authorize(
+      { type: "board", userId: f.human, source: "session", sessionId: f.companyId, isInstanceAdmin: false },
+      "connections:configure", { type: "connection_management", companyId: f.companyId, connectionId, operation: "DELETE /tool-connections/:connectionId" });
+    const archive = f.service.archiveConnection;
+    f.service.archiveConnection = (id, companyId, actor) => archive(id, companyId,
+      actor?.actorType === "user" && actor.actorId === f.human
+        ? { ...actor, authenticatedActorType: "board", managementContext } : actor);
+  }
 
   async function pending() {
     const f = await projectConnectionFixture(db, true);
+    await versionOne(f);
     const legacy = await f.seedConnection(null);
     const candidate = await f.seedConnection(f.a, { status: "draft", installed: false, pending: true, legacyId: legacy.connection.id });
     const bound = await f.run();
@@ -56,8 +88,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   describe("RFL make-before-break real writer sequence", () => {
     async function migration() {
       const f = await projectConnectionFixture(db, true);
-      await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
-        material: { synthetic: true }, valueSha256: "synthetic-migration-version", fingerprintSha256: "synthetic-migration-version" });
+      await versionOne(f);
       const legacy = await f.seedConnection(null);
       // L still serves B; only the fully transferred A worker may be removed.
       await f.service.putConnectionInstalls(legacy.connection.id, { installs: [f.leadA, f.worker, f.outsider]
@@ -278,6 +309,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   it("M03: activated then retired project cannot borrow leftover legacy reach or reset pending", async () => {
     const { f, legacy, candidate, context, finish } = await pending();
     await finish();
+    await authenticateBoardRemoval(f, candidate.connection.id);
     const confirmedActor = { actorType: "user" as const, actorId: f.human, projectDoneConfirmation: { projectId: f.a.id, connectionId: candidate.connection.id } };
     await f.service.archiveConnection(candidate.connection.id, f.companyId, confirmedActor);
     const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
@@ -338,6 +370,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   it("J11: running work blocks archive before any grant/install cleanup", async () => {
     const f = await projectConnectionFixture(db);
     const { connection, grant } = await f.seedConnection();
+    await authenticateBoardRemoval(f, connection.id);
     await f.run();
     await expect(f.service.archiveConnection(connection.id, f.companyId, { actorType: "user", actorId: f.human }))
       .rejects.toMatchObject({ status: 409, details: { code: "project_connection_in_use" } });
@@ -349,6 +382,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   it("A10: archive receipt is in the same transaction; retry does not write a second success", async () => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
+    await authenticateBoardRemoval(f, connection.id);
     await failReceipt(db, connection.id);
     try { await expect(f.service.archiveConnection(connection.id, f.companyId, { actorType: "user", actorId: f.human })).rejects.toThrow(); }
     finally { await restoreReceipt(db); }
@@ -421,7 +455,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
 
     async function version(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
       await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
-        material: { synthetic: true }, valueSha256: "synthetic-d-version", fingerprintSha256: "synthetic-d-version" });
+        material: { synthetic: true }, valueSha256: "synthetic-d-version", fingerprintSha256: "synthetic-d-version" }).onConflictDoNothing();
     }
     async function activate(p: Awaited<ReturnType<typeof pending>>, install = true, failAfterInstall = false) {
       return db.transaction(async tx => {
