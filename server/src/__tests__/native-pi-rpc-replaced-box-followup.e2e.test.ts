@@ -936,7 +936,7 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
       expect(persisted?.error ?? null).toBeNull(); expect(persisted?.errorCode ?? null).toBeNull();
       const logs = stages.map(record).filter(entry => entry.kind === "log" && entry.runId === next.runId).map(entry => String(entry.text));
-      expect(logs.some(text => text.includes("continuing from saved history") && text.includes("backup_without_reusable_lease")),
+      expect(logs.some(text => text.includes("continuing in a fresh provider thread") && text.includes("backup_without_reusable_lease")),
         "the refused restore (backup_without_reusable_lease) was met and continued in this run").toBe(true);
       expect(readdirSync(join(stateRoot, "continuity-breaks")), "the refused backup set aside once, never deleted").toHaveLength(1);
       const finalCheckpoint = record(record(persisted?.runnerProfileJson).sessionCheckpoint);
@@ -944,9 +944,15 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(freshProviderSessionId).toBeTruthy();
       expect(freshProviderSessionId, "fresh provider thread, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
       expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
+      // Evidence, not a target: on this RECOVER path the runtime treats the fresh
+      // thread as resumed, so no saved-history handoff is sent (NSR !recovered).
+      const freshRequest = requests.find(request => request.runId === next.runId)!;
+      console.log(`E2E-PI-SMA60-HISTORY: ${JSON.stringify({ runId: next.runId, containsFact: freshRequest.containsFact,
+        handoffHasFact: freshRequest.handoffHasFact, roles: (record(freshRequest.request).messages as Array<{ role: string }>).map(message => message.role) })}`);
       const continuationNote = (runId: string) => ({ authorizationReason: `restore_unavailable_fresh_thread:restore_unavailable_on_new_box:${runId}` });
       expect(notes, "exactly ONE continuation note").toHaveLength(1);
-      expect(notes[0]?.body).toMatch(/^Continuing from saved history: the earlier provider thread could not be restored on this new sandbox/);
+      expect(notes[0]?.body).toMatch(/^Continuing in a fresh thread: the earlier provider thread could not be restored on this new sandbox/);
+      expect(notes[0]?.body, "the note claims no history the fresh thread did not get").not.toContain("from its saved history");
       expect(record(notes[0]?.metadata)).toMatchObject(continuationNote(next.runId));
       const [taskSessionAfter] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
         eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issueId)));
