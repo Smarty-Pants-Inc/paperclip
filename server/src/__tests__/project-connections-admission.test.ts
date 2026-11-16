@@ -44,6 +44,10 @@ describe("project connection writer admission (round-4 B)", () => {
     const activate = vi.spyOn(retirement, "activateProjectConnectionMigration").mockImplementation(async (tx, input) => {
       const config = { ...input.connection.config, projectScope: { ...f.scope(), migrationPending: false, legacyConnectionId: (input.connection.config.projectScope as Record<string, unknown>).legacyConnectionId } };
       await tx.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, input.connection.id));
+      // D owns the activation receipt on the caller's transaction. The isolated
+      // activation fixture must compose that same receipt boundary, not erase it.
+      await retirement.writeProjectConnectionReceipt(tx, { ...input, connection: { ...input.connection, config },
+        action: "tool_connection.updated", reason: "migration_activated" });
     });
     return { verified, verify, receipt, activate };
   }
