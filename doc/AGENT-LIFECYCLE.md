@@ -105,15 +105,19 @@ The existing company approval rules still apply.
 
 `pauseAgent`, `resumeAgent`, and `terminateAgent` record the requested change.
 They do not wait for external resource operations. A pause, including a budget
-pause, is not retirement. Termination releases the target's execution holds and
-pause reason; it does not change budget policies, limits, spending, or company
-holds. The lifecycle worker must still complete stop and cleanup before
-`lifecycleState` becomes `terminated`.
+pause, is not retirement. A termination request retains the target's execution
+holds, pause reason, task ownership and execution locks while Stop or cleanup
+is unconfirmed. Only the worker's durable host and required-plugin completion
+permits the final transition to `terminated` to release holds and task ownership.
+Budget policies, limits, spending and company holds remain unchanged.
 
-When terminating a report, ordinary unfinished tasks assigned to it return to
-its assignable immediate reporting manager in the same transaction. This uses normal task
-assignment validation and execution-lock fencing; an assignment failure rolls
-back the command rather than partially retiring the agent. An `in_progress` task
+On completed termination, ordinary unfinished tasks assigned to the report return
+to its assignable immediate reporting manager in the worker's completion
+transaction. This uses normal task assignment validation and execution-lock
+fencing; an assignment failure rolls back completion rather than partially
+retiring the agent. The compatibility `status` already says `terminated` during
+Stop, so the status effect also runs at final lifecycle completion, even when
+that compatibility value does not change. An `in_progress` task
 returns as `todo`. Other statuses and real blockers are preserved: retirement is
 not task completion or proof that a blocker was resolved. Terminal tasks retain
 their historical assignee. Conversation and external-channel tasks retain their
@@ -122,7 +126,19 @@ unassignable manager (for example, already terminated during company teardown)
 also cannot receive tasks. Those tasks remain under the existing task/recovery
 workflow. Repeated termination does not
 repeat the transfer or its audit record. POST termination and PATCH terminal
-status use the same lifecycle transaction.
+status use the same request and durable-completion path.
+
+Retirement takes task locks without waiting while holding the agent lock. If a
+checkout already owns a task lock, PostgreSQL rejects that lock attempt with
+`55P03` instead of creating an agent/task deadlock. The root lifecycle transaction
+rolls back and retries with the existing bounded accounting backoff. It also
+retries PostgreSQL-confirmed `40P01` and `40001` rollbacks. Each attempt reacquires
+the company mutex, rechecks authorization and creates a fresh activity-publication
+buffer. Nested lifecycle writes propagate contention to that root boundary;
+they do not retry inside an already-held outer transaction. Exhaustion leaves
+completion uncommitted and reports a retryable conflict. Assignment cancels only
+unfinished human-wake direction. Completed and failed wake receipts retain their
+original status, finish time and requester attribution.
 
 `retry` makes a failed step available for another attempt.
 `reconcilePolicyHolds` updates budget and company holds for the specified company.
