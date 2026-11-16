@@ -16246,6 +16246,15 @@ describe("native session bounded recovery", () => {
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
   });
 
+  it("settles a refused GitHub capability refresh terminally instead of retrying the run", () => {
+    const now = new Date("2026-11-16T00:00:00.000Z");
+    const code = nativeSessionFailureSourceCode(new Error("native_github_access_stale_runner_token"));
+    expect(code).toBe("native_github_access_stale_runner_token");
+    expect(nativeSessionFailureDisposition(1, now, code)).toEqual({
+      phase: "terminal_failure", failureCode: "native_github_access_stale_runner_token", nextAttemptAt: null,
+    });
+  });
+
   it("keeps typed integrity failure permanent even if a wrapper changes its message", () => {
     const failure = new NativeSessionProtocolIntegrityError(
       "semantic_input_digest_mismatch",
