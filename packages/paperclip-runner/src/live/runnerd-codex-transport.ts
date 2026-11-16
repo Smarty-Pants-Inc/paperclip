@@ -138,7 +138,6 @@ const MAX_PRE_AUTHENTICATION_REPLACEMENT_EXITS = 2;
 const GRACEFUL_RUNNER_LIFECYCLES = new Set(["suspended", "stopped"]);
 // A runner in this state needs a fresh bootstrap; a restart ticket can never satisfy it.
 const RUNNER_FRESH_BOOTSTRAP_REQUIRED = "lease_expired_requires_bootstrap";
-const RUNNERD_TURN_TERMINAL_EVENT_TYPES = new Set(["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"]);
 
 /** A runner-reported value as a bounded code, never free text. */
 function runnerLifecycleCode(value: string): string {
@@ -4395,6 +4394,12 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     source: DurableRecoveryIdentity; confirmed: boolean; claimed?: boolean;
     claimantRunId?: string; ticket?: string; ticketFlushed?: boolean; deadline?: number;
   } | null = null;
+  /**
+   * The server released this warm owner to idle: its release() found no
+   * provider work in flight and no pending command (#20825). Cleared when a run
+   * attaches or a turn starts. The transport never infers it from turn events.
+   */
+  #releasedToIdle = false;
   #startupDrainTimedOut = false;
   #controllerDetachedForRestart = false;
   #failure: Error | null = null;
@@ -5099,25 +5104,29 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   }
 
   /**
-   * A retained warm owner whose attached run already settled a provider turn
-   * and has no work in flight or pending. Its runner exit is not reconnected on
-   * the same path: the transport fails and the existing warm-close path
-   * retires the owner (#20825). A run that has not yet settled a turn (still
-   * starting, or between thread start and its first turn) keeps reconnecting.
+   * A retained warm owner the server released to idle, with no work in flight
+   * or pending. Its runner exit is not reconnected on the same path: the
+   * transport fails and the existing warm-close path retires the owner
+   * (#20825). Any other owner, including a live run between two of its turns,
+   * keeps reconnecting (RFL + review-fleet-2 08:31Z).
    */
   #settledIdleWarmOwner(): boolean {
     const core = this.#core;
-    if (!core || !this.#startupComplete || this.options.lifecyclePolicy?.mode !== "warm") return false;
-    if (this.#providerWorkInFlight(core) || core.store.state.commands.some(command => command.status === "pending")) return false;
-    const runId = core.store.state.identity.runId;
-    return core.store.state.committedEvents.some(event =>
-      RUNNERD_TURN_TERMINAL_EVENT_TYPES.has(event.eventType) && event.envelope.runId === runId);
+    if (!core || !this.#startupComplete || this.options.lifecyclePolicy?.mode !== "warm" || !this.#releasedToIdle) return false;
+    return !this.#providerWorkInFlight(core) && !core.store.state.commands.some(command => command.status === "pending");
   }
 
   async #releaseSettledRunner(): Promise<DurableRecoveryIdentity | false> {
     const pair = this.options.releaseResume;
     const core = this.#core;
-    if (!pair || this.options.lifecyclePolicy?.mode !== "warm") return false;
+    if (this.options.lifecyclePolicy?.mode !== "warm") return false;
+    if (!pair) {
+      // Nothing to suspend without a release/resume pair, but the server has
+      // released this owner to idle: record it when it is settled (#20825).
+      if (core && this.#startupComplete && this.#failure === null && !this.#closed && !this.#providerWorkInFlight(core)
+        && !core.store.state.commands.some(command => command.status === "pending")) this.#releasedToIdle = true;
+      return false;
+    }
     this.#assertStartupOpen();
     this.#throwIfFailed();
     if (!core || !this.#startupComplete) throw new Error("native_runner_release_unavailable");
@@ -5126,6 +5135,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       const knownBusy = () => this.#providerWorkInFlight(core);
       if (knownBusy() || !await this.#drainSettledProviderEventsBeforeSuspend() || knownBusy()) return false;
       if (core.store.state.commands.some(command => command.status === "pending")) return false;
+      this.#releasedToIdle = true;
       await core.flushCheckpoint();
       this.#assertStartupOpen();
       this.#releaseEpisode = { source: structuredClone(core.store.state.identity), confirmed: false };
@@ -5241,6 +5251,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     } catch {
       return false;
     }
+    this.#releasedToIdle = false;
     const operation = this.#claimReleasedRunner(input.runId);
     void operation.catch(() => undefined);
     this.#attachmentOperation = operation;
@@ -5265,6 +5276,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return Promise.reject(new Error("native_runner_run_attachment_in_progress"));
     }
     this.#earlyClaim = null;
+    this.#releasedToIdle = false;
     const operation = Promise.resolve().then(() => {
       this.#assertStartupOpen();
       return this.#attachRun(requested, earlyClaim);
@@ -8391,6 +8403,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       resolve: (accepted) => resolveAdmission(accepted),
     };
     this.#turnStartResponsePending = true;
+    this.#releasedToIdle = false;
     let releaseStartResponse!: () => void;
     this.#turnStartResponseSettled = new Promise<void>(resolve => { releaseStartResponse = resolve; });
     this.#expectedProviderTurnId = null;
