@@ -3,7 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { and, eq, isNull, sql, type SQLWrapper } from "drizzle-orm";
 import {
   companies, companyMemberships, companySecrets, connectionGrants, pluginCompanySettings, pluginConfig, plugins,
-  projects, toolConnections, userCompanyPreferences, type Db,
+  projects, toolConnectionInstalls, toolConnections, userCompanyPreferences, type Db,
 } from "@paperclipai/db";
 import { z } from "zod";
 import { conflict, forbidden, HttpError, notFound } from "../errors.js";
@@ -373,14 +373,22 @@ export async function consumeProjectAppApproval(tx: Database, input: {
   const parsed = receiptSchema.safeParse(source?.config[PROJECT_APP_APPROVAL_FIELD]);
   if (!source || source.projectId !== null || !parsed.success || parsed.data.id !== input.receiptId || parsed.data.projectId !== input.projectId) throw unavailable();
   if (source.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined || source.status === "archived") throw consumed();
+  // RFL 09:36Z applies to the source, not just D's first-migration flag.
+  // A retake after abort has retained project history and does not reset D's
+  // migration exception, but B may still be serving from the same live S.
+  const [liveReach] = !input.retainAsPredecessor && source.status === "active" && source.enabled
+    ? await tx.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, source.id),
+    )).limit(1) : [];
+  const retainAsPredecessor = input.retainAsPredecessor === true || liveReach !== undefined;
   const config = { ...source.config, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
   const transportConfig = { ...source.transportConfig, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
-  await tx.update(toolConnections).set(input.retainAsPredecessor
+  await tx.update(toolConnections).set(retainAsPredecessor
     ? { config, transportConfig, updatedAt: new Date() }
     : { status: "archived", enabled: false, config, transportConfig, updatedAt: new Date() })
     .where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id)));
   await persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: input.actorType, actorId: input.actorId,
     action: "tool_connection.project_app_approval_consumed", entityType: "tool_connection", entityId: source.id,
     details: { receiptId: input.receiptId, projectId: input.projectId, connectionId: input.connectionId, previousStatus: source.status,
-      disposition: input.retainAsPredecessor ? "predecessor" : "archived" } });
+      disposition: retainAsPredecessor ? "predecessor" : "archived" } });
 }

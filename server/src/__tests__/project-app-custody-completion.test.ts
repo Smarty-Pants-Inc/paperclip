@@ -237,6 +237,20 @@ describe("project connection make-before-break and local retirement (round-4 D)"
         .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
     });
 
+    it("N6(iii)(a)/(c): a retake after abort cannot archive S while B still serves from it", async () => {
+      const p = await migration();
+      const candidate = await created(p);
+      await p.f.service.archiveConnection(candidate.id, p.f.companyId, { ...p.f.actor(),
+        projectDoneConfirmation: { projectId: p.f.a.id, connectionId: candidate.id } });
+      const retake = await p.create();
+      // Retained ownership deliberately prevents resetting D's first-migration
+      // exception. That is not permission to break another project's legacy.
+      expect((await storedConnection(db, retake.id)).config.projectScope).toMatchObject({ approvedRepositoryIds: [101] });
+      expect(await storedConnection(db, p.legacy.connection.id)).toMatchObject({ status: "active", enabled: true,
+        config: { projectAppApprovalConsumedBy: retake.id } });
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+    });
+
     it("N6(iii)(c) rollback: abort receipt failure cannot release S without retiring its pending consumer", async () => {
       const p = await migration();
       const candidate = await created(p);
