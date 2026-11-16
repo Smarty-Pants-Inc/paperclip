@@ -61,6 +61,15 @@ describe("project connection stable-ID envelope at credential release", () => {
     await expect(resolveGitHubAppCredential(db, connection, grant, false, true, f.leadA.id)).rejects.toThrow();
   });
 
+  it("INT-R2/R05: retain the exact wrong-repository typed refusal alongside the frozen assertion", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection, grant } = await f.seedConnection();
+    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-restricted-token");
+    provider.acquire.mockImplementationOnce(async () => ({ token: "synthetic-wrong-repo-token", expiresAt: Date.now() + 3600000, verifiedRegistrationId: "123",
+      github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "202", fullName: "owner/A", installationId: "456", private: true }] } }));
+    await expect(resolveGitHubAppCredential(db, connection, grant, false, true, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+  });
+
   it.each(["wrong-repo", "malformed", "unapproved-ref"] as const)("RFL-C5/J05/A12 companion: %s returns the intended typed refusal", async kind => {
     const f = await projectConnectionFixture(db);
     const { connection, grant } = await f.seedConnection();
