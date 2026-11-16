@@ -13,6 +13,7 @@ import {
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issues,
   nativeRunFinalizations,
@@ -33,7 +34,7 @@ import { executePaperclipNativeSession, prepareNativeSessionOpenTimeoutRetry, sc
 import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { claimNativeSessionResumptions } from "./native-finalization-reconciler.js";
-import { DurablePrpControlPlane, NativeProviderTerminalFailure } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, NativeProviderTerminalFailure, QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
 import { createNativeRunnerExecutionDriver } from "./native-runner-execution-driver.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { loadNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
@@ -1104,5 +1105,112 @@ describe("native provider startup retry", () => {
       now: new Date(Date.now() + 60 * 60_000),
       deferIneligible: false,
     })).toEqual([]);
+  });
+  // #20887 (RFL ruling part 1): a Pi session counts as established only once
+  // Pi could have received a prompt. Pi 1.5 writes its session file at the
+  // first user message_end and the Pi driver publishes turn.started before it
+  // submits the prompt; a session.open checkpoint alone names no saved thread.
+  describe("a Pi session that never received a prompt (#20887)", () => {
+    const piSessionId = "pi-session-opened-never-prompted";
+    const record = (value: unknown) => (value && typeof value === "object" ? value : {}) as Record<string, unknown>;
+    async function seedPiRun(provider: "pi_rpc" | "codex" = "pi_rpc") {
+      const seeded = await seedRun(await createAgent());
+      const execution = (provider === "pi_rpc" ? {
+        ...seeded.execution,
+        provider: { kind: "pi_rpc", model: "anthropic/test", profile: QUALIFIED_PI_RPC_PROFILE },
+        session: { ...seeded.execution.session, driverKind: "pi_rpc" },
+      } : seeded.execution) as NativeExecutionInputV1;
+      await db.update(heartbeatRuns).set({
+        runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+          || ${JSON.stringify({ nativeExecutionInput: execution })}::jsonb`,
+      }).where(eq(heartbeatRuns.id, seeded.runId));
+      return { ...seeded, execution };
+    }
+    /** session.open saved the provider identity; turn.start then failed before the prompt; the transport was lost. */
+    async function failAfterSessionOpen(seeded: Seeded, options: { provider?: "pi_rpc" | "codex"; promptEvent?: string } = {}) {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+      provider.execute.mockReset().mockImplementation(async () => {
+        const checkpoint = {
+          backendKind: "runner", driverKind: options.provider === "codex" ? "codex_app_server" : "pi_rpc",
+          sessionId: piSessionId, providerSessionId: piSessionId,
+          identity: { companyId, agentId: seeded.agentId, issueId: seeded.issueId, runId: seeded.runId, sessionId: run!.nativeSessionId },
+          cursor: null, activeTurnId: null, semanticResult: null, terminal: null, terminalTurns: [], pendingRuntimeRequests: [],
+        };
+        await db.update(heartbeatRuns).set({
+          runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+            || ${JSON.stringify({ sessionCheckpoint: checkpoint })}::jsonb`,
+        }).where(eq(heartbeatRuns.id, seeded.runId));
+        await db.insert(heartbeatRunEvents).values({ companyId, runId: seeded.runId, agentId: seeded.agentId,
+          seq: 900, eventType: "session.started", stream: "system" });
+        if (options.promptEvent) await db.insert(heartbeatRunEvents).values({ companyId, runId: seeded.runId,
+          agentId: seeded.agentId, seq: 901, eventType: options.promptEvent, stream: "system" });
+        throw new Error("transport_reconnect_grace_exceeded: runner process recovery exceeded 420000ms");
+      });
+      await expect(executePaperclipNativeSession({
+        db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+        backend: {
+          descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+          openSession: async () => { throw new Error("Unexpected provider session call"); },
+        },
+      })).rejects.toThrow("transport_reconnect_grace_exceeded");
+    }
+
+    it("opens the next attempt fresh instead of demanding the never-saved Pi thread", async () => {
+      const seeded = await seedPiRun();
+      await failAfterSessionOpen(seeded);
+      let state = await read(seeded);
+      expect(state.coordinator).toMatchObject({
+        phase: "retryable_failure",
+        failureDetail: expect.objectContaining({ recoveryMode: "bootstrap_retry", providerSessionEstablished: false }),
+      });
+      expect(String(state.coordinator.failureDetail?.nextAction)).not.toMatch(/carried|earlier|exact persisted/i);
+      expect(record(state.run.runnerProfileJson).sessionCheckpoint).toBeUndefined();
+
+      // The scheduled retry claims the same run and its runtime gets no saved
+      // provider session: it opens a new Pi session, demanding no identity.
+      const observed: { checkpoint?: unknown } = {};
+      provider.execute.mockReset().mockImplementation(async (options: {
+        persistedSession?: unknown; controlPlane: { loadSessionCheckpoint?: () => Promise<unknown> };
+      }) => {
+        observed.checkpoint = options.persistedSession ?? await options.controlPlane.loadSessionCheckpoint?.() ?? null;
+        throw new Error("transport_reconnect_grace_exceeded: second attempt observed");
+      });
+      await expect(executePaperclipNativeSession({
+        db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId, leaseOwner: await claimRetry(seeded),
+        backend: {
+          descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+          openSession: async () => { throw new Error("Unexpected provider session call"); },
+        },
+      })).rejects.toThrow("second attempt observed");
+      expect(provider.execute).toHaveBeenCalledOnce();
+      expect(observed.checkpoint).toBeNull();
+      state = await read(seeded);
+      expect(state.coordinator.attempt).toBe(2);
+      expect(JSON.stringify(state.coordinator.failureDetail)).not.toMatch(/provider_identity_changed|native_adopted_provider_identity_mismatch/);
+      const comments = await db.select({ body: issueComments.body }).from(issueComments).where(eq(issueComments.issueId, seeded.issueId));
+      expect(comments.map((comment) => comment.body).join("\n")).not.toMatch(/earlier (provider thread|conversation)/i);
+    });
+
+    it("still resumes exactly a Pi session that may have received a prompt", async () => {
+      const seeded = await seedPiRun();
+      await failAfterSessionOpen(seeded, { promptEvent: "turn.started" });
+      const state = await read(seeded);
+      expect(state.coordinator).toMatchObject({
+        phase: "retryable_failure",
+        failureDetail: expect.objectContaining({ recoveryMode: "exact_checkpoint_resume", providerSessionEstablished: true }),
+      });
+      expect(record(state.run.runnerProfileJson).sessionCheckpoint).toMatchObject({ providerSessionId: piSessionId });
+    });
+
+    it("leaves other providers' session checkpoints on exact resume", async () => {
+      const seeded = await seedPiRun("codex");
+      await failAfterSessionOpen(seeded, { provider: "codex" });
+      const state = await read(seeded);
+      expect(state.coordinator).toMatchObject({
+        phase: "retryable_failure",
+        failureDetail: expect.objectContaining({ recoveryMode: "exact_checkpoint_resume", providerSessionEstablished: true }),
+      });
+      expect(record(state.run.runnerProfileJson).sessionCheckpoint).toMatchObject({ providerSessionId: piSessionId });
+    });
   });
 });
