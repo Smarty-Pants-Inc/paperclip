@@ -66,7 +66,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   if (!chain) return false;
   const lease = chain.tip;
   // Retirement and the supersession claim belong exclusively to the tip.
-  const stamp = newestNativeHarnessBackupStampOnChain(chain, input.normalizedSessionId);
+  const stamp = newestNativeHarnessBackupStampOnChain(chain, input.normalizedSessionId, "restore");
   if (!stamp) return false;
   if (stamp.manifestSha256 !== input.manifestSha256
     || stamp.normalizedSessionId !== input.normalizedSessionId
@@ -133,18 +133,26 @@ export async function nativeSessionOfLeaseRun(db: Db, lease: Pick<SourceLease, "
  * does not establish checkpoint chronology. The newest stamp for ONE native
  * session on the chain's allocation by completion time; another session's stamp
  * never stands in for it. Conflicting latest-time stamps are ambiguous.
+ *
+ * `cleanup` (obsolete-box custody) reads only the given session's stamps: an
+ * older or newer stamp of another session does not hold custody of this box.
+ * `restore` stays fail-closed: the newest stamp across the whole chain must be
+ * the recalling session's, so a NEWER or TIED stamp from another session
+ * refuses. Otherwise an older session could claim the shared source row first
+ * (supersedeIdleWarmSource) and lock out the session whose stamp is newer.
  */
-export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain, normalizedSessionId: string | null) {
+export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain,
+  normalizedSessionId: string | null, mode: "restore" | "cleanup") {
   if (!normalizedSessionId) return null;
   const stamps = [chain.tip, ...chain.predecessors]
     .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, chain.tip.providerLeaseId!))
     .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null
-      && candidate.normalizedSessionId === normalizedSessionId)
+      && (mode === "restore" || candidate.normalizedSessionId === normalizedSessionId))
     .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
   const stamp = stamps[0];
   if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
     && !isDeepStrictEqual(candidate, stamp))) return null;
-  return stamp;
+  return stamp.normalizedSessionId === normalizedSessionId ? stamp : null;
 }
 type RetiredSourceInput = { companyId: string; currentRunId: string; targetProviderLeaseId?: string | null };
 
