@@ -459,6 +459,24 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
       eq(agents.companyId, company.id),
       eq(agents.id, setupId),
     ))).toHaveLength(1);
+    expect(await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalType, "agent"),
+      eq(companyMemberships.principalId, setupId),
+    ))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, company.id),
+      eq(principalPermissionGrants.principalType, "agent"),
+      eq(principalPermissionGrants.principalId, setupId),
+      eq(principalPermissionGrants.permissionKey, "tasks:assign"),
+    ))).toHaveLength(1);
+    expect(await db.select({ permissionKey: principalPermissionGrants.permissionKey })
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, rootCeo.id),
+      ))).toHaveLength(2);
   });
 
   it("creates ten agents concurrently with membership and tasks:assign in five trials", async () => {
