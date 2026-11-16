@@ -1,3 +1,4 @@
+import "./helpers/project-connections-approval-http.js";
 import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
 import { promisify } from "node:util";
@@ -5,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { and, eq, sql } from "drizzle-orm";
 import { connectionGrants, createDb, heartbeatRuns, issues, projects, userCompanyPreferences, toolCatalogEntries, toolPolicies, toolGatewaySessions, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture as seedProjectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture as seedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 const provider = vi.hoisted(() => ({ acquire: vi.fn(async (_db: unknown, connection: { id: string }) => ({
   token: `synthetic-installation-token-${connection.id}`, expiresAt: Date.now() + 3_600_000,
