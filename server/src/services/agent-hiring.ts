@@ -6,9 +6,12 @@ import { notifyAttentionRetentionWork } from "./retention-work-notifications.js"
 import { notifySkillVersionRetention, notifySkillVersionPinChange } from "./skill-version-retention-notifications.js";
 import { agentAppearanceSchema, randomAgentAppearance } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
-import { agents, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { agents, companyMemberships, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { eq, sql } from "drizzle-orm";
+import { lockCompanyAgentRuntime } from "./agent-runtime-lock.js";
+import { isTransientLockContention } from "./transient-lock-contention.js";
+import { notifyMuseContactVerification } from "../modules/external-agents/index.js";
 import type { ActivityPublication } from "./activity-log.js";
-import { eq } from "drizzle-orm";
 import { unprocessable } from "../errors.js";
 import { agentRecordQueries, isPlainRecord, configPatchFromApprovalPayload, normalizeRuntimeConfigForNewAgent, assertAgentDailyCostCap,
   deduplicateAgentName, type CreateAgentData, type CreateAgentOptions, type AgentConfigurationPatch, type AgentHireRecord } from "../lib/agent-records.js";
@@ -28,6 +31,9 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   assertNoInitialAgentInteractionPermissions(input.permissions);
   await assertAgentInteraction(db, { companyId, actorAgentId: options?.createdByAgentId, actorCompanyId: options?.createdByAgentCompanyId,
     operation: "mention", texts: [JSON.stringify(input), ...(options?.interactionTexts ?? [])], lock: "update" });
+  // #20805: after the hirer (and setup draft, records.ts) row locks, before the
+  // agent row write and the grant writes. One lock, independent of company size.
+  await lockCompanyAgentRuntime(db, companyId);
   await notifyAttentionRetentionWork(db, { companyId });
   const { runner, ...data } = input;
   const selection = options?.runnerResolved
@@ -103,6 +109,7 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
       })),
     ).onConflictDoNothing();
   }
+  if (options?.memberGrant) await grantNewAgentMembership(tx, companyId, created.id, options.memberGrant.grantedByUserId);
   if (options?.aiConnectionInstall) {
     const install = options.aiConnectionInstall;
     const connectionIds = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
@@ -118,7 +125,67 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   }
 }
 
+/**
+ * #20805: the hired agent's active membership and tasks:assign belong to the hire
+ * transaction (doc/AGENT-LIFECYCLE.md: a failure rolls back the hire). Same rows
+ * the create and hire routes wrote after commit before this change, including
+ * pending-approval and low-trust hires and the board user's granted_by_user_id.
+ * Idempotent on the two unique keys.
+ */
+async function grantNewAgentMembership(tx: Db, companyId: string, agentId: string, grantedByUserId: string | null) {
+  try {
+    await tx.insert(companyMemberships).values({
+      companyId, principalType: "agent", principalId: agentId, status: "active", membershipRole: "member",
+    }).onConflictDoUpdate({
+      target: [companyMemberships.companyId, companyMemberships.principalType, companyMemberships.principalId],
+      set: { status: "active", membershipRole: "member", updatedAt: new Date() },
+      setWhere: sql`${companyMemberships.status} <> 'active' OR ${companyMemberships.membershipRole} IS DISTINCT FROM 'member'`,
+    });
+    await tx.insert(principalPermissionGrants).values({
+      companyId, principalType: "agent", principalId: agentId, permissionKey: "tasks:assign", scope: null, grantedByUserId,
+    }).onConflictDoUpdate({
+      target: [principalPermissionGrants.companyId, principalPermissionGrants.principalType,
+        principalPermissionGrants.principalId, principalPermissionGrants.permissionKey],
+      set: { scope: null, grantedByUserId, updatedAt: new Date() },
+    });
+  } catch (error) {
+    // The hire's GRANT step: its contention is the one the hire retries and names
+    // agent_hire_grant_contention (#20805 x #20389 rule).
+    if (isTransientLockContention(error) && error && typeof error === "object") hireGrantStepContention.add(error);
+    throw error;
+  }
+}
+
+/** Errors raised by the hire's GRANT step (membership + tasks:assign). Identity-marked,
+ * so the database error itself, its SQLSTATE and message, is unchanged. */
+const hireGrantStepContention = new WeakSet<object>();
+
+/** True when a transient lock contention came from the hire's GRANT step, through the
+ * lifecycle's AccountingContentionError and any other `cause` wrappers. */
+export function isHireGrantStepContention(error: unknown): boolean {
+  for (let value = error, depth = 0; value && typeof value === "object" && depth < 6; depth += 1) {
+    if (hireGrantStepContention.has(value)) return true;
+    value = (value as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Re-assert an existing hire's membership and tasks:assign in one transaction
+ * (idempotent replays of hires that may predate #20805). No retry loop. */
+export async function ensureNewAgentMembership(db: Db, companyId: string, agentId: string, grantedByUserId: string | null) {
+  await db.transaction(async tx => {
+    const txDb = tx as unknown as Db;
+    await lockCompanyAgentRuntime(txDb, companyId);
+    await grantNewAgentMembership(txDb, companyId, agentId, grantedByUserId);
+  });
+  // After commit: a rolled-back grant never queues a Muse contact intent.
+  await db.transaction(tx => notifyMuseContactVerification(tx as unknown as Db, { companyId, agentId }));
+}
+
 export async function prepareAgentHireApproval(txDb: Db, existing: AgentHireRecord, approvedPayload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch> {
+  // #20805: approval activates the agent row (a shared runtime hold) and then
+  // writes its grants (an exclusive one). Take the exclusive hold first.
+  await lockCompanyAgentRuntime(txDb, existing.companyId);
   const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
   const patch = { ...approvedPatch } as AgentConfigurationPatch;
   const hasApprovedAdapterConfig = Object.prototype.hasOwnProperty.call(patch, "adapterConfig") && isPlainRecord(patch.adapterConfig);

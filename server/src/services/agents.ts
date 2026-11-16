@@ -2,6 +2,7 @@ import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { type BudgetServiceHooks } from "./budgets.js";
 import { withAccountingTransaction } from "./accounting-transaction.js";
+import { lockCompanyAgentRuntime } from "./agent-runtime-lock.js";
 import type { ActivityPublication } from "./activity-log.js";
 import { assertCanManageSubordinateAgent, subordinatePermissionScope } from "./agent-subtree-management.js";
 
@@ -68,6 +69,9 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         }
         await assertAgentInteraction(tx, { companyId: existing.companyId, actorAgentId: options?.actorAgentId,
           operation: "configure", targetAgentId: id, lock: "update" });
+        // #20805: the permission write (shared runtime hold) is followed by grant
+        // writes in afterUpdate (exclusive); take the exclusive hold first.
+        await lockCompanyAgentRuntime(tx, existing.companyId);
         const [current] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
         if (!current) return null;
         if (current.status === "pending_approval") throw conflict("Pending approval agent permissions cannot be changed before board approval");
