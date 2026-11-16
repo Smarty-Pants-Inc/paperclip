@@ -157,10 +157,12 @@ export class PiRpcDriver implements HarnessDriver {
     const measure: PiOpenMeasure = async (name, work) => {
       const startedAtMs = Date.now();
       let outcome: ProviderPerformanceSpan["outcome"] = "failed";
+      let attributes: ProviderPerformanceSpan["attributes"];
       try { const result = await work(); outcome = "ok"; return result; }
+      catch (error) { attributes = piBindTimeoutAttributes(error); throw error; }
       finally {
         const endedAtMs = Math.max(startedAtMs, Date.now());
-        spans.push({ name, startedAtMs, endedAtMs, outcome });
+        spans.push({ name, startedAtMs, endedAtMs, outcome, ...(attributes ? { attributes } : {}) });
         // Content-free fallback also survives failures before a session/event
         // queue exists. Never let a diagnostic replace the startup result.
         try { console.error(`pi.open ${name.slice("runner.pi.open.".length)} ${endedAtMs - startedAtMs}ms`); } catch { /* log-only */ }
@@ -354,7 +356,7 @@ export class PiRpcDriver implements HarnessDriver {
         const send = <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => measure(
           request.type === "bind" ? "runner.pi.open.bind_receipt" : `runner.pi.open.${request.type}` as PiOpenPhase, async () => {
           const timeoutMs = this.#options.startupTimeoutMs ?? 5000;
-          const receipt = await withAbort(withTimeout((this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out"), input.signal);
+          const receipt = await withAbort(withTimeout((this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), input.signal);
           if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
           return receipt;
         });
@@ -688,7 +690,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
       if (this.#resident) {
         const previous = this.#resident.context;
-        const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal);
+        const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal, { runId: input.runId });
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
           input.dynamicTools,
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous,
@@ -742,13 +744,13 @@ export class PiRpcHarnessSession implements HarnessSession {
   /** Startup precedes this session and has no turn. Flush before open returns,
    * rather than waiting for a prompt that may never arrive. */
   recordOpenTimings(spans: readonly ProviderPerformanceSpan[], runId: string): void {
-    for (const span of spans) this.#recordTiming(span.name, span.startedAtMs, span.endedAtMs, span.outcome, { runId });
+    for (const span of spans) this.#recordTiming(span.name, span.startedAtMs, span.endedAtMs, span.outcome, { runId }, span.attributes);
     this.#flushTimings();
   }
 
   #recordTiming(name: ProviderPerformancePhase, startedAtMs: number, endedAtMs: number,
-    outcome: "ok" | "failed", origin: { runId: string; turnId?: string }): void {
-    this.#timings.push({ span: { name, startedAtMs, endedAtMs: Math.max(startedAtMs, endedAtMs), outcome },
+    outcome: "ok" | "failed", origin: { runId: string; turnId?: string }, attributes?: ProviderPerformanceSpan["attributes"]): void {
+    this.#timings.push({ span: { name, startedAtMs, endedAtMs: Math.max(startedAtMs, endedAtMs), outcome, ...(attributes ? { attributes } : {}) },
       origin: { runId: origin.runId, ...(origin.turnId ? { turnId: origin.turnId } : {}) } });
   }
 
@@ -779,12 +781,14 @@ export class PiRpcHarnessSession implements HarnessSession {
   async #measure<T>(name: ProviderPerformancePhase, work: () => Promise<T>, origin = { runId: this.#runId }, flushIdle = false): Promise<T> {
     const startedAtMs = Date.now();
     let outcome: "ok" | "failed" = "failed";
+    let attributes: ProviderPerformanceSpan["attributes"];
     const finish = (endedAtMs: number) => {
       if (!this.#pendingTimings.delete(finish)) return;
-      this.#recordTiming(name, startedAtMs, endedAtMs, outcome, origin);
+      this.#recordTiming(name, startedAtMs, endedAtMs, outcome, origin, attributes);
     };
     this.#pendingTimings.add(finish);
     try { const result = await work(); outcome = "ok"; return result; }
+    catch (error) { attributes = piBindTimeoutAttributes(error); throw error; }
     finally {
       finish(Date.now());
       // An external attachment can succeed indefinitely without a turn. Drain
@@ -908,15 +912,17 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal): Promise<PiBindResponse<C>> {
+  async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal,
+    origin = { runId: "runId" in request ? request.runId : this.#runId }): Promise<PiBindResponse<C>> {
     const work = async () => {
       const timeoutMs = this.#admissionTimeoutMs ?? 5000;
-      const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out"), signal);
+      const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), signal);
       if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
       return receipt;
     };
-    return request.type === "bind" || request.type === "begin_turn"
-      ? this.#measure(`runner.pi.${request.type}`, work, { runId: request.runId }) : work();
+    // The phase name is the content-free exchange kind; inventory and lifecycle
+    // receipts need the same duration/outcome evidence as bind and begin_turn.
+    return this.#measure(`runner.pi.${request.type}`, work, origin);
   }
 
   async #revokeBinding(): Promise<void> {
@@ -2067,12 +2073,17 @@ async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
   });
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+function piBindTimeoutAttributes(error: unknown): ProviderPerformanceSpan["attributes"] {
+  return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "pi_bind_timeout"
+    ? { timeoutCode: "pi_bind_timeout" } : undefined;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string, code?: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
       promise,
-      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(message), code ? { code } : {})), timeoutMs); }),
     ]);
   } finally {
     if (timer) clearTimeout(timer);

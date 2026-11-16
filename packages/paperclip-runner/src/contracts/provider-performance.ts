@@ -16,6 +16,7 @@ export const PROVIDER_PERFORMANCE_PHASES = [
   "runner.pi.open.admission", "runner.pi.open.available_models", "runner.pi.open.tool_inventory",
   "runner.pi.open.settle", "runner.pi.open.bind_receipt", "runner.pi.open.begin_turn",
   "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.interrupt_wait", "runner.pi.prompt_to_started",
+  "runner.pi.tool_inventory", "runner.pi.settle", "runner.pi.stop_children", "runner.pi.park_ready",
   "runner.pi.admission.get_state", "runner.pi.admission.set_model",
   "runner.pi.admission.get_available_thinking_levels", "runner.pi.admission.set_thinking_level",
   "pi.request.sent",
@@ -26,6 +27,7 @@ export interface ProviderPerformanceSpan {
   startedAtMs: number;
   endedAtMs: number;
   outcome: "ok" | "failed";
+  attributes?: { timeoutCode: "pi_bind_timeout" };
 }
 
 const names = new Set<string>(PROVIDER_PERFORMANCE_PHASES);
@@ -50,6 +52,10 @@ export function parseProviderPerformanceSpans(payload: unknown, observedAtMs: nu
     if (count >= MAX_PROVIDER_PERFORMANCE_SPANS_PER_NAME) return [];
     counts.set(name, count + 1);
     return [{ name: name as ProviderPerformancePhase, startedAtMs, endedAtMs,
-      outcome: row.outcome === "failed" ? "failed" : "ok" }];
+      outcome: row.outcome === "failed" ? "failed" : "ok",
+      ...(row.outcome === "failed" && name.startsWith("runner.pi.")
+        && row.attributes !== null && typeof row.attributes === "object"
+        && (row.attributes as Record<string, unknown>).timeoutCode === "pi_bind_timeout"
+        ? { attributes: { timeoutCode: "pi_bind_timeout" as const } } : {}) }];
   });
 }
