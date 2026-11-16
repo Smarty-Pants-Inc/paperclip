@@ -92,6 +92,63 @@ it("pulls real raw bytes through the existing backup tar path before source reti
     afterSha256: createHash("sha256").update(await readFile(retained)).digest("hex"), sourceRemoved: true }, null, 2));
 }, 60_000);
 
+it("retains records while excluding only the audited runner binary and compile cache at both evidence copies", async () => {
+  const state = await fixture();
+  const local = await createNativeSetupRuntime("static-exclusion-company");
+  const remote = join(state, "remote-static-tree");
+  const cache = join(remote, "pi", "node-compile-cache");
+  await mkdir(cache, { recursive: true, mode: 0o700 });
+  await mkdir(join(remote, "bin"), { recursive: true, mode: 0o700 });
+  await writeFile(join(remote, "bin", "paperclip-runnerd"), Buffer.alloc(1024 * 1024, 7));
+  for (let i = 0; i < 100; i++) await writeFile(join(cache, `cache-${i}.blob`), Buffer.alloc(1024, i));
+  const retainedFiles = [
+    "control-plane/metadata.json", "diagnostics/stderr", "runner/state.json",
+    "pi/setup-probe-123.jsonl", "stdout.log", "stderr.log", "unknown-new-file.bin",
+  ];
+  for (const entry of retainedFiles) {
+    const path = join(remote, entry);
+    await mkdir(join(path, ".."), { recursive: true, mode: 0o700 });
+    await writeFile(path, entry === "diagnostics/stderr" ? Buffer.alloc(0) : Buffer.from(`record:${entry}`), { mode: 0o600 });
+  }
+  const execute = promisify(execFile);
+  const { syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
+  const localCopy = join(local, "remote-runtime");
+  await syncRemoteRunnerDirectoryOut({ sourcePath: remote, targetPath: localCopy, mode: 0o700,
+    excludeEntries: ["bin/paperclip-runnerd", "pi/node-compile-cache"], runner: { execute: async input => {
+      const result = await execute(input.command, [...input.args ?? []], { encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
+      return { ...result, exitCode: 0, timedOut: false, signal: null, pid: null, startedAt: null };
+    } } });
+  const inventory = async (root: string): Promise<{ bytes: number; paths: string[] }> => {
+    let bytes = 0; const paths: string[] = [];
+    const visit = async (directory: string, prefix = "") => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) await visit(join(directory, entry.name), relative);
+        else { bytes += (await lstat(join(directory, entry.name))).size; paths.push(relative); }
+      }
+    };
+    await visit(root);
+    return { bytes, paths };
+  };
+  const beforeRetention = await inventory(localCopy);
+  expect(beforeRetention.bytes).toBe(150);
+  expect(beforeRetention.paths).not.toContain("bin/paperclip-runnerd");
+  expect(beforeRetention.paths.some(path => path.startsWith("pi/node-compile-cache/"))).toBe(false);
+  for (const entry of retainedFiles) expect(beforeRetention.paths).toContain(entry);
+  expect(await lstat(join(localCopy, "diagnostics", "stderr")).then(item => item.size)).toBe(0);
+  await cleanupNativeSetupRuntime(local, true);
+  const evidence = join(state, "conversation-evidence");
+  const [scope] = await readdir(evidence), [id] = await readdir(join(evidence, scope!));
+  const durable = join(evidence, scope!, id!, "remote-runtime");
+  const afterRetention = await inventory(durable);
+  expect(afterRetention.bytes).toBe(beforeRetention.bytes);
+  expect(afterRetention.bytes).toBe(150);
+  expect(afterRetention.paths).not.toContain("bin/paperclip-runnerd");
+  expect(afterRetention.paths.some(path => path.startsWith("pi/node-compile-cache/"))).toBe(false);
+  for (const entry of retainedFiles) expect(afterRetention.paths).toContain(entry);
+  console.info(`probe static byte check before=${beforeRetention.bytes} after=${afterRetention.bytes}; excluded runner=1048576 cache=102400`);
+}, 60_000);
+
 it("fails closed when cleanup did not create the source", async () => {
   const root = await fixture(); // An arbitrary existing tree is not setup scratch.
   const trace = join(root, "raw-session.ndjson");
