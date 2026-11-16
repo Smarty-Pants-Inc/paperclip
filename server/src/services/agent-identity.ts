@@ -26,8 +26,13 @@ export function agentIdentityService(db: Db) {
   const ownership = (companyId: string, agentId: string) => and(
     eq(agentIdentityKeys.companyId, companyId), eq(agentIdentityKeys.agentId, agentId),
   );
-  async function resolveIdentity(row: typeof agentIdentityKeys.$inferSelect) {
-    if (row.revokedAt) throw new AgentIdentityRevokedError();
+  async function resolveIdentity(
+    row: typeof agentIdentityKeys.$inferSelect,
+    options: { purpose: "signing" | "redaction" },
+  ) {
+    // Revocation forbids using a key, not censoring copies already delivered.
+    // Only the log-redactor factory may resolve revoked private material.
+    if (row.revokedAt && options.purpose !== "redaction") throw new AgentIdentityRevokedError();
     const privateKeyPem = await localEncryptedProvider.resolveVersion({ material: row.privateKeyMaterial, externalRef: null });
     const privateKey = createPrivateKey(privateKeyPem);
     const derived = createPublicKey(privateKey).export({ type: "spki", format: "der" });
@@ -49,7 +54,7 @@ export function agentIdentityService(db: Db) {
     },
     async createExistingLogRedactor(companyId: string, agentId: string) {
       const [row] = await db.select().from(agentIdentityKeys).where(ownership(companyId, agentId));
-      return createAgentIdentityRedactor(row ? (await resolveIdentity(row)).privateKeyPem : undefined);
+      return createAgentIdentityRedactor(row ? (await resolveIdentity(row, { purpose: "redaction" })).privateKeyPem : undefined);
     },
 
     async ensureAgentIdentity(companyId: string, agentId: string) {
@@ -79,7 +84,7 @@ export function agentIdentityService(db: Db) {
           });
         }
         // Fail closed on corruption or a wrong master key; never replace a key.
-        return resolveIdentity(row);
+        return resolveIdentity(row, { purpose: "signing" });
       });
     },
   };
