@@ -53,7 +53,6 @@ import { providerPackWorkspaceId, recordAdmittedRemoteProviderPack, resolveRemot
 import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPending, prepareNativeProviderPackAdmission, rememberAdmittedNativeProviderPack, rememberRecoveredNativeProviderPack, recordNativeProviderPackAdmission, type NativeProviderPackAdmissionSource } from "./native-provider-pack-admission.js";
 import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
-import { verifySnapshotProviderPack } from "./remote-provider-pack-snapshot.js";
 
 import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
@@ -15470,16 +15469,10 @@ export async function prepareRemoteProviderPackOnTarget(input: {
   const expectedProviderPackManifest = input.manifest;
   const stagedRemoteProviderPackRoot = posix.join(remoteTarget.remoteCwd, ".paperclip-runtime", "paperclip-runner", "provider-pack");
   let activeRemoteProviderPackRoot: string | null = null;
-  let preinstalledProviderPackRoots: string[] | undefined;
+  let preinstalledProviderPackRoots: string[] = [];
   let selectedProviderPackManifest = expectedProviderPackManifest;
-  const verifyRemoteProviderPack = async (packRoot: string, snapshot = false, acceptProvenance = false): Promise<RemoteProviderPackManifest> => {
-    if (snapshot) {
-      // A failed seal cannot admit a pack. The selection owner tries the
-      // scoped staged memo next, then full verification of other candidates.
-      return verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot,
-        manifest: expectedProviderPackManifest, provider: input.provider ?? { kind: "opencode" } });
-    }
-    return verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
+  const verifyRemoteProviderPack = (packRoot: string, acceptProvenance = false): Promise<RemoteProviderPackManifest> =>
+    verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
       cwd: remoteTarget.remoteCwd, packRoot, manifest: expectedProviderPackManifest, provider: input.provider,
       acceptProvenance: acceptProvenance && input.acceptProvenanceDifferences === true,
       memoScope: remoteProviderPackMemoScope(remoteTarget),
@@ -15487,7 +15480,6 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
       }); },
     });
-  };
   const discoverPreinstalledProviderPack = async () => {
     if (!remoteTarget || !remoteCommandRunner) return [];
     const result = await remoteCommandRunner.execute({
@@ -15504,56 +15496,54 @@ export async function prepareRemoteProviderPackOnTarget(input: {
     return result.stdout.split(/\r?\n/).map(parseRemoteExecutableCandidate)
       .filter((candidate): candidate is string => candidate !== null);
   };
-  const usePreinstalled = async (snapshot: boolean, onRejected?: (check: string) => void) => useVerifiedPreinstalledRemoteProviderPack({
-    onRejected,
-    candidates: preinstalledProviderPackRoots ??= await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
-    verifyAndLink: async (preinstalledProviderPack) => {
-      const preinstalledManifest = await measureNativeRunnerSpan(
-        input.trace,
-        "provider_pack.verify_preinstalled",
-        () => verifyRemoteProviderPack(preinstalledProviderPack, snapshot, true),
-      );
-      const escapedSource = preinstalledProviderPack.replaceAll(
-        "'",
-        "'\\''",
-      );
-      const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
-        "'",
-        "'\\''",
-      );
-      const escapedParent = posix
-        .dirname(stagedRemoteProviderPackRoot)
-        .replaceAll("'", "'\\''");
-      const linked = await measureNativeRunnerSpan(input.trace, "provider_pack.link_preinstalled", () => remoteCommandRunner.execute({
-        command: "sh",
-        args: [
-          "-c",
-          `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
-        ],
-        cwd: remoteTarget.remoteCwd,
-        bypassSession: true,
-        timeoutMs: 10_000,
-      }));
-      if (linked.exitCode !== 0 || linked.timedOut) {
-        throw providerPackIncompatible("link_failed", "preinstalled provider pack could not be linked");
-      }
-      activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
-      selectedProviderPackManifest = preinstalledManifest;
-      await input.onLog?.(
-        "stderr",
-        "[paperclip-runner] using manifest-matched preinstalled provider pack\n",
-      );
-    },
-  });
   const packSource = await prepareVerifiedRemoteProviderPack({
     trace: input.trace,
-    useSealedPreinstalled: () => usePreinstalled(true),
     verifyStaged: () => measureNativeRunnerSpan(
       input.trace,
       "provider_pack.verify",
-      async () => { selectedProviderPackManifest = await verifyRemoteProviderPack(stagedRemoteProviderPackRoot, false, true); },
+      async () => { selectedProviderPackManifest = await verifyRemoteProviderPack(stagedRemoteProviderPackRoot, true); },
     ),
-    usePreinstalled: (onRejected) => usePreinstalled(false, onRejected),
+    usePreinstalled: async (onRejected) => useVerifiedPreinstalledRemoteProviderPack({
+      onRejected,
+      candidates: preinstalledProviderPackRoots = await measureNativeRunnerSpan(input.trace, "provider_pack.discover", discoverPreinstalledProviderPack),
+      verifyAndLink: async (preinstalledProviderPack) => {
+        const preinstalledManifest = await measureNativeRunnerSpan(
+          input.trace,
+          "provider_pack.verify_preinstalled",
+          () => verifyRemoteProviderPack(preinstalledProviderPack, true),
+        );
+        const escapedSource = preinstalledProviderPack.replaceAll(
+          "'",
+          "'\\''",
+        );
+        const escapedTarget = stagedRemoteProviderPackRoot.replaceAll(
+          "'",
+          "'\\''",
+        );
+        const escapedParent = posix
+          .dirname(stagedRemoteProviderPackRoot)
+          .replaceAll("'", "'\\''");
+        const linked = await measureNativeRunnerSpan(input.trace, "provider_pack.link_preinstalled", () => remoteCommandRunner.execute({
+          command: "sh",
+          args: [
+            "-c",
+            `umask 077; mkdir -p '${escapedParent}' && rm -rf '${escapedTarget}' && ln -s '${escapedSource}' '${escapedTarget}'`,
+          ],
+          cwd: remoteTarget.remoteCwd,
+          bypassSession: true,
+          timeoutMs: 10_000,
+        }));
+        if (linked.exitCode !== 0 || linked.timedOut) {
+          throw providerPackIncompatible("link_failed", "preinstalled provider pack could not be linked");
+        }
+        activeRemoteProviderPackRoot = stagedRemoteProviderPackRoot;
+        selectedProviderPackManifest = preinstalledManifest;
+        await input.onLog?.(
+          "stderr",
+          "[paperclip-runner] using manifest-matched preinstalled provider pack\n",
+        );
+      },
+    }),
     stageAndVerify: async () => {
       if (!configuredProviderPackRoot) {
         throw new Error("runner_remote_provider_artifact_incompatible: install the matching Paperclip package and Daytona image; the image provider pack did not match the bundled release identity");
@@ -15572,7 +15562,7 @@ export async function prepareRemoteProviderPackOnTarget(input: {
         runner: remoteCommandRunner,
         cwd: remoteTarget.remoteCwd,
         targetPath: stagedRemoteProviderPackRoot,
-        reuseRoots: preinstalledProviderPackRoots ?? [],
+        reuseRoots: preinstalledProviderPackRoots,
         trace: input.trace,
         verifyDirectory: async (sourceRoot) => { await verifyRemoteProviderPackManifest(sourceRoot, input.provider); },
         stageDirectory: (sourceRoot) => stageRemoteRunnerDirectory({
@@ -17462,22 +17452,7 @@ async function createRunnerdBackendWithinSessionClaim(
     && input.retainedPluginTaskOwner && !input.remoteWarmRecovery && !input.restartRecovery
     ? pluginTaskOwner = preparePluginTaskOwner().then(prepared => { input.beginRetainedRunAttachment!(); return prepared; })
     : undefined;
-  // Read-only snapshot selection is independent of Git discovery and assigned
-  // MCP resolution. Only opt into concurrent remote calls on a capable direct
-  // runner; the later authority check still decides which exact pack is usable.
-  const snapshotSelection = input.execution.provider.kind === "pi_rpc" && !pluginTask && remoteTarget && remoteCommandRunner
-    && remoteCommandRunner.allowConcurrentSyncOperations === true && input.prepareRunnerEnvironment
-    ? measureNativeRunnerSpan(input.trace, "provider_pack.snapshot_select", async () => {
-        const expected = input.runnerRemoteProviderPackPath?.trim()
-          ? resolveRemoteProviderPackSource(input.runnerRemoteProviderPackPath).manifest
-          : readBundledRemoteProviderPackManifest();
-        const root = "/opt/paperclip-runner/provider-pack";
-        const manifest = await verifySnapshotProviderPack({ runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd,
-          packRoot: root, manifest: expected, provider: { kind: "pi_rpc" } });
-        return { root, manifest, immutable: true as const };
-      }).catch(() => null)
-    : Promise.resolve(null);
-  const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner, preparedSnapshot] = await Promise.allSettled([
+  const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner] = await Promise.allSettled([
     Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
     Promise.resolve().then(() => !nativeReview && !firstPartyOnly && !museRuntime && !addressedParticipant && assignedMcpUrl && assignedMcpToken
       ? timeController("assigned_mcp", () => createAssignedMcpTools({
@@ -17490,7 +17465,6 @@ async function createRunnerdBackendWithinSessionClaim(
       }))
       : undefined),
     earlyPluginTaskOwner,
-    snapshotSelection,
   ]);
   if (preparedEnvironment.status === "rejected") throw preparedEnvironment.reason;
   if (preparedAssignedMcp.status === "rejected") throw preparedAssignedMcp.reason;
@@ -18199,8 +18173,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const useInstalledProviderPack = async () => {
     const expected = expectedProviderPackManifest;
     if (!expected || !remoteTarget || !remoteCommandRunner) return false;
-    const snapshot = preparedSnapshot.status === "fulfilled" ? preparedSnapshot.value : null;
-    for (const installation of [...(snapshot ? [snapshot] : []), ...(remoteNativeArtifacts?.providerPackInventory() ?? [])]) {
+    for (const installation of remoteNativeArtifacts?.providerPackInventory() ?? []) {
       try {
         const manifest = await measureNativeRunnerSpan(input.trace, "provider_pack.compatibility", () => verifyRemoteProviderPackIdentity({
           runner: remoteCommandRunner, cwd: remoteTarget.remoteCwd, packRoot: installation.root,
