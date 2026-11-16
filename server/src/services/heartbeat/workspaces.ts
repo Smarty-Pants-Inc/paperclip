@@ -2805,6 +2805,31 @@ async function resolveInstructionsConfigFingerprintMetadata(
   return metadata;
 }
 
+// Lifecycle timing of the selected environment: how long an idle runner or
+// lease is kept, and how long a reconnect may take. They change when a
+// session is torn down, never what it is; the lifecycle MODE stays.
+const ENVIRONMENT_LIFECYCLE_TIMING_KEYS = ["runnerIdleTimeoutMs", "runnerReconnectGraceMs", "ttlSeconds", "timeoutMs"] as const;
+
+/** The environment category by content: no row timestamp, no lifecycle timing (#20853). */
+function environmentForSessionFingerprint(environment: unknown): unknown {
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) return environment;
+  const value = { ...(environment as Record<string, unknown>) };
+  const selected = value.selectedEnvironment;
+  if (selected && typeof selected === "object" && !Array.isArray(selected)) {
+    const next = { ...(selected as Record<string, unknown>) };
+    // updatedAt advances on every save, including saves that change nothing
+    // the session runs with; the config content below is the boundary.
+    delete next.configRevisionAt;
+    if (next.config && typeof next.config === "object" && !Array.isArray(next.config)) {
+      const config = { ...(next.config as Record<string, unknown>) };
+      for (const key of ENVIRONMENT_LIFECYCLE_TIMING_KEYS) delete config[key];
+      next.config = config;
+    }
+    value.selectedEnvironment = next;
+  }
+  return value;
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -2820,10 +2845,12 @@ function buildSessionConfigCategoryValues(input: {
   runtimeSkills: unknown;
   agentConfigRevision: unknown;
   agentIdentityKeyId?: string;
+  legacyFingerprintShape?: boolean;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(
     input.secretManifest,
   );
+  const legacy = input.legacyFingerprintShape === true;
   const workspaceConfig = { ...parseObject(input.workspaceConfig) };
   // issues.updatedAt also advances for comments and status changes. Those are
   // wake deltas, not execution-workspace configuration changes, so including
@@ -2846,14 +2873,18 @@ function buildSessionConfigCategoryValues(input: {
     adapter: {
       adapterType: input.adapterType,
       ...(input.agentIdentityKeyId ? { agentIdentityKeyId: input.agentIdentityKeyId } : {}),
-      agentConfigRevision: input.agentConfigRevision,
+      // Every save mints a new revision row (id + createdAt), even a save of a
+      // label or a lifecycle timer. The configuration that row describes is
+      // already fingerprinted by content in the categories below, so its
+      // bookkeeping is not session identity (#20853).
+      ...(legacy ? { agentConfigRevision: input.agentConfigRevision } : {}),
     },
     adapterConfig: input.effectiveAdapterConfig,
     agentRuntimeConfig: input.agentRuntimeConfig,
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
     workspaceConfig,
-    environment: input.environment,
+    environment: legacy ? input.environment : environmentForSessionFingerprint(input.environment),
     envBindings: {
       environment: { env: input.environmentEnv },
       project: { env: input.projectEnv },
@@ -2881,6 +2912,12 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   runtimeSkills: unknown;
   agentConfigRevision?: unknown;
   agentIdentityKeyId?: string;
+  /**
+   * Compute the pre-#20853 shape (revision bookkeeping, environment timestamp
+   * and lifecycle timers included). Session preparation accepts a session
+   * saved under it as compatible, so the upgrade itself resets nothing.
+   */
+  legacyFingerprintShape?: boolean;
 }): Promise<EffectiveRunSessionConfigMetadata> {
   const secretManifest = input.secretManifest ?? [];
   const instructions = input.managedInstructions ? {
@@ -2895,6 +2932,11 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
   // to warm still starts a new session.
   if (input.adapterType === "paperclip_runner" && effectiveAdapterConfig.lifecycleMode === undefined) {
     effectiveAdapterConfig.lifecycleMode = "per_turn";
+  }
+  // The idle window only says how long a warm runner waits before it is torn
+  // down; the lifecycle mode above stays part of the identity (#20853).
+  if (input.adapterType === "paperclip_runner" && !input.legacyFingerprintShape) {
+    delete effectiveAdapterConfig.idleTimeoutMs;
   }
   if (input.managedInstructions && !input.retainManagedInstructionPaths) {
     delete effectiveAdapterConfig.instructionsRootPath;
@@ -2926,6 +2968,7 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     runtimeSkills: versionedSkills(input.runtimeSkills),
     agentConfigRevision: input.agentConfigRevision ?? null,
     agentIdentityKeyId: input.agentIdentityKeyId,
+    legacyFingerprintShape: input.legacyFingerprintShape,
   });
   const fingerprints = createEffectiveRunConfigFingerprints({
     session: categoryValues,
