@@ -61,7 +61,7 @@ describe("judge: Stop-pending remains a person's visible durable obligation", ()
    const recovery=recoveryService(db,{enqueueWakeup});
    await recovery.reconcileStrandedAssignedIssues();
    expect(await claimNativeSessionResumptions({db,runnerInstanceId:"judge-recovery",runIds:[f.runId]})).toEqual([]);
-   expect(await claimNativeRestartRecoveries({db,runIds:[f.runId]})).toEqual([]);
+   expect(await claimNativeRestartRecoveries({db,runIds:[f.runId],restartKind:"hard"})).toEqual([]);
    expect((await recovery.sweepStaleIssueLocks()).cleared).toBe(0);
   }
   expect(enqueueWakeup).not.toHaveBeenCalled();
