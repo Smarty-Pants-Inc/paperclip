@@ -15,7 +15,7 @@ async function functionStatements(path: string) {
     .filter(statement => FUNCTIONS.some(name => statement.includes(`CREATE OR REPLACE FUNCTION ${name}(`))).join(";\n");
 }
 
-(support.supported ? describe : describe.skip)("#20805 connector runtime company lock migration (0489)", () => {
+(support.supported ? describe : describe.skip)("#20805 connector runtime company lock migration (0491)", () => {
   it("replaces two function bodies without touching revision rows; the DOWN restores the 0354 bodies", async () => {
     const database = await startEmbeddedPostgresTestDatabase("connector-runtime-company-lock-");
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
@@ -44,7 +44,7 @@ async function functionStatements(path: string) {
       expect(await revisions()).toEqual(seeded);
 
       // UP over the previous bodies: identical to the migrated head, no row changes.
-      const up = await read("./migrations/0489_connector_runtime_company_lock.sql");
+      const up = await read("./migrations/0491_connector_runtime_company_lock.sql");
       await sql.unsafe(up);
       expect(await definitions()).toEqual(head);
       expect(await revisions()).toEqual(seeded);
@@ -57,7 +57,7 @@ async function functionStatements(path: string) {
       expect(await definitions()).toEqual(head);
       expect(await revisions()).toEqual(settled);
       // DOWN: exactly the previous bodies, no row changes.
-      await sql.unsafe(await read("./migration-rollbacks/0489_connector_runtime_company_lock.down.sql"));
+      await sql.unsafe(await read("./migration-rollbacks/0491_connector_runtime_company_lock.down.sql"));
       expect(await definitions()).toEqual(previous);
       expect(await revisions()).toEqual(seeded);
 
