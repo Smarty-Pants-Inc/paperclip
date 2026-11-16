@@ -10,6 +10,7 @@ import {
 import type { CreateToolConnection } from "@paperclipai/shared";
 import { toolAccessService } from "../../services/tool-access.js";
 import { toolAccessRoutes } from "../../routes/tool-access.js";
+import { projectRoutes } from "../../routes/projects.js";
 import { errorHandler } from "../../middleware/index.js";
 import type { ActorInfo } from "../../services/tool-access/types.js";
 import { connectionManagementService } from "../../services/connection-management.js";
@@ -112,7 +113,7 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
         : { type: "agent", companyId, agentId: who, source: "agent_key", onBehalfOfUserId: human, onBehalfOfMemberships: [{ companyId, membershipRole: "owner", status: "active" }] };
       next();
     });
-    app.use("/api", toolAccessRoutes(db)); app.use(errorHandler); return app;
+    app.use("/api", toolAccessRoutes(db)); app.use("/api", projectRoutes(db)); app.use(errorHandler); return app;
   };
   return { companyId, human, primary, leadA, leadB, worker, outsider, a, b, secret: secret!, scope, config, input, actor, management, seedConnection, run, route, service: toolAccessService(db), addAgent };
 }
