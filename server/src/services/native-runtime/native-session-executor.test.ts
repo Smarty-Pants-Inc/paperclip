@@ -14666,6 +14666,12 @@ describe("native warm session supervision", () => {
         // Released while the entry is still busy: no admission attaches meanwhile.
         expect(busyAtRelease).toBe("present");
         expect(close).not.toHaveBeenCalled();
+        // Pair-less guard (binding condition 09:14Z): exactly one release, the
+        // released-to-idle fact, also once the owner has settled to idle.
+        await new Promise(resolve => setTimeout(resolve, 0));
+        expect(release).toHaveBeenCalledOnce();
+        expect(close).not.toHaveBeenCalled();
+        expect(readNativeSessionIdleWork()).toBe("present");
       } else {
         expect(release).not.toHaveBeenCalled();
       }
@@ -21476,6 +21482,98 @@ describe("runnerd provider runtime wiring", () => {
         registerRunStartHandover(null);
         allowRelease(); allowPhysicalStop(); await execute.catch(() => undefined); await closeIdleWarmNativeSessionsForRestart(); owners.mockRestore();
         if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
+      }
+    });
+
+  // #20825 primary fix, binding condition (review-fleet-2 09:14Z, RFL 09:15Z):
+  // releaseWarmNativeSession's released-to-idle release() is only for a warm
+  // owner WITHOUT a release/resume pair. A pair owner's release belongs to its
+  // turn-end finishRelease (reconciliation deadline + source proofs); when that
+  // release errored or stayed unconfirmed its entry.released stays false, and
+  // the warm release must never issue a second release/suspend outside those
+  // protections. The failed=false caller a retained owner reaches here is the
+  // retained board Stop (retainCancelledSession), so the Pi session is bound to
+  // a v1 plugin release/resume pair owner, the same WeakMap the turn end reads.
+  it.each(["pair, turn-end release errored", "pair, turn-end release unconfirmed", "pair-less"] as const)(
+    "gives only a pair-less warm owner the released-to-idle release outside its turn-end reconciliation: %s", async mode => {
+      await closeIdleWarmNativeSessionsForRestart();
+      const pair = mode !== "pair-less";
+      const name = `pair-guard-${mode.replace(/[^a-z]+/g, "-")}`;
+      const current = { ...execution, provider: { kind: "pi_rpc", model: "provider/model" },
+        binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
+        session: { ...execution.session, driverKind: "pi_rpc",
+          normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+      } as NativeExecutionInputV1;
+      const release = vi.fn(async (): Promise<false> => {
+        if (mode === "pair, turn-end release errored") throw new Error("fixture lost release reply");
+        return false;
+      });
+      const close = vi.fn(async () => {});
+      const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
+      const session = { close, cancel, release, snapshot: vi.fn(async () => ({ identity: {
+        ...current.binding, sessionId: current.session.normalizedSessionId,
+      }, activeTurnId: null, pendingRuntimeRequests: [] })) };
+      const owners = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner");
+      const task = vi.fn(async (_operation: unknown) => ({ kind: "description", taskId: "pair-task",
+        launchPreparationVersion: 1, projectAuthCheckVersion: 1, warmTaskVersion: 1, releaseResumeVersion: 1,
+        runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } }));
+      const home = await mkdtemp(join(tmpdir(), "pair-guard-account-"));
+      await writeFile(join(home, "auth.json"), JSON.stringify({ OPENAI_API_KEY: "synthetic-fixture" }), { mode: 0o600 });
+      const runResultJson: Record<string, unknown> = {};
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      let opened!: () => void, end!: () => void;
+      const ready = new Promise<void>(resolve => { opened = resolve; });
+      const ended = new Promise<void>(resolve => { end = resolve; });
+      let retained: boolean | undefined;
+      let running: Promise<unknown> | undefined;
+      try {
+        if (pair) {
+          const owner = scopedNativeExecution(`${name}-owner`);
+          owner.session.lifecyclePolicy = { mode: "warm", idleTimeoutMs: 300_000 };
+          const backend = await createRunnerdBackend({ db: leaseDb(owner), execution: owner, runnerInstanceId: "runner",
+            runnerIngressAuthorized: true, runnerEnvironment: {}, managedAiCredentialHome: home,
+            managedAiCredentialIdentity: "revision", managedAiAccountIdentity: "account",
+            runnerExecutionTarget: { kind: "remote", transport: "sandbox", leaseId: "lease", remoteCwd: ".", runnerTask: task } as never });
+          backend.bindManagedSession(session as never, { releaseResumeOnly: true });
+          // The owner has a release/resume pair (plugin-runner-task.ts releaseResume).
+          expect(owners.mock.results.at(-1)!.value.driver.releaseResume).toBeDefined();
+          // Its turn-end release already ran and errored or stayed unconfirmed.
+          await Promise.resolve().then(() => session.release()).catch(() => undefined);
+          expect(release).toHaveBeenCalledOnce();
+        }
+        const event = (eventType: PrpEvent["eventType"]): PrpEvent => ({ schema: "paperclip.prp.event.v1",
+          sourceEventId: `${name}:${eventType}`, sourceSeq: 1, sourceInstanceId: name, sourceKind: "runner",
+          runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!, turnId: "stopped-turn",
+          eventType, schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} });
+        state.execute.mockReset().mockImplementationOnce(async options => {
+          await options.onSession(session);
+          opened(); await ended;
+          retained = await options.retainCancelledSession({ session, signal: new AbortController().signal,
+            terminalEvent: event("turn.cancelled") });
+          throw new Error("native_finalization_missing: session returned no semantic result");
+        });
+        running = executePaperclipNativeSession({ db: leaseDb(current, {}, runResultJson, updates), execution: current,
+          runnerInstanceId: name }).catch(error => error);
+        const persistence = cancellationDb({ runId: current.binding.runId,
+          resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
+        await Promise.race([ready, running.then(error => { throw error; })]);
+        await expect(cancelNativeSession(current.binding.runId, "Board Stop", { db: persistence.db, scope: "run" }))
+          .resolves.toMatchObject({ dispatched: true });
+        Object.assign(runResultJson, persistence.getResultJson());
+        end();
+        const outcome = await running;
+        if (!(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
+        // The owner is retained and handed back by releaseWarmNativeSession(failed=false).
+        expect(retained).toBe(true);
+        expect(close).not.toHaveBeenCalled();
+        expect(readNativeSessionIdleWork()).toBe("present");
+        // Pair owner: no second release; pair-less owner: exactly one, the released-to-idle fact.
+        expect(release).toHaveBeenCalledOnce();
+        // Never a suspend through the pair either.
+        expect(task.mock.calls.map(([operation]) => (operation as { kind: string }).kind)).toEqual(pair ? ["describe"] : []);
+      } finally {
+        end(); await running; await closeIdleWarmNativeSessionsForRestart(); owners.mockRestore();
+        await rm(home, { recursive: true, force: true });
       }
     });
 
