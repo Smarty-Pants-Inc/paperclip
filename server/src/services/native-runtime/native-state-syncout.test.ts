@@ -271,7 +271,7 @@ describe("native session state syncOut under a recovery deadline", () => {
     } finally {
       release();
       // The abandoned transfer's staging is fenced, so its late write is refused.
-      await transfer?.catch(() => undefined);
+      await transfer?.then(() => expect.fail("late worker wrote state bytes; expected ENOTDIR at the staging transfer fence")).catch(error => { const failure = error as NodeJS.ErrnoException; const fencePath = dirname(targets[0]!); if (failure?.code !== "ENOTDIR" || failure.path !== fencePath) throw error; expect(failure.code).toBe("ENOTDIR"); expect(failure.path).toBe(fencePath); expect(fencePath).toMatch(/\/paperclip-native-state-[^/]+\/transfer$/); });
       await vi.advanceTimersByTimeAsync(0);
     }
     expect(targets.length).toBeGreaterThan(0);
