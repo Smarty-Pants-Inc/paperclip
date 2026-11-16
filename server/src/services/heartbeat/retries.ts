@@ -1,4 +1,5 @@
-import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
+import { boundRunIssueId } from "../run-task-binding.js";
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot, requiresProjectConnectionRunContext } from "../project-connection-run-context.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
@@ -903,7 +904,17 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
-        const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        // Pre-seam null-purpose retry records may retain an already deleted
+        // historical task hint. They have no project authority to preserve;
+        // do not invent a pair or change their existing retry semantics. Once
+        // ownership/pair/conflicting binding exists, missing task is fatal.
+        const snapshotTaskId = boundRunIssueId({ issueId, contextSnapshot: retryContextSnapshot });
+        const [boundTask] = snapshotTaskId ? await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, run.companyId), eq(issues.id, snapshotTaskId),
+        )) : [];
+        const legacyMissingTask = Boolean(snapshotTaskId && !boundTask
+          && !await requiresProjectConnectionRunContext(tx, run.companyId, run.id));
+        const admissionSnapshot: Record<string, unknown> = legacyMissingTask ? {} : await projectConnectionAdmissionSnapshot(tx, {
           companyId: run.companyId, agentId: run.agentId, issueId, contextSnapshot: retryContextSnapshot,
         });
         // All automatic failure paths share the same predecessor claim. A
@@ -1305,7 +1316,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
-        await captureProjectConnectionRunContext(tx, {
+        if (!legacyMissingTask) await captureProjectConnectionRunContext(tx, {
           companyId: run.companyId, agentId: run.agentId, heartbeatRunId: scheduledRun.id,
         });
         let detachWorkspaceFromIssue = false;
