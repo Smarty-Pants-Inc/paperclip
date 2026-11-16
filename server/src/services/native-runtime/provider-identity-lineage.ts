@@ -234,12 +234,20 @@ export async function appendProviderIdentityReset(db: Db, input: {
   runId: string | null;
   recordedAt?: Date;
   consumePending?: PendingProviderIdentityBreak;
+  /**
+   * Called once, after commit, only when THIS call wrote a new record (the
+   * person-visible line, #20853). An idempotent retry of the newest step is
+   * not a new record. A failing callback never undoes or refuses the record.
+   */
+  onRecorded?: (record: ProviderIdentityResetRecord) => Promise<void> | void;
 }): Promise<ProviderIdentityResetRecord> {
   if (!identityPresent(input.previousIdentity) || !identityPresent(input.identity)
     || canonical(input.previousIdentity) === canonical(input.identity)) {
     throw new Error("provider_identity_reset_identity_invalid");
   }
-  return editLockedLineage(db, input.scope, conversation => {
+  let created = false;
+  const written = await editLockedLineage(db, input.scope, conversation => {
+    created = false;
     const records = (Array.isArray(conversation.providerIdentityResets) ? conversation.providerIdentityResets : [])
       .filter((value): value is ProviderIdentityResetRecord => scopedRecord(value, input.scope));
     const newest = records.reduce<ProviderIdentityResetRecord | null>(
@@ -272,8 +280,13 @@ export async function appendProviderIdentityReset(db: Db, input: {
     };
     const kept = [...records, record].sort((left, right) => left.generation - right.generation)
       .slice(-PROVIDER_IDENTITY_RESET_LIMIT);
+    created = true;
     return { next: { ...(consumes ? withoutPending() : conversation), providerIdentityResets: kept }, result: record };
   });
+  if (created) {
+    try { await input.onRecorded?.(written); } catch { /* the record is durable; the line is best effort */ }
+  }
+  return written;
 }
 
 /**
@@ -344,6 +357,8 @@ export async function recordedProviderIdentityTransitionIsAllowed(input: {
   current: unknown;
   /** The box whose state was read. */
   providerLeaseId?: string | null;
+  /** Passed to appendProviderIdentityReset: a NEW record only (#20853). */
+  onRecorded?: (record: ProviderIdentityResetRecord) => Promise<void> | void;
 }): Promise<boolean> {
   if (!identityPresent(input.previous) || !identityPresent(input.current)) return false;
   const lineage = await readProviderIdentityLineage(input.db, input.scope);
@@ -358,7 +373,7 @@ export async function recordedProviderIdentityTransitionIsAllowed(input: {
   if (!end || !identityPresent(end.identity)) return false;
   try {
     await appendProviderIdentityReset(input.db, { scope: input.scope, previousIdentity: end.identity,
-      identity: input.current, reason: pending.reason, runId: pending.runId,
+      identity: input.current, reason: pending.reason, runId: pending.runId, onRecorded: input.onRecorded,
       ...(lineage.pending ? { consumePending: lineage.pending } : {}) });
     if (samePendingBreak(pendingProviderIdentityBreak(input.scope), pending)) pendingProviderIdentityBreaks.delete(pendingKey(input.scope));
   } catch {

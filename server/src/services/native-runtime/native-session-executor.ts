@@ -7785,6 +7785,14 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+import { providerIdentityResetLine } from "./provider-identity-reset-notice.js";
+
+/**
+ * Per run that asked for the fresh-session chat-history handoff: whether it
+ * got one (#20853). A run that never asked, or one this process no longer
+ * remembers, is unknown and the new-thread line makes no history claim.
+ */
+const freshSessionHandoffOutcomes = new Map<string, boolean>();
 export { HELD_PREDECESSOR_NOTICE };
 // The refusals that hold a conversation behind its unfinished predecessor:
 // the prior-owner fences (including the legacy migration fence), the
@@ -13016,7 +13024,16 @@ async function executePaperclipNativeSessionAttempt(
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
             getFreshSessionHandoff: input.getFreshSessionHandoff
-              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
+              ? async () => {
+                const handoff = await controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!);
+                // The new-thread line (#20853) says history was carried only when it was.
+                // Bounded: an entry is normally removed when this run's backup is published.
+                if (freshSessionHandoffOutcomes.size >= 1_000) {
+                  freshSessionHandoffOutcomes.delete(freshSessionHandoffOutcomes.keys().next().value!);
+                }
+                freshSessionHandoffOutcomes.set(input.execution.binding.runId, Boolean(handoff));
+                return handoff;
+              } : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt
@@ -18524,6 +18541,11 @@ async function createRunnerdBackendWithinSessionClaim(
         previous: previousManifest.providerSessionIdentity,
         current: providerSessionIdentity,
         providerLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? null,
+        // The ONE person-visible line: only for a NEW record, i.e. the provider
+        // identity actually changed (never on configFreshness.reset) (#20853).
+        onRecorded: record => input.onLog?.("stdout", providerIdentityResetLine(record, {
+          carriedHistory: record.runId === null ? null : freshSessionHandoffOutcomes.get(record.runId) ?? null,
+        })),
       }))
     ) {
       throw new Error("runner_harness_state_mismatch: provider_identity_changed");
@@ -19323,6 +19345,7 @@ async function createRunnerdBackendWithinSessionClaim(
                 await clearProviderIdentityBreak(input.db, providerIdentityLineageScope(input.execution)).catch(async () => {
                   await input.onLog?.("stderr", "[paperclip-runner] the pending provider-thread note could not be cleared after the backup.\n");
                 });
+                freshSessionHandoffOutcomes.delete(input.execution.binding.runId);
                 await publishNativeHarnessBackup({
                   db: input.db, companyId: input.execution.binding.companyId,
                   scopeDigest: createHash("sha256").update(sessionScopeId).digest("hex"), backupRoot, pendingRoot,
