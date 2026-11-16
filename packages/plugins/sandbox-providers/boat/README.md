@@ -80,18 +80,21 @@ Two hourly limits bound what spares can cost (smarty-dev#20869):
   of this worker's ledger and Boat's inventory of `purpose=spare` boxes created
   in the last hour (which survives worker restarts); proofs of use are this
   worker's, so after a restart a used box counts again until it leaves the hour.
-- **Absolute ceiling, `createCeilingPerHour` (default 60, 1-1000).** Company
-  plugin setting holding ALL creates, spare and run, used or not. At the
-  ceiling the spare refill stops and an ordinary run create is refused before
-  any request to Boat. 60 fits a 50-task burst: one run box per task (claimed
-  spare or cold) plus at most five spares is 55.
+- **Spare-only ceiling, `createCeilingPerHour` (default 60, 1-1000).** Company
+  plugin setting counting ALL creates, spare and run, used or not. At the
+  ceiling the spare refill stops, but an ordinary run create is always
+  admitted and counted, even above the ceiling (RFL ruling A). A person's run
+  must not be left unanswered by a create-cap refusal. 60 fits a 50-task burst:
+  one run box per task (claimed spare or cold) plus at most five spares is 55.
 
-At each refusal the plugin logs an info-level `[boat] create_capped reason=...`
-event (`reason` is `churn_cap` or `ceiling`) with the company, environment,
-counts and refusal counter as structured fields (repeated at most once a
-minute per pool and reason; the counter counts every refusal). While a refusal
-holds, the health message names it (`create_capped reason=...`) and its
-`details.createCapped` lists it; health is `degraded` while the ceiling holds.
+At each spare refusal or over-ceiling run create the plugin logs an info-level
+`[boat] create_capped reason=...` event (`reason` is `churn_cap` or `ceiling`)
+with `kind=spare|run`, the company, environment, counts and refusal/over-ceiling
+counter as structured fields (repeated at most once a minute per pool and
+reason; the counter counts every refusal and every over-ceiling run). While
+that reason holds, the health message names it (`create_capped reason=...`)
+and its `details.createCapped` lists it; health is `degraded` while the ceiling
+holds, including when an over-ceiling run is admitted.
 A cold acquire during a refusal records the outcome reason `create_capped`. A provider-side Boat TTL is applied at create and refreshed when less
 than half remains (maintenance checks every 15 seconds); if the plugin worker
 dies, Boat auto-stops the spare when that TTL expires. The immutable expiry

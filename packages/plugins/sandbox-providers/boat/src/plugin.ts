@@ -1157,7 +1157,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       await maintainReadySpares(true);
       const totals = acquireOutcomeTotals();
       const status = checked ? `Boat resident status probes passed for ${checked} bound leases (not live Boat qualification).` : "Boat sandbox provider healthy";
-      // While a create is refused, health names it (create_capped). The churn
+      // While a spare is refused or a run is over ceiling, health names it (create_capped). The churn
       // cap only delays spares (runs still create cold), so it stays ok; the
       // absolute ceiling refuses run creates too, so it reports degraded.
       const caps = createCapHealth();
@@ -1286,13 +1286,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
       if (shuttingDown) throw new Error("Boat provider is shutting down");
-      // The absolute hourly ceiling holds run creates too; nothing is sent to Boat.
-      const admission = readySpares.admitRunCreate(params.companyId, params.environmentId);
-      if (!admission.admitted) {
-        const { refusal } = admission;
-        throw new Error(`Boat create_capped: reason=${refusal.reason}; ${refusal.allCreates} of ${refusal.ceiling} Boat creates this hour`
-          + ` for this company (createCeilingPerHour); retry after ${refusal.cappedUntil}.`);
-      }
+      // Runs always proceed; the spare-only ceiling still counts and reports them.
+      readySpares.admitRunCreate(params.companyId, params.environmentId);
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
