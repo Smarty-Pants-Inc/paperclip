@@ -621,12 +621,29 @@ export async function persistHeartbeatRunProcessMetadata(
   const startedAt = new Date(observedStartedAt ?? meta.startedAt);
   const processStartedAt = Number.isNaN(startedAt.getTime()) ? new Date() : startedAt;
   return db.transaction(async tx => {
+    // Lock the row as the identity UPDATE below would (no key update, so no
+    // foreign-key waits), so a concurrent terminal write cannot interleave.
     const [binding] = await tx
-      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId })
+      .select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
+        nativePhase: heartbeatRuns.nativePhase, processPid: heartbeatRuns.processPid,
+        processStartedAt: heartbeatRuns.processStartedAt })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, runId))
-      .limit(1);
+      .limit(1)
+      .for("no key update");
     if (!binding) return null;
+    // A finished run keeps the identity of the process that ran it. A later
+    // relaunch by a retained owner must not rewrite it or bump updated_at (#20825).
+    // Still recorded: a terminal run's first or completing identity (a spawn
+    // that lands after a Stop is what stop proof waits for), and a native run
+    // failed as retryable, whose same-run retry relaunches under this run.
+    if (isHeartbeatRunTerminalStatus(binding.status) && binding.nativePhase !== "retryable_failure"
+      && binding.processPid !== null && binding.processStartedAt !== null) {
+      logger.warn({ runId, status: binding.status, processPid: meta.pid, targetKind: meta.targetKind,
+        code: "heartbeat_run_process_identity_terminal_refused" },
+      "heartbeat_run_process_identity_terminal_refused: process identity not recorded for a terminal run");
+      return null;
+    }
     // One UPDATE writes the identity and reserves the event sequence. Updating
     // the row twice here re-checks its foreign keys and can wait behind (or
     // deadlock with) any transaction holding the agent, issue, or predecessor
