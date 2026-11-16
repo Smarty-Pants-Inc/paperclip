@@ -9105,6 +9105,14 @@ async function releaseWarmNativeSession(
   // A late completion or cleanup callback from an older execution must never
   // release a replacement that has since claimed the same logical session.
   if (!entry || entry.ownerToken !== ownerToken) return;
+  if (!failed && entry.closeOnReleaseReason === undefined && !entry.released) {
+    // #20825: tell the retained owner the server released it to idle, while it
+    // is still busy here so no admission can attach to it meanwhile. A Runner
+    // without a release/resume pair suspends nothing; it only records the fact
+    // that lets its idle runner's exit stand down instead of relaunching.
+    await Promise.resolve().then(() => entry.session.release?.()).catch(() => undefined);
+    if (warmNativeSessions.get(sessionId) !== entry || entry.ownerToken !== ownerToken) return;
+  }
   entry.busy = false;
   entry.lastActivityAt = new Date().toISOString();
   if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
