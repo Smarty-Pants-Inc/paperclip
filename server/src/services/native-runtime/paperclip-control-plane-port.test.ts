@@ -1270,6 +1270,72 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
   });
 
+  describe("only the run's own ids are skipped; shaped secrets stay masked (redact-meta4)", () => {
+    const openPort = async (material: (ids: { agentId: string; runId: string }) => string[]) => {
+      const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+      const runnerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+        status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+        runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+        contextSnapshot: { issueId: identity.issueId } });
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `redact-meta4-${identity.runId}` },
+      { runSecretMaterial: material(identity) });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      const event = (seq: number, eventType: "item.delta" | "item.completed", text?: string): PrpEvent => ({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:${seq}`, sourceSeq: seq,
+        sourceInstanceId: runnerId, sourceKind: "runner", runId: identity.runId, normalizedSessionId: identity.sessionId,
+        turnId: `turn-${identity.agentId}`, itemId: `item-${identity.agentId}`, eventType, priority: eventType === "item.delta" ? 1 : 0,
+        emittedAt: new Date(Date.UTC(2026, 10, 16, 0, 0, seq)).toISOString(),
+        payload: eventType === "item.delta" ? { itemId: `item-${identity.agentId}`, kind: "commandExecution", text: text ?? "" } : { itemId: `item-${identity.agentId}` },
+      } as PrpEvent);
+      const rows = async () => db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      return { identity, port, event, rows };
+    };
+    const outputText = (rows: Array<{ payload: unknown }>) => rows.map(row => (row.payload as any).prpEvent).map(event => (event.payload.text ?? "") +
+      ((event.payload.outputTails ?? []) as any[]).map(tail => tail.payload.text ?? "").join("")).join("");
+
+    it("(1)(2) UUID-, host-, region-shaped and 9-digit secrets are masked in output; the agent-id secret and metadata stay byte-equal", async () => {
+      const uuidKey = randomUUID(); // test-only: a bare-UUID API key that is no id of this run
+      const host = "k7q2-tenant.vault-proxy.example.net";
+      const region = "us-west-2";
+      const pin = "482916375";
+      const { identity, port, event, rows } = await openPort(ids => [uuidKey, host, region, pin, ids.agentId]);
+      const ordinary = `agent ${identity.agentId} run ${identity.runId}\ntook 1763297669123 ms; id 1${pin}0; count 12345678\n`;
+      const sent = [event(1, "item.delta", `${ordinary}key ${uuidKey}\n`), event(2, "item.delta", `host ${host} region ${region} pin ${pin}\n`),
+        event(3, "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      const persisted = await rows();
+      expect(persisted.map(row => row.sourceEventId)).toEqual(sent.map(value => value.sourceEventId));
+      for (const [index, row] of persisted.entries()) {
+        const committed = (row.payload as any).prpEvent;
+        for (const key of Object.keys(sent[index]!).filter(key => key !== "payload" && key !== "debug")) {
+          expect(JSON.stringify(committed[key])).toBe(JSON.stringify((sent[index] as any)[key]));
+        }
+        expect(row.sourcePayloadSha256).toBe(nativeSha256(committed));
+      }
+      const text = outputText(persisted);
+      expect(text.startsWith(ordinary)).toBe(true);
+      for (const secret of [uuidKey, host, region, ` ${pin}`]) expect(text.includes(secret)).toBe(false);
+      expect(JSON.stringify(persisted.map(row => row.payload)).includes(uuidKey)).toBe(false);
+    });
+
+    it("(3) checkpointSession checks the binding before redaction, keeps identity byte-equal and masks a UUID-shaped secret", async () => {
+      const uuidKey = randomUUID();
+      const agentId = CONTROL_PLANE_CONFORMANCE_OPEN.identity.agentId;
+      // A secret that occurs inside the agent id but is not an id itself.
+      const fragment = agentId.slice(0, 13);
+      const { identity, port } = await openPort(() => [uuidKey, fragment]);
+      await port.checkpointSession({ backendKind: "mock", sessionId: identity.sessionId, identity,
+        semanticResult: { ...CONTROL_PLANE_CONFORMANCE_RESULT, summary: `used key ${uuidKey}` } });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, identity.runId));
+      const saved = JSON.stringify(run!.runnerProfileJson);
+      expect(saved.includes(uuidKey)).toBe(false);
+      expect(saved).toContain(JSON.stringify(identity.agentId));
+      expect(saved).toContain("used key ***REDACTED***");
+    });
+  });
+
   it("runs the unchanged package conformance suite against Paperclip persistence", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const committedEventIds: string[] = [];
