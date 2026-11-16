@@ -207,3 +207,21 @@ describe("Pi admission budget sharing beyond the open path's private exchanges (
     await expect(f.open()).resolves.toBeDefined();
   });
 });
+
+// F6: host-local broker revocation/creation is accounted INSIDE the same
+// wall-clock budget (it guards the facade's 30 s receive wait), and is
+// therefore bounded by its remaining time instead of overrunning it.
+describe("Pi admission budget bounds host-local broker work (F6)", () => {
+  it("a slow broker creation is cut at the budget and the late broker is still revoked", async () => {
+    const f = await fixture(); const session = await f.released();
+    const before = { created: knobs.created, closed: knobs.closed };
+    knobs.createDelayMs = BUDGET_MS + 800;
+    const { error, elapsedMs } = await elapsed(session.attachRun({ runId: "run-b" }));
+    expect(error).toMatchObject({ code: "pi_admission_deadline_exceeded", timeoutCode: "pi_admission_deadline_exceeded" });
+    expect(elapsedMs).toBeLessThan(BUDGET_MS + 300);
+    expect(f.commands.filter(command => command.type === "bind")).toEqual([]);
+    // The broker that arrives after the deadline is owned and closed, never leaked.
+    await vi.waitFor(() => expect(knobs.created - before.created).toBe(1), { timeout: 3000 });
+    await vi.waitFor(() => expect(knobs.closed - before.closed).toBe(knobs.created - before.created), { timeout: 3000 });
+  });
+});
