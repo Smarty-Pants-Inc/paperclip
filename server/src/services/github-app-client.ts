@@ -92,7 +92,7 @@ export function githubAppJwt(appId: string, privateKey: string, now = Date.now()
   signer.update(`${header}.${body}`);
   return `${header}.${body}.${signer.sign(key).toString("base64url")}`;
 }
-export type AppCredential = { token: string; expiresAt: number; github: NonNullable<Metadata> };
+export type AppCredential = { token: string; expiresAt: number; github: NonNullable<Metadata>; verifiedRegistrationId?: string }; 
 
 const providerId = z.number().int().positive().safe();
 const appSchema = z.object({ id: providerId, client_id: z.string().optional(), slug: z.string().regex(/^[a-z0-9-]+$/) });
@@ -160,7 +160,7 @@ export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Dat
       if (page === 6) githubAppFailure("repositories");
     }
     if (new Set(repositories.map(r => r.fullName.toLowerCase())).size !== config.repositories.length) githubAppFailure("repositories");
-    return { token: minted.token, expiresAt, github: {
+    return { token: minted.token, expiresAt, verifiedRegistrationId: String(app.id), github: {
       userId: String(bot.id), login: bot.login, appSlug: app.slug,
       installationCount: 1, repositoryCount: repositories.length, repositorySelection: "selected",
       installationIds: [config.installationId], installationOwnerLogins: [installation.account.login], repositories,

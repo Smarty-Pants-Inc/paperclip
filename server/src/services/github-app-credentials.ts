@@ -1,7 +1,8 @@
 import { and, eq, sql } from "drizzle-orm";
-import { connectionGrants, toolConnections, toolConnectionInstalls, type Db } from "@paperclipai/db";
-import { resolveConnectionGrantSecret } from "./connection-credentials.js";
+import { connectionGrants, toolConnections, toolConnectionInstalls, projectWorkspaces, type Db } from "@paperclipai/db";
+import { resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership } from "./connection-credentials.js";
 import { unprocessable } from "../errors.js";
+import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
 
 export { isGitHubAppConnection, parseGitHubAppConfig } from "./github-app-client.js";
@@ -41,8 +42,29 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const [c] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id)));
     const [g] = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.id, grant.id)));
     if (!c || !g || !isGitHubAppConnection(c) || g.connectionId !== c.id || !matchesOwnership(c, g) || g.kind !== grant.kind || g.subjectUserId !== grant.subjectUserId
-      || c.credentialPolicy !== connection.credentialPolicy || g.subjectAgentId !== grant.subjectAgentId || g.status !== "active" || (allowDraft ? c.status !== "draft" : (!c.enabled || c.status !== "active"))
-      || JSON.stringify(c.config) !== JSON.stringify(connection.config) || JSON.stringify(g.credentialSecretRefs) !== JSON.stringify(grant.credentialSecretRefs)) githubAppFailure();
+      || c.projectId !== connection.projectId || c.credentialPolicy !== connection.credentialPolicy || g.subjectAgentId !== grant.subjectAgentId || g.status !== "active" || (allowDraft ? c.status !== "draft" : (!c.enabled || c.status !== "active"))
+      || JSON.stringify(c.config) !== JSON.stringify(connection.config)
+      || JSON.stringify(c.credentialSecretRefs) !== JSON.stringify(connection.credentialSecretRefs)
+      || JSON.stringify(g.credentialSecretRefs) !== JSON.stringify(grant.credentialSecretRefs)) githubAppFailure();
+    if (c.projectId) {
+      const scope = readProjectConnectionScope(c);
+      const config = parseGitHubAppConfig(c.config.methodConfig);
+      if (!scope || c.credentialPolicy !== "shared" || g.kind !== "organization"
+        || scope.installationKey !== `github.com/github-app-installation/${config.installationId}`
+        || (!config.appId.startsWith("Iv") && config.appId !== scope.registrationId)
+        || g.credentialSecretRefs.length !== 1 || c.credentialSecretRefs.length !== 1
+        || c.credentialSecretRefs[0]?.secretId !== g.credentialSecretRefs[0]?.secretId
+        || (c.credentialSecretRefs[0]?.versionSelector ?? "latest") !== (g.credentialSecretRefs[0]?.versionSelector ?? "latest")
+        || g.credentialSecretRefs.some(ref => ref.configPath !== GITHUB_APP_KEY_PATH
+          || !scope.approvedSecretRefs.some(approved => approved.secretId === ref.secretId && approved.configPath === ref.configPath))
+        || c.credentialSecretRefs.some(ref => ref.configPath !== GITHUB_APP_KEY_PATH
+          || !scope.approvedSecretRefs.some(approved => approved.secretId === ref.secretId && approved.configPath === ref.configPath))
+        || (!allowDraft && scope.migrationPending)) githubAppFailure();
+      // Actorless use cannot manufacture management authority; B validates current
+      // approval and recipient reach, while existing finish writers own management.
+      await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
+        targetAgentIds: agentId ? [agentId] : [], proposedSecretRefs: g.credentialSecretRefs });
+    }
     if (!allowDraft) {
       const installs = await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.companyId, c.companyId), eq(toolConnectionInstalls.connectionId, c.id)));
       const targetAgentId = agentId ?? (g.kind === "agent" ? g.subjectAgentId : null);
@@ -60,6 +82,34 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
     const result = await client.acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
     await valid();
+    if (c.projectId) {
+      const currentKey = await validateConnectionGrantSecretOwnership(db, c, g, ref);
+      if (currentKey.latestVersion !== secret.latestVersion) githubAppFailure();
+      const scope = readProjectConnectionScope(c);
+      const config = parseGitHubAppConfig(c.config.methodConfig);
+      const repositories = result.github.repositories ?? [];
+      const ids = repositories.map(repo => Number(repo.id));
+      const workspaces = await db.select({ repoUrl: projectWorkspaces.repoUrl, metadata: projectWorkspaces.metadata }).from(projectWorkspaces).where(and(
+        eq(projectWorkspaces.companyId, c.companyId), eq(projectWorkspaces.projectId, c.projectId),
+      ));
+      const requestedIds = config.repositories.map(name => {
+        const matches = workspaces.filter(workspace => {
+          const url = workspace.repoUrl?.replace(/\.git\/?$/i, "").replace(/\/$/, "").toLowerCase();
+          return url === `https://github.com/${name}`;
+        });
+        const values = [...new Set(matches.map(w => Number(w.metadata?.githubRepositoryId)))];
+        return values.length === 1 ? values[0] : undefined;
+      });
+      if (!scope || !ids.length || ids.some(id => !Number.isSafeInteger(id) || id <= 0 || !scope.approvedRepositoryIds.includes(id))
+        || new Set(ids).size !== ids.length || ids.length !== requestedIds.length
+        || requestedIds.some(id => id === undefined || !ids.includes(id))
+        || repositories.some(repo => repo.installationId !== config.installationId || !config.repositories.includes(repo.fullName.toLowerCase()))
+        || (result.verifiedRegistrationId !== undefined && result.verifiedRegistrationId !== scope.registrationId)
+        || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== config.installationId) githubAppFailure("repositories");
+      await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
+        targetAgentIds: agentId ? [agentId] : [], proposedSecretRefs: g.credentialSecretRefs, proposedRepositoryIds: ids });
+      await valid();
+    }
     return result;
   } catch (error) {
     rethrowGitHubAppFailure(error);

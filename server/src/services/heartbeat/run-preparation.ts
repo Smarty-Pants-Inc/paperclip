@@ -951,13 +951,12 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       ),
     )
     .limit(1);
-  const resolvedInstalledConnections = runIdentity?.activeIdentityContextId
-    ? effective.installedConnections
-    : await filterResolvedGitHubConnectionsForRun({
+  const resolvedInstalledConnections = await filterResolvedGitHubConnectionsForRun({
         db: input.db,
         companyId: input.agent.companyId,
         agentId: input.agent.id,
         responsibleUserId: runIdentity?.responsibleUserId ?? null,
+        heartbeatRunId: input.runId,
         connections: effective.installedConnections,
       });
   const permittedConnectionIds = new Set([
@@ -1523,23 +1522,20 @@ export async function createManagedMcpRunConfig(input: {
       ),
     )
     .limit(1);
-  const resolvedAvailableInstalls = runIdentity?.activeIdentityContextId
-    ? installRows
-        .filter((install) => install.enabled && install.status === "active")
-        .map((install) => ({ id: install.connectionId }))
-    : await filterResolvedGitHubConnectionsForRun({
+  const resolvedAvailableInstalls = await filterResolvedGitHubConnectionsForRun({
         db: input.db,
         companyId: input.agent.companyId,
         agentId: input.agent.id,
         responsibleUserId: runIdentity?.responsibleUserId ?? null,
+        heartbeatRunId: input.runId,
         connections: installRows
           .filter(
             (install) =>
               install.enabled &&
               install.status === "active" &&
-              !["degraded", "failed", "error", "missing_secret"].includes(
+              (Boolean(runIdentity?.activeIdentityContextId) || !["degraded", "failed", "error", "missing_secret"].includes(
                 install.healthStatus,
-              ),
+              )),
           )
           .map((install) => ({
             id: install.connectionId,

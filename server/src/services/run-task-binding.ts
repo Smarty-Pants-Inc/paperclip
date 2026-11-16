@@ -1,4 +1,6 @@
 import { sql } from "drizzle-orm";
+import { isUuidLike } from "@paperclipai/shared";
+import { forbidden } from "../errors.js";
 import { heartbeatRuns } from "@paperclipai/db";
 
 export const runTaskContextColumn = sql<Record<string, unknown>>`jsonb_build_object(
@@ -11,6 +13,15 @@ type RunTaskBinding = {
   issueId?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
 };
+
+/** Credential authority must never choose the first of conflicting stored bindings. */
+export function assertBoundRunIssueId(run: RunTaskBinding): void {
+  const values = [run.nativeIssueId, run.issueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId]
+    .filter(value => value !== undefined && value !== null);
+  if (values.some(value => typeof value !== "string" || !isUuidLike(value)) || new Set(values).size > 1) {
+    throw forbidden("Run task identity is invalid", { code: "project_connection_run_context_invalid" });
+  }
+}
 
 export function boundRunIssueId(run: RunTaskBinding): string | null {
   const values = [run.nativeIssueId, run.issueId, run.contextSnapshot?.issueId, run.contextSnapshot?.taskId];

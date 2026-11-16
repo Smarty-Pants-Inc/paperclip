@@ -1,4 +1,5 @@
 import { isGitHubAppConnection } from "../../github-app-credentials.js";
+import { resolveManagedGitHubIdentitySelection } from "../../git-credentials.js";
 import { nativeProviderCatalogFor } from "../../native-provider-catalogs.js";
 import { restConnectorFor } from "../../connectors/rest-registry.js";
 import { isBrowserUseConnection } from "../../browser-use-client.js";
@@ -172,7 +173,12 @@ export function createConnectionTokenBroker(db: Db, { now, secrets, policySvc, a
         );
       }
 
+      const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
+      const githubSelection = github ? await resolveManagedGitHubIdentitySelection(db, input.companyId, {
+        agentId: input.agentId, heartbeatRunId: input.runId, responsibleUserId: runContext.responsibleUserId,
+      }) : null;
       if (
+        connection.projectId || Boolean(githubSelection?.connection?.projectId) || githubSelection?.error?.startsWith("project_connection_") ||
         isGitHubAppConnection(connection) || (
           runContext.run.activeIdentityContextId &&
           (connection.config.sourceTemplateKey === "github" ||

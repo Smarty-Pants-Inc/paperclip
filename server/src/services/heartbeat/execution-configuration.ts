@@ -23,6 +23,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
+import { readProjectConnectionRunContext, isProjectConnectionManagedRequired } from "../project-connection-run-context.js";
 import { resolveAssignedConnectionInstructionsForRun, resolveMcpConnectionSkillsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { applyMcpConnectionSkills } from "../mcp-skill-runtime.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
@@ -165,7 +166,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     runId: run.id, source: "agent_jwt", onBehalfOfUserId: responsibleUserId === "local-board" ? null : responsibleUserId };
   // Only the persisted agent setting selects this mode, never a task override.
   const agentAdapterConfig = parseObject(agent.adapterConfig);
-  const useAgentGitHubEnv = agentAdapterConfig.githubAuthenticationMode === "agent_env";
+  const requestedAgentGitHubEnv = agentAdapterConfig.githubAuthenticationMode === "agent_env";
+  const runProject = await readProjectConnectionRunContext(db, { companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id });
+  const managedRequired = Boolean(runProject.projectId && await isProjectConnectionManagedRequired(db, {
+    companyId: agent.companyId, projectId: runProject.projectId,
+  }));
   const [mentionedSkills, githubIdentity] = await Promise.allSettled([
     preconfiguredHome || pinnedSkillTest ? Promise.resolve([]) : time("configuration_mentions", () => resolveRunScopedMentionedSkillKeys({
       db,
@@ -174,8 +179,8 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       commentIds: extractWakeCommentIds(context),
       actor: skillActor,
     })),
-    useAgentGitHubEnv ? Promise.resolve({ configured: false as const }) : time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
-      agentId: agent.id, responsibleUserId, allowStandingDelegation: false,
+    time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
+      agentId: agent.id, responsibleUserId, allowStandingDelegation: false, heartbeatRunId: run.id,
     })),
   ]);
   if (mentionedSkills.status === "rejected") throw mentionedSkills.reason;
@@ -186,7 +191,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     !acceptedPlanWakeRoutingDecision?.suppressAcceptedContinuation
       ? [...runScopedMentionedSkillKeys, ACCEPTED_PLAN_CONVERSION_SKILL_KEY]
       : runScopedMentionedSkillKeys;
-  const githubSelection = githubIdentity.value;
+  // C2 and taskless ambiguity engage before agent-env/host/ambient mode choice.
+  const protectedGitHub = managedRequired || Boolean(githubIdentity.value.connection?.projectId)
+    || Boolean(githubIdentity.value.error?.startsWith("project_connection_"));
+  const useAgentGitHubEnv = requestedAgentGitHubEnv && !protectedGitHub;
+  const githubSelection = useAgentGitHubEnv ? { configured: false as const } : githubIdentity.value;
   const useHostGitHub =
     !useAgentGitHubEnv && !githubSelection.configured &&
     trustPreset.kind === "standard" &&
@@ -198,7 +207,8 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     await time("configuration_secrets", () => resolveExecutionRunAdapterConfig({
       managedAiCredentials: Boolean(aiBinding),
       managedGitHubCredentials: !useHostGitHub,
-      agentAdapterConfig,
+      // Do not let the lower env resolver re-enable the persisted agent_env mode.
+      agentAdapterConfig: protectedGitHub ? { ...agentAdapterConfig, githubAuthenticationMode: "managed" } : agentAdapterConfig,
       companyId: agent.companyId,
       agentId: agent.id,
       adapterType: agent.adapterType,

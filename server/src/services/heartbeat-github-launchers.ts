@@ -1,12 +1,41 @@
 import { createHash } from "node:crypto";
-import { buildGitAuthInvocation } from "./git-credentials.js";
+import { buildGitAuthInvocation, resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { heartbeatRuns, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { githubLauncherSource, githubBrokerEnvironment } from "@paperclipai/adapter-utils/github-launcher";
 import { cleanupGitHubOperationLaunchers, githubOperationLauncherDirectory, prepareGitHubOperationLaunchers, prepareGitHubExecutionEnvironment } from "@paperclipai/adapter-utils/execution-target";
 
+type ProjectAuthority = { db: Db; companyId: string };
+
+/** Recheck DB ownership at the actual host/env release boundary, not a stale mode flag. */
+async function protectHeartbeatGitHubMode(input: {
+  runId: string; agentId: string; env: Record<string, string>; projectAuthority?: ProjectAuthority;
+}) {
+  if (!input.projectAuthority) return false;
+  const { db, companyId } = input.projectAuthority;
+  const [run] = await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, input.agentId),
+  ));
+  const selected = await resolveManagedGitHubIdentitySelection(db, companyId, {
+    heartbeatRunId: input.runId, agentId: input.agentId, responsibleUserId: run?.responsibleUserId,
+    allowStandingDelegation: false,
+  });
+  return Boolean(selected.connection?.projectId || selected.error?.startsWith("project_connection_"));
+}
+
 /** Delay only managed, read-only context discovery on concurrent direct runners.
  * The callback returns derived keys, never an old PATH or credential snapshot. */
-export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & { defer: boolean }) {
+export async function prepareHeartbeatGitHubEnvironment(input: Parameters<typeof prepareGitHubExecutionEnvironment>[0] & {
+  defer: boolean; agentId?: string; runId?: string; projectAuthority?: ProjectAuthority;
+}) {
+  if (input.projectAuthority && input.agentId && input.runId
+    && await protectHeartbeatGitHubMode({ ...input, agentId: input.agentId, runId: input.runId })) {
+    if (input.hostCredentials) throw new Error("project_connection_unavailable: Project ownership changed before host credential preparation; restart this run");
+    input = { ...input, hostCredentials: false, env: {
+      ...githubBrokerEnvironment(input.env, { url: "", token: "" }), PAPERCLIP_GITHUB_AUTH_MODE: "managed",
+    } };
+  }
   const remote = input.target?.kind === "remote" && input.target.transport === "sandbox" ? input.target : null;
   if (!input.defer || input.hostCredentials || !remote?.runner || remote.runnerTask || remote.runner.allowConcurrentSyncOperations !== true) {
     return { env: await prepareGitHubExecutionEnvironment(input), prepare: undefined };
@@ -33,6 +62,7 @@ export async function prepareHeartbeatGitHubLaunchers(
   input: LauncherInput & {
     native: boolean;
     githubConfigured: boolean;
+    projectAuthority?: ProjectAuthority;
     agentId: string;
     brokerUrl: string;
     createBrokerToken: () => string;
@@ -45,6 +75,11 @@ export async function prepareHeartbeatGitHubLaunchers(
   prepareLaunchers = prepareGitHubOperationLaunchers,
   cleanupLaunchers = cleanupGitHubOperationLaunchers,
 ) {
+  if (await protectHeartbeatGitHubMode(input)) {
+    input = { ...input, githubConfigured: true, env: {
+      ...githubBrokerEnvironment(input.env, { url: "", token: "" }), PAPERCLIP_GITHUB_AUTH_MODE: "managed",
+    } };
+  }
   if (input.env.PAPERCLIP_GITHUB_AUTH_MODE === "agent_env") {
     // This controller-owned mode receives only this agent's resolved bindings.
     // Keep ambient helper/SSH isolation, but do not mint a managed capability or
