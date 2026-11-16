@@ -23353,10 +23353,28 @@ describe("runnerd provider runtime wiring", () => {
     ["an image swap stopped the retained source and the next run claimed a spare", "none", "matching", false, true, "source_changed_stop"],
     ["an image swap stopped the source but provider work followed the backup", "none", "matching", true, false, "source_changed_stop"],
     ["an image swap stopped the source whose stamp names another backup", "none", "foreign", false, false, "source_changed_stop"],
-  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source" | "source_changed_stop") => {
-    const sourceChangedStop = hold === "source_changed_stop";
+    // The stop intent alone must still name a CHANGED boot source and an ended source run.
+    ["an image-swap stop intent names a source that still matches the current image", "none", "matching", false, false, "source_unchanged_stop"],
+    ["an image-swap stop intent's source run is still running", "none", "matching", false, false, "source_changed_stop_run_active"],
+    // review-fleet-3 F1: the sweep confirms the stop seconds after the swap. The intent
+    // is gone and the receipt carries no reason; the next message (hours later) must
+    // still continue the same thread from the backup, through the confirmed receipt.
+    ["an image swap's stop of the retained source completed before the next run", "stopped", "matching", false, true, "source_changed_stopped"],
+    ["an image swap's stop completed but provider work followed the backup", "stopped", "matching", true, false, "source_changed_stopped"],
+    ["an image swap's stop completed whose stamp names another backup", "stopped", "foreign", false, false, "source_changed_stopped"],
+    // Not this class: a confirmed stop of a source that still matches is an idle
+    // warm source (SMAA-143), restored only under that proof and its claim.
+    ["a confirmed stop of a source that still matches is restored only as an idle warm source", "stopped", "matching", false, true, "source_unchanged_stopped"],
+  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source" | "source_changed_stop" | "source_unchanged_stop" | "source_changed_stop_run_active" | "source_changed_stopped" | "source_unchanged_stopped") => {
+    // Cut A's stop-and-keep of an obsolete source: the pending intent, or the settled
+    // row (released, bound stop-and-retain receipt, no intent, reuse scope intact).
+    const sourceChangedStop = hold === "source_changed_stop" || hold === "source_unchanged_stop" || hold === "source_changed_stop_run_active";
+    const confirmedStop = hold === "source_changed_stopped" || hold === "source_unchanged_stopped";
+    const sourceUnchanged = hold === "source_unchanged_stop" || hold === "source_unchanged_stopped";
     const restoreHold = hold === "settled_hold" || hold === "unconfirmed_hold";
-    const idleWarm = !!hold && !restoreHold && !sourceChangedStop;
+    const idleWarm = !!hold && !restoreHold && !sourceChangedStop && !confirmedStop;
+    // Every source that still exists is claimed as superseded before its backup restores.
+    const claimed = idleWarm || sourceChangedStop || confirmedStop;
     const resumed = hold === "resumed_idle_warm" || hold === "resumed_own_source";
     const targetProviderLeaseId = hold === "resumed_own_source" ? "prior-sandbox" : "sandbox-created";
     // Regression: a legacy follow-up retired the warm sandbox as an obsolete lease, so the
@@ -23373,7 +23391,7 @@ describe("runnerd provider runtime wiring", () => {
     const confirmedAt = new Date().toISOString();
     const sourceLease = (manifestSha256: string) => ({
       id: "source-lease", companyId: current.binding.companyId, heartbeatRunId: "source-run", provider: "daytona",
-      providerLeaseId: "prior-sandbox", status: sourceChangedStop ? "pending_cleanup" : idleWarm ? "retained" : restoreHold ? "released" : "expired",
+      environmentId: "environment", providerLeaseId: "prior-sandbox", status: sourceChangedStop ? "pending_cleanup" : idleWarm ? "retained" : restoreHold || confirmedStop ? "released" : "expired",
       cleanupStatus: sourceChangedStop ? "failed" : "success",
       leasePolicy: restoreHold ? "retain_on_failure" : "reuse_by_environment",
       acquiredAt: new Date(Date.now() - 60_000), releasedAt: idleWarm ? null : new Date(Date.now() + 1_000), expiresAt: null,
@@ -23395,7 +23413,11 @@ describe("runnerd provider runtime wiring", () => {
           schema: "paperclip.sandbox-stop-and-retain.v1", requestId: "stop-request", companyId: current.binding.companyId,
           runId: "source-run", leaseId: "source-lease", provider: "daytona", providerLeaseId: "prior-sandbox",
           pluginId: "daytona-plugin", reason: "sandbox_source_changed" } } : {}),
-        ...(hold === "settled_hold" ? { sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1",
+        // The image the source booted; the created lease records the current one.
+        ...(sourceChangedStop || confirmedStop ? { image: "boat-image:old" } : {}),
+        ...(confirmedStop ? { pluginId: "daytona-plugin",
+          reusableSandboxLease: { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId } } : {}),
+        ...(hold === "settled_hold" || confirmedStop ? { sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1",
           requestId: "stop-request", companyId: current.binding.companyId, runId: "source-run", leaseId: "source-lease",
           provider: "daytona", providerLeaseId: "prior-sandbox", pluginId: "daytona-plugin", method: "environmentStopLease",
           confirmedAt } } : {}),
@@ -23411,12 +23433,14 @@ describe("runnerd provider runtime wiring", () => {
       const sha = `sha256:${createHash("sha256").update(stampKind === "matching" ? manifest : "other").digest("hex")}`;
       // No unsaved remote writer is bound to the held allocation, unless the
       // previous run's workspace export is still observed on the warm sandbox.
-      const rows = sourceRunQuery ? [{ sourceRunStatus: hold === "idle_warm_run_active" ? "running" : "succeeded" }]
+      const rows = sourceRunQuery ? [{ sourceRunStatus: hold === "idle_warm_run_active" || hold === "source_changed_stop_run_active" ? "running" : "succeeded" }]
         : fields?.run ? (hold === "idle_warm_export_pending" ? [{ lease: sourceLease(sha),
           run: { id: "source-run", runtimeMode: "native", observedRemoteWorkspace: true, reference: null }, workspace: null }] : [])
         : table === executionWorkspaces ? []
         : table === heartbeatRunEvents ? (laterProviderWork ? [{ runId: "later-run" }] : [])
-          : [{ metadata: {}, providerLeaseId: targetProviderLeaseId, companyId: current.binding.companyId,
+          : [{ id: "lease-created", environmentId: "environment",
+            metadata: sourceChangedStop || confirmedStop ? { image: sourceUnchanged ? "boat-image:old" : "boat-image:new" } : {},
+            providerLeaseId: targetProviderLeaseId, companyId: current.binding.companyId,
             heartbeatRunId: current.binding.runId }, sourceLease(sha)];
       const query = { then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
         leftJoin: () => query, innerJoin: () => query, where: () => query, limit: () => query };
@@ -23483,21 +23507,24 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
+      // The same provider thread continues: the restored provider state names the backed-up thread.
+      expect(JSON.parse(await readFile(join(remoteSession, "runner/codex-provider-state.json"), "utf8")))
+        .toMatchObject({ threadId: "retained-provider-thread" });
       // The stamp is merged in SQL (`coalesce(metadata) || <json>`); read its JSON operand.
       const sqlJson = (value: unknown) => (value as { queryChunks?: unknown[] } | null)?.queryChunks
         ?.find((chunk): chunk is string => typeof chunk === "string" && chunk.startsWith("{"));
       expect(updates.filter(update => update.table === environmentLeases).map(update => ({ ...update, values: { ...update.values,
         metadata: sqlJson(update.values.metadata) ? JSON.parse(sqlJson(update.values.metadata)!) : update.values.metadata } }))).toEqual([
-        // The idle source is claimed first: its reuse scope moves into a superseded
-        // receipt, so it is never resumed with the older state again.
-        ...(idleWarm ? [expect.objectContaining({ values: expect.objectContaining({
+        // A source that still exists is claimed first: its reuse scope moves into a
+        // superseded receipt, so it is never resumed with the older state again.
+        ...(claimed ? [expect.objectContaining({ values: expect.objectContaining({
           metadata: expect.not.objectContaining({ reusableSandboxLease: expect.anything() }) }) })] : []),
         expect.objectContaining({
           values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
             normalizedSessionId: current.session.normalizedSessionId, sourceProviderLeaseId: "prior-sandbox",
             authorizedProviderLeaseId: "sandbox-created" }) } }),
         })]);
-      if (idleWarm) expect(updates.filter(update => update.table === environmentLeases)[0]!.values.metadata).toEqual(
+      if (claimed) expect(updates.filter(update => update.table === environmentLeases)[0]!.values.metadata).toEqual(
         expect.objectContaining({ reusableSandboxLeaseSuperseded: expect.objectContaining({
           supersededByRunId: current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
           reusableSandboxLease: { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId } }) }));
