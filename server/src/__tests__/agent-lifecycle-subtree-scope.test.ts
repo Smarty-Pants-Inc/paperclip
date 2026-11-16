@@ -4,15 +4,17 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, agentApiKeys, authUsers, companies, companyMemberships, createDb,
-  principalPermissionGrants, approvals, issues, budgetPolicies, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
+  principalPermissionGrants, approvals, issues, budgetPolicies, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
 import { configureAgentLifecycle, createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { issueService } from "../services/issues.js";
+import { agentHandoverService } from "../services/agent-handover.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -154,7 +156,9 @@ describe("subtree-scoped agent lifecycle", () => {
   }
 
   for (const via of ["POST", "PATCH"] as const) {
-    it(`#20389 gate row: retire via ${via} releases holds and returns open tasks, never another subtree`, async () => {
+    // superseded by replacement: RFL FINAL S2/S3 + CTL6-RF2-0505 W1/W3/W5/W6.
+    // Original intent: retire through the lead's real agent key, returning only its open tasks and preserving all unrelated rows.
+    it(`#20389 gate row: retire via ${via} releases holds and returns open tasks, never another subtree (current contract: frozen holds and per-item handover)`, async () => {
       const f = await seed();
       const workerId = await f.hire();
       await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget" })
@@ -175,11 +179,58 @@ describe("subtree-scoped agent lifecycle", () => {
       const pause = await f.post(workerId, "pause");
       expect(pause.status, pause.text).toBe(200);
       await f.worker.process(workerId);
+      const beforeAgent = await f.current(workerId);
+      expect(beforeAgent.lifecycleHolds).toEqual(["budget", "manual"]);
+      const beforeTasks = await db.select().from(issues).where(eq(issues.companyId, f.companyId)).orderBy(issues.id);
+      const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id);
+      const events: { action: unknown; entityId: unknown }[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(f.companyId, event => {
+        if (event.type === "activity.logged") events.push({ action: event.payload.action, entityId: event.payload.entityId });
+      });
+      try {
+      // The real request's first transaction rolls back once. There is no hidden
+      // second attempt: neither the agent, task rows nor live activity may change.
+      let attempts = 0;
+      const rollbackDb = new Proxy(db, { get(target, key, receiver) {
+        if (key === "transaction") return (async (work, options) => target.transaction(async tx => {
+          attempts++;
+          const value = await work(tx);
+          if (attempts === 1) await tx.execute(sql`DO $$ BEGIN RAISE EXCEPTION 'forced scoped retire rollback' USING ERRCODE = '40P01'; END $$`);
+          return value;
+        }, options)) as Db["transaction"];
+        return Reflect.get(target, key, receiver);
+      } });
+      const rollbackApi = express();
+      rollbackApi.use(express.json());
+      rollbackApi.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+      rollbackApi.use("/api", agentRoutes(rollbackDb));
+      rollbackApi.use(errorHandler);
+      const failed = via === "POST"
+        ? await request(rollbackApi).post(`/api/agents/${workerId}/terminate`).set("Authorization", `Bearer ${f.token}`).send({})
+        : await request(rollbackApi).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`).send({ status: "terminated" });
+      expect(failed.status, failed.text).toBe(503);
+      expect(attempts).toBe(1);
+      expect(await f.current(workerId)).toEqual(beforeAgent);
+      expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId)).orderBy(issues.id)).toEqual(beforeTasks);
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id)).toEqual(beforeActivity);
+      expect(events).toEqual([]);
+
       const response = via === "POST" ? await f.post(workerId, "terminate")
         : await request(f.api).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`).send({ status: "terminated" });
       expect(response.status, response.text).toBe(200);
       await f.worker.process(workerId);
-      expect.soft(await f.current(workerId)).toMatchObject({ status: "terminated", lifecycleState: "terminated", lifecycleHolds: [], pauseReason: null });
+      // Mirrors agent-retirement-handover's gate row replacement: completion
+      // freezes holds and leaves ALL task rows byte-identical under one marker.
+      expect(await f.current(workerId)).toMatchObject({ status: "terminated", lifecycleState: "terminated",
+        lifecycleHolds: beforeAgent.lifecycleHolds, pauseReason: beforeAgent.pauseReason,
+        lifecycleOperation: { handover: { code: "agent_handover_pending" } } });
+      expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId)).orderBy(issues.id)).toEqual(beforeTasks);
+      const visible = await request(f.board).get(`/api/agents/${workerId}`);
+      expect(visible.status, visible.text).toBe(200);
+      expect(visible.body.handover).toMatchObject({ code: "agent_handover_pending" });
+      const recovery = agentHandoverService(db);
+      expect(await recovery.processAgent(workerId)).toMatchObject({ tasks: expect.arrayContaining([task.id, active.id]), cleared: true, blocked: [] });
+      expect((await f.current(workerId)).lifecycleOperation?.handover).toBeUndefined();
       const current = (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
       expect.soft(current).toMatchObject({ assigneeAgentId: f.ids.lead });
       // Preserve real task blockers and terminal history; retirement is not completion.
@@ -192,8 +243,29 @@ describe("subtree-scoped agent lifecycle", () => {
       expect.soft(await f.current(f.ids.unrelated)).toEqual(unrelated);
       const repeated = await f.post(workerId, "terminate");
       expect(repeated.status, repeated.text).toBe(200);
-      const moves = await db.select().from(activityLog).where(and(eq(activityLog.entityId, task.id), eq(activityLog.action, "issue.reassigned")));
-      expect(moves).toHaveLength(1);
+      await f.worker.process(workerId);
+      await recovery.processAgent(workerId);
+      for (const id of [task.id, active.id]) {
+        const moves = await db.select().from(activityLog).where(and(eq(activityLog.entityId, id), eq(activityLog.action, "issue.reassigned")));
+        expect(moves).toEqual([expect.objectContaining({ details: expect.objectContaining({
+          previousAssigneeAgentId: workerId, assigneeAgentId: f.ids.lead, reason: "agent_terminated",
+        }) })]);
+      }
+      const rows = (await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)))
+        .filter(row => !beforeActivity.some(before => before.id === row.id));
+      expect(rows.filter(row => row.action === "agent.terminated")).toEqual([expect.objectContaining({
+        entityId: workerId, actorType: "agent", actorId: f.ids.lead,
+      })]);
+      expect(rows.filter(row => row.action === "agent.handover_completed")).toEqual([expect.objectContaining({ entityId: workerId })]);
+      // Identity-key revocation is a separate durable-only receipt (postgres.ts
+      // uses persistActivity, not the publication buffer). Keep its row exactly
+      // once; match live publications for the route/terminal/per-item activities.
+      expect(rows.filter(row => row.action === "agent.identity.revoked")).toEqual([expect.objectContaining({ entityId: workerId })]);
+      const publishedRows = rows.filter(row => row.action !== "agent.identity.revoked");
+      expect(events).toHaveLength(publishedRows.length);
+      for (const row of publishedRows) expect(events.filter(event => event.action === row.action && event.entityId === row.entityId)).toHaveLength(1);
+      expect((await f.current(workerId)).lifecycleHolds).toEqual(beforeAgent.lifecycleHolds);
+      } finally { unsubscribe(); }
     }, 60_000);
   }
 
