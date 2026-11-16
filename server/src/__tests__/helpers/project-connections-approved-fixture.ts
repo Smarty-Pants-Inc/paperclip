@@ -61,7 +61,7 @@ export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, i
  * Seeded owned rows receive real, server-written approval preconditions. */
 export async function projectConnectionFixture(db: Db, sharedLead = false) {
   const f = await seedFixture(db, sharedLead);
-  const approved = new Map<string, Promise<unknown>>();
+  const approved = new Map<string, ReturnType<typeof approveProjectFixture>>();
   return { ...f, approve: (project = f.a, installationId = "456") => {
     const id = `${project.id}:${installationId}`;
     if (!approved.has(id)) approved.set(id, approveProjectFixture(db, f, project, installationId));
