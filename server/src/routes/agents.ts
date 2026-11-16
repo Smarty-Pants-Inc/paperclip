@@ -525,6 +525,16 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
   }
 }
 
+function withAgentHireRunLock(handler: (req: Request, res: Response) => Promise<void>) {
+  return async (req: Request, res: Response) => {
+    const runId = req.actor.type === "agent" && req.actor.runId && isUuidLike(req.actor.runId)
+      ? req.actor.runId
+      : null;
+    if (!runId) return handler(req, res);
+    return withHireRunLock(`${req.params.companyId}:${runId}`, () => handler(req, res));
+  };
+}
+
 export function agentRoutes(
   db: Db,
   options: {
@@ -4960,8 +4970,11 @@ export function agentRoutes(
     } else await handleAgentHire(req, res);
   });
 
-  router.post("/companies/:companyId/agents", validate(createAgentSchema), async (req, res) => {
+  router.post("/companies/:companyId/agents", validate(createAgentSchema), withAgentHireRunLock(async (req, res) => {
     const companyId = req.params.companyId as string;
+    const runId = req.actor.type === "agent" && req.actor.runId && isUuidLike(req.actor.runId)
+      ? req.actor.runId
+      : null;
     await assertCanCreateAgentsForCompany(req, companyId, { hiring: true });
     if (req.body.budgetMonthlyCents > 0) assertBoard(req, COMPANY_BUDGETS_PAGE);
 
@@ -5002,6 +5015,7 @@ export function agentRoutes(
       ...createInput
     } = req.body;
     const agentId = setupId ?? randomUUID();
+    const requestFingerprint = hireFingerprint(req.body);
     const requestedCreateConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
     assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
     assertNoAgentAdapterConfigMutation(req, requestedCreateConfig);
@@ -5072,6 +5086,30 @@ export function agentRoutes(
 
     const managedBinding = normalizedRuntimeConfig.aiConnection ? aiRuntimeConnectionBindingSchema.parse(normalizedRuntimeConfig.aiConnection) : undefined;
     const managedConnection = managedBinding && !setupId ? await validateManagedAgentBinding(req, companyId, agentId, createInput.adapterType, normalizedAdapterConfig, managedBinding, createInput.defaultEnvironmentId, "none", true) : undefined;
+    // setupId is a draft identity; completed direct creates reuse the same
+    // run-scoped fingerprint and lock already used by POST /agent-hires.
+    if (!setupId && runId) {
+      const priorCreates = await db
+        .select({ entityId: activityLog.entityId, details: activityLog.details })
+        .from(activityLog)
+        .where(and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.runId, runId),
+          eq(activityLog.action, "agent.created"),
+        ))
+        .orderBy(desc(activityLog.createdAt));
+      const match = priorCreates.find(
+        row => (row.details as Record<string, unknown> | null)?.agentCreateFingerprint === requestFingerprint,
+      );
+      if (match) {
+        const existingAgent = await svc.getById(match.entityId);
+        if (existingAgent && existingAgent.status !== "terminated") {
+          await applyDefaultAgentTaskAssignGrant(companyId, existingAgent.id, null);
+          res.status(200).json({ ...redactAgentRowForResponse(existingAgent), idempotent: true });
+          return;
+        }
+      }
+    }
     const createdAgent = await svcLifecycle.requestHire(
       companyId,
       {
@@ -5136,6 +5174,7 @@ export function agentRoutes(
         name: agent.name,
         role: agent.role,
         desiredSkills: desiredSkillAssignment.desiredSkills,
+        ...(runId ? { agentCreateFingerprint: requestFingerprint } : {}),
         ...(managedConnection?.memberConnectionIds ? { aiConnectionPoolId: managedConnection.connectionId, aiConnectionMemberInstallIds: managedConnection.memberConnectionIds } : {}),
       },
     });
@@ -5151,7 +5190,7 @@ export function agentRoutes(
     ).catch(namedGrantContention);
 
     res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}) });
-  });
+  }));
 
   registerAgentProjectAccessRoutes(router, db);
 
