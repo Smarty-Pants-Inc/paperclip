@@ -13,6 +13,7 @@ import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/pr
 import { createLocalEncryptedCipher } from "../secrets/local-encrypted-provider.js";
 import { connectionManagementService } from "../services/connection-management.js";
 import { githubAppFailure } from "../services/github-app-client.js";
+import { approveFixtureCustodySource } from "./helpers/project-connections-custody-setup.js";
 
 const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
@@ -48,9 +49,10 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   beforeAll(async () => {
     // Synthetic, process-local test key: no host credential/key-file access.
     vi.stubEnv("PAPERCLIP_SECRETS_MASTER_KEY", randomBytes(32).toString("base64"));
+    vi.stubEnv("PAPERCLIP_PUBLIC_URL", "http://127.0.0.1");
     database = await startEmbeddedPostgresTestDatabase("paperclip-project-retire-"); db = createDb(database.connectionString);
   }, 60_000);
-  beforeEach(() => { provider.verify.mockClear(); provider.acquire.mockClear(); });
+  beforeEach(() => { provider.verify.mockReset(); provider.acquire.mockReset(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); vi.unstubAllEnvs(); }, 60_000);
 
   async function versionOne(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
@@ -75,6 +77,8 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     const f = await projectConnectionFixture(db, true);
     await versionOne(f);
     const legacy = await f.seedConnection(null);
+    await approveFixtureCustodySource(db, f, legacy);
+    provider.verify.mockClear(); // finish assertions count the operation, not setup approval
     const candidate = await f.seedConnection(f.a, { status: "draft", installed: false, pending: true, legacyId: legacy.connection.id });
     const bound = await f.run();
     const context = { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id, issueId: bound.issue.id };
@@ -91,6 +95,8 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       const f = await projectConnectionFixture(db, true);
       await versionOne(f);
       const legacy = await f.seedConnection(null);
+      await approveFixtureCustodySource(db, f, legacy);
+      provider.verify.mockClear();
       // L still serves B; only the fully transferred A worker may be removed.
       await f.service.putConnectionInstalls(legacy.connection.id, { installs: [f.leadA, f.worker, f.outsider]
         .map(agent => ({ targetType: "agent" as const, targetId: agent.id })) }, f.actor());
@@ -446,18 +452,27 @@ describe("project connection make-before-break and local retirement (round-4 D)"
 
   it("INT-R5/:366 companion: take fails on the injected receipt P0001 after the same create succeeds", async () => {
     const control = await projectConnectionFixture(db); await versionOne(control);
+    const controlSource = await control.seedConnection(null, { installed: false });
+    await approveFixtureCustodySource(db, control, controlSource);
     const created = await control.service.createConnection(control.companyId, control.input(), control.actor());
     expect(created.projectId).toBe(control.a.id);
     const f = await projectConnectionFixture(db); await versionOne(f);
+    const source = await f.seedConnection(null, { installed: false });
+    await approveFixtureCustodySource(db, f, source);
+    const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId));
+    const beforeConnections = await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId));
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId));
+    const beforeInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId));
+    const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
     await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'synthetic take receipt persistence failure'; END IF; RETURN NEW; END $$`));
     await db.execute(sql.raw("CREATE TRIGGER project_red_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_red_receipt_failure()"));
     try { await expect(f.service.createConnection(f.companyId, f.input(), f.actor())).rejects.toMatchObject({ cause: { code: "P0001", message: "synthetic take receipt persistence failure" } }); }
     finally { await restoreReceipt(db); }
-    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toEqual(beforeApplications);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toEqual(beforeConnections);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toEqual(beforeGrants);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId))).toEqual(beforeInstalls);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual(beforeActivity);
   });
 
   it("A03/W2: explicit finish of archived owner returns terminal typed conflict, never revival", async () => {
