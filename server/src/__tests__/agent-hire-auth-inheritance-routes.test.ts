@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -152,6 +152,71 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
   function childEnvOf(res: request.Response): Record<string, unknown> {
     return ((res.body.agent?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env) ?? {};
   }
+
+  // These are real route/transaction read-backs, not access-service mock calls.
+  // Keep reason: #20805 grant atomicity and the pending/low-trust authorization boundary.
+  it.each([
+    { label: "standard direct", route: "agents", pending: false, lowTrust: false },
+    { label: "pending-approval", route: "agent-hires", pending: true, lowTrust: false },
+    { label: "low-trust", route: "agent-hires", pending: false, lowTrust: true },
+  ])("grant replacement audit: $label hire keeps exactly one active membership and stamped tasks:assign", async ({ route, pending, lowTrust }) => {
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    const companyId = await seedCompany();
+    if (pending) await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, companyId));
+    const res = await request(createApp(db, userActor()))
+      .post(`/api/companies/${companyId}/${route}`)
+      .send({ name: "Grant Audit Child", role: "engineer", adapterType: "process", adapterConfig: {},
+        ...(lowTrust ? { permissions: { trustPreset: "low_trust_review" } } : {}) });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const child = route === "agents" ? res.body : res.body.agent;
+    expect(child.id).toEqual(expect.any(String));
+    // This fixture has no running lifecycle worker; non-pending process hires are paused.
+    expect(child.status).toBe(pending ? "pending_approval" : "paused");
+    if (lowTrust) {
+      const [stored] = await db.select().from(agents).where(eq(agents.id, child.id));
+      expect(stored!.permissions).toMatchObject({ trustPreset: "low_trust_review" });
+    }
+    const membership = await db.select({ companyId: companyMemberships.companyId,
+      principalType: companyMemberships.principalType, principalId: companyMemberships.principalId,
+      membershipRole: companyMemberships.membershipRole, status: companyMemberships.status })
+      .from(companyMemberships).where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalId, child.id)));
+    expect(membership).toEqual([{ companyId, principalType: "agent", principalId: child.id, membershipRole: "member", status: "active" }]);
+    const assign = await db.select({ companyId: principalPermissionGrants.companyId,
+      principalType: principalPermissionGrants.principalType, principalId: principalPermissionGrants.principalId,
+      permissionKey: principalPermissionGrants.permissionKey, scope: principalPermissionGrants.scope,
+      grantedByUserId: principalPermissionGrants.grantedByUserId })
+      .from(principalPermissionGrants).where(and(eq(principalPermissionGrants.companyId, companyId),
+        eq(principalPermissionGrants.principalId, child.id), eq(principalPermissionGrants.permissionKey, "tasks:assign")));
+    expect(assign).toEqual([{ companyId, principalType: "agent", principalId: child.id,
+      permissionKey: "tasks:assign", scope: null, grantedByUserId: "local-board" }]);
+  });
+
+  it.each(["agents", "agent-hires"])("grant replacement audit: exhausted /%s hire keeps zero agents, memberships, and grants", async route => {
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    const companyId = await seedCompany();
+    const fault = `grant_audit_${companyId.replaceAll("-", "")}`;
+    await db.execute(sql.raw(`CREATE SEQUENCE ${fault}_n;
+      CREATE FUNCTION ${fault}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+        IF NEW.company_id = '${companyId}' AND NEW.principal_type = 'agent' THEN
+          PERFORM nextval('${fault}_n');
+          RAISE EXCEPTION 'grant audit contention' USING ERRCODE = '40P01';
+        END IF; RETURN NEW; END $$;
+      CREATE TRIGGER ${fault} BEFORE INSERT ON company_memberships FOR EACH ROW EXECUTE FUNCTION ${fault}();`));
+    try {
+      const res = await request(createApp(db, userActor())).post(`/api/companies/${companyId}/${route}`)
+        .send({ name: "No Partial Grant Child", role: "engineer", adapterType: "process", adapterConfig: {} });
+      expect(res.status, JSON.stringify(res.body)).toBe(503);
+      expect(res.body.code).toBe("agent_hire_grant_contention");
+      const attempts = await db.execute<{ count: string }>(sql.raw(`SELECT last_value::text AS count FROM ${fault}_n`));
+      expect(Number(attempts[0]!.count)).toBe(5);
+      expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toEqual([]);
+      expect(await db.select().from(companyMemberships).where(eq(companyMemberships.companyId, companyId))).toEqual([]);
+      expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId))).toEqual([]);
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER ${fault} ON company_memberships; DROP FUNCTION ${fault}(); DROP SEQUENCE ${fault}_n;`));
+    }
+  });
 
   it("inherits the parent secret_ref for a codex_local hire with no env, and derives the child binding", async () => {
     const companyId = await seedCompany();
