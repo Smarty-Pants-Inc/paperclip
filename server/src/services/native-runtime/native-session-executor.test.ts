@@ -5088,6 +5088,66 @@ describe("remote provider checkpoint snapshots", () => {
       expect(await readFile(join(home, "logs", "unified.jsonl"), "utf8")).toBe("AUTH_SENTINEL");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+  it("checkpoints a default pi_rpc pi-agent tree without driver-owned absolute symlinks", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-agent-absolute-link-checkpoint-"));
+    try {
+      const filesystemRoot = join(root, "filesystem");
+      const source = join(filesystemRoot, "pi-agent");
+      const target = join(root, "backup", "pi-agent");
+      const npmTarget = join(root, "original-pi-home", "npm");
+      const skillTarget = join(root, "company-skill", "skill-a");
+      await mkdir(join(source, "sessions"), { recursive: true });
+      await mkdir(join(source, "skills", "paperclip-company-skills"), { recursive: true });
+      await mkdir(npmTarget, { recursive: true });
+      await mkdir(skillTarget, { recursive: true });
+      await writeFile(join(source, "sessions", "session.jsonl"), "{\"role\":\"assistant\"}\n");
+      await writeFile(join(source, "state.json"), "resume-state\n");
+      await writeFile(join(source, "auth.json"), "credential\n");
+      await writeFile(join(source, "models.json"), "launch-model\n");
+      await writeFile(join(source, "settings.json"), "launch-settings\n");
+      await writeFile(join(npmTarget, "package.json"), "{}\n");
+      await writeFile(join(skillTarget, "SKILL.md"), "skill\n");
+      await symlink(npmTarget, join(source, "npm"), "dir");
+      await symlink(skillTarget, join(source, "skills", "paperclip-company-skills", "skill-a"), "dir");
+
+      const profile = resolveNativeHarnessPersistenceProfile({
+        provider: { kind: "pi_rpc" },
+        session: { normalizedSessionId: "session", driverKind: "pi_rpc" },
+      } as unknown as NativeExecutionInputV1);
+      const excludeEntries = profile.directories.find(directory => directory.name === "pi-agent")!.excludeEntries;
+      const execute = async ({ command, args }: { command: string; args: string[] }) => ({
+        exitCode: 0, timedOut: false, stdout: execFileSync(command, args, { encoding: "utf8" }), stderr: "",
+      });
+
+      await syncRemoteRunnerDirectoryOut({
+        runner: { execute } as never,
+        sourcePath: source,
+        targetPath: target,
+        mode: 0o700,
+        excludeEntries,
+      });
+
+      expect(await readFile(join(target, "sessions", "session.jsonl"), "utf8")).toBe("{\"role\":\"assistant\"}\n");
+      expect(await readFile(join(target, "state.json"), "utf8")).toBe("resume-state\n");
+      for (const excluded of ["auth.json", "models.json", "settings.json"])
+        await expect(access(join(target, excluded))).rejects.toMatchObject({ code: "ENOENT" });
+      for (const omitted of ["npm", "skills/paperclip-company-skills/skill-a"])
+        await expect(lstat(join(target, omitted))).rejects.toMatchObject({ code: "ENOENT" });
+
+      const symlinks: string[] = [];
+      const collectSymlinks = async (directory: string): Promise<void> => {
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          const path = join(directory, entry.name);
+          if (entry.isSymbolicLink()) symlinks.push(path);
+          else if (entry.isDirectory()) await collectSymlinks(path);
+        }
+      };
+      await collectSymlinks(target);
+      expect(symlinks).toEqual([]);
+      expect(await readFile(join(source, "sessions", "session.jsonl"), "utf8")).toBe("{\"role\":\"assistant\"}\n");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
   it.each<{
     name: string;
     provider: Record<string, unknown>;
