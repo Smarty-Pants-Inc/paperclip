@@ -1,3 +1,4 @@
+-- paperclip:migration-compat online_compatible: CREATE OR REPLACE keeps every existing function's name, arguments and return type, and the triggers are unchanged; the only addition is the new function paperclip_lock_runtime_agents. The previous release calls the same functions and writes the same revision rows (each agent once per transaction), now ordered by one company advisory lock instead of an agent row scan, and it was observed running on the migrated schema (RFL src9). No table is rewritten and no data is touched, so no lock is held long.
 -- #20805: company-wide connector runtime invalidation takes ONE company lock
 -- instead of a FOR NO KEY UPDATE scan of every active agent row. The scan joined
 -- deadlock cycles with any transaction that already held one agent row (a hirer).
