@@ -4,7 +4,10 @@ import { coordinatorAttentionQueryKey, coordinatorAttentionSummaryQueryKey, coor
 import { useLocation } from "@/lib/router";
 
 /** Navigation never starts a full-feed read. Reuse it on pages that own one;
- * elsewhere desktop and mobile navigation share the same count-only read. */
+ * elsewhere desktop and mobile navigation share the same count-only read.
+ * The count is For you (`deskBadgeCount`, the server's `viewCounts.mine`):
+ * the Inbox opens on that list, so the badge never counts cards addressed to
+ * someone else (#20846). An older server without it falls back to the total. */
 export function useCoordinatorAttentionCount(companyId: string | null | undefined, enabled = true) {
   const location = useLocation();
   const feedPage = location.pathname.endsWith("/decisions");
@@ -19,7 +22,8 @@ export function useCoordinatorAttentionCount(companyId: string | null | undefine
   // newest known count during route changes, including an explicit fresh zero.
   // Server generation time wins over a delayed older response arriving later.
   const snapshots = feedPage ? [attention, tasks, summary] : taskPage ? [tasks, attention, summary] : [summary, attention, tasks];
-  return snapshots.filter(snapshot => snapshot.data !== undefined)
+  const newest = snapshots.filter(snapshot => snapshot.data !== undefined)
     .sort((a, b) => ((Date.parse(b.data?.generatedAt ?? "") || 0) - (Date.parse(a.data?.generatedAt ?? "") || 0))
-      || b.dataUpdatedAt - a.dataUpdatedAt)[0]?.data?.totalCount ?? 0;
+      || b.dataUpdatedAt - a.dataUpdatedAt)[0]?.data;
+  return newest ? newest.deskBadgeCount ?? newest.totalCount : 0;
 }
