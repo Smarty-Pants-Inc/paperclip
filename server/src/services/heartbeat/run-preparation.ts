@@ -621,6 +621,16 @@ export async function resolveExecutionRunAdapterConfig(input: {
     };
     for (const key of input.trustedEnvSecretKeys ?? []) secretKeys.add(key);
   }
+  // Default trace attribution only after every scoped env overlay has won.
+  // This shared config feeds local adapters and native sandbox launches alike.
+  const mergedEnv = parseObject(resolvedConfig.env);
+  if (
+    input.agentId &&
+    mergedEnv.LANGFUSE_USER_ID === undefined &&
+    Object.keys(mergedEnv).some((key) => key.startsWith("LANGFUSE_"))
+  ) {
+    resolvedConfig.env = { ...mergedEnv, LANGFUSE_USER_ID: input.agentId };
+  }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
   // usable auth.json and an empty OPENAI_API_KEY would dispatch a run that
   // immediately fails with "no Codex credentials provisioned" (adapter_failed),
