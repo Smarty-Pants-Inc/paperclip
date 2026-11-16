@@ -1,6 +1,8 @@
 import { and, desc, eq, inArray } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { issueService } from "../issues.js";
+import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./completed-turn-cleanup.js";
 import { completeTerminatedRemoteNativeSessionCleanup, nativeSessionCleanupBlock, nativeSessionCleanupGateOwners }
   from "../../vendor/paperclip-runner/index.js";
 import { logger } from "../../middleware/logger.js";
@@ -19,9 +21,12 @@ export const NATIVE_CLEANUP_HOLD_NEXT_ACTION =
 
 /**
  * The first time admission holds this queued run behind its task's cleanup
- * gate, append one named run event. It writes no comment, creates no run and
- * wakes nobody; the run stays queued and admission still decides when it
- * starts. Later holds of the same run add nothing.
+ * gate, append one named run event and one plain system comment on the task
+ * thread, which every requester (person, agent, manager) reads with the
+ * task's comments. Both are written once, together. The comment goes through
+ * the issue service directly, not the comment route, so it wakes nobody
+ * (only the route wakes the assignee); it creates no run. The run stays
+ * queued and admission still decides when it starts. Later holds add nothing.
  */
 export async function recordNativeCleanupHold(db: Db, input: {
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId">;
@@ -45,6 +50,10 @@ export async function recordNativeCleanupHold(db: Db, input: {
       message: NATIVE_CLEANUP_HOLD_NEXT_ACTION,
       payload: { reason: NATIVE_CLEANUP_HOLD_CAUSE, cleanupBlock, issueId },
     });
+    await issueService(db).addComment(issueId, `${NATIVE_CLEANUP_SETTLING_MESSAGE} ${NATIVE_CLEANUP_HOLD_NEXT_ACTION}`, {},
+      { authorType: "system", metadata: { version: 1, sourceRunId: run.id,
+        authorizationReason: `${NATIVE_CLEANUP_HOLD_CAUSE}:${run.id}`,
+        sections: [{ rows: [{ type: "run_link", runId: run.id, agentId: run.agentId, title: "Held turn" }] }] } }, tx);
     return true;
   });
 }

@@ -6,7 +6,7 @@ import { and, eq, sql } from "drizzle-orm";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns,
+import { agents, agentWakeupRequests, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns,
   issueComments, issues, plugins } from "@paperclipai/db";
 import { executeNativeSession, nativeSessionCleanupBlock, NativeSessionCloseUnrecoverableError, onNativeSessionCleanupQuarantined,
   parseNativeExecutionInput, type NativeSession, type PrpStructuredRunResult } from "../vendor/paperclip-runner/index.js";
@@ -199,8 +199,13 @@ describe.skipIf(!support.supported)("operator-required remote cleanup admission 
     expect(nativeSessionCleanupBlock(f)).toBe("operator_required");
     const visible = await evidence(f, run.id);
     expect.soft(visible.events).toHaveLength(1);
-    // RECORDED SUPERSEDE (FINAL-BRIEF / J2-5' FINAL): was `visible.notes` length 1 plus the note body and
-    // its 60 s bound. The hold writes no comment; the held run's projection names it for every reader.
+    // RESTORED (judge rule, RFL case 1 UNMET): agents' normal task reads do not return the projection,
+    // so the task-thread comment stays beside the projection read.
+    expect.soft(visible.notes).toHaveLength(1);
+    if (visible.notes[0]) {
+      expect(visible.notes[0].body).toContain("previous session");
+      expect(visible.notes[0].createdAt.getTime() - run.createdAt.getTime()).toBeLessThanOrEqual(60_000);
+    }
     await expectHeldProjection(f, run.id, run.createdAt);
     expect(await readFile(f.trace, "utf8")).toBe('{"retained":"original session evidence"}\n');
   });
@@ -227,7 +232,8 @@ describe.skipIf(!support.supported)("operator-required remote cleanup admission 
     await f.heartbeat.sweepPendingCleanupLeases();
     expect(nativeSessionCleanupBlock(f)).toBe("operator_required");
     expect(await readRun(run.id)).toMatchObject({ status: "queued", startedAt: null });
-    // RECORDED SUPERSEDE (FINAL-BRIEF / J2-5' FINAL): was `(await evidence(f, run.id)).notes` length 1.
+    // RESTORED (judge rule, RFL case 1 UNMET), beside the projection read.
+    expect.soft((await evidence(f, run.id)).notes).toHaveLength(1);
     await expectHeldProjection(f, run.id, run.createdAt);
     expect(f.running()).toBe(true);
 
@@ -487,18 +493,25 @@ describe.skipIf(!support.supported)("operator-required remote cleanup admission 
     } finally { await retire(run.id); }
   });
 
-  it("J2-14 the hold writes no comment and creates no run", async () => {
+  it("J2-14 the hold writes exactly one comment per held run, and it creates no run and wakes nobody", async () => {
     const f = await seed("agent");
     await quarantine(f);
     const run = await enqueue(f);
+    const wakeRequests = () => db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, f.companyId));
+    const wakesBefore = (await wakeRequests()).map(row => row.id).sort();
     try {
       await f.heartbeat.resumeQueuedRuns();
       await f.heartbeat.resumeQueuedRuns();
       await f.heartbeat.sweepPendingCleanupLeases();
       await f.heartbeat.resumeQueuedRuns();
       expect.soft((await evidence(f, run.id)).events).toHaveLength(1);
+      const { notes } = await evidence(f, run.id);
+      expect(notes).toHaveLength(1);
       expect((await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, f.issueId)))
-        .map(row => row.id)).toEqual([f.message.id]);
+        .map(row => row.id).sort()).toEqual([f.message.id, notes[0]!.id].sort());
+      // No wake for the assignee, the requester agent or the manager after it.
+      expect((await wakeRequests()).map(row => row.id).sort()).toEqual(wakesBefore);
       expect((await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
         .map(row => row.id).sort()).toEqual([f.owner.id, run.id].sort());
       expect(await readRun(run.id)).toMatchObject({ status: "queued", startedAt: null });
