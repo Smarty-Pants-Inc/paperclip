@@ -302,17 +302,22 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     expect(execute.mock.calls.some(([call]) => (call.args ?? []).join(" ").includes("paperclip-bridge/queue"))).toBe(false);
     expect(access.env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT).toBe("runner_ingress");
     expect(access.env.PAPERCLIP_GITHUB_BROKER_URL).toBe("");
-    expect(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toMatch(/^[a-f0-9]{64}$/);
-    expect(access.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN).toBe(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
+    expect(access.env).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
+    expect(access.env).not.toHaveProperty("PAPERCLIP_GITHUB_BRIDGE_TOKEN");
     expect(JSON.stringify(access.env)).not.toContain("server-sentinel");
     const requestSentinel = "body-sentinel-never-log";
-    const capability = access.env.PAPERCLIP_GITHUB_BROKER_TOKEN!;
-    const frame = { kind: "github_access.http" as const, requestId: "ingress-request-1", method: "POST",
+    const initialCapability = access.getRunnerIngressCapability()!;
+    const initialFrame = { kind: "github_access.http" as const, requestId: "ingress-idle", method: "POST",
       path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json",
-        "x-paperclip-github-capability": capability }, bodyBase64: Buffer.from(requestSentinel).toString("base64") };
-    const idle = await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-idle" }, run("ingress-run"));
+        "x-paperclip-github-capability": initialCapability }, bodyBase64: Buffer.from(requestSentinel).toString("base64") };
+    const idle = await access.handleRunnerIngressHttpRequest(initialFrame, run("ingress-run"));
     expect(idle.status).toBe(403);
     const release = await access.activate(run("ingress-run"));
+    const capability = access.getRunnerIngressCapability()!;
+    expect(capability).not.toBe(initialCapability);
+    expect((await access.handleRunnerIngressHttpRequest(initialFrame, run("ingress-run"))).status).toBe(403);
+    const frame = { ...initialFrame, requestId: "ingress-request-1",
+      headers: { "content-type": "application/json", "x-paperclip-github-capability": capability } };
     for (const invalid of [{ method: "GET", requestId: "ingress-invalid-method" },
       { path: "/runtime-tools/github/other", requestId: "ingress-invalid-path" }]) {
       const refused = await access.handleRunnerIngressHttpRequest({ ...frame, ...invalid }, run("ingress-run"));
@@ -331,7 +336,7 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
       status: "available", env: { GH_TOKEN: "server-sentinel" },
     });
     const requestRecords = records.filter(chunk => chunk.includes("github_access.request "));
-    expect(requestRecords).toHaveLength(7);
+    expect(requestRecords).toHaveLength(8);
     for (const requestId of ["ingress-idle", "ingress-invalid-method", "ingress-invalid-path", "ingress-forged-run",
       "ingress-auth-header", "ingress-wrong-capability", "ingress-request-1"]) {
       expect(requestRecords.some(chunk => chunk.includes(`"requestId":"${requestId}"`))).toBe(true);
@@ -348,6 +353,25 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     }
     expect(typeof access.handleRunnerIngressHttpRequest).toBe("function");
     await release();
+    access.markRunnerIngressStale();
+    expect(access.ready).toBe(false);
+    expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-stale" }, run("ingress-run"))).status).toBe(503);
+    const refreshedCapabilities: string[] = [];
+    const ingressAccess = access;
+    if (!ingressAccess) throw new Error("runner ingress access was not created");
+    const unregisterRefresher = ingressAccess.setRunnerIngressCapabilityRefresher(async (capability: string) => {
+      refreshedCapabilities.push(capability);
+      ingressAccess.markRunnerIngressReady();
+    });
+    try {
+      const releaseNext = await ingressAccess.activate(run("ingress-next-run"));
+      expect(refreshedCapabilities).toEqual([ingressAccess.getRunnerIngressCapability()]);
+      expect(refreshedCapabilities[0]).not.toBe(capability);
+      expect(ingressAccess.ready).toBe(true);
+      await releaseNext();
+    } finally {
+      unregisterRefresher();
+    }
   } finally {
     await access?.stop();
     await rm(root, { recursive: true, force: true });

@@ -2258,6 +2258,13 @@ export class DurablePrpControlPlane {
     finish: (matches: boolean) => void;
   }>();
   #githubAccessHttpHandler: RunnerPrpGithubAccessHttpHandler | null = null;
+  #githubAccessCapabilityAcks = new Map<string, {
+    connection: AuthorityConnection;
+    connectionId: string;
+    resolve: () => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
   #githubAccessRequestIds = new Set<string>();
   #githubAccessInFlight = new Set<string>();
 
@@ -2351,6 +2358,55 @@ export class DurablePrpControlPlane {
     return () => {
       if (this.#githubAccessHttpHandler === handler) this.#githubAccessHttpHandler = null;
     };
+  }
+
+  /** Push a session-scoped secret over authenticated PRP and wait for runnerd's ack. */
+  async refreshGithubAccessCapability(capability: string): Promise<void> {
+    if (!/^[a-f0-9]{64}$/.test(capability)) throw new Error("native_github_access_stale_runner_token");
+    const identity = this.#store.state.identity;
+    const connection = [...this.#connections].find(candidate =>
+      candidate.secureChannel !== null && candidate.lease !== null && candidate.connectionId !== null &&
+      !candidate.replayOnly && canonicalJson(candidate.identity) === canonicalJson(identity));
+    if (!connection || !this.#admitAuthenticatedFrame(connection)) {
+      throw new Error("native_github_access_stale_runner_token");
+    }
+    const ackId = randomUUID();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#githubAccessCapabilityAcks.delete(ackId);
+        reject(new Error("native_github_access_stale_runner_token"));
+      }, 5_000);
+      timer.unref?.();
+      this.#githubAccessCapabilityAcks.set(ackId, {
+        connection, connectionId: connection.connectionId!, resolve, reject, timer,
+      });
+      this.#sendJson(connection, this.#controlEnvelope(connection, `github_access_capability_${ackId}`,
+        "github_access.capability", { ackId, capability }));
+    });
+  }
+
+  #handleGithubAccessCapabilityAck(connection: AuthorityConnection, envelope: Record<string, unknown>): void {
+    const payload = envelope.payload;
+    const ackId = isRecord(payload) && Object.keys(payload).length === 1 && typeof payload.ackId === "string"
+      ? payload.ackId : null;
+    if (!ackId) { connection.close(); return; }
+    const pending = this.#githubAccessCapabilityAcks.get(ackId);
+    if (!pending) return;
+    if (!connection.identity || !connection.lease ||
+        Object.entries(connection.identity).some(([key, value]) => envelope[key] !== value) ||
+        envelope.connectionId !== connection.connectionId ||
+        envelope.connectionLeaseId !== connection.lease.leaseId ||
+        pending.connection !== connection || pending.connectionId !== connection.connectionId ||
+        !this.#admitAuthenticatedFrame(connection) ||
+        canonicalJson(connection.identity) !== canonicalJson(this.#store.state.identity)) {
+      clearTimeout(pending.timer);
+      this.#githubAccessCapabilityAcks.delete(ackId);
+      pending.reject(new Error("native_github_access_stale_runner_token"));
+      return;
+    }
+    clearTimeout(pending.timer);
+    this.#githubAccessCapabilityAcks.delete(ackId);
+    pending.resolve();
   }
 
   #readableStateChanged(): void {
@@ -3321,6 +3377,15 @@ export class DurablePrpControlPlane {
             }
             return;
           }
+          if (decrypted.kind === "github_access.capability_ack") {
+            try {
+              if (!this.#admitEnvelopeVersion(connection, decrypted) || !this.#admitAuthenticatedFrame(connection)) return;
+              this.#handleGithubAccessCapabilityAck(connection, decrypted);
+            } catch {
+              connection.close();
+            }
+            return;
+          }
           if (decrypted.kind === "command_result" && this.#answerOnArrival(connection, decrypted)) return;
           frame = { decrypted };
         } else {
@@ -3363,6 +3428,12 @@ export class DurablePrpControlPlane {
       onClose: () => {
         this.#recordLeaseFailureIfLapsed(connection);
         this.#connections.delete(connection);
+        for (const [ackId, pending] of this.#githubAccessCapabilityAcks) {
+          if (pending.connection !== connection) continue;
+          clearTimeout(pending.timer);
+          this.#githubAccessCapabilityAcks.delete(ackId);
+          pending.reject(new Error("native_github_access_stale_runner_token"));
+        }
         for (const check of this.#runnerIdentityChecks.values()) {
           if (check.connection === connection) check.finish(false);
         }

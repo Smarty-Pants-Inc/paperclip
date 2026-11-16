@@ -31,6 +31,10 @@ fn read_response(stream: &mut UnixStream) -> String {
 #[test]
 fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
     let mut ingress = GitHubAccessIngress::start().expect("start private Unix socket ingress");
+    let capability = "a".repeat(64);
+    ingress
+        .set_capability(&capability)
+        .expect("install in-memory capability");
     let socket_path = ingress.socket_path().to_owned();
     let private_directory = socket_path.parent().unwrap();
     assert_eq!(
@@ -58,7 +62,7 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
     let mut client = connect(&socket_path);
     write!(
         client,
-        "POST /runtime-tools/github/credentials HTTP/1.1\r\nHost: paperclip.local\r\nContent-Type: application/json\r\nAccept: application/json\r\nAuthorization: Bearer ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-github-capability: ghp_RFL_SENTINEL_TOKEN\r\nx-paperclip-bridge-generation: run-generation-1\r\nx-unknown-secret: must-be-dropped\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        "POST /runtime-tools/github/credentials HTTP/1.1\r\nHost: paperclip.local\r\nContent-Type: application/json\r\nAccept: application/json\r\nx-paperclip-bridge-generation: run-generation-1\r\nx-unknown-secret: must-be-dropped\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
     )
     .unwrap();
 
@@ -84,15 +88,21 @@ fn ingress_forwards_one_exact_redacted_prp_frame_and_writes_its_reply() {
             "headers": {
                 "content-type": "application/json",
                 "accept": "application/json",
-                "x-paperclip-bridge-generation": "run-generation-1",
-                "x-paperclip-github-capability": "ghp_RFL_SENTINEL_TOKEN"
+                "x-paperclip-bridge-generation": "run-generation-1"
             },
             "bodyBase64": "e30="
         })
     );
-    assert!(!request.frame().to_string().contains("authorization"));
-    assert!(!request.frame().to_string().contains("must-be-dropped"));
-    assert_eq!(request.frame().as_object().unwrap().len(), 6);
+    let forwarded = ingress
+        .frame_with_capability(&request)
+        .expect("runnerd stamps its in-memory capability");
+    assert_eq!(
+        forwarded["headers"]["x-paperclip-github-capability"],
+        capability
+    );
+    assert!(!forwarded.to_string().contains("authorization"));
+    assert!(!forwarded.to_string().contains("must-be-dropped"));
+    assert_eq!(forwarded.as_object().unwrap().len(), 6);
     assert!(
         ingress.try_next_request().is_none(),
         "only one PRP frame is forwarded"
@@ -175,7 +185,7 @@ fn private_socket_returns_the_named_503_while_ingress_is_unavailable() {
     let response = read_response(&mut client);
     assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
     assert!(
-        response.contains("runner ingress unavailable"),
+        response.contains("native_github_access_stale_runner_token"),
         "{response}"
     );
     assert!(ingress.try_next_request().is_none());

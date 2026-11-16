@@ -8958,6 +8958,17 @@ function runnerIngressGitHubAccessSelected(input: Pick<Parameters<typeof execute
     target.effectiveCapabilities?.runnerWebSocketIngress === true;
 }
 
+export function sanitizeRunnerIngressLaunchEnvironment(
+  environment: NodeJS.ProcessEnv,
+  runnerIngressSelected: boolean,
+): NodeJS.ProcessEnv {
+  if (!runnerIngressSelected) return environment;
+  const sanitized = { ...environment };
+  delete sanitized.PAPERCLIP_GITHUB_BROKER_TOKEN;
+  delete sanitized.PAPERCLIP_GITHUB_BRIDGE_TOKEN;
+  return sanitized;
+}
+
 function nativeGitHubAccessTransport(input: Parameters<typeof executePaperclipNativeSession>[0]): "runner_ingress" | "callback_bridge" {
   // Transport choice belongs to the provider session, not to a transient route
   // observation. Reusing an ingress-owned session may reconnect PRP, but must
@@ -9459,6 +9470,7 @@ export function nativeSessionFailureSourceCode(
   | "runner_ingress_access_rejected"
   | "runner_ingress_acquisition_failed"
   | "runner_ingress_startup_failed"
+  | "native_github_access_stale_runner_token"
   | "local_runtime_api_listener_unavailable"
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
@@ -9601,6 +9613,7 @@ export function nativeSessionFailureSourceCode(
   if (/\blocal_runtime_api_listener_unavailable\b/.test(message)) {
     return "local_runtime_api_listener_unavailable";
   }
+  if (/native_github_access_stale_runner_token/.test(message)) return "native_github_access_stale_runner_token";
   if (runnerIngressConnectionFailure(error)) return "runner_ingress_startup_failed";
   return "native_session_interrupted";
 }
@@ -12837,6 +12850,11 @@ async function executePaperclipNativeSessionAttempt(
         executionContext?.assertOpen();
         releaseGitHubRun = await githubAccess.activate(input.execution.binding);
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
+      }
+      if (runnerIngressGitHubAccessIsSelected && input.runnerEnvironment) {
+        // The capability is delivered only over the authenticated PRP session;
+        // never plant it in runnerd's initial environment block.
+        input = { ...input, runnerEnvironment: sanitizeRunnerIngressLaunchEnvironment(input.runnerEnvironment, true) };
       }
       return input.runnerEnvironment;
     };

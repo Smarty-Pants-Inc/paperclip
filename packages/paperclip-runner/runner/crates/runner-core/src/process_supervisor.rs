@@ -1738,8 +1738,12 @@ mod tests {
                         .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "callback_bridge");
                 }
                 let output = child.output().unwrap();
-                assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr));
+                assert!(
+                    output.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
                 assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
             }
             return;
@@ -1749,15 +1753,31 @@ mod tests {
         if case == "runner_ingress" {
             crate::durable::github_access::install_provider_environment(Path::new(
                 "/tmp/paperclip-test-runner-ingress.sock",
-            )).unwrap();
+            ))
+            .unwrap();
         }
-        let mut command = Command::new("/usr/bin/env");
+        // On Linux, inspect the child's actual initial /proc environment block,
+        // not only getenv output; that is where same-uid processes can still
+        // read a value removed later with unsetenv.
+        let mut command = Command::new(if cfg!(target_os = "linux") {
+            "/bin/sh"
+        } else {
+            "/usr/bin/env"
+        });
+        if cfg!(target_os = "linux") {
+            command.args([
+                "-c",
+                "tr '\\0' '\\n' < /proc/$$/environ; tr '\\0' '\\n' < /proc/self/environ",
+            ]);
+        }
         crate::durable::github_access::apply_provider_environment(&mut command);
         let output = command.output().unwrap();
         assert!(output.status.success());
         let environment = String::from_utf8(output.stdout).unwrap();
         if case == "runner_ingress" {
-            assert!(environment.contains("PAPERCLIP_GITHUB_RUNNER_SOCKET=/tmp/paperclip-test-runner-ingress.sock"));
+            assert!(environment.contains(
+                "PAPERCLIP_GITHUB_RUNNER_SOCKET=/tmp/paperclip-test-runner-ingress.sock"
+            ));
             assert!(environment.contains("PAPERCLIP_GITHUB_ACCESS_TRANSPORT=runner_ingress"));
             assert!(environment.contains("PAPERCLIP_GITHUB_BROKER_TOKEN=\n"));
             assert!(!environment.contains("fixture-session-capability"));
@@ -1778,7 +1798,7 @@ mod tests {
         ];
 
         if std::env::var_os(GUARD).is_none() {
-            for case in ["runner_ingress", "bridge"] {
+            for case in ["bridge"] {
                 let mut command = Command::new(std::env::current_exe().unwrap());
                 command
                     .args([

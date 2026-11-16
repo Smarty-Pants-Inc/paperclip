@@ -503,6 +503,7 @@ import {
   providerSessionIdentityTransitionIsAllowed,
   providerPlanMarkdown,
   remoteCheckpointIncompleteFailure,
+  sanitizeRunnerIngressLaunchEnvironment,
   resolveRemoteRunnerTransportMode,
   renewNativeSessionExecutionLease,
   runtimeInputLifecycleMetric,
@@ -11621,6 +11622,21 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
+  it("never plants runner-ingress capability values in runnerd launch environments", () => {
+    const source = {
+      PAPERCLIP_GITHUB_BROKER_TOKEN: "session-capability-sentinel",
+      PAPERCLIP_GITHUB_BRIDGE_TOKEN: "bridge-capability-sentinel",
+      GH_TOKEN: "provider-credential-is-not-the-runner-capability",
+      PATH: "/usr/bin:/bin",
+    };
+    const launch = sanitizeRunnerIngressLaunchEnvironment(source, true);
+    expect(launch).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
+    expect(launch).not.toHaveProperty("PAPERCLIP_GITHUB_BRIDGE_TOKEN");
+    expect(launch).toMatchObject({ GH_TOKEN: source.GH_TOKEN, PATH: source.PATH });
+    expect(source.PAPERCLIP_GITHUB_BROKER_TOKEN).toBe("session-capability-sentinel");
+    expect(sanitizeRunnerIngressLaunchEnvironment(source, false)).toBe(source);
+  });
+
   it("never switches a retained PRP session to the callback bridge after ingress authorization drops", async () => {
     const root = await mkdtemp(join(tmpdir(), "native-prp-sticky-session-"));
     const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;

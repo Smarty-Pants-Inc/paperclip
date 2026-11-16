@@ -72,22 +72,28 @@ function requestUnixSocket(socketPath, requestPath, options) {
 async function main() {
   let env = { ...process.env };
 ${options.brokerFile ? String.raw`
-  const runnerIngressCapability = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === 'runner_ingress'
-    ? env.PAPERCLIP_GITHUB_BROKER_TOKEN : '';
+  const runnerIngressBrokerFile = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === 'runner_ingress';
   delete env.PAPERCLIP_API_URL;
   delete env.PAPERCLIP_API_KEY;
   delete env.PAPERCLIP_GITHUB_BRIDGE_TOKEN;
   env.PAPERCLIP_GITHUB_BROKER_URL = '';
   env.PAPERCLIP_GITHUB_BROKER_TOKEN = '';
-  try {
-    const broker = JSON.parse(fs.readFileSync(path.join(directory, 'broker.json'), 'utf8'));
-    if (typeof broker.url === 'string' && typeof broker.token === 'string') {
-      env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
-      env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
-    }
-  } catch {}
-  if (runnerIngressCapability) env.PAPERCLIP_GITHUB_BROKER_TOKEN = runnerIngressCapability;
+  if (!runnerIngressBrokerFile) {
+    try {
+      const broker = JSON.parse(fs.readFileSync(path.join(directory, 'broker.json'), 'utf8'));
+      if (typeof broker.url === 'string' && typeof broker.token === 'string') {
+        env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
+        env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
+      }
+    } catch {}
+  }
 ` : ''}
+  const runnerIngress = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === 'runner_ingress';
+  if (runnerIngress) {
+    delete env.PAPERCLIP_GITHUB_BROKER_TOKEN;
+    delete env.PAPERCLIP_GITHUB_BRIDGE_TOKEN;
+    env.PAPERCLIP_GITHUB_BROKER_URL = '';
+  }
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   let connected = false;
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
@@ -123,21 +129,27 @@ ${options.brokerFile ? String.raw`
     const askBroker = !isLocalGit(process.argv.slice(2));
     try {
     let response;
+    const directRunnerIngress = Boolean(env.PAPERCLIP_GITHUB_RUNNER_SOCKET);
     if (askBroker && (env.PAPERCLIP_GITHUB_RUNNER_SOCKET || (base && env.PAPERCLIP_GITHUB_BROKER_TOKEN))) {
       const requestPath = '/runtime-tools/github/credentials';
-      const url = base.replace(/\/+$/, '').replace(/\/api$/, '') + requestPath;
-      // A slow or restarting control plane must not cost the operation its
-      // managed identity, so a failed request is retried before giving up.
-      // Busy (409) responses and transport failures keep separate budgets, and
-      // the body is read inside the retry so a failed read is retried too.
-      const directRunnerIngress = Boolean(env.PAPERCLIP_GITHUB_RUNNER_SOCKET);
-      let transportFailures = 0, conflicts = 0, result;
+      const url = base ? base.replace(/\/+$/, '').replace(/\/api$/, '') + requestPath : '';
+      // A fresh launch can reach the private socket just before the authenticated
+      // PRP attachment has installed its session capability. Retry only the
+      // named stale-token 503, with all request time bounded to ten seconds.
+      const refreshDeadline = Date.now() + 10000;
+      let transportFailures = 0, conflicts = 0, staleRetries = 0, result;
       for (;;) {
         try {
+          const requestHeaders = { 'content-type': 'application/json' };
+          if (!directRunnerIngress) Object.assign(requestHeaders, {
+            authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
+            'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN,
+          });
+          const timeoutMs = directRunnerIngress
+            ? Math.max(1, Math.min(30000, refreshDeadline - Date.now())) : 10000;
           const requestOptions = {
-            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(directRunnerIngress ? 30000 : 10000),
-            headers: { authorization: 'Bearer ' + (env.PAPERCLIP_GITHUB_BRIDGE_TOKEN || env.PAPERCLIP_API_KEY || env.PAPERCLIP_GITHUB_BROKER_TOKEN),
-              'x-paperclip-github-capability': env.PAPERCLIP_GITHUB_BROKER_TOKEN, 'content-type': 'application/json' },
+            method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
+            headers: requestHeaders,
             body: '{}',
           };
           response = env.PAPERCLIP_GITHUB_RUNNER_SOCKET
@@ -148,6 +160,18 @@ ${options.brokerFile ? String.raw`
             await response.arrayBuffer();
             await new Promise(resolve => setTimeout(resolve, 1000));
             continue;
+          }
+          if (directRunnerIngress && response.status === 503) {
+            const body = Buffer.from(await response.arrayBuffer()).toString('utf8');
+            let code = '';
+            try { code = JSON.parse(body).error; } catch {}
+            if (code === 'native_github_access_stale_runner_token' && Date.now() < refreshDeadline) {
+              const delay = Math.min(100 * (2 ** Math.min(staleRetries++, 6)), refreshDeadline - Date.now());
+              if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+              if (Date.now() < refreshDeadline) continue;
+            }
+            result = null;
+            break;
           }
           result = response.ok ? await response.json() : null;
           break;
@@ -220,8 +244,11 @@ export function githubBrokerEnvironment(input: Record<string, unknown>, broker: 
   env.GIT_SSH_COMMAND = "ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes";
   env.SSH_AUTH_SOCK = "";
   env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
-  const runnerIngressCapability = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === "runner_ingress"
-    ? env.PAPERCLIP_GITHUB_BROKER_TOKEN : undefined;
-  env.PAPERCLIP_GITHUB_BROKER_TOKEN = runnerIngressCapability ?? broker.token;
+  if (env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === "runner_ingress") {
+    delete env.PAPERCLIP_GITHUB_BROKER_TOKEN;
+    delete env.PAPERCLIP_GITHUB_BRIDGE_TOKEN;
+  } else {
+    env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
+  }
   return env;
 }

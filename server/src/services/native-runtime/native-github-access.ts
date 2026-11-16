@@ -104,8 +104,8 @@ function responseFrame(requestId: string, response: HttpReply): NativeGitHubAcce
 
 /**
  * A process-lifetime transport, with authority only while its controller owns a run.
- * Only the random broker capability reaches the launcher environment; the GitHub
- * credential is returned to the requesting command and is never written to disk.
+ * The random capability stays in server memory and reaches runnerd only through
+ * authenticated PRP attachment; the GitHub credential is never written to disk.
  * The resolver still checks the active run and current identity/grants per operation.
  */
 export async function createNativeGitHubAccess(input: {
@@ -126,7 +126,7 @@ export async function createNativeGitHubAccess(input: {
     throw new Error("native_github_runner_ingress_ineligible");
   }
   const duplexRequested = adapterExecutionTargetEnablesSandboxDuplexBridge(input.target);
-  const token = randomBytes(32).toString("hex");
+  let token = randomBytes(32).toString("hex");
   const redactLogValue = (value: string) => value
     .replaceAll(token, "[redacted]")
     .replaceAll(Buffer.from(token).toString("base64"), "[redacted]");
@@ -135,6 +135,8 @@ export async function createNativeGitHubAccess(input: {
   let activeGeneration: string | null = null;
   let stopped = false;
   let ready = true;
+  let staleRunnerCapability = false;
+  let runnerIngressCapabilityRefresher: ((capability: string) => Promise<void>) | null = null;
   let stopping: Promise<void> | undefined;
   let bridge: Awaited<ReturnType<typeof startAdapterExecutionTargetPaperclipBridge>> = null;
 
@@ -237,6 +239,7 @@ export async function createNativeGitHubAccess(input: {
     stopped = true;
     active = null;
     activeGeneration = null;
+    runnerIngressCapabilityRefresher = null;
     bridge?.markOrderlyCompletion?.();
     server?.closeAllConnections();
     const bridgeStop = await Promise.allSettled([bridge?.stop()]);
@@ -289,23 +292,35 @@ export async function createNativeGitHubAccess(input: {
       }
     }
     const launcherUrl = transport === "runner_ingress" ? "" : ready ? bridge?.env.PAPERCLIP_API_URL ?? url : "";
-    const launcherToken = !ready ? "" : bridge?.env.PAPERCLIP_API_KEY ?? token;
+    const launcherToken = transport === "runner_ingress" || !ready ? "" : bridge?.env.PAPERCLIP_API_KEY ?? token;
+    const ingressEnvironment: Record<string, string> = transport === "runner_ingress"
+      ? { [ACCESS_TRANSPORT_ENV]: "runner_ingress" }
+      : {};
     const env = await prepareGitHubOperationLaunchers({
       ...location, cwd: input.cwd,
       env: {
-        ...githubBrokerEnvironment({ PATH: input.env.PATH }, {
+        ...githubBrokerEnvironment({ PATH: input.env.PATH, ...ingressEnvironment }, {
           url: launcherUrl,
           token: launcherToken,
         }),
-        // Never retain an old run's bridge authentication override.
-        PAPERCLIP_GITHUB_BRIDGE_TOKEN: launcherToken,
-        ...(transport === "runner_ingress" ? { [ACCESS_TRANSPORT_ENV]: "runner_ingress" } : {}),
+        ...(transport === "callback_bridge" ? { PAPERCLIP_GITHUB_BRIDGE_TOKEN: launcherToken } : {}),
+        ...ingressEnvironment,
       },
     });
     return {
       env,
       transport,
-      get ready() { return ready && !stopped && (transport === "runner_ingress" || bridge?.readRunDisposition?.().failed !== true); },
+      get ready() { return ready && !stopped && !staleRunnerCapability && (transport === "runner_ingress" || bridge?.readRunDisposition?.().failed !== true); },
+      getRunnerIngressCapability() { return transport === "runner_ingress" ? token : undefined; },
+      setRunnerIngressCapabilityRefresher(refresher: ((capability: string) => Promise<void>) | null) {
+        if (transport !== "runner_ingress") return () => {};
+        runnerIngressCapabilityRefresher = refresher;
+        return () => {
+          if (runnerIngressCapabilityRefresher === refresher) runnerIngressCapabilityRefresher = null;
+        };
+      },
+      markRunnerIngressReady() { if (transport === "runner_ingress") staleRunnerCapability = false; },
+      markRunnerIngressStale() { if (transport === "runner_ingress") staleRunnerCapability = true; },
       duplexRequested,
       async handleRunnerIngressHttpRequest(frame: unknown, sessionBinding: Binding): Promise<NativeGitHubAccessHttpReply> {
         const parsed = parseIngressRequest(frame);
@@ -323,6 +338,7 @@ export async function createNativeGitHubAccess(input: {
         if (!parsed) return respond(jsonReply(403, { error: "GitHub ingress request refused" }));
         const body = decodeBody(parsed.bodyBase64);
         if (!body) return respond(jsonReply(413, { error: "GitHub request body exceeds the configured size limit" }));
+        if (staleRunnerCapability) return respond(jsonReply(503, { error: "native_github_access_stale_runner_token" }));
         // Retain the launcher's existing per-request capability check; the
         // authenticated PRP identity below adds session authority, not a substitute.
         if (!sameToken(parsed.headers[INGRESS_CAPABILITY_HEADER], token)) {
@@ -357,10 +373,24 @@ export async function createNativeGitHubAccess(input: {
         if (binding.companyId !== input.scope.companyId || binding.agentId !== input.scope.agentId ||
             binding.issueId !== input.scope.issueId) throw new Error("GitHub session scope mismatch");
         const generation = randomUUID();
+        if (transport === "runner_ingress") token = randomBytes(32).toString("hex");
         if (transport === "callback_bridge") await bridge?.resume?.(generation);
         const owner = { ...binding };
         active = owner;
         activeGeneration = generation;
+        try {
+          if (transport === "runner_ingress" && runnerIngressCapabilityRefresher) {
+            await runnerIngressCapabilityRefresher(token);
+            staleRunnerCapability = false;
+          }
+        } catch (error) {
+          if (active === owner) {
+            active = null;
+            activeGeneration = null;
+          }
+          staleRunnerCapability = true;
+          throw error;
+        }
         return async () => {
           if (active === owner) {
             active = null;

@@ -51,7 +51,7 @@ mod unix_socket {
     const HTTP_RESPONSE_TIMEOUT_SLICE: Duration = Duration::from_millis(100);
     const CONNECTION_QUEUE_CAPACITY: usize = 32;
     const HTTP_WORKER_COUNT: usize = 4;
-    const ERROR_BODY_UNAVAILABLE: &[u8] = br#"{"error":"runner ingress unavailable"}"#;
+    const ERROR_BODY_UNAVAILABLE: &[u8] = br#"{"error":"native_github_access_stale_runner_token"}"#;
     const ERROR_BODY_METHOD_NOT_ALLOWED: &[u8] = br#"{"error":"Method not allowed"}"#;
     const GITHUB_CREDENTIALS_PATH: &str = "/runtime-tools/github/credentials";
 
@@ -64,6 +64,7 @@ mod unix_socket {
         accept_thread: Option<JoinHandle<()>>,
         worker_threads: Vec<JoinHandle<()>>,
         available: Arc<AtomicBool>,
+        capability: Arc<Mutex<Option<String>>>,
     }
 
     impl GitHubAccessIngress {
@@ -114,6 +115,7 @@ mod unix_socket {
             let connection_receiver = Arc::new(Mutex::new(connection_receiver));
             let shutdown = Arc::new(AtomicBool::new(false));
             let available = Arc::new(AtomicBool::new(true));
+            let capability = Arc::new(Mutex::new(None));
             let next_request_id = Arc::new(AtomicU64::new(0));
             let mut worker_threads: Vec<JoinHandle<()>> = Vec::with_capacity(HTTP_WORKER_COUNT);
 
@@ -122,6 +124,7 @@ mod unix_socket {
                 let requests = request_sender.clone();
                 let shutdown = Arc::clone(&shutdown);
                 let available = Arc::clone(&available);
+                let capability = Arc::clone(&capability);
                 let request_id_prefix = request_id_prefix.clone();
                 let next_request_id = Arc::clone(&next_request_id);
                 let worker = match thread::Builder::new()
@@ -140,6 +143,7 @@ mod unix_socket {
                                 &requests,
                                 &shutdown,
                                 &available,
+                                &capability,
                                 &request_id_prefix,
                                 &next_request_id,
                             ),
@@ -214,6 +218,7 @@ mod unix_socket {
                 accept_thread: Some(accept_thread),
                 worker_threads,
                 available,
+                capability,
             })
         }
 
@@ -223,6 +228,31 @@ mod unix_socket {
 
         pub fn set_available(&self, available: bool) {
             self.available.store(available, Ordering::Release);
+            if !available {
+                if let Ok(mut capability) = self.capability.lock() {
+                    *capability = None;
+                }
+            }
+        }
+
+        pub fn set_capability(&self, capability: &str) -> Result<(), ()> {
+            if capability.len() != 64 || !capability.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(());
+            }
+            let mut current = self.capability.lock().map_err(|_| ())?;
+            *current = Some(capability.to_owned());
+            Ok(())
+        }
+
+        pub fn frame_with_capability(&self, request: &GitHubAccessRequest) -> Option<Value> {
+            let capability = self.capability.lock().ok()?.as_ref()?.clone();
+            let mut frame = request.frame().clone();
+            let headers = frame.get_mut("headers")?.as_object_mut()?;
+            headers.insert(
+                "x-paperclip-github-capability".to_owned(),
+                Value::String(capability),
+            );
+            Some(frame)
         }
 
         pub fn try_next_request(&mut self) -> Option<GitHubAccessRequest> {
@@ -262,6 +292,7 @@ mod unix_socket {
         requests: &SyncSender<GitHubAccessRequest>,
         shutdown: &AtomicBool,
         available: &AtomicBool,
+        capability: &Mutex<Option<String>>,
         request_id_prefix: &str,
         next_request_id: &AtomicU64,
     ) {
@@ -297,7 +328,14 @@ mod unix_socket {
             write_http_error(stream, 403);
             return;
         }
-        if !available.load(Ordering::Acquire) || shutdown.load(Ordering::Acquire) {
+        let capability_ready = capability
+            .lock()
+            .map(|value| value.is_some())
+            .unwrap_or(false);
+        if !available.load(Ordering::Acquire)
+            || !capability_ready
+            || shutdown.load(Ordering::Acquire)
+        {
             write_http_error(stream, 503);
             return;
         }
@@ -474,9 +512,6 @@ mod unix_socket {
                         | "x-paperclip-bridge-transport"
                         | "x-paperclip-run-id"
                 )
-                || (name == "x-paperclip-github-capability"
-                    && value.len() <= 4_096
-                    && !value.contains(','))
             {
                 output.insert(name.clone(), Value::String(value.clone()));
             }
@@ -646,6 +681,14 @@ impl GitHubAccessIngress {
 
     pub fn set_available(&self, _available: bool) {}
 
+    pub fn set_capability(&self, _capability: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    pub fn frame_with_capability(&self, _request: &GitHubAccessRequest) -> Option<Value> {
+        None
+    }
+
     pub fn try_next_request(&mut self) -> Option<GitHubAccessRequest> {
         None
     }
@@ -694,19 +737,20 @@ pub(crate) fn apply_provider_environment(command: &mut std::process::Command) {
         return;
     };
     let Some(environment) = value.as_ref() else {
-        // In callback-bridge mode the server-provided environment is already
-        // complete. Do not rewrite it when no runner ingress is installed.
+        // Bridge-mode children must not inherit stale ingress routing from the
+        // runnerd environment, even if an earlier attachment used this socket.
+        command
+            .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
+            .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT");
         return;
     };
-    // The session capability arrives in runnerd's existing launch environment.
-    // Keep its value only on provider children, where the GitHub launcher needs
-    // it to authenticate the local socket request; never use the bridge URL.
-    let session_capability = std::env::var_os("PAPERCLIP_GITHUB_BROKER_TOKEN").unwrap_or_default();
+    // The capability is held only in runnerd memory and stamped onto the
+    // authenticated PRP frame. Provider children see routing, never authority.
     command
         .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", &environment.socket_path)
         .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress")
         .env("PAPERCLIP_GITHUB_BROKER_URL", "")
-        .env("PAPERCLIP_GITHUB_BROKER_TOKEN", session_capability)
+        .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "")
         .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
 }
 
@@ -750,7 +794,7 @@ pub(crate) fn is_reply_frame(value: &Value) -> bool {
 
 pub(crate) fn error_reply(request_id: &str, status: u16) -> Value {
     let body: &[u8] = if status == 503 {
-        br#"{"error":"runner ingress unavailable"}"#
+        br#"{"error":"native_github_access_stale_runner_token"}"#
     } else if status == 504 {
         br#"{"error":"runner ingress response timed out"}"#
     } else if status == 413 {

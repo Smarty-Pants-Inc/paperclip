@@ -62,6 +62,7 @@ async function startGithubAccessIngressHarness(githubAccess: unknown) {
   let githubHandler: ((frame: unknown, identity: { companyId: string; agentId: string; issueId: string; runId: string }) => Promise<unknown>) | null = null;
   const identity = { companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" };
   const authority = {
+    refreshGithubAccessCapability: vi.fn(async (_capability: string) => undefined),
     setGithubAccessHttpHandler(handler: typeof githubHandler) {
       githubHandler = handler;
       return () => { if (githubHandler === handler) githubHandler = null; };
@@ -80,10 +81,42 @@ async function startGithubAccessIngressHarness(githubAccess: unknown) {
     githubAccess,
   } as unknown as Parameters<typeof connectRunnerPrpIngress>[0]);
   await handle.ready;
-  return { socket, handle, restore: () => { sockets.create = previousCreate; } };
+  return { socket, handle, authority, restore: () => { sockets.create = previousCreate; } };
 }
 
 sockets.create = () => openingSocket();
+
+it("refreshes the runner GitHub capability over the authenticated PRP attachment before readiness", async () => {
+  const capability = "a".repeat(64);
+  const onCapabilityRefreshSuccess = vi.fn();
+  const onCapabilityRefreshFailure = vi.fn();
+  let refreshAttachedCapability!: (capability: string) => Promise<void>;
+  const setRunnerIngressCapabilityRefresher = vi.fn((refresher: (capability: string) => Promise<void>) => {
+    refreshAttachedCapability = refresher;
+    return vi.fn();
+  });
+  const access = {
+    getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" }),
+    handleRequest: vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("{}")})),
+    getCapability: () => capability,
+    setRunnerIngressCapabilityRefresher,
+    onCapabilityRefreshSuccess,
+    onCapabilityRefreshFailure,
+  };
+  const harness = await startGithubAccessIngressHarness(access);
+  try {
+    expect(harness.authority.refreshGithubAccessCapability).toHaveBeenCalledOnce();
+    expect(harness.authority.refreshGithubAccessCapability).toHaveBeenCalledWith(capability);
+    expect(onCapabilityRefreshSuccess).toHaveBeenCalledOnce();
+    expect(setRunnerIngressCapabilityRefresher).toHaveBeenCalledOnce();
+    await refreshAttachedCapability("b".repeat(64));
+    expect(harness.authority.refreshGithubAccessCapability).toHaveBeenNthCalledWith(2, "b".repeat(64));
+    expect(onCapabilityRefreshFailure).not.toHaveBeenCalled();
+  } finally {
+    await harness.handle.close();
+    harness.restore();
+  }
+});
 
 describe("runner provider-ingress WebSocket wire", () => {
   it("serializes only allowlisted ingress diagnostics through Pino", async () => {

@@ -132,7 +132,11 @@ fn send_github_access_requests(
             let _ = request.respond(github_access::error_reply(&request_id, 503));
             continue;
         }
-        let encoded_len = serde_json::to_vec(request.frame())
+        let Some(frame) = ingress.frame_with_capability(&request) else {
+            let _ = request.respond(github_access::error_reply(&request_id, 503));
+            continue;
+        };
+        let encoded_len = serde_json::to_vec(&frame)
             .map_err(|_| DurableRunnerError::invalid("GitHub access request could not be encoded"))?
             .len();
         if encoded_len > max_frame_bytes {
@@ -147,7 +151,7 @@ fn send_github_access_requests(
             let _ = request.respond(github_access::error_reply(&request_id, 502));
             continue;
         }
-        if let Err(error) = transport.send_json(request.frame()) {
+        if let Err(error) = transport.send_json(&frame) {
             let _ = request.respond(github_access::error_reply(&request_id, 503));
             return Err(error);
         }
@@ -1389,6 +1393,59 @@ pub fn run_durable_runner_with_host_control<E: CommandExecutor>(
                 break;
             }
             match message.get("kind").and_then(Value::as_str) {
+                Some("github_access.capability") => {
+                    let ingress = github_access.as_ref().ok_or_else(|| {
+                        DurableRunnerError::invalid(
+                            "GitHub capability refresh arrived without runner ingress",
+                        )
+                    })?;
+                    let payload = message
+                        .get("payload")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "GitHub capability refresh payload is required",
+                            )
+                        })?;
+                    if payload.len() != 2 {
+                        return Err(DurableRunnerError::invalid(
+                            "GitHub capability refresh payload is malformed",
+                        ));
+                    }
+                    let ack_id = payload
+                        .get("ackId")
+                        .and_then(Value::as_str)
+                        .filter(|value| {
+                            !value.is_empty()
+                                && value.len() <= 128
+                                && value.bytes().all(|byte| {
+                                    byte.is_ascii_alphanumeric()
+                                        || matches!(byte, b'.' | b'_' | b':' | b'-')
+                                })
+                        })
+                        .ok_or_else(|| {
+                            DurableRunnerError::invalid("GitHub capability refresh id is malformed")
+                        })?;
+                    let capability = payload
+                        .get("capability")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            DurableRunnerError::invalid(
+                                "GitHub capability refresh value is required",
+                            )
+                        })?;
+                    ingress.set_available(false);
+                    ingress.set_capability(capability).map_err(|_| {
+                        DurableRunnerError::invalid("GitHub capability refresh value is malformed")
+                    })?;
+                    ingress.set_available(true);
+                    transport.send_json(&control_envelope(
+                        &state,
+                        &connection,
+                        "github_access.capability_ack",
+                        json!({ "ackId": ack_id }),
+                    ))?;
+                }
                 Some("lease_renewed") => {
                     let credential = lease.as_mut().ok_or_else(|| {
                         DurableRunnerError::invalid("lease renewal requires a live credential")
@@ -2918,6 +2975,9 @@ mod tests {
         use std::os::unix::net::UnixStream;
 
         let mut ingress = GitHubAccessIngress::start().expect("start private socket");
+        ingress
+            .set_capability(&"a".repeat(64))
+            .expect("install in-memory runner capability");
         let socket_path = ingress.socket_path().to_path_buf();
         let client = thread::spawn(move || {
             let mut stream = UnixStream::connect(socket_path).expect("connect private socket");

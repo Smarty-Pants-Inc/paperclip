@@ -3648,6 +3648,34 @@ it("routes github_access.http only through authenticated PRP without journaling 
   }
 });
 
+it("pushes the runner GitHub capability only over authenticated PRP and waits for its ephemeral ack", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-prp-github-capability-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  const capability = "deadbeef".repeat(8);
+  let client: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    client = await authenticate(core, core.issueBootstrapTicket());
+    expect(client).not.toBeNull();
+    const refresh = core.refreshGithubAccessCapability(capability);
+    void refresh.catch(() => {});
+    const frame = await receiveSecure(client!);
+    expect(frame).toMatchObject({ protocol: "paperclip.runner", kind: "github_access.capability",
+      payload: { capability } });
+    expect(typeof (frame?.payload as Record<string, unknown>)?.ackId).toBe("string");
+    expect(JSON.stringify(core.store.state)).not.toContain(capability);
+    const ackId = (frame?.payload as Record<string, unknown>).ackId;
+    sendSecure(client!, { ...frame!, envelopeId: "github-access-capability-ack", kind: "github_access.capability_ack",
+      payload: { ackId } });
+    await expect(refresh).resolves.toBeUndefined();
+    expect(JSON.stringify(core.store.state)).not.toContain(capability);
+  } finally {
+    client?.socket.destroy();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 const semanticInputDigestFixtures = JSON.parse(readFileSync(
   new URL("../../test/fixtures/semantic-input-digests.json", import.meta.url),
   "utf8",

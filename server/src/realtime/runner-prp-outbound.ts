@@ -34,6 +34,10 @@ type GithubAccessReply = { requestId: string; status: number; headers: Record<st
 type GithubAccessHandler = {
   getSessionBinding(identity: DurableRecoveryIdentity): GithubAccessBinding | null;
   handleRequest(frame: unknown, binding: GithubAccessBinding): Promise<unknown>;
+  getCapability?: () => string | undefined;
+  setRunnerIngressCapabilityRefresher?: (refresher: ((capability: string) => Promise<void>) | null) => () => void;
+  onCapabilityRefreshSuccess?: () => void;
+  onCapabilityRefreshFailure?: () => void;
 };
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const MIN_CONNECT_ATTEMPTS = 3;
@@ -58,7 +62,8 @@ const DEFAULT_LIVENESS_TIMEOUT_MS = 90_000;
 export type RunnerIngressFailureCode =
   | "runner_ingress_unavailable"
   | "runner_ingress_auth_failed"
-  | "runner_connection_lease_expired";
+  | "runner_connection_lease_expired"
+  | "native_github_access_stale_runner_token";
 
 export class RunnerIngressConnectionError extends Error {
   constructor(
@@ -537,6 +542,7 @@ export function connectRunnerPrpIngress(input: {
   let readySettled = false;
   let stopLiveness = () => {};
   let unregisterGithubAccessHandler = () => {};
+  let unregisterGithubCapabilityRefresher: (() => void) | null = null;
   if (input.githubAccess) {
     unregisterGithubAccessHandler = input.authority.setGithubAccessHttpHandler(
       githubAccessRequestDispatcher(input.githubAccess),
@@ -608,6 +614,26 @@ export function connectRunnerPrpIngress(input: {
           );
         }
         if (abort.signal.aborted) return;
+        if (input.githubAccess?.getCapability) {
+          const capability = input.githubAccess.getCapability();
+          try {
+            if (!capability) throw new Error("native_github_access_stale_runner_token");
+            await input.authority.refreshGithubAccessCapability(capability);
+            input.githubAccess.onCapabilityRefreshSuccess?.();
+            if (!unregisterGithubCapabilityRefresher) {
+              unregisterGithubCapabilityRefresher = input.githubAccess.setRunnerIngressCapabilityRefresher?.(
+                nextCapability => input.authority.refreshGithubAccessCapability(nextCapability),
+              ) ?? (() => {});
+            }
+          } catch (error) {
+            input.githubAccess.onCapabilityRefreshFailure?.();
+            throw new RunnerIngressConnectionError(
+              "native_github_access_stale_runner_token",
+              "Runner GitHub capability refresh was not acknowledged.",
+              { cause: error },
+            );
+          }
+        }
         if (!readySettled) {
           readySettled = true;
           readyResolve();
@@ -789,6 +815,7 @@ export function connectRunnerPrpIngress(input: {
       await Promise.all([...ownedWires].map(closeOwnedWire));
       await loop;
       unregisterGithubAccessHandler();
+      unregisterGithubCapabilityRefresher?.();
       await endpoint.close();
       input.onStateChange?.("closed");
       if (!readySettled) {
