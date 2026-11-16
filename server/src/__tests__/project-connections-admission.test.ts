@@ -4,7 +4,7 @@ import { assertProjectConnectionAdmission } from "../services/project-connection
 import { conflict } from "../errors.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolOauthStates, toolProfileBindings, toolProfiles, userCompanyPreferences } from "@paperclipai/db";
+import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolOauthStates, toolProfileBindings, toolProfiles, projectWorkspaces, userCompanyPreferences } from "@paperclipai/db";
 import * as providerScope from "../services/project-connection-provider-scope.js";
 import * as arbitration from "../services/project-connection-arbitration.js";
 import * as retirement from "../services/project-connection-retirement.js";
@@ -375,6 +375,45 @@ describe("project connection writer admission (round-4 B)", () => {
       : f.service.completeVercelConnectCallback({ state, actor });
     await expect(callback).rejects.toMatchObject({ status: 409, details: { code: "project_connection_archived" } });
     expect((await storedConnection(db, connection.id)).status).toBe("archived");
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it.each([false, true])("M03/A08/W1: generic PATCH cannot activate an unfinished owned draft (pending=%s)", async pending => {
+    const f = await projectConnectionFixture(db);
+    const legacy = pending ? await f.seedConnection(null) : undefined;
+    const { connection } = await f.seedConnection(f.a, { status: "draft", pending, legacyId: legacy?.connection.id, installed: false });
+    composeFinish(f);
+    await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, { enabled: true, status: "active" }, context)))
+      .rejects.toMatchObject({ status: 409, details: { code: "project_connection_verification_required" } });
+    expect(await storedConnection(db, connection.id)).toMatchObject({ status: "draft", enabled: false });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("M01/A08/W3: an explicit install cannot expose a still-pending migration candidate", async () => {
+    const f = await projectConnectionFixture(db);
+    const legacy = await f.seedConnection(null);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
+    composeFinish(f);
+    await expect(f.service.putConnectionInstalls(connection.id, { installs: [{ targetType: "agent", targetId: f.worker.id }] }, f.actor()))
+      .rejects.toMatchObject({ status: 409, details: { code: "project_connection_migration_pending" } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+    expect((await storedConnection(db, legacy.connection.id)).enabled).toBe(true);
+  });
+
+  it("J05/A02: provider IDs equal the requested shard, not just any non-empty approved subset", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
+    await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.a.id, name: "Second approved repository", repoUrl: "https://github.com/owner/A2.git", metadata: { githubRepositoryId: 102 } });
+    const config = { ...connection.config, projectScope: { ...f.scope(), approvedRepositoryIds: [101, 102] } };
+    await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connection.id));
+    const harness = composeFinish(f);
+    // Both IDs are ratified and current, but this connection requested only A
+    // (101). A provider reply for approved A2 (102) is still the wrong token.
+    harness.verify.mockResolvedValue({ ...harness.verified, repositoryIds: [102] });
+    await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_repository_not_approved" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
