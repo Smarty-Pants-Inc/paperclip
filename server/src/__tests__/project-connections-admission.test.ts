@@ -3,7 +3,7 @@ import request from "supertest";
 import { assertProjectConnectionAdmission } from "../services/project-connection-admission.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfiles, userCompanyPreferences } from "@paperclipai/db";
+import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolOauthStates, toolProfileBindings, toolProfiles, userCompanyPreferences } from "@paperclipai/db";
 import * as providerScope from "../services/project-connection-provider-scope.js";
 import * as arbitration from "../services/project-connection-arbitration.js";
 import * as retirement from "../services/project-connection-retirement.js";
@@ -303,6 +303,78 @@ describe("project connection writer admission (round-4 B)", () => {
       .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
       .toMatchObject([{ targetId: f.outsider.id }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("A08/W7: actorless project lead changes cannot rewrite the approved team", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection();
+    const { projectService } = await import("../services/projects.js");
+    await expect(projectService(db).update(f.a.id, { leadAgentId: f.leadB.id }))
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_actor_required" } });
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+  });
+
+  it("J01/A08/W7: B's lead cannot change A's approved lead through real project PATCH", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection();
+    const response = await request(f.route(f.leadB.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.leadB.id });
+    expect(response.status).toBe(403);
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("J02/A08/W7: even the primary must reconcile old recipients before changing the lead", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection();
+    composeFinish(f);
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.leadB.id });
+    expect(response.status).toBe(403);
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
+  });
+
+  it("J03/A08/W7: an authorized drained lead change synchronizes live and retained approvals atomically", async () => {
+    const f = await projectConnectionFixture(db);
+    const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const live = await f.seedConnection(f.a, { status: "draft", installed: false });
+    composeFinish(f);
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
+    expect(response.status).toBe(200);
+    expect(response.body.leadAgentId).toBe(f.worker.id);
+    for (const { connection } of [archived, live]) {
+      expect((await storedConnection(db, connection.id)).config.projectScope).toEqual({ ...f.scope(), approvedLeadAgentId: f.worker.id });
+    }
+    expect((await storedConnection(db, archived.connection.id)).status).toBe("archived");
+  });
+
+  it("J11/A08/W7: running-work refusal rolls back project lead and all approval envelopes", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { installed: false });
+    composeFinish(f);
+    vi.mocked(retirement.assertProjectConnectionNotInUse).mockRejectedValue(Object.assign(new Error("synthetic running work"), { status: 409, details: { code: "project_connection_in_use" } }));
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
+    expect(response.status).toBe(409);
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
+  });
+
+  it.each(["direct", "cloud", "vercel"] as const)("A03/A08/W2: an old %s OAuth continuation cannot write an owned App", async transport => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const state = randomUUID();
+    await db.insert(toolOauthStates).values({ companyId: f.companyId, connectionId: connection.id, state, codeVerifier: "synthetic-pkce",
+      subjectUserId: f.human, expiresAt: new Date(Date.now() + 60_000),
+      createdByActorType: "user", createdByActorId: f.human });
+    const actor = { actorType: "user" as const, actorId: f.human };
+    const callback = transport === "direct" ? f.service.completeOAuthCallback({ state, code: "synthetic-code", redirectUri: "https://paperclip.invalid/callback", actor })
+      : transport === "cloud" ? f.service.completePaperclipCloudConnectorCallback({ state, claimId: "synthetic-claim", actor })
+      : f.service.completeVercelConnectCallback({ state, actor });
+    await expect(callback).rejects.toMatchObject({ status: 409, details: { code: "project_connection_archived" } });
+    expect((await storedConnection(db, connection.id)).status).toBe("archived");
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
 
