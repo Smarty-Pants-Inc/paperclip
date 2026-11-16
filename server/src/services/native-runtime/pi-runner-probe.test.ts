@@ -1,4 +1,6 @@
 import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import { runInNewContext } from "node:vm";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -48,7 +50,7 @@ vi.mock("./native-session-executor.js", async original => {
 });
 
 import { QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
-import { probeManagedNativePiRunner } from "./pi-runner-probe.js";
+import { parseProbeStaticManifest, probeStaticExclusions, probeManagedNativePiRunner } from "./pi-runner-probe.js";
 import { syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
 
 type Request = Parameters<CommandManagedRuntimeRunner["execute"]>[0];
@@ -142,6 +144,78 @@ afterEach(async () => {
   mocks.archives.length = 0;
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
+
+describe("native Pi probe static-file manifest", () => {
+  const sha = "a".repeat(64);
+  const binary = "bin/paperclip-runnerd";
+  const cache = "pi/node-compile-cache";
+
+  it("excludes a runner only when its manifest digest matches, retaining custody details", () => {
+    const manifest = parseProbeStaticManifest(`12 ${sha} ${binary}\n4 ${sha} ${cache}/v8.blob\ncount 2\n`, [binary, cache]);
+    const matched = probeStaticExclusions(manifest, sha);
+    expect(matched.excludeEntries).toEqual([binary, cache]);
+    expect(matched.record).toContain(`runnerd expected ${sha} / found ${sha} / match yes`);
+    expect(matched.record).toContain("count 2");
+    expect(matched.record).toContain(`${binary}`);
+    const mismatch = probeStaticExclusions(manifest, "b".repeat(64));
+    expect(mismatch.excludeEntries).toEqual([cache]);
+    expect(mismatch.record).toContain("match no");
+    const absent = probeStaticExclusions({ files: [] }, sha);
+    expect(absent.excludeEntries).toEqual([cache]);
+    expect(absent.record).toContain("found absent / match no");
+  });
+
+  it("runs the production manifest script with sh and busybox sh, paths with spaces, symlink omission and failing checksums", async () => {
+    const source = await readFile(new URL("./pi-runner-probe.ts", import.meta.url), "utf8");
+    const begin = source.indexOf("const PROBE_STATIC_MANIFEST_SCRIPT = ");
+    const end = source.indexOf(";\n\nexport type ProbeStaticManifest", begin);
+    expect(begin).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(begin);
+    const expression = source.slice(begin, end).replace(/^const PROBE_STATIC_MANIFEST_SCRIPT = /, "");
+    const command = runInNewContext(expression) as string;
+    const root = await mkdtemp(join(tmpdir(), "probe-manifest-script-"));
+    roots.push(root);
+    const tree = join(root, "tree");
+    await mkdir(join(tree, "bin"), { recursive: true });
+    await mkdir(join(tree, "pi", "node-compile-cache", "nested"), { recursive: true });
+    await writeFile(join(tree, binary), "runner bytes");
+    await writeFile(join(tree, "pi", "node-compile-cache", "nested", "file with space"), "cache bytes");
+    await symlink(join(tree, binary), join(tree, "pi", "ignored-link"));
+    const run = promisify(execFile);
+    const invoke = (shell: string, path = "/usr/bin:/bin") => run(shell, [...(shell === "busybox" ? ["sh"] : []), "-c", command,
+      "paperclip-probe-static-manifest", tree, binary, cache], { encoding: "utf8", env: { PATH: path } });
+    const shells = ["sh"];
+    if (await run("sh", ["-c", "command -v busybox"], { encoding: "utf8" }).then(() => true).catch(() => false)) shells.push("busybox");
+    for (const shell of shells) {
+      const parsed = await invoke(shell);
+      expect(parsed.stdout).toContain(`${binary}`);
+      expect(parsed.stdout).toContain("pi/node-compile-cache/nested/file with space");
+      expect(parsed.stdout).toContain("count 2");
+      expect(parsed.stdout).not.toContain("ignored-link");
+    }
+    const empty = await run("sh", ["-c", command, "paperclip-probe-static-manifest", tree,
+      "absent-runner", "absent-cache"], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+    expect(empty.stdout).toBe("count 0\n");
+    const failedPath = join(root, "bad-path");
+    await mkdir(failedPath);
+    const badSha = join(failedPath, "sha256sum");
+    await writeFile(badSha, "#!/bin/sh\nexit 9\n", { mode: 0o700 });
+    await expect(invoke("sh", `${failedPath}:/usr/bin:/bin`)).rejects.toMatchObject({ code: 9 });
+  });
+
+  it.each([
+    `12  ${sha} ${binary}\n`,
+    `12  ${binary}\ncount 1\n`,
+    `12 ${sha} other/file\ncount 1\n`,
+    `12 ${sha} ${binary}/../foreign\ncount 1\n`,
+    `12 ${sha} ${binary}\n`,
+    `12 ${sha} ${binary}\ncount 2\n`,
+  ])("rejects malformed or incomplete manifests: %s", value => {
+    const input = value.replaceAll("${sha}", sha).replaceAll("${binary}", binary);
+    expect(() => parseProbeStaticManifest(input, [binary, cache])).toThrow("native_probe_static_manifest_invalid");
+  });
+});
+
 
 describe("native Pi probe runner artifact preparation", () => {
   it.each([true, false])("copies a matching preinstalled runner without uploading and archives cleanup (syncIn=%s)", async sync => {
