@@ -62,3 +62,17 @@ nothing-written replacement, not an additional admission delta supersede.
 The other three admission codes and two provider local-denial codes are NOT
 superseded: product guard order/catch scope restore the original exact codes.
 No other existing expectation may change.
+
+## 4. J05/A02 tenth zero-residue replacement (int5)
+
+Authority: RFL 07:41Z 2026-11-16, `FINDINGS-CUSTODY-RFL.md`.
+Named test: `J05/A02: provider IDs equal the requested shard, not just any non-empty approved subset`
+in `server/src/__tests__/project-connections-admission.test.ts`.
+
+Old: company activity `toHaveLength(0)` after genuine approval setup.
+New: `setupSnapshot(f, [connection.id])` AFTER setup and BEFORE the action,
+with its exact source S, explicitly seeded candidate, and exactly the three
+named setup activity rows; then action activity delta `toBe(0)`.
+The original 102-for-requested-101 trigger, exact
+`project_connection_repository_not_approved` refusal and install-zero assertion
+are unchanged. This uses the same exact setup/leak assertion as the named nine.
