@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { connectionGrants, createDb, issues, toolConnections } from "@paperclipai/db";
+import { connectionGrants, createDb, heartbeatRuns, issues, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
 
@@ -33,6 +33,12 @@ describe("project connection shell/native operation parity", () => {
     await db.update(toolConnections).set({ healthStatus: "ok" }).where(eq(toolConnections.id, b.connection.id));
     await db.update(connectionGrants).set({ createdAt: new Date(Date.now() + 10000) }).where(eq(connectionGrants.id, b.grant.id));
     const bound = await f.run();
+    // Seed the DB-owned admission pair for credential-level transport probes.
+    // This is NOT proof of the outside-C queue's actual admission integration.
+    const [task] = await db.select({ projectId: issues.projectId }).from(issues).where(eq(issues.id, bound.issue.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { ...bound.run.contextSnapshot,
+      projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: task!.projectId },
+    } }).where(eq(heartbeatRuns.id, bound.run.id));
     await initializeRunIdentity(db, { companyId: f.companyId, runId: bound.run.id, responsibleUserId: f.human, cause: "instruction" });
     return { f, a, b, bound, input: { companyId: f.companyId, agentId: f.leadA.id, runId: bound.run.id } };
   }
