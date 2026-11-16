@@ -4968,6 +4968,39 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     return { pluginId, environment, runId, lease, workerManager, runtimeWithPlugin };
   }
 
+  // Keep: cleanup failure paths and secret-safe diagnostics at the plugin boundary.
+  it.each(["worker unavailable", "release method unavailable", "release throws"])(
+    "logs a named sandbox release event when %s", async failure => {
+      const { lease, workerManager, runtimeWithPlugin } = await seedStaleLifecycleReusableLease();
+      if (failure === "worker unavailable") vi.mocked(workerManager.isRunning).mockReturnValue(false);
+      if (failure === "release throws") {
+        vi.mocked(workerManager.getWorker).mockReturnValue({ supportedMethods: ["environmentReleaseLease"] } as never);
+        vi.mocked(workerManager.call).mockRejectedValue(Object.assign(new Error("secret-provider-token"), {
+          name: "secret-error-name", code: "secret-error-code", cause: "secret-error-cause",
+        }));
+      }
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => undefined);
+      try {
+        await runtimeWithPlugin.releaseRunLeases(lease.heartbeatRunId!);
+        expect(warn).toHaveBeenCalledWith({
+          event: failure === "release throws" ? "sandbox_release_failed" : "sandbox_release_not_sent",
+          leaseId: lease.id,
+          reasonClass: failure === "release throws" ? "release_error" : "worker_or_release_method_unavailable",
+        }, "sandbox lease release did not complete");
+        expect(JSON.stringify(warn.mock.calls)).not.toContain("secret-");
+        if (failure === "release throws") expect(workerManager.call).toHaveBeenCalledWith(
+          expect.any(String), "environmentReleaseLease", expect.objectContaining({ providerLeaseId: lease.providerLeaseId }), expect.any(Number),
+        );
+        else expect(workerManager.call).not.toHaveBeenCalled();
+        await expect(environmentService(db).getLeaseById(lease.id)).resolves.toMatchObject({
+          status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
+        });
+      } finally {
+        warn.mockRestore();
+      }
+    },
+  );
+
   it("routes release to pending_cleanup when the worker no longer advertises the release lifecycle method", async () => {
     const { pluginId, lease, workerManager, runtimeWithPlugin } = await seedStaleLifecycleReusableLease();
 

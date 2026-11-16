@@ -3408,9 +3408,11 @@ function createSandboxEnvironmentDriver(
         termination = remoteTerminationReceipt(input.lease, receipt);
         if (input.cancelActiveWork && !termination) cleanupStatus = "failed";
       } catch {
+        logger.warn({ event: "sandbox_release_failed", leaseId: input.lease.id, reasonClass: "release_error" }, "sandbox lease release did not complete");
         cleanupStatus = "failed";
       }
     } else {
+      logger.warn({ event: "sandbox_release_not_sent", leaseId: input.lease.id, reasonClass: "worker_or_release_method_unavailable" }, "sandbox lease release did not complete");
       cleanupStatus = "failed";
     }
     // Ordinary reusable release can fail after the provider already stopped.
