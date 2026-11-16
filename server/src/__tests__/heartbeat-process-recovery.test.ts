@@ -6686,6 +6686,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const heartbeat = heartbeatService(db);
     await heartbeat.resumeQueuedRuns();
+    // A terminal status/report precedes controller and lease cleanup. Wait for
+    // the actual executor settlement before checking the task's release.
+    await heartbeat.drainActiveRunExecutions();
 
     const failedRun = await waitForValue(async () => {
       const row = await db
@@ -6742,14 +6745,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       ),
     ).toBe(false);
 
-    // Instead it escalates straight to needs-attention, same as the
-    // retry-exhausted path.
-    const issue = await db
-      .select({ status: issues.status })
-      .from(issues)
-      .where(eq(issues.id, issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(issue?.status).toBe("blocked");
+    // It escalates without another provider attempt, but task ownership can
+    // only be released after this executor's controller and cleanup settle.
+    // The saved needs-attention report may precede that durable Stop proof.
+    const issue = await waitForValue(async () => {
+      const [row] = await db.select({ status: issues.status, checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId }).from(issues).where(eq(issues.id, issueId));
+      return row?.status === "blocked" ? row : null;
+    });
+    expect(issue).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
 
     const recoveryAction = await db
       .select({

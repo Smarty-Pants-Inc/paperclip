@@ -26,7 +26,7 @@ function callbacks() {
     resolveResponsibleUserIdForRunContext: vi.fn(async () => "retry-user"),
     getAgentInvokability: vi.fn<HeartbeatRetryDependencies["getAgentInvokability"]>(async () => ({ invokable: true })),
     appendRunEvent: vi.fn<HeartbeatRetryDependencies["appendRunEvent"]>(async () => undefined),
-    escalatePlanApprovalResumeFailureNeedsAttention: vi.fn(async () => null),
+    escalatePlanApprovalResumeFailureNeedsAttention: vi.fn<HeartbeatRetryDependencies["escalatePlanApprovalResumeFailureNeedsAttention"]>(async () => null),
     recordPlanApprovalResumeFailureRetry: vi.fn(async () => null),
     setRunStatusIfRunning: vi.fn<HeartbeatRetryDependencies["setRunStatusIfRunning"]>(async () => ({ updated: false, run: null })),
     setWakeupStatus: vi.fn(async () => undefined),
@@ -93,6 +93,21 @@ describe("heartbeat retry module callbacks", () => {
     expect(await extracted.createHeartbeatRetries(database.db, deps).scheduleBoundedRetry("run")).toEqual({ outcome });
     expect(deps.getRun).toHaveBeenCalledWith("run", { unsafeFullResultJson: true });
     expect(deps.getAgent).toHaveBeenCalledTimes(outcome === "missing_agent" ? 1 : 0);
+    expect(database.access).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])("keeps generic recovery out only when the non-retryable interaction saved its disposition (%s)", async (saved) => {
+    const database = guardedDatabase();
+    const deps = callbacks();
+    deps.escalatePlanApprovalResumeFailureNeedsAttention.mockResolvedValue(saved ? "approval" : null);
+    const run = { ...unitRun(), status: "failed", errorCode: "adapter_failed", error: "Permanent adapter failure",
+      contextSnapshot: { issueId: "issue", interactionId: "approval", interactionKind: "request_confirmation",
+        interactionStatus: "accepted", mutation: "interaction", wakeReason: "issue_commented" } } as Run;
+    const result = await extracted.createHeartbeatRetries(database.db, deps)
+      .scheduleInteractionContinuationInfrastructureRetryIfEligible(run, { adapterType: "codex_local" } as Agent);
+    expect(result).toEqual(saved ? { outcome: "retry_exhausted", attempt: 0, maxAttempts: 2 } : null);
+    expect(deps.escalatePlanApprovalResumeFailureNeedsAttention).toHaveBeenCalledExactlyOnceWith(
+      { run, issueId: "issue", attempt: 0, maxAttempts: 2 });
     expect(database.access).not.toHaveBeenCalled();
   });
 
