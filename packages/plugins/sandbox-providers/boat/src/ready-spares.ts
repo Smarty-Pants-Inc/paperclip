@@ -76,7 +76,7 @@ export type ReadySpareOperations = {
 
 export type CreateCapReason = "churn_cap" | "ceiling";
 
-/** The named operator event at a create refusal, and the health reason while it holds. */
+/** The named operator event at a spare refusal or over-ceiling run, and its health reason. */
 export type CreateCapRefusal = {
   companyId: string;
   environmentId: string;
@@ -93,7 +93,7 @@ export type CreateCapRefusal = {
   /** All creates (spare + run) in the window, and the ceiling. */
   allCreates: number;
   ceiling: number;
-  /** Refusals so far for this company (this worker). */
+  /** Spare refusals and over-ceiling runs so far for this company (this worker). */
   refusals: Record<CreateCapReason, number>;
   /** Refusals of this pool and reason not logged since the last event. */
   suppressed: number;
@@ -310,7 +310,7 @@ export class ReadySpareKeeper {
     return keys;
   }
 
-  /** Refusals in effect now, for health/status. */
+  /** Spare refusals and over-ceiling run reasons in effect now, for health/status. */
   activeCaps(): CreateCapRefusal[] {
     const active: CreateCapRefusal[] = [];
     for (const [poolId, entry] of this.capped) {
@@ -357,18 +357,19 @@ export class ReadySpareKeeper {
   }
 
   /**
-   * Admit one ordinary run create against the company's absolute ceiling and
-   * record it. A refused run create is never sent to Boat.
+   * Always admit and count an ordinary run create. The hourly ceiling refuses
+   * only spares; an over-ceiling run still reports the event/counter and keeps
+   * health degraded, but must never leave a person's message unanswered.
    */
-  admitRunCreate(companyId: string, environmentId: string): { admitted: true } | { admitted: false; refusal: CreateCapRefusal } {
+  admitRunCreate(companyId: string, environmentId: string): void {
     const capId = JSON.stringify([companyId, environmentId, "run"]);
     const counts = this.createCounts(companyId);
     if (counts.allCreates >= this.createCeiling(companyId)) {
-      return { admitted: false, refusal: this.refuse(capId, { companyId, environmentId, kind: "run" }, "ceiling", "local", counts) };
+      this.refuse(capId, { companyId, environmentId, kind: "run" }, "ceiling", "local", counts);
+    } else {
+      this.capped.delete(capId);
     }
     this.windowed(this.runCreates, companyId).set(randomUUID(), this.now());
-    this.capped.delete(capId);
-    return { admitted: true };
   }
   start(): void { this.stopping = false; }
   stop(): void { this.stopping = true; }
