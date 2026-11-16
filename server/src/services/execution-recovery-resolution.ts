@@ -897,8 +897,9 @@ export async function settleUnrecoverableExecutions(
             return;
           }
         }
-        // A first start that never connected keeps the executor's own truthful
-        // next step (the note it posted); nothing was recorded or replayed.
+        // A first start that never connected, settled without a fresh
+        // continuation, keeps the executor's own truthful next step; nothing
+        // was recorded or replayed.
         const note = current && action.nextAction && nativeStartupNeverConnectedExhausted(coordinator)
           ? action.nextAction
           : executionRecoverySettlementNote({ current, cause: action.cause,
