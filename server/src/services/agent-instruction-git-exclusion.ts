@@ -4,7 +4,7 @@ import { runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget } fr
 import { logger } from "../middleware/logger.js";
 import { instructionGitExcludeProgram } from "./agent-instruction-files.js";
 
-type StderrClass = "eexist" | "unsafe" | "enoent" | "other";
+type StderrClass = "eexist" | "unsafe" | "enoent" | "other" | "transport";
 interface ExclusionAttempt {
   timedOut: boolean;
   exitCode: number | null;
@@ -41,8 +41,9 @@ export class AgentInstructionGitExclusionError extends Error implements Exclusio
   }
 }
 
-/** The exclusion program is idempotent. A transient exec stall gets one retry;
- * an unsafe path never does. Keep each exec's existing 15-second bound. */
+/** The exclusion program is idempotent. A transient exec failure gets one retry;
+ * an unsafe path never does. Each command keeps its 15-second timeout: the
+ * worst case is about 31 s plus RPC overhead, not a hard wall-clock bound. */
 export async function excludeAgentRuntimeFromGit(
   runId: string,
   target: Extract<AdapterExecutionTarget, { kind: "remote" }>,
@@ -53,15 +54,25 @@ export async function excludeAgentRuntimeFromGit(
   const attempts: ExclusionAttempt[] = [];
   for (let attempt = 0; attempt < 2; attempt++) {
     const started = performance.now();
-    const result = await runAdapterExecutionTargetShellCommand(runId, target, command,
-      { cwd: target.remoteCwd, env: {}, timeoutSec: 15 });
-    if (result.exitCode === 0 && !result.timedOut) return;
-    const diagnostic: ExclusionAttempt = {
-      timedOut: result.timedOut, exitCode: result.exitCode, signal: result.signal,
-      durationMs: typeof result.durationMs === "number" && Number.isFinite(result.durationMs) && result.durationMs >= 0
-        ? result.durationMs : Math.round(performance.now() - started),
-      stderrClass: classifyStderr(result.stderr),
-    };
+    let diagnostic: ExclusionAttempt;
+    try {
+      const result = await runAdapterExecutionTargetShellCommand(runId, target, command,
+        { cwd: target.remoteCwd, env: {}, timeoutSec: 15 });
+      if (result.exitCode === 0 && !result.timedOut) return;
+      diagnostic = {
+        timedOut: result.timedOut, exitCode: result.exitCode, signal: result.signal,
+        durationMs: typeof result.durationMs === "number" && Number.isFinite(result.durationMs) && result.durationMs >= 0
+          ? result.durationMs : Math.round(performance.now() - started),
+        stderrClass: classifyStderr(result.stderr),
+      };
+    } catch {
+      // An RPC rejection is not an unsafe-path verdict. Discard provider text
+      // and causes before entering the same attempt, warning, and retry path.
+      diagnostic = {
+        timedOut: false, exitCode: null, signal: null,
+        durationMs: Math.round(performance.now() - started), stderrClass: "transport",
+      };
+    }
     attempts.push(diagnostic);
     const error = new AgentInstructionGitExclusionError(message, runId, [...attempts]);
     const willRetry = attempt === 0 && diagnostic.stderrClass !== "unsafe";
