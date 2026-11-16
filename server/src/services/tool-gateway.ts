@@ -53,7 +53,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
-import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired } from "./project-connection-run-context.js";
 import { assertProjectConnectionAdmission } from "./project-connection-admission.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { GITHUB_APP_MCP_URL } from "./github-app-client.js";
@@ -123,6 +123,7 @@ import {
   toolApplications,
   toolCallEvents,
   toolCatalogEntries,
+  toolConnectionInstalls,
   toolConnections,
   toolGatewayRateLimitCounters,
   toolGatewaySessions,
@@ -3144,10 +3145,35 @@ export function createToolGatewayService(
 
   async function projectProtectedSession(session: ToolGatewaySession): Promise<boolean> {
     if (!session.agentId) return false;
-    const [owned] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
-      eq(toolConnections.companyId, session.companyId), sql`${toolConnections.projectId} is not null`,
-    )).limit(1);
+    if (session.runId) {
+      const context = await readProjectConnectionRunContext(db, {
+        companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId,
+      });
+      if (context.projectId) return isProjectConnectionManagedRequired(db, { companyId: session.companyId, projectId: context.projectId });
+    }
+    // With no run project, only explicit installed owned reach can create the
+    // project ambiguity gate. An unrelated company's project is never a latch.
+    const [owned] = await db.select({ id: toolConnections.id }).from(toolConnections)
+      .innerJoin(toolConnectionInstalls, and(eq(toolConnectionInstalls.connectionId, toolConnections.id),
+        eq(toolConnectionInstalls.companyId, session.companyId)))
+      .where(and(eq(toolConnections.companyId, session.companyId), sql`${toolConnections.projectId} is not null`,
+        ne(toolConnections.status, "archived"), or(
+          and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, session.agentId)),
+          and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, session.companyId)),
+        ))).limit(1);
     return Boolean(owned);
+  }
+
+  async function githubSelectionForSession(session: ToolGatewaySession, hints: { explicitGrantId?: string; excludeGrantId?: string } = {}) {
+    const [run] = session.runId && session.agentId && !session.identityContextId
+      ? await db.select({ responsibleUserId: heartbeatRuns.responsibleUserId }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, session.runId), eq(heartbeatRuns.companyId, session.companyId), eq(heartbeatRuns.agentId, session.agentId),
+      )) : [];
+    return resolveManagedGitHubIdentitySelection(db, session.companyId, {
+      agentId: session.agentId, heartbeatRunId: session.runId, allowStandingDelegation: false,
+      responsibleUserId: session.identityContextId ? session.responsibleUserId : run?.responsibleUserId ?? session.responsibleUserId,
+      ...hints,
+    });
   }
 
   async function findToolForSession(
@@ -3177,7 +3203,7 @@ export function createToolGatewayService(
     const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
     if (guestBotConnection && tool.connectionId && (tool.connectionId !== guestBotConnection || tool.providerType !== "paperclip_github_chat"))
       throw new ToolGatewayHttpError(403, "Sponsored GitHub runs can only use their bot's governed connection; sponsorship does not grant personal credentials", "guest_connection_denied");
-    if ((session.identityContextId || await projectProtectedSession(session)) && session.agentId && tool.connectionId) {
+    if (session.agentId && tool.connectionId) {
       const [connection] = await db
         .select()
         .from(toolConnections)
@@ -3188,19 +3214,11 @@ export function createToolGatewayService(
           ),
         );
       if (
-        connection?.config.sourceTemplateKey === "github" ||
-        connection?.transportConfig?.sourceTemplateKey === "github"
+        (connection?.config.sourceTemplateKey === "github" ||
+          connection?.transportConfig?.sourceTemplateKey === "github")
+        && (session.identityContextId || connection?.projectId || await projectProtectedSession(session))
       ) {
-        let selected = await resolveManagedGitHubIdentitySelection(
-          db,
-          session.companyId,
-          {
-            agentId: session.agentId,
-            responsibleUserId: session.responsibleUserId,
-            heartbeatRunId: session.runId,
-            allowStandingDelegation: false,
-          },
-        );
+        let selected = await githubSelectionForSession(session);
         if (!selected.grant)
           throw new ToolGatewayHttpError(
             409,
@@ -3251,17 +3269,7 @@ export function createToolGatewayService(
             return target;
           } catch (error) {
             if (attempt !== 0) throw error;
-            const alternate = await resolveManagedGitHubIdentitySelection(
-              db,
-              session.companyId,
-              {
-                agentId: session.agentId,
-                responsibleUserId: session.responsibleUserId,
-                heartbeatRunId: session.runId,
-                allowStandingDelegation: false,
-                excludeGrantId: original.id,
-              },
-            );
+            const alternate = await githubSelectionForSession(session, { excludeGrantId: original.id });
             const accountId = original.providerTenant?.github?.userId;
             if (
               !accountId ||
@@ -3379,16 +3387,17 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tools: ToolGatewayDescriptor[],
   ): Promise<ToolGatewayDescriptor[]> {
-    if (!session.agentId || (!session.identityContextId && !await projectProtectedSession(session))) return tools;
+    if (!session.agentId) return tools;
     const githubIds = new Set(tools.flatMap(tool =>
       tool.connectionId && asRecord(tool.providerMetadata)?.sourceTemplateKey === "github"
         ? [tool.connectionId] : [],
     ));
     if (!githubIds.size) return tools;
-    const selected = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
-      agentId: session.agentId, responsibleUserId: session.responsibleUserId, allowStandingDelegation: false,
-      heartbeatRunId: session.runId,
-    });
+    const [owned] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
+      eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, [...githubIds]), sql`${toolConnections.projectId} is not null`,
+    )).limit(1);
+    if (!session.identityContextId && !owned && !await projectProtectedSession(session)) return tools;
+    const selected = await githubSelectionForSession(session);
     return tools.filter(tool => !tool.connectionId || !githubIds.has(tool.connectionId)
       || tool.connectionId === selected.grant?.connectionId);
   }
@@ -4372,18 +4381,16 @@ export function createToolGatewayService(
       if (!isGitHubAppConnection(connection)) throw new ToolGatewayHttpError(422,
         "Project-owned provider is unsupported", "project_connection_provider_unsupported");
     }
-    const projectProtected = await projectProtectedSession(session);
     const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
-    const runContext = projectProtected && github && session.agentId && session.runId
+    const runContext = github && session.agentId && session.runId
       ? await readProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
     const assertProjectSelection = async () => {
-      if (!projectProtected || !github || !session.agentId) return;
+      if (!github || !session.agentId) return;
       if (runContext) await revalidateProjectConnectionRunContext(db, runContext);
-      const selection = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
-        agentId: session.agentId, responsibleUserId: session.responsibleUserId,
-        heartbeatRunId: session.runId,
-        explicitGrantId: grant.id, allowStandingDelegation: false,
-      });
+      // Ownership can activate during provider I/O: evaluate this on BOTH sides
+      // of acquisition/cache release, never keep a pre-I/O false latch.
+      if (!connection.projectId && !await projectProtectedSession(session)) return;
+      const selection = await githubSelectionForSession(session, { explicitGrantId: grant.id });
       if (selection.grant?.id !== grant.id || selection.connection?.id !== connection.id) {
         throw new ToolGatewayHttpError(409, selection.error ?? "Project GitHub connection is unavailable", "project_connection_use_denied");
       }
@@ -4916,7 +4923,7 @@ export function createToolGatewayService(
       ? (session.responsibleUserId ?? null)
       : (run?.responsibleUserId ?? session.responsibleUserId ?? null);
     if (
-      (session.identityContextId || await projectProtectedSession(session)) &&
+      (session.identityContextId || connection.projectId || await projectProtectedSession(session)) &&
       session.agentId &&
       (connection.config.sourceTemplateKey === "github" ||
         connection.transportConfig?.sourceTemplateKey === "github")
@@ -4924,12 +4931,7 @@ export function createToolGatewayService(
       const captured = githubOperationCredentials.get(session);
       const selected = captured && !isGitHubAppConnection(connection) && !await projectProtectedSession(session)
         ? { grant: captured.grant, error: undefined }
-        : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
-            agentId: session.agentId,
-            responsibleUserId: session.responsibleUserId,
-            heartbeatRunId: session.runId,
-            allowStandingDelegation: false,
-          });
+        : await githubSelectionForSession(session);
       if (!selected.grant || selected.grant.connectionId !== connection.id) {
         throw new ToolGatewayHttpError(
           409,
