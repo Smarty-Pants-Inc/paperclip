@@ -7,6 +7,7 @@ import { getSecretProvider } from "../secrets/provider-registry.js";
 import type { StoredSecretVersionMaterial } from "../secrets/types.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { readRunFailureCause, withoutSqlStatementText } from "@paperclipai/shared";
+import { addRunSecretMaterial } from "./agent-identity-redaction.js";
 
 /**
  * A run row's `error` without SQL statement text. Rows saved before run errors
@@ -24,6 +25,26 @@ function withoutSqlRunError<T>(value: T): T {
 const REGISTRY_KEY = "paperclipSecretRedactions";
 // Project only the registry: run contexts can contain megabytes of prompt data.
 const registrySnapshot = sql`jsonb_build_object('paperclipSecretRedactions', ${heartbeatRuns.contextSnapshot} -> 'paperclipSecretRedactions')`;
+// Read identity scalars alongside the registry, never the full prompt snapshot.
+// Filter each run's values against its own ids before combining issue registries.
+const registryIdentifiers = sql<Array<string | null>>`jsonb_build_array(
+  ${heartbeatRuns.id}, ${heartbeatRuns.agentId}, ${heartbeatRuns.companyId}, ${heartbeatRuns.nativeIssueId},
+  ${heartbeatRuns.contextSnapshot} ->> 'issueId',
+  ${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id',
+  ${heartbeatRuns.contextSnapshot} -> 'paperclipEnvironment' ->> 'id'
+)`;
+const registryColumns = { contextSnapshot: registrySnapshot, identifiers: registryIdentifiers };
+
+type RegistryRow = { contextSnapshot: unknown; identifiers?: Array<string | null> };
+
+function indexedRunSecretValues(values: Iterable<string>, identifiers: Iterable<string | null | undefined>) {
+  const index = { values: [] as string[] };
+  // Use the live index's minimum length, known-id, and derived-material rules.
+  // The exact-value replacer below also serves identity/compatibility callers
+  // with an already prepared list; it deliberately does not impose this policy.
+  addRunSecretMaterial(index, values, identifiers);
+  return index.values;
+}
 
 type RegistryEntry = {
   fingerprintSha256: string;
@@ -83,27 +104,31 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
 export function createRunSecretRedactionRegistry(db: Db) {
   const provider = getSecretProvider("local_encrypted");
 
-  async function valuesForRuns(rows: Array<{ contextSnapshot: unknown }>) {
-    const entries = rows.flatMap((row) => registryEntries(row.contextSnapshot));
-    const unique = new Map(entries.map((entry) => [entry.fingerprintSha256, entry]));
-    const values = await Promise.all(
-      [...unique.values()].map((entry) => provider.resolveVersion({
-        material: entry.material,
-        externalRef: null,
-      })),
-    );
-    return values.sort((left, right) => right.length - left.length);
+  async function valuesForRuns(rows: RegistryRow[], identifiers: string[]) {
+    const resolved = new Map<string, Promise<string>>();
+    const perRun = await Promise.all(rows.map(async (row) => {
+      const values = await Promise.all(registryEntries(row.contextSnapshot).map((entry) => {
+        let value = resolved.get(entry.fingerprintSha256);
+        if (!value) {
+          value = provider.resolveVersion({ material: entry.material, externalRef: null });
+          resolved.set(entry.fingerprintSha256, value);
+        }
+        return value;
+      }));
+      return indexedRunSecretValues(values, [...identifiers, ...row.identifiers ?? []]);
+    }));
+    return [...new Set(perRun.flat())].sort((left, right) => right.length - left.length);
   }
 
   async function valuesForRun(companyId: string, runId: string, viewerUserId: string | null) {
-    const rows = await db.select({ contextSnapshot: registrySnapshot, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
+    const rows = await db.select({ ...registryColumns, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
-    return { values: await valuesForRuns(rows), credentialConnectionName: rows[0]?.credentialConnectionName ?? null };
+    return { values: await valuesForRuns(rows, [companyId, runId]), credentialConnectionName: rows[0]?.credentialConnectionName ?? null };
   }
 
   async function valuesForIssue(companyId: string, issueId: string) {
-    const rows = await db.select({ contextSnapshot: registrySnapshot })
+    const rows = await db.select(registryColumns)
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
@@ -112,13 +137,13 @@ export function createRunSecretRedactionRegistry(db: Db) {
           sql`${heartbeatRuns.contextSnapshot} -> 'paperclipIssue' ->> 'id' = ${issueId}`,
         ),
       ));
-    return valuesForRuns(rows);
+    return valuesForRuns(rows, [companyId, issueId]);
   }
 
   return {
     redactionValuesForRun: async (companyId: string, runId: string) => valuesForRuns(await db
-      .select({ contextSnapshot: registrySnapshot }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)))),
+      .select(registryColumns).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId))), [companyId, runId]),
     register: async (companyId: string, runId: string, value: string) => {
       const fingerprintSha256 = createHash("sha256").update(value).digest("hex");
       await db.transaction(async (tx) => {
@@ -147,7 +172,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
     },
     redactForRuns: async <T extends { id: string }>(companyId: string, runs: T[], viewerUserId: string | null = null): Promise<T[]> => {
       if (runs.length === 0) return [];
-      const rows = await db.select({ id: heartbeatRuns.id, contextSnapshot: registrySnapshot, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
+      const rows = await db.select({ id: heartbeatRuns.id, ...registryColumns, credentialConnectionName: credentialAccessConnectionNameSql(viewerUserId) })
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, runs.map((run) => run.id))));
       // Resolve each encrypted value once per request, but apply only each run's
@@ -162,7 +187,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
           }
           return value;
         }));
-        return [row.id, { values: values.sort((a, b) => b.length - a.length), credentialConnectionName: row.credentialConnectionName ?? null }] as const;
+        return [row.id, { values: indexedRunSecretValues(values, [companyId, row.id, ...row.identifiers ?? []]), credentialConnectionName: row.credentialConnectionName ?? null }] as const;
       })));
       return runs.map((run) => {
         const disclosure = valuesByRun.get(run.id);
