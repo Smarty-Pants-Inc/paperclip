@@ -21,7 +21,9 @@ describe("#20389 RFL F5 hire/approval publication retry", () => {
 
   for (const path of ["hire", "pending approval", "legacy approval"] as const) {
     for (const exhaust of [false, true]) {
-      it(`${path}: ${exhaust ? "exhausted retries publish nothing" : "one rollback then one post-commit event per logical activity"}`, async () => {
+      // superseded by replacement: CTL6-RF2-0632 + RFL 06:36Z F5.
+      // Original intent: no hire/approval binding or activity escapes rollback; committed effects publish exactly once.
+      it(`${path}: ${exhaust ? "exhausted retries publish nothing" : "one rollback then one post-commit event per logical activity"} (current contract: ${exhaust ? "one attempt per failed request" : "explicit retry after a silent rollback"})`, async () => {
         const companyId = randomUUID(), agentId = randomUUID(), approvalId = randomUUID();
         await db.insert(companies).values({ id: companyId, name: "Hiring publication retry", issuePrefix: `H${companyId.slice(0, 7)}` });
         // Metadata only: binding synchronization does not need a secret value.
@@ -64,11 +66,27 @@ describe("#20389 RFL F5 hire/approval publication retry", () => {
         } });
         try {
           const lifecycle = createAgentLifecycle(wrappedDb);
-          const operation = path === "hire"
+          const run = () => path === "hire"
             ? lifecycle.requestHire(companyId, { id: agentId, name: "Worker", adapterType: "process", adapterConfig })
             : lifecycle.approveHire({ approvalId }, "board");
-          if (exhaust) await expect(operation).rejects.toBeInstanceOf(AccountingContentionError);
-          else await operation;
+          const originalAgents = await db.select().from(agents).where(eq(agents.companyId, companyId));
+          const originalApprovals = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
+          // Keep the original eight-rollback pressure, but each rollback belongs to a
+          // separate caller request: lifecycleTransaction must never replay it itself.
+          for (let failedRequests = 0; failedRequests < (exhaust ? ACCOUNTING_TRANSACTION_ATTEMPTS : 1); failedRequests++) {
+            await expect(run()).rejects.toMatchObject({
+              name: AccountingContentionError.name, status: 503, code: "40P01", attempts: 1,
+            });
+            expect(attempts).toBe(failedRequests + 1);
+            expect(committed).toBe(false);
+            expect(events).toEqual([]);
+            expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).toEqual([]);
+            expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId))).toEqual([]);
+            expect(await db.select().from(agents).where(eq(agents.companyId, companyId))).toEqual(originalAgents);
+            expect(await db.select().from(approvals).where(eq(approvals.companyId, companyId))).toEqual(originalApprovals);
+          }
+          // Mirrors agent-lifecycle-publication-once: the caller explicitly retries.
+          if (!exhaust) await run();
           const rows = await db.select().from(activityLog).where(eq(activityLog.companyId, companyId));
           const bindings = await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId));
           const companyAgents = await db.select().from(agents).where(eq(agents.companyId, companyId));
@@ -86,8 +104,13 @@ describe("#20389 RFL F5 hire/approval publication retry", () => {
             if (path !== "hire") expect((await db.select().from(approvals).where(eq(approvals.id, approvalId)))[0]!.status).toBe("pending");
           } else {
             expect(committed).toBe(true);
-            expect(bindings).toHaveLength(1);
-            expect(rows.filter(row => row.action === "secret.binding.created")).toHaveLength(1);
+            expect(bindings).toEqual([expect.objectContaining({
+              secretId: reference!.id, configPath: "env.DEMO", targetType: "agent", targetId: companyAgents[0]!.id,
+            })]);
+            expect(rows.filter(row => row.action === "secret.binding.created")).toEqual([
+              expect.objectContaining({ entityType: "agent", entityId: companyAgents[0]!.id,
+                details: expect.objectContaining({ configPath: "env.DEMO", secretId: reference!.id }) }),
+            ]);
             expect(events).toHaveLength(rows.length);
             expect(events.every(event => event.afterCommit), "all live activity must follow the root commit, not a savepoint").toBe(true);
             for (const row of rows) expect(events.filter(event => event.action === row.action
