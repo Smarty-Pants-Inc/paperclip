@@ -209,7 +209,13 @@ model/thinking RPCs, private exchanges (including `tool_inventory`, `settle`,
 Each exchange receives the smaller of its own limit and the remaining budget;
 completing an exchange never resets that budget. Each warm attach, reconnect,
 claim/input admission and pre-compaction admission gets a fresh budget shared
-by its own RPCs and private exchanges. Prompt acceptance and model/compaction
+by its own RPCs and private exchanges, except that a facade `turn/start` with
+`paperclipRunId` brackets its run attach and its turn in one admission: the
+attach's budget is carried into that turn's validation, bind and `begin_turn`
+(one budget before the prompt, not two). Host-local broker revocation (own 5 s
+cap) and broker creation in a rebind are accounted inside the same wall-clock
+budget and cut at what remains, because the budget guards the facade's 30 s
+receive wait; a broker that arrives after the deadline is closed. Prompt acceptance and model/compaction
 execution retain their separate deadlines. Cold-process readiness also retains
 its separate `processStartupTimeoutMs` budget; this is not a total cold-open
 wall-clock bound.
@@ -223,7 +229,9 @@ Values at or above runner-core's 30,000 ms facade receive wait (and other invali
 values) fail with `pi_admission_deadline_invalid` before opening Pi. Admission
 budget exhaustion has the named code `pi_admission_deadline_exceeded`, exposed
 by the proxy as JSON-RPC `error.data.code`. Private-request expiry preserves the
-existing `Pi private request timed out` message. A lost receipt never triggers a
+existing `Pi private request timed out` message. The deadline error and the
+failed span keep a fixed `timeoutCode`: `pi_bind_timeout` when a private bind
+exchange itself timed out, otherwise `pi_admission_deadline_exceeded`. A lost receipt never triggers a
 retry or prompt.
 
 `pi-rpc-admission-deadline.test.ts` drives production-shaped proxy and in-process
