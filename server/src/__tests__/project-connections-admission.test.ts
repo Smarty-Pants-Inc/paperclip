@@ -1,18 +1,52 @@
 import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { assertProjectConnectionAdmission } from "../services/project-connection-admission.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { activityLog, companyMemberships, companySecrets, connectionGrants, createDb, toolConnections, userCompanyPreferences } from "@paperclipai/db";
+import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfiles, userCompanyPreferences } from "@paperclipai/db";
+import * as providerScope from "../services/project-connection-provider-scope.js";
+import * as arbitration from "../services/project-connection-arbitration.js";
+import * as retirement from "../services/project-connection-retirement.js";
+import * as credentials from "../services/connection-credentials.js";
 import { createToolConnectionSchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
+import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
 
 describe("project connection writer admission (round-4 B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-project-admission-"); db = createDb(database.connectionString); }, 60_000);
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
+  afterEach(() => vi.restoreAllMocks());
+
+  // B-only composition harness: A/C/D remain unimplemented on this lane.
+  // Replace just those exported boundaries and synthetic vault acquisition;
+  // all B writer, authority and transaction SQL below is production code.
+  function composeFinish(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
+    vi.spyOn(credentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: CANARY, latestVersion: 1 });
+    const verified = { identity: { companyId: f.companyId, providerHost: "github.com" as const,
+      verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" },
+      repositoryIds: [101], secretVersion: 1 };
+    const verify = vi.spyOn(providerScope, "verifyProjectConnectionGitHubScope").mockResolvedValue(verified);
+    vi.spyOn(retirement, "lockProjectConnectionLifecycle").mockImplementation(async (tx, input) => {
+      await tx.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId))).for("update");
+    });
+    vi.spyOn(arbitration, "lockProjectConnectionIdentities").mockResolvedValue();
+    vi.spyOn(arbitration, "assertProjectConnectionAvailability").mockResolvedValue();
+    vi.spyOn(retirement, "assertProjectConnectionNotInUse").mockResolvedValue();
+    const receipt = vi.spyOn(retirement, "writeProjectConnectionReceipt").mockImplementation(async (tx, input) => {
+      const [row] = await tx.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.primary.id,
+        action: input.action, entityType: "tool_connection", entityId: input.connection.id,
+        details: { targetAgentIds: input.targetAgentIds, verifiedRepositoryIds: input.verifiedRepositoryIds } }).returning();
+      return { activityId: row!.id };
+    });
+    const activate = vi.spyOn(retirement, "activateProjectConnectionMigration").mockImplementation(async (tx, input) => {
+      const config = { ...input.connection.config, projectScope: { ...f.scope(), migrationPending: false, legacyConnectionId: (input.connection.config.projectScope as Record<string, unknown>).legacyConnectionId } };
+      await tx.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, input.connection.id));
+    });
+    return { verified, verify, receipt, activate };
+  }
+  const finishInput = (agentId: string) => ({ access: { agentIds: [agentId] }, enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [] });
 
   it("J19: a viewer's private primary is not the designated human's approval authority", async () => {
     const f = await projectConnectionFixture(db);
@@ -21,6 +55,35 @@ describe("project connection writer admission (round-4 B)", () => {
     await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: viewer, primaryAgentId: f.outsider.id });
     await expect(f.service.createConnection(f.companyId, f.input(), { ...f.actor(f.outsider.id), responsibleUserId: viewer }))
       .rejects.toMatchObject({ status: 403 });
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("J19: another member's private primary and a mismatched responsible human cannot first-bind", async () => {
+    const f = await projectConnectionFixture(db);
+    const member = `member-${randomUUID()}`;
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: member, membershipRole: "member", status: "active" });
+    await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: member, primaryAgentId: f.outsider.id });
+    for (const actor of [{ ...f.actor(f.outsider.id), responsibleUserId: member }, { ...f.actor(), responsibleUserId: member }]) {
+      await expect(f.service.createConnection(f.companyId, f.input(), actor))
+        .rejects.toMatchObject({ status: 403, details: { code: "project_connection_actor_required" } });
+    }
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("J19: missing trusted handoff refuses even H's real primary; installer labels are not proof", async () => {
+    const f = await projectConnectionFixture(db);
+    const resolve = vi.spyOn(credentials, "resolveConnectionGrantSecret");
+    const verify = vi.spyOn(providerScope, "verifyProjectConnectionGitHubScope");
+    for (const installedBy of [undefined, f.human, `different-human-${randomUUID()}`]) {
+      const input = f.input();
+      input.config = { ...input.config, ...(installedBy ? { installedBy, createdBy: f.human } : {}) };
+      await expect(f.service.createConnection(f.companyId, input, f.actor()))
+        .rejects.toMatchObject({ status: 403, details: { code: "project_connection_human_handoff_required" } });
+    }
+    expect(resolve).not.toHaveBeenCalled();
+    expect(verify).not.toHaveBeenCalled();
     expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
     expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
@@ -118,7 +181,7 @@ describe("project connection writer admission (round-4 B)", () => {
     await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, { status: "archived" }, context))).rejects.toMatchObject({ status: 409 });
   });
 
-  it("J15: a primary cannot turn the trusted manager App classification into a project connection", async () => {
+  it("J15-caller-forgery: a caller managerApp marker is rejected, not treated as trusted classification", async () => {
     const f = await projectConnectionFixture(db);
     const input = f.input();
     input.config = { ...f.config(), projectScope: { ...f.scope(), managerApp: true } };
@@ -159,6 +222,88 @@ describe("project connection writer admission (round-4 B)", () => {
     const saved = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
     expect(saved).toHaveLength(1);
     expect(saved[0]).toMatchObject({ id: grant.id, isDefault: true, credentialSecretRefs: grant.credentialSecretRefs });
+  });
+
+  it("J15/A09: empty refs and alternate key projections never reach the key resolver", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { installed: false });
+    const resolve = vi.spyOn(credentials, "resolveConnectionGrantSecret");
+    await expect(assertProjectConnectionAdmission(db, { companyId: f.companyId, projectId: f.a.id,
+      operation: "finish", actor: f.actor(), connection, proposedSecretRefs: [], targetAgentIds: [f.worker.id],
+    })).rejects.toMatchObject({ status: 403, details: { code: "project_connection_reference_not_approved" } });
+    for (const configPath of ["env.GITHUB_TOKEN", "headers.Authorization", "credentials.otherKey"]) {
+      await expect(assertProjectConnectionAdmission(db, { companyId: f.companyId, projectId: f.a.id,
+        operation: "finish", actor: f.actor(), connection, proposedSecretRefs: [{ secretId: f.secret.id, configPath }], targetAgentIds: [f.worker.id],
+      })).rejects.toMatchObject({ status: 403, details: { code: "project_connection_reference_not_approved" } });
+    }
+    expect(resolve).not.toHaveBeenCalled();
+  });
+
+  it("J02/J03: approved lead finishes an explicit worker with fresh verification and a transactional receipt", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
+    const harness = composeFinish(f);
+    const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor(f.leadA.id));
+    expect(result.connection).toMatchObject({ id: connection.id, projectId: f.a.id, status: "active", enabled: true });
+    expect(harness.verify).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
+      .toMatchObject([{ targetType: "agent", targetId: f.worker.id }]);
+    expect(await db.select().from(toolProfileBindings).where(eq(toolProfileBindings.profileId, result.profile.id)))
+      .toMatchObject([{ targetType: "agent", targetId: f.worker.id }]);
+    const receipts = await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id));
+    expect(receipts).toMatchObject([{ action: "tool_connection.updated", details: { verifiedRepositoryIds: [101], targetAgentIds: [f.worker.id] } }]);
+    expect(JSON.stringify({ result, receipts })).not.toContain(CANARY);
+  });
+
+  it("M02/A10: owned finish receipt failure rolls back activation, installs and profile, keeping legacy", async () => {
+    const f = await projectConnectionFixture(db);
+    const legacy = await f.seedConnection(null);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
+    const harness = composeFinish(f);
+    harness.receipt.mockRejectedValue(new Error("synthetic receipt fault"));
+    const before = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId));
+    await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
+      .rejects.toThrow("synthetic receipt fault");
+    expect((await storedConnection(db, connection.id))).toMatchObject({ status: "draft", enabled: false, config: { projectScope: { migrationPending: true } } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId))).toEqual(before);
+    expect(await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await storedConnection(db, legacy.connection.id)).enabled).toBe(true);
+  });
+
+  it.each(["primary", "lead", "recipient", "key", "returned-repository", "identity"] as const)("A05/M02: %s changes during provider verification refuse before reach", async variant => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
+    const harness = composeFinish(f);
+    harness.verify.mockImplementation(async () => {
+      if (variant === "primary") await db.update(userCompanyPreferences).set({ primaryAgentId: f.outsider.id }).where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
+      if (variant === "lead") await db.update(projects).set({ leadAgentId: f.leadB.id }).where(eq(projects.id, f.a.id));
+      if (variant === "recipient") await db.update(agents).set({ reportsTo: f.leadB.id }).where(eq(agents.id, f.worker.id));
+      if (variant === "key") await db.update(companySecrets).set({ latestVersion: 2 }).where(eq(companySecrets.id, f.secret.id));
+      return { ...harness.verified,
+        ...(variant === "returned-repository" ? { repositoryIds: [999] } : {}),
+        ...(variant === "identity" ? { identity: { ...harness.verified.identity, verifiedRegistrationId: "987" } } : {}),
+      };
+    });
+    await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
+      .rejects.toMatchObject({ status: expect.any(Number) });
+    expect(harness.verify).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+    expect(await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await storedConnection(db, connection.id))).toMatchObject({ status: "draft", enabled: false });
+  });
+
+  it("J02/A05: preserveExistingAccess checks the final recipient union, not only the new worker", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
+    await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: connection.id, targetType: "agent", targetId: f.outsider.id });
+    composeFinish(f);
+    await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, { ...finishInput(f.worker.id), preserveExistingAccess: true }, f.actor()))
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
+      .toMatchObject([{ targetId: f.outsider.id }]);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
 
   it("A12/W7: project deletion cannot strand retained owned history", async () => {
