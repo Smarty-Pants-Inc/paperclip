@@ -8,7 +8,7 @@ import { agentAppearanceSchema, randomAgentAppearance } from "@paperclipai/share
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
 import { agents, companyMemberships, toolConnections, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { and, eq, inArray, sql } from "drizzle-orm";
-import { isProjectOwnedToolConnection, projectOwnedConnectionError } from "./project-owned-connection-guard.js";
+import { isProjectOwnedToolConnection, PROJECT_OWNED_CONNECTION_CODE } from "./project-owned-connection-guard.js";
 import { lockCompanyAgentRuntime } from "./agent-runtime-lock.js";
 import { isTransientLockContention } from "./transient-lock-contention.js";
 import { notifyMuseContactVerification } from "../modules/external-agents/index.js";
@@ -102,6 +102,24 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   publications?: ActivityPublication[]) {
   const tx = txDb;
   const companyId = created.companyId;
+  // This is also called by non-route hires. Validate every resolved pool member
+  // before any identity, file, permission or installation side effect.
+  if (options?.aiConnectionInstall) {
+    const install = options.aiConnectionInstall;
+    const ids = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
+    const connections = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, ids))).for("share");
+    // Merged reader+writer (#20717): a project-owned row (project_id OR the
+    // projectScope envelope) is never a hire-time install on any image; its
+    // only grant path is an explicit, admitted install. Same guard code as the
+    // reader, under this seam's existing 422 contract.
+    const owned = connections.find(connection => connection.projectId != null || isProjectOwnedToolConnection(connection));
+    if (owned) {
+      throw unprocessable("This connection belongs to a project. Install it explicitly for that project's admitted agents; hiring cannot install it.", { code: PROJECT_OWNED_CONNECTION_CODE, connectionId: owned.id });
+    }
+    if (connections.length !== ids.length || connections.some(connection => connection.connectionPurpose !== "ai" || connection.projectId != null)) {
+      throw unprocessable("AI hires require same-company AI connections, including every pool member. TOOL connections cannot be installed through AI setup.", { code: "ai_connection_purpose_required" });
+    }
+  }
   assertEphemeralAgentInstructions({ ...created, name: "" });
   await initializeDurableAgentFiles(txDb, created);
   if (created.status !== "terminated") await agentIdentityService(txDb).ensureAgentIdentity(companyId, created.id, publications);
@@ -123,11 +141,6 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   if (options?.aiConnectionInstall) {
     const install = options.aiConnectionInstall;
     const connectionIds = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
-    // RFL C3: a hire never installs a project-owned connection on this image.
-    const owned = (await tx.select({ id: toolConnections.id, config: toolConnections.config, transportConfig: toolConnections.transportConfig })
-      .from(toolConnections).where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, connectionIds))))
-      .find(isProjectOwnedToolConnection);
-    if (owned) throw projectOwnedConnectionError(owned.id);
     await tx.insert(toolConnectionInstalls).values(connectionIds.map(connectionId => ({
       companyId, connectionId,
       targetType: "agent" as const, targetId: created.id,
