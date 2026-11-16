@@ -16,7 +16,7 @@ const provider = vi.hoisted(() => ({
 vi.mock("../services/connection-credentials.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/connection-credentials.js")>();
   return { ...actual, resolveConnectionGrantSecret: (...args: Parameters<typeof actual.resolveConnectionGrantSecret>) =>
-    args[1].projectId == null ? actual.resolveConnectionGrantSecret(...args) : provider.secret() };
+    (args[1] as { projectId?: string | null }).projectId == null ? actual.resolveConnectionGrantSecret(...args) : provider.secret() };
 });
 vi.mock("../services/github-app-client.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/github-app-client.js")>();
