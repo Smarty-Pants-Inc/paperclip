@@ -583,7 +583,7 @@ describe("managed AI connections", () => {
       await writeFile(path.join(runtime.home!, "pi", "history.jsonl"), "raw native Pi history\n", { mode: 0o600 });
       await writeFile(path.join(runtime.home!, "pi", "provider-trace.jsonl"), "raw provider trace\n", { mode: 0o600 });
       const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")], retried);
-      Object.assign(error, { probeSuccessResult: "hello-verified" });
+      Object.assign(error, { probeSuccessResult: "hello-verified", retirementOnly: true });
       throw error;
     });
 
@@ -617,7 +617,7 @@ describe("managed AI connections", () => {
     const retirement = Promise.withResolvers<void>();
     const probe = async () => {
       const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")]);
-      Object.assign(error, { probeSuccessResult: "hello-verified" });
+      Object.assign(error, { probeSuccessResult: "hello-verified", retirementOnly: true });
       throw error;
     };
     try {

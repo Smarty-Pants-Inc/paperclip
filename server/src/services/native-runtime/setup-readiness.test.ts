@@ -78,7 +78,7 @@ describe("Codex selected native account verification", () => {
       await writeFile(join(input.runtimeDirectory, "pi", "history.jsonl"), "raw history\\n", { mode: 0o600 });
       await writeFile(join(input.runtimeDirectory, "pi", "provider-trace.jsonl"), "raw provider trace\\n", { mode: 0o600 });
       const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retired.promise, undefined, [new Error("fixture retirement timed out")]);
-      Object.assign(error, { probeResult: { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: "paperclip/claude-opus-5-5", helloProbePassed: true } });
+      Object.assign(error, { probeResult: { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: "paperclip/claude-opus-5-5", helloProbePassed: true }, retirementOnly: true });
       throw error;
     });
     const selected = { ...context, config: { provider: "pi_rpc", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" } } };
