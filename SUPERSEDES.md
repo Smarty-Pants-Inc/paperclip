@@ -52,6 +52,12 @@ RFL expressly replaces ONLY the removed handoff code:
 `J19: missing trusted handoff refuses even H's real primary; installer labels are not proof`.
 The original trigger remains no human approval; installer labels remain non-proof.
 No key resolver/provider-scope call and no action-written row remain required.
+The manager-only setup is a genuine C4 session write, with NO source and NO
+receipt. Its sole `plugin.config.updated` activity is asserted exactly before
+the action. The original zero connection assertion stays literal zero. Zero
+NEW activity rows is asserted with `toHaveLength(0)`, AND full before/after
+activity equality preserves every setup row. This is J19's separately granted
+nothing-written replacement, not an additional admission delta supersede.
 
 The other three admission codes and two provider local-denial codes are NOT
 superseded: product guard order/catch scope restore the original exact codes.
