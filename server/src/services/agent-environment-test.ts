@@ -27,6 +27,7 @@ import { probeCopilotExecutionTarget } from "./copilot-connection-probe.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { pluginEnvironmentRequiresAgent } from "./plugin-environment-driver.js";
+import { diagnosticVerifyDelay } from "./diagnostic-verify-delay.js";
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult> {
   const testedAt = new Date().toISOString();
@@ -577,6 +578,9 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
     if (adapterType === "paperclip_runner" && context.config.provider === "pi_rpc"
       && context.executionTarget?.kind === "remote"
       && !(context.executionTarget.transport === "sandbox" && context.executionTarget.runnerTask)) {
+      if (context.executionTarget.transport === "sandbox") {
+        await diagnosticVerifyDelay(context.executionTarget.sandboxLeaseAcquisition?.providerLeaseId ?? context.executionTarget.leaseId ?? "unknown");
+      }
       await assertManagedAiProjectAuth(context.config, binding.provider, context.executionTarget);
       return probeManagedNativePiRunner(context);
     }
