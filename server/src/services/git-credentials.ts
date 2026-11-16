@@ -447,6 +447,11 @@ export async function resolveManagedGitHubIdentitySelection(
   // make unrelated agents fail before their adapter starts and would also
   // suppress their otherwise-eligible legacy credential fallback.
   if (eligibleConnectionIds.size === 0) return unavailable();
+  // Keep protection machine-readable on EVERY unavailable owned branch. Host
+  // and agent_env release must not mistake a disabled/revoked scope for legacy.
+  const protectedSelection = managedRequired || githubConnections.some(connection =>
+    Boolean(connection.projectId && eligibleConnectionIds.has(connection.id)));
+  const selectionError = (message: string) => protectedSelection ? `project_connection_unavailable: ${message}` : message;
   const grants = await db.select().from(connectionGrants).where(and(
     eq(connectionGrants.companyId, companyId),
     inArray(connectionGrants.connectionId, [...eligibleConnectionIds]),
@@ -520,11 +525,9 @@ export async function resolveManagedGitHubIdentitySelection(
   ))) {
     return {
       configured: true, identitySource,
-      error: candidates.length === 0
-        ? managedRequired
-          ? "project_connection_unavailable: This project's managed GitHub scope does not match the requested grant"
-          : "No managed GitHub identity is available for this run"
-        : "More than one managed GitHub identity matches this run",
+      error: selectionError(candidates.length === 0
+        ? "No managed GitHub identity is available for this run"
+        : "More than one managed GitHub identity matches this run"),
     };
   }
   const credentialPath = (grant: typeof connectionGrants.$inferSelect) => {
@@ -574,12 +577,12 @@ export async function resolveManagedGitHubIdentitySelection(
     || b.createdAt.getTime() - a.createdAt.getTime()
     || a.id.localeCompare(b.id),
   )[0]!;
-  if (!grant) return { configured: true, identitySource, error: "No alternative managed GitHub authorization is available" };
+  if (!grant) return { configured: true, identitySource, error: selectionError("No alternative managed GitHub authorization is available") };
   const connection = githubConnections.find((candidate) => candidate.id === grant.connectionId);
   if (!connection?.enabled || connection.status !== "active") {
-    return { configured: true, identitySource, error: "The managed GitHub connection is unavailable" };
+    return { configured: true, identitySource, error: selectionError("The managed GitHub connection is unavailable") };
   }
-  if (grant.status !== "active") return { configured: true, identitySource, error: "The managed GitHub identity must be reconnected" };
+  if (grant.status !== "active") return { configured: true, identitySource, error: selectionError("The managed GitHub identity must be reconnected") };
   if (connection.projectId) {
     try {
       await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, operation: "use", connection,
