@@ -28,7 +28,7 @@ import {
   NativeSessionProtocolIntegrityError,
   nativeRestartContinuationInFlight, nativeRestartInterruptedTurnId,
 } from "./contracts/native-session-backend.js";
-import { runnerPrepareRefusalCode, NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
+import { NativeRunnerResumeStateUnavailableError, runnerPrepareRefusalCode, NativeRunnerLaunchProfileMismatchError, PROVIDER_LAUNCH_PROFILE_MISMATCH, NativeRunnerRefreshRequiredError, PROVIDER_REFRESH_REQUIRED, PROVIDER_ATTACH_REFUSED, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE } from "./contracts/harness-driver.js";
 import type {
   PrpEvent,
   PrpStructuredRunResult,
@@ -7053,6 +7053,161 @@ describe("executeNativeSession recovery", () => {
       await expect(h.run()).rejects.toBeInstanceOf(NativeProviderSideEffectPendingError);
       expect(h.provesNoRunProviderWork).not.toHaveBeenCalled();
       expect(h.openReplacementSession).not.toHaveBeenCalled();
+    });
+  });
+
+  // Gate 6 on fresh's image (prp-resume-unavailable diagnosis, a763d193): a
+  // same-run retry (or a worker's first canonical run) whose turn was in
+  // flight when its box was replaced. The new box has no Runner state (exit 66),
+  // the definite absence. It used to fall through as a bare
+  // native_session_recovery_failed -> native_session_interrupted, retried until
+  // retry_exhausted, and never answered. Real Codex driver + backend recovery;
+  // only the transport, the replacement session and the control plane are doubled.
+  describe("a same-run recovery whose box definitely lost the Runner state while a turn was in flight", () => {
+    const definiteAbsence = () => Object.assign(new NativeRunnerResumeStateUnavailableError(),
+      { cause: new Error("runner_remote_state_unavailable: exit=66 timedOut=false") });
+    const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
+    const pendingRequest = { requestId: "request-inflight", requestKind: "user_input", method: "item/tool/requestUserInput",
+      turnId: "turn-inflight", itemId: "item-inflight", status: "pending", prompt: "Choose", details: {} } as unknown as NonNullable<PersistedNativeSession["pendingRuntimeRequests"]>[number];
+    // The same-run checkpoint a first-turn fresh open writes: no policy of its
+    // own (the session snapshot never carries one), an unsettled active turn.
+    const sameRunCheckpoint = (overrides: Partial<PersistedNativeSession> = {}): PersistedNativeSession => ({
+      backendKind: "runner", driverKind: "codex_app_server", sessionId: "driver-inflight", identity,
+      providerSessionId: "provider-inflight", workingDirectory: WORKSPACE, cursor: "3",
+      semanticResult: null, terminal: null, activeTurnId: "turn-inflight", terminalTurns: [],
+      pendingRuntimeRequests: [], dispositionOnlyRecoveryConsumed: false, dispositionOnlyRecoveryTurnId: null, lineage: [],
+      ...overrides,
+    });
+    function harness(options: {
+      checkpoint: PersistedNativeSession;
+      proof?: boolean | null | "rejects";
+      error?: Error;
+      executionInput?: NativeExecutionInputV1 | NativeExecutionInputV5;
+    }) {
+      const transport = new FakeCodexTransport();
+      transport.rejectMethods.set("initialize", options.error ?? definiteAbsence());
+      const transportFactory = vi.fn(() => transport);
+      const real = createCodexNativeSessionBackend(executionInput, { runnerInstanceId: "runner-recovery", transportFactory });
+      const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "turn-fresh" }));
+      const replacementSnapshot: PersistedNativeSession = {
+        ...options.checkpoint, sessionId: "driver-fresh", providerSessionId: "provider-fresh",
+        activeTurnId: null, pendingRuntimeRequests: [],
+      };
+      const replacementSession: NativeSession = {
+        identity: () => identity,
+        capabilities: async () => ({ resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }),
+        async *events() { yield { ...runnerEvent(4, "turn.completed"), turnId: "turn-fresh" }; },
+        startTurn,
+        result: async () => ({ result, terminal, turnId: "turn-fresh" }),
+        snapshot: async () => structuredClone(replacementSnapshot),
+        close: async () => {},
+      };
+      const openReplacementSession = vi.fn(async () => replacementSession);
+      const openSession = vi.fn(async () => { throw new Error("replacement seam must be used"); });
+      const recoverSession = vi.fn((snapshot: PersistedNativeSession, recoveryOptions: Parameters<NonNullable<NativeSessionBackend["recoverSession"]>>[1]) =>
+        real.recoverSession!(snapshot, recoveryOptions));
+      const backend: NativeSessionBackend = {
+        descriptor: () => real.descriptor(), openSession, openReplacementSession, recoverSession,
+      };
+      const provesNoRunToolWork = vi.fn(async () => {
+        if (options.proof === "rejects") throw new Error("database unavailable");
+        return options.proof === true;
+      });
+      const provesNoRunProviderWork = vi.fn(async () => false);
+      const events: PrpEvent[] = [];
+      const openRun = vi.fn(async () => undefined);
+      const controlPlane: ControlPlanePort = {
+        openRun,
+        loadSessionCheckpoint: async () => structuredClone(options.checkpoint),
+        checkpointSession: async () => {},
+        async appendEvent(event) {
+          events.push(structuredClone(event as PrpEvent));
+          return { cursor: events.length, highestContiguousSourceSeq: highestContiguous(events), disposition: "committed" };
+        },
+        replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+        completeRun: async () => {},
+        provesNoRunProviderWork,
+        ...(options.proof === null ? {} : { provesNoRunToolWork }),
+      } as ControlPlanePort;
+      const onContinuityBreak = vi.fn(async () => undefined);
+      const run = () => executeNativeSession({
+        input: options.executionInput ?? executionInput, backend, controlPlane, onContinuityBreak,
+        getFreshSessionHandoff: async () => "FRESH_HANDOFF: task history",
+        runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery",
+      });
+      return { run, startTurn, openReplacementSession, openSession, recoverSession, provesNoRunToolWork,
+        openRun, onContinuityBreak, transportFactory };
+    }
+
+    // F1 supplies the policy server-side (nativeProviderRecoveryPolicy of the
+    // same-run snapshot); F2 lets the definite absence reach the runtime ladder
+    // by name; the ladder replaces only with a durable no-tool-call proof.
+    it("replaces once, records the continuity break, and answers when the interrupted turn recorded no tool call", async () => {
+      const h = harness({ checkpoint: sameRunCheckpoint({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" }), proof: true });
+      await expect(h.run()).resolves.toMatchObject({ providerSessionId: "provider-fresh", result });
+      expect(h.recoverSession).toHaveBeenCalledOnce();
+      expect(h.provesNoRunToolWork).toHaveBeenCalledOnce();
+      expect(h.openReplacementSession).toHaveBeenCalledOnce();
+      expect(h.openSession).not.toHaveBeenCalled();
+      expect(h.startTurn).toHaveBeenCalledOnce();
+      expect(h.onContinuityBreak).toHaveBeenCalledOnce();
+      expect(h.onContinuityBreak).toHaveBeenCalledWith(expect.objectContaining({
+        previousDriverSessionId: "driver-inflight", previousProviderSessionId: "provider-inflight",
+        replacementDriverSessionId: "driver-fresh", replacementProviderSessionId: "provider-fresh",
+        identityChangeReason: "resume_failed_on_new_box",
+      }));
+    });
+
+    it("records runner_state_lost when the controller's own state and archive are gone (no box exit 66)", async () => {
+      const h = harness({ checkpoint: sameRunCheckpoint({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" }),
+        proof: true, error: new NativeRunnerResumeStateUnavailableError() });
+      await expect(h.run()).resolves.toMatchObject({ providerSessionId: "provider-fresh" });
+      expect(h.onContinuityBreak).toHaveBeenCalledWith(expect.objectContaining({ identityChangeReason: "runner_state_lost" }));
+    });
+
+    it.each([
+      ["the checkpoint carries no recovery policy (a first-turn fresh open before the server fills it)", { proof: true }, {}],
+      ["the interrupted turn recorded a tool call", { proof: false }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
+      ["the control plane predates the tool-call proof", { proof: null }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
+      ["the tool-call proof fails", { proof: "rejects" as const }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
+      ["the computed policy is same_session_only (an unfinished goal)", { proof: true }, { providerRecoveryPolicy: "same_session_only" as const }],
+      ["the policy is the governed wait's (this run's turn is not an untouched rebind)", { proof: true }, { providerRecoveryPolicy: "allow_replacement_after_governed_wait" as const }],
+    ] as const)("names native_provider_state_incompatible (never a bare interruption) when %s", async (_label, options, overrides) => {
+      const h = harness({ checkpoint: sameRunCheckpoint(overrides), ...options });
+      const failure = await h.run().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(NativeProviderStateIncompatibleError);
+      expect((failure as NativeProviderStateIncompatibleError).code).toBe("native_provider_state_incompatible");
+      expect(String((failure as Error).message)).toContain("PRP provider resume state is unavailable");
+      expect(h.recoverSession).toHaveBeenCalledOnce();
+      expect(h.openReplacementSession).not.toHaveBeenCalled();
+      expect(h.openSession).not.toHaveBeenCalled();
+      expect(h.openRun).not.toHaveBeenCalled();
+      expect(h.startTurn).not.toHaveBeenCalled();
+      expect(h.onContinuityBreak).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["no recovery policy", {}],
+      ["the plain replacement policy", { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
+    ] as const)("still stops by name (side effect pending) when the in-flight session holds a pending runtime request (%s)", async (_label, overrides) => {
+      const h = harness({ checkpoint: sameRunCheckpoint({ ...overrides, pendingRuntimeRequests: [pendingRequest] }), proof: true });
+      const failure = await h.run().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(NativeProviderSideEffectPendingError);
+      expect((failure as NativeProviderSideEffectPendingError).code).toBe("native_provider_side_effect_pending");
+      expect(h.provesNoRunToolWork).not.toHaveBeenCalled();
+      expect(h.openReplacementSession).not.toHaveBeenCalled();
+      expect(h.openSession).not.toHaveBeenCalled();
+      expect(h.openRun).not.toHaveBeenCalled();
+    });
+
+    it("never replaces a preconfigured home, even with the plain policy and a no-tool-call proof", async () => {
+      const h = harness({ checkpoint: sameRunCheckpoint({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" }), proof: true,
+        executionInput: { ...preparedInput(), workspace: { ...preparedInput().workspace, cwd: WORKSPACE },
+          schema: "paperclip.native-execution-input.v7", homeMode: "preconfigured" } as unknown as NativeExecutionInputV5 });
+      const failure = await h.run().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(NativeProviderStateIncompatibleError);
+      expect(h.openReplacementSession).not.toHaveBeenCalled();
+      expect(h.openSession).not.toHaveBeenCalled();
     });
   });
 
