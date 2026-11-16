@@ -203,8 +203,11 @@ export const createToolConnectionSchema = z.object({
 
 export type CreateToolConnection = z.infer<typeof createToolConnectionSchema>;
 
-export const updateToolConnectionSchema = objectWithoutDefaults(createToolConnectionSchema.omit({ applicationId: true })).partial().refine(
-  (value) => Object.keys(value).length > 0,
+export const updateToolConnectionSchema = objectWithoutDefaults(createToolConnectionSchema.omit({ applicationId: true })).partial().extend({
+  // Scoped request data only; the writer supplies the authenticated actor.
+  projectDoneConfirmation: z.object({ projectId: z.string().guid(), connectionId: z.string().guid() }).strict().optional(),
+}).refine(
+  (value) => Object.keys(value).some(key => key !== "projectDoneConfirmation"),
   { message: "At least one tool connection field is required" },
 );
 
