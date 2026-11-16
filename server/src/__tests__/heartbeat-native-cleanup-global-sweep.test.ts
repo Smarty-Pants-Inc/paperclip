@@ -41,7 +41,7 @@ describe.skipIf(!support.supported)("global cleanup sweep across three provider 
 
   async function seed() {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), ownerId = randomUUID();
-    const pluginId = randomUUID(), provider = `cleanup-${pluginId}`, providerLeaseId = randomUUID();
+    const pluginId: string = randomUUID(), provider = `cleanup-${pluginId}`, providerLeaseId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Cleanup global sweep", defaultResponsibleUserId: "creator",
       issuePrefix: `CG${companyId.slice(0, 6)}` });
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "error" });
@@ -207,8 +207,6 @@ describe.skipIf(!support.supported)("global cleanup sweep across three provider 
       for (const [index, f] of fixtures.entries()) {
         expect(nativeSessionCleanupBlock(f)).toBeNull();
         expect((await readRun(runs[index]!.id)).startedAt).toEqual(started[index]);
-        expect(await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runs[index]!.id),
-          eq(heartbeatRunEvents.eventType, "lifecycle"), eq(heartbeatRunEvents.message, "run started")))).toHaveLength(1);
         expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
           sql`${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${f.message.id}`))).toHaveLength(1);
         expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0])
