@@ -66,7 +66,15 @@ Successful approval/revocation returns HTTP 200 with the value-free receipt:
 }
 ```
 
-Revocation sets `revokedAt`; it never deletes the audit history. Generic create,
+Revocation sets `revokedAt`; it never deletes the audit history. H's same
+session authority may revoke a consumed, archived source S. This records one
+IDs-only `tool_connection.project_app_revoked` activity row, without un-archiving
+S, reopening a reservation or deleting any source/consumer/binding. A repeated
+revoke is idempotent. Approve cannot resurrect a consumed source. The next AND
+every later credential release or forced refresh is refused with
+`project_app_approval_required` (the existing revoked-receipt refusal).
+
+Generic create,
 PATCH, config replacement, gallery/import or plugin connection writers cannot
 mint or alter `config.projectAppApproval` or its protected source pointer.
 
@@ -107,8 +115,10 @@ configuration and key version. Local receipt mutations and already-authenticated
 installation/repository webhooks invalidate cached verdicts. Revocation and H
 are read from the database on every release, including cache hits. A suspended
 installation, changed stable repository IDs or mismatched verified App identity
-refuses release. Already-exported provider tokens cannot be recalled by a local
-cache invalidation.
+refuses release. A token minted BEFORE local revocation remains valid until
+its provider expiry: a GitHub App installation token lasts at most **60 minutes**.
+The local off switch blocks later releases and refresh/mints; it does not recall
+an already-exported provider token.
 
 The classified manager reference is refused before key resolution and its
 verified numeric App ID after provider verification, including Client-ID aliases
