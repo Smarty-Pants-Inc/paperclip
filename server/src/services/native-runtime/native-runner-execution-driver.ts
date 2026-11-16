@@ -6,6 +6,7 @@ import { resolvePaperclipRunnerTransport, type PaperclipRunnerTransport } from "
 import type { RunnerExecutionDriver } from "../../vendor/paperclip-runner/index.js";
 import { registerRunnerPrpAuthority } from "../../realtime/runner-prp-ws.js";
 import { connectRunnerPrpIngress } from "../../realtime/runner-prp-outbound.js";
+import { controlPlaneLeaseExpiresAtUnixMs } from "../../realtime/runner-control-plane-lease.js";
 import type { NativeRunTrace } from "./native-run-trace.js";
 import type { Db } from "@paperclipai/db";
 import { nativeRunnerCheckpointRegistration } from "./native-runner-checkpoint.js";
@@ -39,6 +40,20 @@ export interface NativeRunnerExecutionDriverInput {
   process?: Omit<RunnerExecutionDriver, "controlPlaneRegistration">;
   trace?: NativeRunTrace;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /**
+   * An idle warm listen_ws owner could not reach its runner before its lease
+   * neared expiry (`native_runner_ingress_unreachable`). The owner retires the
+   * warm session through its ordinary close path; the checkpoint stays (#20825).
+   */
+  onIngressUnreachable?: (error: Error) => void;
+}
+
+/** An idle owner has no command in flight to its runner (a turn, an identity
+ * check, a lifecycle command). Its route may outlive the recovery budget. */
+function controlPlaneIdle(authority: unknown): boolean {
+  const commands = (authority as { store?: { state?: { commands?: unknown } } }).store?.state?.commands;
+  return Array.isArray(commands)
+    && !commands.some(command => (command as { status?: unknown })?.status === "pending");
 }
 
 async function measureNativeRunnerSpan<T>(
@@ -296,13 +311,41 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           let activation: Promise<void> | null = null;
           let ingress = transport.ingress;
           let released = false;
-          const openRoute = (startupDeadlineMs?: number) => connectRunnerPrpIngress({
-            authority, endpoint: ingress, startupDeadlineMs,
-            onStateChange: (state, failureCode) => {
-              void input.onLog?.("stderr",
-                `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`);
-            },
-          });
+          // One failure promise for the registration, readable right after
+          // activate() (before the route exists) and following route
+          // replacement. Only an authenticated route's exhausted recovery
+          // rejects it; startup failures surface through ready().
+          let rejectRouteFailure!: (error: unknown) => void;
+          const routeFailure = new Promise<never>((_resolve, reject) => { rejectRouteFailure = reject; });
+          void routeFailure.catch(() => undefined);
+          let reportedUnreachable = false;
+          const openRoute = (startupDeadlineMs?: number) => {
+            const route = connectRunnerPrpIngress({
+              authority, endpoint: ingress, startupDeadlineMs,
+              // #20825: an idle warm route redials past the recovery budget
+              // until the control plane's lease expiry minus a margin.
+              idleWarm: {
+                isIdle: () => controlPlaneIdle(authority),
+                leaseExpiresAtUnixMs: () => controlPlaneLeaseExpiresAtUnixMs(authority),
+              },
+              onStateChange: (state, failureCode) => {
+                void input.onLog?.("stderr",
+                  `[paperclip-runner] transport mode=provider_ingress state=${state}${failureCode ? ` failure=${failureCode}` : ""}\n`);
+              },
+            });
+            let authenticated = false;
+            void route.ready?.then(() => { authenticated = true; }, () => undefined);
+            void route.failure?.catch((error: unknown) => {
+              if (!authenticated || released || outbound !== route) return;
+              rejectRouteFailure(error);
+              const code = (error as { code?: unknown })?.code;
+              if (code === "native_runner_ingress_unreachable" && !reportedUnreachable) {
+                reportedUnreachable = true;
+                input.onIngressUnreachable?.(error instanceof Error ? error : new Error(String(code)));
+              }
+            });
+            return route;
+          };
           const closeRoute = async () => {
             released = true;
             if (outbound) await outbound.close();
@@ -367,6 +410,18 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
               const count = authority.activeRunnerConnectionCount();
               if (count === 1) return;
               if (count !== 0) throw new Error("runner_ingress_owner_ambiguous");
+              // A route that is still redialing (an idle warm owner past its
+              // recovery budget) dials at once for the arriving turn. Keep it:
+              // closing it would leave nobody dialing if this reopen fails.
+              if (outbound?.redialNow?.()) {
+                while (authority.activeRunnerConnectionCount() === 0) {
+                  assertOpen();
+                  await new Promise(resolve => setTimeout(resolve, Math.max(1, Math.min(25, deadline - Date.now()))));
+                }
+                assertOpen();
+                if (authority.activeRunnerConnectionCount() !== 1) throw new Error("runner_ingress_owner_ambiguous");
+                return;
+              }
               // Refresh the existing authenticated capability. Never acquire a
               // second allocation, change run identity, or launch a process.
               const refreshed = await ingress.refresh();
@@ -405,7 +460,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
               }
             },
             get failure() {
-              return outbound?.failure;
+              return routeFailure;
             },
             startupFailureCode: "runner_ingress_unavailable" as const,
             checkpoint,

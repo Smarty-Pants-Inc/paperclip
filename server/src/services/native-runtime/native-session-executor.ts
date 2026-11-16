@@ -2426,7 +2426,7 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
   }
 }
 
-function nativeSessionScopeKey(execution: NativeExecutionInput): string {
+export function nativeSessionScopeKey(execution: NativeExecutionInput): string {
   return canonicalJson({
     schema: "paperclip.native-session-scope.v2",
     companyId: execution.binding.companyId,
@@ -9123,10 +9123,34 @@ async function releaseWarmNativeSession(
   armWarmNativeSessionIdleTimer(sessionId, entry, idleTimeoutMs);
 }
 
+/** The reason an idle warm owner is retired when its runner stayed unreachable
+ * until its connection lease neared expiry (#20825). */
+export const NATIVE_RUNNER_INGRESS_UNREACHABLE = "native_runner_ingress_unreachable";
+
+/**
+ * #20825: the idle warm owner's ingress redialed until its lease neared expiry
+ * and never reached the runner. Retire it now through the ordinary idle close
+ * path (the same close, checkpoint and forget steps as an idle timeout), so its
+ * last checkpoint stays and the next message starts from it. A busy owner is
+ * left to its turn, which observes the transport failure itself.
+ */
+export function retireUnreachableWarmNativeSession(sessionId: string): boolean {
+  const entry = warmNativeSessions.get(sessionId);
+  if (!entry || entry.busy || entry.released || entry.closeOnReleaseReason !== undefined) return false;
+  if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
+  entry.idleTimer = null;
+  logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
+    providerLeaseId: entry.providerLeaseId ?? null, reason: NATIVE_RUNNER_INGRESS_UNREACHABLE },
+  "idle warm native session's runner is unreachable; retiring it");
+  armWarmNativeSessionIdleTimer(sessionId, entry, 0, NATIVE_RUNNER_INGRESS_UNREACHABLE);
+  return true;
+}
+
 function armWarmNativeSessionIdleTimer(
   sessionId: string,
   entry: WarmNativeSession,
   idleTimeoutMs: number,
+  closeReason = "warm native session idle timeout",
 ): void {
   entry.idleTimer = setTimeout(() => {
     const current = warmNativeSessions.get(sessionId);
@@ -9135,18 +9159,18 @@ function armWarmNativeSessionIdleTimer(
       // A continuation has reserved this scope and is still preparing. It
       // verifies this idle owner as the prior run's authority; suspending it
       // underneath that check makes the ready state look indeterminate.
-      armWarmNativeSessionIdleTimer(sessionId, current, idleTimeoutMs);
+      armWarmNativeSessionIdleTimer(sessionId, current, idleTimeoutMs, closeReason);
       return;
     }
     current.busy = true;
     const released = current.released === true;
-    if (!released) current.closeOnReleaseReason = "warm native session idle timeout";
+    if (!released) current.closeOnReleaseReason = closeReason;
     const closing = (released ? detachReleasedWarmNativeSession(current) : closeWarmNativeSession(current, current.closeOnReleaseReason!))
       .then(() => { forgetWarmNativeSession(sessionId, current); })
       .catch(error => {
         if (released) current.closeOnReleaseReason = "released Runner local detach is unconfirmed";
         if (!released && error instanceof AgentDirectoryOperationBusyError) {
-          armWarmNativeSessionIdleTimer(sessionId, current, agentDirectoryBusyRetryDelayMs());
+          armWarmNativeSessionIdleTimer(sessionId, current, agentDirectoryBusyRetryDelayMs(), closeReason);
           return;
         }
         logger.warn({ runId: current.runId, issueId: current.issueId, environmentId: current.environmentId,
@@ -19672,6 +19696,9 @@ async function createRunnerdBackendWithinSessionClaim(
     binding: input.remoteWarmRecovery ? { ...input.execution.binding, runId: input.remoteWarmRecovery.identity.runId } : input.execution.binding,
     runnerIngressAuthorized: input.runnerIngressAuthorized, runnerPublicUrl: input.runnerPublicUrl, runnerCaBundlePath: input.runnerCaBundlePath,
     prepareRemote: prepareRetainedRemoteRunner, processStarted: remoteRunnerProcessSpawned, checkpoint: checkpointRemoteRunner,
+    // #20825: an idle warm owner whose runner stayed unreachable until its
+    // lease neared expiry retires through the ordinary warm close path.
+    onIngressUnreachable: () => { retireUnreachableWarmNativeSession(sessionScopeId); },
     // Ordinary warm sessions retain this driver and its ingress callback. Use
     // the existing session diagnostic epoch, rebound before run.attach, for
     // both state lines and transport spans; retirement clears both sinks.
