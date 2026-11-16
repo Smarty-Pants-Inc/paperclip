@@ -28,6 +28,7 @@ import { remoteExecutionHasStopped } from "./remote-execution-termination.js";
 import type { AuthorizationActor } from "./authorization.js";
 import type { EnvironmentRuntimeService } from "./environment-runtime.js";
 import { logger } from "../middleware/logger.js";
+import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
 
 const execFile = promisify(execFileCallback);
 type Copy = typeof copies.$inferSelect;
@@ -248,9 +249,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
         assets: [{ key: "instructions", localDir: localRoot, followSymlinks: false }],
       });
       if (staged.assetDirs.instructions !== executionRoot) throw new Error("Instruction copy staging path changed");
-      const excluded = await runAdapterExecutionTargetShellCommand(input.runId, target,
-        `node -e ${quote(instructionGitExcludeProgram)} ${quote(target.remoteCwd)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 });
-      if (excluded.exitCode !== 0 || excluded.timedOut) throw new Error("Could not exclude private instructions from Git staging");
+      await excludeAgentRuntimeFromGit(input.runId, target, "Could not exclude private instructions from Git staging");
     }
     // A refresh does not supersede the completed turn until every local and
     // remote staging step succeeds. Keep its receipt and stop evidence intact
