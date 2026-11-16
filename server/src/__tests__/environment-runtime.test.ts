@@ -5142,6 +5142,62 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       .resolves.toMatchObject({ stdout: `served:${config[key]}` });
   });
 
+  // Keep: J3-24 timing-only environment edits must preserve retained chat state
+  // through real DB-backed admission, not allocate a different provider box.
+  it("reuses a retained warm lease after only TTL and reconnect grace change", async () => {
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", reuseLease: true,
+      runnerLifecycleMode: "warm", ttlSeconds: 3600, runnerReconnectGraceMs: 60_000 };
+    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Retained warm timing regression", status: "in_progress", assigneeAgentId: agentId });
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
+      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Timing compatibility fixture",
+      supportsReusableLeases: true, configSchema: { type: "object" },
+    }] });
+    let acquisitions = 0;
+    const workerManager = {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentAcquireLease") return {
+          providerLeaseId: `timing-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        if (method === "environmentResumeLease") return {
+          providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        if (method === "environmentExecute") return { exitCode: 0, stdout: `continued:${params.lease.providerLeaseId}`, stderr: "" };
+        throw new Error(`Unexpected timing compatibility method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const service = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquire = (selectedEnvironment: Environment, heartbeatRunId: string) => service.acquireRunLease({
+      companyId, environment: selectedEnvironment, issueId, agentId, adapterType: "paperclip_runner",
+      heartbeatRunId, persistedExecutionWorkspace: null,
+    });
+    const first = await acquire(environment, runId);
+    expect(first.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "created" });
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    const nextRunId = randomUUID();
+    await insertRunningManualRun(nextRunId, companyId, agentId);
+    const changed = { ...environment, config: { ...providerConfig, ttlSeconds: 1800, runnerReconnectGraceMs: 420_000 } };
+    await environmentService(db).update(environment.id, { config: changed.config });
+    vi.mocked(workerManager.call).mockClear();
+
+    const next = await acquire(changed, nextRunId);
+
+    expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    expect(next.lease.providerLeaseId).toBe(first.lease.providerLeaseId);
+    expect(acquisitions).toBe(1);
+    expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentResumeLease",
+      expect.objectContaining({ providerLeaseId: first.lease.providerLeaseId }), expect.any(Number));
+    expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentAcquireLease", expect.anything(), expect.anything());
+    expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+    await expect(service.execute({ environment: changed, lease: next.lease, command: "next chat message" }))
+      .resolves.toMatchObject({ exitCode: 0, stdout: `continued:${first.lease.providerLeaseId}` });
+  });
+
   // Compatible sizing changes still preserve a warm conversation until its
   // checkpoint is verifiable. Keep: provider-state data safety.
   it.each(["active", "released", "legacy active", "legacy released", "old identity", "stale checkpoint", "source changed during create"])(
