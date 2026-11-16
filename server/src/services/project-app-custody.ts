@@ -182,6 +182,28 @@ export async function readProjectAppCustody(db: Database, input: {
   return matches[0]!;
 }
 
+/** RFL 05:56Z: an approval source is not an owned reservation against another
+ * receipt-citing first bind of the same installation OR registration. This is a
+ * value-free classification, never approval for the caller or consumption of S.
+ * The caller's own exact receipt is separately re-read under the create locks. */
+export function isUnconsumedProjectAppApprovalSource(connection: Connection, identity: {
+  companyId: string; verifiedRegistrationId: string; canonicalInstallationKey: string;
+}) {
+  const parsed = receiptSchema.safeParse(connection.config[PROJECT_APP_APPROVAL_FIELD]);
+  if (!parsed.success || parsed.data.revokedAt || connection.projectId !== null
+    || ["archived", "disabled"].includes(connection.status) || !isGitHubAppConnection(connection)
+    || connection.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined
+    || parsed.data.companyId !== connection.companyId || connection.companyId !== identity.companyId) return false;
+  const app = parseGitHubAppConfig(connection.config.methodConfig);
+  return app.installationId === parsed.data.installationId
+    && (!/^[1-9]\d*$/.test(app.appId) || app.appId === parsed.data.appId)
+    && connection.credentialSecretRefs.length === 1
+    && connection.credentialSecretRefs[0]!.secretId === parsed.data.secretRef.secretId
+    && connection.credentialSecretRefs[0]!.configPath === parsed.data.secretRef.configPath
+    && (parsed.data.appId === identity.verifiedRegistrationId
+      || `github.com/github-app-installation/${parsed.data.installationId}` === identity.canonicalInstallationKey);
+}
+
 const approvalClient = createGitHubAppClient();
 /** Called ONLY by the session route. HTTP and key resolution occur before row
  * locks. The exact snapshot, current H and current classifier are rechecked
