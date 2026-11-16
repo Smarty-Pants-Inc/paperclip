@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDurableRunLogStore } from "../run-log-store.js";
 import type { StorageProvider } from "../../storage/types.js";
 import { createHeartbeatRunOutput, isNewRunLog } from "./run-output.js";
-import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import { generateKeyPairSync } from "node:crypto";
 import { reportStorageOutageWaitsTo, runInOwnStorageScope } from "../../storage/storage-unavailable.js";
@@ -564,5 +564,113 @@ describe("object-backed diagnostic recording", () => {
     expect(begun).toBe(deferNativeLogRecovery);
     releaseRead();
     await beginning.catch(() => undefined);
+  });
+});
+
+// receipt-stamp: a tool event whose stream holds a possible secret prefix is
+// committed only when its stream's next event arrives, so stored seq order is
+// not the adapter's order. Each stored adapter event carries the receipt stamp
+// payload.receivedAt / payload.adapterEventIndex, assigned when it is received.
+describe("adapter event receipt stamp", () => {
+  type StoredEvent = { seq: number; eventType: string; message?: string; payload?: Record<string, unknown> };
+  async function recorder(secrets: string[]) {
+    const row = { ...newRunRow } as Run;
+    const stored: StoredEvent[] = [];
+    const identityRedactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(identityRedactor, secrets);
+    const output = createHeartbeatRunOutput(createRunRowDb(row), {
+      run: row, runId: row.id, issueId: null, secretKeys: new Set(), identityRedactor,
+      runLogStore: { begin: async () => ({ store: "local_file", logRef: "synthetic/run-1" }), append: async () => 0,
+        enqueue: async () => ({ committed: Promise.resolve(0) }), flush: async () => undefined } as never,
+      appendRunEvent: (async (_run: Run, event: Omit<StoredEvent, "seq">) => {
+        stored.push({ seq: stored.length + 1, ...structuredClone(event) });
+      }) as never,
+      getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    return { stored, handlers: await output.begin(row) };
+  }
+  const stamp = (event: StoredEvent) => ({
+    receivedAt: event.payload?.receivedAt, adapterEventIndex: event.payload?.adapterEventIndex,
+  });
+  const byIndex = (events: StoredEvent[]) =>
+    [...events].sort((left, right) => Number(left.payload?.adapterEventIndex) - Number(right.payload?.adapterEventIndex));
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("(1) review-fleet-4: A1 held, N1, B1, A2 sort back to adapter order by adapterEventIndex, whatever their seq", async () => {
+    const secret = "synthetic-secret-token-0001"; // test-only
+    const { stored, handlers } = await recorder([secret]);
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "A1",
+      payload: { toolCallId: "A", output: "A1 then synthetic-secret" } });
+    await handlers.onAdapterEvent({ eventType: "assistant.message", stream: "stdout", message: "N1", payload: { text: "N1\n" } });
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "B1",
+      payload: { toolCallId: "B", output: "B1 done\n" } });
+    await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: "A2",
+      payload: { toolCallId: "A", output: "-token-0001 A2 done\n" } });
+    await handlers.finishAdapterEvents();
+    expect(stored).toHaveLength(4);
+    // The held A1 is committed after N1 and B1: seq order alone is not adapter order.
+    expect(stored.map(event => event.message)).toEqual(["N1", "B1", "A1", "A2"]);
+    expect(byIndex(stored).map(event => event.message)).toEqual(["A1", "N1", "B1", "A2"]);
+    for (const event of stored) {
+      expect(typeof event.payload?.adapterEventIndex, event.message).toBe("number");
+      expect(new Date(String(event.payload?.receivedAt)).toISOString(), event.message).toBe(event.payload?.receivedAt);
+    }
+    expect(new Set(stored.map(event => event.payload?.adapterEventIndex)).size).toBe(4);
+    expect(JSON.stringify(stored)).not.toContain(secret);
+  });
+
+  it("(2) the stamp survives the redactor when a secret is a digit string of the index or timestamp", async () => {
+    const dateSecret = "20261116"; // test-only
+    const pin = "482916375"; // test-only
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { stored, handlers } = await recorder([dateSecret, pin]);
+    const times = ["2026-11-16T20:26:11.116Z", "2026-11-16T20:26:11.200Z", "2026-11-16T20:26:12.300Z"];
+    const pieces = ["pin 4829", `16375 day ${dateSecret} `, "id 2026111 end\n"];
+    for (const [index, piece] of pieces.entries()) {
+      vi.setSystemTime(new Date(times[index]!));
+      await handlers.onAdapterEvent({ eventType: "tool.output", stream: "stdout", message: piece,
+        payload: { toolCallId: "pin", output: piece, step: 482916375 } });
+      vi.setSystemTime(new Date("2026-11-16T23:59:59.999Z"));
+    }
+    await handlers.finishAdapterEvents();
+    const tools = byIndex(stored.filter(event => event.eventType === "tool.output"));
+    expect(tools).toHaveLength(3);
+    expect(tools.map(stamp)).toEqual(times.map((receivedAt, index) => ({ receivedAt, adapterEventIndex: index + 1 })));
+    const joined = tools.map(event => String(event.payload?.output ?? "")).join("");
+    expect(joined).toBe("pin ***REDACTED*** day ***REDACTED*** id 2026111 end\n");
+    for (const value of [pin, dateSecret]) expect(JSON.stringify(tools.map(event => event.message))).not.toContain(value);
+  });
+
+  it("(3) a replayed event (same source event id) keeps its first stamp and stays one row", async () => {
+    const secret = "synthetic-secret-token-0003"; // test-only
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { stored, handlers } = await recorder([secret]);
+    const deliver = async (at: string, event: Parameters<typeof handlers.onAdapterEvent>[0]) => {
+      vi.setSystemTime(new Date(at));
+      await handlers.onAdapterEvent(structuredClone(event));
+    };
+    const a1 = { eventType: "tool.output", stream: "stdout" as const, message: "A1",
+      payload: { sourceEventId: "src-a1", toolCallId: "A", output: "A1 synthetic-secret" } };
+    const b1 = { eventType: "tool.output", stream: "stdout" as const, message: "B1",
+      payload: { sourceEventId: "src-b1", toolCallId: "B", output: "B1 done\n" } };
+    const n1 = { eventType: "assistant.message", stream: "stdout" as const, message: "N1",
+      payload: { sourceEventId: "src-n1", text: "N1\n" } };
+    await deliver("2026-11-16T19:00:01.000Z", a1);
+    await deliver("2026-11-16T19:00:02.000Z", b1);
+    await deliver("2026-11-16T19:00:03.000Z", n1);
+    await deliver("2026-11-16T19:00:04.000Z", a1); // replay while A1 is still held
+    await deliver("2026-11-16T19:00:05.000Z", b1); // replay after B1 was committed
+    await deliver("2026-11-16T19:00:06.000Z", n1); // non-tool replay
+    await deliver("2026-11-16T19:00:07.000Z", { eventType: "tool.output", stream: "stdout", message: "A2",
+      payload: { sourceEventId: "src-a2", toolCallId: "A", output: "-token-0003 A2\n" } });
+    await handlers.finishAdapterEvents();
+    expect(stored.map(event => event.message).sort()).toEqual(["A1", "A2", "B1", "N1"]);
+    expect(byIndex(stored).map(event => [event.message, stamp(event)])).toEqual([
+      ["A1", { receivedAt: "2026-11-16T19:00:01.000Z", adapterEventIndex: 1 }],
+      ["B1", { receivedAt: "2026-11-16T19:00:02.000Z", adapterEventIndex: 2 }],
+      ["N1", { receivedAt: "2026-11-16T19:00:03.000Z", adapterEventIndex: 3 }],
+      ["A2", { receivedAt: "2026-11-16T19:00:07.000Z", adapterEventIndex: 4 }],
+    ]);
+    expect(JSON.stringify(stored)).not.toContain(secret);
   });
 });
