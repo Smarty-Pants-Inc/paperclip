@@ -282,7 +282,19 @@ export async function testNativeRunnerAuthentication(context: AdapterEnvironment
     return { adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [{ code: `${provider}_hello_probe_passed`, level: "info",
       message: `The native ${provider} runtime verified the selected account and model in ${remote ? "the selected environment" : "the Paperclip host"}.` }] };
   } catch (error) {
-    if (error instanceof NativeEnvironmentProbeCleanupError) throw error;
+    if (error instanceof NativeEnvironmentProbeCleanupError) {
+      const receipt = error.probeResult;
+      if (error.retirementOnly && error.operationError === undefined && receipt?.helloProbePassed === true && receipt.provider === provider
+        && typeof receipt.effectiveModel === "string" && receipt.effectiveModel.trim() && receipt.effectiveModel !== "unknown"
+        && (model === null || receipt.effectiveModel === model)
+        && receipt.providerDriver === (provider === "pi_rpc" ? "pi_rpc" : "codex_app_server")) {
+        Object.assign(error, { probeSuccessResult: { adapterType: "paperclip_runner", status: "pass", testedAt: new Date().toISOString(), checks: [{
+          code: `${provider}_hello_probe_passed`, level: "info",
+          message: `The native ${provider} runtime verified the selected account and model in ${remote ? "the selected environment" : "the Paperclip host"}.`,
+        }] } satisfies AdapterEnvironmentTestResult });
+      }
+      throw error;
+    }
     const message = redactNativeProbeMessage(error instanceof Error ? error.message : "The selected native runtime could not verify this account.", { ...environment, ...(sourceAuthJson ? { [authKey]: sourceAuthJson } : {}) });
     const piMissingAuthentication = provider === "pi_rpc" && /(?:no (?:api[- ]?key|auth(?:entication)?|credentials?)|(?:api[- ]?key|credentials?) (?:is |are )?(?:missing|required|not found))/i.test(message);
     const authentication = piMissingAuthentication || /(?:invalid (?:api[- ]?key|auth(?:entication)? token)|authentication (?:failed|required)|unauthenticated|unauthorized|not authenticated|please (?:log|sign) in|not logged in|\b(?:401|403)\b)/i.test(message);

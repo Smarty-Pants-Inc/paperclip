@@ -9739,6 +9739,15 @@ export class NativeEnvironmentProbeCleanupError extends AggregateError {
     readonly operationError: unknown,
     readonly cleanupErrors: readonly unknown[],
     readonly retryCleanup?: () => Promise<void>,
+    readonly probeResult?: {
+      provider: "codex" | "opencode" | "acpx" | "pi_rpc";
+      providerDriver: string;
+      effectiveModel: string;
+      helloProbePassed: boolean;
+      admissionOnly?: true;
+      sessionAdmissionPassed?: true;
+    },
+    readonly retirementOnly = false,
   ) {
     const errors = [...(operationError === undefined ? [] : [operationError]), ...cleanupErrors];
     super(errors, errors.map(error => error instanceof Error ? error.message : "Native probe cleanup failed.").join("; "), { cause: operationError ?? cleanupErrors[0] });
@@ -9972,6 +9981,8 @@ export async function probeNativeRunnerEnvironment(options: {
   } finally {
     clearTimeout(timer);
     controller.abort(failure ?? new Error("Native provider hello probe complete."));
+    const piRetirementOnlyPending = failure instanceof PiEnvironmentProbeCleanupError
+      && failure.operationError === undefined && failure.probeResult?.helloProbePassed === true;
     const teardownErrors: unknown[] = [];
     const teardownDeadline = Date.now() + cleanupBudget;
     const awaitTeardown = async (pending: Promise<unknown>, detail: string): Promise<void> => {
@@ -9985,14 +9996,20 @@ export async function probeNativeRunnerEnvironment(options: {
         ]);
       } finally { clearTimeout(timeout); }
     };
-    const closingOperation = session ? session.close({ reason: "environment probe complete" }) : bundle.transport.close("environment probe complete");
-    try {
-      await awaitTeardown(closingOperation, "closing the selected runtime");
-      if (bundle.evidence().runnerPid !== null && !bundle.evidence().runnerExited) throw new Error("Native setup probe cleanup is incomplete.");
-    } catch (error) { teardownErrors.push(error); }
+    // PiEnvironmentProbeCleanupError already owns this session's close attempt;
+    // do not double-close it or spend a second ten-second join budget here.
+    const closingOperation = failure instanceof PiEnvironmentProbeCleanupError ? Promise.resolve()
+      : session ? session.close({ reason: "environment probe complete" }) : bundle.transport.close("environment probe complete");
+    if (piRetirementOnlyPending) teardownErrors.push(new Error("Native Pi session retirement remains pending; recovery state retained."));
+    else {
+      try {
+        await awaitTeardown(closingOperation, "closing the selected runtime");
+        if (bundle.evidence().runnerPid !== null && !bundle.evidence().runnerExited) throw new Error("Native setup probe cleanup is incomplete.");
+      } catch (error) { teardownErrors.push(error); }
+    }
     try { await awaitTeardown(operation.catch(() => undefined), "draining native setup"); }
     catch (error) { teardownErrors.push(error); }
-    if (failure instanceof PiEnvironmentProbeCleanupError) {
+    if (failure instanceof PiEnvironmentProbeCleanupError && !piRetirementOnlyPending) {
       try { await awaitTeardown(failure.retired, "joining native Pi retirement"); }
       catch (error) { teardownErrors.push(error); }
     }
@@ -10001,7 +10018,7 @@ export async function probeNativeRunnerEnvironment(options: {
       catch (error) { teardownErrors.push(error); }
     }
     if (registrationTeardownError !== undefined && !teardownErrors.includes(registrationTeardownError)) teardownErrors.push(registrationTeardownError);
-    if (!registrationCleanupConfirmed) teardownErrors.push(new Error("Native setup probe authority release is unconfirmed; recovery state retained."));
+    if (!registrationCleanupConfirmed && !piRetirementOnlyPending) teardownErrors.push(new Error("Native setup probe authority release is unconfirmed; recovery state retained."));
     if (bundle.evidence().runnerPid !== null && bundle.evidence().runnerExited && options.provider === "codex" && options.onCodexCredentialRefresh) {
       try {
         await awaitTeardown(preserveCredentialRefresh(), "preserving credential refresh");
@@ -10032,11 +10049,23 @@ export async function probeNativeRunnerEnvironment(options: {
         if (!registrationCleanupConfirmed) throw new Error("Native probe authority release remains unconfirmed");
         await awaitProbeCleanup(confirmCleanup(retry), deadline, "confirming credential handoff");
       });
-      throw new NativeEnvironmentProbeCleanupError(retained.retired, failure, teardownErrors, retained.retryCleanup);
+      const piReceipt = failure instanceof PiEnvironmentProbeCleanupError && failure.operationError === undefined
+        ? failure.probeResult : undefined;
+      const providerDriver = bundle.evidence().providerDriver;
+      const probeResult = piReceipt ?? (failure === undefined && completed && effectiveModel && providerDriver
+        ? Object.freeze({ ...(piMetadata ? { piMetadata } : {}), provider: options.provider, providerDriver,
+          effectiveModel, ...(options.admissionOnly ? { helloProbePassed: false, admissionOnly: true as const, sessionAdmissionPassed: true as const } : { helloProbePassed: true }) })
+        : undefined);
+      const retirementOnly = Boolean(piRetirementOnlyPending && piReceipt && teardownErrors.length === 1 && registrationTeardownError === undefined);
+      const operationError = retirementOnly ? undefined : failure;
+      throw new NativeEnvironmentProbeCleanupError(retained.retired, operationError, teardownErrors, retained.retryCleanup, probeResult, retirementOnly);
     }
   }
-  if (failure !== undefined) throw failure;
-  if (!completed) throw new Error("The native provider hello probe did not complete.");
+  const retiredPiReceipt = failure instanceof PiEnvironmentProbeCleanupError && failure.operationError === undefined
+    ? failure.probeResult : undefined;
+  if (failure !== undefined && !retiredPiReceipt) throw failure;
+  if (!completed && !retiredPiReceipt) throw new Error("The native provider hello probe did not complete.");
+  if (retiredPiReceipt) return Object.freeze({ ...(piMetadata ? { piMetadata } : {}), ...retiredPiReceipt });
   return Object.freeze({ ...(piMetadata ? { piMetadata } : {}), provider: options.provider, providerDriver: bundle.evidence().providerDriver!, effectiveModel: effectiveModel!,
     ...(options.admissionOnly ? { helloProbePassed: false, admissionOnly: true as const, sessionAdmissionPassed: true as const } : { helloProbePassed: true }) });
 }

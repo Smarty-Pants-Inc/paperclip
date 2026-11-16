@@ -3,7 +3,8 @@ import { isPiThinkingLevelAtMost, PiNativeAdmissionError, resolvePiNativeConfig,
 
 export class PiEnvironmentProbeCleanupError extends Error {
   readonly code = "pi_probe_cleanup_unconfirmed";
-  constructor(readonly retired: Promise<void>, readonly operationError: unknown, readonly cleanupError: unknown, readonly retryCleanup: () => Promise<void>) {
+  constructor(readonly retired: Promise<void>, readonly operationError: unknown, readonly cleanupError: unknown, readonly retryCleanup: () => Promise<void>,
+    readonly probeResult?: { provider: "pi_rpc"; providerDriver: "pi_rpc"; effectiveModel: string; providerSessionId: string; piRpcThinkingLevel?: PiNativeThinkingLevel; helloProbePassed: true }) {
     super("Pi setup probe cleanup is unconfirmed; retain the original execution environment and join retired/retryCleanup.", { cause: operationError ?? cleanupError });
     this.name = "PiEnvironmentProbeCleanupError";
   }
@@ -150,7 +151,11 @@ export async function probePiNativeEnvironment(options: {
     };
     const retired = retire();
     try { await untilAbort(retired, cleanupController.signal); }
-    catch (error) { throw new PiEnvironmentProbeCleanupError(retired, operationError, error, retire); }
+    catch (error) {
+      const probeResult = passed ? Object.freeze({ provider: "pi_rpc" as const, providerDriver: "pi_rpc" as const, effectiveModel: config.model,
+        providerSessionId, ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }), helloProbePassed: true as const }) : undefined;
+      throw new PiEnvironmentProbeCleanupError(retired, operationError, error, retire, probeResult);
+    }
     finally { clearTimeout(cleanupTimer); }
   }
   if (operationError !== undefined) throw operationError;

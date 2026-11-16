@@ -28,6 +28,8 @@ import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
 import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup } from "./retained-ai-credential-cleanup.js";
+import { logActivity } from "./activity-log.js";
+import { logger } from "../middleware/logger.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -601,7 +603,8 @@ export async function prepareManagedAiRuntime(
         return await (antigravitySubscription
           ? withAccountHomeSecretMutationLock(undefined, input.companyId, cleanup) : cleanup());
       } catch (error) {
-        if (retainedCleanupScope && !homeRemoved) retainAiCredentialCleanup({ scope: retainedCleanupScope, home: providerHome, cleanup: cleanupRuntime });
+        if (retainedCleanupScope && !homeRemoved) retainAiCredentialCleanup({ scope: retainedCleanupScope, home: providerHome, cleanup: cleanupRuntime,
+          blocksAccount: subscriptionFile });
         throw error;
       }
     })().finally(() => { cleanupRunning = undefined; });
@@ -639,18 +642,69 @@ export async function withManagedAiProbe<T>(
   probe: (runtime: Awaited<ReturnType<typeof prepareManagedAiRuntime>>) => Promise<T>,
 ): Promise<T> {
   const runtime = await prepareManagedAiRuntime(db, input);
+  // Only subscription-file providers may write a rotated credential back into
+  // the shared grant secret; all other cleanup removes this probe's unique home.
+  const cleanupTouchesAccountState = runtime.attribution.method === "subscription" && input.binding.provider !== "anthropic";
   let retained = false;
   try {
     return await probe(runtime);
   }
   catch (error) {
     if (error instanceof NativeEnvironmentProbeCleanupError) {
-      // Keep the selected credential generation until the native owner has
-      // retired and completed its refresh handoff. HTTP need not wait for it.
+      const successResult = (error as Error & { probeSuccessResult?: unknown }).probeSuccessResult;
+      if (error.retirementOnly && error.operationError === undefined && successResult !== undefined) {
+        // Only this probe's runner/session retirement is pending: answer from
+        // its verified hello receipt and let its bounded owner finish cleanup.
+        retained = true;
+        const retryRetirement = error.retryCleanup;
+        const blocksAccount = cleanupTouchesAccountState;
+        const recordOutcome = async (outcome: "retired" | "retried" | "retained", reason?: string) => {
+          const details = { outcome, ...(reason ? { reason } : {}) };
+          const log = outcome === "retained" ? logger.warn.bind(logger) : logger.info.bind(logger);
+          log({ event: "native_probe_retirement", companyId: input.companyId, agentId: input.agentId, ...details }, "Native probe retirement outcome");
+          try {
+            if (input.agentId) await logActivity(db, { companyId: input.companyId, actorType: "system", actorId: "system",
+              action: "agent.native_probe_retirement", entityType: "agent", entityId: input.agentId, agentId: input.agentId, details });
+          } catch (recordError) {
+            logger.warn({ event: "native_probe_retirement_activity_failed", companyId: input.companyId, agentId: input.agentId,
+              errorName: recordError instanceof Error ? recordError.name : "UnknownError" }, "Native probe retirement activity could not be recorded");
+          }
+        };
+        const safeReason = (failure: unknown) => {
+          if (!(failure instanceof Error)) return "Native probe retirement was not confirmed.";
+          const code = (failure as Error & { code?: unknown }).code;
+          return `${failure.name}${typeof code === "string" && /^[A-Za-z0-9_-]{1,64}$/.test(code) ? ` (${code})` : ""}: retirement was not confirmed.`;
+        };
+        void (async () => {
+          let failure: unknown;
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              if (attempt === 0) await error.retired;
+              else if (retryRetirement) await retryRetirement.call(error);
+              else throw failure ?? new Error("Native probe retirement retry is unavailable.");
+              await runtime.cleanup();
+              await recordOutcome(attempt === 0 ? "retired" : "retried");
+              return;
+            } catch (caught) { failure = caught; }
+          }
+          await recordOutcome("retained", safeReason(failure));
+          const retired = Promise.reject(failure ?? new Error("Native probe retirement was not confirmed."));
+          void retired.catch(() => undefined);
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup,
+            retired, ...(retryRetirement ? { retryRetirement: () => retryRetirement.call(error) } : {}), blocksAccount });
+        })().catch(backgroundError => {
+          logger.warn({ event: "native_probe_retirement_worker_failed", companyId: input.companyId, agentId: input.agentId,
+            errorName: backgroundError instanceof Error ? backgroundError.name : "UnknownError" }, "Native probe retirement worker failed");
+        });
+        return successResult as T;
+      }
+      // A failed hello/admission or any non-retirement error keeps the existing
+      // fail-closed response and selected-account cleanup fence.
       retained = true;
-      const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
+      const retryCleanup = error.retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
-        ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
+        ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}),
+        blocksAccount: cleanupTouchesAccountState });
       throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
     }
     throw error;
@@ -659,7 +713,8 @@ export async function withManagedAiProbe<T>(
       try { await runtime.cleanup(); }
       catch (error) {
         if (runtime.retainedCleanupScope && !(error instanceof RetiredCredentialRecoveryError)) {
-          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup });
+          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup,
+            blocksAccount: cleanupTouchesAccountState });
         }
         throw error;
       }

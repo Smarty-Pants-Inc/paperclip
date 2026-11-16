@@ -11,6 +11,7 @@ type Cleanup = {
   cleanup: () => Promise<void>;
   retryRetirement?: () => Promise<void>;
   retired: "pending" | "confirmed" | "failed";
+  blocksAccount: boolean;
   running?: Promise<void>;
   executing?: boolean;
   warned?: boolean;
@@ -61,17 +62,18 @@ function attempt(entry: Cleanup): Promise<void> {
 }
 
 /** A retirement event gets one cleanup attempt. Already-retired failures retry
- * only on the next same-account action, never on an idle timer or SQL scan. */
+ * on the next same-account action, never an idle timer or SQL scan. Per-probe
+ * homes may be reconciled there without blocking an unrelated hire. */
 export function retainAiCredentialCleanup(input: {
   // Accept legacy Google home metadata for compatibility. Only the explicit
   // bindRetainedAiCredentialHome mapping grants home-to-account authority.
-  scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string;
+  scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string; blocksAccount?: boolean;
 }): void {
   const scopeKey = key(input.scope);
   const entries = retained.get(scopeKey) ?? new Set<Cleanup>();
   if ([...entries].some(entry => entry.cleanup === input.cleanup)) return;
   const entry: Cleanup = { scope: { ...input.scope }, home: input.home, cleanup: input.cleanup, retryRetirement: input.retryRetirement,
-    retired: input.retired ? "pending" : "confirmed" };
+    retired: input.retired ? "pending" : "confirmed", blocksAccount: input.blocksAccount !== false };
   entries.add(entry); retained.set(scopeKey, entries);
   if (input.retired) void input.retired.then(() => {
     entry.retired = "confirmed";
@@ -83,7 +85,10 @@ export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope):
   await Promise.resolve();
   const scopeKey = key(scope);
   if (cleaningScope(scope)) return;
-  for (const entry of [...(retained.get(scopeKey) ?? [])]) await attempt(entry);
+  for (const entry of [...(retained.get(scopeKey) ?? [])]) {
+    try { await attempt(entry); }
+    catch (error) { if (entry.blocksAccount) throw error; }
+  }
 }
 
 export function bindRetainedAiCredentialHome(home: string, scope: RetainedAiCleanupScope): () => void {
