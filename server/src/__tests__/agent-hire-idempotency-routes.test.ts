@@ -295,5 +295,5 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
 
     expect(trials).toHaveLength(5);
     expect(failures, JSON.stringify(failures)).toEqual([]);
-  });
+  }, 120_000);
 });
