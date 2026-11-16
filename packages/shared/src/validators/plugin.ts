@@ -826,6 +826,7 @@ export const pluginManifestV1Schema = z.object({
     }).strict().optional(),
   }).strict().optional(),
   resourceLifecycle: z.array(z.enum(["agent", "project", "agent_runtime"])).min(1).max(3).optional(),
+  instanceSecretKeys: z.array(z.string().regex(/^[a-z][a-z0-9_]{0,63}$/)).max(16).optional(),
   aiConnectionRouter: z.object({ name: z.string().trim().min(1).max(100), description: z.string().trim().min(1).max(500) }).strict().optional(),
   entrypoints: z.object({
     worker: z.string().min(1),

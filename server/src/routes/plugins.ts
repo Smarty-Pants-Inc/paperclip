@@ -79,6 +79,7 @@ import {
   hasCompanyAccess,
 } from "./authz.js";
 import { validateInstanceConfig } from "../services/plugin-config-validator.js";
+import { pluginInstanceSecretWriteRoutes } from "./plugin-instance-secret-write.js";
 import {
   findLocalFolderDeclaration,
   getStoredLocalFolders,
@@ -2339,6 +2340,8 @@ export function pluginRoutes(
   // ===========================================================================
   // Plugin configuration routes
   // ===========================================================================
+
+  router.use(pluginInstanceSecretWriteRoutes(db));
 
   /**
    * GET /api/plugins/:pluginId/config
