@@ -213,7 +213,12 @@ const recoveryCases: RecoveryCase[] = [{ name: "deployed: warm envelope + DB che
 { name: "G-warm-reviewer-shape (diagnostic: no GitHub authority)",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "record", box: "replaced", responseWait: "github-review-shape" },
 { name: "SB-cold: warm envelope + DB checkpoint, done, same box with cold runner",
-  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" }];
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" },
+// Gate 6 (prp-resume-unavailable): the first turn is interrupted IN FLIGHT (no
+// tool call), its box is replaced, and the same-run retry must answer on a
+// replacement with ONE person-visible line. Run on gcp2 (F7, row AT).
+{ name: "AT: first turn interrupted in flight (control active-turn) on a replaced box, same-run retry",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "failed-launched", failoverBackups: "absent", control: "active-turn", expected: "answers-no-history", box: "replaced" }];
 const runRecoveryCase = async (scenario: RecoveryCase) => {
   const governedWait = scenario.priorRun === "yielded-response-wake";
   const reviewerShape = scenario.responseWait === "github-review-shape";
@@ -272,12 +277,27 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
   const allocationIds = [`image-A-${randomUUID()}`, `image-B-${randomUUID()}`];
   const allocations = new Map(allocationIds.map(id => [id, "running" as "running" | "stopped"]));
   const leaseActive = new Map<string, boolean>();
+  // AT: the opening turn's model stream starts and is held open, so the turn is
+  // in flight (no tool call) when controller and box are lost.
+  let holdOpeningTurn = scenario.control === "active-turn";
+  let heldResponse: import("node:http").ServerResponse | undefined;
+  let openingTurnHeld!: () => void;
+  const openingTurnInFlight = new Promise<void>(resolve => { openingTurnHeld = resolve; });
   const model = createServer((req, res) => {
     let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
     req.on("end", () => {
       if (new URL(req.url ?? "/", "http://127.0.0.1").pathname !== "/v1/messages") { res.writeHead(404).end(); return; }
       try {
         const parsed = JSON.parse(body);
+        if (holdOpeningTurn && activeRunId === openingRunId) {
+          holdOpeningTurn = false;
+          requests.push({ runId: activeRunId, path: req.url, request: parsed, held: true,
+            containsFact: JSON.stringify(parsed.messages).includes(fact) });
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          res.write(`event: message_start\ndata: ${JSON.stringify({ type: "message_start", message: { id: "msg-held", type: "message",
+            role: "assistant", model: "faux", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 7, output_tokens: 0 } } })}\n\n`);
+          heldResponse = res; openingTurnHeld(); return;
+        }
         const first = requests.length === 0;
         const opening = governedWait && activeRunId === openingRunId;
         const useFinishTool = opening && first;
@@ -595,6 +615,56 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     }
     activeRunId = first.runId;
     const firstOptions = await executionOptions(first);
+    if (scenario.control === "active-turn") {
+      // Gate 6 (prp-resume-unavailable): the worker's first canonical run is
+      // interrupted mid-turn, its controller and box are lost, and its same-run
+      // retry (attempt 2) lands on a replaced box with no Runner state (exit 66).
+      // It used to end native_session_interrupted -> retry_exhausted, no answer.
+      const interrupted = A.call("execute", firstOptions.input).catch(error => ({ error: String(error) }));
+      await openingTurnInFlight;
+      await vi.waitFor(async () => {
+        const [row] = await db!.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first.runId));
+        expect(record(record(row?.runnerProfileJson).sessionCheckpoint).activeTurnId, "AT prerequisite: opening turn in flight")
+          .toEqual(expect.any(String));
+      }, { timeout: 60_000, interval: 250 });
+      A.child.kill("SIGKILL"); await A.stopped; heldResponse?.destroy();
+      stage("AT opening turn interrupted in flight", { interrupted: await interrupted });
+      await stopBoxProcesses(); allocations.set(allocationIds[0]!, "stopped"); leaseActive.set(allocationIds[0]!, false);
+      const oldDisk = join(root, "image-A-disk-retained"); await rename(remoteCwd, oldDisk); await mkdir(remoteCwd);
+      generation = 2; await installImagePack();
+      const [changedEnvironment] = await db.update(environments).set({ config: { ...environment.config, image: "fixture:image-B" } })
+        .where(eq(environments.id, environmentId)).returning(); environment = changedEnvironment as Environment;
+      const B = await startController();
+      // The scheduled same-run retry: B owns attempt 2 of the SAME run on a new allocation.
+      await db.update(nativeRunFinalizations).set({ phase: "observed", attempt: 1, controllerBootId: String(B.identity.bootId),
+        controllerPid: Number(B.identity.pid), controllerProcessStartedAt: new Date(String(B.identity.processStartedAt)) })
+        .where(eq(nativeRunFinalizations.runId, first.runId));
+      const retryLease = (await runtime.acquireRunLease({ companyId, environment, heartbeatRunId: first.runId, issueId, agentId,
+        adapterType: "paperclip_runner", persistedExecutionWorkspace: null, warmRunnerIdleTimeoutMs: WARM_IDLE_MS })).lease;
+      expect(retryLease.providerLeaseId, "AT prerequisite: the retry runs on the replaced box").toBe(allocationIds[1]);
+      const retryOptions = await executionOptions({ ...first, lease: retryLease });
+      const retryOutcome = await B.call("execute", retryOptions.input);
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, first.runId));
+      // Read here so this file still loads at the RED commit, before the export exists.
+      const executorModule = await import("../services/native-runtime/native-session-executor.js") as unknown as {
+        nativeProviderIdentityChangePersonLine?: (reason: "resume_failed_on_new_box") => string };
+      const personLine = executorModule.nativeProviderIdentityChangePersonLine?.("resume_failed_on_new_box").trim()
+        ?? "missing nativeProviderIdentityChangePersonLine";
+      const nativeLog = existsSync(join(root, "native.log")) ? await readFile(join(root, "native.log"), "utf8") : "";
+      console.log(`E2E-PI-ACTIVE-TURN: ${JSON.stringify({ runId: first.runId, outcome: retryOutcome, error: persisted?.error ?? null,
+        errorCode: persisted?.errorCode ?? null })}`);
+      expect(retryOutcome.error, JSON.stringify(retryOutcome)).toBeUndefined();
+      expect(persisted?.errorCode ?? null, "never a bare interruption or retry exhaustion").not.toMatch(/native_session_interrupted|native_session_retry_exhausted/);
+      expect(retryOutcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: expect.any(String) });
+      expect(String(record(retryOutcome.result).summary).length, "the run answers").toBeGreaterThan(0);
+      // The replacement changed the provider session: ONE person-visible line (its
+      // durable identity record is J3-17's, dl/identity-changed; not written by F7a).
+      expect(nativeLog.split("\n").filter(line => line.includes(personLine)), "one person-visible line").toHaveLength(1);
+      expect(providerCalls.some(call => call.method === "environmentDestroyLease"), "never destroy either box").toBe(false);
+      await retryOptions.sync.restoreWorkspace();
+      stage("GREEN: interrupted first turn answered on a replacement", { runId: first.runId });
+      return;
+    }
     const firstOutcome = await A.call("execute", firstOptions.input);
     if (governedWait) {
       const openingRequests = requests.filter(request => request.runId === first.runId);
