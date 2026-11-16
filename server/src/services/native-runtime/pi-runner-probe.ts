@@ -102,11 +102,20 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       const remoteRoot = posix.join(target!.remoteCwd, ".paperclip-runtime", id);
       const remoteFilesystemRoot = posix.join(remoteRoot, "filesystem"), runnerStateDirectory = posix.join(remoteRoot, "runner");
       const remoteBinary = posix.join(remoteRoot, "bin", "paperclip-runnerd");
+      // With no configured PI_CODING_AGENT_DIR, Pi's managed agent home would be
+      // <remoteRoot>/pi/agent (pi-rpc-driver.ts:227), inside the synced root,
+      // holding absolute-target links (npm, company skills) the sync-out refuses.
+      // Give it a per-probe private dir BESIDE the root instead: launch material
+      // only (config, links, the session's models.json); the hello session file
+      // stays at <remoteRoot>/pi/<id>.jsonl and is retained as before.
+      const privateAgentDir = environment.PI_CODING_AGENT_DIR ? null : posix.join(target!.remoteCwd, ".paperclip-runtime", `${id}-pi-agent`);
+      const probeEnvironment = privateAgentDir ? { ...environment, PI_CODING_AGENT_DIR: privateAgentDir } : environment;
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
       let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
       const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
         if (prepared) return;
-        requireSuccess(await runner!.execute({ command: "mkdir", args: ["-p", "-m", "700", "--", remoteRoot, remoteFilesystemRoot], bypassSession: true, timeoutMs: 10_000 }));
+        requireSuccess(await runner!.execute({ command: "mkdir", args: ["-p", "-m", "700", "--", remoteRoot, remoteFilesystemRoot,
+          ...(privateAgentDir ? [privateAgentDir] : [])], bypassSession: true, timeoutMs: 10_000 }));
         remoteCreated = true;
         pack = await prepareRemoteProviderPackOnTarget({ target: target!, runner: runner!, configuredProviderPackRoot: source.configuredRoot, manifest: source.manifest });
         await createRemoteNativeArtifactPreparation({ target: target!, runner: runner!, remoteBinary,
@@ -149,7 +158,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           await cleanupNativeSetupRuntime(runtimeDirectory, true);
           done("remote_rm");
           // The remote root can hold a full Pi session history; removal shares the 60 s probe retirement budget.
-          requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 60_000 }));
+          requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot, ...(privateAgentDir ? [privateAgentDir] : [])], bypassSession: true, timeoutMs: 60_000 }));
           remoteCreated = false;
           done("done");
           timing.outcome = "ok";
@@ -181,7 +190,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           },
           process: { runnerProcessLauncher, runnerStateDirectory, readRunnerState: () => readRemoteRunnerState({ runner: runner!, stateDirectory: runnerStateDirectory }) } });
         return await probeNativeRunnerEnvironment({ runtimeDirectory, provider: "pi_rpc", model, admissionOnly,
-          workingDirectory: target!.remoteCwd, environment, timeoutMs: 45_000,
+          workingDirectory: target!.remoteCwd, environment: probeEnvironment, timeoutMs: 45_000,
           transportOptions: { ...executionDriver, runnerProcessLauncher, runnerBinary, runnerFilesystemRoot: remoteFilesystemRoot,
             ...nativePiRemoteLaunchOptions(pack.root, source.manifest, remoteRoot), piRpcThinkingLevel,
             externallySandboxed: target!.transport === "sandbox",
