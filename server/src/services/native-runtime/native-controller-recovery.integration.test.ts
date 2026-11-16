@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { DurablePrpControlPlane, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { DurablePrpControlPlane, NativeProviderTerminalFailure, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -391,6 +391,46 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
     await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, stream: "system", level: "info",
       eventType: "session.resumed" });
     expect((await evidence("local_runtime_api_listener_unavailable")).recoveryMode).toBe("ambiguous_state");
+  });
+
+  // #20825 / RFL: the error identifies runner loss, but durable thread evidence
+  // decides bootstrap versus exact resume, even when authentication failed.
+  it.each([
+    "transport_reconnect_grace_exceeded: runner process recovery exceeded 420000ms",
+    "native_runner_replacement_exited_before_authentication: lifecycle=recoverable_failure recoverableFailure=connection_refused",
+  ].flatMap(cause => [
+    [cause, "notification transport", new NativeProviderTerminalFailure("notification_transport_failed", false,
+      `Notification transport failed closed: ${cause}`)],
+    [cause, "plain error", new Error(cause)],
+  ] as const))("chooses bootstrap_retry without provider evidence and exact_checkpoint_resume with a matching thread checkpoint for %s through %s (#20825)", async (_cause, _shape, failure) => {
+    const issueId = randomUUID(), runId = randomUUID(), runnerInstanceId = randomUUID();
+    const normalizedSessionId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Recover runner loss", assigneeAgentId: agentId, status: "in_progress" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: issueId, nativeSessionId: normalizedSessionId, runnerInstanceId,
+      runnerProfileJson: { nativePreparationFencingVersion: 1 } });
+    const sourceFailureCode = nativeSessionFailureSourceCode(failure);
+    const evidence = () => nativeProviderRecoveryEvidence({ db, runId, executionTargetKind: "remote", sourceFailureCode });
+    expect(await evidence()).toEqual({ recoveryMode: "bootstrap_retry", providerSessionEstablished: false,
+      providerEventsExist: false, checkpointExists: false });
+
+    const identity = { runnerInstanceId, environmentLeaseId: randomUUID(), runId, normalizedSessionId,
+      turnId: `turn-${runId}`, itemId: `item-${runId}` };
+    const owner = { companyId, issueId, runId, authorityRunId: runId, bootId: randomUUID(), generation: 1, leaseOwner: randomUUID() };
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed", controllerBootId: owner.bootId,
+      controllerGeneration: 1, leaseOwner: owner.leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000) });
+    const core = new DurablePrpControlPlane({ stateDirectory: join(root, runId), identity,
+      expectedRunnerVersion: "discovery-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+    core.setCheckpointPersistence(nativeRunnerCheckpointWriter(db, owner));
+    try {
+      await core.flushCheckpoint();
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { nativePreparationFencingVersion: 1,
+        sessionCheckpoint: { backendKind: "runner", providerSessionId: "established-provider-thread",
+          sessionId: "established-provider-thread", identity: { companyId, agentId, issueId, runId, sessionId: normalizedSessionId } } } })
+        .where(eq(heartbeatRuns.id, runId));
+      expect(await evidence()).toEqual({ recoveryMode: "exact_checkpoint_resume", providerSessionEstablished: true,
+        providerEventsExist: false, checkpointExists: true });
+    } finally { await core.stop(); }
   });
 
   it("retries a fresh remote start whose launched runner never authenticated through provider ingress", async () => {

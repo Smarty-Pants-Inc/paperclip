@@ -26100,6 +26100,49 @@ it("keeps replacement-auth runner loss quoted in tool output or another provider
   }
 });
 
+// #20825: exhausting runner recovery grace is runner loss, not a provider verdict.
+const reconnectGraceCause20825 = "transport_reconnect_grace_exceeded: runner process recovery exceeded 420000ms";
+const reconnectGraceErrors20825 = [
+  ["notification transport", new NativeProviderTerminalFailure("notification_transport_failed", false,
+    `Notification transport failed closed: ${reconnectGraceCause20825}`)],
+  ["plain error", new Error(reconnectGraceCause20825)],
+] as const;
+
+it.each(reconnectGraceErrors20825)("classifies reconnect-grace runner loss through %s (#20825)", (_shape, error) => {
+  const code = nativeSessionFailureSourceCode(error);
+  expect(code).toBe("native_runner_process_exited");
+  expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({
+    phase: "retryable_failure", failureCode: "native_session_interrupted",
+  });
+});
+
+it.each(reconnectGraceErrors20825)("bounds persistent reconnect-grace runner loss through %s at three attempts (#20825)", (_shape, error) => {
+  const now = new Date("2026-11-16T00:00:00Z");
+  for (const attempt of [1, 2, 3]) {
+    const code = nativeSessionFailureSourceCode(error);
+    expect(nativeSessionFailureDisposition(attempt, now, code)).toEqual(attempt < 3
+      ? { phase: "retryable_failure", failureCode: "native_session_interrupted", nextAttemptAt: new Date(now.getTime() + 30_000) }
+      : { phase: "terminal_failure", failureCode: "native_session_retry_exhausted", nextAttemptAt: null });
+  }
+});
+
+it("keeps reconnect-grace runner loss quoted in tool output or another provider code terminal (#20825 guards)", () => {
+  for (const error of [
+    new NativeProviderTerminalFailure("provider_turn_failed", false,
+      `Notification transport failed closed: ${reconnectGraceCause20825}`),
+    new NativeProviderTerminalFailure("notification_transport_failed", false,
+      `Notification transport failed closed: tool said ${reconnectGraceCause20825}`),
+    new NativeProviderTerminalFailure("provider_turn_failed", false,
+      `Tool output: ${reconnectGraceCause20825}`),
+  ]) {
+    const code = nativeSessionFailureSourceCode(error);
+    expect(code).toBe("native_provider_terminal_failed");
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+      phase: "terminal_failure", failureCode: code, nextAttemptAt: null,
+    });
+  }
+});
+
 it("keeps an ACPX missing runtime package failure actionable and stops automatic retries", () => {
   const failure = new Error('PRP command session.open failed: {"result":{"code":"command_execution_failed","message":"failed to start ACPX provider: ACPX sidecar command session.open was rejected (retryable=false, classification=runtime_package_missing)"},"status":"failed"}');
   const code = nativeSessionFailureSourceCode(failure);
