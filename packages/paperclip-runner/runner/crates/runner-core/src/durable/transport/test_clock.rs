@@ -48,7 +48,6 @@ thread_local! {
 }
 
 /// The liveness clock: virtual on a thread that installed one, else real.
-#[allow(dead_code)]
 pub(crate) fn now() -> Instant {
     INSTALLED.with(|installed| {
         installed
