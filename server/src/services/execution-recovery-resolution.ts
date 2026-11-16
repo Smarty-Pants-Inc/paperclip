@@ -41,6 +41,7 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { provenGoneLegacyControllerBootId } from "./legacy-controller-lease.js";
 import { continueFreshInTransaction, continueHeldExecutions, freshContinuationCheckDue, recordFreshContinuationCheck,
   settleCoalescedFreshContinuationHolds, freshContinuationChain, FRESH_CONTINUATIONS_PER_CHAIN } from "./fresh-continuation-fallback.js";
+import { nativeStartupNeverConnectedExhausted } from "./continuation-cause.js";
 import { alias } from "drizzle-orm/pg-core";
 import { RECOVERY_BACKLOG_AGE_MS, RECOVERY_WAKE_REASONS } from "./heartbeat/queued-run-dispatch-order.js";
 import { parseHeartbeatPolicy } from "./heartbeat/timer-policy.js";
@@ -894,8 +895,12 @@ export async function settleUnrecoverableExecutions(
             return;
           }
         }
-        const note = executionRecoverySettlementNote({ current, cause: action.cause,
-          workspaceRestoreFailed: hasWorkspaceRestoreFailure(run.resultJson), trigger: action.evidence.trigger });
+        // A first start that never connected keeps the executor's own truthful
+        // next step (the note it posted); nothing was recorded or replayed.
+        const note = current && action.nextAction && nativeStartupNeverConnectedExhausted(coordinator)
+          ? action.nextAction
+          : executionRecoverySettlementNote({ current, cause: action.cause,
+            workspaceRestoreFailed: hasWorkspaceRestoreFailure(run.resultJson), trigger: action.evidence.trigger });
         await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: task.companyId, issueId: task.id });
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
