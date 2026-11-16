@@ -410,16 +410,9 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     // Receipt stamp: a held tool event commits after later events of other
     // streams, so stored seq order is not the adapter's order. Every received
     // adapter event takes the next index here, at receipt and before any
-    // redaction or hold; a replay of a source event id already received is
-    // dropped, so its one row keeps the first stamp.
+    // redaction or hold; a replay is a new receipt with its own stamp and row.
     let adapterEventIndex = 0;
-    const receivedSourceEventIds = new Set<string>();
     const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
-      const sourceEventId = event.payload?.sourceEventId;
-      if (typeof sourceEventId === "string" && sourceEventId) {
-        if (receivedSourceEventIds.has(sourceEventId)) return;
-        receivedSourceEventIds.add(sourceEventId);
-      }
       adapterEventIndex += 1;
       const stamp: AdapterEventReceiptStamp = { receivedAt: new Date().toISOString(), adapterEventIndex };
       const raw = event;
