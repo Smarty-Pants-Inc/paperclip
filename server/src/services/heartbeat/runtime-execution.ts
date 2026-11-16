@@ -722,6 +722,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               managedAiCredentialWriteback: managedAiRuntime?.credentialWriteback,
               managedAiCredentialHome: managedAiRuntime ? String((managedAiRuntime.config.env as Record<string, unknown>).CODEX_HOME) : undefined,
               dotWorkspaceRoot: nativeExecution.provider.kind === "openai_dot" && resolvedConfig.dotWorkspaceAccess === true ? executionWorkspace.cwd : undefined,
+              // One source: the same material the heartbeat's live redactor
+              // indexed (addRunSecretMaterial in execution configuration).
+              runSecretMaterial: identityRedactor.values,
               runnerEnvironment: {
                 ...configuredEnvironmentProjection(configuredTaskEnvironment, secretKeys ?? []),
                 ...buildNativeProviderEnvironment(
