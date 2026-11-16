@@ -349,7 +349,7 @@ import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers, prepareHeartbeatGitHubEnvironment } from "./heartbeat-github-launchers.js";
-import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, projectConnectionRunSnapshot } from "./project-connection-run-context.js";
 import {
   cleanupGitHubOperationLaunchers,
   startAdapterExecutionTargetPaperclipBridge,
@@ -2254,8 +2254,8 @@ export function heartbeatService(
       }
       const runtime = await timePreparation("runtime_state", () => ensureRuntimeState(agent));
       const context = parseObject(run.contextSnapshot);
-      // Capture before preparation/provider I/O; workspace/wake project hints remain display-only.
-      const projectConnectionContext = await captureProjectConnectionRunContext(db, {
+      // Admission already captured the pair; preparation must never establish a new one.
+      const projectConnectionContext = await readProjectConnectionRunContext(db, {
         companyId: run.companyId, agentId: run.agentId, heartbeatRunId: run.id,
       });
       context.projectConnectionRunContext = { version: 1, issueId: projectConnectionContext.issueId, projectId: projectConnectionContext.projectId };
@@ -3259,7 +3259,7 @@ export function heartbeatService(
       await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: context,
+          contextSnapshot: projectConnectionRunSnapshot(context),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, run.id));
@@ -3387,7 +3387,7 @@ export function heartbeatService(
             startedAt,
             sessionIdBefore:
               runtimeForAdapter.sessionDisplayId ?? runtimeForAdapter.sessionId,
-            contextSnapshot: context,
+            contextSnapshot: projectConnectionRunSnapshot(context),
             updatedAt: new Date(),
           })
           .where(eq(heartbeatRuns.id, run.id))

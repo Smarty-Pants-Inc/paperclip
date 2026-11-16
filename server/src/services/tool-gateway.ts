@@ -53,7 +53,8 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
-import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { assertProjectConnectionAdmission } from "./project-connection-admission.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { GITHUB_APP_MCP_URL } from "./github-app-client.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
@@ -2037,7 +2038,7 @@ export function createToolGatewayService(
         "run_context_mismatch",
       );
     }
-    const bound = await captureProjectConnectionRunContext(db, {
+    const bound = await readProjectConnectionRunContext(db, {
       companyId: input.companyId, agentId: input.agentId, heartbeatRunId: input.runId,
     });
     if (input.projectId && input.projectId !== bound.projectId) {
@@ -3192,7 +3193,7 @@ export function createToolGatewayService(
           {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
-            heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+            heartbeatRunId: session.runId,
             allowStandingDelegation: false,
           },
         );
@@ -3252,7 +3253,7 @@ export function createToolGatewayService(
               {
                 agentId: session.agentId,
                 responsibleUserId: session.responsibleUserId,
-                heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+                heartbeatRunId: session.runId,
                 allowStandingDelegation: false,
                 excludeGrantId: original.id,
               },
@@ -3382,7 +3383,7 @@ export function createToolGatewayService(
     if (!githubIds.size) return tools;
     const selected = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
       agentId: session.agentId, responsibleUserId: session.responsibleUserId, allowStandingDelegation: false,
-      heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+      heartbeatRunId: session.runId,
     });
     return tools.filter(tool => !tool.connectionId || !githubIds.has(tool.connectionId)
       || tool.connectionId === selected.grant?.connectionId);
@@ -4361,16 +4362,22 @@ export function createToolGatewayService(
     grant: typeof connectionGrants.$inferSelect,
     resolveOptions: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
+    if (connection.projectId) {
+      await assertProjectConnectionAdmission(db, { companyId: session.companyId, projectId: connection.projectId,
+        operation: "use", connection, targetAgentIds: session.agentId ? [session.agentId] : [], proposedSecretRefs: grant.credentialSecretRefs });
+      if (!isGitHubAppConnection(connection)) throw new ToolGatewayHttpError(422,
+        "Project-owned provider is unsupported", "project_connection_provider_unsupported");
+    }
     const projectProtected = await projectProtectedSession(session);
     const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
     const runContext = projectProtected && github && session.agentId && session.runId
-      ? await captureProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
+      ? await readProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
     const assertProjectSelection = async () => {
       if (!projectProtected || !github || !session.agentId) return;
       if (runContext) await revalidateProjectConnectionRunContext(db, runContext);
       const selection = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
         agentId: session.agentId, responsibleUserId: session.responsibleUserId,
-        heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+        heartbeatRunId: session.runId,
         explicitGrantId: grant.id, allowStandingDelegation: false,
       });
       if (selection.grant?.id !== grant.id || selection.connection?.id !== connection.id) {
@@ -4916,7 +4923,7 @@ export function createToolGatewayService(
         : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
-            heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+            heartbeatRunId: session.runId,
             allowStandingDelegation: false,
           });
       if (!selected.grant || selected.grant.connectionId !== connection.id) {
