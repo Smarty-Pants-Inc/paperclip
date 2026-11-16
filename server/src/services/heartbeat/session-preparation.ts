@@ -181,6 +181,17 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
       })] : []),
     ])));
   }
+  // #20853 narrowed the fingerprint. A session saved under the earlier shape
+  // is the same configuration when that shape of today's config still matches
+  // it, so the upgrade itself must not reset every saved session.
+  if (taskSession && readConfigFingerprintFromSessionParams(taskSession.sessionParamsJson)?.fingerprint !== sessionConfigMetadata.fingerprint) {
+    compatibleConfigMetadata.push(...await Promise.all([
+      buildEffectiveRunSessionConfigMetadata({ ...sessionConfigMetadataInput, legacyFingerprintShape: true }),
+      ...(importedManagedInstructions ? [buildEffectiveRunSessionConfigMetadata({
+        ...sessionConfigMetadataInput, retainManagedInstructionPaths: true, legacyFingerprintShape: true,
+      })] : []),
+    ]));
+  }
   const configuredModel =
     readConfiguredModelFromAdapterConfig(runtimeConfig);
   if (context.refreshTools === true && agent.adapterType !== "paperclip_runner") {

@@ -312,7 +312,7 @@ export function claudeOAuthClaimRejectedError(): HttpError {
 }
 
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert">;
+type SecretBindingDb = Pick<Db | DbTransaction, "select" | "delete" | "insert" | "update">;
 
 function isUniqueConstraintViolation(error: unknown, constraintName: string) {
   const seen = new Set<unknown>();
@@ -4271,27 +4271,47 @@ export function secretService(db: Db | DbTransaction) {
 
       const pathPrefix = target.pathPrefix ?? "env";
       const writeDeclarations = async (executor: SecretBindingDb) => {
-        if (options?.replaceAll) {
-          await executor
-            .delete(userSecretDeclarations)
-            .where(and(
-              eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
-            ));
-        } else {
-          await executor
-            .delete(userSecretDeclarations)
-            .where(and(
-              eq(userSecretDeclarations.companyId, companyId),
-              eq(userSecretDeclarations.targetType, target.targetType),
-              eq(userSecretDeclarations.targetId, target.targetId),
-              like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
-            ));
+        const owned = options?.replaceAll
+          ? and(
+            eq(userSecretDeclarations.companyId, companyId),
+            eq(userSecretDeclarations.targetType, target.targetType),
+            eq(userSecretDeclarations.targetId, target.targetId),
+          )
+          : and(
+            eq(userSecretDeclarations.companyId, companyId),
+            eq(userSecretDeclarations.targetType, target.targetType),
+            eq(userSecretDeclarations.targetId, target.targetId),
+            like(userSecretDeclarations.configPath, `${pathPrefix}.%`),
+          );
+        // Same upsert rule as company secret bindings (#20852): an unchanged
+        // declaration keeps its id, which run manifests carry as bindingId.
+        const existing = await executor.select().from(userSecretDeclarations).where(owned);
+        const wanted = new Map(normalizedRefs.map((ref) => [ref.configPath, ref]));
+        const kept = existing.filter((row) => wanted.get(row.configPath)?.definitionId === row.userSecretDefinitionId);
+        const keptPaths = new Set(kept.map((row) => row.configPath));
+        const removed = existing.filter((row) => !keptPaths.has(row.configPath)).map((row) => row.id);
+        if (removed.length > 0) {
+          await executor.delete(userSecretDeclarations).where(inArray(userSecretDeclarations.id, removed));
         }
-        if (normalizedRefs.length === 0) return;
+        for (const row of kept) {
+          const ref = wanted.get(row.configPath)!;
+          if (
+            row.envKey === ref.envKey && row.versionSelector === String(ref.versionSelector) && row.required === ref.required
+            && row.allowMissingOverride === ref.allowMissingOverride && row.label === ref.label
+          ) continue;
+          await executor.update(userSecretDeclarations).set({
+            envKey: ref.envKey,
+            versionSelector: String(ref.versionSelector),
+            required: ref.required,
+            allowMissingOverride: ref.allowMissingOverride,
+            label: ref.label,
+            updatedAt: new Date(),
+          }).where(eq(userSecretDeclarations.id, row.id));
+        }
+        const inserts = normalizedRefs.filter((ref) => !keptPaths.has(ref.configPath));
+        if (inserts.length === 0) return;
         await executor.insert(userSecretDeclarations).values(
-          normalizedRefs.map((ref) => ({
+          inserts.map((ref) => ({
             companyId,
             userSecretDefinitionId: ref.definitionId,
             targetType: target.targetType,
@@ -4922,48 +4942,53 @@ export function secretService(db: Db | DbTransaction) {
       }
 
       const pathPrefixes = [...new Set(normalizedRefs.map((ref) => ref.configPath.split(".")[0]))];
+      const targetScope = and(
+        eq(companySecretBindings.companyId, companyId),
+        eq(companySecretBindings.targetType, target.targetType),
+        eq(companySecretBindings.targetId, target.targetId),
+      );
+      // The rows this sync owns: the whole target (replaceAll, or no refs), else
+      // the path prefixes it is writing.
+      const owned = options?.replaceAll || pathPrefixes.length === 0
+        ? targetScope
+        : and(targetScope, or(...pathPrefixes.flatMap((pathPrefix) => [
+          eq(companySecretBindings.configPath, pathPrefix),
+          like(companySecretBindings.configPath, `${pathPrefix}.%`),
+        ])));
 
       await db.transaction(async (tx) => {
-        if (options?.replaceAll) {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
-        } else if (pathPrefixes.length > 0) {
-          for (const pathPrefix of pathPrefixes) {
-            await tx
-              .delete(companySecretBindings)
-              .where(
-                and(
-                  eq(companySecretBindings.companyId, companyId),
-                  eq(companySecretBindings.targetType, target.targetType),
-                  eq(companySecretBindings.targetId, target.targetId),
-                  or(
-                    eq(companySecretBindings.configPath, pathPrefix),
-                    like(companySecretBindings.configPath, `${pathPrefix}.%`),
-                  ),
-                ),
-              );
-          }
-        } else {
-          await tx
-            .delete(companySecretBindings)
-            .where(
-              and(
-                eq(companySecretBindings.companyId, companyId),
-                eq(companySecretBindings.targetType, target.targetType),
-                eq(companySecretBindings.targetId, target.targetId),
-              ),
-            );
+        // Upsert by (target, configPath) instead of delete-all + insert: a ref
+        // that still names the same secret at the same path keeps its binding
+        // id, so a save of an unrelated key does not mint new ids (#20852) and
+        // per-run allowedBindingIds stay valid. A removed path, or a path that
+        // now names another secret, still loses its row (a new id).
+        const existing = await tx.select().from(companySecretBindings).where(owned);
+        const wanted = new Map(normalizedRefs.map((ref) => [ref.configPath, ref]));
+        const kept = existing.filter((row) => wanted.get(row.configPath)?.secretId === row.secretId);
+        const keptPaths = new Set(kept.map((row) => row.configPath));
+        const removed = existing.filter((row) => !keptPaths.has(row.configPath)).map((row) => row.id);
+        if (removed.length > 0) {
+          await tx.delete(companySecretBindings).where(inArray(companySecretBindings.id, removed));
         }
-        if (normalizedRefs.length === 0) return;
+        for (const row of kept) {
+          const ref = wanted.get(row.configPath)!;
+          if (
+            row.versionSelector === String(ref.versionSelector) && row.required === ref.required && row.label === ref.label
+            && row.projectionClass === ref.projectionClass && row.projectionAllowlistKey === ref.projectionAllowlistKey
+          ) continue;
+          await tx.update(companySecretBindings).set({
+            versionSelector: String(ref.versionSelector),
+            required: ref.required,
+            label: ref.label,
+            projectionClass: ref.projectionClass,
+            projectionAllowlistKey: ref.projectionAllowlistKey,
+            updatedAt: new Date(),
+          }).where(eq(companySecretBindings.id, row.id));
+        }
+        const inserts = normalizedRefs.filter((ref) => !keptPaths.has(ref.configPath));
+        if (inserts.length === 0) return;
         await tx.insert(companySecretBindings).values(
-          normalizedRefs.map((ref) => ({
+          inserts.map((ref) => ({
             companyId,
             secretId: ref.secretId,
             targetType: target.targetType,
