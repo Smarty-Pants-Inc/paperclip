@@ -5,6 +5,7 @@ import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
 import type { LifecycleStore } from "../application/ports.js";
+import type { ActivityPublication } from "../../../types/activity-publication.js";
 import { lifecycleRetryDelay } from "../application/retry.js";
 
 export function assertRootDatabase(db: Db) {
@@ -117,7 +118,8 @@ export async function requestAgentLifecycleRecheckInTransaction(
 
 /** The caller owns the accounting transaction and has locked this agent. */
 async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: LifecycleRow,
-  command: LifecycleCommand, options: ChangeOptions = {}, policyHolds?: string[], restartPause = false) {
+  command: LifecycleCommand, options: ChangeOptions = {}, policyHolds?: string[], restartPause = false,
+  publications?: ActivityPublication[]) {
   if (options.version !== undefined && options.version !== agent.lifecycleVersion) return null;
   if (command === "resume" && agent.lifecycleHolds.includes("setup")) throw new AgentLifecycleConflict("Finish agent setup before resuming");
   if (command === "complete" && (!options.owner || !agent.lifecycleOperation?.leaseUntil || agent.lifecycleOperation?.leaseOwner !== options.owner ||
@@ -189,7 +191,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   }
   const status = compatibilityStatus(next, agent.status);
   if(!canConfigureAgentConnection(agent)&&canConfigureAgentConnection({lifecycleState:next,status}))await effects.beforeConnectionEligibilityRestore?.(tx,agent.companyId,agent.id);
-  if (status !== agent.status || next === "terminated") await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status);
+  if (status !== agent.status || next === "terminated") await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status, publications);
   if (isLifecycleWorkPending(next)) await effects.notifyWork(tx);
   const [updated] = await tx.update(agents).set({
     lifecycleHolds: holds, lifecycleState: next, lifecycleVersion: agent.lifecycleVersion + 1, lifecycleError: null,
@@ -239,10 +241,10 @@ export function createLifecycleStore(db: Db, effects: LifecycleEffects): Lifecyc
     async change(id, command, options = {}) {
       const existing = await get(id);
       if (!existing) return null;
-      return effects.transaction(db, existing.companyId, async tx => {
+      return effects.transaction(db, existing.companyId, async (tx, publications) => {
         const [agent] = await tx.select().from(agents).where(eq(agents.id, id)).for("update", command === "reconcile" ? { skipLocked: true } : undefined);
         if (!agent) return null;
-        return changeLockedAgent(tx, effects, agent, command, options);
+        return changeLockedAgent(tx, effects, agent, command, options, undefined, false, publications);
       });
     },
     async claim(id, owner, now) {
