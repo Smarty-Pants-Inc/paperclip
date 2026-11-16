@@ -2647,8 +2647,8 @@ export class PaperclipRunnerToolAuthority {
       }
       await assertCanManageIssueMonitor(access, { actor }, target.companyId, target.assigneeAgentId, true);
       if (target.assigneeAgentId !== this.binding.agentId || target.assigneeUserId ||
-          !["in_progress", "in_review"].includes(target.status)) {
-        throw forbidden("Monitors require an in-progress or in-review task assigned to this agent");
+          !["todo", "in_progress", "in_review", "blocked"].includes(target.status)) {
+        throw forbidden("Monitors require a todo, in-progress, in-review, or blocked task assigned to this agent");
       }
       return { target, actor };
     };

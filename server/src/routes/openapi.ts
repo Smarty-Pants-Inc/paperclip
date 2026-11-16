@@ -11558,7 +11558,7 @@ registerCurrentRoute({
   method: "post",
   path: "/api/issues/{id}/monitor/check-now",
   tags: ["issues"],
-  summary: "Run an issue monitor check now; humans may check blocked tasks",
+  summary: "Run one issue monitor check through execution admission; humans may check retained blocked or todo monitors",
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 

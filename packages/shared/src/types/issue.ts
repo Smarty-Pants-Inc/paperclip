@@ -966,6 +966,8 @@ export interface Issue {
   assigneeAdapterOverrides: IssueAssigneeAdapterOverrides | null;
   executionPolicy?: IssueExecutionPolicy | null;
   executionState?: IssueExecutionState | null;
+  /** Read-only: a retained monitor whose task status pauses automatic checks. */
+  automaticMonitorChecksPaused?: boolean;
   monitorNextCheckAt?: Date | null;
   monitorLastTriggeredAt?: Date | null;
   monitorAttemptCount?: number;

@@ -71,7 +71,7 @@ export const DEFAULT_MAX_REVIEW_ROUNDS = 3;
 const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
-const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
+const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in todo, in_progress, in_review, or blocked";
 const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
 const STAGE_DECISION_COMMENT_HINT = "Include the decision comment in the same PATCH request; prior comments are not considered.";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
@@ -262,8 +262,10 @@ function buildClearedMonitorState(input: {
   };
 }
 
-function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
-  return Boolean(assigneeAgentId) && !assigneeUserId && (status === "in_progress" || status === "in_review");
+function issueCanRetainMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
+  // Retention is not dispatch eligibility. Automatic checks remain limited to
+  // in_progress/in_review in the scheduler; blocked/todo keep their schedule.
+  return Boolean(assigneeAgentId) && !assigneeUserId && ["todo", "in_progress", "in_review", "blocked"].includes(status);
 }
 
 export function monitorClearReasonForIssue(
@@ -273,7 +275,7 @@ export function monitorClearReasonForIssue(
 ): IssueExecutionMonitorClearReason | null {
   if (status === "done") return "done";
   if (status === "cancelled") return "cancelled";
-  if (!issueAllowsMonitor(status, assigneeAgentId, assigneeUserId)) {
+  if (!issueCanRetainMonitor(status, assigneeAgentId, assigneeUserId)) {
     if (assigneeUserId || !assigneeAgentId) return "invalid_assignee";
     return "invalid_status";
   }
@@ -1154,7 +1156,7 @@ export function buildInitialIssueMonitorFields(input: {
   assigneeUserId?: string | null;
 }) {
   if (!input.policy?.monitor) return {};
-  if (!issueAllowsMonitor(input.status, input.assigneeAgentId ?? null, input.assigneeUserId ?? null)) {
+  if (!issueCanRetainMonitor(input.status, input.assigneeAgentId ?? null, input.assigneeUserId ?? null)) {
     throw unprocessable(MONITOR_INVALID_MESSAGE);
   }
   const exhaustedReason = exhaustedMonitorClearReason({
