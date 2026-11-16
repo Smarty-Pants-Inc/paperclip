@@ -1,8 +1,8 @@
 # Agent cryptographic identity
 
 Each agent has one persistent Ed25519 keypair. New agents receive it in the
-agent-creation transaction. Existing agents receive it when Paperclip prepares
-their next managed run. Migration, startup, public API reads, and opening the
+agent-creation transaction, unless created already terminated. Existing agents
+receive it when Paperclip prepares their next managed run. Migration, startup, public API reads, and opening the
 agent page do not provision existing agents. There is no backfill command.
 
 ## Storage
@@ -25,6 +25,18 @@ Decryption and public/private key validation happen before launch. A wrong
 master key, corrupt ciphertext, or mismatched public key fails the run; none
 causes automatic key replacement. Renames, model changes, pauses, resumes, and
 restarts preserve the keypair.
+
+Termination sets `revoked_at` in the same transaction that changes agent status
+and records `agent.identity.revoked` with only `keyId` in its details. It retains
+the public key and encrypted private material; repeated termination does not
+replace the timestamp or emit another revocation. Private-key resolution fails
+with `AgentIdentityRevokedError` before decryption, and a terminated agent cannot
+provision a first key. Revoked keys are never silently reissued.
+
+Revocation does not erase copies of a private key already delivered to a runtime
+or make its signatures cryptographically unverifiable. Relying parties must
+check current revocation state. Customer-success run authority refuses a revoked
+key with `The agent identity key is revoked`, in addition to its active-run checks.
 
 ## Managed runs
 
@@ -76,8 +88,12 @@ define their own authorization, expiry, and revocation rules.
 returns `null` before provisioning, otherwise:
 
 ```ts
-{ algorithm: "Ed25519", keyId: string, publicKeyPem: string, createdAt: string }
+{ algorithm: "Ed25519", keyId: string, publicKeyPem: string, createdAt: string, revokedAt?: string }
 ```
+
+`revokedAt` is an ISO timestamp for a revoked identity and is omitted for an
+unrevoked identity. Public reads never decrypt private material, including after
+termination.
 
 The agent's Identity section shows a shortened fingerprint and copies the full
 public PEM. Before provisioning it shows “Not created yet” and explains that

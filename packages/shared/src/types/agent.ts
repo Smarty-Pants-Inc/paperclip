@@ -445,4 +445,5 @@ export interface AgentPublicIdentity {
   keyId: string;
   publicKeyPem: string;
   createdAt: string;
+  revokedAt?: string;
 }

@@ -26,6 +26,11 @@ export async function customerSuccessRunAuthority(db: Db, bearer: string): Promi
             eq(heartbeatRuns.companyId, claims.company_id),
           ),
         );
+      const identity = agent ? await agentIdentityService(tx as unknown as Db).getPublicIdentity(
+        agent.companyId,
+        agent.id,
+      ) : null;
+      if (identity?.revokedAt) throw forbidden("The agent identity key is revoked");
       if (
         !agent ||
         !supportsManagedAgentIdentity(agent.adapterType, agent.adapterConfig, run?.driverKind) ||
@@ -36,10 +41,6 @@ export async function customerSuccessRunAuthority(db: Db, bearer: string): Promi
         agentRunWritesRevoked(run)
       )
         throw forbidden("The managed run is not active");
-      const identity = await agentIdentityService(tx as unknown as Db).getPublicIdentity(
-        agent.companyId,
-        agent.id,
-      );
       if (!identity) throw forbidden("The agent identity is unprovisioned");
       return {
         version: 1,
