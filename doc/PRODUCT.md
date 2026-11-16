@@ -470,6 +470,20 @@ filters by name, title, or role; **+** starts or reopens a conversation.
 Selecting an agent opens their persistent conversation; it does not reset history
 or create a task until the existing first-write flow requires one.
 
+On an agent's chat page, **Mine | All members** switches between your conversation
+and a paginated list of that agent's shared conversations, with each owner's name
+and last activity. Only active company members who can read the agent may list
+these conversations. Private conversations (including inherited task/project
+privacy) stay out of this list, even for their owner or an instance administrator.
+Opening someone else's conversation is read-only: the composer says who can send,
+owner-only question/decision/handoff projections are not requested, and the
+conversation owner's read markers are untouched. Existing task read permissions
+and all owner-only chat write guards remain in force.
+
+The opt-in API is `GET /companies/:companyId/chats?agentId=<uuid>&members=all`,
+with `limit` (1–100, default 50) and `offset` (default 0). Omitting `members=all`
+retains the existing caller-only result.
+
 Beside a conversation, the side panel opens on the agent's tasks: one card per
 task the agent created, was assigned, commented on, or acted on, newest first,
 with the task list's filters and a sort control. The agent's artifacts are a

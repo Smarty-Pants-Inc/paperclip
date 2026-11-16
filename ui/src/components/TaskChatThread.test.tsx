@@ -6,8 +6,9 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
+const coordinatorState = vi.hoisted(() => ({ enabled: false, loaded: true, userId: "owner-a" }));
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({
-  useCoordinatorWorkspaceEnabled: () => ({ enabled: false, loaded: true }),
+  useCoordinatorWorkspaceEnabled: () => coordinatorState,
 }));
 import { ThemeProvider } from "@/context/ThemeContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -133,6 +134,7 @@ let root: Root | null = null;
 let queryClient: QueryClient;
 
 beforeEach(() => {
+  coordinatorState.enabled = false;
   localStorage.clear();
   transcriptState.transcriptByRun.clear();
   transcriptState.isInitialHydrating = false;
@@ -185,19 +187,23 @@ async function settleThreadLayout() {
   });
 }
 
-it("renders a non-owner conversation read-only without requesting owner-only metadata", async () => {
+it.each(["composer", "metadata"])("keeps a non-owner conversation read-only (%s)", async boundary => {
+  coordinatorState.enabled = true;
   const fetches: string[] = [];
   vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
     const url = String(input); fetches.push(url);
-    return new Response(JSON.stringify(url.includes("pending-questions") ? { questions: [] } : { items: [], nextCursor: null }), { status: 200, headers: { "content-type": "application/json" } });
+    return new Response(JSON.stringify(url.includes("pending-questions") ? [] : { items: [], nextCursor: null }), { status: 200, headers: { "content-type": "application/json" } });
   });
   render(<TaskChatThread issueId="member-chat" conversationMode conversationOwnerId="member-b"
     currentUserId="owner-a" userLabelMap={new Map([["member-b", "Member B"]])}
     comments={[]} onAdd={vi.fn()} />);
   await settleThreadLayout();
-  expect(container.textContent).toContain("Only Member B can send in this conversation.");
-  expect(container.querySelector('[data-testid="mock-editor"]')).toBeNull();
-  expect(fetches.filter(url => /chat-handoffs|pending-questions|decision-receipts/.test(url))).toEqual([]);
+  if (boundary === "composer") {
+    expect(container.textContent).toContain("Only Member B can send in this conversation.");
+    expect(container.querySelector('[data-testid="mock-editor"]')).toBeNull();
+  } else {
+    expect(fetches.filter(url => /chat-handoffs|pending-questions|decision-receipts/.test(url))).toEqual([]);
+  }
 });
 
 describe.each(["legacy", "native"] as const)("historical %s system status", (runtimeMode) => {
