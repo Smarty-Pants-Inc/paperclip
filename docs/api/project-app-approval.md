@@ -100,6 +100,17 @@ receipt unchanged. Ordinary non-receipt writers still see source reservations
 under the existing alias/exclusivity checks. A receipt never consumes another
 project's approval.
 
+Compatibility with the jointly judged 06:40Z N6 ruling / `e057cf786`: if D's
+migration stage names S as `legacyConnectionId`, consumption keeps S LIVE as a
+linked predecessor and records disposition `predecessor` instead of immediately
+archiving it. Its receipt is still spent in the same transaction. A consumed
+predecessor reserves nothing for other writers and cannot receive a second
+approval. Only its own consuming connection may read custody from it. H may
+revoke it while live too, fencing later releases/refresh exactly as for an
+archived source. D owns eventual archival on migration completion or abort;
+no source is deleted. The custody branch's seam compatibility tests do not
+substitute for the integration branch's full D migration/retirement suite.
+
 Only project-owned connections (`projectId` non-null) require this receipt:
 one internal fact-only reader checks the saved source at first bind, finish,
 management/re-scope admission and credential release. Agent, personal, shared
