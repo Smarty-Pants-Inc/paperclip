@@ -148,7 +148,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { withTransactionRetry } from "../services/transaction-retry.js";
-import { AccountingContentionError, isAccountingContentionError, isAccountingRetryable } from "../services/accounting-transaction.js";
+import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError, isAccountingContentionError, isAccountingRetryable } from "../services/accounting-transaction.js";
 import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -1434,6 +1434,17 @@ export function agentRoutes(
         grantedByUserId,
       );
     }), 5);
+  }
+
+  // The lifecycle keeps upstream's AccountingContentionError for all other
+  // callers. Only this hire CREATE boundary names the proven one-attempt
+  // rollback; the post-create GRANT boundary below is distinct (RFL 07:45Z).
+  function namedHireCreateContention(error: unknown): never {
+    if (!(error instanceof AccountingContentionError) || error.attempts !== 1) throw error;
+    const code = "agent_hire_create_contention";
+    throw Object.assign(new HttpError(503, ACCOUNTING_WRITE_CONTENTION_MESSAGE, { code, retryable: true }), {
+      code, retryable: true, attempts: 1, cause: error.cause,
+    });
   }
 
   // #20805's grant retry above stays exactly as it is (five attempts; the grant
@@ -4804,7 +4815,7 @@ export function agentRoutes(
                 : null,
           },
         },
-      );
+      ).catch(namedHireCreateContention);
       const onboardingFirstAgentBundle = await resolveOnboardingFirstAgentBundle({
         onboardingFirstAgent: hireOnboardingFirstAgent,
         actorType: req.actor.type,
@@ -5081,7 +5092,7 @@ export function agentRoutes(
             req.actor.type !== "agent" && createApplyStoredClaudeLogin === true,
         },
       },
-    );
+    ).catch(namedHireCreateContention);
     if (setupId) {
       if (!createdAgent.lifecycleHolds.includes("setup")) {
         if (!(await assertAgentReadAllowed(req, res, createdAgent))) return;
