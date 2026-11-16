@@ -16226,8 +16226,9 @@ export async function readRemoteRunnerStateFile(input: {
     // never parses bytes an earlier failed attempt left behind. The plugin RPC
     // has no cancel: a failed or abandoned transfer's worker may still write
     // after the host's call settled, so its staging path is fenced, not only
-    // removed (native-state-staging.ts). An abandoned transfer keeps its private
-    // directory until the transfer settles.
+    // removed (native-state-staging.ts). An abandoned transfer's result is never
+    // used, so its staging path is fenced when it is abandoned: no state bytes
+    // sit in a live directory across later reads.
     const transferAttempt = async (timeoutMs?: number) => {
       const { staging, targetPath } = createNativeStateStaging();
       let transfer: ReturnType<typeof syncOut>;
@@ -16237,10 +16238,17 @@ export async function readRemoteRunnerStateFile(input: {
         fenceNativeStateStagingQuietly(staging);
         throw transferError;
       }
-      const settleLate = () => {
-        void transfer.then(() => {
-          try { removeNativeStateStaging(staging); } catch { fenceNativeStateStagingQuietly(staging); }
-        }, () => fenceNativeStateStagingQuietly(staging));
+      const abandon = () => {
+        fenceNativeStateStagingQuietly(staging);
+        // Fence again when the transfer settles if the fence did not hold.
+        const refence = () => {
+          try {
+            if (lstatSync(staging, { throwIfNoEntry: false })?.isDirectory()) fenceNativeStateStagingQuietly(staging);
+          } catch (error) {
+            logger.warn({ err: error }, "native session state staging fence check failed");
+          }
+        };
+        void transfer.then(refence, refence);
       };
       try {
         if (timeoutMs === undefined) await transfer;
@@ -16250,7 +16258,7 @@ export async function readRemoteRunnerStateFile(input: {
             new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), timeoutMs); })])
             .finally(() => clearTimeout(timer));
           if (abandoned) {
-            settleLate();
+            abandon();
             return { timedOut: true, bytes: "" };
           }
         }
