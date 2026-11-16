@@ -15,6 +15,7 @@ import { agentRoutes } from "../routes/agents.js";
 import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
 import { createAgentLifecycle as lifecycleWithEffects } from "../modules/agent-lifecycle/index.js";
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
+import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
 import { issueService } from "../services/issues.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -100,6 +101,10 @@ describe("#20389 RFL retirement regressions", () => {
     expect(response.status, response.text).toBe(200);
     expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminating" });
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toMatchObject({ status: "running", finishedAt: null });
+    // A real contender row is required: checkoutRunId has a run foreign key.
+    const managerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: managerRunId, companyId: f.companyId, agentId: f.managerId, status: "running", contextSnapshot: { issueId: f.task.id } });
+    await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo", "in_progress"], managerRunId)).rejects.toMatchObject({ status: 409 });
     // Attempt the competing checkout before inspecting the old exclusion fields.
     await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo", "in_progress"], randomUUID())).rejects.toThrow();
     expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId, status: "in_progress", executionRunId: runId, checkoutRunId: runId });
@@ -114,6 +119,9 @@ describe("#20389 RFL retirement regressions", () => {
     const response = f.terminate("POST").then(value => value);
     try {
       await delivering.promise;
+      const managerRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: managerRunId, companyId: f.companyId, agentId: f.managerId, status: "running", contextSnapshot: { issueId: f.task.id } });
+      await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo", "in_progress"], managerRunId)).rejects.toMatchObject({ status: 409 });
       expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminating" });
       await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo", "in_progress"], randomUUID())).rejects.toThrow();
       expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId, executionRunId: runId, checkoutRunId: runId });
@@ -190,5 +198,134 @@ describe("#20389 RFL retirement regressions", () => {
     expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated" });
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt!.id)))[0]).toEqual(receipt);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(run);
+  }, 60_000);
+
+  it("retirement retains holds and task ownership until durable Stop and cleanup completion", async () => {
+    const f = await seed(), runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.workerId, status: "running", startedAt: new Date() });
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, f.task.id));
+    await db.update(agents).set({ lifecycleHolds: ["budget"], pauseReason: "budget" }).where(eq(agents.id, f.workerId));
+    let cleanupConfirmed = false;
+    const worker = configureAgentLifecycle(db, {
+      requiredPluginIds: async () => [],
+      runHost: async agent => {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        if (agent.lifecycleState === "terminating") return run?.status === "cancelled" && run.finishedAt ? "complete" : "pending";
+        return cleanupConfirmed ? "complete" : "pending";
+      },
+      runPlugin: async () => "complete",
+    });
+    workers.push(worker);
+    const response = await f.terminate("PATCH");
+    expect(response.status, response.text).toBe(200);
+    await worker.process(f.workerId);
+    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminating", lifecycleHolds: ["budget"], pauseReason: "budget" });
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId, checkoutRunId: runId, executionRunId: runId });
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+    await createAgentLifecycle(db).retry(f.workerId);
+    await worker.process(f.workerId);
+    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "cleaning_up", lifecycleHolds: ["budget"], pauseReason: "budget" });
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId });
+    cleanupConfirmed = true;
+    await createAgentLifecycle(db).retry(f.workerId);
+    await worker.process(f.workerId);
+    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated", lifecycleHolds: [], pauseReason: null });
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId, status: "todo", checkoutRunId: null, executionRunId: null });
+    const managerRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: managerRunId, companyId: f.companyId, agentId: f.managerId, status: "running" });
+    await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo"], managerRunId)).resolves.toMatchObject({ executionRunId: managerRunId });
+  }, 60_000);
+
+  it("durable termination completion retries the real checkout lock cycle and commits one transfer", async () => {
+    const f = await seed();
+    const owner = randomUUID();
+    await db.update(agents).set({ status: "terminated", lifecycleState: "cleaning_up", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 1, leaseOwner: owner,
+        leaseUntil: new Date(Date.now() + 120_000).toISOString() } }).where(eq(agents.id, f.workerId));
+    const taskLocked = barrier(), agentLocked = barrier(), runCheckout = barrier(), runTermination = barrier();
+    const effects = createAgentLifecycleEffects(), transaction = effects.transaction;
+    let attempts = 0;
+    effects.transaction = (database, companyId, work) => transaction(database, companyId, async (tx, publications) => {
+      await tx.execute(sql`set local deadlock_timeout = '100ms'`);
+      await tx.execute(sql`set local statement_timeout = '15s'`);
+      await tx.select().from(agents).where(eq(agents.id, f.workerId)).for("update");
+      if (++attempts === 1) { agentLocked.release(); await runTermination.promise; }
+      return work(tx, publications);
+    });
+    const settle = (promise: Promise<unknown>) => promise.then(value => ({ value }), error => ({ error }));
+    const checkout = settle(db.transaction(async transaction => {
+      const tx = transaction as unknown as Db;
+      await tx.execute(sql`set local deadlock_timeout = '10s'`);
+      await tx.execute(sql`set local statement_timeout = '15s'`);
+      await tx.select().from(issues).where(eq(issues.id, f.task.id)).for("update");
+      taskLocked.release(); await runCheckout.promise;
+      await assertAgentInteraction(tx, { companyId: f.companyId, actorAgentId: f.managerId,
+        targetAgentId: f.managerId, issueId: f.task.id, operation: "assign", lock: true });
+      return true;
+    }));
+    await taskLocked.promise;
+    const completion = settle(createLifecycleStore(db, effects).change(f.workerId, "complete", { version: (await f.currentAgent()).lifecycleVersion, owner }));
+    await agentLocked.promise;
+    try {
+      runCheckout.release();
+      await vi.waitFor(async () => {
+        const waiting = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
+          and wait_event_type = 'Lock' and query like '%from "agents"%'`);
+        expect(waiting.length).toBeGreaterThan(0);
+      }, { timeout: 5_000, interval: 10 });
+    } finally { runCheckout.release(); runTermination.release(); }
+    expect(await completion).toMatchObject({ value: { lifecycleState: "terminated" } });
+    expect(await checkout).toEqual({ value: true });
+    expect(attempts).toBe(2);
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId, status: "todo" });
+    const moves = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.task.id), eq(activityLog.action, "issue.reassigned")));
+    expect(moves).toHaveLength(1);
+  }, 60_000);
+
+  it("a rolled-back lifecycle transaction rechecks authorization before retrying PATCH", async () => {
+    const f = await seed();
+    let transactions = 0, authorizations = 0;
+    const wrappedDb = new Proxy(db, { get(target, key, receiver) {
+      if (key === "transaction") return ((work, options) => target.transaction(async tx => {
+        const value = await work(tx);
+        if (++transactions === 1) throw Object.assign(new Error("forced transaction rollback"), { code: "40P01" });
+        return value;
+      }, options)) as Db["transaction"];
+      return Reflect.get(target, key, receiver);
+    } });
+    const before = await f.currentAgent();
+    const lifecycle = createAgentLifecycle(wrappedDb, {}, async tx => {
+      if ((tx as unknown as { nestedIndex: number }).nestedIndex > 0) return;
+      if (++authorizations > 1) throw new Error("scope revoked before retry");
+    });
+    await expect(lifecycle.updateAndTransition(f.workerId, "terminate", { title: "Must roll back" })).rejects.toThrow("scope revoked before retry");
+    expect(authorizations).toBe(2);
+    expect(transactions).toBe(1);
+    expect(await f.currentAgent()).toEqual(before);
+    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId });
+  }, 60_000);
+
+  it("ordinary assignment preserves all finished human receipts while cancelling pending direction", async () => {
+    const f = await seed(), finishedAt = new Date("2026-11-01T12:00:00.000Z"), runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.workerId, status: "succeeded", finishedAt });
+    const finished = await db.insert(agentWakeupRequests).values(
+      ["completed", "failed", "cancelled", "skipped", "timed_out", "coalesced"].map(status => ({
+        companyId: f.companyId, agentId: f.workerId, source: "on_demand", status, runId, finishedAt,
+        requestedByActorType: "user", requestedByActorId: f.userId, payload: { issueId: f.task.id },
+      })),
+    ).returning();
+    const pending = await db.insert(agentWakeupRequests).values(
+      ["queued", "claimed", "deferred_issue_execution"].map(status => ({
+        companyId: f.companyId, agentId: f.workerId, source: "on_demand", status,
+        requestedByActorType: "user", requestedByActorId: f.userId, payload: { issueId: f.task.id },
+      })),
+    ).returning();
+    await issueService(db).update(f.task.id, { assigneeAgentId: f.managerId, assigneeUserId: null });
+    for (const receipt of finished) {
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0]).toEqual(receipt);
+    }
+    for (const receipt of pending) {
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id)))[0]).toMatchObject({ status: "cancelled", finishedAt: expect.any(Date) });
+    }
   }, 60_000);
 });
