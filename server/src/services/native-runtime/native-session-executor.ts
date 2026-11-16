@@ -8103,7 +8103,10 @@ export function resolveNativeHarnessPersistenceProfile(
             location: "filesystem",
             // Pi sessions are durable; credentials and launch configuration
             // must be re-materialized, not restored into another sandbox.
-            excludeEntries: ["auth.json", "auth.json.lock", "models.json", "settings.json"],
+            // npm and the company-skill links are absolute-target symlinks the
+            // driver re-creates at every open (linkPiNpmInstall,
+            // syncPiCompanySkills); a checkpoint must not carry them out.
+            excludeEntries: ["auth.json", "auth.json.lock", "models.json", "settings.json", "npm", "skills/paperclip-company-skills"],
           }
       : execution.provider.kind === "opencode"
         ? {
