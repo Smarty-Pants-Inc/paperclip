@@ -18,7 +18,7 @@ import { isPaperclipCloudConnectorStrategy, type PaperclipCloudConnector } from 
 import { deriveVercelConnectSubject, vercelConnectCallbackUrl, VercelConnectClientError, type VercelConnectClient } from "../../vercel-connect.js";
 
 import type { ConnectionSetupPolicy } from "../connections/setup-policy.js";
-import { assertSupportedConnection } from "../connections/setup-policy.js";
+import { assertProjectConnectionOAuthUnsupported, assertSupportedConnection } from "../connections/setup-policy.js";
 
 import { actorBinding } from "../actor.js";
 import { assertOAuthRedirectConstraints, randomOauthToken, base64UrlSha256 } from "./authorization-constraints.js";
@@ -56,6 +56,7 @@ export function createOAuthAuthorizationStart(db: Db, dependencies: Dependencies
   ): Promise<ToolOAuthStartResult> {
     await input.actor.managementContext?.reauthorize();
     let connection = await getConnectionRow(connectionId, companyId);
+    assertProjectConnectionOAuthUnsupported(connection);
     assertSupportedConnection(connection);
     await assertConnectorConnectionSetupEnabled(connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");

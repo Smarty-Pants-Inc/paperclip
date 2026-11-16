@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { assertProjectConnectionAdmission } from "../services/project-connection-admission.js";
+import { conflict } from "../errors.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { activityLog, agents, companyMemberships, companySecrets, connectionGrants, createDb, projects, toolConnectionInstalls, toolConnections, toolOauthStates, toolProfileBindings, toolProfiles, userCompanyPreferences } from "@paperclipai/db";
@@ -354,7 +355,7 @@ describe("project connection writer admission (round-4 B)", () => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
     composeFinish(f);
-    vi.mocked(retirement.assertProjectConnectionNotInUse).mockRejectedValue(Object.assign(new Error("synthetic running work"), { status: 409, details: { code: "project_connection_in_use" } }));
+    vi.mocked(retirement.assertProjectConnectionNotInUse).mockRejectedValue(conflict("synthetic running work", { code: "project_connection_in_use" }));
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
     expect(response.status).toBe(409);
     expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());

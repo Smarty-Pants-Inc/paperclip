@@ -5,13 +5,22 @@ import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { toolApplications, toolConnections } from "@paperclipai/db";
 import { getConnectableAppDefinition } from "@paperclipai/shared";
-import { forbidden, unprocessable } from "../../../errors.js";
+import { conflict, forbidden, unprocessable } from "../../../errors.js";
 import { isRetiredComposioConnection, RETIRED_COMPOSIO_MESSAGE } from "@paperclipai/shared";
 
 export function assertSupportedConnection(connection: typeof toolConnections.$inferSelect) {
   if (isRetiredComposioConnection(connection)) {
     throw unprocessable(RETIRED_COMPOSIO_MESSAGE, { code: "composio_broker_retired" });
   }
+}
+
+/** Project ownership in this seam is GitHub App TOOL only. Browser OAuth
+ * continuations cannot replace its approved reference or revive its history,
+ * even when an old authorization state predates the ownership guard. */
+export function assertProjectConnectionOAuthUnsupported(connection: Pick<typeof toolConnections.$inferSelect, "projectId" | "status">) {
+  if (connection.projectId == null) return;
+  if (connection.status === "archived") throw conflict("This project's connection was retired. Create a new approved project connection.", { code: "project_connection_archived" });
+  throw unprocessable("Project-owned GitHub Apps cannot be changed through browser sign-in. Use the saved approved App candidate.", { code: "project_connection_provider_unsupported" });
 }
 
 export function connectionSetupApp(applicationKey: unknown, sourceTemplateKey: unknown) {
