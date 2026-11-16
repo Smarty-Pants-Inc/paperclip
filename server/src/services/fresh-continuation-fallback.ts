@@ -30,7 +30,8 @@ import { freshContinuationChain } from "./fresh-continuation-chain.js";
 export { freshContinuationChain } from "./fresh-continuation-chain.js";
 import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
-import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
+import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode,
+  nativeStartupNeverConnectedExhausted } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
 
 export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPersonOwnedFailureCode, isRecoveryRun } from "./continuation-cause.js";
@@ -694,6 +695,12 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // (b) Causes that are the person's.
   if (isPersonOwnedFailureCode(run.errorCode) || (run.errorCode && !continuationCauseIsSystemOwned(run)))
     return { kind: "person_owned", reason: run.errorCode! };
+  // A first start whose Runner never connected had no provider thread to
+  // restore and no saved work: its bounded retries are spent and the person
+  // retries the task (the executor posted that note). A fresh continuation
+  // would narrate a restore that never happened (rf4).
+  if (nativeStartupNeverConnectedExhausted(coordinator))
+    return { kind: "person_owned", reason: "runner_ingress_startup_failed" };
   // A Stop a person (or an agent acting on the task) asked for is never undone.
   const cancellation = readRunCancellation(run.resultJson);
   if ((cancellation && ["user", "agent"].includes(cancellation.initiator.type))
