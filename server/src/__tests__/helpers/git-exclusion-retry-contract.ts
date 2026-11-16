@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as execution from "@paperclipai/adapter-utils/execution-target";
 import * as ssh from "@paperclipai/adapter-utils/ssh";
 import { logger } from "../../middleware/logger.js";
+import { AgentInstructionGitExclusionError } from "../../services/agent-instruction-git-exclusion.js";
 
 // Keep: the recorded sandbox-exec timeout incident and the unsafe-path trust
 // boundary. Exercise each real prepare entry point, not only a retry helper.
@@ -28,13 +29,15 @@ export function gitExclusionRetryContract(
     });
     afterEach(async () => { vi.restoreAllMocks(); await cleanup(); });
 
-    function stub(results: Array<typeof success>) {
+    function stub(results: Array<typeof success | Error>) {
       let calls = 0;
       const shell = vi.spyOn(execution, "runAdapterExecutionTargetShellCommand").mockImplementation(async (_runId, _target, command) => {
         // Directory observation is a separate command after successful staging;
         // it is not a third exclusion attempt.
         if (!command.includes("Unsafe runtime exclusion directory")) return success;
-        return results[Math.min(calls++, results.length - 1)]!;
+        const result = results[Math.min(calls++, results.length - 1)]!;
+        if (result instanceof Error) throw result;
+        return result;
       });
       return { shell, count: () => calls, exclusionCalls: () => shell.mock.calls.filter(([, , command]) => command.includes("Unsafe runtime exclusion directory")) };
     }
@@ -61,6 +64,71 @@ export function gitExclusionRetryContract(
       expect(exec.count()).toBe(2);
       expect(warnings).toHaveBeenCalledWith(expect.objectContaining({ stderrClass, willRetry: true }), expect.any(String));
       expect(JSON.stringify(warnings.mock.calls)).not.toContain(secret);
+    });
+
+    it.each([false, true])("a rejected transient provider execution receives the same one-retry contract (rejectTwice=%s)", async rejectTwice => {
+      const runId = randomUUID(), target = remote();
+      const rejection = Object.assign(new Error("ETIMEDOUT during provider execution"), { code: "ETIMEDOUT" });
+      const exec = stub([rejection, rejectTwice ? rejection : success]);
+      const warnings = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      let failures = 0;
+      const result = await prepare(runId, target).catch(error => { failures++; return error; });
+      expect(exec.count()).toBe(2);
+      expect(warnings).toHaveBeenCalledTimes(rejectTwice ? 2 : 1);
+      const attempt = { timedOut: false, exitCode: null, signal: null, durationMs: expect.any(Number), stderrClass: "transport" };
+      expect(warnings).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        runId, reason: "AGENT_INSTRUCTION_GIT_EXCLUSION_FAILED", ...attempt, attempts: [attempt], willRetry: true,
+      }), expect.any(String));
+      if (rejectTwice) {
+        expect(failures).toBe(1);
+        expect(result).toBeInstanceOf(AgentInstructionGitExclusionError);
+        if (!(result instanceof AgentInstructionGitExclusionError)) throw new Error("Expected normalized exclusion failure");
+        expect(result).toMatchObject({ runId, ...attempt, attempts: [attempt, attempt] });
+        for (const diagnostic of result.attempts) {
+          expect(Number.isFinite(diagnostic.durationMs)).toBe(true);
+          expect(diagnostic.durationMs).toBeGreaterThanOrEqual(0);
+        }
+        expect(warnings).toHaveBeenLastCalledWith(expect.objectContaining({
+          runId, ...attempt, attempts: result.attempts, willRetry: false,
+        }), expect.any(String));
+      } else {
+        expect(failures).toBe(0);
+        expect(result).toMatchObject({ state: "prepared" });
+        const diagnostic = warnings.mock.calls[0]![0] as { durationMs: number };
+        expect(Number.isFinite(diagnostic.durationMs)).toBe(true);
+        expect(diagnostic.durationMs).toBeGreaterThanOrEqual(0);
+      }
+      for (const [id, actualTarget, , options] of exec.exclusionCalls()) {
+        expect(id).toBe(runId);
+        expect(actualTarget).toBe(target);
+        expect(options).toMatchObject({ timeoutSec: 15, cwd: target.remoteCwd, env: {} });
+      }
+    });
+
+    it("a rejected provider error cannot expose provider secret text instead of safe diagnostics", async () => {
+      const runId = randomUUID();
+      // Even an unsafe-looking provider message is transport failure, not an
+      // unsafe-path verdict from the exclusion program. Never retain its cause.
+      const rejection = Object.assign(new Error(`unsafe ${secret}`, { cause: new Error(secret) }), {
+        code: "ETIMEDOUT", providerDetail: secret,
+      });
+      const exec = stub([rejection, rejection]);
+      const warnings = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const error = await prepare(runId, remote()).catch(error => error);
+      expect(String(error)).not.toContain(secret);
+      if (!(error instanceof Error)) throw new Error("Expected an exclusion failure");
+      expect(error.message).not.toContain(secret);
+      expect(JSON.stringify(error)).not.toContain(secret);
+      expect(JSON.stringify(warnings.mock.calls)).not.toContain(secret);
+      expect(error).toBeInstanceOf(AgentInstructionGitExclusionError);
+      if (!(error instanceof AgentInstructionGitExclusionError)) throw new Error("Expected normalized exclusion failure");
+      expect(error.cause).toBeUndefined();
+      expect(error).not.toHaveProperty("providerDetail");
+      expect(exec.count()).toBe(2);
+      expect(error.attempts).toHaveLength(2);
+      expect(warnings).toHaveBeenCalledTimes(2);
+      expect(warnings).toHaveBeenNthCalledWith(1, expect.objectContaining({ runId, stderrClass: "transport", willRetry: true }), expect.any(String));
+      expect(warnings).toHaveBeenLastCalledWith(expect.objectContaining({ runId, stderrClass: "transport", willRetry: false }), expect.any(String));
     });
 
     it.each([false, true])("never retries an unsafe exclusion (timedOut=%s)", async timedOut => {
