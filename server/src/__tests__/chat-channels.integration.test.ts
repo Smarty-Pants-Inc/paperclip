@@ -74,6 +74,7 @@ import { toolActionRequests, toolInvocations, toolPolicies } from "@paperclipai/
 import { GitHubPublicationLeaseLost, withGitHubPublicationLease } from "../services/chat-github-publication-lease.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { githubChatWizardService } from "../services/chat-github-wizard.js";
 import { dispatchGitHubBotCloudEvent, registerGitHubBotCloudSetupPoller } from "../services/chat-github-cloud-ingress.js";
 import { githubChatManagementService } from "../services/chat-github-management.js";
@@ -7800,7 +7801,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await f.enqueue();
       let clock = Date.now();
       const now = vi.spyOn(Date, "now").mockImplementation(() => clock);
-      onTestFinished(() => now.mockRestore());
+      onTestFinished(async () => {
+        try { await flushSecretResolutionWrites(db); }
+        finally { now.mockRestore(); }
+      });
       const queries: string[] = [];
       const unsafe = db.$client.unsafe;
       db.$client.unsafe = ((query: string, ...rest: unknown[]) => {
