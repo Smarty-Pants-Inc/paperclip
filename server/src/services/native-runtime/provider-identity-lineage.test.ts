@@ -235,3 +235,62 @@ describe("recordedProviderIdentityTransitionIsAllowed", () => {
     expect(fixture.stored()).toEqual([]);
   });
 });
+
+// #20853 PART 2 (ii): the ONE person-visible line, keyed on the provider
+// identity ACTUALLY changing (a new record), never on configFreshness.reset.
+describe("the person-visible line for a recorded provider-identity step (#20853 PART 2, K6)", () => {
+  it("announces a newly recorded step exactly once; a retried read of the same step says nothing again", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    const announced: Array<Record<string, unknown>> = [];
+    const onRecorded = (written: Record<string, unknown>) => { announced.push(written); };
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, onRecorded,
+      previous: identity("01a1e203"), current: identity("01a1e2e9") } as never)).resolves.toBe(true);
+    expect(announced).toEqual([expect.objectContaining({ generation: 1, previousIdentity: identity("01a1e203"),
+      identity: identity("01a1e2e9"), reason: "resume_failed_on_new_box" })]);
+    // A retried capture of the same state: allowed by the durable record, no second line.
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, onRecorded,
+      previous: identity("01a1e203"), current: identity("01a1e2e9") } as never)).resolves.toBe(true);
+    // A retried append of the same step (idempotent) is not a new record either.
+    await appendProviderIdentityReset(fixture.db, { scope, previousIdentity: identity("01a1e203"), identity: identity("01a1e2e9"),
+      reason: "resume_failed_on_new_box", runId: null, onRecorded } as never);
+    expect(announced).toHaveLength(1);
+    expect(fixture.stored()).toHaveLength(1);
+  });
+
+  it("(K6) a restore that kept the same identity records nothing and says nothing, even with a pending break", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    const announced: unknown[] = [];
+    await noteProviderIdentityBreak(fixture.db, scope, "config_changed", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, onRecorded: (r: unknown) => { announced.push(r); },
+      previous: identity("01a1e203"), current: { ...identity("01a1e203") } } as never)).resolves.toBe(false);
+    expect(announced).toEqual([]);
+    expect(fixture.stored()).toEqual([]);
+  });
+
+  it("a failing announcement never turns a durable record into a refusal", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope,
+      onRecorded: async () => { throw new Error("run log closed"); },
+      previous: identity("01a1e203"), current: identity("01a1e2e9") } as never)).resolves.toBe(true);
+    expect(fixture.stored()).toHaveLength(1);
+  });
+
+  it("says which step happened and whether the chat history was carried", async () => {
+    const notice = await import("./provider-identity-reset-notice.js").catch(() => null);
+    expect(notice).not.toBeNull();
+    const line = notice!.providerIdentityResetLine;
+    expect(line({ reason: "resume_failed_on_new_box" }, { carriedHistory: true })).toBe("[paperclip] The agent restarted its session "
+      + "because its earlier session could not be resumed on a new machine. This chat's earlier messages were given to the new session as history.\n");
+    expect(line({ reason: "config_changed" }, { carriedHistory: false })).toBe("[paperclip] The agent restarted its session "
+      + "because its settings changed. The new session does not have this chat's earlier context.\n");
+    expect(line({ reason: "forced_fresh_session" }, { carriedHistory: false })).toContain("because a fresh session was requested.");
+    // Unknown (e.g. recorded after a restart): no claim either way.
+    expect(line({ reason: "resume_failed_on_new_box" }, { carriedHistory: null })).toBe("[paperclip] The agent restarted its session "
+      + "because its earlier session could not be resumed on a new machine.\n");
+  });
+});
