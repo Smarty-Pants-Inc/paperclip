@@ -6,7 +6,7 @@ import { collectAgentAdapterWorkspaceCommandPaths } from "../routes/workspace-co
 import type { AuthorizationActor } from "./authorization.js";
 import { agentService } from "./agents.js";
 import { assertReportEnvSecretAccess, isReportRuntimeEnv } from "./agent-report-runtime.js";
-import { subordinatePermissionScope } from "./agent-subtree-management.js";
+import { authorizeAgentPermissionGrant } from "./agent-permission-grants.js";
 
 export const KNOWN_INSTRUCTIONS_BUNDLE_KEYS = [
   "instructionsBundleMode", "instructionsRootPath", "instructionsEntryFile", "instructionsFilePath", "agentsMdPath",
@@ -90,13 +90,12 @@ type Proposal = { adapterType?: string | null; adapterConfig?: Record<string, un
 export async function assertAgentActorPermissionGrants(
   db: Db, actor: AuthorizationActor, companyId: string, grants: Grant[], targetAgentId?: string,
 ) {
-  if (actor.type !== "agent") return;
   for (const grant of grants) {
     try {
-      if (!grant.scope) throw forbidden("Agents cannot delegate an unscoped permission");
-      if (targetAgentId) await subordinatePermissionScope(db, actor, { id: targetAgentId, companyId }, grant.permissionKey, grant.scope);
+      if (actor.type === "agent" && !grant.scope) throw forbidden("Agents cannot delegate an unscoped permission");
+      if (targetAgentId) await authorizeAgentPermissionGrant(db, actor, { id: targetAgentId, companyId }, grant.permissionKey, true, grant.scope);
     } catch (error) {
-      if (!(error instanceof HttpError) || error.status !== 403) throw error;
+      if (actor.type !== "agent" || !(error instanceof HttpError) || error.status !== 403) throw error;
       throw unprocessable(`Cannot import permission grant ${grant.permissionKey}: ${error.message}`);
     }
   }

@@ -5509,6 +5509,17 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         !(agent.role === "ceo" && grant.permissionKey === "agents:create" && ceoHiringDenial(manifestAgent.permissions)));
     const mode = resolveImportMode(options);
     const plan = await buildPreview(input, options, attribution.source);
+    // Board authority is company-scoped and needs no destination agent row.
+    // Refuse before activation defaults or any other package writes; the final
+    // replay repeats the shared PATCH gate against resolved destination IDs.
+    if (actor.type === "board" && input.target.mode === "existing_company" && plan.include.agents) {
+      for (const entry of plan.preview.plan.agentPlans) {
+        if (entry.action === "skip") continue;
+        const agent = plan.selectedAgents.find(agent => agent.slug === entry.slug);
+        if (agent) await assertAgentActorPermissionGrants(db, actor, input.target.companyId,
+          importedGrants(agent, agent), entry.existingAgentId ?? agent.slug);
+      }
+    }
     if (plan.preview.errors.length > 0) {
       throw unprocessable(`Import preview has errors: ${plan.preview.errors.join("; ")}`);
     }

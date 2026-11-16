@@ -2,13 +2,12 @@ import { Router } from "express";
 import { agents, companyMemberships, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { updateAgentPermissionGrantSchema, isUuidLike } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
-import { badRequest, conflict, forbidden, notFound } from "../errors.js";
+import { badRequest, conflict, notFound } from "../errors.js";
 import { validate } from "../middleware/validate.js";
-import { accessService } from "../services/access.js";
 import { logActivity } from "../services/activity-log.js";
 import { withAccountingTransaction } from "../services/accounting-transaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { assertCanManageSubordinateAgent, subordinatePermissionScope } from "../services/agent-subtree-management.js";
+import { authorizeAgentPermissionGrant } from "../services/agent-permission-grants.js";
 
 export function agentPermissionGrantRoutes(db: Db) {
   const router = Router();
@@ -29,26 +28,7 @@ export function agentPermissionGrantRoutes(db: Db) {
       if (!agent || !hasCompanyAccess(req, agent.companyId)) throw notFound("Agent not found");
       assertCompanyAccess(req, agent.companyId);
       const txDb = tx as unknown as Db;
-      const access = accessService(txDb);
-      let effectiveScope = scope;
-      if (req.actor.type === "agent") {
-        await assertCanManageSubordinateAgent(txDb, req.actor, agent);
-        if (enabled) {
-          if (scope === undefined) {
-            const [existingGrant] = await tx.select().from(principalPermissionGrants).where(and(
-              eq(principalPermissionGrants.companyId, agent.companyId),
-              eq(principalPermissionGrants.principalType, "agent"),
-              eq(principalPermissionGrants.principalId, agent.id),
-              eq(principalPermissionGrants.permissionKey, permissionKey),
-            ));
-            effectiveScope = existingGrant?.scope;
-          }
-          effectiveScope = await subordinatePermissionScope(txDb, req.actor, agent, permissionKey, effectiveScope);
-        }
-      } else if (req.actor.source !== "local_implicit"
-        && !await access.canUser(agent.companyId, req.actor.userId, "users:manage_permissions")) {
-        throw forbidden("Missing permission: users:manage_permissions");
-      }
+      const effectiveScope = await authorizeAgentPermissionGrant(txDb, req.actor, agent, permissionKey, enabled, scope);
       const scopeUpdate = effectiveScope === undefined ? {} : { scope: effectiveScope };
       if (enabled) {
         if (agent.status === "pending_approval" || agent.status === "terminated") {
