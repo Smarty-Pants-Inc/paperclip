@@ -20599,19 +20599,6 @@ async function createRunnerdBackendWithinSessionClaim(
           ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
               workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
           : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
-        // J3-22 member (a): host preparation refused the backup while
-        // recovering the saved session (SMA-60: session.checkpoint.restore
-        // tried and refused). Only an idle rebound checkpoint is taken (see
-        // takeRestoreUnavailableFreshThread); the run continues on a fresh
-        // provider thread of this conversation.
-        if (!result.recovered && !result.session
-          && await takeRestoreUnavailableFreshThread(result.recoveryRefusalCode, snapshot)) {
-          const fresh = wrapManagedSession(await backend.openSession({ identity: snapshot.identity,
-            workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }));
-          await recordRestoreUnavailableFreshThread();
-          await recordAdmittedProviderPack(fresh, snapshot.identity, false);
-          return { recovered: true, session: fresh };
-        }
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();
