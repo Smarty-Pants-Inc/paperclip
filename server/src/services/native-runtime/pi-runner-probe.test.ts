@@ -51,7 +51,7 @@ vi.mock("./native-session-executor.js", async original => {
 
 import { QUALIFIED_PI_RPC_PROFILE } from "../../vendor/paperclip-runner/index.js";
 import { parseProbeStaticManifest, probeStaticExclusions, probeManagedNativePiRunner } from "./pi-runner-probe.js";
-import { syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
+import { resolveNativeHarnessPersistenceProfile, syncRemoteRunnerDirectoryOut } from "./native-session-executor.js";
 
 type Request = Parameters<CommandManagedRuntimeRunner["execute"]>[0];
 const roots: string[] = [];
@@ -498,6 +498,42 @@ describe("native Pi probe agent-home cleanup boundary", () => {
       await expect(lstat(join(dirname(observation.remoteRoot), `${basename(observation.remoteRoot)}-pi-agent`)))
         .rejects.toMatchObject({ code: "ENOENT" });
     }
+  });
+});
+
+
+describe("Pi persistence profile checkpoint run-path symlinks", () => {
+  it("refuses the profile's pi-agent tree when npm and a company skill point outside it", async () => {
+    const f = await fixture("matching");
+    const filesystemRoot = join(f.root, "run-filesystem");
+    const piAgent = join(filesystemRoot, "pi-agent");
+    const externalNpm = join(f.root, "outside-npm");
+    const externalSkill = join(f.root, "outside-company-skill");
+    await mkdir(piAgent, { recursive: true });
+    await mkdir(externalNpm, { recursive: true });
+    await mkdir(externalSkill, { recursive: true });
+    await writeFile(join(externalNpm, "package.json"), "{}\n");
+    await writeFile(join(externalSkill, "SKILL.md"), "company skill\n");
+    await symlink(externalNpm, join(piAgent, "npm"));
+    await mkdir(join(piAgent, "skills"), { recursive: true });
+    await symlink(externalSkill, join(piAgent, "skills", "company-skill"));
+    const execution = {
+      provider: { kind: "pi_rpc", model: "neutral/model", piRpcThinkingLevel: "high" },
+      binding: { companyId: "company", agentId: "agent", issueId: "issue", runId: "run", executionWorkspaceId: "workspace" },
+      workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+      session: { normalizedSessionId: "native-pi-session", driverKind: "pi_rpc", protocolVersion: 1,
+        lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+    } as never;
+    const piAgentDirectory = resolveNativeHarnessPersistenceProfile(execution).directories.find(directory => directory.name === "pi-agent")!;
+    expect(piAgentDirectory.excludeEntries).toEqual(["auth.json", "auth.json.lock", "models.json", "settings.json"]);
+    let observedError = "";
+    try {
+      await syncRemoteRunnerDirectoryOut({ runner: f.runner, sourcePath: piAgent, targetPath: join(f.root, "checkpoint", "pi-agent"),
+        mode: 0o700, excludeEntries: piAgentDirectory.excludeEntries });
+    } catch (error) {
+      observedError = error instanceof Error ? error.message : String(error);
+    }
+    expect(observedError).toBe("runner_remote_checkpoint_archive_unsafe_entry");
   });
 });
 
