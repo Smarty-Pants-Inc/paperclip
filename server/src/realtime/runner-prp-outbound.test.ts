@@ -1026,6 +1026,28 @@ describe("runner provider-ingress WebSocket wire", () => {
     } finally { await harness.handle.close(); harness.restore(); }
   });
 
+  it("records one timed PRP request for a dispatched credential response", async () => {
+    const recordRequest = vi.fn(async (_record: { frame: unknown; response: { status: number }; durationMs: number }) => undefined);
+    const handleRequest = vi.fn(async (frame: { requestId: string }) => ({
+      requestId: frame.requestId, status: 200, headers: { "content-type": "application/json" }, bodyBase64: "e30=",
+    }));
+    const harness = await startGithubAccessIngressHarness({
+      getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" }),
+      handleRequest, recordRequest,
+    });
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: "dispatched-credential-request", method: "POST",
+        path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=",
+      })), false);
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      expect(JSON.parse(harness.socket.send.mock.calls[0]![0] as string)).toMatchObject({ status: 200 });
+      expect(handleRequest).toHaveBeenCalledOnce();
+      expect(recordRequest).toHaveBeenCalledOnce();
+      expect(recordRequest.mock.calls[0]![0]).toMatchObject({ response: { status: 200 }, durationMs: expect.any(Number) });
+    } finally { await harness.handle.close(); harness.restore(); }
+  });
+
   it("records one timed request for an outer PRP refusal before credential dispatch", async () => {
     const recordRequest = vi.fn(async (_record: { frame: unknown; status: number; durationMs: number }) => undefined);
     const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
