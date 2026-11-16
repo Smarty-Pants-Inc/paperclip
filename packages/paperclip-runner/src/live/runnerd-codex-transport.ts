@@ -9714,8 +9714,13 @@ export const createRunnerdCodexTransport =
 
 const retainedNativeProbeCleanups = new Set<{ run: () => Promise<void> }>();
 
-function probeCleanupBudget(timeoutMs = 10_000): number {
-  return Number.isFinite(timeoutMs) && timeoutMs > 0 ? Math.min(timeoutMs, 10_000) : 10_000;
+// Native setup probes must still prove physical retirement (and #20417 trace
+// custody) before cleanup completes; a slow retirement waits longer instead of
+// failing the setup check.
+export const NATIVE_PROBE_CLEANUP_BUDGET_MS = 60_000;
+function probeCleanupBudget(timeoutMs = NATIVE_PROBE_CLEANUP_BUDGET_MS): number {
+  return Number.isFinite(timeoutMs) && timeoutMs > 0
+    ? Math.min(timeoutMs, NATIVE_PROBE_CLEANUP_BUDGET_MS) : NATIVE_PROBE_CLEANUP_BUDGET_MS;
 }
 async function awaitProbeCleanup<T>(pending: Promise<T>, deadline: number, detail: string): Promise<T> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
