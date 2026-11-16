@@ -84,8 +84,8 @@ import { environmentService, KEPT_SANDBOX_LEASE_POLICIES } from "./environments.
 import { instanceSettingsService } from "./instance-settings.js";
 import { hasSandboxSnapshotQualification, qualifiedSandboxSnapshotId, usesManagedCloudSandboxImage, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
-import { loadNativeHarnessBackupLeaseChain, nativeHarnessBackupHasLaterProviderWork,
-  newestNativeHarnessBackupStampOnChain } from "./native-runtime/native-retired-backup-source.js";
+import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
+  nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain } from "./native-runtime/native-retired-backup-source.js";
 import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
 import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
@@ -1748,16 +1748,23 @@ function createSandboxEnvironmentDriver(
    * turn may have resumed the same allocation as a new row; restore already
    * reads the newest stamp across that verified chain
    * (`native-retired-backup-source`), so custody reads the same stamp. A stamp
-   * that provider work recorded after it outdates never proves custody. Rows
-   * that do not form one verified chain ending at this lease keep the
-   * single-row rule.
+   * that provider work recorded after it outdates never proves custody. The
+   * stamp must be for the session this lease's own run served: the reuse scope
+   * has no session, so an older row's stamp can belong to another session.
+   * Rows that do not form one verified chain ending at this lease give no
+   * custody (the restore proof would refuse them), unless this lease is the
+   * allocation's only row: then it is its own one-row chain.
    */
   async function obsoleteLeaseCustodyStamp(lease: EnvironmentLease): Promise<unknown> {
-    const chain = lease.providerLeaseId
-      ? await loadNativeHarnessBackupLeaseChain(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId })
-      : null;
-    if (!chain || chain.tip.id !== lease.id) return lease.metadata?.nativeHarnessBackup;
-    const stamp = newestNativeHarnessBackupStampOnChain(chain);
+    if (!lease.providerLeaseId) return null;
+    const allocation = { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId };
+    let chain = await loadNativeHarnessBackupLeaseChain(db, allocation);
+    if (!chain || chain.tip.id !== lease.id) {
+      const rows = await loadNativeHarnessBackupLeaseRows(db, allocation);
+      if (rows.length !== 1 || rows[0]!.id !== lease.id) return null;
+      chain = { tip: rows[0]!, predecessors: [] };
+    }
+    const stamp = newestNativeHarnessBackupStampOnChain(chain, await nativeSessionOfLeaseRun(db, chain.tip));
     if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
       normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
     return stamp;
