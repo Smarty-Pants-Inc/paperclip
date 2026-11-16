@@ -299,10 +299,3 @@ export function assertProjectConnectionPatch(connection: Connection, input: Reco
     if (Object.hasOwn(input, key) && !isDeepStrictEqual(input[key], connection[key])) throw forbidden("This project's identity and approved key reference cannot change through PATCH", { code: "project_connection_reference_not_approved" });
   }
 }
-
-/** First binding cannot manufacture the human's GitHub clicks from provider
- * identity, delegated createdByUserId, labels, or caller-supplied JSON. The
- * trusted row-12 custody reader is an explicit integration prerequisite. */
-export function requireProjectConnectionHumanHandoff(): never {
-  throw forbidden("The designated human's existing App creation, installation and manager-key custody evidence is required before first binding.", { code: "project_connection_human_handoff_required" });
-}
