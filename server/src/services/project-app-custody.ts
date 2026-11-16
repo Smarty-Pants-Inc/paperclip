@@ -148,7 +148,9 @@ export async function readProjectAppCustody(db: Database, input: {
     if (consumedBy !== undefined) {
       // Single use: an archived consumed source serves ONLY its consumer.
       if (parsed.success && parsed.data.projectId === input.projectId && typeof consumedBy === "string" && consumedBy !== input.connectionId) consumedForProject = consumedBy;
-      if (consumedBy !== input.connectionId || source.status !== "archived") continue;
+      // The consumer reads S whether S was archived or retained live as the
+      // judged make-before-break predecessor (D's legacyConnectionId).
+      if (consumedBy !== input.connectionId) continue;
     } else if (source.status === "archived") continue;
     if (!parsed.success || source.status === "disabled" || source.projectId !== null || !isGitHubAppConnection(source)) continue;
     const receipt = parsed.data;
@@ -320,6 +322,11 @@ export async function prepareProjectAppFirstBind(db: Db, input: { companyId: str
 export async function consumeProjectAppApproval(tx: Database, input: {
   companyId: string; projectId: string; sourceConnectionId: string; receiptId: string; connectionId: string;
   actorType: "agent" | "user" | "system"; actorId: string;
+  /** RFL 04:5xZ (3) "archived, or linked as the predecessor": when the create
+   * staged D's make-before-break migration with S as legacyConnectionId, S keeps
+   * serving its existing installs until D's verified activation; the receipt is
+   * still consumed (single use) in this transaction. */
+  retainAsPredecessor?: boolean;
 }) {
   const [source] = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.sourceConnectionId))).for("update");
   const parsed = receiptSchema.safeParse(source?.config[PROJECT_APP_APPROVAL_FIELD]);
@@ -327,9 +334,12 @@ export async function consumeProjectAppApproval(tx: Database, input: {
   if (source.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined || source.status === "archived") throw consumed();
   const config = { ...source.config, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
   const transportConfig = { ...source.transportConfig, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
-  await tx.update(toolConnections).set({ status: "archived", enabled: false, config, transportConfig, updatedAt: new Date() })
+  await tx.update(toolConnections).set(input.retainAsPredecessor
+    ? { config, transportConfig, updatedAt: new Date() }
+    : { status: "archived", enabled: false, config, transportConfig, updatedAt: new Date() })
     .where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id)));
   await persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: input.actorType, actorId: input.actorId,
     action: "tool_connection.project_app_approval_consumed", entityType: "tool_connection", entityId: source.id,
-    details: { receiptId: input.receiptId, projectId: input.projectId, connectionId: input.connectionId, previousStatus: source.status } });
+    details: { receiptId: input.receiptId, projectId: input.projectId, connectionId: input.connectionId, previousStatus: source.status,
+      disposition: input.retainAsPredecessor ? "predecessor" : "archived" } });
 }
