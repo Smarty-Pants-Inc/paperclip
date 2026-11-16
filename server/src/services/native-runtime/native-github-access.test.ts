@@ -406,6 +406,49 @@ it("records callback-bridge request metadata without body, capability, or respon
   expect(JSON.parse(responseBody)).toEqual({ status: "available", env: { GH_TOKEN: responseSecret } });
 });
 
+it("rejects the runner-ingress capability as callback-bridge HTTP authentication", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "native-github-ingress-http-"));
+  const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
+    stdout: input.args?.[1]?.includes("printf")
+      ? "\0/usr/bin:/bin\0"
+      : `${Array.from({ length: 9 }, () => JSON.stringify({ uploaded: false })).join("\n")}\n`,
+    stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString(),
+  }));
+  let ingress: NativeGitHubAccess | undefined;
+  try {
+    ingress = await createNativeGitHubAccess({
+      scope, cwd: root, env: { PATH: process.env.PATH },
+      target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root,
+        runner: { execute }, streamRunLogs: false,
+        effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
+      resolveCredentials: async () => ({ status: "available", env: {} }),
+      transport: "runner_ingress",
+    });
+    const callback = await broker(undefined, true);
+    const release = await callback.activate(run("callback-run"));
+    try {
+      const capability = ingress.getRunnerIngressCapability()!;
+      expect(capability).toMatch(/^[a-f0-9]{64}$/);
+      const response = await fetch(`${callback.env.PAPERCLIP_GITHUB_BROKER_URL}/runtime-tools/github/credentials`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${capability}`,
+          "x-paperclip-github-capability": capability,
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect([401, 403]).toContain(response.status);
+      expect(callback.resolveCredentials).not.toHaveBeenCalled();
+    } finally {
+      await release();
+    }
+  } finally {
+    await ingress?.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it.each([403, 409, 500])("preserves denial/steering without leaking errors (%s)", async (status) => {
   const b = await broker(vi.fn(async () => { throw Object.assign(new Error("secret-value"), { status }); }));
   await b.activate(run("a"));
