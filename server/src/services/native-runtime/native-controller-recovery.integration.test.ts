@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { nativeProviderRecoveryEvidence, nativeSessionFailureSourceCode, restoreRemoteSuspendedRunnerCheckpoint,
+import { nativeProviderRecoveryEvidence, nativeSessionFailureDisposition, nativeSessionFailureSourceCode, restoreRemoteSuspendedRunnerCheckpoint,
   verifyRemoteRunnerReattachment } from "./native-session-executor.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { RunnerIngressConnectionError } from "../../realtime/runner-prp-outbound.js";
@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { agentTaskSessions, agents, companies, controllerInstances, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, issueComments, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints } from "@paperclipai/db";
-import { DurablePrpControlPlane, NativeProviderTerminalFailure, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
+import { decodeDurablePrpCheckpoint, DurablePrpControlPlane, NativeProviderTerminalFailure, parseNativeExecutionInput, QUALIFIED_PI_RPC_PROFILE, type DurablePrpCheckpoint, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -480,6 +480,149 @@ describe.skipIf(!recoveryPostgresSupport.supported)("native controller durable d
         eventType: "session.resumed" });
       expect((await evidence()).recoveryMode).toBe("ambiguous_state");
     } finally { await core.stop(); }
+  });
+
+  // R1-04 / CORE-c (2026-11-16): a cold box's Runner never connected, so the
+  // transport's own run.prepare wait timed out. Exact text from
+  // runnerd-codex-transport.ts waitForRunnerCommand + describeRunnerCommandStall.
+  const PREPARE_NEVER_CONNECTED = "runner_ingress_unavailable: PRP command run.prepare timed out "
+    + "(runner never connected; pending ahead 0; last runner event none)";
+
+  async function seedFirstRemoteStart(title: string) {
+    const issueId = randomUUID(), runId = randomUUID(), runnerInstanceId = randomUUID();
+    const normalizedSessionId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title, assigneeAgentId: agentId, status: "in_progress" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
+      nativeIssueId: issueId, nativeSessionId: normalizedSessionId, runnerInstanceId,
+      runnerProfileJson: { nativePreparationFencingVersion: 1 } });
+    const identity = { runnerInstanceId, environmentLeaseId: randomUUID(), runId, normalizedSessionId,
+      turnId: `turn-${runId}`, itemId: `item-${runId}` };
+    const owner = { companyId, issueId, runId, authorityRunId: runId, bootId: randomUUID(), generation: 1, leaseOwner: randomUUID() };
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId, runId, phase: "observed", controllerBootId: owner.bootId,
+      controllerGeneration: 1, leaseOwner: owner.leaseOwner, leaseExpiresAt: new Date(Date.now() + 60_000) });
+    const bootstrap = { binding: { companyId, issueId, runId }, identity, transientIngressFailure: false };
+    const template = { provider: { provider: "codex", command: "fixture" }, authorizedTools: {} };
+    const evidence = (error: unknown) => nativeProviderRecoveryEvidence({ db, runId, executionTargetKind: "remote",
+      sourceFailureCode: nativeSessionFailureSourceCode(error), bootstrap });
+    const parts = async () => (await db.select({ part: nativeRunnerCheckpoints.part }).from(nativeRunnerCheckpoints)
+      .where(eq(nativeRunnerCheckpoints.runId, runId))).map(row => row.part).sort();
+    const openCore = (onSaved?: (checkpoint: DurablePrpCheckpoint) => void) => {
+      const core = new DurablePrpControlPlane({ stateDirectory: join(root, runId, "control-plane"), identity,
+        expectedRunnerVersion: "discovery-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      const write = nativeRunnerCheckpointWriter(db, owner);
+      core.setCheckpointPersistence(async saved => { onSaved?.(saved); await write(saved); });
+      return core;
+    };
+    return { runId, root: join(root, runId), template, evidence, parts, openCore };
+  }
+
+  it("retries a FIRST remote start whose run.prepare timed out before any Runner connected (R1-04)", async () => {
+    const start = await seedFirstRemoteStart("Cold box never connected");
+    const failure = new Error(PREPARE_NEVER_CONNECTED);
+    let checkpoint: DurablePrpCheckpoint | undefined;
+    for (const attempt of [1, 2, 3]) {
+      // A same-run retry restores this run's controller checkpoint before it
+      // opens the control plane (restorePerTurnRunnerdController), so each
+      // attempt adds one more pending run.prepare and one more ticket.
+      checkpoint?.restoreSessionDirectory(start.root);
+      const core = start.openCore(saved => { checkpoint = saved; });
+      try {
+        // The exact transport order (runnerd-codex-transport.ts startThread):
+        // template, run.prepare, ticket, flush; session.open is queued only
+        // after run.prepare is answered, so it is never queued here.
+        expect(core.unclaimedBootstrapCheckpoint()).toBeNull();
+        core.persistRunAttachTemplate(start.template);
+        core.queueCommand("run.prepare", start.template);
+        core.issueBootstrapTicket(60_000);
+        await core.flushCheckpoint();
+      } finally { await core.stop(); }
+      expect(await start.parts()).toEqual([...Array.from({ length: attempt }, (_, index) => `command:${index + 1}`), "cursor", "header"]);
+      expect(nativeSessionFailureSourceCode(failure)).toBe("runner_ingress_startup_failed");
+      expect(await start.evidence(failure)).toMatchObject({ recoveryMode: "bootstrap_retry",
+        providerSessionEstablished: false, providerEventsExist: false, checkpointExists: false });
+      const now = new Date();
+      expect(nativeSessionFailureDisposition(attempt, now, "runner_ingress_startup_failed")).toEqual(attempt < 3
+        ? { phase: "retryable_failure", failureCode: "native_session_interrupted", nextAttemptAt: new Date(now.getTime() + 30_000) }
+        : { phase: "terminal_failure", failureCode: "native_session_retry_exhausted", nextAttemptAt: null });
+    }
+  });
+
+  it("retries an inherited unclaimed run.prepare/session.open pair whose run.prepare timed out before any Runner connected (R1-04)", async () => {
+    // The only path that waits on run.prepare with session.open already queued:
+    // an unclaimed pair from an earlier release is not queued again.
+    const start = await seedFirstRemoteStart("Inherited unclaimed pair");
+    const core = start.openCore();
+    try {
+      core.persistRunAttachTemplate(start.template);
+      core.queueCommand("run.prepare", start.template);
+      core.queueCommand("session.open", { reuse: "same_session" });
+      expect(core.unclaimedBootstrapCheckpoint()).not.toBeNull();
+      core.issueBootstrapTicket(60_000);
+      await core.flushCheckpoint();
+    } finally { await core.stop(); }
+    expect((await start.evidence(new Error(PREPARE_NEVER_CONNECTED))).recoveryMode).toBe("bootstrap_retry");
+  });
+
+  it("keeps a run.prepare timeout generic unless the transport and the checkpoint both prove no Runner connected (R1-04 negatives)", async () => {
+    // A Runner that connected (or connected and dropped) may have received run.prepare.
+    for (const message of [
+      "runner_ingress_unavailable: PRP command run.prepare timed out (runner connected; pending ahead 0; last runner event none)",
+      "runner_ingress_unavailable: PRP command run.prepare timed out (runner disconnected 3s; pending ahead 0; last runner event seq 4 2s ago)",
+      // Look-alikes embedded in tool or provider text, or with free text, stay generic.
+      `Tool output: ${PREPARE_NEVER_CONNECTED}`,
+      `${PREPARE_NEVER_CONNECTED} and then the tool printed more`,
+      `${PREPARE_NEVER_CONNECTED}\nprovider said hello`,
+      "runner_ingress_unavailable: PRP command run.prepare timed out (runner never connected; pending ahead 0; see the tool log)",
+      "runner_ingress_unavailable: PRP command run.prepare timed out (runner never connected; pending ahead 1 [turn.start]; last runner event none)",
+      "runner_ingress_unavailable: PRP command turn.start timed out (runner never connected; pending ahead 0; last runner event none)",
+      PREPARE_NEVER_CONNECTED.replace("runner_ingress_unavailable", "runner_local_connect_failed"),
+    ]) expect(nativeSessionFailureSourceCode(new Error(message)), message).toBe("native_session_interrupted");
+    expect(nativeSessionFailureSourceCode(new RunnerIngressConnectionError("runner_connection_lease_expired",
+      "The runner's connection lease expired before it was renewed.", { cause: new Error(PREPARE_NEVER_CONNECTED) })))
+      .toBe("native_session_interrupted");
+    // session.open already queued and timed out: the existing session.open rule, as today.
+    const opened = "runner_ingress_unavailable: PRP command session.open timed out (runner never connected; pending ahead 0; last runner event none)";
+    expect(nativeSessionFailureSourceCode(new Error(opened))).toBe("provider_session_open_timeout");
+
+    // The checkpoint is the proof: the same text after a Runner authenticated
+    // (durable connection count), used its ticket, or got run.prepare answered stays ambiguous.
+    type Records = Map<string, string>;
+    const editJson = (records: Records, key: string, edit: (value: Record<string, any>) => void) => {
+      const value = JSON.parse(records.get(key)!); edit(value); records.set(key, JSON.stringify(value));
+    };
+    const mutations: Array<[string, (records: Records) => void]> = [
+      ["authenticated", records => editJson(records, "header", header => { header.state.connectionCount = 1; })],
+      ["ticket used", records => editJson(records, "header", header => {
+        for (const ticket of Object.values<Record<string, unknown>>(header.state.tickets)) ticket.usedAt = new Date().toISOString();
+      })],
+      ["prepare answered", records => editJson(records, "command:1", command => {
+        command.status = "completed"; command.result = { status: "completed" };
+      })],
+    ];
+    for (const [name, mutate] of mutations) {
+      const start = await seedFirstRemoteStart(`Runner reached (${name})`);
+      let saved: DurablePrpCheckpoint | undefined;
+      const first = start.openCore(value => { saved = value; });
+      try {
+        first.persistRunAttachTemplate(start.template);
+        first.queueCommand("run.prepare", start.template);
+        first.issueBootstrapTicket(60_000);
+        await first.flushCheckpoint();
+      } finally { await first.stop(); }
+      expect((await start.evidence(new Error(PREPARE_NEVER_CONNECTED))).recoveryMode, name)
+        .toBe(nativeSessionFailureSourceCode(new Error(PREPARE_NEVER_CONNECTED)) === "runner_ingress_startup_failed"
+          ? "bootstrap_retry" : "ambiguous_state");
+      // Persist the same controller state with one sign that a Runner was reached.
+      const records = new Map(saved!.records);
+      mutate(records);
+      decodeDurablePrpCheckpoint(records).restoreSessionDirectory(start.root);
+      const reached = start.openCore(value => { saved = value; });
+      try { await reached.flushCheckpoint(); } finally { await reached.stop(); }
+      expect(saved!.records.get("header"), name).toBe(records.get("header"));
+      expect(saved!.records.get("command:1"), name).toBe(records.get("command:1"));
+      expect(await start.parts()).toEqual(["command:1", "cursor", "header"]);
+      expect((await start.evidence(new Error(PREPARE_NEVER_CONNECTED))).recoveryMode, name).toBe("ambiguous_state");
+    }
   });
 
   it("uses the database clock when an import finds an expired owner", async () => {
