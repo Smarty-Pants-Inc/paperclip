@@ -152,6 +152,35 @@ async function forceDefaultGrantDeadlocks(db: Db, principalId: string, failedAtt
   `));
 }
 
+/**
+ * #20805: the new agent's membership is written inside the hire transaction, so
+ * the step whose contention now decides the response is that insert. Fails the
+ * first `failedAttempts` agent-membership inserts in `companyId` other than
+ * `exceptPrincipalId` (the seeded hiring agent).
+ */
+async function forceHireMembershipDeadlocks(db: Db, companyId: string, exceptPrincipalId: string | null, failedAttempts: number) {
+  if (!Number.isInteger(failedAttempts) || failedAttempts < 1) throw new Error("failedAttempts must be a positive integer");
+  await db.execute(sql.raw(`
+    CREATE SEQUENCE agent_hire_default_grant_deadlock_attempts;
+    CREATE FUNCTION agent_hire_default_grant_deadlock() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE attempt bigint;
+    BEGIN
+      IF NEW.company_id = '${companyId}' AND NEW.principal_type = 'agent'
+        AND NEW.principal_id IS DISTINCT FROM ${exceptPrincipalId ? `'${exceptPrincipalId}'` : "NULL"} THEN
+        attempt := nextval('agent_hire_default_grant_deadlock_attempts');
+        IF attempt <= ${failedAttempts} THEN
+          RAISE EXCEPTION 'forced agent hire membership deadlock' USING ERRCODE = '40P01';
+        END IF;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER agent_hire_default_grant_deadlock
+      BEFORE INSERT ON company_memberships
+      FOR EACH ROW EXECUTE FUNCTION agent_hire_default_grant_deadlock();
+  `));
+}
+
 describeEmbeddedPostgres("agent hire idempotency within a run", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -164,6 +193,7 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
 
   afterEach(async () => {
     await db.execute(sql.raw("DROP TRIGGER IF EXISTS agent_hire_default_grant_deadlock ON principal_permission_grants"));
+    await db.execute(sql.raw("DROP TRIGGER IF EXISTS agent_hire_default_grant_deadlock ON company_memberships"));
     await db.execute(sql.raw("DROP FUNCTION IF EXISTS agent_hire_default_grant_deadlock()"));
     await db.execute(sql.raw("DROP SEQUENCE IF EXISTS agent_hire_default_grant_deadlock_attempts"));
     await db.delete(activityLog);
@@ -344,8 +374,8 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
   it("returns a named retryable error when every default-grant transaction deadlocks", async () => {
     const { company, hiringAgent, run } = await seedHiringFixture(db);
     await authorizeAgentToCreate(db, company.id, hiringAgent.id);
-    const rootCeo = await seedRootCeo(db, company.id);
-    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    await seedRootCeo(db, company.id);
+    await forceHireMembershipDeadlocks(db, company.id, hiringAgent.id, 5);
     const retryCountBefore = transactionRetryStats.retried;
     const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
 
@@ -357,7 +387,8 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
       adapterConfig: {},
       runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
     });
-    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    // SUPERSEDED (#20805 docs-audit b): surviving contention answers 503, not 422.
+    expect(response.status, JSON.stringify(response.body)).toBe(503);
     expect(response.body.code).toBe("agent_hire_grant_contention");
     expect(response.body.details).toMatchObject({ retryable: true });
     expect(transactionRetryStats.retried - retryCountBefore).toBe(4);
@@ -366,8 +397,8 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
   it("does not duplicate a direct hire when an exhausted grant request is retried", async () => {
     const { company, hiringAgent, run } = await seedHiringFixture(db);
     await authorizeAgentToCreate(db, company.id, hiringAgent.id);
-    const rootCeo = await seedRootCeo(db, company.id);
-    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    await seedRootCeo(db, company.id);
+    await forceHireMembershipDeadlocks(db, company.id, hiringAgent.id, 5);
     const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
     const url = `/api/companies/${company.id}/agents`;
     const payload = {
@@ -380,11 +411,19 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     };
 
     const exhausted = await request(app).post(url).send(payload);
-    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(422);
+    // SUPERSEDED (#20805 docs-audit b): 503, not 422.
+    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(503);
     expect(exhausted.body.code).toBe("agent_hire_grant_contention");
+    // The exhausted hire rolled back as a whole: no agent was kept.
+    expect(await db.select({ id: agents.id }).from(agents).where(and(
+      eq(agents.companyId, company.id),
+      eq(agents.name, payload.name),
+    ))).toHaveLength(0);
     const retried = await request(app).post(url).send(payload);
-    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
-    expect(retried.body.idempotent).toBe(true);
+    // SUPERSEDED (#20805 F2): nothing half set up survives to be replayed, so the
+    // retry is the first complete create (201), not an idempotent replay (200).
+    expect(retried.status, JSON.stringify(retried.body)).toBe(201);
+    expect(retried.body.idempotent).toBeUndefined();
 
     const hires = await db.select({ id: agents.id }).from(agents).where(and(
       eq(agents.companyId, company.id),
@@ -436,7 +475,7 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     });
     expect(setup.status, JSON.stringify(setup.body)).toBe(201);
     const rootCeo = await seedRootCeo(db, company.id);
-    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    await forceHireMembershipDeadlocks(db, company.id, null, 5);
     const hireUrl = `/api/companies/${company.id}/agent-hires`;
     const payload = {
       setupAgentId: setupId,
@@ -448,11 +487,14 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     };
 
     const exhausted = await request(app).post(hireUrl).send(payload);
-    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(422);
+    // SUPERSEDED (#20805 docs-audit b): 503, not 422.
+    expect(exhausted.status, JSON.stringify(exhausted.body)).toBe(503);
     expect(exhausted.body.code).toBe("agent_hire_grant_contention");
     const retried = await request(app).post(hireUrl).send(payload);
-    expect(retried.status, JSON.stringify(retried.body)).toBe(200);
-    expect(retried.body.idempotent).toBe(true);
+    // SUPERSEDED (#20805 F2): the exhausted hire rolled back, so the retry completes
+    // the setup draft (201) instead of replaying a half-set-up hire (200).
+    expect(retried.status, JSON.stringify(retried.body)).toBe(201);
+    expect(retried.body.idempotent).toBeUndefined();
     expect(retried.body.agent?.id).toBe(setupId);
 
     expect(await db.select({ id: agents.id }).from(agents).where(and(
