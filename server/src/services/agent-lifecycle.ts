@@ -6,17 +6,17 @@ import { notifyDeferredExecutionEligibility } from "./deferred-execution-notific
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyNativeReviewResponse } from "./native-review-response-notifications.js";
-import { getAgentWorkEligibility, isAgentStatusInvokable } from "@paperclipai/shared";
+import { isAgentStatusInvokable } from "@paperclipai/shared";
 import { notifyNativeResponsePresentation } from "./native-response-presentation-notifications.js";
 import { notifyChatInboundWakeNotices } from "./chat-inbound-wake-notice-notifications.js";
 import { logger } from "../middleware/logger.js";
-import { agents, companies, issues, chatConversations, type Db } from "@paperclipai/db";
-import { and, eq, inArray, isNull, notExists } from "drizzle-orm";
-import { issueService } from "./issues.js";
+import { agents, companies, type Db } from "@paperclipai/db";
+import type { AgentLifecycleRequester } from "@paperclipai/shared";
+import { and, eq } from "drizzle-orm";
 import { logActivity, persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
-import { ACCOUNTING_TRANSACTION_ATTEMPTS, AccountingContentionError, accountingRetryDelayMs, isAccountingRetryable, withAccountingTransaction } from "./accounting-transaction.js";
-import { conflict } from "../errors.js";
+import { withAccountingTransaction } from "./accounting-transaction.js";
+import { AGENT_HANDOVER_PENDING_CODE, pendingAgentHandover } from "./agent-handover-items.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
@@ -34,29 +34,6 @@ import { isProviderApiSetupDraft } from "./native-runtime/provider-api-placement
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
-
-async function withLifecycleTransaction<T>(db: Db, companyId: string,
-  work: (tx: Db, publications: ActivityPublication[]) => Promise<T>): Promise<T> {
-  if ("nestedIndex" in db) return withAccountingTransaction(db, companyId, work);
-  for (let attempt = 0; ; attempt++) {
-    try { return await withAccountingTransaction(db, companyId, work); }
-    catch (error) {
-      let cause = error, taskLockContended = false;
-      for (let depth = 0; cause && typeof cause === "object" && depth < 4; depth++) {
-        if ((cause as { code?: string }).code === "55P03") { taskLockContended = true; break; }
-        cause = (cause as { cause?: unknown }).cause;
-      }
-      if (!taskLockContended && !isAccountingRetryable(error)) throw error;
-      if (attempt + 1 >= ACCOUNTING_TRANSACTION_ATTEMPTS) {
-        if (taskLockContended) throw conflict("The retiring agent's tasks are busy. Retry the lifecycle operation.", {
-          code: "agent_retirement_task_contention",
-        });
-        throw new AccountingContentionError(error, attempt + 1);
-      }
-      await new Promise(resolve => setTimeout(resolve, accountingRetryDelayMs(attempt)));
-    }
-  }
-}
 
 export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): lifecycle.LifecycleEffects {
   return {
@@ -82,38 +59,8 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     beforeConnectionEligibilityRestore: async (tx, companyId, agentId) => {
       await notifyMuseContactVerification(tx, { companyId, agentId });
     },
-    async beforeStatusChange(tx, companyId, agentId, before, after, publications) {
+    async beforeStatusChange(tx, companyId, agentId, before, after) {
       await notifyAttentionRetentionWork(tx, { companyId });
-      if (after === "terminated") {
-        const companyAgents = await tx.select().from(agents).where(eq(agents.companyId, companyId));
-        const retiring = companyAgents.find(agent => agent.id === agentId);
-        const manager = companyAgents.find(agent => agent.id === retiring?.reportsTo);
-        // A company teardown may already have terminated the manager. Keep
-        // normal recovery ownership in that case, never prevent cleanup.
-        if (retiring?.lifecycleState === "cleaning_up" && manager
-          && getAgentWorkEligibility({ agent: manager, agents: companyAgents }).assignable) {
-          // Use ordinary task assignment, including its eligibility, visibility,
-          // receipt and execution-lock fencing. Never rewrite terminal history
-          // or the fixed identity of a conversation/channel-bound task.
-          const unfinished = await tx.select().from(issues).where(and(
-            eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId),
-            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-            isNull(issues.conversationAgentId),
-            notExists(tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
-              eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issues.id),
-            ))),
-          )).orderBy(issues.id).for("update", { noWait: true });
-          for (const issue of unfinished) {
-            await issueService(tx).update(issue.id, {
-              companyGuard: companyId, assigneeAgentId: manager.id, assigneeUserId: null,
-              ...(issue.status === "in_progress" ? { status: "todo" } : {}),
-            }, tx, publications ?? [], []);
-            await logActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
-              action: "issue.reassigned", entityType: "issue", entityId: issue.id,
-              details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } }, publications);
-          }
-        }
-      }
       if (before !== after) {
         await notifyStrandedAgentStatus(tx, { companyId, agentId });
         await notifyRunDispatch(tx, { companyId });
@@ -131,7 +78,31 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
       const code = lifecycle.lifecycleFailureCode(error);
       logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
     },
-    transaction: withLifecycleTransaction,
+    // One attempt. The terminal step touches no task row, so it never meets
+    // checkout's task-then-agent order; a rollback is retried only by the
+    // lifecycle worker's next explicit attempt, which re-reads and re-authorizes.
+    transaction: withAccountingTransaction,
+    // The terminal step's named effect: in the same transaction as the
+    // terminated state and its hand-over marker, write the one terminal audit
+    // row for every entry point (POST /terminate and PATCH status alike) and
+    // wake the hand-over recovery worker when this transaction commits.
+    async completeTermination(tx, agent, publications) {
+      const requester = agent.lifecycleOperation?.requestedBy;
+      const handover = await pendingAgentHandover(tx, agent.companyId, agent.id);
+      await logActivity(tx, {
+        companyId: agent.companyId,
+        actorType: requester?.actorType ?? "system",
+        actorId: requester?.actorId ?? "agent_lifecycle",
+        agentId: requester?.agentId ?? null,
+        runId: requester?.runId ?? null,
+        agentApiKeyId: requester?.agentApiKeyId ?? null,
+        action: "agent.terminated",
+        entityType: "agent",
+        entityId: agent.id,
+        details: { handover: { code: AGENT_HANDOVER_PENDING_CODE, openTaskIds: handover.taskIds, liveReportIds: handover.reportIds } },
+      }, publications);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentHandover, agent.id);
+    },
     deleteDependencies: deleteAgentDependencies,
     policyBlocks,
     setAgentBudget: (db, publications, companyId, agentId, amount, userId, isActive) =>
@@ -151,8 +122,11 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
   };
 }
 
-export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, authorize?: (tx: Db) => Promise<void>) {
+export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, authorize?: (tx: Db) => Promise<void>,
+  requester?: AgentLifecycleRequester) {
   const effects = createAgentLifecycleEffects(hooks);
+  // A termination request records who asked; the terminal step's audit row names them.
+  if (requester) effects.requestActor = requester;
   // Reporting-tree edits use this same company accounting lock. Never reuse a
   // route's earlier authorization snapshot after waiting for that lock.
   if (authorize) {
