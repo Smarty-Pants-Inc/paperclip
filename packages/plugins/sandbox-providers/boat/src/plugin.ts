@@ -14,6 +14,7 @@ import { BoatSshCarrier, connectSsh, SSH_RETIRE_ATTEMPTS, type SshRetireWarning 
 import { acquireRunnerIngress, DEFAULT_WARM_RUNNER_IDLE_TIMEOUT_MS, effectiveTtlSeconds, ingressScopeKey,
   privateRunnerEndpoint, resumeSentinelMetadata, runnerIngressGenerationStore, verifyWorkspaceSentinel,
   workspaceDirectory, writeWorkspaceSentinel, type RunnerConfig } from "./runner-support.js";
+import { closedTransportCode, isOwnDeadline, TRANSPORT_ERROR_CODES, transientWords } from "./provider-error-codes.js";
 import { definePlugin, PluginEnvironmentCreationCleanupError, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import type {
   PluginEnvironmentAcquireLeaseParams, PluginEnvironmentDestroyLeaseParams, PluginEnvironmentExecuteParams,
@@ -256,16 +257,23 @@ function parse(raw: Record<string, unknown>): Config {
 }
 type RequestErrorCategory = "request_error" | "network_error" | "http_error" | "parse_error" | "ambiguous_404";
 /** Never retain provider/transport diagnostics, even as a cause. Only these safe
- * fields may cross the worker boundary; scrub the key from our own stack too. */
-function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory): Error & { httpStatus: number | null; category: RequestErrorCategory } {
+ * fields may cross the worker boundary; scrub the key from our own stack too.
+ * `status` (integer HTTP status) and `code` (closed errno only) are the structure
+ * the host's transient-retry classification reads through the SDK diagnostic;
+ * the transient words serve the server's text-only resume retry. */
+function requestError(config: Config, method: string, path: string, httpStatus: number | null, category: RequestErrorCategory, code?: string): Error & { httpStatus: number | null; category: RequestErrorCategory; status?: number; code?: string } {
   const redact = (text: string) => config.apiKey ? text.split(config.apiKey).join("[REDACTED]") : text;
-  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}`)), { httpStatus, category });
+  const closedCode = code !== undefined && TRANSPORT_ERROR_CODES.has(code) ? code : undefined;
+  const words = transientWords(httpStatus, closedCode);
+  const error = Object.assign(new Error(redact(`Boat ${method} ${path} failed (${httpStatus ?? "unavailable"}): ${category}${words ? ` (${words})` : ""}`)),
+    { httpStatus, category }, Number.isInteger(httpStatus) ? { status: httpStatus as number } : {}, closedCode ? { code: closedCode } : {});
   if (error.stack) error.stack = redact(error.stack);
   return error;
 }
 async function request(config: Config, path: string, init: RequestInit = {}, allowMissing = false, responseOptions: { onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean } = {}): Promise<any> {
   let category: RequestErrorCategory = "request_error";
   let httpStatus: number | null = null;
+  let signal: AbortSignal | undefined;
   try {
     if (init.method && init.method !== "GET") assertBoatActivityAdmission();
     const allocation = /^\/sandboxes\/([^/?]+)/.exec(path)?.[1];
@@ -278,7 +286,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       (typeof (requestBody as { getReader?: unknown }).getReader === "function" || typeof (requestBody as { pipe?: unknown }).pipe === "function");
     let response: Response;
     const deadline = Date.now() + BOAT_CALL_BUDGET_MS;
-    const signal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
+    const callSignal = init.signal ?? AbortSignal.timeout(BOAT_CALL_BUDGET_MS);
+    signal = callSignal;
     const method = (init.method ?? "GET").toUpperCase();
     const route = path.replace(/^\/sandboxes\/[^/]+/, "/sandboxes/{sandboxId}");
     const waitForRateLimitPause = async () => {
@@ -294,7 +303,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         error.code = "boat_ip_rate_limit_paused";
         throw error;
       }
-      await delay(remaining, undefined, { signal });
+      await delay(remaining, undefined, { signal: callSignal });
     };
     const retryable429Routes: { method: string; pattern: RegExp }[] = [
       // POST /sandboxes (create): docs/llms-full.txt lines 9864, 9889-9890, 2174.
@@ -310,7 +319,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       await waitForRateLimitPause();
       category = "network_error";
       httpStatus = null;
-      response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal });
+      response = await fetch(`${API}${path}`, { ...init, headers, redirect: "error", signal: callSignal });
       httpStatus = response.status;
       if (response.status !== 429) break;
       category = "http_error";
@@ -353,13 +362,13 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       } else if (retryAfter !== null) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0 || retryAfterMs > remainingMs) throw new Error(category);
-        await delay(retryAfterMs, undefined, { signal });
+        await delay(retryAfterMs, undefined, { signal: callSignal });
       }
       if (!retryableStart || isStreamBody || attempt >= BOAT_MAX_ATTEMPTS || !["rate_limited", "limit_reached", "member_limit_reached"].includes(String(errorCode))) throw new Error(category);
       if (!hasRateLimitWait) {
         const remainingMs = deadline - Date.now();
         if (remainingMs <= 0) throw new Error(category);
-        await delay(Math.min(2_000, remainingMs), undefined, { signal });
+        await delay(Math.min(2_000, remainingMs), undefined, { signal: callSignal });
       }
     }
     responseOptions.onHeaders?.(response.headers);
@@ -386,7 +395,11 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
     return body;
   } catch (error) {
     if (error && typeof error === "object" && (error as { code?: unknown }).code === "boat_ip_rate_limit_paused") throw error;
-    throw requestError(config, init.method ?? "GET", path, httpStatus, category);
+    // Without a definite HTTP refusal, keep only a closed errno from the fetch
+    // failure; our own call deadline is ETIMEDOUT. The failure itself is dropped.
+    const code = httpStatus !== null && httpStatus >= 400 ? undefined
+      : isOwnDeadline(error, signal) ? "ETIMEDOUT" : closedTransportCode(error);
+    throw requestError(config, init.method ?? "GET", path, httpStatus, category, code);
   }
 }
 /** Conservative inventory guard, NOT key-scope detection. Count Personal and
@@ -513,7 +526,8 @@ async function waitSetup(config: Config, id: string): Promise<any> {
     }
     await delay(Math.min(2000, Math.max(0, until - Date.now())));
   }
-  throw new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`);
+  // A Boat-side setup deadline is transient: the host retries it by this errno.
+  throw Object.assign(new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`), { code: "ETIMEDOUT" });
 }
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
   idleActivity.resource(activityKey(config, id));

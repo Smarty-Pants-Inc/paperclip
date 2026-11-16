@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { PluginEnvironmentRunnerIngressError } from "@paperclipai/plugin-sdk";
+import { closedTransportCode } from "./provider-error-codes.js";
 import type { PluginEnvironmentAcquireLeaseParams, PluginEnvironmentExecuteResult, PluginEnvironmentRunnerIngressFailure } from "@paperclipai/plugin-sdk";
 
 export const WORKSPACE_SENTINEL_RELATIVE_PATH = ".paperclip-runtime/reusable-sandbox-lease.json";
@@ -115,9 +116,14 @@ export async function acquireRunnerIngress<T>(phase: PluginEnvironmentRunnerIngr
   try { return await operation(); }
   catch (error) {
     const status = error && typeof error === "object" ? (error as { httpStatus?: number }).httpStatus : undefined;
-    if (typeof status === "number" && status >= 400 && status <= 599) throw new PluginEnvironmentRunnerIngressError({ phase, httpStatus: status });
+    // `status`/`code` keep the host-readable structure (SDK providerErrorDiagnostic)
+    // on the wrapper itself: an integer status, or only a closed errno string.
+    if (typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 599) {
+      throw Object.assign(new PluginEnvironmentRunnerIngressError({ phase, httpStatus: status }), { status });
+    }
     // Do not forward URLs, query tokens, provider bodies, or transport causes.
-    throw new Error(`Boat runner ingress failed during ${phase}.`);
+    const code = closedTransportCode(error);
+    throw Object.assign(new Error(`Boat runner ingress failed during ${phase}.`), code ? { code } : {});
   }
 }
 export function privateRunnerEndpoint(preview: any, runnerPath: string) {
