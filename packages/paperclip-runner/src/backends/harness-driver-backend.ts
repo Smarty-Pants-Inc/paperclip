@@ -168,6 +168,7 @@ export class HarnessDriverBackend implements NativeSessionBackend {
         reason: recovered.reason,
         ...(recovered.failureClass ? { failureClass: recovered.failureClass } : {}),
         ...(recovered.resumeStateUnavailable ? { resumeStateUnavailable: true as const } : {}),
+        ...(recovered.identityChangeReason ? { identityChangeReason: recovered.identityChangeReason } : {}),
         ...(recovered.runnerExitConfirmed ? { runnerExitConfirmed: true as const } : {}),
         ...(recovered.refreshWaitForTurn ? { refreshWaitForTurn: true as const } : {}),
         ...(recovered.prepareRefusalCode ? { prepareRefusalCode: recovered.prepareRefusalCode } : {}),

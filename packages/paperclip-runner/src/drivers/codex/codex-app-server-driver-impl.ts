@@ -20,7 +20,7 @@ import type {
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
 import { NativeSessionProtocolIntegrityError, isNativeProviderRecoveryDeadlineError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
-import { HarnessReconciliationError, runnerRefreshWaitForTurn, isRunnerResumeStateUnavailable, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerReconciliationFailureClass, runnerPrepareRefusalCode, runnerRecoveryRefusalCode } from "../../contracts/harness-driver.js";
+import { HarnessReconciliationError, runnerRefreshWaitForTurn, isRunnerResumeStateUnavailable, runnerResumeStateUnavailableReason, PROVIDER_SIDE_EFFECT_PENDING, PROVIDER_STATE_INCOMPATIBLE, runnerReconciliationFailureClass, runnerPrepareRefusalCode, runnerRecoveryRefusalCode } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
   CODEX_SKILLLESS_BASE_INSTRUCTIONS,
@@ -840,13 +840,17 @@ export class CodexAppServerDriver implements HarnessDriver {
       if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (options.signal.aborted) options.signal.throwIfAborted();
       // A Runner with no saved control-plane state for this session can never
-      // resume it here. With nothing in flight, the runtime's recovery policy
-      // decides, as for a moved workspace root. An in-flight session keeps the
-      // unclassified failure.
+      // resume it here, and every retry reads the same empty state. The runtime's
+      // recovery policy decides, as for a moved workspace root, also with a turn
+      // in flight: it replaces that only with a durable no-tool-call proof, else
+      // names it. A pending runtime request is an unsettled side effect, so it
+      // stops by name for an operator (never replaced, never a bare retry).
       const classified = runnerReconciliationFailureClass(error);
-      const resumeStateUnavailable = !classified && isRunnerResumeStateUnavailable(error)
-        && !persistedSessionInFlight(snapshot);
-      const failureClass = classified ?? (resumeStateUnavailable ? PROVIDER_STATE_INCOMPATIBLE : undefined);
+      const definiteAbsence = !classified && isRunnerResumeStateUnavailable(error);
+      const sideEffectPending = definiteAbsence && Boolean(snapshot.pendingRuntimeRequests?.length);
+      const resumeStateUnavailable = definiteAbsence && !sideEffectPending;
+      const failureClass = classified ?? (sideEffectPending ? PROVIDER_SIDE_EFFECT_PENDING
+        : resumeStateUnavailable ? PROVIDER_STATE_INCOMPATIBLE : undefined);
       return {
         recovered: false,
         reason: redactCodexDiagnostic(String(error)),
@@ -854,7 +858,8 @@ export class CodexAppServerDriver implements HarnessDriver {
         ...(failureClass ? { failureClass } : {}),
         ...(runnerRefreshWaitForTurn(error) ? { refreshWaitForTurn: true as const } : {}),
         ...(runnerPrepareRefusalCode(error) ? { prepareRefusalCode: runnerPrepareRefusalCode(error) } : {}),
-        ...(resumeStateUnavailable ? { resumeStateUnavailable: true as const } : {}),
+        ...(resumeStateUnavailable ? { resumeStateUnavailable: true as const,
+          identityChangeReason: runnerResumeStateUnavailableReason(error) } : {}),
         ...(transport.runnerExitConfirmed?.() === true ? { runnerExitConfirmed: true as const } : {}),
       };
     } finally {

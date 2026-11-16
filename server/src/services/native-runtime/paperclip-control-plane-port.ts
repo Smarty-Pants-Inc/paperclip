@@ -37,7 +37,8 @@ import { eligibleNativeTaskSessionPublication, publishNativeTaskSessionInTransac
   type NativeTaskSessionPublicationContext, type NativeTaskSessionPublicationIssue } from "./native-task-session-publication.js";
 import { lockNativeRunnerCheckpointOwner, nativeRunnerCheckpointOwnerLock, validateNativeRunnerCheckpointOwner, inspectNativeRunnerUpgradeHeader, type NativeRunnerCheckpointOwner } from "./native-runner-checkpoint.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
-import { provesNoNativeRunProviderWork } from "./native-provider-work-proof.js";
+import { provesNoNativeRunProviderWork, provesNoNativeRunToolWork } from "./native-provider-work-proof.js";
+import { withSameRunProviderRecoveryPolicy } from "./native-session-resume.js";
 
 export interface PaperclipControlPlaneBinding {
   companyId: string;
@@ -230,7 +231,9 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       || identity.agentId !== this.#binding.agentId
       || identity.sessionId !== run.nativeSessionId
     ) throw new Error("native_session_checkpoint_invalid");
-    return structuredClone(snapshot as PersistedNativeSession);
+    // This run's own checkpoint (same-run by the binding check above): the
+    // runner's session snapshot never carries a policy (gate 6 F1).
+    return withSameRunProviderRecoveryPolicy(structuredClone(snapshot as PersistedNativeSession));
   }
 
   normalizeReplayPayload(payload: PrpEvent["payload"]): PrpEvent["payload"] {
@@ -527,6 +530,15 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
    */
   async provesNoRunProviderWork(options: { signal: AbortSignal }): Promise<boolean> {
     return provesNoNativeRunProviderWork(this.#db, { ...this.#binding, signal: options.signal });
+  }
+
+  /**
+   * Proves from durable rows, across every runner instance, that this run
+   * recorded no tool call or other side-effecting provider work. Any such row,
+   * an item of unknown kind, or a read failure denies the proof.
+   */
+  async provesNoRunToolWork(options: { signal: AbortSignal }): Promise<boolean> {
+    return provesNoNativeRunToolWork(this.#db, { ...this.#binding, signal: options.signal });
   }
 
   async completeRun(value: NativeRunResult | CompleteControlPlaneRunInput, options?: { signal: AbortSignal }): Promise<void> {

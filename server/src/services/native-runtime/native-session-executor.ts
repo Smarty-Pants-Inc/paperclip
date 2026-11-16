@@ -207,6 +207,7 @@ import {
   NativeProviderTerminalFailure,
   NativeGovernedWaitSettlementPendingError,
   NativeRunnerSourceReconciliationRequiredError,
+  isRunnerResumeStateUnavailable,
   NativeSessionCleanupQuarantinedError,
   NativeSessionCloseUnrecoverableError,
   NativeSessionProtocolIntegrityError,
@@ -307,7 +308,8 @@ import {
   renderNativeRunnerStagedAttachmentInput,
   stageNativeRunnerWakeAttachments,
 } from "./native-runner-file-handoff.js";
-import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeProviderRecoveryPolicy, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
+import { nativeProviderIdentityPersonLine, recordNativeProviderIdentityChange, type NativeProviderIdentityChangeReason, type NativeProviderIdentityRecord } from "./native-provider-identity-record.js";
+import { NATIVE_PROVIDER_SIDE_EFFECT_PENDING, NATIVE_PROVIDER_STATE_INCOMPATIBLE, nativeProviderRecoveryPolicy, withSameRunProviderRecoveryPolicy, nativeRuntimeContextsMatch, nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { clearRunProviderStateUnsaved, markAcceptedRunProviderStateUnsaved } from "./native-provider-state-unsaved.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
@@ -8157,6 +8159,32 @@ export function resolveNativeHarnessPersistenceProfile(
   };
 }
 
+/** The backup gate's identity object (providerSessionIdentityFromDurableProviderState)
+ * for the providers whose durable state names only the thread and provider
+ * session. Other providers' identities carry digests only their durable state
+ * holds, so their replacements are not recorded here (fail closed at backup). */
+function threadProviderSessionIdentity(execution: NativeExecutionInput, driverSessionId: string,
+  providerSessionId: string | null): Record<string, unknown> | null {
+  if (!["codex", "pi_rpc", "opencode", "cursor_cloud"].includes(execution.provider.kind)) return null;
+  return { providerSessionId: driverSessionId, providerBackendSessionId: providerSessionId, providerSessionIdentity: null };
+}
+
+function recordDefiniteAbsenceReplacement(execution: NativeExecutionInput, continuity: {
+  previousDriverSessionId: string; previousProviderSessionId: string | null;
+  replacementDriverSessionId: string; replacementProviderSessionId: string | null;
+  identityChangeReason?: NativeProviderIdentityChangeReason;
+}): NativeProviderIdentityRecord | null {
+  if (!continuity.identityChangeReason) return null;
+  const previousIdentity = threadProviderSessionIdentity(execution, continuity.previousDriverSessionId, continuity.previousProviderSessionId);
+  const identity = threadProviderSessionIdentity(execution, continuity.replacementDriverSessionId, continuity.replacementProviderSessionId);
+  if (!previousIdentity || !identity) return null;
+  return recordNativeProviderIdentityChange(runnerdStateRoot(execution), {
+    companyId: execution.binding.companyId, taskId: execution.binding.issueId,
+    normalizedSessionId: nativeSessionKey(execution), runId: execution.binding.runId,
+    previousIdentity, identity, reason: continuity.identityChangeReason,
+  });
+}
+
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -9057,7 +9085,8 @@ function loadWarmNativeCheckpoint(
     persistedIdentity.runId === execution.binding.runId &&
     persistedIdentity.issueId === execution.binding.issueId;
   const resumed = sameRunRecovery
-    ? structuredClone(envelope.snapshot)
+    // The session snapshot has no policy; give it the rebind's own (gate 6 F1).
+    ? withSameRunProviderRecoveryPolicy(structuredClone(envelope.snapshot), refreshTools)
     : {
         ...envelope.snapshot,
         identity: {
@@ -9452,6 +9481,12 @@ export function nativeSessionFailureSourceCode(
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
   if (error instanceof NativeProviderSideEffectPendingError) return NATIVE_PROVIDER_SIDE_EFFECT_PENDING;
+  // The Runner's definite absence of saved state for this session: every retry
+  // reads the same empty state. Typed class anywhere in the chain (route B), or
+  // the runtime's exact composition of that class's own name (route A, an
+  // older runner that still reports it unclassified). Retry starts fresh.
+  if (isRunnerResumeStateUnavailable(error)
+    || (error instanceof Error && error.message === RUNTIME_COMPOSED_RESUME_STATE_UNAVAILABLE)) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
   if (error instanceof NativeProviderTerminalFailure) {
     if (error.providerCode === "approval_required") return "native_provider_approval_required";
     // Failed terminals retain their security meaning across the provider facade.
@@ -9583,6 +9618,9 @@ export function nativeSessionFailureSourceCode(
   if (runnerIngressConnectionFailure(error)) return "runner_ingress_startup_failed";
   return "native_session_interrupted";
 }
+
+const RUNTIME_COMPOSED_RESUME_STATE_UNAVAILABLE =
+  "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable";
 
 function runnerIngressConnectionFailure(error: unknown, depth = 0): boolean {
   if (!error || typeof error !== "object" || depth > 5) return false;
@@ -13218,6 +13256,17 @@ async function executePaperclipNativeSessionAttempt(
                 "stderr",
                 `[paperclip-runner] provider session continuity break: exact resume failed (${continuity.reason}); old driver session=${continuity.previousDriverSessionId}, old provider session=${continuity.previousProviderSessionId ?? "unavailable"}, replacement driver session=${continuity.replacementDriverSessionId}, replacement provider session=${continuity.replacementProviderSessionId ?? "unavailable"}\n`,
               );
+              // Gate 6 F3: a replacement after the Runner's definite absence is
+              // RECORDED (#20853 PART 2 shape), so the next idle close/backup can
+              // link the old and new provider identities, with ONE person line.
+              // A record that cannot be written never costs this run its answer:
+              // the next backup then fails closed by name, as before.
+              let recorded: NativeProviderIdentityRecord | null = null;
+              try { recorded = recordDefiniteAbsenceReplacement(input.execution, continuity); }
+              catch (error) {
+                await input.onLog?.("stderr", `[paperclip-runner] provider identity record not written: ${error instanceof Error ? error.name : "unknown"}\n`);
+              }
+              if (recorded) await input.onLog?.("stdout", nativeProviderIdentityPersonLine(recorded.reason));
             },
             onSession: async (session) => {
               input.bindAttachmentSession?.(session);

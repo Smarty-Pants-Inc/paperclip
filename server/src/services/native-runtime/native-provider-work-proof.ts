@@ -37,6 +37,33 @@ export async function provesNoNativeRunProviderWork(db: Pick<Db, "execute">, inp
     && row.acceptedResult === false && row.finalizedResult === false);
 }
 
+/** Item kinds a provider only thinks, writes or accounts with. Any other item
+ * kind (a command, a tool, a file change, an MCP or dynamic tool call, or a kind
+ * this list does not know yet) counts as tool work: the proof fails closed. */
+export const NATIVE_INERT_ITEM_KINDS = ["agentMessage", "reasoning", "usage", "userMessage", "contextCompaction", "warning"] as const;
+
+/** No recorded tool call or side-effecting provider work across every runner
+ * instance of this run. Unlike provesNoNativeRunProviderWork, a turn that only
+ * started, thought and wrote text still proves it. An empty
+ * pendingRuntimeRequests alone is NOT this proof. A read failure denies it. */
+export async function provesNoNativeRunToolWork(db: Pick<Db, "execute">, input: {
+  companyId: string; runId: string; signal?: AbortSignal;
+}): Promise<boolean> {
+  input.signal?.throwIfAborted();
+  const { companyId, runId } = input;
+  const inertKinds = sql.join(NATIVE_INERT_ITEM_KINDS.map(value => sql`${value}`), sql`, `);
+  const result = await db.execute(sql`select
+    exists (select 1 from ${heartbeatRunEvents} event where event.company_id = ${companyId} and event.run_id = ${runId}
+      and (event.event_type ~ '^(tool|semantic_tool|delegation|mcp_app|terminal|hook)[.]'
+        or (event.event_type ~ '^item[.]' and coalesce(event.payload->'prpEvent'->'payload'->>'kind', '') not in (${inertKinds})))) as "toolEvent",
+    exists (select 1 from ${toolInvocations} invocation where invocation.company_id = ${companyId}
+      and invocation.run_id = ${runId}) as "toolInvocation"`);
+  input.signal?.throwIfAborted();
+  const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<Record<string, unknown>>;
+  const row = rows[0];
+  return Boolean(row && row.toolEvent === false && row.toolInvocation === false);
+}
+
 export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "execute"> &
   Partial<Pick<EnvironmentRuntimeService, "readPredecessorSandboxRecord">>;
 type ProofDb = Pick<Db, "select" | "execute">;

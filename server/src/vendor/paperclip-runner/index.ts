@@ -161,6 +161,9 @@ export const runnerRecoveryFailureClass = runner.runnerRecoveryFailureClass;
 export const runnerPrepareRefusalCode = runner.runnerPrepareRefusalCode;
 export const RUNNER_PREPARE_REFUSAL_CODES = runner.RUNNER_PREPARE_REFUSAL_CODES;
 export const NativeRunnerRefreshRequiredError = runner.NativeRunnerRefreshRequiredError;
+// The Runner's typed definite absence of saved resume state (gate 6).
+export const NativeRunnerResumeStateUnavailableError = runner.NativeRunnerResumeStateUnavailableError;
+export const isRunnerResumeStateUnavailable = runner.isRunnerResumeStateUnavailable;
 export const INSTRUCTION_REFRESH_PREPARE_CODES = runner.INSTRUCTION_REFRESH_PREPARE_CODES;
 export const isInstructionRefreshPrepareCode = runner.isInstructionRefreshPrepareCode;
 export const runnerReconciliationFailureClass = runner.runnerReconciliationFailureClass;
