@@ -1,5 +1,6 @@
 import { REDACTED_EVENT_VALUE } from "../../redaction.js";
 import { nativeSha256 } from "./canonical.js";
+import { redactSecretShapes } from "../../vendor/paperclip-runner/index.js";
 
 const RECEIPT_FIELDS = new Set(["operationId", "apiOperationId", "callId", "ok", "status", "contentType"]);
 const REDACTED_FIELDS = new Set([...RECEIPT_FIELDS, "data", "apiPayloadRedacted", "apiPayloadSha256"]);
@@ -19,7 +20,8 @@ export function redactRunnerApiEvent<T extends { eventType: string; sourceKind: 
     && Object.keys(payload).every(key => SCHEMA_DENIAL_FIELDS.has(key))
     && SCHEMA_DENIAL_STRINGS.every(key => typeof payload[key] === "string"
       && payload[key].length > 0 && payload[key].length <= 512 && /^[\x20-\x7e]+$/.test(payload[key]))) {
-    return { ...redactRunnerApiPayloads(event), payload: event.payload };
+    return { ...redactRunnerApiPayloads(event), payload: Object.fromEntries(Object.entries(payload)
+      .map(([key, value]) => [key, typeof value === "string" ? redactSecretShapes(value) : value])) };
   }
   return redactRunnerApiPayloads(event);
 }
@@ -44,9 +46,12 @@ export function redactRunnerApiPayloads<T>(value: T): T {
     try {
       const parsed = JSON.parse(value);
       const redacted = redactRunnerApiPayloads(parsed);
-      return (JSON.stringify(parsed) === JSON.stringify(redacted) ? value : JSON.stringify(redacted)) as T;
-    } catch { return value; }
+      return (JSON.stringify(parsed) === JSON.stringify(redacted) ? redactSecretShapes(value) : JSON.stringify(redacted)) as T;
+    } catch { return redactSecretShapes(value) as T; }
   }
+  // Keep API payload hashing above this pass: changing private material under
+  // an existing source receipt must still conflict, even if both values redact.
+  if (typeof value === "string") return redactSecretShapes(value) as T;
   if (!value || typeof value !== "object") return value;
   const entry = value as Record<string, unknown>;
   const operation = entry.apiOperationId ?? entry.operationId;

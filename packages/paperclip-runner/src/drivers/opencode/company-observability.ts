@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { redactObservabilityDiagnostic } from "../agent-observability.js";
+import { redactSecretShapes } from "../../secret-shapes.js";
 
 type Attributes = Record<string, string | number | boolean>;
 interface Span { id: string; name: string; start: number; end: number; failed: boolean; attributes: Attributes }
@@ -84,6 +85,7 @@ export function createOpenCodeCompanyObservability(input: {
     if (typeof value !== "string") return "";
     let text = redactObservabilityDiagnostic(value, env);
     for (const secret of input.sensitiveValues.filter(Boolean).sort((a, b) => b.length - a.length)) text = text.replaceAll(secret, "[REDACTED]");
+    text = redactSecretShapes(text);
     const bytes = Buffer.from(text);
     if (bytes.length > limit && current) current.truncated = true;
     let end = Math.min(bytes.length, limit);

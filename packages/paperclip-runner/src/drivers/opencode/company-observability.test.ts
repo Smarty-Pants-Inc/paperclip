@@ -1,6 +1,7 @@
 import { expect, it, vi } from "vitest";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
 import { createOpenCodeCompanyObservability } from "./company-observability.js";
+import { shapeAssignments, shapePems, shapeTokens } from "../pi/pi-shape-redaction.test-fixture.js";
 
 const environment = {
   PAPERCLIP_OBSERVABILITY_OPENCODE: "1", OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "https://collector.example/v1/traces",
@@ -22,6 +23,19 @@ function setup(env = environment, response = new Response("{}")) {
   const observer = createOpenCodeCompanyObservability({ environment: env, model: "openrouter/test-model", sensitiveValues: ["provider-secret"], fetch: transport, onDiagnostic: diagnostic });
   return { observer: observer!, bodies, transport, diagnostic };
 }
+it.for([...shapeTokens, ...shapeAssignments, ...shapePems])("redacts unknown $kind shapes in OpenCode's existing exporter", async ({ value }) => {
+  const { observer, bodies, transport } = setup();
+  observer.observe(event("turn.submitted", { text: `safe prompt ${value}` }));
+  observer.observe(event("tool.execution.completed", { name: `safe tool ${value}`, output: `safe result ${value}`, status: "failed" }, "run-one", "shape"));
+  observer.observe(event("item.completed", { kind: "agentMessage", text: `safe answer ${value}` }));
+  observer.observe(event("turn.completed"));
+  await observer.close();
+  expect(transport).toHaveBeenCalledOnce();
+  const wire = JSON.stringify(bodies);
+  expect(wire).not.toContain(JSON.stringify(value).slice(1, -1));
+  expect(wire).toContain("[REDACTED:");
+  expect(wire).toContain("safe result");
+});
 it("requires an explicit controller opt-in even when ambient OTLP is configured", () => {
   expect(setup({ ...environment, PAPERCLIP_OBSERVABILITY_OPENCODE: "0" }).observer).toBeUndefined();
   expect(createOpenCodeCompanyObservability({ environment: undefined, model: "test", sensitiveValues: [] })).toBeUndefined();

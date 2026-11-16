@@ -86,9 +86,25 @@ private bind/tool socket paths. The same list builder used by OpenCode includes
 literal, JSON-escaped and multiline/PEM-body forms. Initial and rotated provider
 broker capabilities join the live redaction list before binding; retired values
 remain protected if a later turn echoes them. Redaction precedes field truncation
-and covers captured prompts, answers, tool output and projected command names.
-This protects known launch/runtime values, not arbitrary secrets discovered in
-files or transformed into unrecognized encodings; choose capture settings accordingly.
+and covers captured prompts, answers, tool output (including errors) and projected
+command names. After exact-value redaction, the shared Pi/OpenCode exporter also
+replaces recognizable unknown secret shapes with `[REDACTED:<kind>]`: private-key
+PEM blocks (including escaped newlines, space-joined, rewrapped and orphan framing
+with adjacent base64), GitHub, OpenAI/Anthropic, Langfuse, Slack and AWS access-key
+shapes, JWTs, bearer credentials, and shell/JSON assignments whose names contain
+KEY, TOKEN, SECRET, PASSWORD, PRIVATE or CREDENTIAL. Assignment names and existing
+redaction marks are retained. Ordinary prose, identifiers, UUIDs and bare git SHAs
+are not secret shapes. The same pure pass runs after registered-value redaction
+at the server's existing recursive native API/run-log redaction boundary, after
+API payload hashing and before native event persistence; it does not modify
+provider inputs or raw Pi session files.
+
+These are conservative output heuristics, not a guarantee against all secret
+encodings. Arbitrary base64 re-encoding without recognizable framing, secret
+shapes split across separate streaming receipts, and formats outside this table
+are not recognized. Secret-named assignments can redact nonsecret code values;
+orphan PEM framing can consume adjacent base64-looking text. Choose capture
+settings accordingly.
 
 The image-N event adapter is **our code**: Pi's sink emits `turn.started` and
 per-receipt `usage.reported`, not the exporter's submission/usage layout. It is

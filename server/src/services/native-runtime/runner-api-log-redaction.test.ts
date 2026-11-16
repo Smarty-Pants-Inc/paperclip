@@ -66,6 +66,28 @@ describe("API payload persistence redaction", () => {
     expect(JSON.stringify(redactRunnerApiEvent(nested))).not.toContain("private-fixture-value");
     expect(redactRunnerApiPayloads(payload)).not.toHaveProperty("inputSchemaGuidance");
   });
+  it("redacts unknown shapes even in the bounded schema-denial exception", () => {
+    const token = `ghp_${"FakeShapeToken9".repeat(3)}`;
+    const event = { sourceKind: "runner", eventType: "harness.diagnostic", payload: {
+      provider: "pi", operationId: "call_api", callId: "denied", code: "semantic_tool_denied", paperclipExecuted: false,
+      message: `Invalid input ${token}`, inputSchemaGuidance: "Check /properties/title/type.",
+    } };
+    const saved = redactRunnerApiEvent(event);
+    expect(saved.payload.message).toBe("Invalid input [REDACTED:github]");
+    expect(saved.payload.inputSchemaGuidance).toBe(event.payload.inputSchemaGuidance);
+    expect(event.payload.message).toContain(token);
+    expect(redactRunnerApiEvent(saved)).toEqual(saved);
+  });
+  it("redacts JSON argument copies without collapsing private API replay hashes", () => {
+    const text = JSON.stringify({ command: '"privateMaterial": "fake-shaped-assignment"' });
+    expect(redactRunnerApiPayloads({ text }).text).not.toContain("fake-shaped-assignment");
+    const first = { operationId: "call_api", data: { token: `sk-${"FakeShape9".repeat(3)}` } };
+    const second = { ...first, data: { token: `sk-${"OtherShape9".repeat(3)}` } };
+    const a = redactRunnerApiPayloads(first) as any, b = redactRunnerApiPayloads(second) as any;
+    expect(a.apiPayloadSha256).not.toBe(b.apiPayloadSha256);
+    expect(redactRunnerApiPayloads(a)).toEqual(a);
+    expect(redactRunnerApiPayloads(b)).toEqual(b);
+  });
   it("omits malformed API arguments and semantic result envelopes", () => {
     const value = { item: { type: "tool_use", name: "call_api", input: { operationId: "invalid", body: { value: "private-fixture-value" } } },
       result: { operationId: "call_api", result: { data: "private-fixture-value" } } };

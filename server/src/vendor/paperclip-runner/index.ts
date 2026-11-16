@@ -91,6 +91,7 @@ const sourceUrl = new URL(
 );
 const runner = (await import(sourceUrl.href)) as RunnerModule;
 export const taskDocumentKeySchema = runner.taskDocumentKeySchema;
+export const redactSecretShapes = runner.redactSecretShapes;
 
 export const CURSOR_CLOUD_DEFAULT_TIMEOUT_MS = runner.CURSOR_CLOUD_DEFAULT_TIMEOUT_MS;
 export const RUNNER_TOOL_SCOPE_TOKEN_HEADER = runner.RUNNER_TOOL_SCOPE_TOKEN_HEADER;
