@@ -716,7 +716,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (!binding) return;
     if (!binding.initial || this.#activeTurn) throw new Error("Pi recovery cannot release an active binding");
     await this.#sendBind({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin }, undefined, budget);
-    await this.#revokeBinding();
+    await this.#revokeBinding(budget);
   }
 
   async attachRun(input: Parameters<NonNullable<HarnessSession["attachRun"]>>[0] & {
@@ -929,9 +929,20 @@ export class PiRpcHarnessSession implements HarnessSession {
     if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
     this.#admitted = false;
     try {
-      await this.#revokeBinding();
+      // Host-local broker work is accounted inside this admission's wall-clock
+      // budget (it guards the facade's 30 s receive wait), bounded by what
+      // remains rather than allowed to overrun it before the bind exchange.
+      await this.#revokeBinding(budget);
       signal?.throwIfAborted();
-      const broker = await createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
+      const pending = createPiProviderBinding({ model: this.#config.model, environment: resident.environment, thinkingLevel: this.#config.piRpcThinkingLevel, modelConfiguration: resident.modelConfiguration });
+      let broker: Awaited<typeof pending>;
+      try {
+        broker = await budget.request(() => pending, this.#admissionTimeoutMs ?? 10_000, "Pi provider binding timed out", signal);
+      } catch (error) {
+        // A broker that arrives after the deadline is still owned: revoke it.
+        void pending.then(late => late.close()).catch(() => undefined);
+        throw error;
+      }
       const origin = { epoch: resident.epoch + 1, runId, turnId: `pi-turn-${randomUUID()}` };
       resident.binding = { origin, close: broker.close, initial: false };
       const request = { schema: 1, type: "bind", nonce: randomUUID(), sessionId: this.#normalizedSessionId,
@@ -972,7 +983,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       ? this.#measure(`runner.pi.${kind}`, work, origin) : work();
   }
 
-  async #revokeBinding(): Promise<void> {
+  /** With an admission budget, revocation spends (and is bounded by) it. */
+  async #revokeBinding(budget?: PiAdmissionBudget): Promise<void> {
     if (!this.#providerRevocation) {
       const binding = this.#revokingBinding ?? this.#resident?.binding;
       if (!binding) return;
@@ -984,7 +996,9 @@ export class PiRpcHarnessSession implements HarnessSession {
         .then(() => { this.#revokingBinding = null; })
         .finally(() => { this.#providerRevocation = undefined; });
     }
-    await withTimeout(this.#providerRevocation, 5000, "Pi broker revocation timed out");
+    const revocation = this.#providerRevocation;
+    if (budget) await budget.request(() => revocation, 5000, "Pi broker revocation timed out");
+    else await withTimeout(revocation, 5000, "Pi broker revocation timed out");
   }
 
   async #fenceFailure(error: unknown): Promise<void> {
