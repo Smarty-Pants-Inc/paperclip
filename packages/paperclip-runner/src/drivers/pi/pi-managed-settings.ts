@@ -101,7 +101,10 @@ export async function configurePiManagedCompaction(input: {
   const inherited = !hasSettings && !sameHome;
   // Image defaults are not authority to route a managed session away from its
   // loopback provider. Pi 1.5.2 settings.md:13-14 defines these startup defaults.
-  const base = inherited ? { ...original, ...(input.model.startsWith("paperclip/")
+  // Override only when the image sets a startup default; otherwise inherit
+  // nothing extra, so a managed home without image defaults stays unchanged.
+  const routesAway = record(original) && (original.defaultProvider !== undefined || original.defaultModel !== undefined);
+  const base = inherited ? { ...original, ...(routesAway && input.model.startsWith("paperclip/")
     ? { defaultProvider: "paperclip", defaultModel: input.model.slice("paperclip/".length) } : {}) } : settings;
   // Validate every package before creating or writing the managed home: Pi must
   // never fall back to installing a missing npm source during startup.
