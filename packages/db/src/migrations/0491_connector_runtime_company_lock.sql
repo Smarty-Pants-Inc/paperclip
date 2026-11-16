@@ -310,3 +310,27 @@ $$;
 DROP TRIGGER IF EXISTS paperclip_agent_runtime_files_changed ON activity_log;
 CREATE TRIGGER paperclip_agent_runtime_files_changed AFTER INSERT ON activity_log
   REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION paperclip_agent_runtime_files_changed();
+--> statement-breakpoint
+-- #20805 R2 (src11, review-fleet-4 F1c): an agents row's existing manager
+-- (reports_to) takes its FK key share in a BEFORE ROW trigger, while the
+-- statement's rows are written and before any AFTER ROW runtime record
+-- (paperclip_agent_runtime_changed) takes the shared company hold. Before this, in
+-- a multi-row agents INSERT the RI check of a later row took the manager's key
+-- share after an earlier row's runtime record held the shared lock. The RI
+-- check then finds the key share already held. Same rows, same revisions.
+CREATE OR REPLACE FUNCTION paperclip_agent_runtime_lock_manager() RETURNS trigger
+LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+BEGIN
+  PERFORM 1 FROM agents WHERE id = NEW.reports_to FOR KEY SHARE;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_insert ON agents;
+CREATE TRIGGER paperclip_agent_runtime_lock_manager_insert BEFORE INSERT ON agents
+  FOR EACH ROW WHEN (NEW.reports_to IS NOT NULL) EXECUTE FUNCTION paperclip_agent_runtime_lock_manager();
+--> statement-breakpoint
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_update ON agents;
+CREATE TRIGGER paperclip_agent_runtime_lock_manager_update BEFORE UPDATE OF reports_to ON agents
+  FOR EACH ROW WHEN (NEW.reports_to IS NOT NULL AND NEW.reports_to IS DISTINCT FROM OLD.reports_to)
+  EXECUTE FUNCTION paperclip_agent_runtime_lock_manager();
