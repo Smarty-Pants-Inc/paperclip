@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, or, sql } from "drizzle-orm";
 import { heartbeatRuns, issues, projects, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
@@ -51,6 +51,38 @@ async function taskProject(db: Executor, companyId: string, issueId: string | nu
 /** Only queue admission may create the pair; credential consumers must only read it. */
 export function captureProjectConnectionRunContext(db: Executor, input: CaptureInput): Promise<ProjectConnectionRunContext> {
   return resolveRunContext(db, input, true);
+}
+
+/**
+ * Queue writers call this after their task lock and before subordinate run,
+ * wake, profile or agent locks. The task id comes from the writer's authorized
+ * binding, never a caller project hint. Persist the returned pair atomically
+ * with the new run (including scheduled retries).
+ */
+export async function projectConnectionAdmissionSnapshot(db: Executor, input: Readonly<{
+  companyId: string; agentId: string; issueId: string | null; contextSnapshot: Record<string, unknown>;
+}>): Promise<Record<string, unknown>> {
+  assertBoundRunIssueId({ issueId: input.issueId, contextSnapshot: input.contextSnapshot });
+  const issueId = boundRunIssueId({ issueId: input.issueId, contextSnapshot: input.contextSnapshot });
+  const projectId = await taskProject(db, input.companyId, issueId, true);
+  const projectIds = new Set<string>();
+  if (projectId) projectIds.add(projectId);
+  else {
+    // D also protects an installed agent's taskless/non-project work. Use the
+    // same saved install boundary and sorted lifecycle locks for that case.
+    const owned = await db.select({ projectId: toolConnections.projectId }).from(toolConnections)
+      .innerJoin(toolConnectionInstalls, and(eq(toolConnectionInstalls.companyId, toolConnections.companyId),
+        eq(toolConnectionInstalls.connectionId, toolConnections.id)))
+      .where(and(eq(toolConnections.companyId, input.companyId), or(
+        and(eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, input.agentId)),
+        and(eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, input.companyId)),
+      )));
+    for (const row of owned) if (row.projectId) projectIds.add(row.projectId);
+  }
+  for (const id of [...projectIds].sort()) await lockProjectConnectionLifecycle(db, { companyId: input.companyId, projectId: id });
+  // Task remains locked across the lifecycle wait. Only a server-derived pair
+  // survives; copied predecessor/caller pairs are not authority for a new run.
+  return { ...input.contextSnapshot, [SNAPSHOT_KEY]: { version: 1, issueId, projectId } };
 }
 
 /** Read the admission pair without inventing one at first credential/cache use. */

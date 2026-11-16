@@ -6,7 +6,7 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import { lockProjectConnectionRows } from "./project-connection-arbitration.js";
 import { assertProjectConnectionNotInUse } from "./project-connection-retirement.js";
-import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
 import { profileManagementActor } from "./tool-access/profiles/connection-configuration.js";
 import { isGitHubAppConnection } from "./github-app-client.js";
 import type { DbTransaction } from "./tool-access/types.js";
@@ -1646,7 +1646,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
           || ctx.actorType !== "agent" || !ctx.agentId) {
           return decision("deny", "deny_policy_block", "Project connection is not available to this actor.", [], [], { redactionPlan: redaction.redactionPlan });
         }
-        const run = await captureProjectConnectionRunContext(tx, {
+        const run = await readProjectConnectionRunContext(tx, {
           companyId: ctx.companyId, agentId: ctx.agentId, heartbeatRunId: ctx.heartbeatRunId,
         });
         if (run.projectId && run.projectId !== connection.projectId) {
