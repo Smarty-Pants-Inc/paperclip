@@ -370,7 +370,7 @@ async function exchange(socketPath: string, request: unknown, options: PiPrivate
       if (error) reject(error); else resolve(value);
     };
     const abort = () => finish(new Error("Pi private request aborted"));
-    const timer = setTimeout(() => finish(new Error("Pi private request timed out")), timeoutMs);
+    const timer = setTimeout(() => finish(Object.assign(new Error("Pi private request timed out"), { code: "pi_bind_timeout" })), timeoutMs);
     options.signal?.addEventListener("abort", abort, { once: true });
     socket.once("error", () => finish(new Error("Pi private channel failed")));
     socket.once("close", () => finish(new Error("Pi private channel closed before receipt")));
