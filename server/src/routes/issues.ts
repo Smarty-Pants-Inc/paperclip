@@ -19957,7 +19957,11 @@ export function issueRoutes(
 
   router.get("/companies/:companyId/chats", async (req, res) => {
     const companyId = req.params.companyId as string;
-    if (req.query.members === "all" && !actorCanAccessCompany(req, companyId)) throw notFound("Agent not found");
+    if (req.query.members === "all") {
+      if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
+      if (!actorCanAccessCompany(req, companyId) ||
+          (await access.getMembership(companyId, "user", req.actor.userId))?.status !== "active") throw notFound("Agent not found");
+    }
     assertCompanyAccess(req, companyId);
     if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
     if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
@@ -19969,7 +19973,6 @@ export function issueRoutes(
       }).strict().safeParse(req.query);
       if (!query.success) throw badRequest("Invalid conversation filters");
       const { agentId, limit, offset } = query.data;
-      if ((await access.getMembership(companyId, "user", req.actor.userId))?.status !== "active") throw notFound("Agent not found");
       const resolved = await agentsSvc.resolveByReference(companyId, agentId);
       if (!resolved.agent || !(await access.decide({ actor: req.actor, action: "agent:read",
         resource: { type: "agent", companyId, agentId },
