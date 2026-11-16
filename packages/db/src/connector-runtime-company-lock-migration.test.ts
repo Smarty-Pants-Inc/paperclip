@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { appendFile, readFile } from "node:fs/promises";
 import postgres from "postgres";
 import { describe, expect, it } from "vitest";
 import { applyPendingMigrations } from "./client.js";
@@ -69,7 +69,9 @@ async function functionStatements(path: string) {
         AND resource_type = 'agent_runtime' GROUP BY resource_id ORDER BY resource_id`;
       expect(bumped.map(row => [row.resource_id, row.n])).toEqual([...agentIds].sort().map(id => [id, 1]));
 
-      console.info(`RED_E_MIGRATION ${JSON.stringify({ seededRevisions: seeded.length, upDownRowDelta: 0, downRestoresPrevious: true, rerunRowDelta: 0 })}`);
+      const line = `RED_E_MIGRATION ${JSON.stringify({ seededRevisions: seeded.length, upDownRowDelta: 0, downRestoresPrevious: true, rerunRowDelta: 0 })}`;
+      console.info(line);
+      if (process.env.RED_EVIDENCE_FILE) await appendFile(process.env.RED_EVIDENCE_FILE, line + "\n");
     } finally {
       await sql.end(); await database.cleanup();
     }
