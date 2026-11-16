@@ -233,7 +233,8 @@ describe("resident Pi model binding", () => {
     expect(diagnostics[0]).toMatchObject({ runId: "run-b" });
     expect(diagnostics[0]!.turnId).toBeUndefined();
     expect(diagnostics[1]).toMatchObject({ runId: "run-b", turnId: turn.turnId });
-    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(8);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now()).filter(span => span.name === "runner.pi.tool_inventory")).toEqual([expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })]);
     expect(parseProviderPerformanceSpans(diagnostics[1]!.payload, Date.now()).map(span => span.name))
       .toEqual(["runner.pi.admission.get_state", "runner.pi.begin_turn", "runner.pi.prompt_to_started"]);
     expect(runEvents.indexOf(runEvents.find(event => event.eventType === "turn.started")!))
@@ -244,7 +245,8 @@ describe("resident Pi model binding", () => {
       ...admission.map(command => `runner.pi.admission.${command}`),
     ]));
     expect(spans.filter(span => span.name === "runner.pi.admission.get_state")).toHaveLength(3);
-    expect(spans).toHaveLength(10);
+    expect(spans).toHaveLength(11);
+    expect(spans.filter(span => span.name === "runner.pi.tool_inventory")).toEqual([expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })]);
     for (const span of spans) {
       expect(span.outcome).toBe("ok");
       expect(span.startedAtMs).toBeGreaterThanOrEqual(startedAtMs);
@@ -272,7 +274,8 @@ describe("resident Pi model binding", () => {
     const visible = diagnostics.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
     const counts = (spans: ProviderPerformanceSpan[]) => Object.fromEntries([...new Set(spans.map(span => span.name))]
       .map(name => [name, spans.filter(span => span.name === name).length]));
-    expect(emitted).toHaveLength(210);
+    expect(emitted).toHaveLength(211);
+    expect(emitted.filter(span => span.name === "runner.pi.tool_inventory")).toEqual([expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })]);
     expect(emitted.length).toBeGreaterThan(MAX_PROVIDER_PERFORMANCE_SPANS);
     expect(emitted.filter(span => span.name === "runner.pi.admission.get_state").length).toBeGreaterThan(16);
     expect(counts(visible)).toEqual(counts(emitted));
@@ -290,12 +293,12 @@ describe("resident Pi model binding", () => {
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
     const expected: Record<string, number> = {
-      "runner.pi.attach": 1, "runner.pi.bind": 1,
+      "runner.pi.attach": 1, "runner.pi.bind": 1, "runner.pi.tool_inventory": 1,
       "runner.pi.admission.get_state": 2, "runner.pi.admission.set_model": 1,
       "runner.pi.admission.get_available_thinking_levels": 1, "runner.pi.admission.set_thinking_level": 1,
     };
     for (let index = 0; index < 100; index++) {
-      if (index % 3 === 0) { await f.session.attachRun({ runId: "run-b" }); expected["runner.pi.attach"]!++; }
+      if (index % 3 === 0) { await f.session.attachRun({ runId: "run-b" }); expected["runner.pi.attach"]!++; expected["runner.pi.tool_inventory"]!++; }
       else if (index % 3 === 1) { await f.session.revalidateAfterClaim(); expected["runner.pi.admission.get_state"]!++; }
       else {
         await f.session.reconnect();
@@ -305,6 +308,7 @@ describe("resident Pi model binding", () => {
       const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
       const emitted = diagnostics.flatMap(event => event.payload.spans as ProviderPerformanceSpan[]);
       const visible = diagnostics.flatMap(event => parseProviderPerformanceSpans(event.payload, Date.now()));
+      expect(visible.filter(span => span.name === "runner.pi.tool_inventory")).toEqual(Array.from({ length: expected["runner.pi.tool_inventory"]! }, () => expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })));
       // All completed measurements have drained at each public admission boundary:
       // zero retained spans is stronger than merely staying below the 128-span bound.
       expect(emitted).toHaveLength(Object.values(expected).reduce((sum, count) => sum + count, 0));
@@ -341,7 +345,8 @@ describe("resident Pi model binding", () => {
     expect(events.at(-1)).toMatchObject({ eventType: disposition === "rejected" ? "turn.failed" : "turn.completed" });
     // External admission drains seven spans; the turn's state proof and
     // begin_turn wait until turn.started. No agent_start means no prompt-to-start span.
-    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(8);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now()).filter(span => span.name === "runner.pi.tool_inventory")).toEqual([expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })]);
     expect(parseProviderPerformanceSpans(diagnostics[1]!.payload, Date.now())).toHaveLength(2);
     await f.session.close(); await tick();
     expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(2);
@@ -358,7 +363,8 @@ describe("resident Pi model binding", () => {
     const diagnostics = f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans");
     expect(diagnostics).toHaveLength(1);
     expect(diagnostics[0]!.turnId).toBeUndefined();
-    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(7);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now())).toHaveLength(8);
+    expect(parseProviderPerformanceSpans(diagnostics[0]!.payload, Date.now()).filter(span => span.name === "runner.pi.tool_inventory")).toEqual([expect.objectContaining({ name: "runner.pi.tool_inventory", outcome: "ok" })]);
     const initialRunTimings = f.events.filter(event => event.runId === "run-a" && event.payload.code === "provider_performance_spans");
     expect(initialRunTimings).toHaveLength(2); // Cold open, then the first turn.
     expect(initialRunTimings[0]!.turnId).toBeUndefined();
