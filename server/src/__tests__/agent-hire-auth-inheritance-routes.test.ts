@@ -23,6 +23,7 @@ import {
   userSecretDefinitions,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectNoTokenLeak } from "./helpers/token-leak.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
 import { secretService } from "../services/secrets.js";
@@ -43,6 +44,31 @@ type Db = ReturnType<typeof createDb>;
 // The fixed Claude Code OAuth binding. It is a user-secret reference to the
 // fixed key. Any other shape is a replacement or a weaker binding.
 const FIXED_CLAUDE_OAUTH_BINDING = { type: "user_secret_ref", key: "CLAUDE_CODE_OAUTH_TOKEN" } as const;
+const FIXTURE_CLAUDE_OAUTH_TOKEN = "sk-ant-oat01-fixture-hire-oauth-0123456789abcdef";
+
+// Keep reason: #20816, a never-OK credential leak across the hire response boundary.
+// Each planted response must trip the same assertion used on the real route.
+describe("hire response token-leak guard controls", () => {
+  it.each([
+    ["seeded OAuth value", FIXTURE_CLAUDE_OAUTH_TOKEN],
+    ["exact value without a token prefix", "fixture-unprefixed-secret"],
+    ["unseeded Claude API shape", "sk-ant-api03-planted-0123456789abcdefghijkl"],
+    ["unseeded Claude OAuth shape", "sk-ant-oat01-planted-0123456789abcdefghijkl"],
+    ["unseeded OpenAI project shape", "sk-proj-planted-0123456789abcdefghijkl"],
+  ])("rejects a planted %s in a response object", (_label, token) => {
+    expect(() => expectNoTokenLeak(
+      { agent: { metadata: { leakedToken: token } } },
+      [FIXTURE_CLAUDE_OAUTH_TOKEN, "fixture-unprefixed-secret"],
+    )).toThrow();
+  });
+
+  it("accepts instructions paths containing sl-task-", () => {
+    expect(() => expectNoTokenLeak({ agent: { adapterConfig: {
+      instructionsFilePath: "/tmp/sl-task-0123456789abcdefghijkl/instructions/AGENTS.md",
+      instructionsRootPath: "/tmp/sl-task-0123456789abcdefghijkl/instructions",
+    } } }, [FIXTURE_CLAUDE_OAUTH_TOKEN])).not.toThrow();
+  });
+});
 
 function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
   return { type: "agent", agentId, companyId, source: "agent_jwt" };
@@ -83,10 +109,10 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     await db.delete(approvals);
     await db.delete(activityLog);
     await db.delete(userSecretDeclarations);
-    await db.delete(userSecretDefinitions);
     await db.delete(companySecretBindings);
     await db.delete(companySecretVersions);
     await db.delete(companySecrets);
+    await db.delete(userSecretDefinitions);
     await db.delete(companySecretProviderConfigs);
     await db.delete(principalPermissionGrants);
     await db.delete(companyMemberships);
@@ -661,6 +687,18 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
 
   it("inherits the fixed Claude OAuth binding, keeps its version, and leaks no token value", async () => {
     const companyId = await seedCompany();
+    const svc = secretService(db);
+    const definition = await svc.ensureClaudeOAuthUserSecretDefinition(companyId);
+    const secret = await svc.createCurrentUserSecretValue(companyId, "local-board", {
+      definitionId: definition.id,
+      value: FIXTURE_CLAUDE_OAUTH_TOKEN,
+    });
+    // Seed the actual encrypted value behind the pinned version, not just a ref.
+    for (let version = 2; version <= 3; version += 1) {
+      await svc.rotateCurrentUserSecretValue(companyId, "local-board", secret.id, {
+        value: FIXTURE_CLAUDE_OAUTH_TOKEN,
+      });
+    }
     const parent = await seedParentAgent(companyId, "claude_local", {
       CLAUDE_CODE_OAUTH_TOKEN: { ...FIXED_CLAUDE_OAUTH_BINDING, version: 3 },
     });
@@ -679,7 +717,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       version: 3,
     });
     // The response body carries the reference only, never a token value.
-    expect(JSON.stringify(res.body)).not.toContain("sk-");
+    expectNoTokenLeak(res.body, [FIXTURE_CLAUDE_OAUTH_TOKEN]);
 
     const declarations = await db
       .select()
