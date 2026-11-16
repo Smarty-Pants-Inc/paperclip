@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -762,6 +762,52 @@ describe("PiRpcDriver", () => {
       expect(f.events.some(event => event.eventType === "session.failed")).toBe(false);
       expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }
+  });
+
+  it("recreates driver-owned npm and company-skill links when opening a restored Pi home", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-restored-home-"));
+    const checkpoint = join(root, "checkpoint", "pi-agent");
+    const restoredHome = join(root, "restored", "pi-agent");
+    const originalHome = join(root, "original-pi-home");
+    const skillRoot = join(root, "company-skill");
+    const transport = new class extends FailureTransport {
+      override async request(type: string, _input?: PiRpcRecord) {
+        return { data: type === "get_state" ? { sessionId: "restored", model: { provider: "paperclip", id: "faux" }, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+          : type === "set_model" ? { provider: "paperclip", id: "faux" }
+          : type === "get_available_models" ? { models: [{ provider: "paperclip", id: "faux", contextWindow: 200000 }] }
+          : type === "get_available_thinking_levels" ? { levels: ["off"] }
+          : type === "prompt" ? { disposition: "started" } : undefined };
+      }
+    }();
+    vi.stubEnv("PI_CODING_AGENT_DIR", originalHome);
+    try {
+      await mkdir(join(checkpoint, "sessions"), { recursive: true });
+      await writeFile(join(checkpoint, "sessions", "restored.jsonl"), "resume-state\n");
+      await mkdir(join(originalHome, "npm"), { recursive: true });
+      await mkdir(skillRoot, { recursive: true });
+      await writeFile(join(skillRoot, "SKILL.md"), "skill\n");
+      await cp(checkpoint, restoredHome, { recursive: true });
+      const session = await new PiRpcDriver({ runtimeDirectory: join(root, "runtime"), model: "paperclip/faux", piRpcThinkingLevel: "off",
+        runtimeContext: { skills: [{ bundle: { rootPath: skillRoot } }] },
+        environment: { PI_CODING_AGENT_DIR: restoredHome, PI_OFFLINE: "1", PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1",
+          PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+        transportFactory: () => transport as unknown as PiRpcTransport,
+        bindRequest: (async (_path: string, command: PiBindCommand) => command.type === "bind"
+          ? { schema: 1, type: "bind", nonce: command.nonce, sessionId: command.sessionId, epoch: command.epoch, runId: command.runId,
+            provider: command.provider.name, model: command.model, thinkingLevel: command.thinkingLevel, ...bindContent(command) }
+          : command.type === "tool_inventory" ? { ...command, nativeTools: [] }
+          : command.type === "stop_children" ? { ...command, settled: [], uncertain: [] } : { ...command, ack: true }) as never,
+      }).openSession({ runId: "restored", normalizedSessionId: "restored", workingDirectory: root });
+      try {
+        expect(await readFile(join(restoredHome, "sessions", "restored.jsonl"), "utf8")).toBe("resume-state\n");
+        expect(await readlink(join(restoredHome, "npm"))).toBe(join(originalHome, "npm"));
+        const skillLinks = (await readdir(join(restoredHome, "skills", "paperclip-company-skills")))
+          .filter(name => name.startsWith("bundle-"));
+        expect(skillLinks).toHaveLength(1);
+        expect(skillLinks[0]).toMatch(/^bundle-[a-f0-9]{64}$/);
+        expect(await readlink(join(restoredHome, "skills", "paperclip-company-skills", skillLinks[0]!))).toBe(skillRoot);
+      } finally { await session.close({ reason: "unit cleanup" }); }
+    } finally { vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); }
   });
 
   it("opens a partial runtime context without granting an agent-files home", async () => {
