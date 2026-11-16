@@ -302,7 +302,16 @@ describe("native session state syncOut with an out-of-process late writer", () =
   // The late worker's own failure answers an RPC the host already settled, so
   // it reaches nobody (plugin-worker-manager drops a response for a settled call).
   const lateWorkerWrite = (target: string, bytes: string) => {
-    try { workerWrite(target, bytes); } catch { /* refused late write; no caller left to answer */ }
+    try { workerWrite(target, bytes); } catch (error) {
+      const failure = error as NodeJS.ErrnoException;
+      const fencePath = dirname(target);
+      if (failure?.code !== "ENOTDIR" || failure.path !== fencePath) throw error;
+      expect(failure.code).toBe("ENOTDIR");
+      expect(failure.path).toBe(fencePath);
+      expect(fencePath).toMatch(/\/paperclip-native-state-[^/]+\/transfer$/);
+      return;
+    }
+    expect.fail("late worker wrote state bytes; expected ENOTDIR at the staging transfer fence");
   };
   const observe = <T>(p: Promise<T>) => {
     let o: { value?: T; error?: unknown; at: number } | undefined;
