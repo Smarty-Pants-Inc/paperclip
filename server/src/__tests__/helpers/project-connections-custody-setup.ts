@@ -1,6 +1,9 @@
+import express from "express";
 import request from "supertest";
 import { eq } from "drizzle-orm";
-import { companySecrets, pluginConfig, plugins, projects, type Db, type toolConnections } from "@paperclipai/db";
+import { companySecrets, plugins, projects, type Db, type toolConnections } from "@paperclipai/db";
+import { pluginRoutes } from "../../routes/plugins.js";
+import { errorHandler } from "../../middleware/index.js";
 import { projectConnectionFixture, storedConnection } from "./project-connections-fixture.js";
 
 type Fixture = Awaited<ReturnType<typeof projectConnectionFixture>>;
@@ -16,7 +19,18 @@ export async function provisionFixtureCustodyManager(db: Db, f: Fixture) {
   if (!plugin) throw new Error("Custody setup requires the native manager plugin row");
   const [anchor] = await db.insert(projects).values({ companyId: f.companyId, name: "github-manager-key" }).returning();
   await db.insert(companySecrets).values({ companyId: f.companyId, key: "manager_private_key", name: "Manager key metadata only", scope: "instance", ownerPluginId: plugin.id, ownerProjectId: anchor!.id });
-  await db.insert(pluginConfig).values({ pluginId: plugin.id, companyId: f.companyId, configJson: { managerAppId: "999", managerKeyAnchorProjectId: anchor!.id } });
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = { type: "board", source: "session", sessionId: f.companyId, userId: f.human, isInstanceAdmin: true,
+      companyIds: [f.companyId], memberships: [{ companyId: f.companyId, membershipRole: "owner", status: "active" }] };
+    next();
+  });
+  app.use("/api", pluginRoutes(db, {} as never));
+  app.use(errorHandler);
+  const configured = await request(app).post(`/api/plugins/${plugin.id}/config`).set("Origin", "http://127.0.0.1")
+    .send({ companyId: f.companyId, configJson: { managerAppId: "999", managerKeyAnchorProjectId: anchor!.id } });
+  if (configured.status !== 200) throw new Error(`Custody manager session configuration failed (${configured.status}): ${JSON.stringify(configured.body)}`);
 }
 
 /** Real session route, vault, provider seam, receipt and atomic activity.
