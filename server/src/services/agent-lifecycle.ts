@@ -15,7 +15,8 @@ import { and, eq, inArray, isNull, notExists } from "drizzle-orm";
 import { issueService } from "./issues.js";
 import { persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
-import { withAccountingTransaction } from "./accounting-transaction.js";
+import { ACCOUNTING_TRANSACTION_ATTEMPTS, AccountingContentionError, accountingRetryDelayMs, isAccountingRetryable, withAccountingTransaction } from "./accounting-transaction.js";
+import { conflict } from "../errors.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
@@ -33,6 +34,29 @@ import { isProviderApiSetupDraft } from "./native-runtime/provider-api-placement
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
+
+async function withLifecycleTransaction<T>(db: Db, companyId: string,
+  work: (tx: Db, publications: ActivityPublication[]) => Promise<T>): Promise<T> {
+  if ("nestedIndex" in db) return withAccountingTransaction(db, companyId, work);
+  for (let attempt = 0; ; attempt++) {
+    try { return await withAccountingTransaction(db, companyId, work); }
+    catch (error) {
+      let cause = error, taskLockContended = false;
+      for (let depth = 0; cause && typeof cause === "object" && depth < 4; depth++) {
+        if ((cause as { code?: string }).code === "55P03") { taskLockContended = true; break; }
+        cause = (cause as { cause?: unknown }).cause;
+      }
+      if (!taskLockContended && !isAccountingRetryable(error)) throw error;
+      if (attempt + 1 >= ACCOUNTING_TRANSACTION_ATTEMPTS) {
+        if (taskLockContended) throw conflict("The retiring agent's tasks are busy. Retry the lifecycle operation.", {
+          code: "agent_retirement_task_contention",
+        });
+        throw new AccountingContentionError(error, attempt + 1);
+      }
+      await new Promise(resolve => setTimeout(resolve, accountingRetryDelayMs(attempt)));
+    }
+  }
+}
 
 export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): lifecycle.LifecycleEffects {
   return {
@@ -60,36 +84,37 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     },
     async beforeStatusChange(tx, companyId, agentId, before, after) {
       await notifyAttentionRetentionWork(tx, { companyId });
-      if (before !== after) {
-        if (after === "terminated") {
-          const companyAgents = await tx.select().from(agents).where(eq(agents.companyId, companyId));
-          const retiring = companyAgents.find(agent => agent.id === agentId);
-          const manager = companyAgents.find(agent => agent.id === retiring?.reportsTo);
-          // A company teardown may already have terminated the manager. Keep
-          // normal recovery ownership in that case, never prevent cleanup.
-          if (manager && getAgentWorkEligibility({ agent: manager, agents: companyAgents }).assignable) {
-            // Use ordinary task assignment, including its eligibility, visibility,
-            // receipt and execution-lock fencing. Never rewrite terminal history
-            // or the fixed identity of a conversation/channel-bound task.
-            const unfinished = await tx.select().from(issues).where(and(
-              eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId),
-              inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
-              isNull(issues.conversationAgentId),
-              notExists(tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
-                eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issues.id),
-              ))),
-            )).orderBy(issues.id).for("update");
-            for (const issue of unfinished) {
-              await issueService(tx).update(issue.id, {
-                companyGuard: companyId, assigneeAgentId: manager.id, assigneeUserId: null,
-                ...(issue.status === "in_progress" ? { status: "todo" } : {}),
-              }, tx, [], []);
-              await persistActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
-                action: "issue.reassigned", entityType: "issue", entityId: issue.id,
-                details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } });
-            }
+      if (after === "terminated") {
+        const companyAgents = await tx.select().from(agents).where(eq(agents.companyId, companyId));
+        const retiring = companyAgents.find(agent => agent.id === agentId);
+        const manager = companyAgents.find(agent => agent.id === retiring?.reportsTo);
+        // A company teardown may already have terminated the manager. Keep
+        // normal recovery ownership in that case, never prevent cleanup.
+        if (retiring?.lifecycleState === "cleaning_up" && manager
+          && getAgentWorkEligibility({ agent: manager, agents: companyAgents }).assignable) {
+          // Use ordinary task assignment, including its eligibility, visibility,
+          // receipt and execution-lock fencing. Never rewrite terminal history
+          // or the fixed identity of a conversation/channel-bound task.
+          const unfinished = await tx.select().from(issues).where(and(
+            eq(issues.companyId, companyId), eq(issues.assigneeAgentId, agentId),
+            inArray(issues.status, ["backlog", "todo", "in_progress", "in_review", "blocked"]),
+            isNull(issues.conversationAgentId),
+            notExists(tx.select({ id: chatConversations.id }).from(chatConversations).where(and(
+              eq(chatConversations.companyId, companyId), eq(chatConversations.issueId, issues.id),
+            ))),
+          )).orderBy(issues.id).for("update", { noWait: true });
+          for (const issue of unfinished) {
+            await issueService(tx).update(issue.id, {
+              companyGuard: companyId, assigneeAgentId: manager.id, assigneeUserId: null,
+              ...(issue.status === "in_progress" ? { status: "todo" } : {}),
+            }, tx, [], []);
+            await persistActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
+              action: "issue.reassigned", entityType: "issue", entityId: issue.id,
+              details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } });
           }
         }
+      }
+      if (before !== after) {
         await notifyStrandedAgentStatus(tx, { companyId, agentId });
         await notifyRunDispatch(tx, { companyId });
         await notifyDeferredExecutionEligibility(tx, { companyId });
@@ -106,7 +131,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
       const code = lifecycle.lifecycleFailureCode(error);
       logger.warn({ ...context, failureCode: code ?? "unclassified" }, "Agent lifecycle operation failed");
     },
-    transaction: withAccountingTransaction,
+    transaction: withLifecycleTransaction,
     deleteDependencies: deleteAgentDependencies,
     policyBlocks,
     setAgentBudget: (db, publications, companyId, agentId, amount, userId, isActive) =>
@@ -130,11 +155,14 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}, aut
   const effects = createAgentLifecycleEffects(hooks);
   // Reporting-tree edits use this same company accounting lock. Never reuse a
   // route's earlier authorization snapshot after waiting for that lock.
-  if (authorize) effects.transaction = (database, companyId, work) =>
-    withAccountingTransaction(database, companyId, async (tx, publications) => {
-      await authorize(tx);
-      return work(tx, publications);
-    });
+  if (authorize) {
+    const transaction = effects.transaction;
+    effects.transaction = (database, companyId, work) =>
+      transaction(database, companyId, async (tx, publications) => {
+        await authorize(tx);
+        return work(tx, publications);
+      });
+  }
   return lifecycle.createAgentLifecycle(db, effects);
 }
 
