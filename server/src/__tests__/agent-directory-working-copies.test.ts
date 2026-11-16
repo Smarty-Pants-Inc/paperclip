@@ -1,4 +1,5 @@
 import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
+import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
@@ -90,11 +91,15 @@ describe("persistent agent directories", () => {
   });
 
   gitExclusionRetryContract(async (runId, executionTarget) => {
-    if (!await copies.get(companyId, runId)) {
+    if (!(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).length) {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
     }
     return copies.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget });
-  });
+  }, async () => {
+    // Retire fixture-only remote owners before the unscoped cleanup-worker tests.
+    await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), nextAttemptAt: null,
+      receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } }).where(eq(agentInstructionWorkingCopies.companyId, companyId));
+  }, (runId, error) => queueGitExclusionNextTry(db, companyId, agentId, userId, runId, error));
 
   describe("post-save directory cleanup worker", () => {
     afterEach(async () => {
