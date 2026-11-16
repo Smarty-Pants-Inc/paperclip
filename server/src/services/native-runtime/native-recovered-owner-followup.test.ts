@@ -1266,6 +1266,35 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       providerLeaseId: followUp.providerLeaseId })).toBe(true);
   }, 60_000);
 
+  // RFL F1 (dl-floor-b3 RED, no fix): the retry today goes through fresh-session
+  // preparation (heartbeat/run-state.ts:819 -> session-preparation.ts:203-207),
+  // which drops the task session it would resume. The same-run branch keeps
+  // the checkpoint runtime selection rebound onto THIS run from the set-aside
+  // owner (runtime-selection.ts:1105-1115); recovery evidence reads it as an
+  // established provider session (native-session-executor.ts:9776-9786).
+  it("F1 RED: drops the set-aside owner's inherited resume checkpoint when SMA-66's same run starts its fresh thread", async () => {
+    const { followUp, floor } = await seedSuspendNeverFinished("retained");
+    const checkpointOf = async () => (await db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, followUp.runId)))[0]?.profile?.sessionCheckpoint as Record<string, unknown> | undefined;
+    expect((await checkpointOf())?.providerSessionId).toBe("provider-session-before-recovery");
+    expect(await followUp.start("created", undefined, false, floor)).toBe(ADMITTED);
+    expect((await checkpointOf())?.providerSessionId).not.toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  // RFL F1 (dl-floor-b3 RED, no fix): the allocation changed between the
+  // heartbeat's acquisition and the quarantine (this run's own lease is no
+  // longer active). The same run must not start its fresh thread on the stale
+  // allocation without re-reading it (the retry re-acquires in workspace
+  // preparation, heartbeat.ts:2965-2995).
+  it("F1 RED: does not start SMA-66's same-run fresh thread on an allocation that is no longer this run's active lease", async () => {
+    const { prior, followUp, proofs, floor } = await seedSuspendNeverFinished("retained");
+    await db.insert(environmentLeases).values({ id: followUp.leaseId, companyId, environmentId: followUp.environmentId,
+      issueId: prior.issueId, heartbeatRunId: followUp.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+      status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    const outcome = await followUp.start("created", undefined, false, floor);
+    expect({ outcome, proofs: proofs.length }).not.toEqual({ outcome: ADMITTED, proofs: 1 });
+  }, 60_000);
+
   it.each([
     { label: "its prior lease is still active", status: "active" as const },
     { label: "it ended on this very sandbox", status: "expired" as const, sameSandbox: true },
