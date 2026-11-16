@@ -63,6 +63,7 @@ import {
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 import { resolveConnectionGrantSecret } from "../services/connection-credentials.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import * as cogneeBridge from "../services/cognee-connection.js";
 import { createKvDemoHttpServer, type KvDemoHttpServer } from "../../../packages/kv-demo-mcp-server/src/http.js";
 import {
@@ -565,6 +566,10 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   }, 90_000);
 
   afterEach(async () => {
+    // Runtime secret resolutions defer audit inserts. Settle that existing queue
+    // before deleting its rows/parents; otherwise it can repopulate audits in the
+    // cleanup window and leave company_id's restrictive FK behind.
+    await flushSecretResolutionWrites(db);
     await db.delete(activityLog);
     await db.delete(toolCallEvents);
     await db.delete(toolRuntimeSlots);
@@ -599,6 +604,7 @@ describeEmbeddedPostgres("tool gateway acceptance", () => {
   });
 
   afterAll(async () => {
+    if (db) await flushSecretResolutionWrites(db);
     await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
   });
