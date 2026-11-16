@@ -54,6 +54,14 @@ let pluginContext: PluginContext | undefined;
 let spareClaimStore: ReadySpareClaimStore | undefined;
 let spareRefreshTimer: ReturnType<typeof setInterval> | undefined;
 let spareMaintenanceWork: Promise<void> | undefined;
+/**
+ * The #20912 stale sync-temp sweep runs at startup and then every 30 minutes,
+ * with identical rules, so a killed worker's temp that was younger than
+ * SYNC_TEMP_MAX_AGE_MS at startup does not wait for a later restart.
+ */
+const SYNC_TEMP_SWEEP_INTERVAL_MS = 30 * 60_000;
+let syncTempSweepTimer: ReturnType<typeof setInterval> | undefined;
+let syncTempSweepWork: Promise<void> | undefined;
 let shuttingDown = false;
 let boatRateLimitPauseUntil = 0;
 const preparedEnvDirectories = new Map<string, string>();
@@ -974,6 +982,14 @@ function refreshRunCreateLedger(config: Config, companyId: string, environmentId
     .finally(() => { if (runCreateLedgerReads.get(companyId)?.work === work) runCreateLedgerReads.set(companyId, { at: startedAt }); });
   runCreateLedgerReads.set(companyId, { at: last?.at ?? Number.NEGATIVE_INFINITY, work });
 }
+/** One best-effort pass of the #20912 sweep; never throws. */
+async function sweepSyncTemps(logger: PluginContext["logger"] | undefined): Promise<void> {
+  try {
+    const swept = await sweepStaleSyncTemps();
+    if (swept.removed) logger?.info(`[boat] removed stale paperclip-boat-sync temp dirs removed=${swept.removed} kept=${swept.kept}`,
+      { ...swept, maxAgeMs: SYNC_TEMP_MAX_AGE_MS });
+  } catch { /* Neither startup nor the timer fails on the sweep. */ }
+}
 function clearSpareRefreshTimerIfIdle(): void {
   if ([...knownSparePools.values()].some(pool => pool.desired > 0)) return;
   if (spareRefreshTimer) clearInterval(spareRefreshTimer);
@@ -1142,12 +1158,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.setClaimStore(spareClaimStore);
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
+    if (syncTempSweepTimer) clearInterval(syncTempSweepTimer);
+    syncTempSweepTimer = undefined;
     // A worker killed mid-transfer left its paperclip-boat-sync-*/transfer.tar (#20912).
-    try {
-      const swept = await sweepStaleSyncTemps();
-      if (swept.removed) ctx.logger.info(`[boat] removed stale paperclip-boat-sync temp dirs removed=${swept.removed} kept=${swept.kept}`,
-        { ...swept, maxAgeMs: SYNC_TEMP_MAX_AGE_MS });
-    } catch { /* Startup never fails on the sweep. */ }
+    await sweepSyncTemps(ctx.logger);
+    syncTempSweepTimer = setInterval(() => {
+      if (shuttingDown || syncTempSweepWork) return;
+      syncTempSweepWork = sweepSyncTemps(duplexLogger).finally(() => { syncTempSweepWork = undefined; });
+    }, SYNC_TEMP_SWEEP_INTERVAL_MS);
+    syncTempSweepTimer.unref?.();
     ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight");
   },
   multiCompanyConfig: true,
@@ -1219,10 +1238,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     activitySubscriptionCompanies.clear();
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
+    if (syncTempSweepTimer) clearInterval(syncTempSweepTimer);
+    syncTempSweepTimer = undefined;
     try {
       try {
         await Promise.allSettled([...inFlightAcquisitions]);
         await Promise.allSettled([...runCreateLedgerReads.values()].map(read => read.work));
+        if (syncTempSweepWork) await syncTempSweepWork;
         if (spareMaintenanceWork) await spareMaintenanceWork.catch(() => undefined);
         await readySpares.drain();
         await Promise.all([...companySpareActivityWrites.values(), ...companyAcquireOutcomeWrites.values()].map(write => write.catch(() => undefined)));

@@ -363,7 +363,8 @@ describe("Boat ready spare", () => {
     const timer = vi.spyOn(globalThis, "setInterval");
     await setup(0);
     await plugin.definition.onHealth!();
-    expect(timer).not.toHaveBeenCalled();
+    // No spare timer (15 s). The only interval is the #20912 temp sweep (30 min), which reads no Boat inventory.
+    expect(timer.mock.calls.map(([, ms]) => ms)).toEqual([30 * 60_000]);
     expect(f.calls).toEqual([]);
     await plugin.definition.onShutdown?.();
   });
