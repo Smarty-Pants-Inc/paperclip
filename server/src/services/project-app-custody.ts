@@ -20,6 +20,8 @@ type Connection = typeof toolConnections.$inferSelect;
 type Ref = Readonly<{ secretId: string; configPath: string; versionSelector?: "latest" | number }>;
 export const PROJECT_APP_APPROVAL_FIELD = "projectAppApproval";
 export const PROJECT_APP_APPROVAL_SOURCE = "projectAppApprovalSourceId";
+/** Server-written on S when a receipt-citing first bind consumes it (RFL 04:5xZ). */
+export const PROJECT_APP_APPROVAL_CONSUMED_BY = "projectAppApprovalConsumedBy";
 export const ROW12_INSTALLER_PLUGIN_KEY = "paperclipai.plugin-row12-installer";
 const positiveId = z.string().regex(/^[1-9]\d*$/);
 const repoIds = z.array(z.number().int().positive().safe()).min(1).max(500).refine(ids => new Set(ids).size === ids.length);
@@ -31,6 +33,7 @@ const receiptSchema = z.object({
 }).strict();
 export type ProjectAppApproval = Readonly<z.infer<typeof receiptSchema>>;
 const unavailable = () => forbidden("The project App requires the current responsible human's approval of this exact verified tuple.", { code: "project_app_approval_required" });
+const consumed = () => conflict("This project App approval was already used by a project connection. H must approve a new source.", { code: "project_app_approval_consumed" });
 const managerUnavailable = () => forbidden("The session-configured manager App classification is unavailable.", { code: "project_app_manager_classification_unavailable" });
 const managerForbidden = () => forbidden("The manager App and its private-key reference cannot serve a project or agent.", { code: "project_app_manager_forbidden" });
 const sorted = (ids: readonly number[]) => [...ids].sort((a, b) => a - b);
@@ -101,7 +104,7 @@ export function assertProjectAppReceiptInput(input: { config?: unknown; transpor
     const value = input[key];
     if (value === undefined) continue;
     const record = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-    for (const field of [PROJECT_APP_APPROVAL_FIELD, PROJECT_APP_APPROVAL_SOURCE]) {
+    for (const field of [PROJECT_APP_APPROVAL_FIELD, PROJECT_APP_APPROVAL_SOURCE, PROJECT_APP_APPROVAL_CONSUMED_BY]) {
       if (Object.hasOwn(record, field) || (existing?.[key] && Object.hasOwn(existing[key], field))) {
         throw forbidden("Project App approval receipts are written only by the responsible human's board-session approval route.", { code: "project_app_receipt_protected" });
       }
@@ -126,6 +129,9 @@ async function responsibleHuman(db: Database, companyId: string, userId: string,
 export async function readProjectAppCustody(db: Database, input: {
   companyId: string; projectId: string; config: Record<string, unknown>; refs: readonly Ref[];
   registrationId?: string; repositoryIds: readonly number[];
+  /** The owned connection reading its custody. Only the connection that consumed
+   * an archived source may keep reading it; a first bind passes none. */
+  connectionId?: string;
 }): Promise<Readonly<{ sourceConnectionId: string; receipt: ProjectAppApproval }>> {
   const app = parseGitHubAppConfig(input.config.methodConfig);
   await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId, verifiedAppId: input.registrationId, requireConfigured: true });
@@ -135,9 +141,16 @@ export async function readProjectAppCustody(db: Database, input: {
   const sources = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId),
     typeof sourceId === "string" ? eq(toolConnections.id, sourceId) : undefined)).for("share");
   const matches: Array<{ sourceConnectionId: string; receipt: ProjectAppApproval }> = [];
+  let consumedForProject: string | undefined;
   for (const source of sources) {
     const parsed = receiptSchema.safeParse(source.config[PROJECT_APP_APPROVAL_FIELD]);
-    if (!parsed.success || source.status === "archived" || source.status === "disabled" || source.projectId !== null || !isGitHubAppConnection(source)) continue;
+    const consumedBy = source.config[PROJECT_APP_APPROVAL_CONSUMED_BY];
+    if (consumedBy !== undefined) {
+      // Single use: an archived consumed source serves ONLY its consumer.
+      if (parsed.success && parsed.data.projectId === input.projectId && typeof consumedBy === "string" && consumedBy !== input.connectionId) consumedForProject = consumedBy;
+      if (consumedBy !== input.connectionId || source.status !== "archived") continue;
+    } else if (source.status === "archived") continue;
+    if (!parsed.success || source.status === "disabled" || source.projectId !== null || !isGitHubAppConnection(source)) continue;
     const receipt = parsed.data;
     const sourceApp = parseGitHubAppConfig(source.config.methodConfig);
     if (receipt.revokedAt || receipt.companyId !== input.companyId || receipt.projectId !== input.projectId || receipt.humanUserId !== company?.defaultResponsibleUserId
@@ -154,6 +167,16 @@ export async function readProjectAppCustody(db: Database, input: {
     if (grants.length !== 1 || grants[0]!.kind !== "organization" || grants[0]!.status !== "active" || grants[0]!.credentialSecretRefs.length !== 1
       || !grants[0]!.credentialSecretRefs.every(ref => ref.secretId === receipt.secretRef.secretId && ref.configPath === receipt.secretRef.configPath)) continue;
     matches.push({ sourceConnectionId: source.id, receipt });
+  }
+  if (matches.length === 0 && consumedForProject) {
+    // While the consumer is live for this project and installation, a replay
+    // is the existing named duplicate; once it is retired, the receipt is spent.
+    const [consumer] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, consumedForProject)));
+    if (consumer && consumer.status !== "archived" && consumer.projectId === input.projectId
+      && isGitHubAppConnection(consumer) && parseGitHubAppConfig(consumer.config.methodConfig).installationId === app.installationId) {
+      throw conflict("This project already has a live connection to that installation", { code: "project_installation_in_use" });
+    }
+    throw consumed();
   }
   if (matches.length !== 1) throw unavailable();
   return matches[0]!;
@@ -287,4 +310,26 @@ export async function prepareProjectAppFirstBind(db: Db, input: { companyId: str
     exclusive: input.exclusive, approvedLeadAgentId: project.leadAgentId, approvedByAgentId: input.actorId, responsibleUserId: custody.receipt.humanUserId,
     approvedRepositoryIds: [...verified.repositoryIds], approvedSecretRefs: [{ secretId: ref.secretId, configPath: ref.configPath }] };
   return { custody, verified, providerTenant, config: { ...input.config, projectScope: scope, [PROJECT_APP_APPROVAL_SOURCE]: custody.sourceConnectionId }, secretVersion };
+}
+
+/** RFL 04:5xZ: the receipt-citing first bind CONSUMES its source S,
+ * make-before-break, inside the create transaction. S is archived (never
+ * deleted) and linked to its consumer; the receipt and credential binding stay
+ * readable for audit. Any failure in the caller's transaction leaves S live,
+ * still reserved, and the receipt unconsumed. */
+export async function consumeProjectAppApproval(tx: Database, input: {
+  companyId: string; projectId: string; sourceConnectionId: string; receiptId: string; connectionId: string;
+  actorType: "agent" | "user" | "system"; actorId: string;
+}) {
+  const [source] = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.sourceConnectionId))).for("update");
+  const parsed = receiptSchema.safeParse(source?.config[PROJECT_APP_APPROVAL_FIELD]);
+  if (!source || source.projectId !== null || !parsed.success || parsed.data.id !== input.receiptId || parsed.data.projectId !== input.projectId) throw unavailable();
+  if (source.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined || source.status === "archived") throw consumed();
+  const config = { ...source.config, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
+  const transportConfig = { ...source.transportConfig, [PROJECT_APP_APPROVAL_CONSUMED_BY]: input.connectionId };
+  await tx.update(toolConnections).set({ status: "archived", enabled: false, config, transportConfig, updatedAt: new Date() })
+    .where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id)));
+  await persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: input.actorType, actorId: input.actorId,
+    action: "tool_connection.project_app_approval_consumed", entityType: "tool_connection", entityId: source.id,
+    details: { receiptId: input.receiptId, projectId: input.projectId, connectionId: input.connectionId, previousStatus: source.status } });
 }

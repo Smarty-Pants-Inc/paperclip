@@ -100,9 +100,12 @@ function legacyAliases(connection: Connection) {
 /** All identity-affecting owned/null/alias writers use the same live-row arbiter. */
 export async function assertProjectConnectionAvailability(
   tx: Db | DbTransaction,
-  input: Readonly<{ identity: ProjectConnectionIdentity; projectId: string | null; exclusive: boolean; excludeConnectionId?: string }>,
+  input: Readonly<{ identity: ProjectConnectionIdentity; projectId: string | null; exclusive: boolean; excludeConnectionId?: string;
+    /** RFL 04:5xZ: ONLY the create citing S's verified receipt (consumed in the
+     * same transaction) ignores S. Every other writer still collides with S. */
+    consumedSourceConnectionId?: string }>,
 ): Promise<void> {
-  const { identity, projectId, exclusive, excludeConnectionId } = input;
+  const { identity, projectId, exclusive, excludeConnectionId, consumedSourceConnectionId } = input;
   assertIdentity(identity);
   if (exclusive && projectId === null) {
     throw unprocessable("Only a project connection can reserve an EXCLUSIVE App", { code: "project_connection_scope_invalid" });
@@ -154,7 +157,7 @@ export async function assertProjectConnectionAvailability(
   let duplicate = false;
   let incompatible = false;
   for (const connection of live) {
-    if (connection.id === excludeConnectionId) continue;
+    if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId) continue;
     const ownedIdentity = projectConnectionIdentityForConnection(connection);
     const aliases = legacyAliases(connection);
     const grantAliases = aliasesByConnection.get(connection.id);
@@ -185,7 +188,7 @@ export async function assertProjectConnectionAvailability(
  */
 export async function assertKnownProjectConnectionCreateAliases(
   tx: Db | DbTransaction,
-  input: Readonly<{ companyId: string; projectId: string | null; exclusive: boolean; config: Record<string, unknown>; excludeConnectionId?: string }>,
+  input: Readonly<{ companyId: string; projectId: string | null; exclusive: boolean; config: Record<string, unknown>; excludeConnectionId?: string; consumedSourceConnectionId?: string }>,
 ): Promise<void> {
   if (input.config.sourceTemplateKey !== "github" || input.config.connectionMethodKey !== "app-installation") return;
   const method = object(input.config.methodConfig);
@@ -202,14 +205,14 @@ export async function assertKnownProjectConnectionCreateAliases(
   // identity for the null row. This is denial-only, so no lock can turn it into
   // approval. B/C must still verify and lock any eventual successful attempt.
   if (input.exclusive && saved.some(connection => {
-    if (connection.id === input.excludeConnectionId) return false;
+    if (connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId) return false;
     const aliases = legacyAliases(connection);
     return (installationKey !== null && aliases.installationKeys.has(installationKey))
       || (registrationHint !== null && aliases.registrationIds.has(registrationHint));
   })) throw conflict("This installation or App registration is reserved by another live connection", { code: "installation_not_exclusive" });
   const identities = saved.flatMap(connection => {
     const identity = projectConnectionIdentityForConnection(connection);
-    if (!identity || connection.id === input.excludeConnectionId) return [];
+    if (!identity || connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId) return [];
     const sameInstallation = identity.canonicalInstallationKey === installationKey;
     const sameRegistration = identity.verifiedRegistrationId === registrationHint;
     const exclusiveConflict = (input.exclusive || object(connection.config.projectScope)?.exclusive === true)
@@ -221,6 +224,7 @@ export async function assertKnownProjectConnectionCreateAliases(
   await lockProjectConnectionIdentities(tx, identities);
   for (const identity of identities) await assertProjectConnectionAvailability(tx, {
     identity, projectId: input.projectId, exclusive: input.exclusive, excludeConnectionId: input.excludeConnectionId,
+    consumedSourceConnectionId: input.consumedSourceConnectionId,
   });
   // A concurrent archive may have released the known collision while we waited.
   // Retry OUTSIDE this transaction; do not now take project lifecycle rows while

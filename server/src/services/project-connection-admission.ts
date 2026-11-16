@@ -183,7 +183,7 @@ export async function assertProjectConnectionAdmission(
   if (connection && scope) {
     const requested = input.proposedRepositoryIds ?? await projectConnectionRepositoryIds(db, companyId, projectId, parseGitHubAppConfig(connection.config.methodConfig).repositories);
     await readProjectAppCustody(db, { companyId, projectId, config: connection.config,
-      refs: input.proposedSecretRefs ?? connection.credentialSecretRefs, registrationId: scope.registrationId, repositoryIds: requested });
+      refs: input.proposedSecretRefs ?? connection.credentialSecretRefs, registrationId: scope.registrationId, repositoryIds: requested, connectionId: connection.id });
   }
   const { project, human, primary } = await currentAuthority(db, companyId, projectId);
   if (project.archivedAt && !["retire", "disable", "project_update"].includes(operation)) {
