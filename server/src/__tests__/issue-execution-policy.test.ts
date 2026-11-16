@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
+import { buildInitialIssueMonitorFields, applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState, stripMonitorFromExecutionPolicy } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 import { buildExecutionPolicy } from "../../../ui/src/lib/issue-execution-policy.ts";
 
@@ -1867,7 +1867,7 @@ describe("issue execution policy transitions", () => {
   });
 
   describe("monitor policy", () => {
-    it("schedules a one-shot monitor on an active agent-owned issue", () => {
+    it.each(["in_progress", "in_review", "blocked", "todo"] as const)("schedules a one-shot monitor on an agent-owned %s issue", status => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
         monitor: {
@@ -1879,7 +1879,7 @@ describe("issue execution policy transitions", () => {
 
       const result = applyIssueExecutionPolicyTransition({
         issue: {
-          status: "in_progress",
+          status,
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
           executionPolicy: null,
@@ -1908,6 +1908,13 @@ describe("issue execution policy transitions", () => {
           scheduledBy: "board",
         },
       });
+    });
+
+    it.each(["blocked", "todo"] as const)("creates an agent-owned %s task with a retained monitor", status => {
+      const policy = normalizeIssueExecutionPolicy({ monitor: { nextCheckAt: "2099-01-01T00:00:00.000Z" } });
+      expect(buildInitialIssueMonitorFields({ policy, status, assigneeAgentId: coderAgentId }))
+        .toMatchObject({ monitorNextCheckAt: new Date("2099-01-01T00:00:00.000Z"),
+          executionState: { monitor: { status: "scheduled" } } });
     });
 
     it("auto-clears a scheduled monitor when the issue moves to done", () => {
@@ -1982,7 +1989,7 @@ describe("issue execution policy transitions", () => {
       expect(() =>
         applyIssueExecutionPolicyTransition({
           issue: {
-            status: "blocked",
+            status: "backlog",
             assigneeAgentId: coderAgentId,
             assigneeUserId: null,
             executionPolicy: null,

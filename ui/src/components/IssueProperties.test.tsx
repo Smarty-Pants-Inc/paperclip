@@ -3198,6 +3198,16 @@ describe("IssueProperties", () => {
     expect(monitorRowText()).not.toMatch(/overdue|next tick/i);
 
     renderMonitor(createIssue({
+      status: "todo",
+      executionPolicy: createExecutionPolicy({ monitor: { ...baseMonitorState, nextCheckAt: at(-18) } }),
+      executionState: createExecutionState({ monitor: { ...baseMonitorState, nextCheckAt: at(-18) } }),
+    }));
+    await flush();
+    expect(monitorRowText()).toContain("Automatic checks paused");
+    expect(monitorRowText()).toContain("Check now to request a manual check");
+    expect(monitorRowText()).not.toMatch(/overdue|next tick/i);
+
+    renderMonitor(createIssue({
       status: "in_progress",
       executionPolicy: createExecutionPolicy(),
       executionState: createExecutionState({ monitor: {
