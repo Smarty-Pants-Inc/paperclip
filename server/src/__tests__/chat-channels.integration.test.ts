@@ -1220,6 +1220,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           .where(and(inArray(chatDeliveries.companyId, companyIds), inArray(chatDeliveries.state, ["received", "processing", "retry"])));
         await db.update(chatPublications).set({ state: "cancelled", nextAttemptAt: null })
           .where(and(inArray(chatPublications.companyId, companyIds), inArray(chatPublications.state, ["pending", "awaiting_consent", "streaming", "retry"])));
+        // Recovery is not endpoint-scoped. Once a gone chat source settles,
+        // an open task may legitimately continue from its saved work. Pause
+        // this completed fixture's agents after its services and assertions,
+        // without changing a task's persisted conversation identity.
+        await db.update(agents).set({ status: "paused" })
+          .where(and(inArray(agents.companyId, companyIds), notInArray(agents.status, ["paused", "terminated"])));
       }
       fixtureServices.clear();
       fixtureCompanies.clear();
