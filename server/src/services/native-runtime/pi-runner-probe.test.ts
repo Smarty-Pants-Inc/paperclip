@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -399,6 +399,108 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.requests).toEqual([]);
   });
 });
+
+describe("native Pi probe agent-home cleanup boundary", () => {
+  it("keeps default Pi launch material outside retained setup evidence and passes configured homes through", async () => {
+    const f = await fixture("matching");
+    const privateAgentDirs: string[] = [];
+    const privateDirectoryEmptyAtStart: boolean[] = [];
+    const agentHomes: string[] = [];
+    const probeEnvironments: Record<string, string>[] = [];
+    mocks.probe.mockReset().mockImplementation(async (options: any) => {
+      const mkdirRequest = f.requests.findLast(request => request.command === "mkdir")!;
+      const remoteRoot = mkdirRequest.args![4];
+      const configuredAgentDir = options.environment.PI_CODING_AGENT_DIR as string | undefined;
+      const agentHome = configuredAgentDir ?? join(remoteRoot, "pi", "agent");
+      const expectedPrivateAgentDir = join(dirname(remoteRoot), `${basename(remoteRoot)}-pi-agent`);
+      agentHomes.push(agentHome);
+      probeEnvironments.push({ ...options.environment });
+      if (configuredAgentDir === expectedPrivateAgentDir) {
+        privateAgentDirs.push(agentHome);
+        privateDirectoryEmptyAtStart.push(await readdir(agentHome).then(entries => entries.length === 0, () => false));
+      }
+      const outsideNpm = join(f.root, `external-npm-${agentHomes.length}`);
+      await mkdir(outsideNpm, { recursive: true });
+      await mkdir(agentHome, { recursive: true });
+      await writeFile(join(agentHome, "models.json"), "{}", { mode: 0o600 });
+      await writeFile(join(agentHome, "auth.json"), "{}", { mode: 0o600 });
+      await symlink(outsideNpm, join(agentHome, "npm"));
+      await mkdir(join(remoteRoot, "pi"), { recursive: true });
+      await writeFile(join(remoteRoot, "pi", "setup-test.jsonl"), "{}\n", { mode: 0o600 });
+      await options.onCleanupConfirmed();
+      return { providerDriver: "pi_rpc", effectiveModel: model, helloProbePassed: !options.admissionOnly,
+        sessionAdmissionPassed: true, piMetadata: { version: "1.5.2" } };
+    });
+
+    const result = await probeManagedNativePiRunner(f.context);
+    if (process.env.PAPERCLIP_AGENTDIR_RED_EVIDENCE === "1") {
+      console.error(`[PI_AGENTDIR_RED_EVIDENCE] result=${JSON.stringify(result)} cleanupErrors=${JSON.stringify(mocks.cleanupErrors)} homes=${JSON.stringify(agentHomes)} environments=${JSON.stringify(probeEnvironments)}`);
+    }
+    expect(result.status).toBe("pass");
+    expect(mocks.cleanupErrors).toEqual([]);
+    expect(mocks.probe).toHaveBeenCalledTimes(2);
+    expect(privateAgentDirs).toHaveLength(2);
+    expect(new Set(privateAgentDirs).size).toBe(2);
+    expect(privateDirectoryEmptyAtStart).toEqual([true, true]);
+    expect(agentHomes).toEqual(privateAgentDirs);
+    expect(probeEnvironments.map(environment => environment.PI_CODING_AGENT_DIR)).toEqual(privateAgentDirs);
+    const mkdirRequests = f.requests.filter(request => request.command === "mkdir");
+    const removeRequests = f.requests.filter(request => request.command === "rm" && request.args?.[0] === "-rf");
+    for (const privateAgentDir of privateAgentDirs) {
+      const mkdirRequest = mkdirRequests.find(request => request.args?.includes(privateAgentDir));
+      const remoteRoot = mkdirRequest?.args?.[4];
+      expect(remoteRoot).toBeDefined();
+      expect(privateAgentDir).toBe(join(dirname(remoteRoot!), `${basename(remoteRoot!)}-pi-agent`));
+      expect(removeRequests.some(request => request.args?.includes(privateAgentDir))).toBe(true);
+      await expect(lstat(privateAgentDir)).rejects.toMatchObject({ code: "ENOENT" });
+    }
+    const stateDir = join(f.root, "state");
+    const stateEntries = await readdir(stateDir, { recursive: true });
+    expect(stateEntries.filter(entry => entry.endsWith("remote-runtime/pi/setup-test.jsonl"))).toHaveLength(2);
+    expect(stateEntries.some(entry => /remote-runtime\/pi\/agent(?:\/|$)/.test(entry))).toBe(false);
+    expect(stateEntries.some(entry => /(?:^|\/)(?:auth|models)\.json$/.test(entry))).toBe(false);
+    for (const entry of stateEntries) {
+      expect((await lstat(join(stateDir, entry))).isSymbolicLink()).toBe(false);
+    }
+
+    const configured = await fixture("matching");
+    const configuredAgentDir = join(configured.root, "configured-pi-agent");
+    Object.assign(configured.context.config, { env: { PI_CODING_AGENT_DIR: configuredAgentDir } });
+    const configuredObservations: { environment: Record<string, string>; remoteRoot: string }[] = [];
+    mocks.probe.mockReset().mockImplementation(async (options: any) => {
+      const mkdirRequest = configured.requests.findLast(request => request.command === "mkdir")!;
+      const remoteRoot = mkdirRequest.args![4];
+      configuredObservations.push({ environment: { ...options.environment }, remoteRoot });
+      const agentHome = options.environment.PI_CODING_AGENT_DIR ?? join(remoteRoot, "pi", "agent");
+      expect(agentHome).toBe(configuredAgentDir);
+      const outsideNpm = join(configured.root, "configured-external-npm");
+      await mkdir(outsideNpm, { recursive: true });
+      await mkdir(agentHome, { recursive: true });
+      await writeFile(join(agentHome, "models.json"), "{}", { mode: 0o600 });
+      await writeFile(join(agentHome, "auth.json"), "{}", { mode: 0o600 });
+      await rm(join(agentHome, "npm"), { force: true });
+      await symlink(outsideNpm, join(agentHome, "npm"));
+      await mkdir(join(remoteRoot, "pi"), { recursive: true });
+      await writeFile(join(remoteRoot, "pi", "setup-test.jsonl"), "{}\n", { mode: 0o600 });
+      await options.onCleanupConfirmed();
+      return { providerDriver: "pi_rpc", effectiveModel: model, helloProbePassed: !options.admissionOnly,
+        sessionAdmissionPassed: true, piMetadata: { version: "1.5.2" } };
+    });
+    expect((await probeManagedNativePiRunner(configured.context)).status).toBe("pass");
+    expect(mocks.cleanupErrors).toEqual([]);
+    expect(configuredObservations).toHaveLength(2);
+    for (const observation of configuredObservations) {
+      expect(observation.environment.PI_CODING_AGENT_DIR).toBe(configuredAgentDir);
+      const mkdirRequest = configured.requests.find(request => request.command === "mkdir" && request.args?.[4] === observation.remoteRoot)!;
+      expect(mkdirRequest.args?.slice(4)).toEqual([observation.remoteRoot, join(observation.remoteRoot, "filesystem")]);
+      const removal = configured.requests.find(request => request.command === "rm" && request.args?.[0] === "-rf" && request.args?.includes(observation.remoteRoot));
+      expect(removal?.args).toEqual(["-rf", "--", observation.remoteRoot]);
+      await expect(lstat(join(dirname(observation.remoteRoot), `${basename(observation.remoteRoot)}-pi-agent`)))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+});
+
 
 async function retainedStaticManifests(root: string): Promise<string[]> {
   const state = join(root, "state");
