@@ -681,13 +681,26 @@ describePostgres("Resource lifecycle events", () => {
     expect((await inbox.list(companyId, 100, undefined, [...all])).map(e => Number(e.id))).toEqual([rows[41].id]);
   });
 
+  // #20805 R4 (RFL 06:42Z 11-16 + joint addendum 06:43Z): TEST SHAPE, not a production
+  // path. The old body awaited requestHire on another connection (db) from inside a
+  // transaction whose agent insert holds the SHARED company runtime hold; the hire
+  // takes it EXCLUSIVE, so it waited on this test's own open transaction (a hang
+  // Postgres cannot see). Audit (result.md R4, r4-audit-raw.txt): 0 production paths
+  // await a hire or a company-wide writer through db from inside a transaction that
+  // wrote an agent runtime row or holds the shared lock. The higher id is now
+  // committed by a concurrent per-agent writer (an agent row and its creation event,
+  // shared/shared, as production writers do); the assertion is kept unchanged.
   it("never skips a lower event id that commits after a higher id is acknowledged", async () => {
     const plugin = await createPlugin();
     const inbox = pluginLifecycleInbox(db, plugin.id);
     await db.transaction(async tx => {
       const [low] = await tx.insert(agents).values({ companyId, name: "Delayed commit" }).returning();
       await recordResourceCreationEvent(tx as unknown as Db, companyId, "agent", low.id);
-      const high = await createAgent();
+      const high = await db.transaction(async other => {
+        const [created] = await other.insert(agents).values({ companyId, name: "Committed first" }).returning();
+        await recordResourceCreationEvent(other as unknown as Db, companyId, "agent", created.id);
+        return created;
+      });
       const [visible] = await inbox.list(companyId);
       expect(visible.resourceId).toBe(high.id);
       await inbox.acknowledge(companyId, visible.id);
@@ -695,6 +708,40 @@ describePostgres("Resource lifecycle events", () => {
       expect(low.id).not.toBe(high.id);
     });
     expect(await inbox.list(companyId)).toEqual([expect.objectContaining({ action: "create" })]);
+  });
+
+  // #20805 R4 RED, the production shape this ordering protects: a hire (EXCLUSIVE
+  // company runtime lock) that starts while a per-agent writer is open waits for that
+  // writer to commit, so the writer's lower ids commit first and the inbox never has
+  // to skip one. Fails if the per-agent writer takes no shared hold (literal D1).
+  it("a hire waits for an open per-agent writer, so the writer's lower event id commits first", async () => {
+    const plugin = await createPlugin();
+    const inbox = pluginLifecycleInbox(db, plugin.id);
+    let hire: Promise<Awaited<ReturnType<typeof createAgent>>> | undefined;
+    let hireSettled = false;
+    let lowId = "";
+    await db.transaction(async tx => {
+      const [low] = await tx.insert(agents).values({ companyId, name: "Open writer" }).returning();
+      lowId = low.id;
+      await recordResourceCreationEvent(tx as unknown as Db, companyId, "agent", low.id);
+      const [backend] = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
+      hire = createAgent();
+      void hire.then(() => { hireSettled = true; }, () => { hireSettled = true; });
+      await vi.waitFor(async () => {
+        const blocked = await db.execute(sql`SELECT a.pid FROM pg_stat_activity a JOIN pg_locks l ON l.pid = a.pid AND NOT l.granted
+          WHERE l.locktype = 'advisory' AND ${Number(backend.pid)} = ANY(pg_blocking_pids(a.pid))`);
+        expect(blocked.length).toBeGreaterThan(0);
+      }, { timeout: 5000 });
+      expect(hireSettled).toBe(false); // still waiting when the writer commits
+    });
+    const high = await hire!;
+    const visible = await inbox.list(companyId);
+    const ids = visible.map(event => ({ resourceId: event.resourceId, id: BigInt(event.id) }));
+    const lowEvent = ids.find(event => event.resourceId === lowId)!;
+    const highEvent = ids.find(event => event.resourceId === high.id)!;
+    expect(lowEvent).toBeDefined();
+    expect(highEvent).toBeDefined();
+    expect(lowEvent.id < highEvent.id).toBe(true);
   });
 
   it.each([{ resourceLifecycle: ["project"] }, { resourceLifecycle: ["agent_runtime"] }] as const)("preserves legacy manual streams with automatic subscription %j", async ({ resourceLifecycle }) => {
