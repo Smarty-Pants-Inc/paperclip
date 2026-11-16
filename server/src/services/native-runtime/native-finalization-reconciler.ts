@@ -231,10 +231,18 @@ export async function claimNativeSessionResumptions(input: {
         (typeof checkpointRecord.providerSessionId === "string"
           && checkpointRecord.providerSessionId.length > 0)
         || Object.keys(record(checkpointRecord.providerIdentity)).length > 0;
+      // #20887: a Pi session this run opened but never prompted left only
+      // session-open events; its failure dropped the unrestorable checkpoint.
+      const neverPromptedEvent = failureDetail.providerSessionNeverPrompted === true && !checkpoint && providerEvent
+        ? await tx.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+          eq(heartbeatRunEvents.runId, row.run.id),
+          inArray(heartbeatRunEvents.eventType, ["session.resumed", "turn.started", "provider.event", "provider.rpc_result"]),
+        )).limit(1).then((rows) => rows[0] ?? null)
+        : providerEvent;
       const bootstrapRetry =
         !!persistedInput
         && !checkpoint
-        && !providerEvent
+        && !neverPromptedEvent
         && failureDetail.recoveryMode === "bootstrap_retry"
         && failureDetail.providerSessionEstablished === false;
       if (

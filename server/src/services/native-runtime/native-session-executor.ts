@@ -9819,6 +9819,47 @@ const PROVIDER_DURABLE_EVENT_TYPES = NATIVE_PROVIDER_DURABLE_EVENT_TYPES;
 type NativeRecoveryMode =
   "bootstrap_retry" | "exact_checkpoint_resume" | "ambiguous_state";
 
+// Runner, transport or provider-process loss: the failure itself says nothing
+// about the provider thread, so durable evidence decides (#20825, #20887).
+const NATIVE_PI_NEVER_PROMPTED_RETRY_CODES = new Set<ReturnType<typeof nativeSessionFailureSourceCode>>([
+  "native_session_interrupted", "native_runner_process_exited", "provider_transport_failed",
+  "provider_process_exited", "provider_stdout_closed", "provider_process_output_closed",
+  "provider_process_status_failed", "provider_request_timeout",
+]);
+
+/** Event types that only report a provider session being opened. Any other
+ * provider event (turn.started, provider output, a resumed thread) means a
+ * prompt may have reached the provider. */
+const NATIVE_SESSION_OPEN_ONLY_EVENT_TYPES = new Set(["harness.ready", "session.started", "session.updated"]);
+
+/**
+ * #20887: true only for a pi_rpc checkpoint of this run whose session never
+ * received a prompt. Pi 1.5 creates its session file at the first user
+ * message_end; the Pi driver publishes turn.started before it submits the
+ * prompt, so without turn.started (or any later provider output, turn or
+ * result state) Pi has no saved thread for this identity. A session carried
+ * from a settled predecessor is that conversation, never this run's open.
+ */
+export async function piProviderSessionNeverPrompted(
+  db: Pick<Db, "select">,
+  run: { companyId: string; id: string; nativeSessionId: string | null; createdAt: Date },
+  checkpoint: Record<string, unknown>,
+): Promise<boolean> {
+  const empty = (value: unknown) => value == null || (Array.isArray(value) && value.length === 0);
+  if (checkpoint.driverKind !== "pi_rpc" || typeof checkpoint.providerSessionId !== "string"
+    || !checkpoint.providerSessionId || checkpoint.activeTurnId != null || checkpoint.cursor != null
+    || checkpoint.semanticResult != null || checkpoint.terminal != null || checkpoint.governedWait != null
+    || checkpoint.goal != null || !empty(checkpoint.terminalTurns) || !empty(checkpoint.pendingRuntimeRequests)
+    || !empty(checkpoint.lineage)) return false;
+  const promptEvidence = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
+    eq(heartbeatRunEvents.runId, run.id),
+    inArray(heartbeatRunEvents.eventType, [...PROVIDER_DURABLE_EVENT_TYPES]
+      .filter((type) => !NATIVE_SESSION_OPEN_ONLY_EVENT_TYPES.has(type))),
+  )).limit(1);
+  if (promptEvidence.length > 0) return false;
+  return !await carriesSettledPredecessorSession(db, run, checkpoint.providerSessionId);
+}
+
 export async function nativeProviderRecoveryEvidence(input: {
   db: Db;
   runId: string;
@@ -9837,6 +9878,7 @@ export async function nativeProviderRecoveryEvidence(input: {
   providerEventsExist: boolean;
   checkpointExists: boolean;
   unclaimedBootstrap?: { fingerprint: string };
+  providerSessionNeverPrompted?: true;
 }> {
   const run = await input.db
     .select({ runnerProfileJson: heartbeatRuns.runnerProfileJson, companyId: heartbeatRuns.companyId,
@@ -9868,6 +9910,20 @@ export async function nativeProviderRecoveryEvidence(input: {
   const providerEventsExist = durableEvents.some((event) =>
     PROVIDER_DURABLE_EVENT_TYPES.has(event.eventType),
   );
+  // #20887: Pi writes its session file only at the first user message_end,
+  // and the Pi driver publishes turn.started before it submits that prompt.
+  // A Pi session this run opened but never sent a prompt has no thread to
+  // restore, so it is not established: the run opens a fresh one instead.
+  if (providerSessionEstablished && run && NATIVE_PI_NEVER_PROMPTED_RETRY_CODES.has(input.sourceFailureCode)
+    && await piProviderSessionNeverPrompted(input.db, run, checkpointRecord)) {
+    return {
+      recoveryMode: "bootstrap_retry",
+      providerSessionEstablished: false,
+      providerEventsExist,
+      checkpointExists,
+      providerSessionNeverPrompted: true,
+    };
+  }
   const unclaimedBootstrap = !checkpointExists && !providerEventsExist && input.bootstrap
     && input.bootstrap.binding.runId === input.runId && run?.companyId === input.bootstrap.binding.companyId
     && run.nativeIssueId === input.bootstrap.binding.issueId && run.nativeSessionId === input.bootstrap.identity.normalizedSessionId
@@ -14146,6 +14202,7 @@ async function executePaperclipNativeSessionAttempt(
                 recoveryEvidence.providerSessionEstablished,
               providerEventsExist: recoveryEvidence.providerEventsExist,
               checkpointExists: recoveryEvidence.checkpointExists,
+              ...(recoveryEvidence.providerSessionNeverPrompted ? { providerSessionNeverPrompted: true } : {}),
               // Restart recovery relaunches a remote runner for this retry only
               // with this proof that the failed runner is gone.
               ...(recoveryEvidence.recoveryMode === "bootstrap_retry" && nativeRunnerExitConfirmed(error)
@@ -14206,7 +14263,9 @@ async function executePaperclipNativeSessionAttempt(
                               ? "Inspect the persisted native session after its bounded resume budget was exhausted."
                               : recoveryEvidence.recoveryMode ===
                                   "bootstrap_retry"
-                                ? recoveryEvidence.checkpointExists
+                                ? recoveryEvidence.providerSessionNeverPrompted
+                                  ? `Retry provider bootstrap on this same run${nativeStartupRetryWait(providerCooldownAt)}; durable evidence proves the provider session it opened never received a prompt, so a fresh provider session starts.`
+                                  : recoveryEvidence.checkpointExists
                                   ? `Retry provider bootstrap on this same run${nativeStartupRetryWait(providerCooldownAt)}; durable evidence proves this run did no provider work of its own, and it resumes the provider session carried from its settled predecessor.`
                                   : `Retry provider bootstrap on this same run${nativeStartupRetryWait(providerCooldownAt)}; durable evidence proves no provider session or provider event was created.`
                                 : "Resume this same run from its exact persisted native provider checkpoint after the retry delay.",
@@ -14334,6 +14393,13 @@ async function executePaperclipNativeSessionAttempt(
             throw new Error("native_runner_bootstrap_evidence_changed");
           }
         }
+        // #20887: re-prove under the run lock that the Pi session never got a
+        // prompt before dropping its checkpoint, so the retry opens fresh.
+        if (recoveryEvidence.providerSessionNeverPrompted && !(await nativeProviderRecoveryEvidence({ db: tx as unknown as Db,
+          runId: input.execution.binding.runId, executionTargetKind: input.runnerExecutionTarget?.kind ?? "local",
+          sourceFailureCode })).providerSessionNeverPrompted) {
+          throw new Error("native_runner_bootstrap_evidence_changed");
+        }
         const unusedTerminal = !!recoveryEvidence.unclaimedBootstrap && phase === "terminal_failure"
           && !runBeforeWrite?.costAccountedAt;
         if (unusedTerminal) await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, input.execution.binding.companyId);
@@ -14355,6 +14421,10 @@ async function executePaperclipNativeSessionAttempt(
               : {}),
             nativePhase: phase,
             nativePhaseUpdatedAt: now,
+            // The never-prompted Pi session has no thread to restore.
+            ...(recoveryEvidence.providerSessionNeverPrompted ? {
+              runnerProfileJson: sql`${heartbeatRuns.runnerProfileJson} - 'sessionCheckpoint'`,
+            } : {}),
             ...(unusedTerminal ? {
               usageJson: sql`coalesce(${heartbeatRuns.usageJson}, '{}'::jsonb) || '{"accountingProviderWorkStarted":false}'::jsonb`,
               costAccountingPending: true,
