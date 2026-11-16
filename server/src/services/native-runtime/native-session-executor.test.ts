@@ -3409,6 +3409,12 @@ describe("remote provider pack manifest", () => {
       if (inspectionResets > 0 && inspectionReset && script.includes("base64 <") && script.includes(inspectionReset)
         && (inspectionReset === "runner-state.json" || !script.includes("runner-state.json"))) {
         inspectionResets--;
+        // The pre-syncOut inspector surfaces a failed state read as empty output,
+        // which its JSON parser misclassifies; the syncOut path below gets the
+        // transport exception directly and the checkpoint caller can retry it.
+        if (provider === "opencode-new-durable-inspect-reset" && inspectionReset === "runner-state.json") {
+          return { exitCode: 0, signal: null, timedOut: false, stderr: "", stdout: "" };
+        }
         throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
       }
       const statePath = /^test -f '([^']+)'/.exec(script)?.[1];
@@ -3428,10 +3434,12 @@ describe("remote provider pack manifest", () => {
           && !command.args[1].includes("runner-state.json") ? providerState : suspendedState)).toString("base64") : "",
       };
     });
+    const runLogs: string[] = [];
     try {
       let coldAdmission: ReturnType<typeof admittedNativeProviderPack> = null;
       const prepare = createRunnerdBackend({ db: preparedDb, execution: remoteExecution,
         runnerInstanceId: "bundled-image-runner", runnerIngressAuthorized: true,
+        onLog: async (_stream, chunk) => { runLogs.push(chunk); },
         ...(firstDurable ? { controllerPersistence: { bootId: randomUUID() } } : {}),
         ...(opencode ? { runnerEnvironment: { ...configuredEnvironmentProjection(diagnostics ? { PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS: "1" } : {}), PAPERCLIP_NATIVE_MCP_NAME: "assigned-fixture", PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1/mcp/gateways/assigned-fixture", PAPERCLIP_NATIVE_MCP_TOKEN: "private-fixture" } } : {}),
         runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
@@ -3557,7 +3565,13 @@ describe("remote provider pack manifest", () => {
           }
           return;
         }
+        // Caller-level outcome: settlement wraps harness inspection in the
+        // bounded transient-read retry at retryTransientRemoteCheckpointRead.
         await driver.mock.calls.at(-1)![0].checkpoint!("settled");
+        if (provider === "opencode-new-durable-inspect-reset") {
+          expect(runLogs.join("")).toContain("remote checkpoint inspection interrupted (attempt 1 of 3); reading the settled state again");
+          expect(providerStateUnsaved.mark).not.toHaveBeenCalled();
+        }
         expect(providerStateUnsaved.mark).not.toHaveBeenCalled();
         expect(harnessStorage.persistNativeHarnessBackup).toHaveBeenCalledTimes(1);
         expect(checkpointReadResets).toBe(0);
