@@ -880,6 +880,131 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(log.includes(`pin ${pin}`)).toBe(false);
   }, 60_000);
 
+  // redact-sec2 F1 (smarty-dev#20895 (a)): a secret the agent fetches through the
+  // agent secret route mid-run must reach the run's live output redactor.
+  it("redact-sec2 F1: a secret fetched mid-run through the agent secret route is masked in the stored log and tool events printed after the fetch, whole and folded; output before the fetch is unchanged", async () => {
+    const { randomBytes } = await import("node:crypto");
+    const { execFileSync } = await import("node:child_process");
+    const { default: express } = await import("express");
+    const { default: request } = await import("supertest");
+    const { secretRoutes } = await import("../routes/secrets.js");
+    const { errorHandler } = await import("../middleware/error-handler.js");
+    const f = await seed();
+    const token = randomBytes(30).toString("base64"); // test-only, 40 characters
+    const svc = secretService(db);
+    const secret = await svc.create(f.companyId, { key: "SEC2_FETCHED", name: `sec2-fetched-${f.agentId}`, provider: "local_encrypted", value: token }, { userId: f.userId });
+    await svc.createBinding({ companyId: f.companyId, secretId: secret.id, targetType: "agent", targetId: f.agentId,
+      configPath: "access.SEC2_FETCHED", projectionClass: "unclassified" });
+    const forms = [["whole", token], ...["20", "8"].map(width => [`fold -w ${width}`, execFileSync("fold", ["-w", width], { input: token, encoding: "utf8" })])];
+    const windows = Array.from({ length: token.length - 31 }, (_, index) => token.slice(index, index + 32));
+    const before = `BEFORE<<${token}>>\n`;
+    inspect.set(f.agentId, async input => {
+      expect(input.config.env).not.toHaveProperty("SEC2_FETCHED");
+      await input.onLog("stdout", before);
+      await input.onEvent?.({ eventType: "tool.output", stream: "stdout", level: "info", message: before, payload: { output: before } });
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = { type: "agent", agentId: f.agentId, companyId: f.companyId, runId: input.runId, keyScope: { kind: "standard" }, source: "agent_jwt" };
+        next();
+      });
+      app.use("/api", secretRoutes(db));
+      app.use(errorHandler);
+      const fetched = await request(app).post("/api/agents/me/secrets/sec2_fetched/value");
+      expect(fetched.status).toBe(200);
+      expect(fetched.body.value === token).toBe(true);
+      await input.onLog("stdout", "AFTER-FETCH\n");
+      for (const [name, text] of forms) {
+        const printed = `${name}<<${text}>>\n`;
+        await input.onLog("stdout", printed);
+        await input.onEvent?.({ eventType: "tool.output", stream: "stdout", level: "info", message: printed, payload: { output: printed } });
+      }
+      await input.onLog("stdout", "END-OF-OUTPUT\n");
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    const strings = (value: unknown): string[] => typeof value === "string" ? [value]
+      : Array.isArray(value) ? value.flatMap(strings)
+        : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+    const events = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .filter(event => event.eventType === "tool.output").sort((left, right) => left.seq - right.seq);
+    expect(events).toHaveLength(1 + forms.length);
+    // Printed before the fetch: committed as it was (no retroactive rewrite).
+    // Boolean checks: a failure must not print the generated secret.
+    expect(log.includes(before)).toBe(true);
+    expect(events[0]!.message === before).toBe(true);
+    expect((events[0]!.payload as { output?: string }).output === before).toBe(true);
+    const afterLog = log.slice(log.indexOf("AFTER-FETCH"));
+    expect(afterLog.includes("END-OF-OUTPUT")).toBe(true);
+    const afterEvents = events.slice(1).map(event => [event.message, ...strings(event.payload)].join("\n")).join("\n");
+    for (const [name, stored] of [["stored run log after the fetch", afterLog], ["tool events after the fetch", afterEvents]] as const) {
+      const compact = stored.replace(/\s+/g, "");
+      const leaked = windows.filter(window => compact.includes(window));
+      expect(leaked.length, `${name}: ${leaked.length}/${windows.length} fetched-secret windows survived`).toBe(0);
+      expect(stored.includes(token), name).toBe(false);
+      for (const [form] of forms) expect(stored.includes(`${form}<<`), `${name}: ${form} printed`).toBe(true);
+      expect(stored.includes("***REDACTED***"), name).toBe(true);
+    }
+  }, 60_000);
+
+  // redact-sec2 F3: tool-output event text shares the per-stream hold onLog uses.
+  it("redact-sec2 F3: a secret split across two tool-output events is masked; ordinary text split across events stays intact", async () => {
+    const { randomBytes } = await import("node:crypto");
+    const f = await seed();
+    const token = randomBytes(30).toString("base64"); // test-only
+    const pin = "482916375"; // test-only
+    const bindings: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries({ SEC2_SPLIT_TOKEN: token, SEC2_SPLIT_PIN: pin })) {
+      const secret = await secretService(db).create(f.companyId, { name: `redact-sec2-${key}-${f.agentId}`, provider: "local_encrypted", value }, { userId: f.userId });
+      bindings[key] = { type: "secret_ref", secretId: secret.id, version: "latest" };
+    }
+    const adapterConfig = { model: "agent-model", env: bindings };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+    const ordinary = `ordinary build output: 48 tests passed in 1763297669123 ms; agent ${f.agentId}; checksum 9f2c41d07ab3\n`;
+    const tokenText = `token=${token} done\n`;
+    const pinText = `pin ${pin} done\n`;
+    const splits = [
+      { callId: "ordinary", text: ordinary, at: ordinary.indexOf("1763297") + 4 },
+      { callId: "token", text: tokenText, at: tokenText.indexOf(token) + 17 },
+      { callId: "pin", text: pinText, at: pinText.indexOf(pin) + 4 },
+    ];
+    inspect.set(f.agentId, async input => {
+      expect((input.config.env as Record<string, string>).SEC2_SPLIT_TOKEN === token).toBe(true);
+      for (const { callId, text, at } of splits) {
+        for (const piece of [text.slice(0, at), text.slice(at)]) {
+          await input.onEvent?.({ eventType: "tool.output", stream: "stdout", level: "info", message: piece,
+            payload: { toolCallId: callId, output: piece } });
+        }
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const events = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .filter(event => event.eventType === "tool.output").sort((left, right) => left.seq - right.seq);
+    expect(events).toHaveLength(splits.length * 2);
+    for (const { callId, text } of splits) {
+      const own = events.filter(event => (event.payload as { toolCallId?: string }).toolCallId === callId);
+      expect(own).toHaveLength(2);
+      const messages = own.map(event => event.message ?? "").join("");
+      const outputs = own.map(event => (event.payload as { output?: string }).output ?? "").join("");
+      for (const joined of [messages, outputs]) {
+        if (callId === "ordinary") expect(joined).toBe(text);
+        else {
+          const value = callId === "token" ? token : pin;
+          const cut = text.slice(0, splits.find(split => split.callId === callId)!.at).length - text.indexOf(value);
+          expect(joined.includes(value), `${callId} split across two events`).toBe(false);
+          // Neither half of the split secret is committed in either event.
+          for (const half of [value.slice(0, cut), value.slice(cut)]) expect(joined.includes(half), `${callId} half`).toBe(false);
+          expect(joined.includes("***REDACTED***"), callId).toBe(true);
+          expect(joined.endsWith(" done\n"), callId).toBe(true);
+        }
+      }
+    }
+  }, 60_000);
+
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
