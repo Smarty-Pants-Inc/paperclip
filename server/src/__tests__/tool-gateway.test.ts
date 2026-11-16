@@ -3084,6 +3084,9 @@ rl.on("line", (line) => {
           }
         }
         if (secret) {
+          // Settle deferred secret-audit/touch writes before this in-test removal,
+          // just as teardown does before deleting their referenced parent rows.
+          await flushSecretResolutionWrites(db);
           const removed = await service.archiveConnection(connection!.id, company.id, { actorType: "user", actorId: "alice" });
           expect(removed.removal.secretsRevoked).toBe(1);
           const [deleted] = await db.select().from(companySecrets).where(eq(companySecrets.id, activeSecretId!));
