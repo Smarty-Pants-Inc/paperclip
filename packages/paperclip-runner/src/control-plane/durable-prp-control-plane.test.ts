@@ -3648,6 +3648,43 @@ it("routes github_access.http only through authenticated PRP without journaling 
   }
 });
 
+it("scopes GitHub access request counters to one PRP session after a runner restart", async () => {
+  const root = mkdtempSync(resolve(tmpdir(), "runner-prp-github-access-restart-"));
+  const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
+  const requestId = "github-access-runner-generation-0000000000000000";
+  const handler = vi.fn(async (frame: Readonly<Record<string, unknown>>) => ({
+    requestId: String(frame.requestId), status: 200,
+    headers: { "cache-control": "no-store", "content-type": "application/json" },
+    bodyBase64: Buffer.from("{}").toString("base64"),
+  }));
+  core.setGithubAccessHttpHandler(handler);
+  let first: AuthenticatedClient | null = null;
+  let restarted: AuthenticatedClient | null = null;
+  try {
+    await core.start();
+    first = await authenticate(core, core.issueBootstrapTicket());
+    expect(first).not.toBeNull();
+    sendSecure(first!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId,
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    expect(await receiveSecure(first!)).toMatchObject({ requestId, status: 200 });
+
+    // A restarted runner starts its local request counter at zero. Its new
+    // authenticated PRP attachment is a new access generation, not a replay
+    // inside the old connection.
+    restarted = await authenticate(core, first!.leaseToken!);
+    expect(restarted).not.toBeNull();
+    sendSecure(restarted!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId,
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    expect(await receiveSecure(restarted!)).toMatchObject({ requestId, status: 200 });
+    expect(handler).toHaveBeenCalledTimes(2);
+  } finally {
+    first?.socket.destroy();
+    restarted?.socket.destroy();
+    await core.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 it("pushes the runner GitHub capability only over authenticated PRP and waits for its ephemeral ack", async () => {
   const root = mkdtempSync(resolve(tmpdir(), "runner-prp-github-capability-"));
   const core = new DurablePrpControlPlane({ stateDirectory: root, identity, expectedRunnerVersion, expectedRunnerDigest });
