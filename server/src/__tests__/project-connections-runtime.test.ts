@@ -262,6 +262,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id, issueId: bound.issue.id });
     expect(selected.credential).toBeUndefined();
     expect(selected.configured).toBe(true);
+    expect(selected.error).toBeTruthy();
     expect(selected.error).toContain("project_connection_use_denied");
     expect(provider.acquire).not.toHaveBeenCalled();
   });
@@ -435,7 +436,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: run!.id });
     let session;
     try { session = await createToolGatewayService(db).createSession({ companyId: f.companyId, agentId: f.leadA.id, runId: run!.id, projectId: f.b.id }); }
-    catch (error) { expect(error).toMatchObject({ status: 403, reasonCode: "run_context_mismatch" }); return; }
+    catch (error) { expect(error).toMatchObject({ status: 403 }); expect(error).toMatchObject({ status: 403, reasonCode: "run_context_mismatch" }); return; }
     expect(session.projectId).toBeNull();
   });
 
@@ -539,6 +540,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, context);
     expect(provider.acquire).toHaveBeenCalledTimes(1);
     expect(selected.credential).toBeUndefined();
+    expect(selected.error).toBeTruthy();
     expect(selected.error).toBe("project_connection_run_context_invalid");
     expect(selected.credential?.connectionId).not.toBe(b.connection.id);
   });

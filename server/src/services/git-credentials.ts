@@ -17,7 +17,7 @@ import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
-import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, hasProjectConnectionOwnership, type ProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, requiresProjectConnectionRunContext, type ProjectConnectionRunContext } from "./project-connection-run-context.js";
 
 /**
  * Server-side git credentials for managed project checkouts and execution-workspace base
@@ -391,7 +391,7 @@ export async function resolveManagedGitHubIdentitySelection(
   let runContext: ProjectConnectionRunContext | undefined;
   let managedRequired = false;
   try {
-    if ((context.heartbeatRunId || context.issueId) && await hasProjectConnectionOwnership(db, companyId)) {
+    if ((context.heartbeatRunId || context.issueId) && await requiresProjectConnectionRunContext(db, companyId, context.heartbeatRunId)) {
       runContext = await readProjectConnectionRunContext(db, {
         companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
       });
@@ -643,7 +643,7 @@ export async function resolveManagedGitHubCredential(
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   let captured: ProjectConnectionRunContext | undefined;
   try {
-    if ((context.heartbeatRunId || context.issueId) && await hasProjectConnectionOwnership(db, companyId)) captured = await readProjectConnectionRunContext(db, {
+    if ((context.heartbeatRunId || context.issueId) && await requiresProjectConnectionRunContext(db, companyId, context.heartbeatRunId)) captured = await readProjectConnectionRunContext(db, {
       companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
     });
   } catch { return { configured: true, error: "project_connection_run_context_invalid" }; }
