@@ -13,7 +13,8 @@ import { nativePostResultFailureCategory, type NativePostResultFailureCategory }
 import { logger } from "../../middleware/logger.js";
 import { RESTART_WARM_CLOSE_CONCURRENCY } from "../../shutdown.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
-import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, recordNativeHarnessBackupStampOnLeaseChain,
+  retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -55,7 +56,6 @@ import { nativeProviderPackAdmissionFailureCode, nativeProviderPackAdmissionPend
 import { type PackProvider, type ProviderPackInstallation, canonicalProviderPackDigestJson, providerPackIncompatible, verifyRemoteProviderPack as verifyRemoteProviderPackIdentity } from "./remote-provider-pack-verification.js";
 import { remoteProviderPackMemoScope } from "./remote-provider-pack-memo.js";
 
-import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { NATIVE_SESSION_EXECUTION_LEASE_TTL_MS, lockNativeExecutionLeaseForReacquire, nativeExecutionLeaseHeldCondition, releaseUnstartedNativeExecutionClaim, startNativeSessionExecutionLeaseRenewal, type NativeExecutionLeaseRenewal } from "./native-execution-lease.js";
 export { renewNativeSessionExecutionLease } from "./native-execution-lease.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -18730,16 +18730,12 @@ async function createRunnerdBackendWithinSessionClaim(
       runnerInstanceId: backup.manifest.runnerInstanceId,
       completedAt: backup.manifest.completedAt,
     });
-    const leaseId = remoteTarget.leaseId;
-    const updated = await writeEnvironmentCleanup(input.db, tx => tx
-      .update(environmentLeases)
-      .set({
-        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: stamp })}::jsonb`,
-        updatedAt: new Date(),
-      })
-      .where(eq(environmentLeases.id, leaseId))
-      .returning({ id: environmentLeases.id })
-      .then((rows) => rows[0] ?? null), { companyId: leaseRow.companyId, runId: leaseRow.heartbeatRunId ?? undefined, leaseId });
+    // The backend names the lease this owner was admitted on; a later turn may
+    // have resumed the same allocation as a new row. Stamp that chain's tip.
+    const updated = await recordNativeHarnessBackupStampOnLeaseChain(input.db, {
+      leaseId: remoteTarget.leaseId, companyId: leaseRow.companyId, providerLeaseId: leaseRow.providerLeaseId,
+      runId: leaseRow.heartbeatRunId, stamp,
+    });
     if (!updated) throw new Error("runner_harness_backup_lease_missing");
   };
 
