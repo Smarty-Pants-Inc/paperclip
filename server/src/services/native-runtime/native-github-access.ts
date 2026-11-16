@@ -326,7 +326,7 @@ export async function createNativeGitHubAccess(input: {
       markRunnerIngressReady() { if (transport === "runner_ingress") staleRunnerCapability = false; },
       markRunnerIngressStale() { if (transport === "runner_ingress") staleRunnerCapability = true; },
       duplexRequested,
-      async handleRunnerIngressHttpRequest(frame: unknown, sessionBinding: Binding): Promise<NativeGitHubAccessHttpReply> {
+      async handleRunnerIngressHttpRequest(frame: unknown, sessionBinding: Binding, recordLog = true): Promise<NativeGitHubAccessHttpReply> {
         const startedAt = performance.now();
         const requestOnLog = activeOnLog;
         const parsed = parseIngressRequest(frame);
@@ -338,7 +338,9 @@ export async function createNativeGitHubAccess(input: {
             responseSize: response.body.byteLength, requestId: redactLogValue(parsed?.requestId ?? requestId),
             transport: "prp", durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
           };
-          await Promise.resolve(requestOnLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
+          if (recordLog) {
+            await Promise.resolve(requestOnLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
+          }
           return responseFrame(requestId, response);
         };
         if (!parsed) return respond(jsonReply(403, { error: "GitHub ingress request refused" }));

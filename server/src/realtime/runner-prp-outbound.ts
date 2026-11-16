@@ -437,12 +437,13 @@ function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
   return async (value: unknown, identity: DurableRecoveryIdentity): Promise<GithubAccessReply> => {
     const startedAt = performance.now();
     const requestId = githubAccessFrameRequestId(value);
-    const refusal = async (id: string, status: number, message: string) => {
-      const response = githubAccessResponse(id, status, { error: message });
+    const recordResponse = async (response: GithubAccessReply) => {
       await Promise.resolve(handler.recordRequest?.({ frame: value, response,
         durationMs: Math.max(0, Math.round(performance.now() - startedAt)) })).catch(() => undefined);
       return response;
     };
+    const refusal = (id: string, status: number, message: string) =>
+      recordResponse(githubAccessResponse(id, status, { error: message }));
     if (requestId === null) return refusal("invalid-request", 403, "GitHub ingress request refused");
     if (inFlight.size >= DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_IN_FLIGHT) {
       return refusal(requestId, 503, "GitHub ingress request capacity unavailable");
@@ -468,15 +469,15 @@ function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
         }),
       ]);
       if (!sameGithubAccessBinding(binding, handler.getSessionBinding(identity))) {
-        return githubAccessResponse(requestId, 403, { error: "GitHub ingress run binding changed" });
+        return await recordResponse(githubAccessResponse(requestId, 403, { error: "GitHub ingress run binding changed" }));
       }
-      return normalizeGithubAccessReply(result, requestId) ??
-        githubAccessResponse(requestId, 503, { error: "GitHub credentials unavailable" });
+      return await recordResponse(normalizeGithubAccessReply(result, requestId) ??
+        githubAccessResponse(requestId, 503, { error: "GitHub credentials unavailable" }));
     } catch (error) {
       const timeout = typeof error === "object" && error !== null &&
         (error as { githubAccessTimeout?: unknown }).githubAccessTimeout === true;
-      return githubAccessResponse(requestId, timeout ? 504 : 503,
-        { error: timeout ? "GitHub credential request timed out" : "GitHub credentials unavailable" });
+      return await recordResponse(githubAccessResponse(requestId, timeout ? 504 : 503,
+        { error: timeout ? "GitHub credential request timed out" : "GitHub credentials unavailable" }));
     } finally {
       if (timer !== undefined) clearTimeout(timer);
       inFlight.delete(inFlightRequest);

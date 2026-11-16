@@ -311,7 +311,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     if (currentIdentity.runId !== identity.runId || identity.runId !== runId || !agentId || !issueId) return null;
                     return githubAccess.getSessionBinding({ companyId, agentId, issueId, runId });
                   },
-                  handleRequest: (frame, binding) => githubAccess.handleRunnerIngressHttpRequest(frame, binding),
+                  handleRequest: (frame, binding) => githubAccess.handleRunnerIngressHttpRequest(frame, binding, false),
                   recordRequest: ({ frame, response, durationMs }) => githubAccess.recordRunnerIngressRequest(frame, response, durationMs),
                   getCapability: () => githubAccess.getRunnerIngressCapability(),
                   setRunnerIngressCapabilityRefresher: refresher => githubAccess.setRunnerIngressCapabilityRefresher(refresher),
