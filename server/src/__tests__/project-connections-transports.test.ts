@@ -1,3 +1,4 @@
+import "./helpers/project-connections-approval-http.js";
 import { createHash } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { connectionGrants, createDb, heartbeatRuns, issues, toolCatalogEntries, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 const provider = vi.hoisted(() => ({ acquire: vi.fn(async (_db: unknown, connection: { id: string }) => ({
   token: `synthetic-transport-token-${connection.id}`, expiresAt: Date.now() + 3600000,

@@ -1,9 +1,10 @@
+import "./helpers/project-connections-approval-http.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, companySecretBindings, connectionGrants, createDb, toolApplications, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { lockProjectConnectionIdentities } from "../services/project-connection-arbitration.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 // Judge-added production-writer qualification. No admission, custody, provider,
 // arbitration, lifecycle or receipt implementation is replaced. Missing trusted
@@ -14,8 +15,12 @@ describe("integration INT-A2/INT-A3 real create transactions", () => {
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-project-integration-"); db = createDb(database.connectionString, { maxConnections: 8 }); }, 60_000);
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
 
+  // Measure transaction residue relative to genuine approval setup. The source
+  // App/application/grant/bindings and approval/config activity are prerequisites,
+  // not writes made by either racer. No race or assertion is changed.
+  const baselines = new Map<string, Record<string, number>>();
   async function counts(companyId: string) {
-    return {
+    const observed = {
       applications: (await db.select().from(toolApplications).where(eq(toolApplications.companyId, companyId))).length,
       connections: (await db.select().from(toolConnections).where(eq(toolConnections.companyId, companyId))).length,
       grants: (await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, companyId))).length,
@@ -23,6 +28,8 @@ describe("integration INT-A2/INT-A3 real create transactions", () => {
       installs: (await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, companyId))).length,
       receipts: (await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "tool_connection.project_taken")))).length,
     };
+    const baseline = baselines.get(companyId);
+    return Object.fromEntries(Object.entries(observed).map(([key, value]) => [key, value - (baseline?.[key] ?? 0)]));
   }
 
   it.each(["duplicate", "shared-first", "exclusive-first", "exclusive-alias-A-first", "exclusive-alias-B-first"] as const)(
@@ -33,6 +40,9 @@ describe("integration INT-A2/INT-A3 real create transactions", () => {
           config: { ...f.input(project).config, methodConfig: { ...f.config(project).methodConfig, installationId: String(456 + i) } } }))
         : [f.input(f.a), f.input(f.b, { exclusive: true })];
       if (order === "exclusive-first" || order === "exclusive-alias-B-first") inputs.reverse();
+      await f.approve(f.a);
+      if (order !== "duplicate") await f.approve(f.b, order.startsWith("exclusive-alias") ? "457" : "456");
+      baselines.set(f.companyId, await counts(f.companyId));
       let release!: () => void;
       let locked!: () => void;
       const held = new Promise<void>(done => { locked = done; });
@@ -71,6 +81,7 @@ describe("integration INT-A2/INT-A3 real create transactions", () => {
 
   it("INT-A3/A10: same successful production create is the control for the injected receipt failure", async () => {
     const f = await projectConnectionFixture(db);
+    await f.approve(); baselines.set(f.companyId, await counts(f.companyId));
     const result = await f.service.createConnection(f.companyId, f.input(), f.actor());
     expect(result.projectId).toBe(f.a.id);
     expect(await counts(f.companyId)).toMatchObject({ applications: 1, connections: 1, grants: 1, receipts: 1 });
@@ -78,6 +89,7 @@ describe("integration INT-A2/INT-A3 real create transactions", () => {
 
   it("INT-A3/A10: actual receipt P0001 is required, with zero application/connection/grant/binding/install/receipt residue", async () => {
     const f = await projectConnectionFixture(db);
+    await f.approve(); baselines.set(f.companyId, await counts(f.companyId));
     await db.execute(sql.raw(`CREATE FUNCTION project_int_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'INT-A3 receipt fault'; END IF; RETURN NEW; END $$`));
     await db.execute(sql.raw("CREATE TRIGGER project_int_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_int_receipt_failure()"));
     try {
