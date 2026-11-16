@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import { activityLog, agents, approvals, companies, companySecretBindings, companySecrets, createDb, userCompanyPreferences, type Db,
@@ -6,6 +8,10 @@ import { activityLog, agents, approvals, companies, companySecretBindings, compa
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
+import { agentRoutes } from "../routes/agents.js";
+import { approvalRoutes } from "../routes/approvals.js";
+import { errorHandler } from "../middleware/error-handler.js";
+import { AccountingContentionError } from "../services/accounting-transaction.js";
 
 // #20389 B6: supersede-by-REPLACEMENT for ctl5's F5 tests (agent-hiring-publication-retry.test.ts and
 // agent-primary-publication-retry.test.ts), which force 40P01 and require the lifecycle's internal
@@ -22,14 +28,14 @@ describe("#20389 B6 lifecycle publication without an internal retry (replaces ct
   afterAll(async () => { await database?.cleanup(); });
 
   /** Root transactions only; `failNext` makes the next one raise a real PostgreSQL 40P01 after its work. */
-  function failingDb() {
+  function failingDb(persistent = false) {
     const state = { attempts: 0, failNext: true, committed: false };
     const wrapped = new Proxy(db, { get(target, key, receiver) {
       if (key === "transaction") return (async (work, options) => {
         const result = await target.transaction(async tx => {
           state.attempts++;
           const value = await work(tx);
-          if (state.failNext) { state.failNext = false; await tx.execute(sql`DO $$ BEGIN RAISE EXCEPTION 'forced lifecycle rollback' USING ERRCODE = '40P01'; END $$`); }
+          if (persistent || state.failNext) { state.failNext = false; await tx.execute(sql`DO $$ BEGIN RAISE EXCEPTION 'forced lifecycle rollback' USING ERRCODE = '40P01'; END $$`); }
           return value;
         }, options);
         state.committed = true;
@@ -46,6 +52,50 @@ describe("#20389 B6 lifecycle publication without an internal retry (replaces ct
     }
     return codes;
   };
+
+  for (const path of ["agents", "agent-hires", "approval"] as const) {
+    it(`HTTP ${path}: persistent hire contention returns the upstream 503 code in one attempt and writes nothing`, async () => {
+      const companyId = randomUUID(), approvalId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Hire contention", issuePrefix: `C${companyId.slice(0, 7)}`,
+        requireBoardApprovalForNewAgents: false });
+      // Metadata only, no secret value/provider: exercise the real binding write and rollback.
+      const [reference] = await db.insert(companySecrets).values({ companyId, key: "DEMO", name: "DEMO",
+        provider: "local_encrypted", status: "active" }).returning();
+      const payload = { name: "Worker", adapterType: "process", adapterConfig: {
+        env: { DEMO: { type: "secret_ref", secretId: reference!.id, version: "latest" } },
+      } };
+      if (path === "approval") await db.insert(approvals).values({ id: approvalId, companyId, type: "hire_agent",
+        requestedByUserId: "board", payload });
+      const { wrapped, state } = failingDb(true);
+      const api = express();
+      api.use(express.json());
+      api.use((req, _res, next) => {
+        req.actor = { type: "board", source: "session", userId: "board", isInstanceAdmin: true, companyIds: [companyId] };
+        next();
+      });
+      api.use("/api", agentRoutes(wrapped));
+      api.use("/api", approvalRoutes(wrapped));
+      api.use(errorHandler);
+      const events: unknown[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(companyId, event => events.push(event));
+      try {
+        const response = await request(api).post(path === "approval"
+          ? `/api/approvals/${approvalId}/approve` : `/api/companies/${companyId}/${path}`).send(path === "approval" ? {} : payload);
+        const counts = { agents: (await db.select().from(agents).where(eq(agents.companyId, companyId))).length,
+          bindings: (await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, companyId))).length,
+          activity: (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).length, events: events.length };
+        console.log("HIRE_CONTENTION_HTTP_PROOF", JSON.stringify({ path, status: response.status, body: response.body,
+          attempts: state.attempts, committed: state.committed, counts }));
+        expect(counts).toEqual({ agents: 0, bindings: 0, activity: 0, events: 0 });
+        expect({ attempts: state.attempts, committed: state.committed }).toEqual({ attempts: 1, committed: false });
+        if (path === "approval") expect((await db.select().from(approvals).where(eq(approvals.id, approvalId)))[0]!.status).toBe("pending");
+        expect(response.status, response.text).toBe(503);
+        const upstream = new AccountingContentionError({ code: "40P01" }, 1);
+        expect(response.body).toMatchObject({ error: upstream.message, code: upstream.code,
+          details: { code: upstream.code, retryable: true } });
+      } finally { unsubscribe(); }
+    }, 60_000);
+  }
 
   for (const path of ["hire", "pending approval", "legacy approval"] as const) {
     it(`${path}: a rolled-back attempt publishes nothing; the explicit retry publishes each activity once after commit`, async () => {
