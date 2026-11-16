@@ -1,22 +1,32 @@
+import "./helpers/project-connections-approval-http.js";
 import { generateKeyPairSync } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { connectionGrants, createDb, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { CANARY, projectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { CANARY } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 const provider = vi.hoisted(() => ({
-  secret: vi.fn(async () => ({ value: "synthetic-project-key-never-return-this", latestVersion: 1 })),
+  secret: vi.fn(async () => ({ value: "synthetic-project-key-never-return-this", latestVersion: 2 })),
   acquire: vi.fn<(namespace: string, config: import("../services/github-app-client.js").GitHubAppConfig, key: string, force?: boolean) => Promise<import("../services/github-app-client.js").AppCredential>>(async () => ({ token: "synthetic-restricted-token", expiresAt: Date.now() + 3600000, verifiedRegistrationId: "123",
     github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
   })),
 }));
-vi.mock("../services/connection-credentials.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../services/connection-credentials.js")>(), resolveConnectionGrantSecret: provider.secret,
-}));
-vi.mock("../services/github-app-client.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../services/github-app-client.js")>(), createGitHubAppClient: () => ({ acquire: provider.acquire }),
-}));
+vi.mock("../services/connection-credentials.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/connection-credentials.js")>();
+  return { ...actual, resolveConnectionGrantSecret: (...args: Parameters<typeof actual.resolveConnectionGrantSecret>) =>
+    args[1].projectId == null ? actual.resolveConnectionGrantSecret(...args) : provider.secret() };
+});
+vi.mock("../services/github-app-client.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("../services/github-app-client.js")>();
+  return { ...actual, createGitHubAppClient: (...options: Parameters<typeof actual.createGitHubAppClient>) => {
+    const client = actual.createGitHubAppClient(...options);
+    return { acquire: (...args: Parameters<typeof client.acquire>) =>
+      args[0].includes(":approval:") || args[0].includes(":connection-create:")
+        ? client.acquire(...args) : provider.acquire(...args) };
+  } };
+});
 import { resolveGitHubAppCredential } from "../services/github-app-credentials.js";
 import { parseGitHubAppConfig } from "../services/github-app-client.js";
 import { verifyProjectConnectionGitHubScope } from "../services/project-connection-provider-scope.js";
@@ -91,7 +101,7 @@ describe("project connection stable-ID envelope at credential release", () => {
       throw new Error(`Unexpected synthetic provider path ${path}`);
     });
     const cached = actual.createGitHubAppClient(http);
-    provider.secret.mockResolvedValue({ value: key, latestVersion: 1 });
+    provider.secret.mockResolvedValue({ value: key, latestVersion: 2 });
     provider.acquire.mockImplementation(cached.acquire);
     try {
       expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-cached-token");
@@ -103,7 +113,7 @@ describe("project connection stable-ID envelope at credential release", () => {
       await expect(resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
       expect(http).toHaveBeenCalledTimes(requests);
     } finally {
-      provider.secret.mockResolvedValue({ value: CANARY, latestVersion: 1 });
+      provider.secret.mockResolvedValue({ value: CANARY, latestVersion: 2 });
       provider.acquire.mockImplementation(async () => ({ token: "synthetic-restricted-token", expiresAt: Date.now() + 3600000, verifiedRegistrationId: "123",
         github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] } }));
     }
