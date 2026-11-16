@@ -190,11 +190,6 @@ export async function assertProjectConnectionAdmission(
     if (!membership || membership.membershipRole === "viewer") throw forbidden("An active company manager is required");
     return;
   }
-  if (connection && scope) {
-    const requested = input.proposedRepositoryIds ?? await projectConnectionRepositoryIds(db, companyId, projectId, parseGitHubAppConfig(connection.config.methodConfig).repositories);
-    await readProjectAppCustody(db, { companyId, projectId, config: connection.config,
-      refs: input.proposedSecretRefs ?? connection.credentialSecretRefs, registrationId: scope.registrationId, repositoryIds: requested, connectionId: connection.id });
-  }
   const { project, human, primary } = await currentAuthority(db, companyId, projectId);
   if (project.archivedAt && !["retire", "disable", "project_update"].includes(operation)) {
     throw conflict("This project is archived. Its connection cannot grant or release new access.", { code: "project_connection_project_archived" });
@@ -271,6 +266,11 @@ export async function assertProjectConnectionAdmission(
   if (operation === "use" && grants[0]!.status !== "active") throw forbidden("This project's organization authorization is unavailable", { code: "project_connection_reference_not_approved" });
   const ids = grants[0]!.providerTenant?.github?.installationIds;
   if (!ids || ids.length !== 1 || `github.com/github-app-installation/${ids[0]}` !== scope.installationKey) throw forbidden("The authorization does not match the approved installation", { code: "project_connection_reference_not_approved" });
+  // RFL 05:56Z: retain the repository/reference refusal order, then require
+  // custody on EVERY owned admission path. The board-human removal exception
+  // above is unchanged; no ordinary success may return before this reader.
+  await readProjectAppCustody(db, { companyId, projectId, config: connection!.config,
+    refs, registrationId: scope.registrationId, repositoryIds: requested, connectionId: connection!.id });
 }
 
 /** Request protection before normalization. Keep attempts visible rather than
