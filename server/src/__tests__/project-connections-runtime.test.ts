@@ -105,6 +105,36 @@ describe("project connection task-derived selection and no legacy fallback (roun
     expect(provider.acquire).not.toHaveBeenCalled();
   });
 
+  it.each(["legacy_oauth", "null_agent_app"] as const)("RFL-C3/A05/M03: ownership activates during %s acquisition; stale legacy token is refused", async kind => {
+    const f = await projectConnectionFixture(db);
+    const legacy = await f.seedConnection(null);
+    await db.update(toolConnections).set({ credentialPolicy: "per_agent",
+      ...(kind === "legacy_oauth" ? { config: { sourceTemplateKey: "github" } } : {}) }).where(eq(toolConnections.id, legacy.connection.id));
+    await db.update(connectionGrants).set({ kind: "agent", isDefault: false, subjectAgentId: f.leadA.id,
+      ...(kind === "legacy_oauth" ? { credentialSecretRefs: [{ configPath: "oauth.access_token", secretId: f.secret.id }] } : {}),
+    }).where(eq(connectionGrants.id, legacy.grant.id));
+    const bound = await f.run();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: bound.issue.id,
+      projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: f.a.id } } }).where(eq(heartbeatRuns.id, bound.run.id));
+    const activate = async () => { await f.seedConnection(f.a, { status: "active", installed: false }); };
+    const secrets = detectableFallback();
+    if (kind === "legacy_oauth") secrets.resolveSecretValue.mockImplementationOnce(async () => { await activate(); return "synthetic-stale-legacy-token"; });
+    else provider.acquire.mockImplementationOnce(async (_db, connection) => {
+      await activate();
+      return { token: `synthetic-installation-token-${connection.id}`, expiresAt: Date.now() + 3600000,
+        github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] } };
+    });
+    const result = await resolveManagedGitHubCredential(db, secrets, f.companyId, {
+      agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id,
+    });
+    expect(result.credential).toBeUndefined();
+    expect(result.configured).toBe(true);
+    expect(result.error).toContain("project_connection_unavailable");
+    if (kind === "legacy_oauth") expect(secrets.resolveSecretValue).toHaveBeenCalledTimes(1);
+    else expect(provider.acquire).toHaveBeenCalledTimes(1);
+    expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+
   it("A07: persists a projectless admission pair, ignoring a taskless snapshot project", async () => {
     const f = await projectConnectionFixture(db);
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, status: "running", contextSnapshot: { projectId: f.b.id } }).returning();

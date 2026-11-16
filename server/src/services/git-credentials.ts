@@ -647,6 +647,20 @@ export async function resolveManagedGitHubCredential(
   if (!selection.grant) return { configured: true, identitySource: selection.identitySource, error: selection.error };
   const acquire = async (selection: Awaited<ReturnType<typeof resolveManagedGitHubIdentitySelection>>) => {
     let grant = selection.grant!;
+    // Every credential branch (including legacy OAuth and null agent-owned App)
+    // re-evaluates retained ownership, assignment and selection after async I/O.
+    const recheck = async () => {
+      if (captured) {
+        try { await revalidateProjectConnectionRunContext(db, captured); }
+        catch { return "project_connection_run_context_invalid"; }
+      }
+      const current = await resolveManagedGitHubIdentitySelection(db, companyId, context);
+      if (current.grant?.id !== grant.id || current.connection?.id !== grant.connectionId
+        || JSON.stringify(current.grant.credentialSecretRefs) !== JSON.stringify(grant.credentialSecretRefs)) {
+        return current.error ?? "The managed GitHub identity changed during acquisition";
+      }
+      return undefined;
+    };
     if (grant.kind === "user" && grant.subjectUserId) {
       const [membership] = await db.select({ id: companyMemberships.id, role: companyMemberships.membershipRole }).from(companyMemberships).where(and(
         eq(companyMemberships.companyId, companyId),
@@ -659,11 +673,8 @@ export async function resolveManagedGitHubCredential(
     const appConnection = selection.connection;
     if (appConnection && isGitHubAppConnection(appConnection)) {
       const app = await resolveGitHubAppCredential(db, appConnection, grant, false, false, context.agentId);
-      if (captured) await revalidateProjectConnectionRunContext(db, captured);
-      if (grant.kind === "organization" || appConnection.projectId) {
-        const current = await resolveManagedGitHubIdentitySelection(db, companyId, context);
-        if (current.grant?.id !== grant.id) throw new Error("The shared GitHub App audience changed during acquisition");
-      }
+      const changed = await recheck();
+      if (changed) return { configured: true, identitySource: selection.identitySource, error: changed };
       return { configured: true, identitySource: selection.identitySource, credential: {
         token: app.token, source: "managed_connection" as const, secretName: null, refreshPerOperation: true,
         githubIdentity: { userId: app.github.userId, login: app.github.login },
@@ -727,7 +738,8 @@ export async function resolveManagedGitHubCredential(
     } else {
       token = await secrets.resolveSecretValue(companyId, accessRef.secretId, accessRef.versionSelector ?? "latest", { accessContext });
     }
-    if (captured) await revalidateProjectConnectionRunContext(db, captured);
+    const changed = await recheck();
+    if (changed) return { configured: true, identitySource: selection.identitySource, error: changed };
     return {
       configured: true, identitySource: selection.identitySource,
       credential: {
