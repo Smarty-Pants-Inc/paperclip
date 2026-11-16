@@ -1,3 +1,4 @@
+import { agentIdentityRedactionVectors } from "../../__tests__/fixtures/agent-identity-redaction-vectors.js";
 import { NativeSessionDiagnostics } from "../native-runtime/native-session-diagnostics.js";
 import { withS3FailureDiagnostics } from "../../storage/s3-failure.js";
 import { objectLogFixture } from "./__tests__/object-log-fixture.js";
@@ -287,6 +288,48 @@ describe("heartbeat run output log recovery", () => {
       .map((line) => JSON.parse(line));
     expect(lines.map((line) => line.chunk)).toEqual(["attempt one\n", "attempt two\n"]);
     expect(lines.map((line) => line.seq)).toEqual([1, 2]);
+  });
+});
+
+describe("transformed identity material at the object-log boundary (#20832)", () => {
+  const fixture = agentIdentityRedactionVectors();
+  const cases = fixture.vectors.flatMap(vector => (["diagnostic", "native export"] as const).map(path => ({ ...vector, path })));
+
+  it.each(cases)("redacts $name through $path before storage", async ({ chunks, path: entryPath }) => {
+    const row = { ...newRunRow } as Run;
+    const store = objectLogFixture();
+    const db = createRunRowDb(row) as Db & { select: () => unknown };
+    db.select = (() => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) })) as typeof db.select;
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, runLogStore: store,
+      identityRedactor: createAgentIdentityRedactor(fixture.privateKeyPem), secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const handlers = await output.begin(row);
+    // The leading precision controls are outside all PEM/key-body context.
+    const allChunks = [fixture.precision.join("\n") + "\n", ...chunks, "\n", fixture.precision.join("\n") + "\n"];
+    let cursor = 0;
+    for (const chunk of allChunks) {
+      if (entryPath === "diagnostic") await handlers.onLog("stdout", chunk);
+      else await handlers.onPersistedNativeLog!(++cursor, formatNativeRunLogEvent({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: row.id,
+        sourceEventId: `source:${cursor}`, sourceInstanceId: "source", sourceKind: "runner",
+        sourceSeq: cursor, normalizedSessionId: "session", eventType: "item.delta", priority: 2,
+        emittedAt: new Date().toISOString(), payload: { text: chunk },
+      }));
+    }
+    await store.finalize(output.handle!);
+    const content = (await store.read(output.handle!, { limitBytes: 128 * 1024 })).content;
+    const stored = content.trim().split("\n").map(line => {
+      const chunk = JSON.parse(line).chunk as string;
+      return entryPath === "diagnostic" ? chunk : JSON.parse(chunk).event.payload.text as string;
+    }).join("");
+    for (const window of fixture.windows) expect(stored, "32-character key-body window survived").not.toContain(window);
+    expect(stored).not.toMatch(/-----BEGIN[^\r\n]*PRIVATE KEY-----|-----END[^\r\n]*PRIVATE KEY-----/);
+    for (const value of fixture.precision) {
+      expect(value).toHaveLength(44);
+      expect(stored).toContain(value);
+    }
   });
 });
 
