@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { syncFiles } from "./file-sync.js";
+import { SYNC_TEMP_MAX_AGE_MS, sweepStaleSyncTemps, syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
 import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readyCreateCeilingPerHour, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
   readySpareEnvironmentIds, readySpareIdleMinutes, readySpareMax, readySparePoolKey,
@@ -1099,6 +1099,12 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     readySpares.setClaimStore(spareClaimStore);
     if (spareRefreshTimer) clearInterval(spareRefreshTimer);
     spareRefreshTimer = undefined;
+    // A worker killed mid-transfer left its paperclip-boat-sync-*/transfer.tar (#20912).
+    try {
+      const swept = await sweepStaleSyncTemps();
+      if (swept.removed) ctx.logger.info(`[boat] removed stale paperclip-boat-sync temp dirs removed=${swept.removed} kept=${swept.kept}`,
+        { ...swept, maxAgeMs: SYNC_TEMP_MAX_AGE_MS });
+    } catch { /* Startup never fails on the sweep. */ }
     ctx.logger.info("Boat sandbox provider ready; guardian requires per-lease SSH preflight");
   },
   multiCompanyConfig: true,
