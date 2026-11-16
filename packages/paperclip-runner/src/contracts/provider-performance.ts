@@ -22,12 +22,19 @@ export const PROVIDER_PERFORMANCE_PHASES = [
   "pi.request.sent",
 ] as const;
 export type ProviderPerformancePhase = typeof PROVIDER_PERFORMANCE_PHASES[number];
+/** Fixed, content-free timeout evidence: a private bind exchange timed out, or
+ * the shared Pi admission budget expired (before or during an exchange). */
+export const PI_TIMEOUT_CODES = ["pi_bind_timeout", "pi_admission_deadline_exceeded"] as const;
+export type PiTimeoutCode = typeof PI_TIMEOUT_CODES[number];
+export function isPiTimeoutCode(value: unknown): value is PiTimeoutCode {
+  return (PI_TIMEOUT_CODES as readonly unknown[]).includes(value);
+}
 export interface ProviderPerformanceSpan {
   name: ProviderPerformancePhase;
   startedAtMs: number;
   endedAtMs: number;
   outcome: "ok" | "failed";
-  attributes?: { timeoutCode: "pi_bind_timeout" };
+  attributes?: { timeoutCode: PiTimeoutCode };
 }
 
 const names = new Set<string>(PROVIDER_PERFORMANCE_PHASES);
@@ -55,7 +62,7 @@ export function parseProviderPerformanceSpans(payload: unknown, observedAtMs: nu
       outcome: row.outcome === "failed" ? "failed" : "ok",
       ...(row.outcome === "failed" && name.startsWith("runner.pi.")
         && row.attributes !== null && typeof row.attributes === "object"
-        && (row.attributes as Record<string, unknown>).timeoutCode === "pi_bind_timeout"
-        ? { attributes: { timeoutCode: "pi_bind_timeout" as const } } : {}) }];
+        && isPiTimeoutCode((row.attributes as Record<string, unknown>).timeoutCode)
+        ? { attributes: { timeoutCode: (row.attributes as { timeoutCode: PiTimeoutCode }).timeoutCode } } : {}) }];
   });
 }
