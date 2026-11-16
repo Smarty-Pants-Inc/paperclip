@@ -11,7 +11,7 @@ import { restConnectorFor } from "../connectors/rest-registry.js";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, sql } from "drizzle-orm";
 import { agentInstructionRevisions, agents, companySkillVersions, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 import { isToolConnectionAttentionHealth } from "@paperclipai/shared";
@@ -348,7 +348,9 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
   });
   const hasVoiceConnection = effective.installedConnections.some(connection => connection.transport === "voice");
   const [runIdentity] = hasGitHubConnection || hasVoiceConnection
-    ? await input.db.select({ issueId: boundRunIssueIdSql(), responsibleUserId: heartbeatRuns.responsibleUserId, activeIdentityContextId: heartbeatRuns.activeIdentityContextId })
+    ? await input.db.select({ issueId: boundRunIssueIdSql(), responsibleUserId: heartbeatRuns.responsibleUserId, activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
+        hasRetainedProjectOwnership: sql<boolean>`exists (select 1 from tool_connections owned where owned.company_id = ${input.agent.companyId} and owned.project_id is not null)`,
+      })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.id, input.runId),
@@ -359,12 +361,15 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
     : [];
   // Broker runs pin the permitted tool catalog, not one person’s credential.
   // Selection happens at each operation and can change through steering.
-  const resolvedInstalledConnections = runIdentity?.activeIdentityContextId
-    ? effective.installedConnections : await filterResolvedGitHubConnectionsForRun({
+  const resolvedInstalledConnections = await filterResolvedGitHubConnectionsForRun({
     db: input.db,
     companyId: input.agent.companyId,
     agentId: input.agent.id,
     responsibleUserId: runIdentity?.responsibleUserId ?? null,
+    heartbeatRunId: input.runId,
+    // Preserve the existing broker's multi-person null catalog only when the
+    // same server read proves there is no retained owned scope to disclose.
+    preserveUnownedCatalog: Boolean(runIdentity?.activeIdentityContextId) && !runIdentity?.hasRetainedProjectOwnership,
     connections: effective.installedConnections,
   });
   // App access is optional runtime context. Keep usable assignments pinned, but

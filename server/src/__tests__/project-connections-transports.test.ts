@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { connectionGrants, createDb, heartbeatRuns, issues, toolConnections } from "@paperclipai/db";
+import { connectionGrants, createDb, heartbeatRuns, issues, toolCatalogEntries, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
 
@@ -14,6 +15,7 @@ const provider = vi.hoisted(() => ({ acquire: vi.fn(async (_db: unknown, connect
 vi.mock("../services/github-app-credentials.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/github-app-credentials.js")>(), resolveGitHubAppCredential: provider.acquire,
 }));
+import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import { initializeRunIdentity } from "../services/run-identity.js";
 import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
 import { createNativeGitHubAccess } from "../services/native-runtime/native-github-access.js";
@@ -42,6 +44,25 @@ describe("project connection shell/native operation parity", () => {
     await initializeRunIdentity(db, { companyId: f.companyId, runId: bound.run.id, responsibleUserId: f.human, cause: "instruction" });
     return { f, a, b, bound, input: { companyId: f.companyId, agentId: f.leadA.id, runId: bound.run.id } };
   }
+
+  it("RFL-C1/J17/J18: real native discovery with an active identity pins only the task A catalog", async () => {
+    const { f, a, b, bound } = await shared();
+    const [profile] = await db.insert(toolProfiles).values({ companyId: f.companyId, name: "Native catalog qualification", profileKey: "native-fixture", defaultAction: "deny" }).returning();
+    await db.insert(toolProfileBindings).values({ companyId: f.companyId, profileId: profile!.id, targetType: "agent", targetId: f.leadA.id });
+    const catalogs: { id: string; connectionId: string }[] = [];
+    for (const owned of [a, b]) {
+      await db.update(toolConnections).set({ transport: "mcp_remote", healthStatus: "healthy" }).where(eq(toolConnections.id, owned.connection.id));
+      const [entry] = await db.insert(toolCatalogEntries).values({ companyId: f.companyId, applicationId: owned.connection.applicationId,
+        connectionId: owned.connection.id, name: "read_file", toolName: "read_file", riskLevel: "read", isReadOnly: true,
+        inputSchema: { type: "object" }, versionHash: "native-fixture" }).returning();
+      catalogs.push(entry!);
+      await db.insert(toolProfileEntries).values({ companyId: f.companyId, profileId: profile!.id, selectorType: "connection", effect: "include", connectionId: owned.connection.id });
+    }
+    const result = await resolveNativeRuntimeMcpSnapshot({ db, agent: f.leadA, runId: bound.run.id });
+    const expected = createHash("sha256").update(JSON.stringify({ version: 1, agentId: f.leadA.id,
+      connections: [a.connection.id], tools: catalogs.filter(c => c.connectionId === a.connection.id).map(c => c.id).sort() })).digest("hex");
+    expect(result).toEqual({ assignmentSetId: `sha256:${expected}`, digest: expected, bindingId: `native-mcp:${bound.run.id}` });
+  });
 
   it("J17/A07 shell Git/gh operation resolver selects task A, not healthier B", async () => {
     const { a, b, input } = await shared();
