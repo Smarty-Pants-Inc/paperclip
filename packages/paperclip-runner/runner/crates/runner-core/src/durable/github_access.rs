@@ -684,23 +684,30 @@ pub(crate) fn clear_provider_environment(socket_path: &Path) {
 }
 
 pub(crate) fn apply_provider_environment(command: &mut std::process::Command) {
-    command
-        .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
-        .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT");
     let Ok(value) = provider_environment_slot().lock() else {
         command
+            .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
+            .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT")
             .env("PAPERCLIP_GITHUB_BROKER_URL", "")
             .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "")
             .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
         return;
     };
-    if let Some(environment) = value.as_ref() {
-        command
-            .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", &environment.socket_path)
-            .env("PAPERCLIP_GITHUB_BROKER_URL", "")
-            .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "")
-            .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
-    }
+    let Some(environment) = value.as_ref() else {
+        // In callback-bridge mode the server-provided environment is already
+        // complete. Do not rewrite it when no runner ingress is installed.
+        return;
+    };
+    // The session capability arrives in runnerd's existing launch environment.
+    // Keep its value only on provider children, where the GitHub launcher needs
+    // it to authenticate the local socket request; never use the bridge URL.
+    let session_capability = std::env::var_os("PAPERCLIP_GITHUB_BROKER_TOKEN").unwrap_or_default();
+    command
+        .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", &environment.socket_path)
+        .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress")
+        .env("PAPERCLIP_GITHUB_BROKER_URL", "")
+        .env("PAPERCLIP_GITHUB_BROKER_TOKEN", session_capability)
+        .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
 }
 
 /// One local HTTP request waiting for a matching authenticated PRP reply.
