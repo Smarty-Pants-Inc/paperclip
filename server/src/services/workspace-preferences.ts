@@ -1,8 +1,14 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { userWorkspacePreferences, type Db } from "@paperclipai/db";
-import type { UpdateWorkspacePreference, WorkspacePreference } from "@paperclipai/shared";
+import { isReasoningDisplay, type ReasoningDisplay, type UpdateWorkspacePreference, type WorkspacePreference } from "@paperclipai/shared";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
+
+/** Only well-formed entries leave the service, whatever the stored JSON holds. */
+function agentReasoningDisplayMap(value: unknown): Record<string, ReasoningDisplay> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, display]) => isReasoningDisplay(display)));
+}
 
 export function workspacePreferenceService(db: Db) {
   async function get(userId: string): Promise<WorkspacePreference> {
@@ -13,6 +19,7 @@ export function workspacePreferenceService(db: Db) {
       userId,
       coordinatorWorkspaceEnabled: !(row?.classicWorkspaceEnabled ?? false),
       timeZone: row?.timeZone ?? null,
+      agentReasoningDisplay: agentReasoningDisplayMap(row?.agentReasoningDisplay),
       updatedAt: row?.updatedAt.toISOString() ?? null,
     };
   }
@@ -27,12 +34,21 @@ export function workspacePreferenceService(db: Db) {
         }),
         ...(update.timeZone === undefined ? {} : { timeZone: update.timeZone }),
       };
+      // One agent's entry changes per save; a concurrent save for another
+      // agent is merged by the database, not overwritten by a stale map.
+      const reasoning = update.agentReasoningDisplay;
+      const insertReasoning = reasoning?.display ? { agentReasoningDisplay: { [reasoning.agentId]: reasoning.display } } : {};
+      const updateReasoning = reasoning === undefined ? {} : {
+        agentReasoningDisplay: reasoning.display
+          ? sql`${userWorkspacePreferences.agentReasoningDisplay} || jsonb_build_object(${reasoning.agentId}::text, ${reasoning.display}::text)`
+          : sql`${userWorkspacePreferences.agentReasoningDisplay} - ${reasoning.agentId}::text`,
+      };
       const result = await db.transaction(async tx => {
         const txDb = tx as unknown as Db;
-        await tx.insert(userWorkspacePreferences).values({ userId, ...changes })
+        await tx.insert(userWorkspacePreferences).values({ userId, ...changes, ...insertReasoning })
           .onConflictDoUpdate({
             target: userWorkspacePreferences.userId,
-            set: { ...changes, updatedAt: new Date() },
+            set: { ...changes, ...updateReasoning, updatedAt: new Date() },
           });
         const { publication } = await persistActivity(txDb, {
           companyId, actorType: "user", actorId: userId,

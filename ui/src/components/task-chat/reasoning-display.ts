@@ -1,15 +1,24 @@
+import type { ReasoningDisplay } from "@paperclipai/shared";
 import { findUIAdapter } from "@/adapters/registry";
 
-/** How a run's reasoning shows in chat: folded into the turn, or inline. */
-export type ReasoningDisplay = "fold" | "inline";
+export type { ReasoningDisplay };
 
-/**
- * One place decides how a run's reasoning shows: the run adapter's declared
- * `transcriptPresentation.liveReasoningView`, else fold. There is no per-chat
- * or per-browser choice.
- */
+/** The reasoning display an adapter declares for its transcripts. */
 export function adapterReasoningDisplay(adapterType: string | null | undefined): ReasoningDisplay {
   return adapterType && findUIAdapter(adapterType)?.transcriptPresentation?.liveReasoningView === "inline"
     ? "inline"
     : "fold";
+}
+
+/**
+ * One place decides how a run's reasoning shows: the person's choice for the
+ * run's agent (set on the agent's page and saved on the server), else the
+ * adapter's declared default. There is no per-chat or per-browser choice.
+ */
+export function resolveReasoningDisplay(
+  preferences: Readonly<Record<string, ReasoningDisplay>> | null | undefined,
+  agentId: string | null | undefined,
+  adapterType: string | null | undefined,
+): ReasoningDisplay {
+  return (agentId ? preferences?.[agentId] : undefined) ?? adapterReasoningDisplay(adapterType);
 }

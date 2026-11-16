@@ -3368,6 +3368,13 @@
       "when": 1794815117351,
       "tag": "0491_connector_runtime_company_lock",
       "breakpoints": true
+    },
+    {
+      "idx": 492,
+      "version": "7",
+      "when": 1794830400042,
+      "tag": "0492_agent_reasoning_display",
+      "breakpoints": true
     }
   ]
 }

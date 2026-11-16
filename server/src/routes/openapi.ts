@@ -7241,7 +7241,7 @@ registerCurrentRoute({
   method: "put",
   path: "/api/companies/{companyId}/workspace-preferences/me",
   tags: ["workspace-preferences"],
-  summary: "Update your personal workspace or time zone; active company membership provides audit context",
+  summary: "Update your personal workspace, time zone or reasoning display for one of the company's agents; active company membership provides audit context",
   body: updateWorkspacePreferenceSchema,
   responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
