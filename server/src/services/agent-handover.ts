@@ -28,7 +28,9 @@ export { AGENT_HANDOVER_PENDING_CODE, assertAgentRetirementHandoverAllowed } fro
  * The target is re-checked per item: the nearest manager up the chain that is not
  * retired or retiring. With none (or a loop), the item stays put under the marker.
  * Publication happens after each item's commit. The marker clears only when no
- * open task and no live report remain. Re-running changes nothing.
+ * re-homable open task and no live report remain. Bound conversations retain
+ * their fixed identity; the final activity names their count and ids once.
+ * Re-running changes nothing.
  */
 
 const SYSTEM_ACTOR = { actorType: "system" as const, actorId: "agent_handover" };
@@ -182,11 +184,23 @@ export function agentHandoverService(db: Db, options: { now?: () => Date; repair
       const [agent] = await tx.select().from(agents).where(eq(agents.id, retiredAgentId)).for("update");
       if (!agent) return true;
       const remaining = await pendingAgentHandover(tx, companyId, retiredAgentId);
+      // Re-read bindings at settlement, not from an earlier item's outcome:
+      // conversation identities stay with the retired agent and are not work
+      // the hand-over worker can re-home (review-fleet-2 07:34Z).
+      const boundTasks = remaining.taskIds.length ? await tx.select({ id: issues.id }).from(issues).where(and(
+        eq(issues.companyId, companyId), inArray(issues.id, remaining.taskIds),
+        sql`(${issues.conversationAgentId} is not null or exists (select 1 from ${chatConversations} c
+          where c.company_id = ${companyId} and c.issue_id = ${issues.id}))`,
+      )).orderBy(asc(issues.id)) : [];
+      const boundTaskIds = new Set(boundTasks.map(task => task.id));
+      const rehomableTaskIds = remaining.taskIds.filter(id => !boundTaskIds.has(id));
       // The failed item's transaction rolled back, so persist its reason here with
       // the marker. The company/agent locks serialize concurrent passes; querying
       // durable history also dedupes after a restart or a change back to an old reason.
       // Keep the audit even if another worker has since completed the item.
       for (const item of blocked) {
+        // Intentionally retained conversations are not failed reassignments.
+        if (item.kind === "task" && boundTaskIds.has(item.id)) continue;
         const action = item.kind === "task" ? "issue.reassignment_failed" : "agent.reports_to_change_failed";
         const entityType = item.kind === "task" ? "issue" : "agent";
         const [recorded] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
@@ -218,15 +232,16 @@ export function agentHandoverService(db: Db, options: { now?: () => Date; repair
         }
       }
       const marked = agent.lifecycleOperation?.handover;
-      if (!remaining.taskIds.length && !remaining.reportIds.length) {
+      if (!rehomableTaskIds.length && !remaining.reportIds.length) {
         if (marked) {
           await tx.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'handover'` }).where(eq(agents.id, agent.id));
           await logActivity(tx, { companyId, ...SYSTEM_ACTOR, action: "agent.handover_completed", entityType: "agent", entityId: agent.id,
-            details: { since: marked.since } }, publications);
+            details: { since: marked.since, conversationBoundCount: boundTasks.length,
+              conversationBoundTaskIds: boundTasks.map(task => task.id) } }, publications);
         }
         return true;
       }
-      const still = new Set([...remaining.taskIds, ...remaining.reportIds]);
+      const still = new Set([...rehomableTaskIds, ...remaining.reportIds]);
       const next: AgentHandoverMarker = { code: AGENT_HANDOVER_PENDING_CODE, since: marked?.since ?? now().toISOString(),
         ...(blocked.some(item => still.has(item.id)) ? { blocked: blocked.filter(item => still.has(item.id)) } : {}) };
       if (JSON.stringify(next) !== JSON.stringify(marked)) {
