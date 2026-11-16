@@ -605,6 +605,8 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   heartbeatRunId?: string | null;
   issueId?: string | null;
   connections: T[];
+  /** Only the server native broker's same-statement ownership read may set this. */
+  preserveUnownedCatalog?: boolean;
 }): Promise<T[]> {
   const githubConnections = input.connections.filter((connection) => {
     const config = connection.config && typeof connection.config === "object"
@@ -615,7 +617,7 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
       : {};
     return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
   });
-  if (githubConnections.length === 0) return input.connections;
+  if (githubConnections.length === 0 || input.preserveUnownedCatalog) return input.connections;
   const selection = await resolveManagedGitHubIdentitySelection(input.db, input.companyId, {
     agentId: input.agentId,
     responsibleUserId: input.responsibleUserId ?? null,
