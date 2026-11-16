@@ -7404,3 +7404,136 @@ describe("runner exits that must not relaunch on the same path (#20825)", () => 
       } finally { await owner.cleanup(); }
     }, 60_000);
 });
+
+// #20825 B edge (review-fleet-2): a runnerd PROCESS death between two turns of
+// the SAME run. B fails only an owner whose attached run settled a turn and has
+// nothing in flight or pending; a pending next turn must still reconnect, and
+// a death before the next turn is sent must fail by name and stay resumable.
+describe("a runnerd death between two turns of the same run (#20825 B)", () => {
+  const identity = { runnerInstanceId: "between-turns-runner", environmentLeaseId: "between-turns-lease", runId: "between-turns-run",
+    normalizedSessionId: "between-turns-session", turnId: "between-turns-turn", itemId: "between-turns-item" };
+  async function startRun(directory: string) {
+    let core!: DurablePrpControlPlane;
+    const children: ReturnType<typeof spawn>[] = [];
+    const exits: Promise<void>[] = [];
+    // Every launch (the first runner and any replacement) is a real runnerd.
+    const launch = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec): durableControlPlane.RunnerProcessHandle => {
+      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: "ignore" });
+      children.push(child);
+      exits.push(new Promise(resolveExit => child.once("exit", () => resolveExit())));
+      return {
+        child,
+        completion: new Promise<durableControlPlane.RunnerProcessResult>((resolveExit, rejectExit) => {
+          child.once("error", rejectExit);
+          child.once("exit", (code, signal) => resolveExit({ code, signal, stdout: "", stderr: "" }));
+        }),
+        isExitConfirmed: () => child.exitCode !== null || child.signalCode !== null,
+      };
+    });
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex, codexArgs: fakeCodexArgs(directory, "--durable-turn-ids", "--call-log", join(directory, "calls.log")),
+      stateDirectory: directory, prpIdentity: identity, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      runnerReconnectGraceMs: 420_000, runnerProcessLauncher: launch,
+      controlPlaneRegistration: async authority => {
+        core = authority;
+        await authority.start();
+        return { release: () => undefined };
+      },
+    });
+    bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+    const opened = await bundle.transport.request("thread/start", { cwd: directory, dynamicTools: [] }) as { thread: { id: string; sessionId: string } };
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    const turnCompleted = async () => {
+      for (;;) {
+        const next = await notifications.next();
+        if (next.done) throw new Error("notification stream closed before turn/completed");
+        if (next.value.method === "turn/completed") return next.value;
+      }
+    };
+    const cleanup = async () => {
+      vi.useRealTimers();
+      const providerPid = bundle.evidence().codexPid;
+      if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch {} }
+      await bundle.transport.close().catch(() => undefined);
+      for (const child of children) if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await Promise.all(exits);
+    };
+    return { bundle, launch, children, exits, notifications, turnCompleted, thread: opened.thread, core: () => core, cleanup };
+  }
+
+  it("reconnects when turn 2 is already pending and completes turn 2 on the replacement runner", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-between-turns-pending-"));
+    const run = await startRun(directory);
+    try {
+      await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 1." }] });
+      await run.turnCompleted();
+      // runnerd is alive but stopped, so turn 2's turn.start stays pending; then it dies.
+      run.children[0]!.kill("SIGSTOP");
+      const turn2 = run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 2 of the same run." }] });
+      void turn2.catch(() => undefined);
+      await vi.waitFor(() => expect(run.core().store.state.commands
+        .some(command => command.status === "pending" && command.type === "turn.start")).toBe(true), { timeout: 5_000 });
+      run.children[0]!.kill("SIGKILL");
+      await run.exits[0];
+      // Run-level progress, not a failure: the same thread's turn 2 completes on a replacement runnerd.
+      await turn2;
+      await run.turnCompleted();
+      expect(run.launch).toHaveBeenCalledTimes(2);
+      expect(run.bundle.evidence().diagnostics.some(line => line.startsWith("native_runner_idle_warm_owner_exited"))).toBe(false);
+      expect((await run.bundle.transport.request("thread/read", {})).thread).toMatchObject({ id: run.thread.id });
+      const calls = (await readFile(join(directory, "calls.log"), "utf8")).trim().split(/\r?\n/);
+      expect(calls.filter(call => call === "thread/start")).toHaveLength(1);
+      expect(calls.filter(call => call === "turn/start")).toHaveLength(2);
+    } finally {
+      await run.cleanup();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("fails by name, never relaunches, when runnerd dies before turn 2 is sent, and a same-run resume keeps the session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-between-turns-idle-"));
+    const run = await startRun(directory);
+    let resumed: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
+    try {
+      await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 1." }] });
+      await run.turnCompleted();
+      run.children[0]!.kill("SIGKILL");
+      await run.exits[0];
+      // The provider-facing stream closes with the named cause (never silent).
+      const closed = await run.notifications.next().then(() => null, (error: unknown) => error as Error);
+      expect(closed?.message).toBe("native_runner_idle_warm_owner_exited: lifecycle=unreported");
+      // Turn 2 is refused with the same named cause.
+      await expect(run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 2." }] }))
+        .rejects.toThrow(/^native_runner_idle_warm_owner_exited: lifecycle=unreported$/);
+      // No relaunch loop.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      for (let elapsed = 0; elapsed < 30_000; elapsed += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        await new Promise(resolveTurn => setImmediate(resolveTurn));
+      }
+      vi.useRealTimers();
+      expect(run.launch).toHaveBeenCalledTimes(1);
+      await run.bundle.transport.close().catch(() => undefined);
+      // The same run's recovery opens a new runner on the same state and resumes the SAME provider session.
+      resumed = createCapabilityRunnerdCodexTransport({
+        runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex, codexArgs: fakeCodexArgs(directory, "--durable-turn-ids", "--call-log", join(directory, "calls.log")),
+        stateDirectory: directory, prpIdentity: identity, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+        resumeProviderSession: { driverSessionId: run.thread.id, providerSessionId: run.thread.sessionId },
+      });
+      resumed.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+      expect((await resumed.transport.request("thread/read", {})).thread).toMatchObject({ id: run.thread.id });
+      const next = resumed.transport.notifications()[Symbol.asyncIterator]();
+      await resumed.transport.request("turn/start", { input: [{ type: "text", text: "The next message." }] });
+      for (;;) if ((await next.next()).value?.method === "turn/completed") break;
+      // One provider thread for the whole run: started once, then resumed, never started again.
+      const calls = (await readFile(join(directory, "calls.log"), "utf8")).trim().split(/\r?\n/);
+      expect(calls.filter(call => call === "thread/start")).toHaveLength(1);
+      expect(calls.filter(call => call === "thread/resume").length).toBeGreaterThanOrEqual(1);
+      expect(calls.filter(call => call === "turn/start")).toHaveLength(2);
+    } finally {
+      await resumed?.transport.close().catch(() => undefined);
+      await run.cleanup();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 90_000);
+});
