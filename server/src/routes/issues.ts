@@ -19969,6 +19969,7 @@ export function issueRoutes(
       }).strict().safeParse(req.query);
       if (!query.success) throw badRequest("Invalid conversation filters");
       const { agentId, limit, offset } = query.data;
+      if ((await access.getMembership(companyId, "user", req.actor.userId))?.status !== "active") throw notFound("Agent not found");
       const resolved = await agentsSvc.resolveByReference(companyId, agentId);
       if (!resolved.agent || !(await access.decide({ actor: req.actor, action: "agent:read",
         resource: { type: "agent", companyId, agentId },

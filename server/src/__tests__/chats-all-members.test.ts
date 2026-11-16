@@ -3,9 +3,10 @@ import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { activityLog, agents, authUsers, companies, companyMemberships, createDb, issueComments, issueReadStates, issues, issueThreadInteractions } from "@paperclipai/db";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueReadStates, issues, issueThreadInteractions } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
 import { authorizationService } from "../services/authorization.js";
+import { agentRoutes } from "../routes/agents.js";
 import { errorHandler } from "../middleware/index.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
@@ -19,13 +20,14 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
   const agentId = randomUUID(), otherAgentId = randomUUID(), foreignAgentId = randomUUID(), hiddenAgentId = randomUUID();
   const owner = randomUUID(), member = randomUUID(), privateOwner = randomUUID();
   const ownChat = randomUUID(), memberChat = randomUUID(), privateChat = randomUUID(), otherChat = randomUUID(), legacyChat = randomUUID();
-  const interactionId = randomUUID();
+  const interactionId = randomUUID(), failedRunId = randomUUID();
   const originalMode = process.env.PAPERCLIP_ISSUE_PRIVACY_MODE;
   function appFor(userId = owner, extra: Record<string, unknown> = {}) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => { req.actor = { type: "board", source: "session", userId, companyIds: [companyId], ...extra }; next(); });
     app.use("/api", issueRoutes(db, { wakeup: async () => null } as never));
+    app.use("/api", agentRoutes(db));
     app.use(errorHandler);
     return app;
   }
@@ -59,6 +61,7 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
     await db.execute(sql`update issues set visibility = null where id = ${legacyChat}`);
     await db.insert(issueComments).values({ companyId, issueId: memberChat, authorAgentId: agentId, authorType: "agent", body: "Saved answer for Member B" });
     await db.insert(issueReadStates).values({ companyId, issueId: memberChat, userId: member, lastReadAt: new Date("2020-01-01") });
+    await db.insert(heartbeatRuns).values({ id: failedRunId, companyId, agentId, status: "failed", runtimeMode: "legacy", contextSnapshot: { issueId: memberChat }, finishedAt: new Date() });
     await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId: memberChat, kind: "request_confirmation", status: "pending", payload: { version: 1, prompt: "Approve?" } });
   }, 90_000);
   afterAll(async () => {
@@ -95,6 +98,9 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
     expect((await list(appFor(owner, { type: "agent", agentId, companyId, userId: undefined, source: "agent_key" }))).status).toBe(403);
     expect((await list(appFor(randomUUID(), { companyIds: [] }))).status).toBe(404);
   });
+  it("requires active membership even for an instance administrator", async () => {
+    expect((await list(appFor(randomUUID(), { companyIds: [], isInstanceAdmin: true }))).status).toBe(404);
+  });
   it("requires a visible agent in this company", async () => {
     expect((await list(appFor(), { agentId: foreignAgentId })).status).toBe(404);
     // A stale companyIds assertion must not bypass the canonical agent read.
@@ -126,6 +132,12 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
       : operation === "retry" ? await request(app).post(`${base}/retry`).send({ idempotencyKey: randomUUID(), observedRunId: null })
       : operation === "interrupt" ? await request(app).post(`${base}/queued-comments/interrupt`).send({ queueId: randomUUID(), revision: "revision", targetRunId: randomUUID() })
       : await request(app).post(`${base}/context/compact`).send({});
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    expect(response.body.error).toMatch(/conversation owner/);
+  });
+  it("keeps the agent failed-run retry endpoint owner-only", async () => {
+    const response = await request(appFor()).post(`/api/agents/${agentId}/wakeup`)
+      .send({ source: "on_demand", triggerDetail: "manual", reason: "retry_failed_run", failedRunId });
     expect(response.status, JSON.stringify(response.body)).toBe(403);
     expect(response.body.error).toMatch(/conversation owner/);
   });
