@@ -308,7 +308,14 @@ export async function verifyGitHubAppCandidate(db: Db, input: { companyId: strin
   const privateKey = await secretService(db).resolveSecretValue(input.companyId, ref.secretId, version, {
     accessContext: { actorType: "system", actorId: input.actorId, consumerType: "system", consumerId: "project-app-reference-verification" },
   });
-  const result = await approvalClient.acquire(`${input.companyId}:${input.namespace}:${ref.secretId}:${secret.latestVersion}:${version}`, app, privateKey, true);
+  let result: Awaited<ReturnType<typeof approvalClient.acquire>>;
+  try {
+    result = await approvalClient.acquire(`${input.companyId}:${input.namespace}:${ref.secretId}:${secret.latestVersion}:${version}`, app, privateKey, true);
+  } catch (error) {
+    if (input.projectId != null) throw new HttpError(503,
+      "GitHub project App verification is unavailable. No connection was created.", { code: "project_app_verification_unavailable" });
+    throw error;
+  }
   const registrationId = positiveId.safeParse(result.verifiedRegistrationId);
   const ids = repoIds.safeParse((result.github.repositories ?? []).map(repo => Number(repo.id)));
   if (!registrationId.success || !ids.success || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== app.installationId) throw unavailable();
