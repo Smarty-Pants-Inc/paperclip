@@ -134,19 +134,97 @@ const taskSessionScope = (scope: ProviderIdentityLineageScope) => and(
   eq(agentTaskSessions.companyId, scope.companyId), eq(agentTaskSessions.agentId, scope.agentId),
   eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, scope.taskKey));
 
-export async function readProviderIdentityResets(db: Pick<Db, "select">, scope: ProviderIdentityLineageScope): Promise<unknown[]> {
+/**
+ * A governed new provider thread started on this conversation, before any
+ * record names its identity: restart-up's same-run replacement, or a fresh
+ * start on a new box while a durable backup names the older thread. It is
+ * stored DURABLY in the run that starts the thread, inside the piConversation
+ * record beside providerIdentityResets (review-fleet-3 F1, #20787 J3-21), so
+ * a stop, crash or swap before the first suspended read does not lose it. The
+ * identity is filled in at the first suspended read of the box, before or
+ * after a restart, and only for the box named by providerLeaseId (null: the
+ * caller could not name the box). Publishing a backup clears it.
+ */
+export interface PendingProviderIdentityBreak {
+  reason: ProviderIdentityResetReason;
+  runId: string;
+  /** The box the new thread started on; null when the caller cannot name it. */
+  providerLeaseId: string | null;
+  notedAt: string;
+}
+/** The durable note's field inside the piConversation record. */
+export const PENDING_PROVIDER_IDENTITY_BREAK_KEY = "pendingProviderIdentityBreak";
+
+function pendingBreakFromConversation(conversation: unknown): PendingProviderIdentityBreak | null {
+  const value = plainObject(conversation) ? conversation[PENDING_PROVIDER_IDENTITY_BREAK_KEY] : undefined;
+  if (!plainObject(value)) return null;
+  if (!(PROVIDER_IDENTITY_RESET_REASONS as readonly unknown[]).includes(value.reason)
+    || typeof value.runId !== "string" || !value.runId
+    || !(value.providerLeaseId === null || (typeof value.providerLeaseId === "string" && value.providerLeaseId))
+    || typeof value.notedAt !== "string") return null;
+  return { reason: value.reason as ProviderIdentityResetReason, runId: value.runId,
+    providerLeaseId: value.providerLeaseId as string | null, notedAt: value.notedAt };
+}
+
+const samePendingBreak = (left: PendingProviderIdentityBreak | null, right: PendingProviderIdentityBreak | null) =>
+  left !== null && right !== null && canonical(left) === canonical(right);
+
+/** The lineage's records and durable pending note; empty when the conversation is missing or rotated. */
+async function readProviderIdentityLineage(db: Pick<Db, "select">, scope: ProviderIdentityLineageScope): Promise<{
+  records: unknown[]; pending: PendingProviderIdentityBreak | null;
+}> {
   const [session] = await db.select().from(agentTaskSessions).where(taskSessionScope(scope)).limit(1);
   const conversation = (() => { try { return readPiConversation(session?.sessionParamsJson); } catch { return null; } })();
   // Records live with the conversation they describe. A rotated conversation
   // (a new normalized session) starts a new lineage and new backups.
-  if (!conversation || conversation.id !== scope.normalizedSessionId) return [];
-  return providerIdentityResetsFromSessionParams(session?.sessionParamsJson);
+  if (!conversation || conversation.id !== scope.normalizedSessionId) return { records: [], pending: null };
+  return { records: providerIdentityResetsFromSessionParams(session?.sessionParamsJson),
+    pending: pendingBreakFromConversation(conversation) };
+}
+
+export async function readProviderIdentityResets(db: Pick<Db, "select">, scope: ProviderIdentityLineageScope): Promise<unknown[]> {
+  return (await readProviderIdentityLineage(db, scope)).records;
+}
+
+/** The durable pending note of this conversation, if any. */
+export async function readPendingProviderIdentityBreak(db: Pick<Db, "select">, scope: ProviderIdentityLineageScope):
+  Promise<PendingProviderIdentityBreak | null> {
+  return (await readProviderIdentityLineage(db, scope)).pending;
+}
+
+/**
+ * Edit this conversation's piConversation record under the issue →
+ * task-session lock order used by selectPiConversation. `edit` returns the
+ * next conversation (null: no write) and the result.
+ */
+async function editLockedLineage<T>(db: Db, scope: ProviderIdentityLineageScope,
+  edit: (conversation: Record<string, unknown>) => { next: Record<string, unknown> | null; result: T }): Promise<T> {
+  return db.transaction(async tx => {
+    const [issue] = await tx.select().from(issues)
+      .where(and(eq(issues.id, scope.taskKey), eq(issues.companyId, scope.companyId))).for("no key update");
+    if (!issue) throw new Error("provider_identity_reset_lineage_missing");
+    const [session] = await tx.select().from(agentTaskSessions).where(taskSessionScope(scope)).for("update");
+    const conversation = readPiConversation(session?.sessionParamsJson);
+    if (!session || !conversation || conversation.id !== scope.normalizedSessionId) {
+      throw new Error("provider_identity_reset_lineage_missing");
+    }
+    const { next, result } = edit(conversation as unknown as Record<string, unknown>);
+    if (next) {
+      const params = session.sessionParamsJson ?? {};
+      await tx.update(agentTaskSessions).set({
+        sessionParamsJson: { ...params, [PI_CONVERSATION_KEY]: next },
+        updatedAt: new Date(),
+      }).where(eq(agentTaskSessions.id, session.id));
+    }
+    return result;
+  });
 }
 
 /**
  * Append one step to the lineage under the issue → task-session lock order
  * used by selectPiConversation. The step must extend the newest record (or
- * start the lineage); anything else would leave a gap and is refused.
+ * start the lineage); anything else would leave a gap and is refused. With
+ * `consumePending`, the same transaction drops that durable pending note.
  */
 export async function appendProviderIdentityReset(db: Db, input: {
   scope: ProviderIdentityLineageScope;
@@ -155,26 +233,28 @@ export async function appendProviderIdentityReset(db: Db, input: {
   reason: ProviderIdentityResetReason;
   runId: string | null;
   recordedAt?: Date;
+  consumePending?: PendingProviderIdentityBreak;
 }): Promise<ProviderIdentityResetRecord> {
   if (!identityPresent(input.previousIdentity) || !identityPresent(input.identity)
     || canonical(input.previousIdentity) === canonical(input.identity)) {
     throw new Error("provider_identity_reset_identity_invalid");
   }
-  return db.transaction(async tx => {
-    const [issue] = await tx.select().from(issues)
-      .where(and(eq(issues.id, input.scope.taskKey), eq(issues.companyId, input.scope.companyId))).for("no key update");
-    if (!issue) throw new Error("provider_identity_reset_lineage_missing");
-    const [session] = await tx.select().from(agentTaskSessions).where(taskSessionScope(input.scope)).for("update");
-    const conversation = readPiConversation(session?.sessionParamsJson);
-    if (!session || !conversation || conversation.id !== input.scope.normalizedSessionId) {
-      throw new Error("provider_identity_reset_lineage_missing");
-    }
-    const records = providerIdentityResetsFromSessionParams(session.sessionParamsJson)
+  return editLockedLineage(db, input.scope, conversation => {
+    const records = (Array.isArray(conversation.providerIdentityResets) ? conversation.providerIdentityResets : [])
       .filter((value): value is ProviderIdentityResetRecord => scopedRecord(value, input.scope));
     const newest = records.reduce<ProviderIdentityResetRecord | null>(
       (latest, candidate) => !latest || candidate.generation > latest.generation ? candidate : latest, null);
+    const consumes = input.consumePending !== undefined
+      && samePendingBreak(pendingBreakFromConversation(conversation), input.consumePending);
+    const withoutPending = () => {
+      const next = { ...conversation };
+      delete next[PENDING_PROVIDER_IDENTITY_BREAK_KEY];
+      return next;
+    };
     if (newest && canonical(newest.previousIdentity) === canonical(input.previousIdentity)
-      && canonical(newest.identity) === canonical(input.identity)) return newest;
+      && canonical(newest.identity) === canonical(input.identity)) {
+      return { next: consumes ? withoutPending() : null, result: newest };
+    }
     if (newest && canonical(newest.identity) !== canonical(input.previousIdentity)) {
       throw new Error("provider_identity_reset_chain_broken");
     }
@@ -192,54 +272,70 @@ export async function appendProviderIdentityReset(db: Db, input: {
     };
     const kept = [...records, record].sort((left, right) => left.generation - right.generation)
       .slice(-PROVIDER_IDENTITY_RESET_LIMIT);
-    const params = session.sessionParamsJson ?? {};
-    await tx.update(agentTaskSessions).set({
-      sessionParamsJson: { ...params, [PI_CONVERSATION_KEY]: { ...conversation, providerIdentityResets: kept } },
-      updatedAt: new Date(),
-    }).where(eq(agentTaskSessions.id, session.id));
-    return record;
+    return { next: { ...(consumes ? withoutPending() : conversation), providerIdentityResets: kept }, result: record };
   });
 }
 
 /**
- * A governed new provider thread that this process started (restart-up's
- * same-run replacement after a failed resume). The executor turns it into a
- * durable record at the first suspended-state read that sees the new thread,
- * which is the run's own checkpoint, an idle close or a restart close.
+ * In-process copy of each note. It is a fallback only for a note whose
+ * durable write failed; a restart loses it (fail closed, as before F1).
  */
-type PendingProviderIdentityBreak = {
-  reason: ProviderIdentityResetReason; runId: string; notedAt: number;
-  /** The box the new thread started on; null when the caller cannot name it. */
-  providerLeaseId: string | null;
-};
 const pendingProviderIdentityBreaks = new Map<string, PendingProviderIdentityBreak>();
 const pendingKey = (scope: ProviderIdentityLineageScope) =>
   JSON.stringify([scope.companyId, scope.agentId, scope.taskKey, scope.normalizedSessionId]);
 
-export function noteProviderIdentityBreak(scope: ProviderIdentityLineageScope, reason: ProviderIdentityResetReason, runId: string,
-  providerLeaseId: string | null = null): void {
-  pendingProviderIdentityBreaks.set(pendingKey(scope), { reason, runId, notedAt: Date.now(), providerLeaseId });
+/**
+ * Note a governed new provider thread, durably, in the run that starts it.
+ * Returns false when the durable write failed (missing or rotated
+ * conversation, database error); the in-process note then remains the only
+ * copy, and a restart before the first suspended read refuses the thread.
+ */
+export async function noteProviderIdentityBreak(db: Db, scope: ProviderIdentityLineageScope,
+  reason: ProviderIdentityResetReason, runId: string, providerLeaseId: string | null = null,
+  notedAt: Date = new Date()): Promise<boolean> {
+  const note: PendingProviderIdentityBreak = { reason, runId, providerLeaseId, notedAt: notedAt.toISOString() };
+  pendingProviderIdentityBreaks.set(pendingKey(scope), note);
+  try {
+    await editLockedLineage(db, scope, conversation => ({
+      next: { ...conversation, [PENDING_PROVIDER_IDENTITY_BREAK_KEY]: note }, result: undefined }));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
+/** The in-process copy of this conversation's note (see noteProviderIdentityBreak). */
 export function pendingProviderIdentityBreak(scope: ProviderIdentityLineageScope): PendingProviderIdentityBreak | null {
   return pendingProviderIdentityBreaks.get(pendingKey(scope)) ?? null;
 }
 
-/** A published backup names the new thread itself; a later change needs its own break. */
-export function clearProviderIdentityBreak(scope: ProviderIdentityLineageScope): void {
+/**
+ * A published backup names the new thread itself; a later change needs its
+ * own break. Clears the in-process and the durable note (same lock order).
+ */
+export async function clearProviderIdentityBreak(db: Db, scope: ProviderIdentityLineageScope): Promise<void> {
   pendingProviderIdentityBreaks.delete(pendingKey(scope));
+  const { pending } = await readProviderIdentityLineage(db, scope);
+  if (!pending) return;
+  await editLockedLineage(db, scope, conversation => {
+    if (conversation[PENDING_PROVIDER_IDENTITY_BREAK_KEY] === undefined) return { next: null, result: undefined };
+    const next = { ...conversation };
+    delete next[PENDING_PROVIDER_IDENTITY_BREAK_KEY];
+    return { next, result: undefined };
+  });
 }
 
-/** Test seam: a server restart loses the in-process pending notes. */
+/** Test seam: a server restart loses the in-process notes (the durable ones stay). */
 export function clearPendingProviderIdentityBreaksForTest(): void {
   pendingProviderIdentityBreaks.clear();
 }
 
 /**
  * The executor's decision when a box's provider identity differs from the
- * newest compatible backup manifest. Recorded chain: allow. A pending break
- * from this process: record the step from the chain's end, then allow only
- * if the stored chain now reaches the box. Otherwise refuse.
+ * newest compatible backup manifest. Recorded chain: allow. A pending note
+ * (durable, else this process's copy) for this box: record the step from the
+ * chain's end and drop the note in the same transaction, then allow only if
+ * the stored chain now reaches the box. Otherwise refuse.
  */
 export async function recordedProviderIdentityTransitionIsAllowed(input: {
   db: Db;
@@ -250,9 +346,11 @@ export async function recordedProviderIdentityTransitionIsAllowed(input: {
   providerLeaseId?: string | null;
 }): Promise<boolean> {
   if (!identityPresent(input.previous) || !identityPresent(input.current)) return false;
-  const records = await readProviderIdentityResets(input.db, input.scope);
+  const lineage = await readProviderIdentityLineage(input.db, input.scope);
+  const { records } = lineage;
   if (providerIdentityChainAllows({ records, scope: input.scope, previous: input.previous, current: input.current })) return true;
-  const pending = pendingProviderIdentityBreak(input.scope);
+  const memory = pendingProviderIdentityBreak(input.scope);
+  const pending = lineage.pending ?? memory;
   if (!pending) return false;
   // A new thread noted on one box never authorizes the state of another.
   if (pending.providerLeaseId !== null && pending.providerLeaseId !== (input.providerLeaseId ?? null)) return false;
@@ -260,11 +358,12 @@ export async function recordedProviderIdentityTransitionIsAllowed(input: {
   if (!end || !identityPresent(end.identity)) return false;
   try {
     await appendProviderIdentityReset(input.db, { scope: input.scope, previousIdentity: end.identity,
-      identity: input.current, reason: pending.reason, runId: pending.runId });
+      identity: input.current, reason: pending.reason, runId: pending.runId,
+      ...(lineage.pending ? { consumePending: lineage.pending } : {}) });
+    if (samePendingBreak(pendingProviderIdentityBreak(input.scope), pending)) pendingProviderIdentityBreaks.delete(pendingKey(input.scope));
   } catch {
-    return false;
+    // A concurrent reader may have recorded the same step; the stored chain decides.
   }
-  if (pendingProviderIdentityBreak(input.scope) === pending) pendingProviderIdentityBreaks.delete(pendingKey(input.scope));
   const stored = await readProviderIdentityResets(input.db, input.scope);
   return providerIdentityChainAllows({ records: stored, scope: input.scope, previous: input.previous, current: input.current });
 }
