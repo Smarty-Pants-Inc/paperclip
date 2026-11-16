@@ -3482,6 +3482,13 @@ export function toolAccessService(
           await assertProjectConnectionNotInUse(tx, { companyId, projectId: connection.projectId, connectionId: connection.id, actor, projectDoneConfirmation: actor?.projectDoneConfirmation });
         }
       }
+      if (connection.projectId && verifiedProject && readProjectConnectionScope(lockedConnection)!.migrationPending) {
+        // D validates zero candidate installs. Clear pending and write its one
+        // activation receipt BEFORE adding any reach, on this same transaction;
+        // later profile/install failures still roll the transition back.
+        await activateProjectConnectionMigration(tx, { connection: lockedConnection, actor,
+          targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds, verifiedSecretVersion: verifiedProject.secretVersion });
+      }
       // A renamed connection can leave its old profile name in use. Resolve
       // names against profiles too, including when finalizing an installed draft.
       const otherProfiles = await tx
@@ -3708,10 +3715,6 @@ export function toolAccessService(
         },
         tx,
       );
-      if (connection.projectId && verifiedProject && readProjectConnectionScope(lockedConnection)!.migrationPending) {
-        await activateProjectConnectionMigration(tx, { connection: lockedConnection, actor,
-          targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds, verifiedSecretVersion: verifiedProject.secretVersion });
-      }
       await notifyGitHubCredentialChange(tx, connection);
       await notifyToolConnectionHealth(tx, connection);
       const [updatedConnection] = await tx
@@ -3732,8 +3735,8 @@ export function toolAccessService(
         .set({ status: "active", updatedAt: new Date() })
         .where(eq(toolApplications.id, connection.applicationId));
 
-      if (connection.projectId && verifiedProject) await writeProjectConnectionReceipt(tx, { connection: updatedConnection, actor,
-        action: "tool_connection.updated", reason: "project_connection_verified_finish", targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds });
+      if (connection.projectId && verifiedProject && !readProjectConnectionScope(lockedConnection)!.migrationPending) await writeProjectConnectionReceipt(tx, { connection: updatedConnection, actor,
+        action: "tool_connection.updated", reason: "access_updated", targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds });
       return { profileId, profileBindings, policies, updatedConnection };
     });
     emitConnectionUpdated(
@@ -4981,8 +4984,12 @@ export function toolAccessService(
     ): Promise<ToolConnection> => {
       const existing = await getConnectionRow(connectionId);
       assertProjectConnectionPatch(existing, input);
-      const projectActor = projectConnectionActor(managementContext);
-      const disableOnly = Object.keys(input).length === 1 && input.enabled === false;
+      const authenticatedProjectActor = projectConnectionActor(managementContext);
+      const projectActor = authenticatedProjectActor ? { ...authenticatedProjectActor,
+        ...(input.projectDoneConfirmation ? { projectDoneConfirmation: input.projectDoneConfirmation } : {}),
+      } : undefined;
+      const patchKeys = Object.keys(input).filter(key => key !== "projectDoneConfirmation");
+      const disableOnly = patchKeys.length === 1 && input.enabled === false;
       if (existing.projectId) await assertProjectConnectionAdmission(db, { companyId: existing.companyId, projectId: existing.projectId, connection: existing,
         operation: disableOnly ? "disable" : "update", actor: projectActor });
       if (managementContext?.actor.type === "agent" && existing.connectionPurpose === "channel"
@@ -5068,6 +5075,8 @@ export function toolAccessService(
             const rows = await write(tx);
             await syncCredentialBindings(rows[0]!, [], tx);
             await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(rows[0]!);
+            if (rows[0]!.projectId) await writeProjectConnectionReceipt(tx, { connection: rows[0]!, actor: projectActor,
+              action: "tool_connection.updated", reason: disableOnly ? "connection_disabled" : "access_updated" });
             return rows;
           });
       emitConnectionUpdated(row, existing, "api");
