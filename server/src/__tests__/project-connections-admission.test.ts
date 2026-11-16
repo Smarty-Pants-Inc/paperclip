@@ -362,6 +362,47 @@ describe("project connection writer admission (round-4 B)", () => {
     expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
   });
 
+  // These release REDs deliberately use D's REAL exports. On lane B's
+  // isolated Stage-0 checkout they remain blocked on D, not mocked green.
+  it("J03/B-RF2-0036-integration: real lifecycle/gate permits a drained lead change atomically", async () => {
+    const f = await projectConnectionFixture(db);
+    const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const live = await f.seedConnection(f.a, { status: "draft", installed: false });
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
+    expect(response.status).toBe(200);
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.worker.id);
+    for (const { connection } of [archived, live]) {
+      expect((await storedConnection(db, connection.id)).config.projectScope).toEqual({ ...f.scope(), approvedLeadAgentId: f.worker.id });
+    }
+    expect(await storedConnection(db, archived.connection.id)).toMatchObject({ status: "archived", enabled: false });
+  });
+
+  it("J11/B-RF2-0036-integration: real running-work gate rolls back lead and every retained approval", async () => {
+    const f = await projectConnectionFixture(db);
+    const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const live = await f.seedConnection(f.a, { status: "draft", installed: false });
+    await f.run(f.a, f.worker.id);
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
+    expect(response.status).toBe(409);
+    expect(response.body.details?.code ?? response.body.code).toBe("project_connection_in_use");
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.leadA.id);
+    for (const { connection } of [archived, live]) {
+      expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+    }
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("J03/B-RF2-0036-archived-only: changing the lead preserves the sole connection's terminal archive", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
+    expect(response.status).toBe(200);
+    expect((await db.select().from(projects).where(eq(projects.id, f.a.id)))[0]!.leadAgentId).toBe(f.worker.id);
+    expect(await storedConnection(db, connection.id)).toMatchObject({ status: "archived", enabled: false,
+      config: { projectScope: { ...f.scope(), approvedLeadAgentId: f.worker.id } } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
+  });
+
   it.each(["direct", "cloud", "vercel"] as const)("A03/A08/W2: an old %s OAuth continuation cannot write an owned App", async transport => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "archived", installed: false });
