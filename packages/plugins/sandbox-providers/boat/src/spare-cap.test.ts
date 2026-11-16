@@ -381,8 +381,10 @@ describe("Independent spare-cap cost and visibility judge", () => {
 });
 
 // smarty-dev#20869 REDs beyond the judge's probes. A claimed spare whose run
-// reached a step on it is USED: its replacement is not churn. The absolute
-// ceiling holds every create whatever the proof-of-use rule decides.
+// reached a step on it is USED: its replacement is not churn. The hourly
+// ceiling counts every create but refuses only spares (RFL ruling A).
+// Keep: recorded #20869 failure path -- refusing a person's run at the ceiling
+// becomes Core's non-transient lease_acquire_failed, leaving it unanswered.
 async function execute(h: Harness, id: string, command = "true") {
   return await settle(plugin.definition.onEnvironmentExecute!({ driverKey: "boat", companyId: h.company, environmentId: h.env,
     lease: { providerLeaseId: id, metadata: {} }, command, args: [], config: baseConfig } as any));
@@ -391,7 +393,22 @@ function cappedEvents(h: Harness, reason?: "churn_cap" | "ceiling"): LogEntry[] 
   return h.boat.log.filter(e => (e.note ?? "").startsWith("info: ") && (e.note ?? "").includes("create_capped")
     && (reason === undefined || (e.value as { reason?: string } | undefined)?.reason === reason));
 }
-describe("Spare create cap: proof of use, refusal event and absolute ceiling", () => {
+/** Reach 6 creates using real acquire/execute/release hooks, then consume the
+ * last warm spare. Its refill is refused: the next acquire must create a run. */
+async function reachCeiling(h: Harness): Promise<void> {
+  await seed(h);
+  for (let n = 0; n < 5; n++) {
+    const lease = await settle(h.acquire(`ceiling-used-${n}`));
+    expect(h.boat.boxes.get(lease.providerLeaseId!)?.labels.purpose).toBe("spare");
+    await execute(h, lease.providerLeaseId!);
+    await advance(20_000);
+    await release(h, lease.providerLeaseId!);
+    await advance(2_000);
+  }
+  expect(h.boat.creates().length + h.boat.creates("run").length).toBe(6);
+  expect(liveUnclaimed(h)).toHaveLength(0);
+}
+describe("Spare create cap: proof of use, refusal event and hourly ceiling", () => {
   it("RED-HIRE a real short hire probe (claimed, used, released in ~20 s) is not counted as churn", async () => {
     const h = await harness("hire-probe", 1);
     await seed(h);
@@ -432,27 +449,50 @@ describe("Spare create cap: proof of use, refusal event and absolute ceiling", (
     expect(event.value).toHaveProperty("refusals");
   });
 
-  it("CEILING the absolute hourly ceiling holds every create, spare and run, even when every spare is used", async () => {
-    const h = await harness("ceiling", 1, { createCeilingPerHour: 6 });
-    await seed(h);
-    let refused: unknown;
-    for (let n = 0; n < 10 && refused === undefined; n++) {
-      try {
-        const lease = await settle(h.acquire(`ceiling-${n}`));
-        await execute(h, lease.providerLeaseId!);
-        await advance(20_000);
-        await release(h, lease.providerLeaseId!);
-        await advance(2_000);
-      } catch (error) { refused = error; }
-    }
-    const observed = { spareCreates: h.boat.creates().length, runCreates: h.boat.creates("run").length };
-    expect(observed.spareCreates + observed.runCreates, JSON.stringify(observed)).toBe(6);
-    expect(String(refused)).toMatch(/create_capped/);
-    const events = cappedEvents(h, "ceiling");
-    expect(events.length).toBeGreaterThan(0);
-    expect(events.at(-1)!.value).toMatchObject({ companyId: h.company, environmentId: h.env, reason: "ceiling", ceiling: 6, allCreates: 6 });
+  it("CEILING-RUN a RUN create at the hourly ceiling returns a lease, reports kind=run and degrades health", async () => {
+    const h = await harness("ceiling-run", 1, { createCeilingPerHour: 6 });
+    await reachCeiling(h);
+    const before = h.boat.creates("run").length;
+    const lease = await settle(h.acquire("over-ceiling"));
+    expect(lease.providerLeaseId).toBeTruthy();
+    expect(h.boat.boxes.get(lease.providerLeaseId!)?.labels.purpose).toBe("run");
+    expect(h.boat.creates("run")).toHaveLength(before + 1);
+    const [event] = cappedEvents(h, "ceiling").filter(e => (e.value as { kind?: string }).kind === "run");
+    expect(event, "info-level create_capped event for the admitted run").toBeDefined();
+    expect(event.value).toMatchObject({ companyId: h.company, environmentId: h.env, kind: "run", reason: "ceiling",
+      allCreates: 6, spareCreates: 5, runCreates: 1, ceiling: 6 });
     const health = await settle(plugin.definition.onHealth!());
-    expect(JSON.stringify(health)).toContain("create_capped");
-    expect(JSON.stringify(health)).toContain("ceiling");
+    expect(health.status).toBe("degraded");
+    expect(health.message).toMatch(/create_capped.*ceiling/);
+    expect(health.details).toMatchObject({ createCapped: expect.arrayContaining([
+      expect.objectContaining({ kind: "run", reason: "ceiling", companyId: h.company, environmentId: h.env })
+    ]) });
+    const firstRefusals = (health.details as any).createRefusals.ceiling;
+    expect(firstRefusals).toBeGreaterThan(0);
+    // Counts include admitted over-ceiling runs too. Wait out log suppression
+    // so the next run event exposes the updated ledger and counter.
+    await advance(61_000);
+    const next = await settle(h.acquire("further-over-ceiling"));
+    expect(next.providerLeaseId).toBeTruthy();
+    expect(h.boat.creates("run")).toHaveLength(before + 2);
+    const last = cappedEvents(h, "ceiling").filter(e => (e.value as { kind?: string }).kind === "run").at(-1)!;
+    expect(last.value).toMatchObject({ allCreates: 7, spareCreates: 5, runCreates: 2, ceiling: 6,
+      refusals: { ceiling: expect.any(Number) } });
+    expect((last.value as any).refusals.ceiling).toBeGreaterThan(firstRefusals);
+    h.boat.record({ kind: "event", note: "RULING-A-RUN", value: { lease, next, event: event.value, last: last.value, health } });
+  });
+
+  it("CEILING-SPARE the same hourly ceiling refuses a SPARE with reason=ceiling and kind=spare", async () => {
+    const h = await harness("ceiling-spare", 1, { createCeilingPerHour: 6 });
+    await reachCeiling(h);
+    const spareCreates = h.boat.creates().length;
+    await settle(h.emit("issue.created"));
+    await advance(5_000);
+    expect(h.boat.creates()).toHaveLength(spareCreates);
+    const events = cappedEvents(h, "ceiling").filter(e => (e.value as { kind?: string }).kind === "spare");
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.at(-1)!.value).toMatchObject({ companyId: h.company, environmentId: h.env,
+      kind: "spare", reason: "ceiling", ceiling: 6, allCreates: 6 });
+    h.boat.record({ kind: "event", note: "RULING-A-SPARE", value: { spareCreates, event: events.at(-1)!.value } });
   });
 });
