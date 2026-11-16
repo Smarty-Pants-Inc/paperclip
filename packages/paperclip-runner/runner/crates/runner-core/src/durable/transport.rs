@@ -37,6 +37,15 @@ const RUNTIME_READ_TIMEOUT: Duration = Duration::from_millis(250);
 const QUEUED_CONTROL_READ_TIMEOUT: Duration = Duration::from_millis(1);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// A listener-mode controller sends a WebSocket ping every 20 s and drops a
+/// runner after 90 s without traffic (server/src/realtime/runner-prp-outbound.ts).
+/// No inbound frame at all (data, ping or pong) for longer than that plus
+/// margin means the controller is gone, often half-open with no FIN. Close so
+/// the listener's one controller slot is freed for the server's redial instead
+/// of being held until runnerd next writes (its lease renewal).
+const INBOUND_SILENCE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounded close reason; the connected loop records it as the diagnostic.
+const INBOUND_SILENCE_TIMEOUT_CODE: &str = "inbound_silence_timeout";
 const MAX_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -904,6 +913,19 @@ pub(crate) struct AuthenticatedTransport {
     socket: RunnerSocket,
     secure_channel: SecureChannel,
     max_frame_bytes: usize,
+    /// Liveness clock reading of the last inbound frame, listener mode only:
+    /// the server pings only the connections it dials. A runner-dialed
+    /// connection (server/src/realtime/runner-prp-ws.ts) gets no pings and
+    /// may legitimately stay quiet for longer than the window.
+    last_inbound: Option<Instant>,
+}
+
+/// Clock for the inbound silence window; tests pause it per thread.
+fn liveness_now() -> Instant {
+    #[cfg(test)]
+    return test_clock::now();
+    #[cfg(not(test))]
+    Instant::now()
 }
 
 #[derive(Debug)]
@@ -1084,10 +1106,12 @@ impl AuthenticatedTransport {
                 challenge.server_proof.as_bytes(),
                 client_proof.as_bytes(),
             )?;
+            let last_inbound = matches!(socket, RunnerSocket::Listen(_)).then(liveness_now);
             let mut transport = Self {
                 socket,
                 secure_channel,
                 max_frame_bytes: config.max_frame_bytes,
+                last_inbound,
             };
             // Ticket validation and lease persistence happen before the server
             // emits welcome. Give that durable admission the connection setup
@@ -1163,11 +1187,29 @@ impl AuthenticatedTransport {
         &mut self,
         deadline: Option<Instant>,
     ) -> Result<Option<Value>, DurableRunnerError> {
-        let frame =
-            match receive_plain_optional_until(&mut self.socket, self.max_frame_bytes, deadline)? {
-                Some(frame) => frame,
-                None => return Ok(None),
-            };
+        let mut inbound = false;
+        let received = receive_plain_observed(
+            &mut self.socket,
+            self.max_frame_bytes,
+            deadline,
+            &mut inbound,
+        );
+        if let Some(last_inbound) = self.last_inbound.as_mut() {
+            // Read first, then judge: frames buffered while the loop was busy
+            // (a long command) are drained above and count as traffic.
+            if inbound {
+                *last_inbound = liveness_now();
+            } else if matches!(received, Ok(None))
+                && liveness_now().saturating_duration_since(*last_inbound)
+                    >= INBOUND_SILENCE_TIMEOUT
+            {
+                return Err(DurableRunnerError::invalid(INBOUND_SILENCE_TIMEOUT_CODE));
+            }
+        }
+        let frame = match received? {
+            Some(frame) => frame,
+            None => return Ok(None),
+        };
         self.secure_channel.decrypt(&frame, false).map(Some)
     }
 }
@@ -1597,6 +1639,17 @@ fn receive_plain_optional_until(
     max_frame_bytes: usize,
     deadline: Option<Instant>,
 ) -> Result<Option<Value>, DurableRunnerError> {
+    receive_plain_observed(socket, max_frame_bytes, deadline, &mut false)
+}
+
+/// `inbound` becomes true when any complete WebSocket frame was read,
+/// including Ping/Pong control frames that never reach the caller.
+fn receive_plain_observed(
+    socket: &mut (impl WebSocketMessages + ?Sized),
+    max_frame_bytes: usize,
+    deadline: Option<Instant>,
+    inbound: &mut bool,
+) -> Result<Option<Value>, DurableRunnerError> {
     loop {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(DurableRunnerError::invalid(
@@ -1604,6 +1657,7 @@ fn receive_plain_optional_until(
             ));
         }
         let message = socket.read_message();
+        *inbound |= message.is_ok();
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(DurableRunnerError::invalid(
                 "WebSocket authentication message deadline elapsed",
