@@ -1336,6 +1336,95 @@ describe("PaperclipControlPlanePort conformance", () => {
     });
   });
 
+  // redact-sec2 F1 (smarty-dev#20895 (a)): the port's redactor is built once; a
+  // secret the agent fetches through the agent secret route later must reach it.
+  it("redact-sec2 F1: a secret fetched mid-run through the agent secret route is masked in native events committed after the fetch, whole and folded; events before it are unchanged", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const { randomBytes } = await import("node:crypto");
+    const { default: express } = await import("express");
+    const { default: request } = await import("supertest");
+    const { secretRoutes } = await import("../../routes/secrets.js");
+    const { errorHandler } = await import("../../middleware/error-handler.js");
+    const { secretService } = await import("../secrets.js");
+    const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+    const runnerId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+      runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+      contextSnapshot: { issueId: identity.issueId } });
+    const token = randomBytes(30).toString("base64"); // test-only, 40 characters
+    const key = `SEC2_${identity.runId.replace(/-/g, "").slice(0, 12)}`.toUpperCase();
+    const svc = secretService(db);
+    const secret = await svc.create(identity.companyId, { key, name: `sec2-native-${identity.runId}`, provider: "local_encrypted", value: token });
+    await svc.createBinding({ companyId: identity.companyId, secretId: secret.id, targetType: "agent", targetId: identity.agentId,
+      configPath: `access.${key}`, projectionClass: "unclassified" });
+    try {
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `redact-sec2-${identity.runId}` },
+      { runSecretMaterial: [] });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      let seq = 0;
+      const sent: PrpEvent[] = [];
+      const append = async (itemId: string, text?: string) => {
+        seq += 1;
+        const event = { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:${seq}`, sourceSeq: seq,
+          sourceInstanceId: runnerId, sourceKind: "runner", runId: identity.runId, normalizedSessionId: identity.sessionId,
+          turnId: "sec2-turn", itemId, eventType: text === undefined ? "item.completed" : "item.delta", priority: text === undefined ? 0 : 1,
+          emittedAt: new Date(Date.UTC(2026, 10, 16, 0, 0, seq)).toISOString(),
+          payload: text === undefined ? { itemId } : { itemId, kind: "commandExecution", text } } as PrpEvent;
+        sent.push(event);
+        await port.appendEvent(event);
+      };
+      const before = `BEFORE<<${token}>>\n`;
+      await append("sec2-before", before);
+      await append("sec2-before");
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        req.actor = { type: "agent", agentId: identity.agentId, companyId: identity.companyId, runId: identity.runId, keyScope: { kind: "standard" }, source: "agent_jwt" };
+        next();
+      });
+      app.use("/api", secretRoutes(db));
+      app.use(errorHandler);
+      const fetched = await request(app).post(`/api/agents/me/secrets/${key.toLowerCase()}/value`);
+      expect(fetched.status).toBe(200);
+      expect(fetched.body.value === token).toBe(true);
+      const forms = [["whole", token], ...["20", "8"].map(width => [`fold -w ${width}`, execFileSync("fold", ["-w", width], { input: token, encoding: "utf8" })])];
+      for (const [index, [name, text]] of forms.entries()) {
+        await append(`sec2-after-${index}`, `${name}<<${text}>>\n`);
+        await append(`sec2-after-${index}`);
+      }
+      const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      expect(persisted.map(row => row.sourceEventId)).toEqual(sent.map(event => event.sourceEventId));
+      const committed = persisted.map(row => (row.payload as any).prpEvent);
+      // Committed before the fetch: unchanged (traces are never rewritten).
+      expect(committed[0].payload.text === before).toBe(true);
+      const envelope = (event: Record<string, unknown>) => JSON.stringify(Object.keys(event).filter(name => name !== "payload" && name !== "debug")
+        .sort().map(name => [name, event[name]]));
+      for (const [index, event] of committed.entries()) expect(envelope(event)).toBe(envelope(sent[index] as any));
+      const windows = Array.from({ length: token.length - 31 }, (_, index) => token.slice(index, index + 32));
+      for (const [index, [name]] of forms.entries()) {
+        const itemId = `sec2-after-${index}`;
+        const own = committed.filter(event => event.itemId === itemId);
+        const text = own.map(event => (event.payload.text ?? "") + ((event.payload.outputTails ?? []) as any[]).map(tail => tail.payload.text ?? "").join("")).join("");
+        // Boolean checks: a failure must not print the generated secret.
+        expect(text.includes(`${name}<<`), name).toBe(true);
+        expect(text.includes("***REDACTED***"), name).toBe(true);
+        const raw = JSON.stringify(own).replace(/\\n/g, "").replace(/\s+/g, "");
+        const leaked = windows.filter(window => raw.includes(window));
+        expect(leaked.length, `${name}: ${leaked.length}/${windows.length} fetched-secret windows survived`).toBe(0);
+      }
+    } finally {
+      // The route's access audit is written by a deferred queue: settle it, then
+      // drop this test's rows so the suite's company cleanup stays possible.
+      const { flushSecretResolutionWrites } = await import("../secret-resolution-writes.js");
+      const { secretAccessEvents } = await import("@paperclipai/db");
+      await flushSecretResolutionWrites(db);
+      await db.delete(secretAccessEvents).where(eq(secretAccessEvents.heartbeatRunId, identity.runId));
+      await svc.remove(secret.id);
+    }
+  });
+
   it("runs the unchanged package conformance suite against Paperclip persistence", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const committedEventIds: string[] = [];
