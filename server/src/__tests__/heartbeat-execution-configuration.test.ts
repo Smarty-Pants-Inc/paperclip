@@ -1,5 +1,5 @@
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
-import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
+import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, randomUUID } from "node:crypto";
 import { trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { access, chmod, mkdir, readdir, readFile, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, projects, plugins, environments } from "@paperclipai/db";
+import { agentIdentityKeys, agents, authUsers, companies, companyMemberships, companySkills, companySkillTestRuns, createDb, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, projects, plugins, environments } from "@paperclipai/db";
 import { companySkillService } from "../services/company-skills.js";
 import { skillVersionCachePaths, withSkillVersionCacheLock } from "../services/skill-version-cache.js";
 import { registerServerAdapter, unregisterServerAdapter, type AdapterExecutionContext } from "../adapters/index.js";
@@ -17,6 +17,7 @@ import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration, ty
 import { buildEffectiveRunSessionConfigMetadata, resolveTaskSessionConfigFreshness } from "../services/heartbeat/workspaces.js";
 import { aiConnectionBindingSchema, type Environment } from "@paperclipai/shared";
 import { secretService } from "../services/secrets.js";
+import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { syncAgentAdapterEnvBindings } from "../services/agent-secret-bindings.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { aiConnectionService } from "../services/ai-connections.js";
@@ -1002,6 +1003,115 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
           expect(joined.endsWith(" done\n"), callId).toBe(true);
         }
       }
+    }
+  }, 60_000);
+
+  // redact-sec3 C1: the random-identity row above flakes when the pin's last
+  // digit starts a 32-character window of the run's identity key. These rows
+  // pin the identity to the fixed seed "redact-sec3-identity-1" (a
+  // window starts with "5"), so the chunk-hold/whole-number interaction is
+  // exercised every time.
+  const fixedIdentityPem = (seed: string) => createPrivateKey({ format: "der", type: "pkcs8",
+    key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), createHash("sha256").update(seed).digest()]),
+  }).export({ type: "pkcs8", format: "pem" }).toString();
+  async function seedFixedIdentity(f: Awaited<ReturnType<typeof seed>>, seedText: string) {
+    const privateKeyPem = fixedIdentityPem(seedText);
+    const publicKey = createPublicKey(createPrivateKey(privateKeyPem));
+    const encrypted = await localEncryptedProvider.createSecret({ value: privateKeyPem });
+    await db.insert(agentIdentityKeys).values({ companyId: f.companyId, agentId: f.agentId, algorithm: "Ed25519",
+      keyId: `sha256:${createHash("sha256").update(publicKey.export({ type: "spki", format: "der" })).digest("base64url")}`,
+      publicKeyPem: publicKey.export({ type: "spki", format: "pem" }).toString(), privateKeyMaterial: encrypted.material });
+    return privateKeyPem;
+  }
+  async function bindEnvSecrets(f: Awaited<ReturnType<typeof seed>>, values: Record<string, string>) {
+    const bindings: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(values)) {
+      const secret = await secretService(db).create(f.companyId, { name: `redact-sec3-${key}-${f.agentId}`, provider: "local_encrypted", value }, { userId: f.userId });
+      bindings[key] = { type: "secret_ref", secretId: secret.id, version: "latest" };
+    }
+    const adapterConfig = { model: "agent-model", env: bindings };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+  }
+
+  it("redact-sec3 C1: at the fixed identity seed, a 9-digit secret whose last digit starts an identity-key window is masked in the stored log", async () => {
+    const f = await seed();
+    const pin = "482916375"; // test-only
+    const uuidKey = randomUUID(); // test-only
+    const identityPem = await seedFixedIdentity(f, "redact-sec3-identity-1");
+    await bindEnvSecrets(f, { VENDOR_API_KEY: uuidKey, VENDOR_PIN: pin });
+    const ordinary = `agent ${f.agentId} reported; took 1763297669123 ms; id 1${pin}0\n`;
+    inspect.set(f.agentId, async input => {
+      expect(input.agentIdentity?.privateKeyPem === identityPem).toBe(true);
+      await input.onLog("stdout", ordinary);
+      await input.onLog("stdout", `key ${uuidKey}\npin ${pin}\n`);
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    expect(log).toContain(ordinary);
+    expect(log.includes(uuidKey)).toBe(false);
+    expect(log.includes(`pin ${pin}`), "9-digit secret committed whole across the material hold").toBe(false);
+    expect(log.includes("pin ***REDACTED***\n")).toBe(true);
+  }, 60_000);
+
+  it("redact-sec3 C1: at the fixed identity seed, a 9-digit secret split 4/5 across two newline-ended tool events is masked", async () => {
+    const f = await seed();
+    const pin = "482916375"; // test-only
+    const identityPem = await seedFixedIdentity(f, "redact-sec3-identity-1");
+    await bindEnvSecrets(f, { SEC3_SPLIT_PIN: pin });
+    inspect.set(f.agentId, async input => {
+      expect(input.agentIdentity?.privateKeyPem === identityPem).toBe(true);
+      for (const piece of ["pin 4829", "16375\n"]) {
+        await input.onEvent?.({ eventType: "tool.output", stream: "stdout", level: "info", message: piece,
+          payload: { toolCallId: "pin", output: piece } });
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const events = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .filter(event => event.eventType === "tool.output").sort((left, right) => left.seq - right.seq);
+    expect(events).toHaveLength(2);
+    const messages = events.map(event => event.message ?? "").join("");
+    const outputs = events.map(event => (event.payload as { output?: string }).output ?? "").join("");
+    for (const joined of [messages, outputs]) {
+      expect(joined.includes(pin), "9-digit secret committed whole across two tool events").toBe(false);
+      for (const half of ["4829", "16375"]) expect(joined.includes(half), "half").toBe(false);
+      expect(joined).toBe("pin ***REDACTED***\n");
+    }
+  }, 60_000);
+
+  // redact-sec3 C2: a held tool-output event must not commit after later events.
+  it("redact-sec3 C2: a held tool event on stream A commits before a later event of the run; committed order follows adapter order", async () => {
+    const f = await seed();
+    const pin = "482916375"; // test-only
+    await bindEnvSecrets(f, { SEC3_ORDER_PIN: pin });
+    const sent = [
+      { order: "A1", eventType: "tool.output", stream: "stdout" as const, call: "A", text: "pin 4829" },
+      { order: "N1", eventType: "adapter.progress", stream: "system" as const, call: null, text: "progress note." },
+      { order: "B1", eventType: "tool.output", stream: "stderr" as const, call: "B", text: "other call output." },
+      { order: "A2", eventType: "tool.output", stream: "stdout" as const, call: "A", text: "16375 done." },
+    ];
+    inspect.set(f.agentId, async input => {
+      for (const { order, eventType, stream, call, text } of sent) {
+        await input.onEvent?.({ eventType, stream, level: "info", message: text,
+          payload: { ...(call ? { toolCallId: call } : {}), output: text, order } });
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const orders = new Set(sent.map(event => event.order));
+    const committed = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .sort((left, right) => left.seq - right.seq)
+      .filter(event => orders.has((event.payload as { order?: string } | null)?.order ?? ""));
+    expect(committed.map(event => (event.payload as { order: string }).order)).toEqual(["A1", "N1", "B1", "A2"]);
+    // Committing early must not release the split secret: it stays masked across A's events.
+    const own = committed.filter(event => (event.payload as { toolCallId?: string }).toolCallId === "A");
+    for (const joined of [own.map(event => event.message ?? "").join(""), own.map(event => (event.payload as { output?: string }).output ?? "").join("")]) {
+      expect(joined.includes(pin)).toBe(false);
+      for (const half of ["4829", "16375"]) expect(joined.includes(half), "half").toBe(false);
+      expect(joined).toBe("pin ***REDACTED*** done.");
     }
   }, 60_000);
 
