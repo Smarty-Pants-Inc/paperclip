@@ -1,7 +1,10 @@
 import request from "supertest";
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, agents, connectionGrants, createDb, toolConnectionInstalls, toolConnections, userCompanyPreferences } from "@paperclipai/db";
+import { activityLog, agents, companySecrets, companySecretVersions, connectionGrants, createDb, heartbeatRuns, issues, projects, toolApplications, toolConnectionInstalls, toolConnections, userCompanyPreferences } from "@paperclipai/db";
+import * as admission from "../services/project-connection-admission.js";
+import * as arbitration from "../services/project-connection-arbitration.js";
+import { activateProjectConnectionMigration, assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../services/project-connection-retirement.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
 
@@ -193,5 +196,91 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       .rejects.toMatchObject({ status: 409, details: { code: "project_connection_archived" } });
     expect((await storedConnection(db, connection.id)).status).toBe("archived");
     expect(provider.verify).not.toHaveBeenCalled();
+  });
+
+  // These additional checks exercise D's actual PostgreSQL transaction and
+  // HTTP/remove code with ONLY A/B's not-yet-implemented contracts isolated.
+  // They are D data-safety/lock proofs, NOT admission/identity qualification and
+  // do not replace or loosen any of the original end-to-end REDs above.
+  describe("D transaction boundary (adjacent A/B contracts isolated)", () => {
+    beforeEach(() => {
+      vi.spyOn(admission, "readProjectConnectionScope").mockImplementation(connection =>
+        connection.projectId ? connection.config.projectScope as admission.ProjectConnectionScope : null);
+      vi.spyOn(admission, "assertProjectConnectionAdmission").mockResolvedValue(undefined);
+      vi.spyOn(arbitration, "lockProjectConnectionIdentities").mockResolvedValue(undefined);
+    });
+    afterEach(() => vi.restoreAllMocks());
+
+    async function version(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
+      await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
+        material: { synthetic: true }, valueSha256: "synthetic-d-version", fingerprintSha256: "synthetic-d-version" });
+    }
+    async function activate(p: Awaited<ReturnType<typeof pending>>, install = true, failAfterInstall = false) {
+      return db.transaction(async tx => {
+        await activateProjectConnectionMigration(tx, { connection: p.candidate.connection, actor: p.f.actor(),
+          targetAgentIds: [p.f.leadA.id], verifiedRepositoryIds: [101], verifiedSecretVersion: 1 });
+        if (install) await tx.insert(toolConnectionInstalls).values({ companyId: p.f.companyId, connectionId: p.candidate.connection.id,
+          targetType: "agent", targetId: p.f.leadA.id });
+        if (failAfterInstall) await tx.execute(sql`select 1 / 0`);
+      });
+    }
+
+    it("D/M01: activation and caller installs commit together without touching shared lead's legacy", async () => {
+      const p = await pending(); await version(p.f);
+      const legacy = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await activate(p);
+      expect(await storedConnection(db, p.candidate.connection.id)).toMatchObject({ status: "active", enabled: true,
+        config: { projectScope: { migrationPending: false } } });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.candidate.connection.id))).toHaveLength(1);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacy);
+      const receipts = await db.select().from(activityLog).where(eq(activityLog.entityId, p.candidate.connection.id));
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({ action: "tool_connection.updated", actorType: "agent", actorId: p.f.primary.id,
+        responsibleUserId: p.f.human, details: { migrationPending: false, reason: "migration_activated", verifiedRepositoryIds: [101] } });
+    });
+
+    it.each(["receipt", "install"] as const)("D/M02: actual PG %s failure rolls pending/reach back and preserves legacy", async boundary => {
+      const p = await pending(); await version(p.f);
+      const legacy = await storedConnection(db, p.legacy.connection.id);
+      const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.id));
+      if (boundary === "receipt") await failReceipt(db, p.candidate.connection.id);
+      try { await expect(activate(p, true, boundary === "install")).rejects.toThrow(); }
+      finally { if (boundary === "receipt") await restoreReceipt(db); }
+      expect(await storedConnection(db, p.candidate.connection.id)).toEqual(p.candidate.connection);
+      expect(await storedConnection(db, legacy.id)).toEqual(legacy);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.candidate.connection.id))).toHaveLength(0);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.id))).toEqual(installs);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, p.candidate.connection.id))).toHaveLength(0);
+    });
+
+    it.each(["scope", "key-version", "revoked-version", "recipient", "history", "already-installed"] as const)("D/M02: stale %s refuses activation with zero legacy effects", async stale => {
+      const p = await pending(); await version(p.f);
+      if (stale === "scope") await db.update(toolConnections).set({ config: { ...p.candidate.connection.config,
+        projectScope: { ...p.f.scope(), migrationPending: true, legacyConnectionId: p.legacy.connection.id, approvedRepositoryIds: [202] } } })
+        .where(eq(toolConnections.id, p.candidate.connection.id));
+      if (stale === "key-version") await db.update(companySecrets).set({ latestVersion: 2 }).where(eq(companySecrets.id, p.f.secret.id));
+      if (stale === "revoked-version") await db.update(companySecretVersions).set({ revokedAt: new Date() }).where(eq(companySecretVersions.secretId, p.f.secret.id));
+      if (stale === "recipient") await db.delete(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      if (stale === "history") await p.f.seedConnection(p.f.a, { status: "archived", installed: false });
+      if (stale === "already-installed") await db.insert(toolConnectionInstalls).values({ companyId: p.f.companyId, connectionId: p.candidate.connection.id, targetType: "agent", targetId: p.f.leadA.id });
+      const before = await storedConnection(db, p.candidate.connection.id);
+      const legacyInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await expect(activate(p, false)).rejects.toMatchObject({ status: 409, details: { code: "project_connection_verification_stale" } });
+      expect(await storedConnection(db, before.id)).toEqual(before);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacyInstalls);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, before.id))).toHaveLength(0);
+    });
+
+    it("D/M03: activated state is not reset on repeat activation; archived candidate is terminal", async () => {
+      const p = await pending(); await version(p.f); await activate(p);
+      const active = await storedConnection(db, p.candidate.connection.id);
+      await db.transaction(tx => activateProjectConnectionMigration(tx, { connection: active, actor: p.f.actor(), targetAgentIds: [p.f.leadA.id], verifiedRepositoryIds: [101], verifiedSecretVersion: 1 }));
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, active.id))).toHaveLength(1);
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, p.bound.run.id));
+      await p.f.service.archiveConnection(active.id, p.f.companyId, p.f.actor());
+      await expect(activate(p, false)).rejects.toMatchObject({ status: 409, details: { code: "project_connection_archived" } });
+      expect(await storedConnection(db, active.id)).toMatchObject({ status: "archived", config: { projectScope: { migrationPending: false } } });
+    });
+
   });
 });
