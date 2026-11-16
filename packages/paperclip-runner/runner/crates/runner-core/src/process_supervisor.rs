@@ -1159,7 +1159,8 @@ impl SupervisedProcess {
         crate::configured_environment::apply_configured_environment(&mut command, |key| {
             std::env::var(key).ok()
         })?;
-        crate::durable::github_access::apply_provider_environment(&mut command);
+        crate::durable::github_access::apply_provider_environment(&mut command)
+            .map_err(LocalRunnerError::invalid)?;
         if let Some(executable) = verified_runtime_executable {
             // Node reports a sealed memfd launch as `/memfd:... (deleted)` via
             // process.execPath. Give descriptor-loaded runtimes the inherited,
@@ -1722,13 +1723,21 @@ mod tests {
         const GUARD: &str = "PAPERCLIP_TEST_GITHUB_ENV_CHILD";
         const CASE: &str = "PAPERCLIP_TEST_GITHUB_ENV_CASE";
         const GITHUB_ENVIRONMENT_KEYS: &[&str] = &[
+            "PAPERCLIP_GITHUB_RUNNER_SOCKET",
+            "PAPERCLIP_GITHUB_ACCESS_TRANSPORT",
             "PAPERCLIP_GITHUB_BROKER_URL",
             "PAPERCLIP_GITHUB_BROKER_TOKEN",
             "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
         ];
 
         if std::env::var_os(GUARD).is_none() {
-            for case in ["runner_ingress", "bridge"] {
+            let mut failures = Vec::new();
+            for case in [
+                "runner_ingress",
+                "bridge",
+                "runner_ingress_missing_capability",
+                "runner_ingress_empty_capability",
+            ] {
                 let mut command = Command::new(std::env::current_exe().unwrap());
                 command
                     .args([
@@ -1740,24 +1749,64 @@ mod tests {
                     .env("PAPERCLIP_GITHUB_BROKER_URL", "https://bridge.invalid")
                     .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "fixture-session-capability")
                     .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "fixture-bridge-token")
-                    .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
-                    .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT");
+                    .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", "/tmp/stale-runner-ingress.sock")
+                    .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress");
                 if case == "runner_ingress" {
                     command.env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress");
+                } else if case == "runner_ingress_missing_capability" {
+                    command
+                        .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress")
+                        .env_remove("PAPERCLIP_GITHUB_BROKER_TOKEN");
+                } else if case == "runner_ingress_empty_capability" {
+                    command
+                        .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress")
+                        .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "");
                 }
                 let output = command.output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "isolated GitHub environment test failed: {}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+                if !output.status.success()
+                    || !String::from_utf8_lossy(&output.stdout).contains("1 passed")
+                {
+                    failures.push(format!(
+                        "{case}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
             }
+            assert!(
+                failures.is_empty(),
+                "isolated GitHub environment failures:\n{}",
+                failures.join("\n")
+            );
             return;
         }
 
         let case = std::env::var(CASE).unwrap();
+        if matches!(
+            case.as_str(),
+            "runner_ingress_missing_capability" | "runner_ingress_empty_capability"
+        ) {
+            crate::durable::github_access::install_provider_environment(Path::new(
+                "/tmp/paperclip-test-runner-ingress.sock",
+            ))
+            .unwrap();
+            match SupervisedProcess::spawn_with_environment_keys(
+                Path::new("/bin/sh"),
+                &["-c".to_owned(), "exit 0".to_owned()],
+                Duration::from_millis(500),
+                1024,
+                GITHUB_ENVIRONMENT_KEYS,
+            ) {
+                Err(error) => assert!(error
+                    .to_string()
+                    .contains("github_access_capability_missing")),
+                Ok(mut process) => {
+                    process.terminate_group().unwrap();
+                    panic!("spawn unexpectedly accepted a missing GitHub capability");
+                }
+            }
+            return;
+        }
         let script = if case == "runner_ingress" {
             crate::durable::github_access::install_provider_environment(Path::new(
                 "/tmp/paperclip-test-runner-ingress.sock",

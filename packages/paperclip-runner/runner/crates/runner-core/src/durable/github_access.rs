@@ -683,7 +683,9 @@ pub(crate) fn clear_provider_environment(socket_path: &Path) {
     }
 }
 
-pub(crate) fn apply_provider_environment(command: &mut std::process::Command) {
+pub(crate) fn apply_provider_environment(
+    command: &mut std::process::Command,
+) -> Result<(), &'static str> {
     let Ok(value) = provider_environment_slot().lock() else {
         command
             .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
@@ -691,23 +693,29 @@ pub(crate) fn apply_provider_environment(command: &mut std::process::Command) {
             .env("PAPERCLIP_GITHUB_BROKER_URL", "")
             .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "")
             .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
-        return;
+        return Ok(());
     };
     let Some(environment) = value.as_ref() else {
         // In callback-bridge mode the server-provided environment is already
-        // complete. Do not rewrite it when no runner ingress is installed.
-        return;
+        // complete, except that runner-ingress selectors must never leak in.
+        command
+            .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
+            .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT");
+        return Ok(());
     };
     // The session capability arrives in runnerd's existing launch environment.
     // Keep its value only on provider children, where the GitHub launcher needs
     // it to authenticate the local socket request; never use the bridge URL.
-    let session_capability = std::env::var_os("PAPERCLIP_GITHUB_BROKER_TOKEN").unwrap_or_default();
+    let session_capability = std::env::var_os("PAPERCLIP_GITHUB_BROKER_TOKEN")
+        .filter(|capability| !capability.is_empty())
+        .ok_or("github_access_capability_missing")?;
     command
         .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", &environment.socket_path)
         .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress")
         .env("PAPERCLIP_GITHUB_BROKER_URL", "")
         .env("PAPERCLIP_GITHUB_BROKER_TOKEN", session_capability)
         .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "");
+    Ok(())
 }
 
 /// One local HTTP request waiting for a matching authenticated PRP reply.
