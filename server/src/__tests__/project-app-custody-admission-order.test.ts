@@ -76,7 +76,7 @@ describe("RFL 05:56Z custody admission order and acquire-only remap", () => {
     const before = await snapshot(f.companyId);
     const calls = http.mock.calls.length;
     await expect(resolveGitHubAppCredential(db, c.connection, c.grant, false, true, f.leadA.id))
-      .rejects.toMatchObject({ status: 403, details: { code: "github_app_access_unavailable" } });
+      .rejects.toMatchObject({ status: 422, details: { code: "github_app_access_unavailable" } });
     expect(http.mock.calls.length).toBe(calls);
     expect(await snapshot(f.companyId)).toEqual(before);
   });
