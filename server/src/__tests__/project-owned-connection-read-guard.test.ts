@@ -183,6 +183,52 @@ describe("project-owned tool connections on an image without the #20717 writer (
     expect(installs.map(install => install.targetType)).toEqual(["company"]);
   });
 
+  it("J4 board reconnect (connectGalleryApp reconnectConnectionId) on THIS image rewrites a project-owned row's config without projectScope", async () => {
+    const f = await seed();
+    const owned = await seedApp(f, true);
+    const methodConfig = { version: "1", appId: "1", installationId: "456", repositories: "owner/repo", permissionProfile: "read" };
+    const cfg = { ...(owned.connection.config as Record<string, unknown>), methodConfig };
+    await db.update(toolConnections).set({ config: cfg, transportConfig: cfg, transport: "mcp_remote" }).where(eq(toolConnections.id, owned.connection.id));
+    await db.update(toolApplications).set({ type: "mcp_http" }).where(eq(toolApplications.id, owned.connection.applicationId));
+    console.log("J4 before owned?", isProjectOwnedToolConnection((await db.select().from(toolConnections).where(eq(toolConnections.id, owned.connection.id)))[0]));
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      console.log("J4 fetch", String(url)); if (String(url).startsWith("https://api.githubcopilot.com/")) {
+        const rpc = JSON.parse(String(init?.body ?? "{}"));
+        return Response.json({ jsonrpc: "2.0", id: rpc.id, result: { tools: [{ name: "list_issues", description: "x", inputSchema: { type: "object" }, annotations: { readOnlyHint: true } }] } });
+      }
+      return Response.json({}, { status: 404 });
+    });
+    const svc = toolAccessService(db, { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }], remoteHttpRequest: async (url: string, init: RequestInit) => fetch(url, init) } as never);
+    let err: unknown = null;
+    let wizard: { catalog: Array<{ id: string }> } | null = null;
+    try {
+      wizard = await svc.connectGalleryApp(f.companyId, { galleryKey: "github", connectionMethodKey: "app-installation",
+        reconnectConnectionId: owned.connection.id, grantKind: "organization", configValues: methodConfig, credentialValues: {} } as never,
+        { actorType: "user", actorId: "owner" } as never);
+    } catch (e) { err = e; }
+    console.log("J4 connectGalleryApp error:", err ? String((err as Error).message).slice(0, 200) + " " + JSON.stringify((err as { details?: unknown }).details ?? null).slice(0, 200) : "none");
+    const [after] = await db.execute(sql`SELECT project_id, status, enabled, config ? 'projectScope' AS c_scope, transport_config ? 'projectScope' AS t_scope FROM tool_connections WHERE id = ${owned.connection.id}`);
+    console.log("J4 after connect", JSON.stringify(after));
+    if (wizard) {
+      try {
+        await svc.finishGalleryAppConnection(f.companyId, owned.connection.id, { enabledCatalogEntryIds: wizard.catalog.map(e => e.id),
+          askFirstCatalogEntryIds: [], access: { agentIds: [f.other, f.loose] } } as never, { actorType: "user", actorId: "owner" } as never);
+        console.log("J4 finish ok");
+      } catch (e) { console.log("J4 finish error", String((e as Error).message).slice(0, 200), JSON.stringify((e as { details?: unknown }).details ?? null).slice(0, 200)); }
+      const [fin] = await db.execute(sql`SELECT project_id, status, enabled, config ? 'projectScope' AS c_scope, transport_config ? 'projectScope' AS t_scope FROM tool_connections WHERE id = ${owned.connection.id}`);
+      console.log("J4 after finish", JSON.stringify(fin));
+      const [row] = await db.select().from(toolConnections).where(eq(toolConnections.id, owned.connection.id));
+      const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, owned.connection.id));
+      try { const t = await resolveGitHubAppCredential(db, row!, grant!, false, false, f.other); console.log("J4 token minted for agent in project B:", t.token); }
+      catch (e) { console.log("J4 mint error", String((e as Error).message).slice(0, 150)); }
+      const sel = await resolveManagedGitHubIdentitySelection(db, f.companyId, { agentId: f.loose });
+      console.log("J4 loose-agent git identity grant is owned row's:", sel.grant?.connectionId === owned.connection.id);
+    }
+    spy.mockRestore();
+    // Contract: this image must never strip the envelope from a project-owned row.
+    expect(after).toMatchObject({ c_scope: true, t_scope: true });
+  });
+
   it("detects ownership from the envelope alone, in either config, whatever its value (no schema read)", () => {
     expect(isProjectOwnedToolConnection({ config: { projectScope: { version: 1 } }, transportConfig: {} })).toBe(true);
     expect(isProjectOwnedToolConnection({ config: {}, transportConfig: { projectScope: { version: 1 } } })).toBe(true);
