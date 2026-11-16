@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { NativeSessionDiagnostics, nativeSessionDiagnostics } from "./native-session-diagnostics.js";
+import { NativeSessionDiagnostics, nativeIdleDiagnosticReason, nativeSessionDiagnostics } from "./native-session-diagnostics.js";
 import { createNativeRunTrace } from "./native-run-trace.js";
 
 const owner = { companyId: "company", sessionScope: "session", runId: "run-a" };
@@ -134,6 +134,33 @@ describe("native session diagnostic ownership", () => {
     for (const privateText of ["synthetic-secret", "/private/customer", "alice@", "token"])
       expect(args).not.toContain(privateText);
     expect(sink).not.toHaveBeenCalled();
+  });
+
+  // #20825: an idle warm owner's transport failure carried up to 1,000
+  // characters of runner stderr. Idle logging names only a bounded code.
+  it.each([
+    ["[paperclip-runner] runnerd diagnostic: native_runner_idle_warm_owner_exited: Bearer abc123secret /home/paul/private_dir/runner-state.json",
+      "native_runner_idle_warm_owner_exited"],
+    ["transport_reconnect_grace_exceeded: runner process recovery exceeded 420000ms: Bearer abc123secret /srv/private_root/x",
+      "transport_reconnect_grace_exceeded"],
+    ["Bearer abc123secret /srv/private_root/runner_state token=lease_expired_requires_bootstrap", "other"],
+    ["Error: EACCES: permission denied, open '/home/paul/.config/secret_file'", "other"],
+  ])("logs only a bounded reason code for idle text %j", (text, reason) => {
+    const idle = vi.fn(), failed = vi.fn();
+    const channel = new NativeSessionDiagnostics(owner, owner, idle, failed, { idleReasonCode: true });
+    channel.activate(owner, vi.fn(async () => undefined)).retire();
+    channel.record(text);
+    expect(idle).toHaveBeenCalledExactlyOnceWith(owner, "session_diagnostic", reason);
+    const logged = JSON.stringify(idle.mock.calls);
+    for (const privateText of ["Bearer", "abc123", "/home/", "/srv/", "private", "EACCES", "token"])
+      expect(logged).not.toContain(privateText);
+  });
+
+  it("bounds the idle reason code to the closed token shape", () => {
+    expect(nativeIdleDiagnosticReason("native_runner_idle_warm_owner_exited: detail")).toBe("native_runner_idle_warm_owner_exited");
+    expect(nativeIdleDiagnosticReason(`${"a_".repeat(13)}b: too many parts`)).toBe("other");
+    expect(nativeIdleDiagnosticReason("UPPER_CASE_CODE: no")).toBe("other");
+    expect(nativeIdleDiagnosticReason("x".repeat(5_000))).toBe("other");
   });
 
   it("retains a sink failure without leaking its exception", async () => {

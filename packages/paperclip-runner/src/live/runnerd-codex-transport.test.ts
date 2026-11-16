@@ -7230,3 +7230,177 @@ describe("a Runner command that gets no answer", () => {
       .toBe("runner disconnected 125s; pending ahead 0; last runner event none");
   });
 });
+
+// #20825: a finished run's retained warm owner relaunched its idle runner
+// every ~6 s for the whole 420 s reconnect grace. The remote launcher reports
+// every exit with code null and the runner's durable lifecycle; each replacement
+// died before it authenticated (its state needed a fresh bootstrap).
+describe("runner exits that must not relaunch on the same path (#20825)", () => {
+  type DurableExit = { lifecycle: string; recoverableFailure: string | null };
+  const remoteExitDetail = (state: DurableExit) =>
+    `runner_remote_process_exited lifecycle=${state.lifecycle}${state.recoverableFailure ? ` recoverableFailure=${state.recoverableFailure}` : ""}`;
+  // What the remote launcher returns for a replacement whose exit the monitor
+  // proved before the replacement authenticated.
+  const preAuthExit = (state: DurableExit): durableControlPlane.RunnerProcessHandle => ({
+    child: { pid: undefined, exitCode: null, kill: () => false },
+    completion: Promise.resolve({ code: null, signal: null, stdout: "", stderr: remoteExitDetail(state),
+      runnerLifecycle: state } as durableControlPlane.RunnerProcessResult),
+    isExitConfirmed: () => true,
+  });
+  const fakeClock = () => vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  // Fake time in small steps, letting real I/O (sockets, files) settle between steps.
+  const advance = async (ms: number) => {
+    for (let elapsed = 0; elapsed < ms; elapsed += 100) {
+      await vi.advanceTimersByTimeAsync(100);
+      await new Promise(resolveTurn => setImmediate(resolveTurn));
+    }
+  };
+
+  async function startOwner(input: {
+    mode: "warm" | "per_turn";
+    providerArgs?: string[];
+    /** The durable state the first runner's remote completion reports, if any. */
+    firstExit?: (directory: string) => Promise<DurableExit>;
+    replacement: () => durableControlPlane.RunnerProcessHandle;
+    controlPlaneRegistration?: Parameters<typeof createCapabilityRunnerdCodexTransport>[0] extends infer O
+      ? O extends { controlPlaneRegistration?: infer R } ? R : never : never;
+  }) {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-same-path-relaunch-"));
+    const children: ReturnType<typeof spawn>[] = [];
+    const exits: Promise<void>[] = [];
+    const launch = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec): durableControlPlane.RunnerProcessHandle => {
+      if (launch.mock.calls.length > 1) return input.replacement();
+      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: "ignore" });
+      children.push(child);
+      exits.push(new Promise(resolveExit => child.once("exit", () => resolveExit())));
+      return {
+        child,
+        completion: new Promise<durableControlPlane.RunnerProcessResult>((resolveExit, rejectExit) => {
+          child.once("error", rejectExit);
+          child.once("exit", (code, signal) => {
+            if (!input.firstExit) { resolveExit({ code, signal, stdout: "", stderr: "" }); return; }
+            input.firstExit(directory).then(state => resolveExit({ code: null, signal: null, stdout: "",
+              stderr: remoteExitDetail(state), runnerLifecycle: state } as durableControlPlane.RunnerProcessResult), rejectExit);
+          });
+        }),
+        isExitConfirmed: () => child.exitCode !== null || child.signalCode !== null,
+      };
+    });
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(directory, ...(input.providerArgs ?? [])), stateDirectory: directory,
+      lifecyclePolicy: input.mode === "warm" ? { mode: "warm", idleTimeoutMs: 60_000 } : { mode: "per_turn", idleTimeoutMs: null },
+      runnerReconnectGraceMs: 420_000, runnerProcessLauncher: launch,
+      ...(input.controlPlaneRegistration ? { controlPlaneRegistration: input.controlPlaneRegistration } : {}),
+    });
+    bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+    await bundle.transport.request("thread/start", { cwd: directory, dynamicTools: [] });
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    let failure: Error | null = null;
+    const drain = () => void (async () => {
+      for (;;) if ((await notifications.next()).done) return;
+    })().catch(error => { failure = error as Error; });
+    const diagnostics = () => bundle.evidence().diagnostics;
+    const cleanup = async () => {
+      vi.useRealTimers();
+      const providerPid = bundle.evidence().codexPid;
+      if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch {} }
+      await bundle.transport.detachControllerForRestart!().catch(() => undefined);
+      for (const child of children) child.kill("SIGKILL");
+      await Promise.all(exits);
+      await rm(directory, { recursive: true, force: true });
+    };
+    return { directory, bundle, launch, children, exits, notifications, drain, failure: () => failure, diagnostics, cleanup };
+  }
+
+  it("does not relaunch an idle warm owner's runner after its run settled", async () => {
+    const owner = await startOwner({ mode: "warm",
+      replacement: () => preAuthExit({ lifecycle: "recoverable_failure", recoverableFailure: "connection_refused" }) });
+    try {
+      await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Finish, then stay warm." }] });
+      for (;;) if ((await owner.notifications.next()).value?.method === "turn/completed") break;
+      owner.drain();
+      fakeClock();
+      owner.children[0]!.kill("SIGKILL");
+      await owner.exits[0];
+      await advance(60_000);
+      // Today: about 12 same-path relaunches by 60 s, 60-70 by the 420 s grace.
+      expect(owner.launch.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(owner.diagnostics().some(line => line.startsWith("native_runner_idle_warm_owner_exited"))).toBe(true);
+      expect(owner.failure()?.message).toMatch(/^native_runner_idle_warm_owner_exited/);
+    } finally { await owner.cleanup(); }
+  }, 60_000);
+
+  it("gives an in-flight turn's replacement that exits before authenticating one retry, then a named failure", async () => {
+    const owner = await startOwner({ mode: "warm", providerArgs: ["--hold-turn"],
+      replacement: () => preAuthExit({ lifecycle: "recoverable_failure", recoverableFailure: "connection_refused" }) });
+    try {
+      await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Hold this turn." }] });
+      await expectTurnStarted(owner.notifications);
+      owner.drain();
+      fakeClock();
+      owner.children[0]!.kill("SIGKILL");
+      await owner.exits[0];
+      await advance(60_000);
+      // The first runner, its replacement, and one retry.
+      expect(owner.launch).toHaveBeenCalledTimes(3);
+      const named = owner.diagnostics().filter(line => line.startsWith("native_runner_replacement_exited_before_authentication"));
+      expect(named).toEqual([
+        "native_runner_replacement_exited_before_authentication: lifecycle=recoverable_failure recoverableFailure=connection_refused",
+      ]);
+      expect(owner.diagnostics().some(line => line.startsWith("transport_reconnect_grace_exceeded"))).toBe(false);
+    } finally { await owner.cleanup(); }
+  }, 60_000);
+
+  it("treats a remote per-turn runner's exit after runner.suspending with a graceful durable lifecycle as expected", async () => {
+    let core!: DurablePrpControlPlane;
+    const owner = await startOwner({ mode: "per_turn",
+      controlPlaneRegistration: async authority => {
+        core = authority;
+        await authority.start();
+        return { release: () => undefined };
+      },
+      // The remote monitor reads the runner's durable state after the exit.
+      firstExit: async () => ({ lifecycle: "suspended", recoverableFailure: null }),
+      replacement: () => preAuthExit({ lifecycle: "recoverable_failure", recoverableFailure: "connection_refused" }) });
+    try {
+      await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Finish this turn." }] });
+      for (;;) if ((await owner.notifications.next()).value?.method === "turn/completed") break;
+      owner.drain();
+      // The runner committed its suspension before it exited (runnerd at this
+      // base never emits runner.suspending itself; the journal entry is planted).
+      const events = core.store.state.committedEvents;
+      const last = events.at(-1)!;
+      events.push({ ...structuredClone(last), sourceSeq: last.sourceSeq + 1, sourceEventId: `${last.sourceEventId}-suspending`,
+        eventType: "runner.suspending", envelope: { ...structuredClone(last.envelope), eventType: "runner.suspending", payload: {} } });
+      owner.children[0]!.kill("SIGKILL");
+      await owner.exits[0];
+      await new Promise(resolveWait => setTimeout(resolveWait, 1_500));
+      expect(owner.launch).toHaveBeenCalledTimes(1);
+      expect(owner.failure()).toBeNull();
+      expect(owner.diagnostics().filter(line => /native_runner_process_exited|runner process disconnected|transport_reconnect_grace_exceeded/.test(line)))
+        .toEqual([]);
+    } finally { await owner.cleanup(); }
+  }, 60_000);
+
+  it.each(["first runner", "replacement"] as const)(
+    "stands down at once when the %s's durable state requires a fresh bootstrap", async which => {
+      const leaseExpired = { lifecycle: "recoverable_failure", recoverableFailure: "lease_expired_requires_bootstrap" };
+      const owner = await startOwner({ mode: "warm", providerArgs: ["--hold-turn"],
+        ...(which === "first runner" ? { firstExit: async () => leaseExpired } : {}),
+        replacement: () => preAuthExit(leaseExpired) });
+      try {
+        await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Hold this turn." }] });
+        await expectTurnStarted(owner.notifications);
+        owner.drain();
+        fakeClock();
+        owner.children[0]!.kill("SIGKILL");
+        await owner.exits[0];
+        await advance(60_000);
+        // No launch after the runner state that a restart ticket can never satisfy.
+        expect(owner.launch).toHaveBeenCalledTimes(which === "first runner" ? 1 : 2);
+        expect(owner.failure()?.message).toBe(
+          "native_runner_lease_expired_requires_bootstrap: lifecycle=recoverable_failure recoverableFailure=lease_expired_requires_bootstrap");
+      } finally { await owner.cleanup(); }
+    }, 60_000);
+});

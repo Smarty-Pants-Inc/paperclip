@@ -2619,6 +2619,38 @@ fs.readFileSync = function(path, ...args) {
     expect(handle.child.exitCode).toBeNull();
   });
 
+  // #20825: the transport decides whether an exit is expected or needs a
+  // fresh bootstrap from the runner's durable lifecycle, not from stderr text.
+  it.each([
+    [{ lifecycle: "recoverable_failure", recoverableFailure: "lease_expired_requires_bootstrap" },
+      { lifecycle: "recoverable_failure", recoverableFailure: "lease_expired_requires_bootstrap" }],
+    [{ lifecycle: "suspended" }, { lifecycle: "suspended", recoverableFailure: null }],
+    [{ lifecycle: "stopped", recoverable_failure: "Bearer abc /srv/x" }, { lifecycle: "stopped", recoverableFailure: "other" }],
+    [null, { lifecycle: "unavailable", recoverableFailure: null }],
+  ])("reports the remote runner's durable lifecycle %j as a structured code on its completion", async (state, expected) => {
+    let nonce = "";
+    const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    const execute = vi.fn(async (input: { command?: string; args?: string[] }) => {
+      const label = input.args?.[2];
+      if (label === "paperclip-runner-launch") { nonce = input.args?.[4] ?? ""; return ok; }
+      if (label === "paperclip-runner-process-identity") return { ...ok, stdout: `${nonce}\n4321\n2026-09-06T00:00:00.000Z\nrunner-remote\n` };
+      if (label === "paperclip-runner-monitor") return { ...ok, exitCode: 45 };
+      if (label === "paperclip-runner-diagnostics") return ok;
+      if (input.command === "sh" && input.args?.[1]?.includes("base64")) {
+        return state === null ? { ...ok, exitCode: 1 } : { ...ok, stdout: Buffer.from(JSON.stringify(state)).toString("base64") };
+      }
+      throw new Error(`unexpected remote command: ${label ?? "missing"}`);
+    });
+    const handle = createRemoteRunnerProcessLauncher({
+      target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+      runner: { execute } as never, remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+      stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-remote",
+    })({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
+    const result = await handle.completion;
+    expect(result).toMatchObject({ code: null, runnerLifecycle: expected });
+    expect(JSON.stringify((result as { runnerLifecycle?: unknown }).runnerLifecycle)).not.toMatch(/Bearer|\/srv/);
+  });
+
   it.each(["missing marker", "missing fingerprint"])("terminates a detached runner with %s before admitting managed work", async kind => {
     vi.useFakeTimers();
     try {
