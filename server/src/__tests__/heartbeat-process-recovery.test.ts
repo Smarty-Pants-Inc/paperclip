@@ -6755,18 +6755,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(issue).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
 
-    const recoveryAction = await db
-      .select({
-        status: issueRecoveryActions.status,
-        sourceIssueId: issueRecoveryActions.sourceIssueId,
-      })
-      .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(recoveryAction).toMatchObject({
-      status: "active",
-      sourceIssueId: issueId,
-    });
+    // Stop inspection history is retained. Select the one current recovery
+    // action, never the database's arbitrary first historical row.
+    const recoveryActions = await db.select().from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    const activeRecoveryActions = recoveryActions.filter(action => ["active", "escalated"].includes(action.status));
+    expect(activeRecoveryActions).toHaveLength(1);
+    const recoveryAction = activeRecoveryActions[0]!;
+    expect(recoveryAction).toMatchObject({ status: "active", sourceIssueId: issueId });
+    expect(recoveryActions.filter(action => action.cause === "execution_stop_pending")
+      .every(action => ["resolved", "cancelled"].includes(action.status))).toBe(true);
+    const [settledInteraction] = await db.select({ result: issueThreadInteractions.result }).from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.id, interactionId));
+    expect(settledInteraction.result).toMatchObject({ resumeFailure: { recoveryActionId: recoveryAction.id } });
 
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);
@@ -6852,19 +6853,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("blocked");
 
-    const recoveryAction = await db
-      .select({
-        id: issueRecoveryActions.id,
-        status: issueRecoveryActions.status,
-        sourceIssueId: issueRecoveryActions.sourceIssueId,
-      })
-      .from(issueRecoveryActions)
-      .where(eq(issueRecoveryActions.sourceIssueId, issueId))
-      .then((rows) => rows[0] ?? null);
-    expect(recoveryAction).toMatchObject({
-      status: "active",
-      sourceIssueId: issueId,
-    });
+    const recoveryActions = await db.select().from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId)));
+    const activeRecoveryActions = recoveryActions.filter(action => ["active", "escalated"].includes(action.status));
+    expect(activeRecoveryActions).toHaveLength(1);
+    const recoveryAction = activeRecoveryActions[0]!;
+    expect(recoveryAction).toMatchObject({ status: "active", sourceIssueId: issueId });
+    expect(recoveryActions.filter(action => action.cause === "execution_stop_pending")
+      .every(action => ["resolved", "cancelled"].includes(action.status))).toBe(true);
 
     const comments = await selectRecoveryCommentsForIssue(issueId);
     expect(comments).toHaveLength(1);
