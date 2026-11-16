@@ -149,7 +149,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const identityRedactor = createAgentIdentityRedactor();
   const earlyObservability = unsupportedObservability === undefined && observabilityKind(initialHarness)
     ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(initialHarness)!, companyId: agent.companyId, agentId: agent.id }) : undefined;
-  identityRedactor.values.push(...observabilitySecretValues(earlyObservability));
+  // The run's own ids are metadata, never secret text (a header or env value
+  // equal to the agent id must not mask every event and log line).
+  const runIdentifiers = [run.id, agent.id, agent.companyId, issueId, selectedEnvironmentId, selectedEnvironmentForConfig?.id];
+  // Observability header values follow the same rules as run secrets.
+  addRunSecretMaterial(identityRedactor, observabilitySecretValues(earlyObservability), runIdentifiers);
   onIdentityRedactorPrepared(identityRedactor);
   // The executor keeps these values in its failure redactor before any later
   // preparation step can fail. Subsequent provider/identity values extend it.
@@ -221,7 +225,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // resolved, the same way native log recovery adds registered run secrets.
   const resolvedEnv = parseObject(resolvedConfig.env);
   addRunSecretMaterial(identityRedactor, [...secretKeys].flatMap(key =>
-    typeof resolvedEnv[key] === "string" && resolvedEnv[key] ? [resolvedEnv[key] as string] : []));
+    typeof resolvedEnv[key] === "string" && resolvedEnv[key] ? [resolvedEnv[key] as string] : []), runIdentifiers);
   if (useAgentGitHubEnv && !["GH_TOKEN", "GITHUB_TOKEN"].some(key => {
     const value = parseObject(resolvedConfig.env)[key];
     return typeof value === "string" && value.trim().length > 0;
@@ -471,8 +475,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const harness = agentHarnessType(agent.adapterType, runtimeConfig);
   const observability = unsupportedObservability !== "unsupported_home_mode" && observabilityKind(harness)
     ? agentObservabilityLaunch(observabilitySnapshot, { kind: observabilityKind(harness)!, companyId: agent.companyId, agentId: agent.id }) : undefined;
-  identityRedactor.values.push(...observabilitySecretValues(observability));
-  identityRedactor.values.sort((a, b) => b.length - a.length);
+  addRunSecretMaterial(identityRedactor, observabilitySecretValues(observability), runIdentifiers);
   if (observabilitySnapshot.state === "unavailable") {
     logger.warn({ runId: run.id, reason: observabilitySnapshot.reason }, "Agent observability unavailable; execution continues without export");
     const reason = observabilitySnapshot.reason;
