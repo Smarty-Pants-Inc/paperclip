@@ -25350,6 +25350,31 @@ it("records a runner process exit that closed the provider event stream as runne
   expect(nativeSessionFailureSourceCode(new NativeProviderTerminalFailure("notification_transport_failed", false,
     "Notification transport failed closed: tool said native_runner_process_exited: oops"))).toBe("native_provider_terminal_failed");
 });
+// #20825 B edge: runnerd dies between two turns of the same run, before the
+// next turn is sent. The transport fails with native_runner_idle_warm_owner_exited;
+// the Codex driver closes the stream with it (codex-session-notifications.ts
+// failProtocol) and the next turn start reports it (codex-harness-session.ts
+// codex_turn_start_protocol_failure). Either shape is runner loss, retried on
+// the same run, never a permanent provider verdict or a generic interruption.
+it("records an idle warm owner's runner exit between two turns of a run as runner loss", () => {
+  for (const cause of ["native_runner_idle_warm_owner_exited: lifecycle=unreported",
+    "native_runner_idle_warm_owner_exited: lifecycle=recoverable_failure recoverableFailure=connection_refused"]) {
+    const closed = new NativeProviderTerminalFailure("notification_transport_failed", false,
+      `Notification transport failed closed: ${cause}`);
+    const refusedNextTurn = new Error(
+      `codex_turn_start_protocol_failure: notification_transport_failed: Notification transport failed closed: ${cause}`);
+    for (const error of [closed, refusedNextTurn]) {
+      const code = nativeSessionFailureSourceCode(error);
+      expect(code).toBe("native_runner_process_exited");
+      expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({ phase: "retryable_failure", failureCode: "native_session_interrupted" });
+    }
+  }
+  // The runner code only inside provider text stays a provider failure.
+  expect(nativeSessionFailureSourceCode(new NativeProviderTerminalFailure("provider_turn_failed", false,
+    "Notification transport failed closed: native_runner_idle_warm_owner_exited: lifecycle=unreported"))).toBe("native_provider_terminal_failed");
+  expect(nativeSessionFailureSourceCode(new NativeProviderTerminalFailure("notification_transport_failed", false,
+    "Notification transport failed closed: tool said native_runner_idle_warm_owner_exited: oops"))).toBe("native_provider_terminal_failed");
+});
 it("keeps an ACPX missing runtime package failure actionable and stops automatic retries", () => {
   const failure = new Error('PRP command session.open failed: {"result":{"code":"command_execution_failed","message":"failed to start ACPX provider: ACPX sidecar command session.open was rejected (retryable=false, classification=runtime_package_missing)"},"status":"failed"}');
   const code = nativeSessionFailureSourceCode(failure);
