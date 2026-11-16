@@ -1082,6 +1082,72 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }
   }, 60_000);
 
+  // redact-sec3 C2: a held tool-output event must not commit after later events.
+  it("redact-sec3 C2: a held tool event on stream A commits before a later event of the run; committed order follows adapter order", async () => {
+    const f = await seed();
+    const pin = "482916375"; // test-only
+    await bindEnvSecrets(f, { SEC3_ORDER_PIN: pin });
+    const sent = [
+      { order: "A1", eventType: "tool.output", stream: "stdout" as const, call: "A", text: "pin 4829" },
+      { order: "N1", eventType: "adapter.progress", stream: "system" as const, call: null, text: "progress note." },
+      { order: "B1", eventType: "tool.output", stream: "stderr" as const, call: "B", text: "other call output." },
+      { order: "A2", eventType: "tool.output", stream: "stdout" as const, call: "A", text: "16375 done." },
+    ];
+    inspect.set(f.agentId, async input => {
+      for (const { order, eventType, stream, call, text } of sent) {
+        await input.onEvent?.({ eventType, stream, level: "info", message: text,
+          payload: { ...(call ? { toolCallId: call } : {}), output: text, order } });
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const orders = new Set(sent.map(event => event.order));
+    const committed = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .sort((left, right) => left.seq - right.seq)
+      .filter(event => orders.has((event.payload as { order?: string } | null)?.order ?? ""));
+    expect(committed.map(event => (event.payload as { order: string }).order)).toEqual(["A1", "N1", "B1", "A2"]);
+    // Committing early must not release the split secret: it stays masked across A's events.
+    const own = committed.filter(event => (event.payload as { toolCallId?: string }).toolCallId === "A");
+    for (const joined of [own.map(event => event.message ?? "").join(""), own.map(event => (event.payload as { output?: string }).output ?? "").join("")]) {
+      expect(joined.includes(pin)).toBe(false);
+      for (const half of ["4829", "16375"]) expect(joined.includes(half), "half").toBe(false);
+      expect(joined).toBe("pin ***REDACTED*** done.");
+    }
+  }, 60_000);
+
+  // redact-sec3 C2: when the held stream never sends again, finish adds no row:
+  // one adapter event stays one committed event, in adapter order.
+  it("redact-sec3 C2: a held tool event whose stream never resumes stays one committed row, before the later event; no part of the secret is committed", async () => {
+    const f = await seed();
+    const pin = "482916375"; // test-only
+    await bindEnvSecrets(f, { SEC3_NORESUME_PIN: pin });
+    const sent = [
+      { order: "A1", stream: "stdout" as const, call: "A", text: "pin 4829" },
+      { order: "B1", stream: "stderr" as const, call: "B", text: "other call output." },
+    ];
+    inspect.set(f.agentId, async input => {
+      for (const { order, stream, call, text } of sent) {
+        await input.onEvent?.({ eventType: "tool.output", stream, level: "info", message: text,
+          payload: { toolCallId: call, output: text, order } });
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const events = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .filter(event => event.eventType === "tool.output").sort((left, right) => left.seq - right.seq);
+    // Exactly one committed row per adapter event: no extra row at finish.
+    expect(events.map(event => (event.payload as { order?: string } | null)?.order ?? "(none)")).toEqual(["A1", "B1"]);
+    expect(events.map(event => (event.payload as { toolCallId?: string }).toolCallId)).toEqual(["A", "B"]);
+    for (const event of events) {
+      for (const text of [event.message ?? "", (event.payload as { output?: string }).output ?? ""]) {
+        expect(text.includes(pin)).toBe(false);
+        expect(text.includes("4829"), "secret half").toBe(false);
+      }
+    }
+    expect(events[0]!.message?.startsWith("pin ")).toBe(true);
+    expect(events[1]!.message).toBe("other call output.");
+  }, 60_000);
+
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
