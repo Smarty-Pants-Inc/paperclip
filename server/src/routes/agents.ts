@@ -4647,6 +4647,11 @@ export function agentRoutes(
             }, decisionNote: null, decidedByUserId: null, decidedAt: null, updatedAt: new Date(),
           });
         }
+        await applyDefaultAgentTaskAssignGrant(
+          companyId,
+          setupAgent.id,
+          req.actor.type === "board" ? (req.actor.userId ?? null) : null,
+        );
         res.status(200).json({ agent: redactAgentRowForResponse(setupAgent), approval, idempotent: true });
         return;
       }
