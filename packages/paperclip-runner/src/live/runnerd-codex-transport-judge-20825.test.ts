@@ -1,5 +1,5 @@
 // RFL judge probe 08:31Z (#20825 loop-fix judge, checks 2, 4 and 5), copied from
-// /srv/scratch/paul/tasks/direct/rfl-loopfix-judge/artifacts/judge-probe-20825.test.ts.
+// Ported from RFL loopfix judge probe judge-probe-20825.test.ts. (2026-11-16).
 // Binding ruling (RFL + review-fleet-2, 08:31Z): loop fix B stands an idle warm
 // owner down only on the server's "owner released to idle" fact, never on "the
 // attached run has a turn terminal", so a LIVE run between two turns reconnects.
