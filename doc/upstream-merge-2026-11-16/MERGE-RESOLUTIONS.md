@@ -1,5 +1,18 @@
 # Merge-down chat follow-up resolutions — 2026-11-16
 
+## C — accepted upstream test-name replacements (RFL 12:53Z)
+
+All six are upstream-owned replacements from `0ead74b4f3132fe8cb0ab485b0746d75b00e6d3d` ([upstream #20827](https://github.com/paperclipai/paperclip/pull/20827)), not silently dropped fork tests. Their originals came from upstream `889947c238c088a09c39d2783bc5e3521a8d1d8d` / #13038. RFL-B.md accepts this disposition: retain the replacements, restore zero obsolete tests. The Slack rewrite separates progress and the final answer; provider-specific Telegram behavior remains covered by its replacement rows.
+
+| Old name | Upstream replacement name | Disposition |
+|---|---|---|
+| coalesces one Slack run's lifecycle and final response despite an interleaved task control | keeps one Slack progress message and a separate final response despite an interleaved task control | Upstream replacement; retained |
+| keeps a slack retry's queue, working, and selected final on its own provider identity | keeps a slack retry's queue and working progress on its own provider identity and delivers its selected final | Upstream replacement; retained |
+| keeps a telegram retry's queue, working, and selected final on its own provider identity | keeps a telegram retry's queue and working progress on its own provider identity and delivers its selected final | Upstream replacement; retained |
+| updates only the linked same-run slack failure notice when recovering an accepted response | delivers a recovered slack answer without editing another run's failure notice | Upstream replacement; retained |
+| updates only the linked same-run telegram failure notice when recovering an accepted response | delivers a recovered telegram answer without editing another run's failure notice | Upstream replacement; retained |
+| does not let removed-input cleanup overwrite a pre-run FIFO lane already replaced by its answer | keeps a separate FIFO answer visible while removed-input cleanup edits its queued notice | Upstream replacement; retained |
+
 This is the tracked follow-up register for the merge of upstream `29903bed59b16a20e1b65f38cd99743e7309cae9` into fork base `a763d193f89d9e25abe3e06edb86b411f04951f4`. No `MERGE-RESOLUTIONS.md` was tracked at starting chat head `03658c43eacc50655be3c89355d752ba6449e5ca`; this location is the fallback required by `RFL-ADD.md`. It supplements, rather than silently edits, the supplied merge-resolution register.
 
 ## RFL-authorized supersedes
