@@ -25,7 +25,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { HttpError } from "../errors.js";
-import { createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
+import { AGENT_HIRE_ATTEMPTS, AgentHireContentionError, createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
 import { agentRoutes } from "../routes/agents.js";
 import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError } from "../services/accounting-transaction.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -37,12 +37,14 @@ import { secretService } from "../services/secrets.js";
 //      keeps the database error only in `cause`.
 //      RFL 07:45Z 11-16: distinct named hire codes
 //      writes nothing: no agent, no binding, no activity, no event.
-//  (b) The GRANT step runs AFTER the create transaction commits, inside #20805's withTransactionRetry (5 attempts).
-//      When a persistent 40P01 exhausts those attempts, the caller gets a NAMED error, never a bare 500. The
-//      committed agent without membership is today's behaviour (removed later by #20805's source fix), so this
-//      file asserts nothing about writes there.
-//  R2: a transient 40P01 in the grant step is retried by #20805's retry; nothing is published from a rolled-back
-//      attempt and each activity is published exactly once.
+//  (b) SUPERSEDED BY REPLACEMENT (RFL, #20805 x #20389): the GRANT step (membership + tasks:assign) now runs
+//      INSIDE the hire transaction (#20805 F2), so a grant fault is injected where the grant writes (a 40P01
+//      raised by the new agent's membership insert), not at the end of a separate post-commit transaction. The
+//      hire's ONE retry wrapper (retryTransientLockContention, five attempts) retries it; exhausted, the caller
+//      gets the distinct named 503 agent_hire_grant_contention, and the WHOLE hire rolled back (review-fleet-2
+//      07:43Z): no agent, membership, grant, activity or event.
+//  R2: a transient 40P01 in the grant step is retried by that wrapper (same injection as (b)); nothing is
+//      published from a rolled-back attempt and each activity is published exactly once.
 //  R4 (RFL check row): a 10-wide concurrent hire burst through the route gives 10 x 201, no 5xx, no duplicate agent.
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -110,6 +112,36 @@ function faultingDb(db: Db, fault: (tx: Db) => Promise<boolean>) {
   return { wrapped: wrapped as Db, state };
 }
 
+/**
+ * #20805 x #20389: the grant step runs inside the hire transaction, so the grant fault is raised where the grant
+ * writes: the new agent's membership insert (any agent principal in `companyId` other than `exceptPrincipalId`)
+ * raises a real 40P01 for its first `failedAttempts` attempts. `faults()` counts them across rolled-back attempts.
+ */
+async function forceHireGrantDeadlocks(db: Db, companyId: string, exceptPrincipalId: string, failedAttempts: number) {
+  await db.execute(sql.raw(`
+    CREATE SEQUENCE agent_hire_grant_fault_attempts;
+    CREATE FUNCTION agent_hire_grant_fault() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF NEW.company_id = '${companyId}' AND NEW.principal_type = 'agent' AND NEW.principal_id <> '${exceptPrincipalId}'
+        AND nextval('agent_hire_grant_fault_attempts') <= ${failedAttempts} THEN
+        RAISE EXCEPTION 'forced agent hire grant deadlock' USING ERRCODE = '40P01';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER agent_hire_grant_fault BEFORE INSERT ON company_memberships
+      FOR EACH ROW EXECUTE FUNCTION agent_hire_grant_fault();
+  `));
+  return {
+    faults: async () => {
+      const result = await db.execute(sql.raw("SELECT last_value, is_called FROM agent_hire_grant_fault_attempts")) as unknown as
+        { last_value: string | number; is_called: boolean }[] | { rows: { last_value: string | number; is_called: boolean }[] };
+      const row = (Array.isArray(result) ? result : result.rows)[0]!;
+      return row.is_called ? Math.min(Number(row.last_value), failedAttempts) : 0;
+    },
+  };
+}
+
 const sqlStates = (error: unknown) => {
   const codes: string[] = [];
   for (let cause = error as { code?: unknown; cause?: unknown } | undefined, depth = 0; cause && typeof cause === "object" && depth < 6;
@@ -131,6 +163,9 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
   }, 60_000);
 
   afterEach(async () => {
+    await db.execute(sql.raw("DROP TRIGGER IF EXISTS agent_hire_grant_fault ON company_memberships"));
+    await db.execute(sql.raw("DROP FUNCTION IF EXISTS agent_hire_grant_fault()"));
+    await db.execute(sql.raw("DROP SEQUENCE IF EXISTS agent_hire_grant_fault_attempts"));
     await db.delete(activityLog);
     await db.delete(approvals);
     await db.delete(heartbeatRuns);
@@ -156,13 +191,6 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
   /** True inside the transaction that created the hired agent row. */
   const createsHiredAgent = (companyId: string) => async (tx: Db) =>
     (await tx.select({ id: agents.id }).from(agents).where(and(eq(agents.companyId, companyId), eq(agents.name, HIRED)))).length > 0;
-  /** True inside a transaction that gave the hired agent its company membership (the grant step). */
-  const grantsHiredAgent = (companyId: string) => async (tx: Db) => {
-    const result = await tx.execute(sql`
-      SELECT 1 FROM ${companyMemberships} m JOIN ${agents} a ON a.id::text = m.principal_id
-      WHERE m.company_id = ${companyId} AND m.principal_type = 'agent' AND a.name = ${HIRED}`) as unknown as unknown[] | { rows: unknown[] };
-    return (Array.isArray(result) ? result : result.rows).length > 0;
-  };
 
   it("R3(a) agent-hires, inherited secret binding: the failed create writes no binding; the caller's own retry writes it once", async () => {
     const { company, hiringAgent, runs } = await seedHiringFixture(db);
@@ -243,30 +271,49 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
       expect(events).toEqual([]);
     }, 60_000);
 
-    it(`R3(b) ${route}: a persistent 40P01 in the grant step that exhausts #20805's five attempts is a named error, not a bare 500`, async () => {
+    it(`R3(b) ${route}: a persistent 40P01 in the grant step exhausts the hire's five attempts: named 503 agent_hire_grant_contention, nothing written`, async () => {
       const { company, hiringAgent, runs } = await seedHiringFixture(db);
-      const { wrapped, state } = faultingDb(db, grantsHiredAgent(company.id));
+      const resourceEvents = () => db.select().from(resourceLifecycleEvents).where(eq(resourceLifecycleEvents.companyId, company.id));
+      const resourceEventsBefore = await resourceEvents();
+      const fault = await forceHireGrantDeadlocks(db, company.id, hiringAgent.id, 1_000);
       const thrown: unknown[] = [];
-      const app = createApp(wrapped, agentActor(company.id, hiringAgent.id, runs[0]!.id), thrown);
-      const response = await request(app).post(`/api/companies/${company.id}/${route}`).send({
-        name: HIRED, role: "engineer", reportsTo: hiringAgent.id, adapterType: "process",
-        runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
-      });
-      expect(state.faults, "the grant step keeps #20805's withTransactionRetry: five attempts").toBe(5);
-      expect(response.status, JSON.stringify(response.body)).not.toBe(500);
-      expect(response.body.error).not.toBe("Internal server error");
-      expect(response.status, JSON.stringify(response.body)).toBe(503);
-      expect(response.body).toMatchObject({ error: ACCOUNTING_WRITE_CONTENTION_MESSAGE });
-      expect(thrown[0]).toBeInstanceOf(AccountingContentionError);
-      expect(thrown[0]).toMatchObject({ code: "40P01", attempts: 5 });
+      const app = createApp(db, agentActor(company.id, hiringAgent.id, runs[0]!.id), thrown);
+      const events: unknown[] = [];
+      const unsubscribe = subscribeCompanyLiveEvents(company.id, event => { events.push(event); });
+      try {
+        const response = await request(app).post(`/api/companies/${company.id}/${route}`).send({
+          name: HIRED, role: "engineer", reportsTo: hiringAgent.id, adapterType: "process",
+          runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+        });
+        expect(await fault.faults(), "the hire's one retry wrapper: five attempts").toBe(AGENT_HIRE_ATTEMPTS);
+        expect(response.status, JSON.stringify(response.body)).not.toBe(500);
+        expect(response.body.error).not.toBe("Internal server error");
+        expect(response.status, JSON.stringify(response.body)).toBe(503);
+        // SUPERSEDED (RFL, #20805 x #20389): the grant step's own named code, distinct from the create step's.
+        expect(response.body).toMatchObject({ code: "agent_hire_grant_contention", details: { retryable: true } });
+        expect(response.body.code).not.toBe("agent_hire_create_contention");
+        expect(thrown).toHaveLength(1);
+        expect(thrown[0]).toBeInstanceOf(AgentHireContentionError);
+        expect(thrown[0]).toMatchObject({ status: 503, code: "40P01", attempts: AGENT_HIRE_ATTEMPTS });
+        expect(sqlStates(thrown[0])).toContain("40P01");
+      } finally { unsubscribe(); }
+      // The grant runs inside the hire transaction: the whole hire rolled back (review-fleet-2 07:43Z).
+      expect(await db.select().from(agents).where(and(eq(agents.companyId, company.id), eq(agents.name, HIRED)))).toHaveLength(0);
+      expect(await db.select().from(agents).where(eq(agents.companyId, company.id))).toHaveLength(1);
+      expect(await db.select().from(companyMemberships).where(and(eq(companyMemberships.companyId, company.id),
+        ne(companyMemberships.principalId, hiringAgent.id)))).toHaveLength(0);
+      expect(await db.select().from(principalPermissionGrants).where(and(eq(principalPermissionGrants.companyId, company.id),
+        ne(principalPermissionGrants.principalId, hiringAgent.id)))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, company.id))).toHaveLength(0);
+      expect(await resourceEvents(), "no resource lifecycle event for the hire").toEqual(resourceEventsBefore);
+      expect(events).toEqual([]);
     }, 60_000);
 
     it(`R2 ${route}: a transient 40P01 in the grant step is retried; each activity is published once, after commit`, async () => {
       const { company, hiringAgent, runs } = await seedHiringFixture(db);
-      let failures = 2;
-      const grants = grantsHiredAgent(company.id);
-      const { wrapped, state } = faultingDb(db, async tx => failures > 0 && await grants(tx) && failures-- > 0);
-      const app = createApp(wrapped, agentActor(company.id, hiringAgent.id, runs[0]!.id));
+      // SUPERSEDED (RFL, #20805 x #20389): the grant fault is raised by the grant write inside the hire transaction.
+      const fault = await forceHireGrantDeadlocks(db, company.id, hiringAgent.id, 2);
+      const app = createApp(db, agentActor(company.id, hiringAgent.id, runs[0]!.id));
       const events: { action: unknown; entityId: unknown }[] = [];
       const unsubscribe = subscribeCompanyLiveEvents(company.id, event => {
         if (event.type === "activity.logged") events.push({ action: event.payload.action, entityId: event.payload.entityId });
@@ -279,7 +326,7 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
         });
       } finally { unsubscribe(); }
       expect(response.status, JSON.stringify(response.body)).toBe(201);
-      expect(state.faults).toBe(2);
+      expect(await fault.faults()).toBe(2);
       const hired = await db.select().from(agents).where(and(eq(agents.companyId, company.id), eq(agents.name, HIRED)));
       expect(hired).toHaveLength(1);
       expect(await db.select().from(companyMemberships).where(and(eq(companyMemberships.companyId, company.id),
