@@ -1718,6 +1718,86 @@ mod tests {
     }
 
     #[test]
+    fn supervised_children_receive_the_active_github_access_environment() {
+        const GUARD: &str = "PAPERCLIP_TEST_GITHUB_ENV_CHILD";
+        const CASE: &str = "PAPERCLIP_TEST_GITHUB_ENV_CASE";
+        const GITHUB_ENVIRONMENT_KEYS: &[&str] = &[
+            "PAPERCLIP_GITHUB_BROKER_URL",
+            "PAPERCLIP_GITHUB_BROKER_TOKEN",
+            "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
+        ];
+
+        if std::env::var_os(GUARD).is_none() {
+            for case in ["runner_ingress", "bridge"] {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "process_supervisor::tests::supervised_children_receive_the_active_github_access_environment",
+                    ])
+                    .env(GUARD, "1")
+                    .env(CASE, case)
+                    .env("PAPERCLIP_GITHUB_BROKER_URL", "https://bridge.invalid")
+                    .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "fixture-session-capability")
+                    .env("PAPERCLIP_GITHUB_BRIDGE_TOKEN", "fixture-bridge-token")
+                    .env_remove("PAPERCLIP_GITHUB_RUNNER_SOCKET")
+                    .env_remove("PAPERCLIP_GITHUB_ACCESS_TRANSPORT");
+                if case == "runner_ingress" {
+                    command.env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "runner_ingress");
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "isolated GitHub environment test failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+
+        let case = std::env::var(CASE).unwrap();
+        let script = if case == "runner_ingress" {
+            crate::durable::github_access::install_provider_environment(Path::new(
+                "/tmp/paperclip-test-runner-ingress.sock",
+            ))
+            .unwrap();
+            "test \"$PAPERCLIP_GITHUB_RUNNER_SOCKET\" = /tmp/paperclip-test-runner-ingress.sock \\
+                && test \"$PAPERCLIP_GITHUB_ACCESS_TRANSPORT\" = runner_ingress \\
+                && test \"$PAPERCLIP_GITHUB_BROKER_TOKEN\" = fixture-session-capability \\
+                && test -z \"$PAPERCLIP_GITHUB_BROKER_URL\" \\
+                && test -z \"$PAPERCLIP_GITHUB_BRIDGE_TOKEN\" \\
+                && printf 'runner ingress environment ok\\n'"
+        } else {
+            "test \"$PAPERCLIP_GITHUB_BROKER_URL\" = https://bridge.invalid \\
+                && test \"$PAPERCLIP_GITHUB_BROKER_TOKEN\" = fixture-session-capability \\
+                && test \"$PAPERCLIP_GITHUB_BRIDGE_TOKEN\" = fixture-bridge-token \\
+                && test -z \"${PAPERCLIP_GITHUB_RUNNER_SOCKET:-}\" \\
+                && test -z \"${PAPERCLIP_GITHUB_ACCESS_TRANSPORT:-}\" \\
+                && printf 'bridge environment ok\\n'"
+        };
+        let mut process = SupervisedProcess::spawn_with_environment_keys(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script.to_owned()],
+            Duration::from_millis(500),
+            1024,
+            GITHUB_ENVIRONMENT_KEYS,
+        )
+        .unwrap();
+        let observed = process.receive_stdout_line(Duration::from_secs(5)).unwrap();
+        process.terminate_group().unwrap();
+        assert_eq!(
+            observed,
+            Some(if case == "runner_ingress" {
+                "runner ingress environment ok".to_owned()
+            } else {
+                "bridge environment ok".to_owned()
+            })
+        );
+    }
+
+    #[test]
     fn terminating_the_group_stops_a_tool_job_that_left_its_session() {
         let (mut process, directory, job, orphans) =
             spawn_provider_with_escaped_tool_job("terminate");
