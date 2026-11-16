@@ -239,6 +239,7 @@ export async function assertKnownProjectConnectionCreateAliases(
 export async function lockProjectConnectionRows(
   tx: Db | DbTransaction,
   candidates: readonly Connection[],
+  options: Readonly<{ lockSavedRows?: boolean }> = {},
 ): Promise<Connection[]> {
   const owned = candidates.filter(connection => connection.projectId !== null);
   if (owned.length === 0) return [...candidates];
@@ -252,16 +253,20 @@ export async function lockProjectConnectionRows(
   // Sort by company + UUID before subordinate saved-row locks. Avoid depending
   // on insertion/catalog order when a profile covers several project scopes.
   for (const companyId of [...new Set(owned.map(connection => connection.companyId))].sort()) {
-    // Existing install/finish order is application -> connection -> profile.
-    await tx.select({ id: toolApplications.id }).from(toolApplications).where(and(
+    // Install/finish uses application -> connection -> profile. Profile writers
+    // instead keep their existing full-reference key-share -> profile order;
+    // taking one owned application's UPDATE lock here before another profile
+    // reference would invert that order. Lifecycle/identity locks still protect
+    // the owned mutations, and that caller re-reads after its subordinate waits.
+    if (options.lockSavedRows !== false) await tx.select({ id: toolApplications.id }).from(toolApplications).where(and(
       eq(toolApplications.companyId, companyId),
       inArray(toolApplications.id, owned.filter(connection => connection.companyId === companyId).map(connection => connection.applicationId)),
     )).orderBy(toolApplications.id).for("update");
-    const rows = await tx.select().from(toolConnections).where(and(
+    const query = tx.select().from(toolConnections).where(and(
       eq(toolConnections.companyId, companyId),
       inArray(toolConnections.id, owned.filter(connection => connection.companyId === companyId).map(connection => connection.id)),
-    )).orderBy(toolConnections.id).for("no key update");
-    locked.push(...rows);
+    )).orderBy(toolConnections.id);
+    locked.push(...await (options.lockSavedRows === false ? query : query.for("no key update")));
   }
   const byId = new Map(locked.map(connection => [connection.id, connection]));
   for (const previous of owned) {
