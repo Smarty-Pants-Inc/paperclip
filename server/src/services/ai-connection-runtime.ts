@@ -29,7 +29,21 @@ import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigrav
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
 import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup, retainedAiAccountKeyHash } from "./retained-ai-credential-cleanup.js";
 import { logger } from "../middleware/logger.js";
-import { summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
+import { boundDiagnosticFields, summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
+
+/** DIAGNOSTIC (log only): the cleanup-pending warning names each teardown error
+ * by its sanitized summary (name and code through an allow pattern, a message
+ * only when it is an identifier-shaped code), never raw text; the line is
+ * bounded to DIAGNOSTIC_LINE_MAX_BYTES. Never throws. */
+export function warnNativeProbeCleanupPending(input: { accountKeyHash: string; agentId: string; cleanupErrors: readonly unknown[]; operationError?: unknown }): void {
+  try {
+    const message = "Native AI probe cleanup remains pending";
+    logger.warn(boundDiagnosticFields({ code: "native_probe_cleanup_pending", accountKeyHash: input.accountKeyHash, agentId: input.agentId,
+      cleanupErrors: input.cleanupErrors.slice(0, 8).map(failure => summarizeDiagnosticError(failure)),
+      ...(input.cleanupErrors.length > 8 ? { cleanupErrorsOmitted: input.cleanupErrors.length - 8 } : {}),
+      operationError: input.operationError === undefined ? null : summarizeDiagnosticError(input.operationError) }, message), message);
+  } catch { /* log only */ }
+}
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -655,11 +669,8 @@ export async function withManagedAiProbe<T>(
         agentId: input.agentId,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
       try {
-        // DIAGNOSTIC (log only): name each teardown error (sanitized summary).
-        logger.warn({ code: "native_probe_cleanup_pending", accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
-          agentId: input.agentId, cleanupErrors: error.cleanupErrors.slice(0, 8).map(failure => summarizeDiagnosticError(failure)),
-          operationError: error.operationError === undefined ? null : summarizeDiagnosticError(error.operationError) },
-          "Native AI probe cleanup remains pending");
+        warnNativeProbeCleanupPending({ accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
+          agentId: input.agentId, cleanupErrors: error.cleanupErrors, operationError: error.operationError });
       } catch { /* Diagnostics must not change the HTTP response. */ }
       throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
     }
