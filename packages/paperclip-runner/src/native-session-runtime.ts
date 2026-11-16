@@ -2642,9 +2642,6 @@ export async function executeNativeSession(
       if (recovery.failureClass === PROVIDER_REFRESH_REQUIRED) {
         throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
       }
-      if (recovery.failureClass === PROVIDER_LAUNCH_PROFILE_MISMATCH) {
-        throw new NativeRunnerLaunchProfileMismatchError(recovery.reason ?? "unknown");
-      }
       const governedWaitFollowUpLostState = !replacementAllowed && await governedWaitFollowUpMayStartFresh({
         input,
         checkpoint: providerRecoveryCheckpoint,
@@ -2656,6 +2653,13 @@ export async function executeNativeSession(
       if (!replacementAllowed && !governedWaitFollowUpLostState) {
         if (recovery.failureClass === PROVIDER_STATE_INCOMPATIBLE) {
           throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
+        }
+        // A Runner that refuses saved state under a changed launch profile is
+        // an incompatible-state refusal: as upstream, it is terminal only when
+        // the checkpoint does not allow replacement. Otherwise the same run
+        // continues below on a replacement session (#20736, #20787).
+        if (recovery.failureClass === PROVIDER_LAUNCH_PROFILE_MISMATCH) {
+          throw new NativeRunnerLaunchProfileMismatchError(recovery.reason ?? "unknown");
         }
         const failure = new Error(
           `native_session_recovery_failed: ${recovery.reason ?? "unknown"}`,
