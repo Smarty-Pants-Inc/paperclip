@@ -478,6 +478,37 @@ export async function ensureFreshContinuation(db: Db, input: Input): Promise<Fre
   return db.transaction(tx => continueFreshInTransaction(tx as unknown as Db, input));
 }
 
+/**
+ * Whether the run exact recovery would restore died before the controller:
+ * no finalization owner row and no controller recovery metadata (#20925). For
+ * a fresh-thread refusal that is the run it tried to recover (its retry
+ * source, else the previous run of the same conversation); otherwise the run
+ * itself. Such a run left no provider thread or controller state to restore.
+ */
+async function exactRecoverySourceDiedBeforeController(tx: Db, run: typeof heartbeatRuns.$inferSelect,
+  coordinator: typeof nativeRunFinalizations.$inferSelect | null): Promise<boolean> {
+  if (run.runtimeMode !== "native") return false;
+  let target = run;
+  if (isFreshThreadRefusal(run)) {
+    const [source] = run.retryOfRunId
+      ? await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.id, run.retryOfRunId)))
+      : run.nativeSessionId && run.nativeIssueId ? await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+        eq(heartbeatRuns.nativeIssueId, run.nativeIssueId), eq(heartbeatRuns.nativeSessionId, run.nativeSessionId),
+        sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (${run.createdAt.toISOString()}::timestamptz, ${run.id}::uuid)`))
+        .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
+    if (!source || source.agentId !== run.agentId || source.runtimeMode !== "native") return false;
+    target = source;
+  } else if (coordinator) return false;
+  if (!UNFINISHED_STATUSES.includes(target.status) || !target.finishedAt
+    || target.runnerProfileJson?.nativeControllerRecovery != null) return false;
+  if (target.id === run.id) return true;
+  const [owner] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations)
+    .where(and(eq(nativeRunFinalizations.companyId, run.companyId), eq(nativeRunFinalizations.runId, target.id))).limit(1);
+  return !owner;
+}
+
 /** Durable physical settlement, not expiry or a failed status, identifies an
  * older owner whose system hold may belong to a later refused follow-up. */
 function stoppedRemoteOwnerCondition() {
@@ -661,6 +692,9 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   // Exact recovery that is still under way keeps its chance, for a bounded
   // number of checks; each owner below also bounds itself.
   const recheck = new Date(now.getTime() + EXACT_RECOVERY_RECHECK_MS);
+  // A run that died before the controller (for example in workspace
+  // preparation) left nothing for exact recovery to restore (#20925).
+  const nothingToRecover = await exactRecoverySourceDiedBeforeController(tx, run, coordinator ?? null);
   const waits: Array<FreshContinuationResult | null> = [];
   if (adapterExecutionControls.has(run.id)) waits.push(pending("execution_settling", recheck));
   if (coordinator?.leaseOwner || (coordinator?.resultId && coordinator.phase !== "committed")
@@ -678,8 +712,12 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     if (recovery && EXACT_RECOVERY_STATES.includes(recovery.state))
       waits.push(pending("saved_work_recovery_running",
         new Date(Math.max(recheck.getTime(), recovery.nextAttemptAt ?? 0))));
-    if (!isOwnedReconciliationHold(hold) && isRestoreHold(hold) && blocksExecution(hold) && recovery?.state !== "complete")
-      waits.push(pending("workspace_recovery_owns_restore", recheck));
+    if (!isOwnedReconciliationHold(hold) && isRestoreHold(hold) && blocksExecution(hold) && recovery?.state !== "complete") {
+      // Nothing exact to restore and no saved-work recovery under way: skip
+      // straight to the isolated fresh continuation (as past the bound).
+      if (nothingToRecover && !(recovery && EXACT_RECOVERY_STATES.includes(recovery.state))) waitSkipped = true;
+      else waits.push(pending("workspace_recovery_owns_restore", recheck));
+    }
     const retainedCheck = object(hold.evidence.retainedSourceFallbackCheck);
     if (recovery?.state === "exhausted" && typeof retainedCheck.nextCheckAt === "number" && retainedCheck.nextCheckAt > now.getTime())
       waits.push(pending("retained_source_fallback_pending", new Date(retainedCheck.nextCheckAt)));
