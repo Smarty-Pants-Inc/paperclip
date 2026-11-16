@@ -4,7 +4,9 @@ import { and, eq, sql } from "drizzle-orm";
 import { activityLog, agents, companySecrets, companySecretVersions, connectionGrants, createDb, heartbeatRuns, issues, projects, toolApplications, toolConnectionInstalls, toolConnections, userCompanyPreferences } from "@paperclipai/db";
 import * as admission from "../services/project-connection-admission.js";
 import * as arbitration from "../services/project-connection-arbitration.js";
+import * as activityService from "../services/activity-log.js";
 import { activateProjectConnectionMigration, assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../services/project-connection-retirement.js";
+import { toolAccessService } from "../services/tool-access.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
 
@@ -18,7 +20,7 @@ vi.mock("../services/github-app-credentials.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/github-app-credentials.js")>(),
   refreshGitHubAppAccess: provider.verify, resolveGitHubAppCredential: provider.acquire,
 }));
-import { resolveManagedGitHubCredential, resolveManagedGitHubIdentitySelection } from "../services/git-credentials.js";
+import { createGitRemoteAuthProvider, resolveManagedGitHubCredential, resolveManagedGitHubIdentitySelection } from "../services/git-credentials.js";
 
 // Receipt failure is injected at the actual PostgreSQL insert boundary, not in
 // a fake service. This trigger exists only in this disposable test database.
@@ -46,6 +48,183 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     const finish = () => f.service.finishGalleryAppConnection(f.companyId, candidate.connection.id, { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [f.leadA.id] } }, f.actor());
     return { f, legacy, candidate, bound, context, finish };
   }
+
+  // RFL F2/F3: these tests intentionally use the REAL create/finish/install-set
+  // writers and Git auth factory. Candidate rows are NEVER seeded here. The
+  // only simulated dependency is the external provider; all writes/faults are PG.
+  // Keep reason: migration data safety and credential trust boundary.
+  describe("RFL make-before-break real writer sequence", () => {
+    async function migration() {
+      const f = await projectConnectionFixture(db, true);
+      await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
+        material: { synthetic: true }, valueSha256: "synthetic-migration-version", fingerprintSha256: "synthetic-migration-version" });
+      const legacy = await f.seedConnection(null);
+      // L still serves B; only the fully transferred A worker may be removed.
+      await f.service.putConnectionInstalls(legacy.connection.id, { installs: [f.leadA, f.worker, f.outsider]
+        .map(agent => ({ targetType: "agent" as const, targetId: agent.id })) }, f.actor());
+      const a = await f.run(f.a, f.worker.id);
+      const b = await f.run(f.b);
+      const context = { agentId: f.worker.id, responsibleUserId: f.human, heartbeatRunId: a.run.id, issueId: a.issue.id };
+      const bContext = { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: b.run.id, issueId: b.issue.id };
+      const create = () => f.service.createConnection(f.companyId, f.input(), f.actor());
+      const finish = (id: string, service = f.service) => service.finishGalleryAppConnection(f.companyId, id,
+        { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [f.leadA.id, f.worker.id] } }, f.actor());
+      const cleanup = () => f.service.putConnectionInstalls(legacy.connection.id, { installs: [f.leadA, f.outsider]
+        .map(agent => ({ targetType: "agent" as const, targetId: agent.id })) }, f.actor());
+      return { f, legacy, a, b, context, bContext, create, finish, cleanup };
+    }
+
+    // A restart means a NEW database client and NEW stateful service/factory,
+    // not two calls to the same resolver. Nothing in the old factory is reused.
+    async function restartedPush(p: Awaited<ReturnType<typeof migration>>, connectionId: string | null, context = p.context) {
+      const restartedDb = createDb(database.connectionString);
+      const secrets = { getByName: vi.fn(async () => null), resolveSecretValue: vi.fn(async () => "synthetic-ambient-must-not-be-read") };
+      const nextService = toolAccessService(restartedDb);
+      expect(nextService).not.toBe(p.f.service);
+      const nextGit = createGitRemoteAuthProvider(restartedDb, p.f.companyId, context,
+        { secrets, env: { GH_TOKEN: "synthetic-ambient-must-not-be-used" } });
+      const acquiredBefore = provider.acquire.mock.calls.length;
+      try {
+        if (connectionId) {
+          const invocation = await nextGit("https://github.com/owner/A.git");
+          expect(invocation?.env.GH_TOKEN).toBe(`synthetic-project-token-${connectionId}`);
+          expect(provider.acquire.mock.calls.slice(acquiredBefore).some(([, connection]) => connection.id === connectionId)).toBe(true);
+        } else {
+          await expect(nextGit("https://github.com/owner/A.git")).rejects.toThrow();
+          expect(provider.acquire.mock.calls.slice(acquiredBefore)).toHaveLength(0);
+        }
+        expect(secrets.getByName).not.toHaveBeenCalled();
+        expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
+      } finally { await restartedDb.$client.end({ timeout: 1 }); }
+    }
+
+    async function created(p: Awaited<ReturnType<typeof migration>>) {
+      await restartedPush(p, p.legacy.connection.id);
+      const candidate = await p.create();
+      const row = await storedConnection(db, candidate.id);
+      expect(row).toMatchObject({ projectId: p.f.a.id, status: "draft", enabled: false,
+        config: { projectScope: { migrationPending: true, legacyConnectionId: p.legacy.connection.id } } });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, candidate.id))).toHaveLength(0);
+      const receipts = await db.select().from(activityLog).where(and(eq(activityLog.entityId, candidate.id), eq(activityLog.action, "tool_connection.project_taken")));
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]!.details).toMatchObject({ migrationPending: true });
+      await restartedPush(p, p.legacy.connection.id);
+      return row;
+    }
+
+    it("RFL/M01: actual create -> token verification -> atomic install -> recipient-local legacy removal, with shared L still serving B", async () => {
+      const p = await migration(); const candidate = await created(p);
+      const legacyBefore = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await p.finish(candidate.id);
+      expect(provider.verify).toHaveBeenCalled();
+      expect(await storedConnection(db, candidate.id)).toMatchObject({ status: "active", enabled: true, config: { projectScope: { migrationPending: false } } });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, candidate.id))).toHaveLength(2);
+      const [receipt] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, candidate.id), eq(activityLog.action, "tool_connection.updated")));
+      expect(receipt?.details).toMatchObject({ migrationPending: false, verifiedRepositoryIds: [101] });
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacyBefore);
+      await restartedPush(p, candidate.id);
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+      await p.cleanup();
+      const remaining = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      expect(remaining.map(row => row.targetId).sort()).toEqual([p.f.leadA.id, p.f.outsider.id].sort());
+      await restartedPush(p, candidate.id);
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+    });
+
+    it("RFL/M02 create: failing the first operation leaves no candidate/application/grant residue, and legacy pushes survive a new service", async () => {
+      const p = await migration();
+      const applications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId));
+      const legacyInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${p.f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'synthetic create receipt failure'; END IF; RETURN NEW; END $$`));
+      await db.execute(sql.raw("CREATE TRIGGER project_red_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_red_receipt_failure()"));
+      try { await expect(p.create()).rejects.toThrow(); }
+      finally { await restoreReceipt(db); }
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, p.f.companyId))).toEqual([p.legacy.connection]);
+      expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId))).toEqual(applications);
+      expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, p.f.companyId))).toEqual([p.legacy.grant]);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacyInstalls);
+      await restartedPush(p, p.legacy.connection.id);
+    });
+
+    it.each(["mint", "wrong-repository-id", "stale-approval", "stale-key", "stale-recipient", "finish-install", "receipt"] as const)(
+      "RFL/M02 second operation: %s failure preserves pending/non-serving candidate and usable legacy across a new service", async boundary => {
+        const p = await migration(); const candidate = await created(p);
+        const legacyInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+        if (boundary === "mint") provider.verify.mockRejectedValueOnce(new Error("synthetic mint failure"));
+        if (["wrong-repository-id", "stale-approval", "stale-key", "stale-recipient"].includes(boundary)) {
+          provider.verify.mockImplementationOnce(async () => {
+            if (boundary === "stale-approval") await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, p.f.primary.id));
+            if (boundary === "stale-key") await db.update(companySecrets).set({ latestVersion: 2 }).where(eq(companySecrets.id, p.f.secret.id));
+            if (boundary === "stale-recipient") await db.update(agents).set({ reportsTo: p.f.primary.id }).where(eq(agents.id, p.f.worker.id));
+            return { token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
+              github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"],
+                repositories: [{ id: boundary === "wrong-repository-id" ? "999" : "101", fullName: "owner/A", installationId: "456", private: true }] } };
+          });
+        }
+        if (boundary === "receipt") await failReceipt(db, candidate.id);
+        if (boundary === "finish-install") {
+          await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_install_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.connection_id = '${candidate.id}' THEN RAISE EXCEPTION 'synthetic finish install failure'; END IF; RETURN NEW; END $$`));
+          await db.execute(sql.raw("CREATE TRIGGER project_red_install_failure BEFORE INSERT ON tool_connection_installs FOR EACH ROW EXECUTE FUNCTION project_red_install_failure()"));
+        }
+        try { await expect(p.finish(candidate.id)).rejects.toThrow(); }
+        finally {
+          if (boundary === "receipt") await restoreReceipt(db);
+          if (boundary === "finish-install") await db.execute(sql.raw("DROP TRIGGER IF EXISTS project_red_install_failure ON tool_connection_installs"));
+        }
+        expect(await storedConnection(db, candidate.id)).toMatchObject({ status: "draft", enabled: false, config: { projectScope: { migrationPending: true } } });
+        expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, candidate.id))).toHaveLength(0);
+        expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacyInstalls);
+        expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, candidate.id), eq(activityLog.action, "tool_connection.updated")))).toHaveLength(0);
+        await restartedPush(p, p.legacy.connection.id);
+      });
+
+    it("RFL/M03 third operation: actual legacy cleanup fault cannot undo activation; new service still uses candidate, then retire blocks every fallback", async () => {
+      const p = await migration(); const candidate = await created(p); await p.finish(candidate.id);
+      const activated = await storedConnection(db, candidate.id);
+      const receipts = await db.select().from(activityLog).where(eq(activityLog.entityId, candidate.id));
+      const legacyInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await restartedPush(p, candidate.id);
+      await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_cleanup_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.connection_id = '${p.legacy.connection.id}' THEN RAISE EXCEPTION 'synthetic legacy cleanup failure'; END IF; RETURN OLD; END $$`));
+      await db.execute(sql.raw("CREATE TRIGGER project_red_cleanup_failure BEFORE DELETE ON tool_connection_installs FOR EACH ROW EXECUTE FUNCTION project_red_cleanup_failure()"));
+      try { await expect(p.cleanup()).rejects.toThrow(); }
+      finally { await db.execute(sql.raw("DROP TRIGGER IF EXISTS project_red_cleanup_failure ON tool_connection_installs")); }
+      expect(await storedConnection(db, candidate.id)).toEqual(activated);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, candidate.id))).toEqual(receipts);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(legacyInstalls);
+      await restartedPush(p, candidate.id);
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+      const restartedDb = createDb(database.connectionString);
+      try {
+        const restartedService = toolAccessService(restartedDb);
+        await restartedService.archiveConnection(candidate.id, p.f.companyId, { ...p.f.actor(),
+          projectDoneConfirmation: { projectId: p.f.a.id, connectionId: candidate.id } } as ReturnType<typeof p.f.actor>);
+      } finally { await restartedDb.$client.end({ timeout: 1 }); }
+      expect(await storedConnection(db, candidate.id)).toMatchObject({ status: "archived", config: { projectScope: { migrationPending: false } } });
+      await restartedPush(p, null);
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+    });
+  });
+
+  it("RFL/A06a PATCH: dead lead/no primary board human disables through existing narrow PATCH, with one human receipt and no table repair", async () => {
+    const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection();
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.leadA.id));
+    await db.update(userCompanyPreferences).set({ primaryAgentId: null }).where(eq(userCompanyPreferences.companyId, f.companyId));
+    // Seed the fault before the HTTP request: a post-return route receipt is
+    // not atomic and must NOT leave this row disabled when the receipt fails.
+    await failReceipt(db, connection.id);
+    try {
+      const failed = await request(f.route()).patch(`/api/tool-connections/${connection.id}`).send({ enabled: false });
+      expect(failed.status).toBe(500);
+      expect(await storedConnection(db, connection.id)).toEqual(connection);
+    } finally { await restoreReceipt(db); }
+    const result = await request(f.route()).patch(`/api/tool-connections/${connection.id}`).send({ enabled: false });
+    expect(result.status).toBe(200);
+    expect(await storedConnection(db, connection.id)).toMatchObject({ projectId: f.a.id, status: "active", enabled: false, config: connection.config });
+    const receipts = await db.select().from(activityLog).where(and(eq(activityLog.entityId, connection.id), eq(activityLog.action, "tool_connection.updated")));
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]).toMatchObject({ actorType: "user", actorId: f.human, details: { projectId: f.a.id, connectionId: connection.id, reason: "connection_disabled" } });
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(1);
+  });
 
   it("M01: verified finish clears pending atomically, selects A during legacy overlap and preserves unconverted B", async () => {
     const { f, legacy, candidate, context, finish } = await pending();
@@ -282,5 +461,136 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       expect(await storedConnection(db, active.id)).toMatchObject({ status: "archived", config: { projectScope: { migrationPending: false } } });
     });
 
+    it("D/A06a/A10: actual board DELETE with dead lead/no primary has one atomic human receipt; failure rolls all local effects back", async () => {
+      const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.leadA.id));
+      await db.update(userCompanyPreferences).set({ primaryAgentId: null }).where(eq(userCompanyPreferences.companyId, f.companyId));
+      await failReceipt(db, connection.id);
+      try {
+        expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`)).status).toBe(500);
+        expect(await storedConnection(db, connection.id)).toEqual(connection);
+        expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))[0]).toEqual(grant);
+        expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(1);
+        expect((await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId)))[0]!.status).toBe("active");
+      } finally { await restoreReceipt(db); }
+      const result = await request(f.route()).delete(`/api/tool-connections/${connection.id}`);
+      expect(result.status).toBe(200);
+      expect(result.body).toMatchObject({ status: "archived", enabled: false, removal: { grantsRevoked: 1, installsRemoved: 1, secretsRevoked: 0 } });
+      const receipts = await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id));
+      expect(receipts).toHaveLength(1);
+      expect(receipts[0]).toMatchObject({ action: "tool_connection.archived", actorType: "user", actorId: f.human,
+        responsibleUserId: f.human, details: { removal: { grantsRevoked: 1, installsRemoved: 1 }, projectId: f.a.id } });
+      expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`)).status).toBe(200);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toEqual(receipts);
+    });
+
+    it.each(["queued", "starting", "running"])("D/J11: %s project work refuses before grant/install/archive changes", async status => {
+      const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+      const work = await f.run(); await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, work.run.id));
+      await expect(f.service.archiveConnection(connection.id, f.companyId, f.actor())).rejects.toMatchObject({ status: 409, details: {
+        code: "project_connection_in_use", runs: [{ id: work.run.id, href: `/runs/${work.run.id}` }],
+      } });
+      expect(await storedConnection(db, connection.id)).toEqual(connection);
+      expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))[0]).toEqual(grant);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+    });
+
+    it("D/J11: same shared agent's B work is not A's work; null-task work is conservatively protected", async () => {
+      const f = await projectConnectionFixture(db, true); const { connection } = await f.seedConnection();
+      await f.run(f.b);
+      await expect(db.transaction(tx => assertProjectConnectionNotInUse(tx, { companyId: f.companyId, projectId: f.a.id, connectionId: connection.id }))).resolves.toBeUndefined();
+      const taskless = await f.run(null);
+      await expect(db.transaction(tx => assertProjectConnectionNotInUse(tx, { companyId: f.companyId, projectId: f.a.id, connectionId: connection.id }))).rejects.toMatchObject({ status: 409 });
+      await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, taskless.run.id));
+      const removed = await f.service.archiveConnection(connection.id, f.companyId, f.actor());
+      expect(removed.connection.status).toBe("archived");
+    });
+
+    it("D/J11: generic force/project-done status is not confirmation; exact caller-scoped confirmation is explicit", async () => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection(); await f.run();
+      await db.update(projects).set({ status: "completed" }).where(eq(projects.id, f.a.id));
+      await expect(f.service.archiveConnection(connection.id, f.companyId, { ...f.actor(), force: true } as ReturnType<typeof f.actor>)).rejects.toMatchObject({ status: 409 });
+      const wrong = { actorType: "user" as const, actorId: f.human, projectDoneConfirmation: { projectId: f.b.id, connectionId: connection.id } };
+      expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: wrong.projectDoneConfirmation })).status).toBe(409);
+      const confirmation = { projectId: f.a.id, connectionId: connection.id };
+      expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: confirmation })).status).toBe(200);
+      // A conflicting retry cannot turn the state-bound receipt into a replay API.
+      expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: wrong.projectDoneConfirmation })).status).toBe(409);
+    });
+
+    it("D/J11 race: lifecycle row serializes same-project admission/retire, not unrelated projects", async () => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection();
+      let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+      let entered!: () => void; const ready = new Promise<void>(resolve => { entered = resolve; });
+      const admissionTx = db.transaction(async tx => { await lockProjectConnectionLifecycle(tx, { companyId: f.companyId, projectId: f.a.id });
+        await tx.update(issues).set({ title: "admitted under project lock" }).where(eq(issues.companyId, f.companyId)); entered(); await held; });
+      await ready;
+      try {
+        await expect(db.transaction(async tx => { await tx.execute(sql`set local lock_timeout = '100ms'`);
+          await lockProjectConnectionLifecycle(tx, { companyId: f.companyId, projectId: f.a.id }); })).rejects.toThrow();
+        await expect(db.transaction(tx => lockProjectConnectionLifecycle(tx, { companyId: f.companyId, projectId: f.b.id }))).resolves.toBeUndefined();
+      } finally { release(); await admissionTx; }
+      await expect(db.transaction(tx => lockProjectConnectionLifecycle(tx, { companyId: f.b.id, projectId: f.a.id }))).rejects.toMatchObject({ status: 404 });
+      await expect(db.transaction(tx => assertProjectConnectionNotInUse(tx, { companyId: f.companyId, projectId: f.b.id, connectionId: connection.id }))).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("D/J11 run-start race: a run committed under lifecycle lock is seen by the waiting actual retire writer", async () => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection();
+      const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Admitted work", projectId: f.a.id,
+        assigneeAgentId: f.leadA.id, responsibleUserId: f.human }).returning();
+      let release!: () => void; const held = new Promise<void>(resolve => { release = resolve; });
+      let entered!: () => void; const ready = new Promise<void>(resolve => { entered = resolve; });
+      const starting = db.transaction(async tx => {
+        await lockProjectConnectionLifecycle(tx, { companyId: f.companyId, projectId: f.a.id });
+        await tx.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, issueId: issue!.id, scopeKind: "issue", status: "queued" });
+        entered(); await held;
+      });
+      await Promise.race([ready, starting]);
+      const retirement = f.service.archiveConnection(connection.id, f.companyId, f.actor()).then(value => ({ value }), error => ({ error }));
+      try { release(); await starting; }
+      finally { release(); await starting; }
+      expect(await retirement).toMatchObject({ error: { status: 409, details: { code: "project_connection_in_use" } } });
+      expect(await storedConnection(db, connection.id)).toEqual(connection);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+    });
+
+    it("D/A10: no activity publication before commit; failed post-commit publication retains one durable receipt", async () => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection();
+      const publication = vi.spyOn(activityService, "publishActivity").mockImplementation(() => { throw new Error("synthetic realtime failure"); });
+      await failReceipt(db, connection.id);
+      try { await expect(f.service.archiveConnection(connection.id, f.companyId, f.actor())).rejects.toThrow(); }
+      finally { await restoreReceipt(db); }
+      expect(publication).not.toHaveBeenCalled();
+      await expect(f.service.archiveConnection(connection.id, f.companyId, f.actor())).resolves.toMatchObject({ connection: { status: "archived" } });
+      expect(publication).toHaveBeenCalledTimes(1);
+      const receipts = await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id));
+      expect(receipts).toHaveLength(1);
+      await f.service.archiveConnection(connection.id, f.companyId, f.actor());
+      expect(publication).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toEqual(receipts);
+    });
+
+    it("D/A10/A11: removal stays local; retained ownership/approval and B/shared key survive; new retake has distinct receipt", async () => {
+      const f = await projectConnectionFixture(db, true); const a = await f.seedConnection(); const b = await f.seedConnection(f.b);
+      const key = (await db.select().from(companySecrets).where(eq(companySecrets.id, f.secret.id)))[0];
+      const removed = await f.service.archiveConnection(a.connection.id, f.companyId, f.actor());
+      expect(removed.removal.secretsRevoked).toBe(0);
+      expect(await storedConnection(db, a.connection.id)).toMatchObject({ projectId: f.a.id, config: a.connection.config,
+        credentialRefs: [], credentialSecretRefs: [], status: "archived", enabled: false });
+      expect(await storedConnection(db, b.connection.id)).toEqual(b.connection);
+      expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, b.grant.id)))[0]).toEqual(b.grant);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, b.connection.id))).toHaveLength(1);
+      expect((await db.select().from(companySecrets).where(eq(companySecrets.id, f.secret.id)))[0]).toEqual(key);
+      expect(provider.verify).not.toHaveBeenCalled(); expect(provider.acquire).not.toHaveBeenCalled();
+      const next = await f.seedConnection();
+      await db.transaction(tx => writeProjectConnectionReceipt(tx, { connection: next.connection, actor: f.actor(), action: "tool_connection.project_taken",
+        reason: "synthetic-PEM-token-canary", targetAgentIds: [f.leadA.id], verifiedRepositoryIds: [101] }));
+      const receipts = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+      expect(receipts).toHaveLength(2);
+      expect(receipts[0]!.id).not.toBe(receipts[1]!.id);
+      expect(JSON.stringify(receipts)).not.toContain("synthetic-PEM-token-canary");
+      await expect(db.transaction(tx => writeProjectConnectionReceipt(tx, { connection: next.connection, actor: f.actor(), action: "tool_connection.project_taken" }))).rejects.toMatchObject({ status: 409 });
+    });
   });
 });
