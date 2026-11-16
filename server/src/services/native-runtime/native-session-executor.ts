@@ -9839,6 +9839,13 @@ const NATIVE_SESSION_OPEN_ONLY_EVENT_TYPES = new Set(["harness.ready", "session.
  * prompt, so without turn.started (or any later provider output, turn or
  * result state) Pi has no saved thread for this identity. A session carried
  * from a settled predecessor is that conversation, never this run's open.
+ *
+ * session.open itself already advances the checkpoint: the harness emits
+ * session.started, the goal capability and snapshot, then the root
+ * thread_lineage and model items, so the open checkpoint carries a cursor
+ * and exactly one root lineage entry (the opened thread, depth 0, no parent,
+ * threadId == providerSessionId). Neither implies a prompt; a child thread or
+ * another root does. semanticResult stays null until a turn proposes a result.
  */
 export async function piProviderSessionNeverPrompted(
   db: Pick<Db, "select">,
@@ -9846,18 +9853,22 @@ export async function piProviderSessionNeverPrompted(
   checkpoint: Record<string, unknown>,
 ): Promise<boolean> {
   const empty = (value: unknown) => value == null || (Array.isArray(value) && value.length === 0);
-  if (checkpoint.driverKind !== "pi_rpc" || typeof checkpoint.providerSessionId !== "string"
-    || !checkpoint.providerSessionId || checkpoint.activeTurnId != null || checkpoint.cursor != null
+  const providerSessionId = checkpoint.providerSessionId;
+  const onlyOpenedRoot = (lineage: unknown) => empty(lineage) || (Array.isArray(lineage) && lineage.length === 1
+    && record(lineage[0]).threadId === providerSessionId && record(lineage[0]).depth === 0
+    && record(lineage[0]).parentThreadId == null);
+  if (checkpoint.driverKind !== "pi_rpc" || typeof providerSessionId !== "string"
+    || !providerSessionId || checkpoint.activeTurnId != null
     || checkpoint.semanticResult != null || checkpoint.terminal != null || checkpoint.governedWait != null
     || checkpoint.goal != null || !empty(checkpoint.terminalTurns) || !empty(checkpoint.pendingRuntimeRequests)
-    || !empty(checkpoint.lineage)) return false;
+    || !onlyOpenedRoot(checkpoint.lineage)) return false;
   const promptEvidence = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.runId, run.id),
     inArray(heartbeatRunEvents.eventType, [...PROVIDER_DURABLE_EVENT_TYPES]
       .filter((type) => !NATIVE_SESSION_OPEN_ONLY_EVENT_TYPES.has(type))),
   )).limit(1);
   if (promptEvidence.length > 0) return false;
-  return !await carriesSettledPredecessorSession(db, run, checkpoint.providerSessionId);
+  return !await carriesSettledPredecessorSession(db, run, providerSessionId);
 }
 
 export async function nativeProviderRecoveryEvidence(input: {
