@@ -225,3 +225,39 @@ describe("Pi admission budget bounds host-local broker work (F6)", () => {
     await vi.waitFor(() => expect(knobs.closed - before.closed).toBe(knobs.created - before.created), { timeout: 3000 });
   });
 });
+
+// F7: the facade's turn/start attaches its run and starts the turn inside one
+// receive wait, so attach and turn admission share ONE budget before the prompt.
+type TurnAdmission = { beginTurnAdmission?(): void; endTurnAdmission?(): void };
+describe("one Pi admission budget per facade turn admission (F7)", () => {
+  it("a turn admission's attach and startTurn share one budget and never send the prompt past it", async () => {
+    const f = await fixture(); const session = await f.released();
+    // attach: 300 + 300 ms; turn: begin_turn 500 ms. Each fits 1000 ms alone.
+    Object.assign(f.exchangeDelays, { tool_inventory: 300, bind: 300, begin_turn: 500 });
+    const admission = session as unknown as TurnAdmission;
+    admission.beginTurnAdmission?.();
+    try {
+      await session.attachRun({ runId: "run-b" });
+      const { error } = await elapsed(session.startTurn({ message: { role: "user", text: "one" } }));
+      expect(error).toMatchObject({ code: "pi_admission_deadline_exceeded" });
+    } finally { admission.endTurnAdmission?.(); }
+    expect(f.transport.commands).not.toContain("prompt");
+  });
+
+  it("without a turn admission, a separate attach and a later turn keep their own budgets", async () => {
+    const f = await fixture(); const session = await f.released();
+    Object.assign(f.exchangeDelays, { tool_inventory: 300, bind: 300, begin_turn: 500 });
+    await session.attachRun({ runId: "run-b" });
+    await expect(session.startTurn({ message: { role: "user", text: "one" } })).resolves.toMatchObject({ turnId: expect.any(String) });
+    expect(f.transport.commands).toContain("prompt");
+  });
+
+  it("an ended turn admission never leaks its budget into a later turn", async () => {
+    const f = await fixture(); const session = await f.released();
+    const admission = session as unknown as TurnAdmission;
+    admission.beginTurnAdmission?.();
+    try { await session.attachRun({ runId: "run-b" }); } finally { admission.endTurnAdmission?.(); }
+    await delay(BUDGET_MS + 100);
+    await expect(session.startTurn({ message: { role: "user", text: "later" } })).resolves.toMatchObject({ turnId: expect.any(String) });
+  });
+});
