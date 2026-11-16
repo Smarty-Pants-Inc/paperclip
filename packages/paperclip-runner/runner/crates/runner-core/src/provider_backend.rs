@@ -1329,6 +1329,13 @@ struct CodexProviderState {
     pi_runtime_context: Value,
     #[serde(default)]
     pi_launch_profile_digest: Option<String>,
+    /// SHA-256 of the qualified Pi executable: the release that owns the
+    /// saved conversation. As for OpenCode below, the launch-profile digest
+    /// also covers controller bytes (Node command, proxy bundle) that a
+    /// rebuild or deploy replaces; this field lets a settled Pi session tell
+    /// those apart (#20736, #20787).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_release_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     opencode_launch_profile_digest: Option<String>,
     /// SHA-256 of the qualified OpenCode executable: the upstream release that
@@ -1472,6 +1479,7 @@ impl CodexProviderState {
             config,
             pi_runtime_context: Value::Null,
             pi_launch_profile_digest: None,
+            pi_release_digest: None,
             opencode_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
@@ -2459,6 +2467,31 @@ impl CodexCommandExecutor {
             && state.is_settled_for_run_rebinding()
     }
 
+    fn pi_release_digest(&self, config: &CodexProviderConfig) -> Option<String> {
+        if config.provider != "pi_rpc" {
+            return None;
+        }
+        self.pi_launch_profile
+            .as_ref()
+            .map(|profile| profile.executable.sha256.clone())
+    }
+
+    // The OpenCode rule above, for native Pi (#20736, #20787). A server restart
+    // or deploy that leaves a Pi chat unclosed hands its saved state to a
+    // runner whose Node command or proxy bundle changed. Pi keeps the
+    // conversation in its own session JSONL, keyed by the session id, not by
+    // the controller bytes. Re-bind only when the saved Pi release equals this
+    // startup's executable (legacy state without the field stays exact), and
+    // nothing is in flight: the settled rule plus no deferred Pi terminal and
+    // no live descendant. A changed Pi release or work in flight fails closed.
+    fn rebinds_settled_pi_session(&self, state: &CodexProviderState) -> bool {
+        state.pi_release_digest.is_some()
+            && state.pi_release_digest == self.pi_release_digest(&state.config)
+            && state.is_settled_for_run_rebinding()
+            && state.pi_deferred_terminal.is_none()
+            && state.descendant_thread_ids.is_empty()
+    }
+
     fn bind_cursor_cloud_launch_profile(
         &self,
         config: &CodexProviderConfig,
@@ -2929,6 +2962,11 @@ impl CodexCommandExecutor {
             None
         };
         let expected_pi_profile_digest = self.bind_pi_launch_profile(&state.config)?;
+        if state.pi_launch_profile_digest != expected_pi_profile_digest
+            && self.rebinds_settled_pi_session(&state)
+        {
+            state.pi_launch_profile_digest = expected_pi_profile_digest.clone();
+        }
         if state.pi_launch_profile_digest != expected_pi_profile_digest {
             return Err(DurableRunnerError::launch_profile_mismatch(
                 "Pi runner launch profile changed across durable recovery",
@@ -3808,6 +3846,7 @@ impl CodexCommandExecutor {
             state.run_identity = self.event_identity.clone();
             state.pi_runtime_context = pi_runtime_context.clone();
             state.pi_launch_profile_digest = pi_launch_profile_digest;
+            state.pi_release_digest = self.pi_release_digest(&state.config);
             state.opencode_launch_profile_digest = opencode_launch_profile_digest;
             state.opencode_release_digest = self.opencode_release_digest(&state.config);
             state.cursor_cloud_launch_profile_digest = cursor_cloud_launch_profile_digest;
@@ -11010,6 +11049,7 @@ done
             },
             pi_runtime_context: Value::Null,
             pi_launch_profile_digest: None,
+            pi_release_digest: None,
             opencode_launch_profile_digest: None,
             opencode_release_digest: None,
             cursor_cloud_launch_profile_digest: None,
