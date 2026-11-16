@@ -579,13 +579,17 @@ describe("managed AI connections", () => {
     const stopped = deferredSignal();
     const provider = vi.fn(async runtime => readFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), "utf8"));
     const merge = vi.spyOn(codexAdapter, "decideCodexAuthMerge").mockRejectedValue(new Error("fixture cleanup storage unavailable"));
+    const { logger } = await import("../middleware/logger.js");
+    const warning = vi.spyOn(logger, "warn").mockImplementation(() => {});
     let retained: Awaited<ReturnType<typeof prepareManagedAiRuntime>> | undefined;
     try {
       await expect(withManagedAiProbe(db, input, async runtime => {
         retained = runtime;
         await writeFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), auth(owner, "11"));
         throw new runnerProbe.NativeEnvironmentProbeCleanupError(stopped.promise, new Error("fixture probe interruption"), []);
-      })).rejects.toMatchObject({ details: { code: "native_probe_cleanup_pending" } });
+      })).rejects.toMatchObject({ status: 422, message: "The native account test is still cleaning up. Retry after runtime cleanup completes.", details: { code: "native_probe_cleanup_pending" } });
+      expect(warning.mock.calls.filter(([fields]) => (fields as Record<string, unknown>).code === "native_probe_cleanup_pending")).toHaveLength(1);
+      expect(warning.mock.calls.some(([fields]) => (fields as Record<string, unknown>).accountKeyHash === createHash("sha256").update(row.grant.id).digest("hex").slice(0, 12))).toBe(true);
       await expect(withManagedAiProbe(db, input, provider)).resolves.toBe(auth(owner, "10"));
       expect(provider).toHaveBeenCalledOnce(); expect(merge).not.toHaveBeenCalled();
       stopped.resolve();
@@ -599,7 +603,7 @@ describe("managed AI connections", () => {
       await expect(withManagedAiProbe(db, input, provider)).resolves.toBe(auth(owner, "11"));
       expect(await service.credential(row)).toBe(auth(owner, "11"));
       await expect(access(retained!.home!)).rejects.toMatchObject({ code: "ENOENT" });
-    } finally { stopped.resolve(); merge.mockRestore(); await retained?.cleanup().catch(() => {}); }
+    } finally { stopped.resolve(); warning.mockRestore(); merge.mockRestore(); await retained?.cleanup().catch(() => {}); }
   });
 
   it("allows quota refresh alongside a manual probe and keeps the freshest saved credential", async () => {
