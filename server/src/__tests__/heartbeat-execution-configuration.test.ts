@@ -820,6 +820,36 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(row.blobUnchanged && row.sha256LinesUnchanged === row.sha256LinesTotal, "ordinary stdout masked after secret_ref token ended").toBe(true);
   }, 60_000);
 
+  it("redact-meta (5)(6)(8)(9): short and id-valued env secrets leave stored log text byte-equal; a long one is masked", async () => {
+    const { randomBytes } = await import("node:crypto");
+    const { syncAgentAdapterEnvBindings } = await import("../services/agent-secret-bindings.js");
+    const f = await seed();
+    const longToken = randomBytes(30).toString("base64"); // test-only
+    const values = { SHORT_ONE: "1", SHORT_V1: "v1", LANGFUSE_USER_ID: f.agentId, LONG_TOKEN: longToken };
+    const env: Record<string, unknown> = { model: "agent-model" };
+    const bindings: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(values)) {
+      const secret = await secretService(db).create(f.companyId, { name: `redact-meta-${key}-${f.agentId}`, provider: "local_encrypted", value }, { userId: f.userId });
+      bindings[key] = { type: "secret_ref", secretId: secret.id, version: "latest" };
+    }
+    const adapterConfig = { ...env, env: bindings };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+    const ordinary = `test 1 passed in v1.2.3 (11 files)\nagent ${f.agentId} reported\n`;
+    inspect.set(f.agentId, async input => {
+      expect((input.config.env as Record<string,string>).LANGFUSE_USER_ID === f.agentId).toBe(true);
+      await input.onLog("stdout", ordinary);
+      await input.onLog("stdout", `token=${longToken}\n`);
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    expect(log).toContain(ordinary);
+    expect(log).toContain(f.agentId);
+    expect(log.includes(longToken)).toBe(false);
+  }, 60_000);
+
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
