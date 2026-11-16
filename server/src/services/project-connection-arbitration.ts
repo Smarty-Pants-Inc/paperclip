@@ -176,6 +176,61 @@ export async function assertProjectConnectionAvailability(
 }
 
 /**
+ * Denial-only guard for a generic writer that has not completed B/C preflight.
+ * Submitted App/client/installation spellings are lookup hints, NEVER verified
+ * identity or approval. Only identities from saved server-owned envelopes may
+ * be locked here. This closes known shared/EXCLUSIVE/null alias collisions even
+ * while first-bind custody is unavailable; it does not authorize any new bind.
+ * B/C still must provide verified facts for previously unbound registrations.
+ */
+export async function assertKnownProjectConnectionCreateAliases(
+  tx: Db | DbTransaction,
+  input: Readonly<{ companyId: string; projectId: string | null; exclusive: boolean; config: Record<string, unknown>; excludeConnectionId?: string }>,
+): Promise<void> {
+  if (input.config.sourceTemplateKey !== "github" || input.config.connectionMethodKey !== "app-installation") return;
+  const method = object(input.config.methodConfig);
+  if (!method) return;
+  const installationId = decimal(method.installationId);
+  const installationKey = installationId ? `${INSTALLATION_PREFIX}${installationId}` : null;
+  // Numeric spellings are lookup hints only. This can refuse a conflicting
+  // registration alias, but never authorizes or verifies an unbound App.
+  const registrationHint = decimal(method.appId);
+  const saved = await tx.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.companyId), ne(toolConnections.status, "archived"),
+  ));
+  // A definite live legacy collision can be refused without inventing verified
+  // identity for the null row. This is denial-only, so no lock can turn it into
+  // approval. B/C must still verify and lock any eventual successful attempt.
+  if (input.exclusive && saved.some(connection => {
+    if (connection.id === input.excludeConnectionId) return false;
+    const aliases = legacyAliases(connection);
+    return (installationKey !== null && aliases.installationKeys.has(installationKey))
+      || (registrationHint !== null && aliases.registrationIds.has(registrationHint));
+  })) throw conflict("This installation or App registration is reserved by another live connection", { code: "installation_not_exclusive" });
+  const identities = saved.flatMap(connection => {
+    const identity = projectConnectionIdentityForConnection(connection);
+    if (!identity || connection.id === input.excludeConnectionId) return [];
+    const sameInstallation = identity.canonicalInstallationKey === installationKey;
+    const sameRegistration = identity.verifiedRegistrationId === registrationHint;
+    const exclusiveConflict = (input.exclusive || object(connection.config.projectScope)?.exclusive === true)
+      && (sameInstallation || sameRegistration);
+    const duplicate = input.projectId !== null && connection.projectId === input.projectId && sameInstallation;
+    return exclusiveConflict || duplicate ? [identity] : [];
+  });
+  if (!identities.length) return;
+  await lockProjectConnectionIdentities(tx, identities);
+  for (const identity of identities) await assertProjectConnectionAvailability(tx, {
+    identity, projectId: input.projectId, exclusive: input.exclusive, excludeConnectionId: input.excludeConnectionId,
+  });
+  // A concurrent archive may have released the known collision while we waited.
+  // Retry OUTSIDE this transaction; do not now take project lifecycle rows while
+  // retaining identity locks acquired by this refusal-only path.
+  throw conflict("The known reservation changed while waiting. Retry with current state.", {
+    code: "project_connection_changed", retryable: true,
+  });
+}
+
+/**
  * Assignment/grant/profile writers share the same lock order as create/finish.
  * Candidates are only lock hints, never authority. Re-read each row AFTER all
  * waits and reject a changed identity before the caller checks final admission.

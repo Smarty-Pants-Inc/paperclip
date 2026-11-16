@@ -1,7 +1,10 @@
-import type { ToolAccessMutationDb } from "../types.js";
+import type { ActorInfo, DbTransaction, ToolAccessMutationDb } from "../types.js";
+import { forbidden, unprocessable } from "../../../errors.js";
+import { lockProjectConnectionRows } from "../../project-connection-arbitration.js";
+import { assertProjectConnectionAdmission } from "../../project-connection-admission.js";
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { connectionGrants, toolConnections } from "@paperclipai/db";
+import { connectionGrants, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { RAILWAY_SSH_SECRET_PATH } from "../../railway-ssh.js";
 import { isRailwayConnection } from "../../railway.js";
 
@@ -29,7 +32,34 @@ export function createOrganizationGrantStore(db: Db) {
       unrequestedScopes: string[];
       requestedScopes: string[];
     },
+    actor?: ActorInfo,
   ) {
+    if (connection.projectId !== null) {
+      // Owned finish/create must compose this with connection + receipt on its
+      // ACTUAL transaction. A standalone default-grant write cannot reauthorize
+      // or make a non-serving migration draft usable after a partial failure.
+      if (dbClient === db || !("execute" in dbClient)) throw unprocessable(
+        "Project organization grants require the connection writer transaction", { code: "project_connection_transaction_required" });
+      const tx = dbClient as DbTransaction;
+      [connection] = await lockProjectConnectionRows(tx, [connection]);
+      const installs = await tx.select().from(toolConnectionInstalls).where(and(
+        eq(toolConnectionInstalls.companyId, connection.companyId), eq(toolConnectionInstalls.connectionId, connection.id),
+      ));
+      if (installs.some(install => install.targetType !== "agent")) throw forbidden(
+        "Project connections require explicit project agent installs", { code: "project_connection_target_outside_project" });
+      await actor?.managementContext?.reauthorize();
+      await assertProjectConnectionAdmission(tx, {
+        companyId: connection.companyId, projectId: connection.projectId,
+        operation: "finish", actor, connection, proposedSecretRefs: connection.credentialSecretRefs,
+        targetAgentIds: installs.map(install => install.targetId),
+      });
+      const grants = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id),
+      ));
+      if (grants.length > 1 || grants.some(grant => grant.kind !== "organization")) {
+        throw unprocessable("Project Apps support one fixed default organization identity", { code: "project_connection_provider_unsupported" });
+      }
+    }
     const providerTenantWithOauth = (
       current: (typeof connectionGrants.$inferSelect)["providerTenant"],
     ) =>
@@ -54,7 +84,9 @@ export function createOrganizationGrantStore(db: Db) {
           eq(connectionGrants.companyId, connection.companyId),
           eq(connectionGrants.connectionId, connection.id),
           eq(connectionGrants.kind, "organization"),
-          eq(connectionGrants.isDefault, true),
+          // Revocation clears isDefault. A verified same-reference recovery of
+          // the sole owned identity updates it rather than inserting a second.
+          connection.projectId !== null ? undefined : eq(connectionGrants.isDefault, true),
         ),
       )
       .limit(1);
@@ -76,12 +108,13 @@ export function createOrganizationGrantStore(db: Db) {
             ? { providerTenant: providerTenantWithOauth(existing.providerTenant) }
             : {}),
           status: "active",
+          ...(connection.projectId !== null ? { isDefault: true } : {}),
           revokedAt: null,
           revokedByAgentId: null,
           revokedByUserId: null,
           updatedAt: new Date(),
         })
-        .where(eq(connectionGrants.id, existing.id))
+        .where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.id, existing.id)))
         .returning();
       if (!updated)
         throw new Error("Failed to update default connection grant");
