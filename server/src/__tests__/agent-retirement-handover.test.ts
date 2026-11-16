@@ -6,8 +6,9 @@ import express from "express";
 import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, agentApiKeys, approvals, authUsers, budgetIncidents, budgetPolicies, companies,
+import { activityLog, agents, agentApiKeys, approvals, authUsers, budgetIncidents, budgetPolicies, chatConversations, chatEndpoints, companies,
   companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants, routineRuns, routineTriggers, routines as routinesTable,
+  toolApplications, toolConnections,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -596,6 +597,47 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     expect(duplicates(await f.activity())).toEqual([]);
     f.unsubscribe();
   }, 60_000);
+
+  // review-fleet-2 07:34Z: bound conversations are intentionally left, not pending hand-over work.
+  for (const withRehomable of [false, true]) {
+    it(`conversation_bound: ${withRehomable ? "after moving ordinary work" : "with only bound work"}, clear the marker and record N once`, async () => {
+      const f = await seed();
+      const direct = await f.task("Fixed conversation identity", "todo");
+      await db.update(issues).set({ conversationAgentId: f.workerId, conversationUserId: f.userId,
+        conversationState: "active" }).where(eq(issues.id, direct.id));
+      const channel = await f.task("Channel conversation", "blocked");
+      const [application] = await db.insert(toolApplications).values({ companyId: f.companyId, name: "Retire chat", type: "chat" }).returning();
+      const [connection] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: application!.id,
+        name: "Retire chat", uid: randomUUID(), connectionPurpose: "channel", transport: "chat_sdk" }).returning();
+      const [endpoint] = await db.insert(chatEndpoints).values({ companyId: f.companyId, connectionId: connection!.id,
+        provider: "slack", publicId: randomUUID(), assignedAgentId: f.workerId }).returning();
+      await db.insert(chatConversations).values({ companyId: f.companyId, endpointId: endpoint!.id, issueId: channel.id,
+        externalConversationId: randomUUID(), externalLabel: "Retained channel" });
+      const ordinary = withRehomable ? await f.task("Ordinary work", "todo") : null;
+      await f.retire();
+      expect(marker(await f.current(f.workerId))).toMatchObject({ code: "agent_handover_pending" });
+      const service = await f.handover();
+      expect(await service.processAgent(f.workerId)).toMatchObject({ cleared: true });
+      expect(marker(await f.current(f.workerId))).toBeUndefined();
+      expect((await request(f.board).get(`/api/agents/${f.workerId}`)).body.handover).toBeUndefined();
+      expect(await f.currentTask(direct.id)).toMatchObject({ assigneeAgentId: f.workerId, conversationAgentId: f.workerId });
+      expect(await f.currentTask(channel.id)).toMatchObject({ assigneeAgentId: f.workerId, status: "blocked" });
+      if (ordinary) expect(await f.currentTask(ordinary.id)).toMatchObject({ assigneeAgentId: f.leadId });
+      const final = await f.activity("agent.handover_completed");
+      expect(final).toHaveLength(1);
+      expect(final[0]).toMatchObject({ entityId: f.workerId, details: {
+        conversationBoundCount: 2, conversationBoundTaskIds: [direct.id, channel.id].sort(),
+      } });
+      expect(await f.activity("issue.reassignment_failed")).toEqual([]);
+      const settledActivity = await f.activity();
+      await service.processAgent(f.workerId);
+      await service.processPending();
+      expect(await f.activity()).toEqual(settledActivity);
+      await vi.waitFor(() => expect(f.events.filter(event => event.action === "agent.handover_completed"
+        && event.entityId === f.workerId)).toHaveLength(1));
+      f.unsubscribe();
+    }, 60_000);
+  }
 
   // ---- W4: per-item target re-check; walk up to the nearest ACTIVE manager; none -> stays put, never null, never a cycle
   it("W4: the manager is already retired: items walk up to the nearest ACTIVE manager", async () => {
