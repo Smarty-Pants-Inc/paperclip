@@ -173,7 +173,7 @@ fn private_socket_preserves_the_existing_browser_header_refusal() {
 }
 
 #[test]
-fn private_socket_returns_the_named_503_while_ingress_is_unavailable() {
+fn private_socket_returns_the_named_pending_503_until_capability_is_acknowledged() {
     let mut ingress = GitHubAccessIngress::start().expect("start private Unix socket ingress");
     ingress.set_available(false);
     let mut client = connect(ingress.socket_path());
@@ -185,7 +185,7 @@ fn private_socket_returns_the_named_503_while_ingress_is_unavailable() {
     let response = read_response(&mut client);
     assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
     assert!(
-        response.contains("native_github_access_stale_runner_token"),
+        response.contains("native_github_access_capability_pending"),
         "{response}"
     );
     assert!(ingress.try_next_request().is_none());

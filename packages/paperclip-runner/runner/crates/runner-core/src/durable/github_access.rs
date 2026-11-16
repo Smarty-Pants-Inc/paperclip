@@ -51,7 +51,7 @@ mod unix_socket {
     const HTTP_RESPONSE_TIMEOUT_SLICE: Duration = Duration::from_millis(100);
     const CONNECTION_QUEUE_CAPACITY: usize = 32;
     const HTTP_WORKER_COUNT: usize = 4;
-    const ERROR_BODY_UNAVAILABLE: &[u8] = br#"{"error":"native_github_access_stale_runner_token"}"#;
+    const ERROR_BODY_CAPABILITY_PENDING: &[u8] = br#"{"error":"native_github_access_capability_pending"}"#;
     const ERROR_BODY_METHOD_NOT_ALLOWED: &[u8] = br#"{"error":"Method not allowed"}"#;
     const GITHUB_CREDENTIALS_PATH: &str = "/runtime-tools/github/credentials";
 
@@ -621,7 +621,7 @@ mod unix_socket {
         } else if status == 403 {
             br#"{"error":"GitHub session authentication required"}"#.as_slice()
         } else if status == 503 {
-            ERROR_BODY_UNAVAILABLE
+            ERROR_BODY_CAPABILITY_PENDING
         } else if status == 504 {
             br#"{"error":"runner ingress response timed out"}"#.as_slice()
         } else {
@@ -790,6 +790,15 @@ pub(crate) fn is_reply_frame(value: &Value) -> bool {
         && object.contains_key("status")
         && object.contains_key("headers")
         && object.contains_key("bodyBase64")
+}
+
+pub(crate) fn capability_pending_reply(request_id: &str) -> Value {
+    json!({
+        "requestId": request_id,
+        "status": 503,
+        "headers": { "content-type": "application/json", "cache-control": "no-store" },
+        "bodyBase64": BASE64.encode(br#"{"error":"native_github_access_capability_pending"}"#),
+    })
 }
 
 pub(crate) fn error_reply(request_id: &str, status: u16) -> Value {

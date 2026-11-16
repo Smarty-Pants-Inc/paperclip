@@ -165,10 +165,15 @@ ${options.brokerFile ? String.raw`
             const body = Buffer.from(await response.arrayBuffer()).toString('utf8');
             let code = '';
             try { code = JSON.parse(body).error; } catch {}
-            if (code === 'native_github_access_stale_runner_token' && Date.now() < refreshDeadline) {
+            if (code === 'native_github_access_capability_pending' && Date.now() < refreshDeadline) {
               const delay = Math.min(100 * (2 ** Math.min(staleRetries++, 6)), refreshDeadline - Date.now());
               if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
               if (Date.now() < refreshDeadline) continue;
+            }
+            if (code === 'native_github_access_stale_runner_token') {
+              process.stderr.write('Paperclip: GitHub native_github_access_stale_runner_token; refusing managed credentials.\\n');
+              process.exitCode = 1;
+              return;
             }
             result = null;
             break;

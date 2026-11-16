@@ -133,7 +133,7 @@ fn send_github_access_requests(
             continue;
         }
         let Some(frame) = ingress.frame_with_capability(&request) else {
-            let _ = request.respond(github_access::error_reply(&request_id, 503));
+            let _ = request.respond(github_access::capability_pending_reply(&request_id));
             continue;
         };
         let encoded_len = serde_json::to_vec(&frame)

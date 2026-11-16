@@ -99,9 +99,10 @@ describe("managed GitHub launchers", () => {
       PAPERCLIP_GITHUB_RUNNER_SOCKET: socketPath,
       PATH: `${managed}${path.delimiter}${real}${path.delimiter}${process.env.PATH}`,
     };
-    const result = await exec(path.join(managed, "git"), ["remote", "-v"], { cwd: root, env });
-    expect(socketRequests, result.stderr).toBe(1);
-    expect(result.stdout).toBe("anonymous");
+    const result = await exec(path.join(managed, "git"), ["remote", "-v"], { cwd: root, env })
+      .then(value => ({ ...value, code: 0 }), error => error as { code?: number; stderr?: string });
+    expect(result).toMatchObject({ code: 1, stderr: expect.stringContaining("native_github_access_stale_runner_token") });
+    expect(socketRequests).toBe(1);
   });
 
   it.each(["", "relative/node", "/runtime/node --flag", "/runtime/node\nexit 1", "/runtime/node\0"])(
