@@ -5708,6 +5708,55 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn named_proxy_startup_deadline_at_25_s_is_surfaced_inside_the_30_s_thread_start_wait() {
+        // The Pi proxy answers an unfinished thread/start at its 25 s whole-open
+        // deadline with a named, phased error. The facade's unchanged 30 s wait
+        // must surface that error, not its generic "response timed out".
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*)
+      sleep 25
+      printf '%s\n' '{"id":2,"error":{"code":-32000,"message":"pi_startup_deadline: Pi startup exceeded its 25000 ms deadline in phase first_get_state (step pi_spawn_to_get_state)","data":{"code":"pi_startup_deadline","phase":"first_get_state"}}}' ;;
+  esac
+done
+"#;
+        let config = CodexProviderConfig {
+            profile: None,
+            provider: "codex".to_owned(),
+            driver: "codex_app_server".to_owned(),
+            provider_version: "thread-start-deadline-fixture".to_owned(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            model: None,
+            provider_session_id: None,
+            instructions: "Test only.".to_owned(),
+            approval_policy: "never".to_owned(),
+            externally_sandboxed: false,
+            read_only: false,
+            include_skill_instructions: None,
+            conversation_mode: None,
+        };
+        let started = std::time::Instant::now();
+        let error = CodexProvider::start(&config, None).err().unwrap().to_string();
+        let elapsed = started.elapsed();
+        assert!(
+            error.starts_with("Codex thread/start failed: ")
+                && error.contains("pi_startup_deadline")
+                && error.contains("phase first_get_state"),
+            "{error}"
+        );
+        assert!(!error.contains("response timed out"), "{error}");
+        assert!(elapsed >= Duration::from_secs(25) && elapsed < Duration::from_secs(30));
+    }
+
+    #[cfg(unix)]
     fn completion_tail_provider() -> CodexProvider {
         completion_tail_provider_with_stdout_flood(false)
     }
