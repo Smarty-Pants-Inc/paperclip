@@ -1,5 +1,5 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
-import { assertNotManagerApp, assertProjectAppReceiptInput, prepareProjectAppFirstBind, readProjectAppCustody, verifyGitHubAppCandidate } from "./project-app-custody.js";
+import { assertNotManagerApp, assertProjectAppReceiptInput, consumeProjectAppApproval, prepareProjectAppFirstBind, readProjectAppCustody, verifyGitHubAppCandidate } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
 import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, stageProjectConnectionMigration, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { assertKnownProjectConnectionCreateAliases, assertProjectConnectionAvailability, lockProjectConnectionIdentities, mapProjectConnectionUniquenessError, projectConnectionIdentityForConnection } from "./project-connection-arbitration.js";
@@ -4893,7 +4893,10 @@ export function toolAccessService(
       const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
         // This is a refusal check against known saved identities, not provider
         // verification or approval of submitted App/client spelling.
-        await assertKnownProjectConnectionCreateAliases(tx, { companyId, projectId, config,
+        // Only a receipt-citing project create ignores ITS source S (re-verified
+        // below, consumed in this transaction); every other create collides with S.
+        const consumedSourceConnectionId = projectId !== null ? preparedProject?.custody.sourceConnectionId : undefined;
+        await assertKnownProjectConnectionCreateAliases(tx, { companyId, projectId, config, consumedSourceConnectionId,
           exclusive: (input as CreateToolConnection & { exclusive?: boolean }).exclusive === true });
         if (projectId !== null) {
           // B must prepare the protected envelope from authorized, reference-only
@@ -4913,12 +4916,17 @@ export function toolAccessService(
           await actor?.managementContext?.reauthorize();
           await assertProjectConnectionAdmission(tx, { companyId, projectId, operation: "create", actor,
             proposedSecretRefs: input.credentialSecretRefs ?? [] });
+          // Existing named conflicts (duplicate / EXCLUSIVE) keep their order and
+          // codes; S is ignored only for this receipt's own create.
+          await assertProjectConnectionAvailability(tx, { identity, projectId, consumedSourceConnectionId,
+            exclusive: asRecord(config.projectScope).exclusive === true });
+          // Serialize receipt consumers on S before re-reading it: a concurrent
+          // replay sees S consumed (single use) after this lock is released.
+          await tx.select({ id: toolConnections.id }).from(toolConnections).where(and(eq(toolConnections.companyId, companyId), eq(toolConnections.id, preparedProject!.custody.sourceConnectionId))).for("update");
           const custody = await readProjectAppCustody(tx, { companyId, projectId, config, refs: input.credentialSecretRefs ?? [],
             registrationId: preparedProject!.verified.identity.verifiedRegistrationId, repositoryIds: preparedProject!.verified.repositoryIds });
           const [key] = await tx.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.id, custody.receipt.secretRef.secretId))).for("share");
-          if (custody.receipt.id !== preparedProject!.custody.receipt.id || !key || key.latestVersion !== preparedProject!.secretVersion) throw conflict("The approved project App changed during first binding", { code: "project_app_approval_state_changed" });
-          await assertProjectConnectionAvailability(tx, { identity, projectId,
-            exclusive: asRecord(config.projectScope).exclusive === true });
+          if (custody.receipt.id !== preparedProject!.custody.receipt.id || custody.sourceConnectionId !== consumedSourceConnectionId || !key || key.latestVersion !== preparedProject!.secretVersion) throw conflict("The approved project App changed during first binding", { code: "project_app_approval_state_changed" });
           config = await stageProjectConnectionMigration(tx, { companyId, projectId, sourceConnectionId: custody.sourceConnectionId,
             config, status: input.status ?? "draft", enabled: input.enabled ?? false });
         }
@@ -4987,6 +4995,11 @@ export function toolAccessService(
         if (projectId !== null) await writeProjectConnectionReceipt(tx, {
           connection: row, actor, action: "tool_connection.project_taken", reason: "project_connection_created",
         });
+        // Make-before-break: the owned row, its receipt, S's archive and the
+        // consumption activity commit together, or none of them do.
+        if (projectId !== null) await consumeProjectAppApproval(tx, { companyId, projectId, sourceConnectionId: consumedSourceConnectionId!,
+          receiptId: preparedProject!.custody.receipt.id, connectionId: row.id,
+          actorType: actor?.actorType === "user" ? "user" : actor?.actorType === "agent" ? "agent" : "system", actorId: actor?.actorId ?? "system" });
         return row;
       }).catch(error => { throw mapProjectConnectionUniquenessError(error); });
       emitConnectionCreated(row, "api");
