@@ -56,3 +56,26 @@ it.each([undefined, "future_unknown"])("server receives one generic code for old
   expect(runnerPrepareRefusalCode({ runnerCommandResult: { commandType: "run.prepare", status: "failed",
     result: { code: "command_execution_failed", refusalCode, message: "Pi run.prepare launch does not match the runner-owned qualified profile" } } })).toBe("provider_prepare_refused");
 });
+
+// J3-22 member (a) (RFL 09:55Z): its OWN predicate, no set. It matches exactly
+// backup_without_reusable_lease (still a FRESH_THREAD_REFUSAL_CODES member);
+// prose and every other code stay on today's next-run path.
+it("member (a) matches exactly the refused-restore code, never prose or another code", async () => {
+  const refusal = await import("./runner-reconciliation-refusal.js") as Record<string, unknown>;
+  const codeOf = refusal.restoreUnavailableOnNewBoxCode as ((value: unknown) => string | null) | undefined;
+  const code = "runner_harness_state_mismatch: backup_without_reusable_lease";
+  expect(refusal.RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE).toBe(code);
+  expect(refusal.RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON).toBe("restore_unavailable_on_new_box");
+  expect(FRESH_THREAD_REFUSAL_CODES).toContain(code);
+  expect(Object.keys(refusal).filter(name => /SAME_RUN/.test(name))).toEqual([]);
+  expect(codeOf?.(nativeReconciliationError(code))).toBe(code);
+  expect(codeOf?.(new Error("opaque", { cause: nativeReconciliationError(code) }))).toBe(code);
+  expect(codeOf?.(code)).toBe(code);
+  // Prose never matches; every other code keeps today's next-run path.
+  expect(codeOf?.(new Error(code))).toBeNull();
+  for (const other of FRESH_THREAD_REFUSAL_CODES.filter(value => value !== code)) {
+    expect(codeOf?.(nativeReconciliationError(other))).toBeNull();
+    expect(codeOf?.(other)).toBeNull();
+  }
+  expect(codeOf?.("runner_harness_state_mismatch: provider_identity_changed")).toBeNull();
+});
