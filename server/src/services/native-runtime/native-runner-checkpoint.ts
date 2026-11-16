@@ -188,7 +188,7 @@ function parkedSuccessorWaitingForOwner(tx: CheckpointTransaction, owner: Native
 }
 
 export async function assertNativeRunnerCheckpointOwner(tx: CheckpointTransaction, owner: NativeRunnerCheckpointOwner, newWork: boolean,
-  authorization: { checkpointMaintenanceOnly: boolean }) {
+  authorization: { checkpointMaintenanceOnly: boolean } = { checkpointMaintenanceOnly: false }) {
   const locked = await lockNativeRunnerCheckpointOwner(tx, owner);
   await validateNativeRunnerCheckpointOwner(tx, owner, locked, newWork, authorization);
 }
