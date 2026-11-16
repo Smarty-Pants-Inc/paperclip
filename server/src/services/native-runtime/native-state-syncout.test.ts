@@ -87,6 +87,25 @@ describe("native session state syncOut", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
+  it("preserves provider-state transport failures from the active read transport", async () => {
+    const failure = Object.assign(new Error("Daytona syncOut file download failed: socket hang up"), { code: "ECONNRESET" });
+    const runner = {
+      execute: vi.fn(async ({ args }: { args?: string[] }) => {
+        if (args?.[1]?.includes("base64 <")) throw failure;
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      }),
+      syncOut: vi.fn(async () => { throw failure; }),
+    };
+    await expect(readRemoteRunnerProviderState({ runner: runner as never, stateDirectory: "/private",
+      execution: { provider: { kind: "opencode" } } as never })).rejects.toBe(failure);
+  });
+
+  it("preserves provider-state parse failures from syncOut", async () => {
+    const runner = syncRunner({ failParse: true });
+    await expect(readRemoteRunnerProviderState({ runner: runner as never, stateDirectory: "/private",
+      execution: { provider: { kind: "opencode" } } as never })).rejects.toBeInstanceOf(SyntaxError);
+  });
+
   it("preserves exit-66 missing-state meaning and command fallback logging", async () => {
     const missing = { execute: vi.fn(async () => ({ exitCode: 66, timedOut: false, stdout: "", stderr: "" })) };
     await expect(readRemoteRunnerStateFile({ runner: missing as never, remotePath: "/private/runner-state.json" })).rejects.toMatchObject({ exitCode: 66 });
