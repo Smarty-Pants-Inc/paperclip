@@ -7773,6 +7773,10 @@ async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExe
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
 import { HELD_PREDECESSOR_NOTICE } from "./held-predecessor-notice-text.js";
+import { recordAndAnnounceProviderThreadReplacement } from "./provider-thread-lineage.js";
+
+/** Runs whose fresh provider session received the chat-history handoff (#20853). */
+const freshSessionHandoffDeliveredRuns = new Set<string>();
 export { HELD_PREDECESSOR_NOTICE };
 // The refusals that hold a conversation behind its unfinished predecessor:
 // the prior-owner fences (including the legacy migration fence), the
@@ -13004,7 +13008,18 @@ async function executePaperclipNativeSessionAttempt(
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
             getFreshSessionHandoff: input.getFreshSessionHandoff
-              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
+              ? async () => {
+                const handoff = await controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!);
+                // The replacement-thread line (#20853) says history was carried only when it was.
+                if (handoff) {
+                  // Bounded: an entry is normally removed at this run's checkpoint.
+                  if (freshSessionHandoffDeliveredRuns.size >= 1_000) {
+                    freshSessionHandoffDeliveredRuns.delete(freshSessionHandoffDeliveredRuns.values().next().value!);
+                  }
+                  freshSessionHandoffDeliveredRuns.add(input.execution.binding.runId);
+                }
+                return handoff;
+              } : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt
@@ -19223,6 +19238,11 @@ async function createRunnerdBackendWithinSessionClaim(
                     `[paperclip-runner] remote checkpoint read interrupted (attempt ${attempt} of ${attempts}); reading the settled state again\n`,
                   ),
                 );
+                // The identity the last verified backup of this session holds,
+                // read before this backup replaces it (#20853 PART 2).
+                const previousBackupIdentity = compatibleNativeHarnessBackupManifests({
+                  root, execution: input.execution, runnerInstanceId: input.runnerInstanceId,
+                })[0]?.manifest.providerSessionIdentity ?? null;
                 const manifest = await buildNativeHarnessBackupManifestStreamed({
                   backupRoot: pendingRoot,
                   execution: input.execution,
@@ -19269,6 +19289,32 @@ async function createRunnerdBackendWithinSessionClaim(
                     });
                   } : undefined,
                 });
+                // A provider thread that is not the one the previous backup held
+                // was replaced: record it (generation, previous/new identity,
+                // reason) and tell the person once. A restore of the same thread
+                // records nothing, whatever configFreshness.reset said (K6).
+                const normalizedSessionId = nativeSessionKey(input.execution);
+                if (previousBackupIdentity && normalizedSessionId) {
+                  await recordAndAnnounceProviderThreadReplacement({
+                    db: input.db,
+                    companyId: input.execution.binding.companyId,
+                    taskId: input.execution.binding.issueId,
+                    runId: input.execution.binding.runId,
+                    normalizedSessionId,
+                    previousIdentity: previousBackupIdentity,
+                    identity: providerSessionIdentity,
+                    reason: sandboxLeaseAcquisition?.outcome && sandboxLeaseAcquisition.outcome !== "resumed"
+                      ? "resume_failed_on_new_box" : "provider_thread_replaced",
+                    carriedHistory: freshSessionHandoffDeliveredRuns.has(input.execution.binding.runId),
+                    onLog: input.onLog,
+                  }).catch(async (error: unknown) => {
+                    // The backup is already durable; a lost record must be
+                    // visible, never a silent claim of continuity.
+                    const code = error instanceof Error ? error.message.split(/[\s:]/)[0]!.slice(0, 120) : "unknown";
+                    await input.onLog?.("stderr", `[paperclip-runner] provider thread replacement could not be recorded (${code})\n`);
+                  });
+                }
+                freshSessionHandoffDeliveredRuns.delete(input.execution.binding.runId);
               } finally {
                 await removeNativeHarnessBackup(pendingRoot);
               }
