@@ -21536,6 +21536,26 @@ describe("runnerd provider runtime wiring", () => {
         .toEqual([]);
     });
 
+    it("(#20853 i, rf3 timing) a new thread is recorded in the SAME run: no further message, a stop, then the close backs it up and the next host preparation does not refuse", async () => {
+      const fixture = await resumedSandboxWithStaleBackup({ label: "same-run", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [] });
+      const lineage = await import("./provider-identity-lineage.js");
+      onTestFinished(() => lineage.clearPendingProviderIdentityBreaksForTest());
+      // The run that starts the new thread (W1 onContinuityBreak / W2 new-box fresh start) notes it.
+      await lineage.noteProviderIdentityBreak(fixture.db, lineageScope(fixture.current), "resume_failed_on_new_box", fixture.current.binding.runId);
+      // No further message. The server stops before any later read of the box:
+      // only what the starting run made durable survives.
+      lineage.clearPendingProviderIdentityBreaksForTest();
+      // The close after the stop backs up the new thread instead of refusing it ...
+      expect(String(await closeCheckpoint(fixture) ?? "")).not.toContain("provider_identity_changed");
+      expect((fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>).providerIdentityResets)
+        .toEqual([expect.objectContaining({ generation: 1, previousIdentity: identityOf("01a1e203"), identity: identityOf("01a1e2e9"),
+          runId: fixture.current.binding.runId })]);
+      // ... and the next host preparation resumes it in place.
+      fixture.syncIn.mockClear();
+      await expect(fixture.options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+    });
+
     it("(b) without a recorded break, the same idle close still refuses the newer thread", async () => {
       const fixture = await resumedSandboxWithStaleBackup({ label: "b-unrecorded", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [] });
       const controller = new DurablePrpControlPlane({ stateDirectory: join(fixture.options.stateDirectory!, "control-plane"),
