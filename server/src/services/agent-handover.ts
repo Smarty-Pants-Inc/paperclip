@@ -182,6 +182,22 @@ export function agentHandoverService(db: Db, options: { now?: () => Date; repair
       const [agent] = await tx.select().from(agents).where(eq(agents.id, retiredAgentId)).for("update");
       if (!agent) return true;
       const remaining = await pendingAgentHandover(tx, companyId, retiredAgentId);
+      // The failed item's transaction rolled back, so persist its reason here with
+      // the marker. The company/agent locks serialize concurrent passes; querying
+      // durable history also dedupes after a restart or a change back to an old reason.
+      // Keep the audit even if another worker has since completed the item.
+      for (const item of blocked) {
+        const action = item.kind === "task" ? "issue.reassignment_failed" : "agent.reports_to_change_failed";
+        const entityType = item.kind === "task" ? "issue" : "agent";
+        const [recorded] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+          eq(activityLog.companyId, companyId), eq(activityLog.action, action),
+          eq(activityLog.entityType, entityType), eq(activityLog.entityId, item.id),
+          sql`${activityLog.details}->>'retiredAgentId' = ${retiredAgentId}`,
+          sql`${activityLog.details}->>'reason' = ${item.reason}`,
+        )).limit(1);
+        if (!recorded) await logActivity(tx, { companyId, ...SYSTEM_ACTOR, action, entityType, entityId: item.id,
+          details: { retiredAgentId, reason: item.reason } }, publications);
+      }
       if (!remaining.reportIds.length) {
         const moved = await tx.select({ entityId: activityLog.entityId, details: activityLog.details }).from(activityLog)
           .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, "agent.reports_to_changed"),
