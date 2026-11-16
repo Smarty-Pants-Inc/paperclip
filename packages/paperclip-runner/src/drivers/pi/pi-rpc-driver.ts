@@ -14,7 +14,7 @@ import { loadPiBuiltinModelCatalog, mergedPiModelsJson, readPiModelsSnapshot } f
 import { buildPiManagedModel, originalPiModelsFile, type PiManagedModel } from "./pi-managed-model.js";
 import { piCompanySkillsAgentHome, syncPiCompanySkills } from "./pi-company-skills.js";
 import { configurePiNativeMcp } from "./pi-native-mcp.js";
-import { configurePiManagedCompaction, linkPiNpmInstall } from "./pi-managed-settings.js";
+import { configurePiManagedCompaction } from "./pi-managed-settings.js";
 import { piHostInstructionSegment, verifiedPiChildBridgePath } from "./extension/index.js";
 import { piRpcUserInput } from "./pi-user-input.js";
 import { createPiEventProjector, type PiEventOrigin } from "./pi-event-projector.js";
@@ -252,9 +252,6 @@ export class PiRpcDriver implements HarnessDriver {
     let bootstrapProvider: PiBindProvider | undefined;
     let bootstrapToolsDeferred = false;
     if (this.#options.model && usesPiProviderLoopback(this.#options.model, environment)) {
-      await mkdir(agentHome, { recursive: true, mode: 0o700 });
-      await linkPiNpmInstall(agentHome, dirname(originalModelsFile));
-      environment.PI_CODING_AGENT_DIR = agentHome;
       const modelsFile = join(agentHome, "models.json");
       // Resolution and the defensive snapshot reread share one startup warning.
       let diagnosed = false;
