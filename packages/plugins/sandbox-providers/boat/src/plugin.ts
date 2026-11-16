@@ -1339,9 +1339,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
       if (shuttingDown) throw new Error("Boat provider is shutting down");
-      // Runs always proceed; the spare-only ceiling still counts and reports
-      // them, including the hour's creates Boat holds from before a restart.
       readySpares.admitRunCreate(params.companyId, params.environmentId, attemptId);
+      // Only companies with a spare setting do the run-path read. A spares-less company's
+      // in-plugin create event/health can undercount runs after a worker restart; that is
+      // accepted (gold) because the R1 boat-create-alarm cron reads Boat's inventory
+      // directly every 30 minutes and counts every company's runs.
       if (hasSpareSetting) refreshRunCreateLedger(c, params.companyId, params.environmentId);
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
