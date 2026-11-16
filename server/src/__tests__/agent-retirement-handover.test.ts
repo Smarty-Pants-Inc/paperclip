@@ -741,9 +741,16 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     const task = await f.task("Unfinished", "in_progress");
     const errors: unknown[] = [];
     const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, canReconcile: () => true, onError: error => errors.push(error) });
-    const recovery = (await handoverModule()).startAgentHandoverRecovery(db, coordinator);
+    // At the pre-worker base, exercise the public retirement path anyway: the
+    // ownership assertions below, not a missing-module error, must be the RED.
+    const handover = await import("../services/agent-handover.js").catch(error => {
+      if (["ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND"].includes(error.code)
+        && error.message.includes("/services/agent-handover.")) return null;
+      throw error;
+    });
+    const recovery = handover?.startAgentHandoverRecovery(db, coordinator);
     try {
-      await recovery.ready;
+      await recovery?.ready;
       const response = await f.terminate("POST");
       expect(response.status, response.text).toBe(200);
       await f.worker.process(f.workerId);
