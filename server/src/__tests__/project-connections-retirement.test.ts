@@ -525,6 +525,20 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
     });
 
+    it.each(["native", "snapshot-issue", "snapshot-task"] as const)("D/J11 stored task binding: %s queued work without a direct issueId still protects A", async binding => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection(f.a, { installed: false });
+      const work = await f.run();
+      await db.update(heartbeatRuns).set({ issueId: null, status: "queued",
+        nativeIssueId: binding === "native" ? work.issue.id : null,
+        contextSnapshot: binding === "snapshot-issue" ? { issueId: ` ${work.issue.id} ` }
+          : binding === "snapshot-task" ? { issueId: " ", taskId: work.issue.id } : {},
+      }).where(eq(heartbeatRuns.id, work.run.id));
+      await expect(f.service.archiveConnection(connection.id, f.companyId, f.actor())).rejects.toMatchObject({ status: 409,
+        details: { code: "project_connection_in_use", runs: [{ id: work.run.id, href: `/runs/${work.run.id}` }] } });
+      expect(await storedConnection(db, connection.id)).toEqual(connection);
+      expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+    });
+
     it("D/J11: same shared agent's B work is not A's work; null-task work is conservatively protected", async () => {
       const f = await projectConnectionFixture(db, true); const { connection } = await f.seedConnection();
       await f.run(f.b);

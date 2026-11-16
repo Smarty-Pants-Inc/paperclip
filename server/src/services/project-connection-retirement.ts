@@ -7,6 +7,7 @@ import {
 import { isUuidLike } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { persistActivity } from "./activity-log.js";
+import { boundRunIssueIdSql } from "./run-task-binding.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import type { ActorInfo, DbTransaction } from "./tool-access/types.js";
 
@@ -65,10 +66,10 @@ export async function assertProjectConnectionNotInUse(
     eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, input.connectionId),
     eq(toolConnectionInstalls.targetType, "company"), eq(toolConnectionInstalls.targetId, input.companyId),
   ));
-  // Resolve only stored task bindings, not a snapshot's claimed project. The
-  // JSON task-id comparison stays text so a malformed historical hint cannot
-  // produce a UUID cast error or bypass the gate.
-  const taskBinding = sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')`;
+  // Use the existing stored task-binding precedence, including native runs and
+  // trimmed historical task IDs. A snapshot's claimed project is NOT authority.
+  // Compare as text so malformed historical hints cannot cause a UUID cast.
+  const taskBinding = boundRunIssueIdSql();
   const projectTask = tx.select({ id: issues.id }).from(issues).where(and(
     eq(issues.companyId, input.companyId), eq(issues.projectId, input.projectId), sql`${issues.id}::text = ${taskBinding}`,
   ));
@@ -118,6 +119,12 @@ export async function writeProjectConnectionReceipt(
     || (input.verifiedRepositoryIds ?? []).some(id => !Number.isSafeInteger(id) || id <= 0)) {
     throw conflict("Receipt identifiers must be normalized domain identifiers", { code: "project_connection_receipt_invalid" });
   }
+  const audit = input.actor?.managementContext?.audit;
+  const actorType = input.actor?.actorType ?? audit?.actorType;
+  const actorId = input.actor?.actorId ?? audit?.actorId;
+  if (!actorType || !actorId || (audit && (audit.actorType !== actorType || audit.actorId !== actorId))) {
+    throw forbidden("Project connection receipts require the actual actor", { code: "project_connection_actor_required" });
+  }
   if (input.action !== "tool_connection.archived" && connection.status === "archived") {
     throw conflict("This project's connection was retired. Create a new approved project connection.", { code: "project_connection_archived" });
   }
@@ -136,12 +143,6 @@ export async function writeProjectConnectionReceipt(
     )).limit(1);
     if (receipt) return { activityId: receipt.id };
   }
-  const audit = input.actor?.managementContext?.audit;
-  const actorType = input.actor?.actorType ?? audit?.actorType;
-  const actorId = input.actor?.actorId ?? audit?.actorId;
-  if (!actorType || !actorId || (audit && (audit.actorType !== actorType || audit.actorId !== actorId))) {
-    throw forbidden("Project connection receipts require the actual actor", { code: "project_connection_actor_required" });
-  }
   const operationId = randomUUID();
   const { activity } = await persistActivity(tx as Db, {
     companyId: connection.companyId, actorType, actorId,
@@ -158,6 +159,10 @@ export async function writeProjectConnectionReceipt(
       // A caller reason may include provider text. Keep only known semantic
       // reasons; never copy arbitrary config, secret references or wire bodies.
       reason: receiptReason(input.reason, input.action),
+      // Reuse the existing activity vocabulary; the connection timeline ignores
+      // updated rows with no lifecycle, so an atomic receipt must carry it.
+      ...(input.action === "tool_connection.updated" && input.reason === "connection_disabled" ? { lifecycle: "paused" } : {}),
+      ...(input.action === "tool_connection.updated" && input.reason === "migration_activated" ? { lifecycle: "resumed" } : {}),
       targetAgentIds: [...new Set(input.targetAgentIds ?? [])].sort(),
       verifiedRepositoryIds: [...new Set(input.verifiedRepositoryIds ?? [])].sort((a, b) => a - b),
     },

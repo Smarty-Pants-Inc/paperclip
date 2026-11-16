@@ -9,7 +9,10 @@ import { vercelConnectResourcesFor } from "../vercel-credentials.js";
 import type { ActorInfo } from "../types.js";
 import { chatCredentialMutationLease } from "../../chat-credential-mutation-lease.js";
 import { removeSlackRegistration } from "../../chat-slack-registration-cleanup.js";
-import { chatEndpoints } from "@paperclipai/db";
+import { activityLog, chatEndpoints } from "@paperclipai/db";
+import { assertProjectConnectionAdmission, readProjectConnectionScope } from "../../project-connection-admission.js";
+import { lockProjectConnectionIdentities } from "../../project-connection-arbitration.js";
+import { assertProjectConnectionNotInUse, lockProjectConnectionLifecycle, writeProjectConnectionReceipt } from "../../project-connection-retirement.js";
 import { isBrowserUseConnection } from "../../browser-use-client.js";
 import { browserUseService } from "../../browser-use.js";
 import { emitConnectionUpdated } from "../../connector-telemetry.js";
@@ -17,8 +20,9 @@ import { and, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { connectionGrants, connectionTokenIssuances, companySecretBindings, companySecrets, userSecretDefinitions, userSecretDeclarations, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolOauthStates, toolGatewaySessions, toolMcpGateways, toolMcpGatewayTokens, toolProfileBindings, toolProfileEntries, toolProfiles, toolRuntimeSlots } from "@paperclipai/db";
 import type { ToolConnectionRemovalResult, ToolConnectionRemovalSummary } from "@paperclipai/shared";
-import { notFound } from "../../../errors.js";
+import { conflict, notFound } from "../../../errors.js";
 import { logger } from "../../../middleware/logger.js";
+import { publishActivity } from "../../activity-log.js";
 import { forgetMcpHttpSessions } from "../../mcp-http.js";
 import { secretService } from "../../secrets.js";
 import { connectionSecretsUsedByOtherConsumers } from "../../connection-credentials.js";
@@ -235,6 +239,7 @@ async function removeConnection(
   ): Promise<ToolConnectionRemovalResult> {
     await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
+    if (connection.projectId !== null) return removeProjectConnection(connection, actor);
     const [endpoint] = await db.select().from(chatEndpoints).where(and(eq(chatEndpoints.connectionId, connection.id), eq(chatEndpoints.companyId, connection.companyId), eq(chatEndpoints.provider, "slack")));
     if (!endpoint) return removeConnectionUnlocked(connectionId, companyId, actor);
     return chatCredentialMutationLease(db)(endpoint, async lease => {
@@ -248,6 +253,177 @@ async function removeConnection(
       await removeSlackRegistration(db, endpoint.id, lease);
       return removeConnectionUnlocked(connectionId, companyId, actor);
     });
+  }
+
+  /** Owned GitHub retirement is local and atomic. Do not reuse the null-path's
+   * resumable provider teardown: its separate commits and secret destruction
+   * cannot be rolled back when an owned retirement receipt fails. Pool refs and
+   * protected approval history remain history; the shared key itself is never
+   * removed, suspended or exported here.
+   */
+  async function removeProjectConnection(initial: typeof toolConnections.$inferSelect, actor?: ActorInfo): Promise<ToolConnectionRemovalResult> {
+    const result = await db.transaction(async tx => {
+      const projectId = initial.projectId!;
+      await lockProjectConnectionLifecycle(tx, { companyId: initial.companyId, projectId });
+      const readCurrent = async () => {
+        const [row] = await tx.select().from(toolConnections).where(and(
+          eq(toolConnections.companyId, initial.companyId), eq(toolConnections.id, initial.id),
+        ));
+        if (!row || row.projectId !== projectId) throw notFound("Project connection not found");
+        return row;
+      };
+      let connection = await readCurrent();
+      await assertProjectConnectionAdmission(tx, { companyId: connection.companyId, projectId, connection, actor, operation: "retire" });
+      const beforeLocks = readProjectConnectionScope(connection);
+      if (!beforeLocks) throw conflict("Project connection approval is unavailable", { code: "project_connection_scope_invalid" });
+      await lockProjectConnectionIdentities(tx, [{ companyId: connection.companyId, providerHost: "github.com",
+        verifiedRegistrationId: beforeLocks.registrationId, canonicalInstallationKey: beforeLocks.installationKey }]);
+      connection = await readCurrent();
+      let scope = readProjectConnectionScope(connection);
+      if (!scope || scope.registrationId !== beforeLocks.registrationId || scope.installationKey !== beforeLocks.installationKey) {
+        throw conflict("Project connection identity changed. Retry removal.", { code: "project_connection_verification_stale" });
+      }
+      await assertProjectConnectionAdmission(tx, { companyId: connection.companyId, projectId, connection, actor, operation: "retire" });
+      await tx.select({ id: toolApplications.id }).from(toolApplications).where(and(
+        eq(toolApplications.companyId, connection.companyId), eq(toolApplications.id, connection.applicationId),
+      )).for("update");
+      connection = await readCurrent();
+      await assertProjectConnectionAdmission(tx, { companyId: connection.companyId, projectId, connection, actor, operation: "retire" });
+      await tx.select({ id: toolConnections.id }).from(toolConnections).where(and(
+        eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id),
+      )).for("update");
+      connection = await readCurrent();
+      await assertProjectConnectionAdmission(tx, { companyId: connection.companyId, projectId, connection, actor, operation: "retire" });
+      scope = readProjectConnectionScope(connection);
+      if (!scope || scope.registrationId !== beforeLocks.registrationId || scope.installationKey !== beforeLocks.installationKey) {
+        throw conflict("Project connection identity changed. Retry removal.", { code: "project_connection_verification_stale" });
+      }
+      const confirmation = (actor as (ActorInfo & { projectDoneConfirmation?: Readonly<{ projectId: string; connectionId: string }> }) | undefined)?.projectDoneConfirmation;
+      if (confirmation && (confirmation.projectId !== projectId || confirmation.connectionId !== connection.id)) {
+        throw conflict("Project-done confirmation must name this project and connection", { code: "project_connection_confirmation_mismatch" });
+      }
+      if (connection.status === "archived") {
+        if (connection.enabled || connection.credentialRefs.length || connection.credentialSecretRefs.length) throw conflict("Archived project connection has conflicting state", { code: "project_connection_receipt_state_conflict" });
+        const [receipt] = await tx.select().from(activityLog).where(and(
+          eq(activityLog.companyId, connection.companyId), eq(activityLog.entityType, "tool_connection"),
+          eq(activityLog.entityId, connection.id), eq(activityLog.action, "tool_connection.archived"),
+        )).limit(1);
+        if (!receipt || receipt.details?.projectId !== projectId || receipt.details?.connectionId !== connection.id
+          || receipt.details?.installationKey !== scope.installationKey || receipt.details?.registrationId !== scope.registrationId
+          || receipt.details?.status !== "archived" || receipt.details?.enabled !== false || !receipt.details?.removal) {
+          throw conflict("This archived project connection has no matching retirement receipt", { code: "project_connection_receipt_state_conflict" });
+        }
+        return { connection, removal: receipt.details.removal as ToolConnectionRemovalSummary, changed: false, activity: null };
+      }
+      await assertProjectConnectionNotInUse(tx, { companyId: connection.companyId, projectId, connectionId: connection.id, actor,
+        projectDoneConfirmation: confirmation });
+      const now = new Date();
+      const binding = actorBinding(actor);
+      const grants = await tx.update(connectionGrants).set({ status: "revoked", isDefault: false,
+        revokedAt: now, revokedByAgentId: binding.actorType === "agent" ? binding.actorId : null,
+        revokedByUserId: binding.actorType === "user" ? binding.actorId : null, credentialSecretRefs: [], updatedAt: now,
+      }).where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id), ne(connectionGrants.status, "revoked")))
+        .returning({ id: connectionGrants.id });
+      // Already-revoked grant refs are no longer active access either.
+      await tx.update(connectionGrants).set({ credentialSecretRefs: [], updatedAt: now }).where(and(
+        eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id),
+      ));
+      const bindings = await tx.delete(companySecretBindings).where(and(
+        eq(companySecretBindings.companyId, connection.companyId), eq(companySecretBindings.targetType, "tool_connection"), eq(companySecretBindings.targetId, connection.id),
+      )).returning({ id: companySecretBindings.id });
+      const installs = await tx.delete(toolConnectionInstalls).where(and(
+        eq(toolConnectionInstalls.companyId, connection.companyId), eq(toolConnectionInstalls.connectionId, connection.id),
+      )).returning({ id: toolConnectionInstalls.id });
+      let appProfile: ToolConnectionRemovalSummary["appProfile"] = "absent";
+      let appProfileEntriesRemoved = 0, appProfileBindingsRemoved = 0, gatewayTokensRevoked = 0, gatewaySessionsRevoked = 0;
+      const [profile] = await tx.select().from(toolProfiles).where(and(
+        eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.profileKey, `app:${connection.id}`),
+      )).for("no key update");
+      if (profile) {
+        appProfileEntriesRemoved = (await tx.delete(toolProfileEntries).where(and(
+          eq(toolProfileEntries.companyId, connection.companyId), eq(toolProfileEntries.profileId, profile.id),
+        )).returning({ id: toolProfileEntries.id })).length;
+        appProfileBindingsRemoved = (await tx.delete(toolProfileBindings).where(and(
+          eq(toolProfileBindings.companyId, connection.companyId), eq(toolProfileBindings.profileId, profile.id),
+        )).returning({ id: toolProfileBindings.id })).length;
+        const gateways = await tx.select({ id: toolMcpGateways.id }).from(toolMcpGateways).where(and(
+          eq(toolMcpGateways.companyId, connection.companyId), eq(toolMcpGateways.profileId, profile.id),
+        ));
+        if (!gateways.length) {
+          await tx.delete(toolProfiles).where(and(eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.id, profile.id)));
+          appProfile = "deleted";
+        } else {
+          await tx.update(toolProfiles).set({ status: "archived", defaultAction: "deny", updatedAt: now }).where(and(
+            eq(toolProfiles.companyId, connection.companyId), eq(toolProfiles.id, profile.id),
+          ));
+          appProfile = "archived";
+          const tokens = await tx.select({ id: toolMcpGatewayTokens.id }).from(toolMcpGatewayTokens).where(and(
+            eq(toolMcpGatewayTokens.companyId, connection.companyId), inArray(toolMcpGatewayTokens.gatewayId, gateways.map(row => row.id)),
+          ));
+          gatewayTokensRevoked = (await tx.update(toolMcpGatewayTokens).set({ revokedAt: now, updatedAt: now }).where(and(
+            eq(toolMcpGatewayTokens.companyId, connection.companyId), inArray(toolMcpGatewayTokens.gatewayId, gateways.map(row => row.id)), isNull(toolMcpGatewayTokens.revokedAt),
+          )).returning({ id: toolMcpGatewayTokens.id })).length;
+          if (tokens.length) gatewaySessionsRevoked = (await tx.update(toolGatewaySessions).set({ revokedAt: now, updatedAt: now }).where(and(
+            eq(toolGatewaySessions.companyId, connection.companyId), inArray(toolGatewaySessions.gatewayTokenId, tokens.map(row => row.id)), isNull(toolGatewaySessions.revokedAt),
+          )).returning({ id: toolGatewaySessions.id })).length;
+        }
+      }
+      const catalog = await tx.update(toolCatalogEntries).set({ status: "removed", updatedAt: now }).where(and(
+        eq(toolCatalogEntries.companyId, connection.companyId), eq(toolCatalogEntries.connectionId, connection.id), ne(toolCatalogEntries.status, "removed"),
+      )).returning({ id: toolCatalogEntries.id });
+      const oauthStates = await tx.delete(toolOauthStates).where(and(
+        eq(toolOauthStates.companyId, connection.companyId), eq(toolOauthStates.connectionId, connection.id),
+      )).returning({ state: toolOauthStates.state });
+      const issuanceHashes = await tx.update(connectionTokenIssuances).set({ tokenHash: null }).where(and(
+        eq(connectionTokenIssuances.companyId, connection.companyId), eq(connectionTokenIssuances.connectionId, connection.id), sql`${connectionTokenIssuances.tokenHash} is not null`,
+      )).returning({ id: connectionTokenIssuances.id });
+      await notifyGitHubCredentialChange(tx, connection);
+      await notifyToolConnectionHealth(tx, connection);
+      const [archived] = await tx.update(toolConnections).set({ status: "archived", enabled: false, credentialRefs: [], credentialSecretRefs: [],
+        config: withoutInlineOAuthTokens(connection.config), transportConfig: withoutInlineOAuthTokens(connection.transportConfig), updatedAt: now,
+      }).where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id))).returning();
+      if (!archived) throw notFound("Project connection not found");
+      const remaining = await tx.select({ id: toolConnections.id }).from(toolConnections).where(and(
+        eq(toolConnections.companyId, connection.companyId), eq(toolConnections.applicationId, connection.applicationId), ne(toolConnections.status, "archived"),
+      )).limit(1);
+      const applicationArchived = !remaining.length && (await tx.update(toolApplications).set({ status: "archived", archivedAt: now, updatedAt: now }).where(and(
+        eq(toolApplications.companyId, connection.companyId), eq(toolApplications.id, connection.applicationId), ne(toolApplications.status, "archived"),
+      )).returning({ id: toolApplications.id })).length > 0;
+      const removal: ToolConnectionRemovalSummary = {
+        secretsRevoked: 0, secretsRetainedShared: new Set(connection.credentialSecretRefs.map(ref => ref.secretId)).size,
+        credentialRefsCleared: connection.credentialRefs.length + connection.credentialSecretRefs.length,
+        secretBindingsRemoved: bindings.length, grantsRevoked: grants.length, installsRemoved: installs.length,
+        appProfile, appProfileEntriesRemoved, appProfileBindingsRemoved, catalogEntriesMarkedRemoved: catalog.length,
+        oauthStatesDiscarded: oauthStates.length, tokenIssuanceHashesCleared: issuanceHashes.length, runtimeSlotsStopped: 0,
+        gatewayTokensRevoked, gatewaySessionsRevoked, applicationArchived, externalCredentialCleanup: null,
+      };
+      const { activityId } = await writeProjectConnectionReceipt(tx, { connection: archived, actor, action: "tool_connection.archived", reason: "project_retired" });
+      const [activity] = await tx.update(activityLog).set({ details: sql`${activityLog.details} || ${JSON.stringify({ removal, projectDoneConfirmed: confirmation !== undefined })}::jsonb` }).where(and(
+        eq(activityLog.companyId, connection.companyId), eq(activityLog.id, activityId),
+      )).returning();
+      if (!activity) throw new Error("Project connection retirement receipt was not persisted");
+      return { connection: archived, removal, changed: true, activity };
+    });
+    if (result.changed) {
+      forgetMcpHttpSessions(initial.id);
+      emitConnectionUpdated(result.connection, initial, "archive");
+      // Only publish after the actual transaction commits. A realtime failure
+      // cannot erase the durable receipt or turn an already-committed removal
+      // into a second transition on retry.
+      if (result.activity) {
+        const row = result.activity;
+        try {
+          publishActivity({ companyId: row.companyId, pluginEvent: null, payload: {
+            issueId: null, actorType: row.actorType, actorId: row.actorId, action: row.action,
+            entityType: row.entityType, entityId: row.entityId, agentId: row.agentId, runId: row.runId,
+            responsibleUserId: row.responsibleUserId, details: row.details,
+          } });
+        } catch (error) {
+          logger.warn({ err: error, companyId: row.companyId, activityId: row.id }, "Project retirement committed but activity publication failed");
+        }
+      }
+    }
+    return { connection: toConnection(result.connection), removal: result.removal };
   }
 
   async function removeConnectionUnlocked(connectionId: string, companyId?: string, actor?: ActorInfo): Promise<ToolConnectionRemovalResult> {
