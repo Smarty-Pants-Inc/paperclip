@@ -1,4 +1,7 @@
 import { heartbeatService } from "../services/heartbeat.js";
+import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
+import * as fileStoreModule from "../services/agent-file-store.js";
+import * as instructionAuthorization from "../services/agent-instruction-authorization.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { notifyDirectoryCleanup } from "../services/directory-cleanup-notifications.js";
@@ -1295,6 +1298,188 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
     expect(await run({ warm: true })).toBeTruthy();
+  });
+  // RED for smarty-dev#20814 (b13): a low-trust run that changed nothing must not be asked for write authority.
+  const lowTrust = () => db.update(agents).set({ permissions: { trustPreset: "low_trust_review",
+    authorizationPolicy: { trustBoundary: { mode: "low_trust_review", companyId, rootIssueId: randomUUID() } } } }).where(eq(agents.id, agentId));
+  it("b13 RED: a low-trust warm run that changed no agent file checkpoints cleanly and stays warm", async () => {
+    await lowTrust();
+    const copy = await run({ warm: true });
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const saved = await copies.checkpointWarm({ companyId, runId: copy.runId });
+      expect(warn.mock.calls.filter(call => call[1] === "Agent file checkpoint failed")).toEqual([]);
+      expect(saved).toMatchObject({ state: "warm_saved", errorCode: null, errorMessage: null });
+      expect(saved?.receipt?.checkpointState).toBe("unchanged");
+      expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+      expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
+    } finally { warn.mockRestore(); }
+  });
+  // Exercise the production heartbeat callback consumed by the native executor,
+  // rather than duplicating its saved-state-to-boolean expression in this test.
+  async function heartbeatCopy(copy: Awaited<ReturnType<typeof run>>) {
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const [currentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, copy.runId));
+    type Input = Parameters<typeof createHeartbeatInstructionWorkingCopy>[0];
+    const lifecycle = createHeartbeatInstructionWorkingCopy({ db, instructionCopies: copies,
+      agent: agent!, readRun: () => currentRun!, context: {},
+      session: { taskSession: null, taskSessionForRun: null, sessionConfigMetadata: {} as Input["session"]["sessionConfigMetadata"] },
+      workspace: { executionTarget: null, executionWorkspace: { cwd: home } as Input["workspace"]["executionWorkspace"], persistedExecutionWorkspace: null },
+      appendRunEvent: vi.fn(async () => {}),
+    });
+    type Prepare = Parameters<typeof lifecycle.prepare>[0];
+    await lifecycle.prepare({ runtimeConfig: {}, hasInstructionFilesystem: true,
+      nativeRuntimeResolution: { kind: "native", profile: { backend: "pi_rpc" } } as Prepare["nativeRuntimeResolution"],
+      nativeLifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 } });
+    expect(lifecycle.instructionCopy?.runId).toBe(copy.runId);
+    return lifecycle;
+  }
+  it("b13 RED: the executor-facing checkpointWarm callback returns true for an unchanged low-trust turn", async () => {
+    await lowTrust();
+    const copy = await run({ warm: true });
+    const lifecycle = await heartbeatCopy(copy);
+    expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(true);
+    expect(lifecycle.getInstructionSave()).toMatchObject({ state: "unchanged", errorCode: null });
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+  });
+  it("b13 KEEP: a low-trust warm run that changed an agent file is refused with the named reason and nothing is saved", async () => {
+    await lowTrust();
+    const copy = await run({ warm: true });
+    await fs.writeFile(path.join(copy.localRoot, "memory.txt"), "note written by an outside-triggered run");
+    const refused = await copies.checkpointWarm({ companyId, runId: copy.runId });
+    expect(refused?.errorCode).toBe("AGENT_FILES_CHECKPOINT_UNSTABLE");
+    expect(refused?.errorMessage).toContain("This low-trust run cannot change persistent agent instructions, including AGENTS.md");
+    const stopped = await copies.collectStopped({ companyId, runId: copy.runId });
+    expect(stopped).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_SAVE_FAILED" });
+    await expect(fs.stat(path.join(root, "memory.txt"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+  });
+  // Instrument real stores without replacing their implementation or policy.
+  function observedStore(afterWriteDenied?: () => Promise<void>) {
+    const actual = fileStoreModule.agentFileStore;
+    const stores: Array<ReturnType<typeof actual>> = [];
+    const factory = vi.spyOn(fileStoreModule, "agentFileStore").mockImplementation((...args) => {
+      const store = actual(...args);
+      vi.spyOn(store, "apply");
+      const locked = store.locked;
+      vi.spyOn(store, "locked").mockImplementation((async (...args: Parameters<typeof locked>) => {
+        try { return await locked(...args); }
+        catch (error) {
+          if (args[3]) await afterWriteDenied?.();
+          throw error;
+        }
+      }) as typeof locked);
+      stores.push(store);
+      return store;
+    });
+    copies = agentInstructionWorkingCopyService(db);
+    return { stores, restore() { factory.mockRestore(); copies = agentInstructionWorkingCopyService(db); } };
+  }
+  it.each(["one-byte", "added", "deleted", "renamed", "executable"] as const)(
+    "b13 GUARD: low-trust %s mutation reaches real store.apply and is refused without saving", async mutation => {
+      await lowTrust();
+      await fs.writeFile(path.join(root, "note.txt"), "abc");
+      await fs.chmod(path.join(root, "note.txt"), 0o600);
+      const observed = observedStore();
+      const commit = vi.spyOn(instructionAuthorization, "authorizeInstructionCommit");
+      try {
+        const before = await snapshotAgentFiles(root);
+        const copy = await run({ warm: true });
+        const note = path.join(copy.localRoot, "note.txt");
+        if (mutation === "one-byte") await fs.writeFile(note, "abd");
+        if (mutation === "added") await fs.writeFile(path.join(copy.localRoot, "new.txt"), "new");
+        if (mutation === "deleted") await fs.unlink(note);
+        if (mutation === "renamed") await fs.rename(note, path.join(copy.localRoot, "renamed.txt"));
+        if (mutation === "executable") await fs.chmod(note, 0o700);
+        const refused = await copies.checkpointWarm({ companyId, runId: copy.runId });
+        expect(refused).toMatchObject({ state: "prepared", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", candidateHash: null });
+        expect(refused?.receipt?.checkpointState).toBeUndefined();
+        const apply = observed.stores.flatMap(store => vi.mocked(store.apply).mock.results);
+        expect(apply).toHaveLength(1);
+        await expect(apply[0]!.value).rejects.toMatchObject({ status: 403, details: { reason: "deny_low_trust_boundary" } });
+        expect(commit).toHaveBeenCalledOnce();
+        expect(await snapshotAgentFiles(root)).toEqual(before);
+        expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unavailable");
+        expect(await snapshotAgentFiles(root)).toEqual(before);
+      } finally { commit.mockRestore(); observed.restore(); }
+    });
+  it("b13 GUARD: a low-trust added symlink is rejected before store.apply, not silently classified unchanged", async () => {
+    await lowTrust();
+    const observed = observedStore();
+    const warn = vi.spyOn(logger, "warn");
+    try {
+      const before = await snapshotAgentFiles(root);
+      const copy = await run({ warm: true });
+      await fs.symlink(entryFile, path.join(copy.localRoot, "link"));
+      const refused = await copies.checkpointWarm({ companyId, runId: copy.runId });
+      expect(refused).toMatchObject({ state: "prepared", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", candidateHash: null });
+      expect(refused?.receipt?.checkpointState).toBeUndefined();
+      expect(observed.stores.flatMap(store => vi.mocked(store.apply).mock.calls)).toEqual([]);
+      const failures = warn.mock.calls.filter(call => call[1] === "Agent file checkpoint failed");
+      expect(failures).toHaveLength(3);
+      for (const call of failures) expect(call[0]).toMatchObject({ err: { code: "AGENT_FILES_UNSAFE_PATH" } });
+      expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unavailable");
+      expect(await snapshotAgentFiles(root)).toEqual(before);
+    } finally { warn.mockRestore(); observed.restore(); }
+  });
+  it("b13 GUARD: revoked read access after admission returns false and records no save or unchanged receipt", async () => {
+    await lowTrust();
+    const copy = await run({ warm: true });
+    const lifecycle = await heartbeatCopy(copy);
+    const before = await snapshotAgentFiles(root);
+    await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, userId));
+    await expect(agentFileStore(db).read(companyId, agentId, entryFile,
+      { type: "agent", companyId, agentId, runId: copy.runId })).rejects.toMatchObject({ status: 403, details: { code: "RESPONSIBLE_USER_UNAVAILABLE" } });
+    expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(false);
+    const refused = await copies.get(companyId, copy.runId);
+    expect(refused).toMatchObject({ state: "prepared", candidateHash: null, errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE" });
+    expect(refused?.receipt?.checkpointState).toBeUndefined();
+    expect(lifecycle.getInstructionSave()).toMatchObject({ state: "pending_collection" });
+    expect(await snapshotAgentFiles(root)).toEqual(before);
+  });
+  it("b13 GUARD: read access revoked between write refusal and fallback cannot record unchanged", async () => {
+    await lowTrust();
+    const copy = await run({ warm: true });
+    const before = await snapshotAgentFiles(root);
+    // A real membership revocation after the write transaction has rejected,
+    // before a possible read transaction. No authorization decision is faked.
+    let revocations = 0;
+    const observed = observedStore(async () => {
+      revocations++;
+      await db.update(companyMemberships).set({ status: "suspended" }).where(eq(companyMemberships.principalId, userId));
+    });
+    const read = vi.spyOn(instructionAuthorization, "authorizeInstructionRead");
+    try {
+      const lifecycle = await heartbeatCopy(copy);
+      read.mockClear();
+      expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(false);
+      const checkpoint = await copies.get(companyId, copy.runId);
+      expect(revocations).toBe(1);
+      expect(checkpoint).toMatchObject({ state: "prepared", errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE", candidateHash: null });
+      expect(checkpoint?.receipt?.checkpointState).toBeUndefined();
+      // Base has no fallback; candidate must not turn a failed fallback into a
+      // successful receipt. Retain the actual attempt count as judge evidence.
+      console.info("b13 read-revocation observation", { readFallbackAttempts: read.mock.calls.length });
+      for (const result of read.mock.results) await expect(result.value).rejects.toMatchObject({ status: 403,
+        details: { code: "RESPONSIBLE_USER_UNAVAILABLE" } });
+      expect(lifecycle.getInstructionSave()).toMatchObject({ state: "pending_collection" });
+      expect(await snapshotAgentFiles(root)).toEqual(before);
+    } finally { read.mockRestore(); observed.restore(); }
+  });
+  it("b13 GUARD: normal-trust unchanged warm checkpoint uses the write recheck with no read fallback", async () => {
+    const copy = await run({ warm: true });
+    const observed = observedStore();
+    const read = vi.spyOn(instructionAuthorization, "authorizeInstructionRead");
+    const commit = vi.spyOn(instructionAuthorization, "authorizeInstructionCommit");
+    try {
+      const before = await snapshotAgentFiles(root);
+      const saved = await copies.checkpointWarm({ companyId, runId: copy.runId });
+      expect(saved).toMatchObject({ state: "warm_saved", errorCode: null, receipt: { checkpointState: "unchanged" } });
+      expect(commit).toHaveBeenCalledOnce(); expect(read).not.toHaveBeenCalled();
+      expect(observed.stores.flatMap(store => vi.mocked(store.apply).mock.calls)).toEqual([]);
+      expect(observed.stores.flatMap(store => vi.mocked(store.locked).mock.calls).map(call => call[3])).toEqual([true]);
+      expect(await snapshotAgentFiles(root)).toEqual(before);
+    } finally { read.mockRestore(); commit.mockRestore(); observed.restore(); }
   });
   it("rechecks authorization even for an unchanged warm checkpoint", async () => {
     const copy = await run({ warm: true });
