@@ -80,7 +80,8 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
             targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700 });
           // Commit the pulled bytes to permanent evidence BEFORE remote rm.
           await cleanupNativeSetupRuntime(runtimeDirectory, true);
-          requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 10_000 }));
+          // The remote root can hold a full Pi session history; removal shares the 60 s probe retirement budget.
+          requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 60_000 }));
           remoteCreated = false;
         }
         await cleanupNativeSetupRuntime(runtimeDirectory, true);
