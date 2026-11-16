@@ -3783,6 +3783,7 @@ export async function ensureAssignmentIssueAccessGrant(
   issue: typeof issues.$inferSelect,
   previous: Pick<typeof issues.$inferSelect, "assigneeAgentId" | "assigneeUserId" | "visibility"> | null,
   actor: { agentId?: string | null; userId?: string | null },
+  postCommitActivityPublications?: ActivityPublication[],
 ) {
   if (issue.visibility !== "private") return null;
   const subject = issue.assigneeAgentId
@@ -3839,7 +3840,7 @@ export async function ensureAssignmentIssueAccessGrant(
       subjectId: grant.subjectId,
       source: grant.source,
     },
-  });
+  }, postCommitActivityPublications);
   return grant;
 }
 
@@ -12363,13 +12364,13 @@ export function issueService(db: Db) {
             const descendants = await tx.select().from(issues).where(inArray(issues.id, protectedRows.map((row: { id: string }) => row.id)));
             for (const descendant of descendants) await ensureAssignmentIssueAccessGrant(tx, descendant, null, {
               agentId: actorAgentId ?? null, userId: actorUserId ?? null,
-            });
+            }, activityPublications);
           }
         }
         await ensureAssignmentIssueAccessGrant(tx, updated, receiptExisting, {
           agentId: actorAgentId ?? null,
           userId: actorUserId ?? null,
-        });
+        }, activityPublications);
         await recordChatCompletion(tx, receiptExisting, updated);
         // An operator explicitly choosing a disposition owns that decision,
         // including choosing In Review while the conversation is Idle.

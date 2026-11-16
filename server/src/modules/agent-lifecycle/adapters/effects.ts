@@ -12,7 +12,7 @@ export interface LifecycleEffects {
   notifyWork(db: Db): Promise<void>;
   /** The calling controller process, stamped on a lifecycle lease so restart recovery can settle a dead holder. */
   leaseHolder?(): Record<string, unknown> | null;
-  beforeStatusChange(db: Db, companyId: string, agentId: string, before: string, after: string): Promise<void>;
+  beforeStatusChange(db: Db, companyId: string, agentId: string, before: string, after: string, publications?: ActivityPublication[]): Promise<void>;
   beforeConnectionEligibilityRestore?(db: Db, companyId: string, agentId: string): Promise<void>;
   reportFailure(context: LifecycleFailure, error: unknown): void;
   deleteDependencies(db: Db, companyId: string, agentId: string): Promise<void>;
