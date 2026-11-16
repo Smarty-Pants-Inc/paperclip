@@ -195,27 +195,45 @@ checks are not separate-host, deployed, or daily-work qualification.
 
 ## Native admission deadline
 
-The native Pi proxy passes an explicit `startupTimeoutMs` to `PiRpcDriver` for
-model/thinking admission and each private bind exchange, including
-`tool_inventory`. The proxy default is 10,000 ms, matching the driver's existing
-metadata-discovery budget and allowing inventory replies beyond the standalone
-driver's 5,000 ms fallback. This does not change the separate cold-process
-`processStartupTimeoutMs` budget.
+The native Pi proxy and in-process backend use the same
+`PAPERCLIP_PI_ADMISSION_TIMEOUT_MS` validation helper and pass an explicit
+`startupTimeoutMs` to `PiRpcDriver`. Both default to 10,000 ms, allowing inventory
+replies beyond the standalone driver's 5,000 ms private-exchange fallback. The
+in-process backend can also supply `startupTimeoutMs` as a validated fallback;
+an explicit environment value takes precedence. Neither integration reads this
+setting from ambient process environment.
+
+After cold-process readiness, one monotonic admission-wide budget is shared by
+model/thinking RPCs, private exchanges (including `tool_inventory`, `settle`,
+`bind` and `begin_turn`), metadata discovery and any deferred bootstrap settlement.
+Each exchange receives the smaller of its own limit and the remaining budget;
+completing an exchange never resets that budget. Each warm attach, reconnect,
+claim/input admission and pre-compaction admission gets a fresh budget shared
+by its own RPCs and private exchanges. Prompt acceptance and model/compaction
+execution retain their separate deadlines. Cold-process readiness also retains
+its separate `processStartupTimeoutMs` budget; this is not a total cold-open
+wall-clock bound.
 
 Runner callers can supply `PAPERCLIP_PI_ADMISSION_TIMEOUT_MS` in the transport's
 explicit `options.environment`. It crosses the existing Pi provider environment
 projection and runner-core's Pi-specific child allowlist; it is not inherited
 from ambient environment or supplied by task-configured environment projection.
-The proxy accepts only integer milliseconds from 1 through 29,999. Values at or
-above runner-core's 30,000 ms facade receive wait (and other invalid values) fail
-with `pi_admission_deadline_invalid` before opening Pi. Private-request expiry
-reports `Pi private request timed out`; a lost receipt never triggers a retry or
-prompt. The deadline applies per exchange, not to a whole multi-exchange open.
+Both integrations accept only integer milliseconds from 1 through 29,999.
+Values at or above runner-core's 30,000 ms facade receive wait (and other invalid
+values) fail with `pi_admission_deadline_invalid` before opening Pi. Admission
+budget exhaustion has the named code `pi_admission_deadline_exceeded`, exposed
+by the proxy as JSON-RPC `error.data.code`. Private-request expiry preserves the
+existing `Pi private request timed out` message. A lost receipt never triggers a
+retry or prompt.
 
-`pi-rpc-admission-deadline.test.ts` drives the production-shaped proxy config
-through real private sockets: a 6-second inventory reply succeeds, a reply past
-the configured deadline fails after one exchange without prompting, and values
-at or beyond the facade wait are rejected. This is hermetic boundary proof,
+`pi-rpc-admission-deadline.test.ts` drives production-shaped proxy and in-process
+backend config through real private sockets: 6-second inventory replies succeed
+with default and explicit deadlines, a reply past the configured deadline fails
+after one exchange without prompting, and values at or beyond the facade wait
+are rejected. Four 7.9-second private replies would each fit an 8-second
+per-exchange limit but exceed the facade's 30-second wait in aggregate; the
+shared budget instead refuses admission during the second exchange at 8 seconds,
+with the named deadline code and no prompt. This is hermetic boundary proof,
 not deployed-provider or daily-work qualification.
 
 ## Lost acknowledgments
