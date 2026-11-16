@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import { LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectNoTokenLeak } from "./helpers/token-leak.js";
 import { awsSecretsManagerProvider } from "../secrets/aws-secrets-manager-provider.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
 import { SecretProviderClientError } from "../secrets/types.js";
@@ -2652,7 +2653,7 @@ describeEmbeddedPostgres("secretService", () => {
     expect(versions).toHaveLength(1);
     expect(versions[0]?.providerVersionRef).toBe("version-1");
     expect(JSON.stringify(versions[0])).not.toContain("runtime-secret");
-    expect(JSON.stringify(versions[0])).not.toContain("sk-");
+    expectNoTokenLeak(versions[0], ["runtime-secret"]);
 
     await expect(
       svc.resolveSecretValue(companyId, secret.id, "latest", {
@@ -3810,7 +3811,7 @@ describeEmbeddedPostgres("secretService", () => {
       .where(eq(companySecretVersions.secretId, imported!.id));
     expect(versions).toHaveLength(1);
     expect(JSON.stringify(versions[0])).not.toContain("runtime-secret");
-    expect(JSON.stringify(versions[0])).not.toContain("sk-");
+    expectNoTokenLeak(versions[0], ["runtime-secret"]);
   });
 
   it("sanitizes AWS remote import row provider errors", async () => {
