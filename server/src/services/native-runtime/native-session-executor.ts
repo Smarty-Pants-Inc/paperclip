@@ -19856,7 +19856,7 @@ async function createRunnerdBackendWithinSessionClaim(
     await input.trace?.record({ name: "provider.session.restore_unavailable_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
       attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
         refusalCode: code, reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON } });
-    await input.onLog?.("stdout", `[paperclip-runner] continuing from saved history: the backup could not be restored on this `
+    await input.onLog?.("stdout", `[paperclip-runner] continuing in a fresh provider thread: the backup could not be restored on this `
       + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON}).\n`);
     const { companyId, issueId, agentId, runId } = input.execution.binding;
     await writeRestoreUnavailableContinuationNotice(input.db, { companyId, issueId, agentId, runId, code,
