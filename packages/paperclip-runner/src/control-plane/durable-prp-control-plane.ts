@@ -674,8 +674,10 @@ function isUnauthenticatedBootstrapState(state: StoredCoreState, expected: Parti
       || Object.values(state.tickets).some(ticket => ticket.usedAt !== null || ticket.warmTransitionId !== undefined)
       || Object.keys(state.leases).length !== 0 || state.lastLeaseId !== null || state.lastLeaseExpiresAt !== null
       || state.replayDeliveries !== 0 || state.duplicateCommandResults !== 0
-      || state.commands.length < 2 || state.commands[0]?.type !== "run.prepare"
-      || state.commands[1]?.type !== "session.open"
+      // session.open is queued only after run.prepare is answered; until then a
+      // start and each same-run retry of it leave only pending run.prepare commands.
+      || state.commands[0]?.type !== "run.prepare"
+      || (state.commands[1]?.type !== "session.open" && state.commands.some(command => command.type !== "run.prepare"))
       || state.commands.some(command => command.status !== "pending" || command.result !== null));
 }
 
