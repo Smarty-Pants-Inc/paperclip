@@ -41,7 +41,7 @@ describe("task Stop proof does not invert the native coordinator/run order", () 
       runtimeMode: "native", nativeIssueId: issueId, startedAt: new Date(Date.now() - 60_000), finishedAt: new Date(),
       processPid: 2_000_000_000, contextSnapshot: { issueId }, resultJson: { retainedDiagnostic: "never remove" } });
     await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, issueId));
-    await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, agentId,
+    await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
       phase: "observed", leaseOwner: "expired-owner", leaseExpiresAt: new Date(Date.now() - 60_000) });
     return { companyId, agentId, issueId, runId };
   }
@@ -73,7 +73,7 @@ describe("task Stop proof does not invert the native coordinator/run order", () 
       } });
     }
     const sweepDb = new Proxy(db, { get(target, property) {
-      if (property === "transaction") return (effect: (tx: Db) => unknown) => target.transaction(tx => effect(new Proxy(tx, {
+      if (property === "transaction") return (effect: (tx: Db) => Promise<unknown>) => target.transaction(tx => effect(new Proxy(tx, {
         get(transaction, key) {
           if (key === "select") return (...args: unknown[]) => selectBarrier((transaction.select as any)(...args));
           const value = Reflect.get(transaction, key);
