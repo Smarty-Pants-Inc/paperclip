@@ -1,4 +1,4 @@
-import { projectConnectionAdmissionSnapshot, projectConnectionRunSnapshot } from "../project-connection-run-context.js";
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot, projectConnectionRunSnapshot } from "../project-connection-run-context.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -5249,6 +5249,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .returning()
             .then((rows) => rows[0]);
 
+          await captureProjectConnectionRunContext(tx, {
+            companyId: agent.companyId, agentId, heartbeatRunId: newRun.id,
+          });
           if (ownsReconstructionContinuation) {
             await tx.update(issueRecoveryActions).set({ evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
               continuationDelivery: "delivered", continuationRunId: newRun.id,
@@ -5553,6 +5556,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .returning()
         .then((rows) => rows[0]);
 
+      await captureProjectConnectionRunContext(tx, {
+        companyId: agent.companyId, agentId, heartbeatRunId: newRun.id,
+      });
       const continuedIssueId = readNonEmptyString(enrichedContextSnapshot.issueId);
       if (continuedIssueId && readNonEmptyString(enrichedContextSnapshot.freshContinuationIsolation)) {
         await tx.execute(sql`select id from issues where company_id = ${agent.companyId} and id = ${continuedIssueId} for update`);

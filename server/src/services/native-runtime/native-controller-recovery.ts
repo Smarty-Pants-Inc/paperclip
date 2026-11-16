@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "../project-connection-run-context.js";
 import { createHash } from "node:crypto";
 import { posix } from "node:path";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
@@ -163,7 +164,7 @@ export async function deferNativeRunForBusyAgentDirectory(db: Db, input: {
       || (["run", "issue"].includes(String(cancellation.scope)) && ["pending", "acknowledged"].includes(String(cancellation.dispatchState)))
       || deferrals >= input.maxDeferrals) return "refused";
     await notifyNativeFinalizationWork(tx, { companyId: input.companyId, issueId: current.issueId, runId: input.runId });
-    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, agentDirectoryBusyDeferrals: deferrals + 1 }, updatedAt: new Date() })
+    await tx.update(heartbeatRuns).set({ contextSnapshot: projectConnectionRunSnapshot({ ...context, agentDirectoryBusyDeferrals: deferrals + 1 }), updatedAt: new Date() })
       .where(eq(heartbeatRuns.id, input.runId));
     const detail = record(owner.failureDetail);
     await tx.update(nativeRunFinalizations).set({

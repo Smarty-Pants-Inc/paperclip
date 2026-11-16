@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { randomUUID } from "node:crypto";
@@ -14,6 +15,9 @@ export async function materializeNativeProviderCapacityRetry(input: {
   runId: string;
   agentId: string;
 }) {
+  const admissionSnapshot = await projectConnectionAdmissionSnapshot(input.tx, {
+    companyId: input.companyId, agentId: input.agentId, issueId: input.issueId, contextSnapshot: { issueId: input.issueId },
+  });
   const [run] = await input.tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
     eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId),
@@ -41,6 +45,7 @@ export async function materializeNativeProviderCapacityRetry(input: {
   ]) delete predecessorContext[key];
   const contextSnapshot = {
     ...predecessorContext,
+    projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext,
     issueId: input.issueId,
     taskId: input.issueId,
     forceFreshSession: true,
@@ -68,6 +73,9 @@ export async function materializeNativeProviderCapacityRetry(input: {
     scheduledRetryAttempt: attempt, scheduledRetryAt: dueAt,
     error: NATIVE_PROVIDER_OVERLOADED_MESSAGE, errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
     contextSnapshot,
+  });
+  await captureProjectConnectionRunContext(input.tx, {
+    companyId: input.companyId, agentId: input.agentId, heartbeatRunId: retryId,
   });
   return retryId;
 }

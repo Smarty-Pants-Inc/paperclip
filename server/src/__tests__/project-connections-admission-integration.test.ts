@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { materializeNativeProviderCapacityRetry } from "../services/native-runtime/native-provider-capacity-retry.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { readProjectConnectionRunContext } from "../services/project-connection-run-context.js";
 import { lockProjectConnectionLifecycle } from "../services/project-connection-retirement.js";
@@ -70,5 +71,23 @@ describe("integration J17/J18 production run admission", () => {
     expect(run).not.toBeNull();
     const [stored] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run!.id), eq(heartbeatRuns.companyId, f.companyId)));
     expect(stored!.contextSnapshot?.projectConnectionRunContext).toEqual({ version: 1, issueId: null, projectId: null });
+  });
+
+  it("C-2/J17/J18: actual native-capacity successor admits its task project before scheduled-retry commit", async () => {
+    const f = await projectConnectionFixture(db);
+    const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Capacity successor",
+      assigneeAgentId: f.leadA.id, responsibleUserId: f.human, projectId: f.a.id }).returning();
+    const [predecessor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id,
+      nativeIssueId: issue!.id, runtimeMode: "native", status: "failed", responsibleUserId: f.human,
+      contextSnapshot: { issueId: issue!.id, projectId: f.b.id,
+        projectConnectionRunContext: { version: 1, issueId: issue!.id, projectId: f.b.id } } }).returning();
+    const retryId = await db.transaction(tx => materializeNativeProviderCapacityRetry({ tx: tx as unknown as typeof db,
+      companyId: f.companyId, agentId: f.leadA.id, issueId: issue!.id, runId: predecessor!.id }));
+    const [retry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retryId));
+    expect(retry!.status).toBe("scheduled_retry");
+    expect(retry!.contextSnapshot?.projectConnectionRunContext).toEqual({ version: 1, issueId: issue!.id, projectId: f.a.id });
+    await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, retryId));
+    expect(await readProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: retryId }))
+      .toMatchObject({ issueId: issue!.id, projectId: f.a.id });
   });
 });

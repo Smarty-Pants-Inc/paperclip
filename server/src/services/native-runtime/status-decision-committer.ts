@@ -1,3 +1,4 @@
+import { projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { forbidden, HttpError } from "../../errors.js";
@@ -1706,6 +1707,14 @@ export async function commitNativeStatusDecision(input: {
   const publications: ActivityPublication[] = [];
   const terminalRunsToEmit: (typeof heartbeatRuns.$inferSelect)[] = [];
   const committed = await input.db.transaction(async (tx) => {
+    if (reasonCode.startsWith("native_provider_overloaded")) {
+      const [origin] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
+      ));
+      if (origin) await projectConnectionAdmissionSnapshot(tx, {
+        companyId: input.companyId, agentId: origin.agentId, issueId: input.issueId, contextSnapshot: { issueId: input.issueId },
+      });
+    }
     const retiredReview = input.requireReassessmentSource?.retiredAutomaticReview;
     if (retiredReview && !await lockCurrentNativeCompletionContract(tx as unknown as Db, {
       companyId: input.companyId, issueId: input.issueId, contractId: retiredReview.contractId,

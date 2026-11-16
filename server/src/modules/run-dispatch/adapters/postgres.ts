@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "../../../services/project-connection-run-context.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
@@ -1386,7 +1387,7 @@ export function createPostgresRunDispatchAdapter(
         status: "scheduled_retry",
         scheduledRetryAt,
         updatedAt: now,
-        contextSnapshot: { ...parseObject(run.contextSnapshot), scheduledRetryAt: scheduledRetryAt.toISOString() },
+        contextSnapshot: projectConnectionRunSnapshot({ ...parseObject(run.contextSnapshot), scheduledRetryAt: scheduledRetryAt.toISOString() }),
         resultJson: { ...parseObject(run.resultJson), executionWait },
       })
       .where(and(

@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "./project-connection-run-context.js";
 import { createHash } from "node:crypto";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -132,7 +133,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
           : [];
         await tx.update(heartbeatRuns)
           .set({
-            contextSnapshot: { ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] },
+            contextSnapshot: projectConnectionRunSnapshot({ ...contextSnapshot, [REGISTRY_KEY]: [...currentEntries, entry] }),
             updatedAt: new Date(),
           })
           .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId)));
