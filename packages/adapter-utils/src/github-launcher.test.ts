@@ -51,7 +51,7 @@ describe("managed GitHub launchers", () => {
         res.setHeader("content-type", "application/json");
         if (socketRequests === 1) {
           res.statusCode = 503;
-          res.end(JSON.stringify({ error: "native_github_access_stale_runner_token" }));
+          res.end(JSON.stringify({ error: "native_github_access_capability_pending" }));
         } else {
           res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "operation-token" } }));
         }
@@ -74,6 +74,34 @@ describe("managed GitHub launchers", () => {
     expect(received).toEqual({ method: "POST", url: "/runtime-tools/github/credentials", body: "{}",
       capability: undefined });
     expect(fallbackRequests).toBe(0);
+  });
+
+  it("does not retry a stale runner token or wait for a later response", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-stale-runner-token-"));
+    cleanups.push(() => rm(root, { recursive: true, force: true }));
+    const managed = path.join(root, "managed"), real = path.join(root, "real");
+    await mkdir(managed); await mkdir(real);
+    await writeFile(path.join(managed, "git"), githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
+    await writeFile(path.join(real, "git"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || "anonymous");\n`, { mode: 0o700 });
+    const socketPath = path.join(root, "runner.sock");
+    let socketRequests = 0;
+    const socketServer = createServer((_req, res) => {
+      socketRequests += 1;
+      res.statusCode = 503;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ error: socketRequests === 1
+        ? "native_github_access_stale_runner_token" : "should-not-be-retried" }));
+    });
+    await new Promise<void>(resolve => socketServer.listen(socketPath, resolve));
+    cleanups.push(() => new Promise<void>(resolve => socketServer.close(() => resolve())));
+    const env = {
+      ...githubBrokerEnvironment({ PAPERCLIP_GITHUB_ACCESS_TRANSPORT: "runner_ingress" }, { url: "", token: "" }),
+      PAPERCLIP_GITHUB_RUNNER_SOCKET: socketPath,
+      PATH: `${managed}${path.delimiter}${real}${path.delimiter}${process.env.PATH}`,
+    };
+    const result = await exec(path.join(managed, "git"), ["remote", "-v"], { cwd: root, env });
+    expect(socketRequests, result.stderr).toBe(1);
+    expect(result.stdout).toBe("anonymous");
   });
 
   it.each(["", "relative/node", "/runtime/node --flag", "/runtime/node\nexit 1", "/runtime/node\0"])(
