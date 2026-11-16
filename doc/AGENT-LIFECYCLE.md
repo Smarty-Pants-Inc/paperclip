@@ -444,6 +444,7 @@ and failed attempts use the same growing backoff helper as verification. After
 five incomplete attempts the operation parks with `retryRequired: true`, no
 `retryAt`, and a visible `lifecycleError` naming the blocking invocation when the
 stop evidence identifies one, or the required plugin for pending plugin work.
+These parked Stop diagnostics include the stable code `lifecycle_stop_retry_required`.
 When no invocation can be identified, the error names the lifecycle operation
 and the unresolved stop/cleanup proof rather than inventing an invocation ID.
 The phase and all unfinished resources are retained; parking is not stop proof.
