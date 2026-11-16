@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { redactSecretShapes } from "./secret-shapes.js";
 import { leakedPemWindows, secretShapePemVectors } from "./secret-shapes-pem.test-fixture.js";
+import { identityMarkPrecisionInputs } from "./secret-shapes-identity.test-fixture.js";
 import { shapeAssignments, shapeNegatives, shapePems, shapeTokens } from "./drivers/pi/pi-shape-redaction.test-fixture.js";
 
 // Keep reason: data-safety trust boundary; these check exact kinds and the pure
@@ -42,6 +43,17 @@ describe("redactSecretShapes", () => {
       expect(redactSecretShapes(text)).toBe(text);
     },
   );
+  it.for(identityMarkPrecisionInputs)("O1: preserves $name after an identity mark", ({ text }) => {
+    expect(redactSecretShapes(text)).toBe(text);
+    expect(redactSecretShapes(redactSecretShapes(text))).toBe(text);
+  });
+  it("still hides a contiguous PEM body immediately following an identity mark", () => {
+    const body = "AbCdEf01+/".repeat(16);
+    const output = redactSecretShapes(`***REDACTED***${body}`);
+    expect(output).not.toContain(body);
+    expect(output).toContain("***REDACTED***");
+    expect(redactSecretShapes(output)).toBe(output);
+  });
   it("preserves a large non-PEM base64-looking dump, including after an orphan END", () => {
     const dump = `${"A".repeat(76)}\n`.repeat(10_000);
     expect(redactSecretShapes(dump)).toBe(dump);

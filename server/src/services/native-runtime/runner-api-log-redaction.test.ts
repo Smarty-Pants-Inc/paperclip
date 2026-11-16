@@ -1,5 +1,43 @@
+import { generateKeyPairSync } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { identityMarkPrecisionInputs } from "../../../../packages/paperclip-runner/src/secret-shapes-identity.test-fixture.js";
+import { leakedPemWindows, secretShapePemVectors } from "../../../../packages/paperclip-runner/src/secret-shapes-pem.test-fixture.js";
+import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { redactRunnerApiEvent, redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
+
+// Data-safety and precision at the actual identity -> persisted event boundary.
+// Also run this suite on the exact efe82e8f merge, not a regex projection of it.
+describe("composed identity/shape persistence", () => {
+  it.each(identityMarkPrecisionInputs)("O1: keeps $name in both orders", ({ text }) => {
+    const identity = createAgentIdentityRedactor();
+    const secret = "fake-registered-value";
+    identity.values.push(secret);
+    const input = { eventType: "item.completed", sourceKind: "runner", payload: { text: text.replaceAll("***REDACTED***", secret) } };
+    const expected = { ...input, payload: { text } };
+    expect(redactRunnerApiEvent(identity.redact(input))).toEqual(expected);
+    // In the reverse order a named assignment is already shape-masked before
+    // the exact-value redactor sees it. Its mark kind may differ; its complete
+    // surrounding transcript must still survive byte-for-byte.
+    expect(identity.redact(redactRunnerApiEvent(input))).toEqual({ ...expected, payload: {
+      text: text.replace("GH_TOKEN=***REDACTED***", "GH_TOKEN=[REDACTED:assignment]"),
+    } });
+    expect(redactRunnerApiEvent(expected)).toEqual(expected);
+    expect(input.payload.text).toContain(secret);
+  });
+  it.each([false, true])("hides all supported PEM vectors in both orders (configured=%s)", configured => {
+    const key = configured ? generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString() : undefined;
+    for (const { text, body, keyType, name } of secretShapePemVectors().filter(vector => vector.supported)) {
+      const identity = createAgentIdentityRedactor(key);
+      const input = { eventType: "item.completed", sourceKind: "runner", payload: { text } };
+      for (const output of [redactRunnerApiEvent(identity.redact(input)), identity.redact(redactRunnerApiEvent(input))]) {
+        expect(leakedPemWindows(output.payload.text, body), `${keyType} ${name}`).toBe(0);
+        expect(output.payload.text).not.toMatch(/-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/);
+        expect(redactRunnerApiEvent(output)).toEqual(output);
+      }
+      expect(input.payload.text).toBe(text);
+    }
+  });
+});
 
 describe("API payload persistence redaction", () => {
   it.each(["POST /api/agents/me/secrets/{key}/value", "POST /api/companies/{companyId}/exports", "GET /api/projects/{id}"])("preserves private HTTP results on the wire, but omits %s from history", operationId => {

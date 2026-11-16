@@ -1,11 +1,11 @@
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { secretShapePerformanceInputs } from "./secret-shapes-performance.test-fixture.js";
+import { secretShapePerformanceInputsAt } from "./secret-shapes-performance.test-fixture.js";
 
 // Keep reason: data safety / event-loop availability at the server output trust
 // boundary. Isolate RED so a quadratic regexp cannot hang the test coordinator.
-describe("secret-shape 1 MiB adversarial budget", () => {
-  it.for(secretShapePerformanceInputs)("finishes $name in less than 100 ms", ({ name, text }) => {
+describe.each([1, 4])("secret-shape %i MiB adversarial budget", mib => {
+  it.for(secretShapePerformanceInputsAt(mib * 1024 * 1024))("finishes $name in less than 100 ms", ({ name, text }) => {
     const moduleUrl = new URL("./secret-shapes.ts", import.meta.url).href;
     const probe = spawnSync(process.execPath, ["--input-type=module", "-e", `
       import { readFileSync } from 'node:fs';
