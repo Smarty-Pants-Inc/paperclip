@@ -1,3 +1,4 @@
+import { markReattachAuthenticated } from "../heartbeat/run-admission.js";
 import { existsSync } from "node:fs";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import type { SandboxRunnerRetention } from "./sandbox-runner-retention.js";
@@ -352,6 +353,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     "runner.prp.authenticate",
                     () => outbound!.ready,
                   );
+                  markReattachAuthenticated(input.binding.runId);
                   await measureNativeControllerStep("process_identity_ready", () => input.processIdentityReady);
                 },
                 { parentName: "runner.session.startup" },

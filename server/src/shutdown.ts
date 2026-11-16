@@ -8,8 +8,6 @@ type ShutdownLogger = {
 };
 
 export const PRE_DRAIN_SHUTDOWN_BUDGET_MS = 20_000;
-// about 12 warm chats per stop at ~6 s each, fewer if earlier pre-drain steps use part of the 20 s budget
-export const RESTART_WARM_CLOSE_CONCURRENCY = 4;
 
 export type ShutdownStepResult<T> =
   | { outcome: "completed"; value: T; durationMs: number }
@@ -25,18 +23,19 @@ export async function runBoundedShutdownStep<T>(input: {
   step: string;
   signal: "SIGINT" | "SIGTERM";
   timeoutMs: number;
-  run: () => Promise<T>;
+  run: (abort: AbortSignal) => Promise<T>;
   log: ShutdownLogger;
   now?: () => number;
 }): Promise<ShutdownStepResult<T>> {
   const now = input.now ?? Date.now;
   const startedAt = now();
   const timeoutMs = Math.max(0, input.timeoutMs);
+  const abort = new AbortController();
   let timer: NodeJS.Timeout | null = null;
   try {
     const result = await Promise.race([
       Promise.resolve()
-        .then(input.run)
+        .then(() => input.run(abort.signal))
         .then(
           (value) => ({ outcome: "completed" as const, value }),
           (error: unknown) => ({ outcome: "failed" as const, error }),
@@ -56,6 +55,7 @@ export async function runBoundedShutdownStep<T>(input: {
       input.log.error({ ...fields, err: result.error }, "shutdown step failed; continuing shutdown");
       return { outcome: "failed", error: result.error, durationMs };
     }
+    abort.abort(new Error(`shutdown step ${input.step} timed out`));
     input.log.info(fields, "shutdown step timed out; continuing shutdown without it");
     return { outcome: "timed_out", durationMs };
   } finally {
@@ -72,7 +72,7 @@ export function createPreDrainShutdownBudget(input: {
   const now = input.now ?? Date.now;
   const deadline = now() + (input.budgetMs ?? PRE_DRAIN_SHUTDOWN_BUDGET_MS);
   return {
-    run<T>(step: string, run: () => Promise<T>) {
+    run<T>(step: string, run: (abort: AbortSignal) => Promise<T>) {
       return runBoundedShutdownStep({
         step,
         signal: input.signal,

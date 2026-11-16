@@ -66,7 +66,8 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
             return;
           }
           if (host === "pending" || typeof host === "object") {
-            if (!await runStep("defer", () => deferIncomplete(null, typeof host === "object" ? host : undefined))) continue;
+            const pendingReason = typeof host === "object" ? host.pending : "host_step_pending";
+            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date(), { pendingReason }))) continue;
             return;
           }
           if (!await runStep("complete_host", () => store.completeHost(agent, owner))) continue;
@@ -79,7 +80,7 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           }
           if (!await runStep("renew", () => store.renew(agent, owner, new Date()))) continue phase;
           if (await runStep("plugin", () => driver.runPlugin(agent, pluginId), pluginId) === "pending") {
-            if (!await runStep("defer", () => deferIncomplete(null, { pluginId }))) continue phase;
+            if (!await runStep("defer", () => store.defer(agent, owner, null, new Date(), { pendingReason: "plugin_step_pending" }))) continue phase;
             return;
           }
           if (!await runStep("complete_plugin", () => store.completePlugin(agent, owner, pluginId), pluginId)) continue phase;
