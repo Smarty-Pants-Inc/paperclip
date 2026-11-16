@@ -3409,12 +3409,6 @@ describe("remote provider pack manifest", () => {
       if (inspectionResets > 0 && inspectionReset && script.includes("base64 <") && script.includes(inspectionReset)
         && (inspectionReset === "runner-state.json" || !script.includes("runner-state.json"))) {
         inspectionResets--;
-        // The pre-syncOut inspector surfaces a failed state read as empty output,
-        // which its JSON parser misclassifies; the syncOut path below gets the
-        // transport exception directly and the checkpoint caller can retry it.
-        if (provider === "opencode-new-durable-inspect-reset" && inspectionReset === "runner-state.json") {
-          return { exitCode: 0, signal: null, timedOut: false, stderr: "", stdout: "" };
-        }
         throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
       }
       const statePath = /^test -f '([^']+)'/.exec(script)?.[1];
