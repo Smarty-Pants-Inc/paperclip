@@ -123,7 +123,7 @@ class FakeBoat {
 
 type Harness = { name: string; boat: FakeBoat; company: string; env: string; emit(eventType: string): Promise<void>;
   acquire(runId: string): Promise<{ providerLeaseId: string | null }>; dbCalls: Array<{ inAcquire: boolean; sql: string }>;
-  warnings: string[]; state: Map<string, unknown> };
+  warnings: string[]; state: Map<string, unknown>; config: Record<string, unknown> };
 
 let acquireDepth = 0;
 let current: Harness | undefined;
@@ -154,7 +154,7 @@ async function harness(name: string, spareMax = 3, extraConfig: Record<string, u
     claims.add(String(params[0]));
     return { rowCount: 1 };
   } };
-  const instanceConfig = { spares: 1, spareMax, spareDemandWindowMinutes: 10, spareEnvironmentIds: [env], spareIdleMinutes: IDLE_MINUTES, ...extraConfig };
+  const instanceConfig: Record<string, unknown> = { spares: 1, spareMax, spareDemandWindowMinutes: 10, spareEnvironmentIds: [env], spareIdleMinutes: IDLE_MINUTES, ...extraConfig };
   const warn = (message: string) => { warnings.push(message); boat.record({ kind: "warn", note: message }); };
   await plugin.definition.setup({
     config: { get: async () => instanceConfig },
@@ -175,7 +175,7 @@ async function harness(name: string, spareMax = 3, extraConfig: Record<string, u
   } as any);
   await plugin.definition.onConfigChanged!(instanceConfig, { companyId: company } as any);
   const h: Harness = {
-    name, boat, company, env, dbCalls, warnings, state,
+    name, boat, company, env, dbCalls, warnings, state, config: instanceConfig,
     emit(eventType) {
       const handler = eventHandlers.get(eventType);
       if (!handler) throw new Error(`no handler for ${eventType}`);
@@ -494,5 +494,79 @@ describe("Spare create cap: proof of use, refusal event and hourly ceiling", () 
     expect(events.at(-1)!.value).toMatchObject({ companyId: h.company, environmentId: h.env,
       kind: "spare", reason: "ceiling", ceiling: 6, allCreates: 6 });
     h.boat.record({ kind: "event", note: "RULING-A-SPARE", value: { spareCreates, event: events.at(-1)!.value } });
+  });
+});
+
+// Review-fleet-2 judge of 7cb44662 (smarty-dev#20869), kept as permanent tests.
+// F1 (loop v): the hour's RUN creates must survive a worker restart.
+const boatCreatesBefore = (h: Harness, seq = Number.POSITIVE_INFINITY) =>
+  h.boat.log.filter(e => e.kind === "boat" && e.method === "POST" && e.path === "/sandboxes" && e.seq < seq).length;
+const kindOf = (e: LogEntry) => (e.value as { kind?: string } | undefined)?.kind;
+/** The judge's rapid loop: claim, one trivial execute, release; until Boat holds `until` creates. */
+async function rapidUseUntil(h: Harness, prefix: string, until: number, maxLoops = 40): Promise<{ loops: number; warm: number }> {
+  let loops = 0, warm = 0;
+  while (boatCreatesBefore(h) < until && loops < maxLoops) {
+    const lease = await settle(h.acquire(`${prefix}-${loops}`));
+    expect(lease.providerLeaseId, "every run gets a lease (ruling A)").toBeTruthy();
+    if (h.boat.boxes.get(lease.providerLeaseId!)?.labels.purpose === "spare") warm++;
+    expect((await execute(h, lease.providerLeaseId!)).exitCode).toBe(0);
+    await release(h, lease.providerLeaseId!);
+    loops++;
+  }
+  return { loops, warm };
+}
+/** All worker-local state is discarded; only Boat's rows and the company config remain. */
+async function restartWorker(h: Harness): Promise<void> {
+  await settle(Promise.resolve(plugin.definition.onShutdown?.()));
+  eventHandlers.clear();
+  await plugin.definition.setup({ config: { get: async () => h.config },
+    logger: { info: vi.fn((message, meta) => h.boat.record({ kind: "event", note: `info: ${message}`, value: meta })),
+      warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    db: { namespace: "boat_sandbox_provider", execute: async () => ({ rowCount: 1 }) },
+    events: { on: (type: string, _filter: unknown, handler: (event: unknown) => Promise<void>) => {
+      eventHandlers.set(type, handler); return () => eventHandlers.delete(type);
+    } },
+    state: { get: async (k: any) => h.state.get(`${k.scopeId}:${k.stateKey}`) ?? null,
+      set: async (k: any, value: unknown) => { h.state.set(`${k.scopeId}:${k.stateKey}`, value); } },
+  } as any);
+  await plugin.definition.onConfigChanged!(h.config, { companyId: h.company } as any);
+}
+describe("Judge F1/F2: the all-create count survives a restart; unbound use and run-heavy hours", () => {
+  it("RESTART-CEILING after a worker restart the counted total equals Boat's creates, the run alarm fires and a spare is refused", async () => {
+    const CEILING = 8;
+    const h = await harness("restart-ceiling", 1, { createCeilingPerHour: CEILING });
+    await seed(h);
+    const beforeRestart = await rapidUseUntil(h, "before-restart", CEILING + 3);
+    const atRestart = { spare: h.boat.creates().length, run: h.boat.creates("run").length, total: boatCreatesBefore(h) };
+    expect(atRestart.total).toBeGreaterThanOrEqual(CEILING + 3);
+    expect(atRestart.run, "past the ceiling the loop runs cold").toBeGreaterThan(1);
+    await restartWorker(h);
+    const restartSeq = h.boat.record({ kind: "event", note: "WORKER-RESTARTED" }).seq;
+    const afterRestart = await rapidUseUntil(h, "after-restart", atRestart.total + 3);
+    await advance(5_000);
+    const after = (e: LogEntry) => e.seq > restartSeq;
+    const runEvents = cappedEvents(h, "ceiling").filter(e => after(e) && kindOf(e) === "run");
+    const spareEvents = cappedEvents(h, "ceiling").filter(e => after(e) && kindOf(e) === "spare");
+    const observed = { beforeRestart, atRestart, afterRestart, boatTotal: boatCreatesBefore(h),
+      runEvents: runEvents.map(e => ({ allCreates: (e.value as any).allCreates, boatCreatesBefore: boatCreatesBefore(h, e.seq) })),
+      spareEvents: spareEvents.map(e => ({ allCreates: (e.value as any).allCreates, boatCreatesBefore: boatCreatesBefore(h, e.seq), source: (e.value as any).source })),
+      sparePostsAfterRestart: h.boat.creates().filter(after).length };
+    h.boat.record({ kind: "event", note: "RESTART-CEILING", value: observed });
+    // Runs are still admitted (ruling A), and each is counted on top of Boat's hour.
+    expect(h.boat.creates("run").length, JSON.stringify(observed)).toBeGreaterThan(atRestart.run);
+    expect(runEvents.length, `the over-ceiling run alarm fires after the restart: ${JSON.stringify(observed)}`).toBeGreaterThan(0);
+    expect(runEvents[0].value).toMatchObject({ companyId: h.company, environmentId: h.env, kind: "run", reason: "ceiling", ceiling: CEILING });
+    // Each alarm's count is Boat's actual creates at that moment, the hour's
+    // creates from before the restart included.
+    for (const event of observed.runEvents) expect(event.allCreates, JSON.stringify(observed)).toBe(event.boatCreatesBefore);
+    expect(observed.runEvents[0].allCreates).toBeGreaterThan(atRestart.total - 1);
+    expect(spareEvents.length, `a spare create is refused at the ceiling after the restart: ${JSON.stringify(observed)}`).toBeGreaterThan(0);
+    for (const event of observed.spareEvents) expect(event.allCreates, JSON.stringify(observed)).toBe(event.boatCreatesBefore);
+    expect(observed.sparePostsAfterRestart, JSON.stringify(observed)).toBe(0);
+    const health = await settle(plugin.definition.onHealth!());
+    expect(health.status).toBe("degraded");
+    expect(health.details).toMatchObject({ createCapped: expect.arrayContaining([
+      expect.objectContaining({ kind: "run", reason: "ceiling", companyId: h.company, ceiling: CEILING }),
+    ]) });
   });
 });
