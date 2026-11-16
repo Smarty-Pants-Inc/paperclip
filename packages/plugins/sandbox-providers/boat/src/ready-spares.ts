@@ -2,7 +2,24 @@ import { createHash, randomUUID } from "node:crypto";
 
 export const MAX_READY_SPARES = 5;
 export const MAX_CONFIGURED_READY_SPARES = 3;
+/**
+ * Churn cap: spare creates per company per rolling hour that no run has proven
+ * it used. A claimed spare whose run reached a step on it (see markUsed) offsets
+ * one create in the same hour, so real demand never starves on this cap.
+ */
 export const MAX_READY_SPARE_CREATES_PER_HOUR = 12;
+/**
+ * Absolute ceiling on ALL Boat creates (spare + run) per company per rolling
+ * hour, whatever the churn rule decides. 60 lets a 50-task burst on a gate run:
+ * at most 50 run boxes (one per task, claimed spare or cold) plus at most five
+ * spares (MAX_READY_SPARES) is 55, with headroom for a few failed attempts.
+ */
+export const DEFAULT_CREATE_CEILING_PER_HOUR = 60;
+export const MIN_CREATE_CEILING_PER_HOUR = 1;
+export const MAX_CREATE_CEILING_PER_HOUR = 1_000;
+const CREATE_WINDOW_MS = 60 * 60 * 1000;
+/** Repeat a refusal event for the same pool and reason at most this often; the counter counts every refusal. */
+const CREATE_CAP_EVENT_INTERVAL_MS = 60_000;
 export const READY_SPARE_TTL_SECONDS = 1_800;
 export const DEFAULT_READY_SPARE_IDLE_MINUTES = 60;
 export const MIN_READY_SPARE_IDLE_MINUTES = 15;
@@ -48,9 +65,47 @@ export type ReadySpareOperations = {
    * stop decided under an older (idle) view never outruns a newer event.
    */
   desired?(): Promise<number>;
-  /** Optional provider-side hourly cap check; fail closed on an unknown result. */
-  allowCreate?(): Promise<boolean>;
+  /**
+   * Optional provider-side hourly check; fail closed on an unknown result.
+   * `false` refuses (churn_cap). An object reports the durable count of spare
+   * creates in the last hour (the provider inventory, which survives worker
+   * restarts) and the keeper applies the churn cap and ceiling to it.
+   */
+  allowCreate?(): Promise<boolean | { recentSpareCreates: number }>;
 };
+
+export type CreateCapReason = "churn_cap" | "ceiling";
+
+/** The named operator event at a create refusal, and the health reason while it holds. */
+export type CreateCapRefusal = {
+  companyId: string;
+  environmentId: string;
+  kind: "spare" | "run";
+  reason: CreateCapReason;
+  /** Which count decided: this worker's ledger or Boat's durable inventory. */
+  source: "local" | "provider";
+  /** Spare creates in the window not offset by a proven use, and the cap. */
+  churnCreates: number;
+  churnCap: number;
+  spareCreates: number;
+  usedCredits: number;
+  runCreates: number;
+  /** All creates (spare + run) in the window, and the ceiling. */
+  allCreates: number;
+  ceiling: number;
+  /** Refusals so far for this company (this worker). */
+  refusals: Record<CreateCapReason, number>;
+  /** Refusals of this pool and reason not logged since the last event. */
+  suppressed: number;
+  cappedUntil: string;
+};
+
+export function readyCreateCeilingPerHour(config: unknown): number {
+  if (!config || typeof config !== "object" || Array.isArray(config)) return DEFAULT_CREATE_CEILING_PER_HOUR;
+  const ceiling = (config as Record<string, unknown>).createCeilingPerHour;
+  return Number.isInteger(ceiling) && Number(ceiling) >= MIN_CREATE_CEILING_PER_HOUR && Number(ceiling) <= MAX_CREATE_CEILING_PER_HOUR
+    ? Number(ceiling) : DEFAULT_CREATE_CEILING_PER_HOUR;
+}
 
 export type ReadySpareClaimStore = {
   reserve(spare: ReadySpare, claimToken: string, runId: string): Promise<boolean>;
@@ -58,7 +113,7 @@ export type ReadySpareClaimStore = {
 
 export type ReadySpareClaimResult =
   | { outcome: "spare"; spare: ReadySpare }
-  | { outcome: "cold"; reason: "no_ready_spare" | "refill_in_flight" | "config_mismatch" | "claim_conflict" };
+  | { outcome: "cold"; reason: "no_ready_spare" | "create_capped" | "refill_in_flight" | "config_mismatch" | "claim_conflict" };
 
 export type ReadySpareClaimDatabase = {
   namespace: string;
@@ -187,7 +242,16 @@ export class ReadySpareKeeper {
   private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
   private readonly inFlightClaims = new Map<string, number>();
+  /** Spare create reservations per company (pending, failed and successful starts all count). */
   private readonly recentCreates = new Map<string, Map<string, number>>();
+  /** Ordinary run create attempts per company; they count toward the ceiling only. */
+  private readonly runCreates = new Map<string, Map<string, number>>();
+  /** Claimed spares whose bound run reached a step on the box, keyed by box ID: one credit per box. */
+  private readonly usedCredits = new Map<string, Map<string, number>>();
+  private readonly createCeilings = new Map<string, number>();
+  private readonly capped = new Map<string, { refusal: CreateCapRefusal; until: number; loggedAt: number; suppressed: number }>();
+  private readonly refusalCounts = new Map<string, Record<CreateCapReason, number>>();
+  private refusalListener?: (refusal: CreateCapRefusal) => void;
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
   private readonly stoppingSpares = new Set<string>();
@@ -200,6 +264,112 @@ export class ReadySpareKeeper {
   ) {}
 
   setClaimStore(claimStore: ReadySpareClaimStore | undefined): void { this.claimStore = claimStore; }
+  /** Called at every refusal that should be logged (throttled per pool and reason). */
+  setRefusalListener(listener: ((refusal: CreateCapRefusal) => void) | undefined): void { this.refusalListener = listener; }
+  setCreateCeiling(companyId: string, ceiling: number): void {
+    this.createCeilings.set(companyId, Number.isInteger(ceiling) && ceiling >= MIN_CREATE_CEILING_PER_HOUR && ceiling <= MAX_CREATE_CEILING_PER_HOUR
+      ? ceiling : DEFAULT_CREATE_CEILING_PER_HOUR);
+  }
+  createCeiling(companyId: string): number { return this.createCeilings.get(companyId) ?? DEFAULT_CREATE_CEILING_PER_HOUR; }
+
+  private windowed(ledger: Map<string, Map<string, number>>, companyId: string): Map<string, number> {
+    const entries = ledger.get(companyId) ?? new Map<string, number>();
+    for (const [token, at] of entries) if (this.now() - at >= CREATE_WINDOW_MS) entries.delete(token);
+    ledger.set(companyId, entries);
+    return entries;
+  }
+
+  /** This worker's rolling-hour create counts for one company. */
+  createCounts(companyId: string): { spareCreates: number; runCreates: number; usedCredits: number; churnCreates: number; allCreates: number } {
+    const spareCreates = this.windowed(this.recentCreates, companyId).size;
+    const runCreates = this.windowed(this.runCreates, companyId).size;
+    const usedCredits = this.windowed(this.usedCredits, companyId).size;
+    return { spareCreates, runCreates, usedCredits, churnCreates: Math.max(0, spareCreates - usedCredits), allCreates: spareCreates + runCreates };
+  }
+
+  /**
+   * Proof of use: the run whose acquire was bound to this claimed spare reached
+   * a step on it. The spare is USED, so one spare create in this hour (its
+   * replacement) is no longer churn. Idempotent per box. Returns true when new.
+   */
+  markUsed(companyId: string, spareId: string): boolean {
+    const credits = this.windowed(this.usedCredits, companyId);
+    if (credits.has(spareId)) return false;
+    credits.set(spareId, this.now());
+    return true;
+  }
+
+  /** Pools of this company now refused by the churn cap (a new proof of use may admit their replacement). */
+  churnCappedPools(companyId: string): ReadySpareKey[] {
+    const keys: ReadySpareKey[] = [];
+    for (const [poolId, entry] of this.capped) {
+      if (entry.refusal.companyId !== companyId || entry.refusal.kind !== "spare" || entry.refusal.reason !== "churn_cap" || this.now() >= entry.until) continue;
+      const [, environmentId, configHash] = JSON.parse(poolId) as [string, string, string];
+      keys.push({ companyId, environmentId, configHash });
+    }
+    return keys;
+  }
+
+  /** Refusals in effect now, for health/status. */
+  activeCaps(): CreateCapRefusal[] {
+    const active: CreateCapRefusal[] = [];
+    for (const [poolId, entry] of this.capped) {
+      if (this.now() >= entry.until) { this.capped.delete(poolId); continue; }
+      active.push(entry.refusal);
+    }
+    return active;
+  }
+
+  refusalTotals(): Record<CreateCapReason, number> {
+    const totals: Record<CreateCapReason, number> = { churn_cap: 0, ceiling: 0 };
+    for (const counts of this.refusalCounts.values()) { totals.churn_cap += counts.churn_cap; totals.ceiling += counts.ceiling; }
+    return totals;
+  }
+
+  private isCapped(capId: string): boolean {
+    const entry = this.capped.get(capId);
+    return entry !== undefined && this.now() < entry.until;
+  }
+
+  private refuse(capId: string, scope: { companyId: string; environmentId: string; kind: "spare" | "run" }, reason: CreateCapReason,
+    source: "local" | "provider", counts: ReturnType<ReadySpareKeeper["createCounts"]>, churnCreates = counts.churnCreates, allCreates = counts.allCreates): CreateCapRefusal {
+    const refusals = this.refusalCounts.get(scope.companyId) ?? { churn_cap: 0, ceiling: 0 };
+    refusals[reason]++;
+    this.refusalCounts.set(scope.companyId, refusals);
+    // The earliest moment a counted create can leave the window. A provider
+    // count gives no timestamps here, so hold for the whole window; the next
+    // admitted create for this pool clears it.
+    const local = reason === "ceiling"
+      ? [...this.windowed(this.recentCreates, scope.companyId).values(), ...this.windowed(this.runCreates, scope.companyId).values()]
+      : [...this.windowed(this.recentCreates, scope.companyId).values()];
+    const until = source === "local" && local.length ? Math.min(...local) + CREATE_WINDOW_MS : this.now() + CREATE_WINDOW_MS;
+    const previous = this.capped.get(capId);
+    const sameEpisode = previous !== undefined && this.now() < previous.until && previous.refusal.reason === reason;
+    const log = !sameEpisode || this.now() - previous.loggedAt >= CREATE_CAP_EVENT_INTERVAL_MS;
+    const suppressed = sameEpisode && !log ? previous.suppressed + 1 : 0;
+    const refusal: CreateCapRefusal = { ...scope, reason, source, churnCreates, churnCap: this.maxCreatesPerHour,
+      spareCreates: counts.spareCreates, usedCredits: counts.usedCredits, runCreates: counts.runCreates,
+      allCreates, ceiling: this.createCeiling(scope.companyId), refusals: { ...refusals },
+      suppressed: sameEpisode && log ? previous.suppressed : 0, cappedUntil: new Date(until).toISOString() };
+    this.capped.set(capId, { refusal, until, loggedAt: log ? this.now() : previous!.loggedAt, suppressed });
+    if (log) { try { this.refusalListener?.(refusal); } catch { /* Reporting never changes admission. */ } }
+    return refusal;
+  }
+
+  /**
+   * Admit one ordinary run create against the company's absolute ceiling and
+   * record it. A refused run create is never sent to Boat.
+   */
+  admitRunCreate(companyId: string, environmentId: string): { admitted: true } | { admitted: false; refusal: CreateCapRefusal } {
+    const capId = JSON.stringify([companyId, environmentId, "run"]);
+    const counts = this.createCounts(companyId);
+    if (counts.allCreates >= this.createCeiling(companyId)) {
+      return { admitted: false, refusal: this.refuse(capId, { companyId, environmentId, kind: "run" }, "ceiling", "local", counts) };
+    }
+    this.windowed(this.runCreates, companyId).set(randomUUID(), this.now());
+    this.capped.delete(capId);
+    return { admitted: true };
+  }
   start(): void { this.stopping = false; }
   stop(): void { this.stopping = true; }
   reset(): void {
@@ -208,6 +378,8 @@ export class ReadySpareKeeper {
     this.pools.clear(); this.inFlightCreates.clear(); this.reconciling.clear(); this.activeDesired.clear();
     this.pendingReconciliations.clear(); this.adopting.clear(); this.claiming.clear(); this.inFlightClaims.clear(); this.recentCreates.clear(); this.failures.clear(); this.demandEvents.clear();
     this.stoppingSpares.clear();
+    this.runCreates.clear(); this.usedCredits.clear(); this.createCeilings.clear(); this.capped.clear(); this.refusalCounts.clear();
+    this.refusalListener = undefined;
   }
 
   /**
@@ -342,6 +514,7 @@ export class ReadySpareKeeper {
     if (index < 0) {
       if (healthy.length || (this.inFlightClaims.get(poolId) ?? 0) > 0) return { outcome: "cold", reason: "claim_conflict" };
       if (this.hasConfigMismatch(key)) return { outcome: "cold", reason: "config_mismatch" };
+      if (this.isCapped(poolId)) return { outcome: "cold", reason: "create_capped" };
       if (this.isRefilling(key)) return { outcome: "cold", reason: "refill_in_flight" };
       return { outcome: "cold", reason: "no_ready_spare" };
     }
@@ -489,20 +662,46 @@ export class ReadySpareKeeper {
     // fan-out is at most the target (missing <= desired), while company-wide
     // hourly reservations still serialize the quota decision across pools.
     const reservations: string[] = [];
+    const scope = { companyId: key.companyId, environmentId: key.environmentId, kind: "spare" as const };
     for (let i = 0; i < missing; i++) {
       if (this.stopping || this.now() < (this.failures.get(poolId)?.retryAt ?? 0)) break;
-      const recent = this.recentCreates.get(key.companyId) ?? new Map<string, number>();
-      for (const [token, at] of recent) if (this.now() - at >= 60 * 60 * 1000) recent.delete(token);
-      this.recentCreates.set(key.companyId, recent);
-      if (recent.size >= this.maxCreatesPerHour) break;
+      const local = this.createCounts(key.companyId);
+      const ceiling = this.createCeiling(key.companyId);
+      // The ceiling counts every create, used or not; the churn cap counts only
+      // spare creates no proven use offsets. Instant releases and failed claim
+      // verifications never produce a proof of use, so they stay counted.
+      if (local.allCreates >= ceiling) { this.refuse(poolId, scope, "ceiling", "local", local); break; }
+      if (local.churnCreates >= this.maxCreatesPerHour) { this.refuse(poolId, scope, "churn_cap", "local", local); break; }
+      const recent = this.windowed(this.recentCreates, key.companyId);
       const reservation = randomUUID();
       recent.set(reservation, this.now());
       if (operations.allowCreate) {
-        let allowed = false;
-        try { allowed = await operations.allowCreate(); } catch { allowed = false; }
-        if (!allowed || this.stopping) { recent.delete(reservation); break; }
+        let verdict: boolean | { recentSpareCreates: number } = false;
+        let known = true;
+        try { verdict = await operations.allowCreate(); } catch { known = false; }
+        if (this.stopping || !known) { recent.delete(reservation); break; } // Unknown inventory fails closed, but is not a cap.
+        if (verdict === false) {
+          recent.delete(reservation);
+          this.refuse(poolId, scope, "churn_cap", "provider", this.createCounts(key.companyId));
+          break;
+        }
+        if (typeof verdict === "object" && verdict !== null) {
+          // Boat's inventory survives restarts and other workers' creates; it
+          // does not yet hold this reservation. Credits are this worker's.
+          const counts = this.createCounts(key.companyId);
+          const providerSpare = Number.isFinite(verdict.recentSpareCreates) ? Math.max(0, Math.trunc(verdict.recentSpareCreates)) : Number.POSITIVE_INFINITY;
+          const providerChurn = Math.max(0, providerSpare - counts.usedCredits);
+          const providerAll = providerSpare + counts.runCreates;
+          const reason: CreateCapReason | undefined = providerAll >= ceiling ? "ceiling" : providerChurn >= this.maxCreatesPerHour ? "churn_cap" : undefined;
+          if (reason) {
+            recent.delete(reservation);
+            this.refuse(poolId, scope, reason, "provider", this.createCounts(key.companyId), providerChurn, providerAll);
+            break;
+          }
+        }
       }
       if (this.stopping) { recent.delete(reservation); break; }
+      this.capped.delete(poolId);
       reservations.push(reservation);
     }
     if (!reservations.length) return;

@@ -16,6 +16,7 @@ const manifest: PaperclipPluginManifestV1 = {
       spareMax: { type: "integer", minimum: 1, maximum: 5, default: 3, title: "Maximum warm Boat spares", description: "Maximum demand-following ready spares per listed environment." },
       spareDemandWindowMinutes: { type: "integer", minimum: 5, maximum: 60, default: 10, title: "Spare demand window (minutes)", description: "Count acquisitions in this rolling window when scaling the spare pool." },
       spareIdleMinutes: { type: "integer", minimum: 15, maximum: 1440, default: 60, title: "Spare idle timeout (minutes)", description: "Stop company spares after this long with no agent or user activity." },
+      createCeilingPerHour: { type: "integer", minimum: 1, maximum: 1000, default: 60, title: "Boat create ceiling (per hour)", description: "Absolute limit on ALL Boat sandbox creates (spares and runs) per company per rolling hour; at the limit new creates are refused and health reports create_capped. The default 60 fits a 50-task burst (50 run boxes plus at most 5 spares)." },
       spareEnvironmentIds: { type: "array", maxItems: 10, uniqueItems: true, default: [], title: "Spare environments", description: "Environment IDs allowed to hold warm spares. Empty disables spare creation.", items: { type: "string", minLength: 1 } },
     },
   },

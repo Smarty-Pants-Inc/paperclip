@@ -63,9 +63,36 @@ acquire asynchronously rediscovers candidates by labels; if it has no in-memory
 candidate, that acquire creates normally and a later acquire may claim the adopted
 spare. Mismatched, stopped, expired or unfinished unclaimed spares are stopped,
 never deleted. At most three spares are configured
-per company/environment and no more than 12 spare create attempts per company
-per rolling hour are allowed. Failed starts use exponential backoff (up to 15
-minutes). A provider-side Boat TTL is applied at create and refreshed when less
+per company/environment. Failed starts use exponential backoff (up to 15
+minutes).
+
+Two hourly limits bound what spares can cost (smarty-dev#20869):
+
+- **Churn cap (12 per company per rolling hour).** Every spare create attempt
+  counts, including pending and failed starts, instant claim/release and a
+  claim whose post-rename verification failed. A claimed spare counts as USED
+  only on proof of use: the run's acquire returned that box AND the run reached
+  a step on it, i.e. Core called `environmentExecute`, the Runner ingress
+  endpoint or a duplex channel open for that exact lease before any release,
+  stop or destroy. Each used spare offsets one spare create in the same hour,
+  so its replacement is not churn. A hire setup check that claims a box, runs
+  its probe command and releases it ~20 s later is use. The count is the larger
+  of this worker's ledger and Boat's inventory of `purpose=spare` boxes created
+  in the last hour (which survives worker restarts); proofs of use are this
+  worker's, so after a restart a used box counts again until it leaves the hour.
+- **Absolute ceiling, `createCeilingPerHour` (default 60, 1-1000).** Company
+  plugin setting holding ALL creates, spare and run, used or not. At the
+  ceiling the spare refill stops and an ordinary run create is refused before
+  any request to Boat. 60 fits a 50-task burst: one run box per task (claimed
+  spare or cold) plus at most five spares is 55.
+
+At each refusal the plugin logs an info-level `[boat] create_capped reason=...`
+event (`reason` is `churn_cap` or `ceiling`) with the company, environment,
+counts and refusal counter as structured fields (repeated at most once a
+minute per pool and reason; the counter counts every refusal). While a refusal
+holds, the health message names it (`create_capped reason=...`) and its
+`details.createCapped` lists it; health is `degraded` while the ceiling holds.
+A cold acquire during a refusal records the outcome reason `create_capped`. A provider-side Boat TTL is applied at create and refreshed when less
 than half remains (maintenance checks every 15 seconds); if the plugin worker
 dies, Boat auto-stops the spare when that TTL expires. The immutable expiry
 label records the initial create deadline; Boat's refreshed `archiveAfter` is
