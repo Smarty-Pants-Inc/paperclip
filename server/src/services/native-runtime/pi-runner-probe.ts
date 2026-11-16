@@ -110,6 +110,8 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       // stays at <remoteRoot>/pi/<id>.jsonl and is retained as before.
       const privateAgentDir = environment.PI_CODING_AGENT_DIR ? null : posix.join(target!.remoteCwd, ".paperclip-runtime", `${id}-pi-agent`);
       const probeEnvironment = privateAgentDir ? { ...environment, PI_CODING_AGENT_DIR: privateAgentDir } : environment;
+      // Pi requires an absolute agent dir (pi-company-skills.ts); fail closed by name, never at open.
+      if (privateAgentDir && !posix.isAbsolute(privateAgentDir)) throw new Error("native_probe_agent_dir_not_absolute");
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
       let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
       const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
