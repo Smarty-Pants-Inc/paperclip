@@ -201,6 +201,43 @@ it("proves a launched bootstrap never authenticated after its credentials were i
   } finally { await core.stop(); rmSync(root, { recursive: true, force: true }); }
 });
 
+it("proves a run.prepare-only bootstrap and its same-run retries never authenticated (R1-04)", async () => {
+  // session.open is queued only after run.prepare is answered, so a Runner
+  // that never connected leaves run.prepare alone; each same-run retry
+  // restores that checkpoint and queues one more run.prepare.
+  const root = mkdtempSync(resolve(tmpdir(), "runner-prepare-only-bootstrap-"));
+  const template = { provider: { provider: "codex", command: "fixture" }, authorizedTools: {} };
+  let checkpoint: DurablePrpCheckpoint | undefined;
+  try {
+    for (const attempt of [1, 2, 3]) {
+      checkpoint?.restoreSessionDirectory(root);
+      const core = new DurablePrpControlPlane({ stateDirectory: resolve(root, "control-plane"), identity, expectedRunnerVersion, expectedRunnerDigest });
+      core.setCheckpointPersistence(async value => { checkpoint = value; });
+      try {
+        core.persistRunAttachTemplate(template);
+        core.queueCommand("run.prepare", template);
+        core.issueBootstrapTicket(60_000);
+        await core.flushCheckpoint();
+      } finally { await core.stop(); }
+      expect([...checkpoint!.records.keys()].filter(key => key.startsWith("command:"))).toHaveLength(attempt);
+      expect(inspectUnauthenticatedBootstrapCheckpoint(checkpoint!.records, identity)).toBe(true);
+    }
+    // Anything but run.prepare (or the inherited session.open pair) after it is not this bootstrap.
+    rmSync(root, { recursive: true, force: true });
+    const core = new DurablePrpControlPlane({ stateDirectory: resolve(root, "control-plane"), identity, expectedRunnerVersion, expectedRunnerDigest });
+    core.setCheckpointPersistence(async value => { checkpoint = value; });
+    try {
+      core.persistRunAttachTemplate(template);
+      core.queueCommand("run.prepare", template);
+      core.queueCommand("turn.start", { prompt: "not a bootstrap" });
+      core.issueBootstrapTicket(60_000);
+      await core.flushCheckpoint();
+    } finally { await core.stop(); }
+    expect([...checkpoint!.records.keys()].sort()).toEqual(["command:1", "command:2", "cursor", "header"]);
+    expect(inspectUnauthenticatedBootstrapCheckpoint(checkpoint!.records, identity)).toBe(false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 it("hands the ticket refresh to the process owner for the first launch only", () => {
   const launches: RunnerProcessLaunchSpec[] = [];
   const refreshBootstrapTicket = vi.fn(async () => "fresh-ticket");
