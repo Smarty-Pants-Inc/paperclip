@@ -1,4 +1,6 @@
 import { randomUUID } from "node:crypto";
+import request from "supertest";
+import { assertProjectConnectionAdmission } from "../services/project-connection-admission.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { activityLog, companyMemberships, companySecrets, connectionGrants, createDb, toolConnections, userCompanyPreferences } from "@paperclipai/db";
@@ -62,6 +64,43 @@ describe("project connection writer admission (round-4 B)", () => {
     proposed.config = { ...f.config(f.b), methodConfig: { ...f.config(f.b).methodConfig, repositories: "owner/A", repositoryIds: [101] } };
     await expect(f.service.createConnection(f.companyId, proposed, f.actor(f.leadB.id))).rejects.toMatchObject({ status: 403 });
     expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("A02/B1: a lead's workspace metadata edit is not primary repository ratification for the next take", async () => {
+    // Keep: trust boundary. Exercise the real lead PATCH then the common
+    // next-take admission, independently of the missing human-custody reader.
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection(f.a, { status: "archived", installed: false });
+    const { projectService } = await import("../services/projects.js");
+    const [workspace] = await projectService(db).listWorkspaces(f.a.id);
+    const edited = await request(f.route(f.leadA.id))
+      .patch(`/api/projects/${f.a.id}/workspaces/${workspace!.id}`)
+      .send({ metadata: { githubRepositoryId: 999 }, repoUrl: "https://github.com/owner/unapproved.git" });
+    expect(edited.status).toBe(200);
+    expect(edited.body.metadata.githubRepositoryId).toBe(999);
+    // Even a request from the real primary cannot silently turn a lead's
+    // mutable hint into a fresh approval. The retained snapshot is [101].
+    await expect(assertProjectConnectionAdmission(db, { companyId: f.companyId, projectId: f.a.id,
+      operation: "create", actor: f.actor(), proposedRepositoryIds: [999],
+      proposedSecretRefs: connection.credentialSecretRefs,
+    })).rejects.toMatchObject({ status: 403, details: { code: "project_connection_repository_not_approved" } });
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(1);
+  });
+
+  it("A02/B1-narrow: a worker's workspace edit cannot widen an already approved connection", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection } = await f.seedConnection();
+    const { projectService } = await import("../services/projects.js");
+    const [workspace] = await projectService(db).listWorkspaces(f.a.id);
+    const edited = await request(f.route(f.worker.id))
+      .patch(`/api/projects/${f.a.id}/workspaces/${workspace!.id}`)
+      .send({ metadata: { githubRepositoryId: "999" } });
+    expect(edited.status).toBe(200);
+    await expect(assertProjectConnectionAdmission(db, { companyId: f.companyId, projectId: f.a.id,
+      operation: "update", actor: f.actor(f.leadA.id), connection, proposedRepositoryIds: [999],
+    })).rejects.toMatchObject({ status: 403, details: { code: "project_connection_repository_not_approved" } });
+    expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
   });
 
   it("A04: null adoption, reparent, owner clearing and direct archive are not generic PATCH", async () => {
