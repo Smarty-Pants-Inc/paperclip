@@ -4826,7 +4826,10 @@ export function toolAccessService(
       assertProjectAppReceiptInput(input);
       let preparedProject: Awaited<ReturnType<typeof prepareProjectAppFirstBind>> | undefined;
       let verifiedCandidate: Awaited<ReturnType<typeof verifyGitHubAppCandidate>> | undefined;
-      if (isGitHubAppConnection({ config })) await assertNotManagerApp(db, { companyId, refs: input.credentialSecretRefs ?? [], appId: parseGitHubAppConfig(config.methodConfig).appId });
+      const manager = isGitHubAppConnection({ config }) ? await assertNotManagerApp(db, {
+        companyId, refs: [...(input.credentialRefs ?? []), ...(input.credentialSecretRefs ?? [])],
+        appId: parseGitHubAppConfig(config.methodConfig).appId, requireConfigured: input.projectId != null,
+      }) : null;
       // Check raw request authority before normalization or any application/key/provider write.
       if ([input.config, input.transportConfig].some(c => c && Object.hasOwn(c, "projectScope"))) throw forbidden("Project approval metadata is server-written", { code: "project_connection_scope_protected" });
       if (input.projectId != null) {
@@ -4852,7 +4855,10 @@ export function toolAccessService(
         ...(input.credentialRefs ?? []),
         ...(input.credentialSecretRefs ?? []),
       ]);
-      if (!preparedProject && isGitHubAppConnection({ config })) verifiedCandidate = await verifyGitHubAppCandidate(db, {
+      // Ordinary Apps retain their documented draft/create behavior when no C4
+      // manager exists. With a manager, verify aliases solely for its exclusion;
+      // do not demand a project receipt for personal/agent/shared connections.
+      if (!preparedProject && manager && isGitHubAppConnection({ config })) verifiedCandidate = await verifyGitHubAppCandidate(db, {
         companyId, config, refs: input.credentialSecretRefs ?? [], namespace: "connection-create", actorId: actor?.actorId ?? undefined,
       });
       if (transport === "mcp_remote")

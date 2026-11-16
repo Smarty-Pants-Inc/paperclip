@@ -1,8 +1,8 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, sql } from "drizzle-orm";
 import { connectionGrants, toolConnections, toolConnectionInstalls, projectWorkspaces, type Db } from "@paperclipai/db";
 import { resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership } from "./connection-credentials.js";
 import { HttpError, unprocessable } from "../errors.js";
-import { assertNotManagerApp, readProjectAppCustody } from "./project-app-custody.js";
+import { assertNotManagerApp, projectAppManagerConfigured, readProjectAppCustody } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
 import { assertNotProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
@@ -43,8 +43,9 @@ export async function getGitHubAppGrant(db: Db, connection: Connection, options:
 }
 
 export async function resolveGitHubAppCredential(db: Db, connection: Connection, grant: Grant, allowDraft = false, force = false, agentId?: string | null) {
-  const valid = async () => {
-    const [c] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id)));
+  const valid = async (verifiedAppId?: string) => {
+    const [c] = await db.select({ ...getTableColumns(toolConnections), hasProjectAppManager: projectAppManagerConfigured(toolConnections.companyId) })
+      .from(toolConnections).where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id)));
     const [g] = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.id, grant.id)));
     // RFL C3: every App token for an agent, run, tool call or MCP header is
     // minted here. A project-owned row (current or as passed) never yields one.
@@ -55,7 +56,8 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
       || JSON.stringify(c.config) !== JSON.stringify(connection.config)
       || JSON.stringify(c.credentialSecretRefs) !== JSON.stringify(connection.credentialSecretRefs)
       || JSON.stringify(g.credentialSecretRefs) !== JSON.stringify(grant.credentialSecretRefs)) githubAppFailure();
-    await assertNotManagerApp(db, { companyId: c.companyId, refs: g.credentialSecretRefs, appId: parseGitHubAppConfig(c.config.methodConfig).appId });
+    if (c.projectId || c.hasProjectAppManager) await assertNotManagerApp(db, { companyId: c.companyId, refs: g.credentialSecretRefs,
+      appId: parseGitHubAppConfig(c.config.methodConfig).appId, verifiedAppId, requireConfigured: c.projectId != null });
     if (c.projectId) {
       const scope = readProjectConnectionScope(c);
       const config = parseGitHubAppConfig(c.config.methodConfig);
@@ -93,8 +95,7 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     if (!ref) githubAppFailure();
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
     const result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
-    await assertNotManagerApp(db, { companyId: c.companyId, refs: g.credentialSecretRefs, verifiedAppId: result.verifiedRegistrationId });
-    await valid();
+    await valid(result.verifiedRegistrationId);
     if (c.projectId) {
       const currentKey = await validateConnectionGrantSecretOwnership(db, c, g, ref);
       if (currentKey.latestVersion !== secret.latestVersion) githubAppFailure();
@@ -123,7 +124,7 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
         refs: g.credentialSecretRefs, registrationId: result.verifiedRegistrationId, repositoryIds: ids });
       await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
         targetAgentIds: agentId ? [agentId] : [], proposedSecretRefs: g.credentialSecretRefs, proposedRepositoryIds: ids });
-      await valid();
+      await valid(result.verifiedRegistrationId);
     }
     return result;
   } catch (error) {
