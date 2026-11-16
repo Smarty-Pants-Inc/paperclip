@@ -243,7 +243,9 @@ real directories (never symlinks) owned by the worker user, whose newest entry
 is older than the maximum step window, five sync steps of at most 30 minutes
 (Core's `MAX_SANDBOX_SYNC_TIMEOUT_MS`, which also clamps the step timeout here),
 i.e. 150 minutes. Other prefixes are never touched. A younger directory is left
-for a possibly live worker; the next startup after the window removes it.
+for a possibly live worker. The same sweep, with the same rules, also runs every
+30 minutes on an unref'd timer (cleared at shutdown), so such a directory is
+removed within 30 minutes of leaving the window, without a restart.
 
 Resume verifies the recorded workspace sentinel at the allocation's original
 cwd, even when Core rewrites `remoteCwd` to a prepared shared workspace below it.
