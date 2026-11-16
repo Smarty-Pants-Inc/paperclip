@@ -67,3 +67,37 @@ it("RED-SWEEP worker restart removes a killed worker's stale paperclip-boat-sync
   expect(existsSync(path.join(outside, "transfer.tar"))).toBe(true);
   expect(info.some(message => message.includes("paperclip-boat-sync") && message.includes("removed=1"))).toBe(true);
 });
+
+// Review-fleet-2 judge (F4): a tar younger than 150 min at startup must not wait
+// for the next qualifying restart. The same sweep, same rules, also runs every
+// 30 minutes; the timer never holds the worker open and stops at shutdown.
+it("RED-SWEEP-TIMER the 30-minute timer sweeps a temp that aged past 150 min after startup; a fresh one stays", async () => {
+  vi.useFakeTimers({ now: Date.now(), toFake: ["setInterval", "clearInterval", "Date"] });
+  try {
+    const intervals: Array<{ ms: number | undefined; handle: ReturnType<typeof setInterval> }> = [];
+    const realSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, "setInterval").mockImplementation(((fn: () => void, ms?: number) => {
+      const handle = realSetInterval(fn, ms); intervals.push({ ms, handle }); return handle;
+    }) as typeof setInterval);
+    // 140 min old at startup: kept by the startup sweep, stale 30 min later.
+    const ageing = leave("paperclip-boat-sync-Gh56Ij", 140 * 60_000);
+    const info = await startWorker();
+    spy.mockRestore();
+    expect(existsSync(ageing), "younger than 150 min at startup: kept").toBe(true);
+    const sweepTimer = intervals.find(entry => entry.ms === 30 * 60_000);
+    expect(sweepTimer, "a 30-minute sweep interval is installed at startup").toBeDefined();
+    expect((sweepTimer!.handle as unknown as { hasRef(): boolean }).hasRef(), "the sweep timer is unref'd").toBe(false);
+    const fresh = leave("paperclip-boat-sync-Kl78Mn", 0); // a transfer that starts after startup
+    await vi.advanceTimersByTimeAsync(30 * 60_000);
+    await vi.waitFor(() => expect(existsSync(ageing), "aged past 150 min: swept by the timer").toBe(false),
+      { timeout: 5_000, interval: 20 });
+    expect(readFileSync(path.join(fresh, "transfer.tar"), "utf8")).toContain("state bytes");
+    expect(info.some(message => message.includes("paperclip-boat-sync") && message.includes("removed=1"))).toBe(true);
+    // Shutdown clears the timer: a later stale temp is left for the next worker.
+    await plugin.definition.onShutdown?.();
+    const later = leave("paperclip-boat-sync-Op90Qr", 3 * 60 * 60_000);
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    expect(existsSync(later), "no sweep after shutdown").toBe(true);
+  } finally { vi.useRealTimers(); }
+});
