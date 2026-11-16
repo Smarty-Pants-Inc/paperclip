@@ -22,7 +22,7 @@ vi.mock("./environment-execution-target.js", () => ({ resolveEnvironmentExecutio
 import { agentEnvironmentTestService } from "./agent-environment-test.js";
 
 describe("plugin Runner setup-test lease", () => {
-  it("requests a lease that outlives the three-minute probe and teardown", async () => {
+  it("requests a lease that outlives the probe and its unbounded sync-out + rm teardown (>= 600 s)", async () => {
     mocks.acquire.mockResolvedValue({ lease: { ...mocks.lease } });
     mocks.updateLeaseMetadata.mockResolvedValue({ ...mocks.lease, metadata: { remoteCwd: "/workspace", runnerTaskProbe: {} } });
     mocks.resolveTarget.mockResolvedValue({ kind: "remote", transport: "sandbox", providerKey: "fixture", remoteCwd: "/workspace", runnerTaskProbe: { runId: "run", sessionId: "session" }, runnerTask: vi.fn() });
@@ -35,6 +35,6 @@ describe("plugin Runner setup-test lease", () => {
       requestedExpiresAt: expect.any(Date),
     }));
     const requestedExpiresAt = mocks.acquire.mock.calls[0]![0].requestedExpiresAt as Date;
-    expect(requestedExpiresAt.getTime()).toBeGreaterThanOrEqual(before + 360_000);
+    expect(requestedExpiresAt.getTime()).toBeGreaterThanOrEqual(before + 600_000);
   });
 });
