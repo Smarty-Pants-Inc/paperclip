@@ -72,6 +72,12 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
         || c.credentialSecretRefs.some(ref => ref.configPath !== GITHUB_APP_KEY_PATH
           || !scope.approvedSecretRefs.some(approved => approved.secretId === ref.secretId && approved.configPath === ref.configPath))
         || (!allowDraft && scope.migrationPending)) githubAppFailure();
+      // Preserve the credential owner's named old-H/revoke refusal before any
+      // management/recipient denial. This DB fence runs on cache hits too;
+      // admission itself still checks repository/reference boundaries first.
+      await readProjectAppCustody(db, { companyId: c.companyId, projectId: c.projectId, config: c.config,
+        refs: g.credentialSecretRefs, registrationId: scope.registrationId, connectionId: c.id,
+        repositoryIds: await projectConnectionRepositoryIds(db, c.companyId, c.projectId, config.repositories) });
       // Actorless use cannot manufacture management authority; B validates current
       // approval and recipient reach, while existing finish writers own management.
       await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
