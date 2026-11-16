@@ -5,7 +5,7 @@ import { composioAppSetupSchema, composioAppsRefreshSchema, composioAppsSyncSche
 import { aggregatorAppsSyncSchema, aggregatorAppsRefreshSchema, arcadeDiscoverySetupSchema } from "@paperclipai/shared/aggregator-apps";
 import { Router, type Request, type Response } from "express";
 import type { Db } from "@paperclipai/db";
-import { agents, companies, connectionGrants, issues, issueThreadInteractions, toolConnectionInstalls, toolMcpAppViews } from "@paperclipai/db";
+import { agents, companies, connectionGrants, issues, issueThreadInteractions, toolConnectionInstalls, toolConnections, toolMcpAppViews } from "@paperclipai/db";
 import { and, eq, or } from "drizzle-orm";
 import {
   APP_STORE_DEFINITIONS,
@@ -242,6 +242,19 @@ export function cloudConnectorEnrollmentReturnPath(issuePrefix: string, returnTo
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Explicit actor-scoped acknowledgement, not a generic force/admin bypass. */
+function projectDoneConfirmation(body: unknown): Readonly<{ projectId: string; connectionId: string }> | undefined {
+  if (!body || typeof body !== "object" || !Object.hasOwn(body, "projectDoneConfirmation")) return undefined;
+  const value = (body as Record<string, unknown>).projectDoneConfirmation;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw badRequest("Expected a scoped project-done confirmation");
+  const confirmation = value as Record<string, unknown>;
+  if (Object.keys(confirmation).length !== 2 || typeof confirmation.projectId !== "string" || !UUID_PATTERN.test(confirmation.projectId)
+    || typeof confirmation.connectionId !== "string" || !UUID_PATTERN.test(confirmation.connectionId)) {
+    throw badRequest("Project-done confirmation must name only its project and connection");
+  }
+  return { projectId: confirmation.projectId, connectionId: confirmation.connectionId };
+}
 
 export function toolAccessRoutes(
   db: Db,
@@ -2224,7 +2237,15 @@ function connectorEnrollmentPrincipal(req: Request): string {
     if (!existing) return;
     await assertToolConnectionConfigureAccess(req, existing);
     if (aiConnectionRouterPluginKey(existing)) throw badRequest("Update this connection pool through its pool settings.");
+    const [saved] = await db.select({ projectId: toolConnections.projectId }).from(toolConnections).where(and(
+      eq(toolConnections.companyId, existing.companyId), eq(toolConnections.id, existing.id),
+    ));
     const connection = await svc.updateConnection(existing.id, req.body, connectionRequestContext(req));
+    // The common owned writer persists its value-free receipt on the actual
+    // update transaction. Never duplicate it here or return a post-commit audit
+    // failure after the destructive update has already committed. Null behavior
+    // and the original management/configure checks remain unchanged.
+    if (saved?.projectId) { res.json(connection); return; }
     const lifecycleChanges = classifyConnectionUpdate(
       { enabled: existing.enabled, config: existing.config },
       { enabled: connection.enabled, config: connection.config },
@@ -2271,16 +2292,25 @@ function connectorEnrollmentPrincipal(req: Request): string {
     await assertToolConnectionConfigureAccess(req, existing);
     if (aiConnectionRouterPluginKey(existing)) throw badRequest("Remove this connection pool through its revision-checked pool settings.");
     const applicationBefore = await svc.getApplication(existing.applicationId);
+    // Ownership is read from the saved row, not an older/alternate API projection.
+    const [saved] = await db.select({ projectId: toolConnections.projectId }).from(toolConnections).where(and(
+      eq(toolConnections.companyId, existing.companyId), eq(toolConnections.id, existing.id),
+    ));
+    const actor = { ...connectionRequestActor(req),
+      ...(saved?.projectId ? { projectDoneConfirmation: projectDoneConfirmation(req.body) } : {}),
+    };
     const { connection, removal } = await svc.archiveConnection(
       existing.id,
       existing.companyId,
-      connectionRequestActor(req),
+      actor,
     );
     const applicationAfter = await svc.getApplication(existing.applicationId);
     // The receipt is counts and outcomes only. Removal is a revocation boundary
     // (PAP-17119) and operators need to see what it tore down, but this row is
     // company-readable activity, so it never carries a secret name or value.
-    await logActivity(db, {
+    // Owned removal already persisted its final receipt with ALL local effects.
+    // A route-level insert could fail after commit, or duplicate a same-row retry.
+    if (!saved?.projectId) await logActivity(db, {
       companyId: connection.companyId,
       ...connectionRequestActor(req),
       action: "tool_connection.archived",
@@ -2288,7 +2318,7 @@ function connectorEnrollmentPrincipal(req: Request): string {
       entityId: connection.id,
       details: { transport: connection.transport, ...removal },
     });
-    if (applicationBefore.status !== "archived" && applicationAfter.status === "archived") {
+    if (!saved?.projectId && applicationBefore.status !== "archived" && applicationAfter.status === "archived") {
       await logActivity(db, {
         companyId: applicationAfter.companyId,
         ...connectionRequestActor(req),
