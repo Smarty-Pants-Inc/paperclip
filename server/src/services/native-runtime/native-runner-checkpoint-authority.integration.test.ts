@@ -89,4 +89,44 @@ describeEmbeddedPostgres("checkpoint writer business-authority handover", () => 
       await expect(core.flushCheckpoint()).rejects.toThrow("native_runner_checkpoint_owner_lost");
     } finally { await core.stop(); }
   });
+  // #20825 R-c: an idle warm session's run has FINISHED (result committed, no
+  // business lease). When the server redials it, the control plane's welcome
+  // (CP:4156-4186: connectionCount++, store.save(), then a checkpoint flush
+  // before the frame is sent) must pass the owner fence, or the reconnect can
+  // never authenticate. No new work is admitted by a welcome.
+  it.each(["finished_idle", "foreign_execution_run"] as const)("R-c: a finished idle warm run's reconnect welcome flush: %s", async scenario => {
+    const { db, runId, issueId, native } = await environment.seedRun(`IDLE-WARM-RECONNECT-${scenario}`);
+    const { companyId, agentId, successor, runtimeRoot } = environment.current;
+    await db.update(nativeRunFinalizations).set({ controllerBootId: successor.bootId, controllerGeneration: 1,
+      leaseOwner: randomUUID(), leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, runId));
+    const core = new DurablePrpControlPlane({ stateDirectory: join(runtimeRoot, runId), identity: {
+      runnerInstanceId: native.runnerInstanceId, environmentLeaseId: native.environmentLeaseId, runId,
+      normalizedSessionId: native.normalizedSessionId, turnId: native.turnId, itemId: native.itemId },
+      expectedRunnerVersion: "fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+    try {
+      await registerNativeRunnerCheckpoint({ db, authority: core, bootId: successor.bootId, binding: { companyId, issueId, runId } });
+      core.queueCommand("turn.start", { prompt: "the turn that finished" });
+      await core.flushCheckpoint();
+      const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
+      const [result] = await db.insert(nativeRunResults).values({ companyId, issueId, runId,
+        completionContractId: contract!.id, serverFingerprint: "idle-warm-fixture", schemaStatus: "accepted", resultJson: { summary: "Completed" },
+        canonicalSha256: "idle-warm-fixture" }).returning();
+      await db.update(nativeRunFinalizations).set({ resultId: result!.id, phase: "committed", leaseOwner: null,
+        leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, runId));
+      if (scenario === "foreign_execution_run") {
+        // The issue moved on to another run that holds no live controller.
+        const other = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: other, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native", status: "succeeded" });
+        await db.update(issues).set({ executionRunId: other }).where(eq(issues.id, issueId));
+      } else {
+        await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, issueId));
+      }
+      // The welcome's own write (connectionCount++, lastLease*, store.save())
+      // is maintenance with no new work. issueBootstrapTicket() makes the same
+      // kind of save through the public surface; the flush is what is fenced.
+      core.issueBootstrapTicket();
+      if (scenario === "finished_idle") await expect(core.flushCheckpoint()).resolves.toBeUndefined();
+      else await expect(core.flushCheckpoint()).rejects.toThrow("native_runner_checkpoint_owner_lost");
+    } finally { await core.stop(); }
+  });
 });

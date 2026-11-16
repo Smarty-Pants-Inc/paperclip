@@ -431,6 +431,8 @@ import {
   cancelNativeSession,
   closeWarmNativeSessionsForEnvironment,
   claimWarmNativeInstructionCopy,
+  nativeSessionScopeKey,
+  retireUnreachableWarmNativeSession,
   warmRetirementDirectoryWait,
   warmSessionReleaseWait,
   nativeSessionWorkspaceScope,
@@ -12067,6 +12069,65 @@ describe("native warm session supervision", () => {
       expect(session.close).toHaveBeenCalledTimes(forgotten ? 1 : 2);
     } finally {
       allowClose = true;
+      await closeWarmNativeSessionsForEnvironment({ environmentId: identity, reason: "test cleanup" });
+    }
+  });
+
+  // #20825 R-retire (owner): the idle warm owner's ingress redialed until its
+  // lease neared expiry. It retires through the ordinary idle close path with
+  // the named reason, long before the old idle timeout, and is forgotten, so
+  // the next message starts a new owner from the persisted checkpoint.
+  it.each(["idle", "busy"] as const)("retires an unreachable %s warm owner through the warm close path with native_runner_ingress_unreachable", async mode => {
+    const identity = `warm-ingress-unreachable-${mode}`;
+    const warmExecution = { ...execution, binding: { ...execution.binding, runId: identity, executionWorkspaceId: `${identity}-workspace` },
+      session: { ...execution.session, normalizedSessionId: identity, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 8 * 60 * 60_000 } },
+    } as NativeExecutionInputV1;
+    let releaseTurn!: () => void;
+    const turnGate = new Promise<void>(resolve => { releaseTurn = resolve; });
+    const session = { close: vi.fn(async (_input?: { reason?: string }) => undefined) };
+    let sessionBound!: () => void;
+    const bound = new Promise<void>(resolve => { sessionBound = resolve; });
+    state.execute.mockReset().mockImplementation(async (options) => {
+      await options.onSession?.(session);
+      sessionBound();
+      if (mode === "busy") await turnGate;
+      return { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" },
+        turnId: identity, normalizedSessionId: identity, providerSessionId: identity,
+        driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    const copy = (runId: string) => ({ runId, root: `/tmp/${identity}`, preparationKey: "same", hasChanges: async () => false,
+      collectStopped: async () => undefined });
+    const scope = nativeSessionScopeKey(warmExecution);
+    try {
+      const running = executePaperclipNativeSession({ db: leaseDb(warmExecution), execution: warmExecution, runnerInstanceId: identity,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", environmentId: identity, remoteCwd: `/tmp/${identity}` },
+        instructionWorkingCopy: copy(identity) });
+      if (mode === "busy") {
+        await bound;
+        // A turn is running: its own transport failure owns the outcome.
+        expect(retireUnreachableWarmNativeSession(scope)).toBe(false);
+        releaseTurn();
+        await running;
+        expect(session.close).not.toHaveBeenCalled();
+        return;
+      }
+      await running;
+      expect(session.close).not.toHaveBeenCalled();
+      expect(retireUnreachableWarmNativeSession(scope)).toBe(true);
+      await vi.waitFor(() => expect(session.close).toHaveBeenCalledWith({ reason: "native_runner_ingress_unreachable" }));
+      // Retired once: a repeated report does nothing.
+      expect(retireUnreachableWarmNativeSession(scope)).toBe(false);
+      const adopt = vi.fn(async () => null);
+      await expect(claimWarmNativeInstructionCopy({ priorExecution: warmExecution,
+        companyId: warmExecution.binding.companyId, agentId: warmExecution.binding.agentId,
+        executionWorkspaceId: warmExecution.binding.executionWorkspaceId, workspace: warmExecution.workspace,
+        environmentId: identity, runId: `${identity}-follow-up`, preparationKey: "same", adopt })).resolves.toBeNull();
+      // The owner was forgotten after its close: the follow-up finds no warm
+      // owner (no second close, nothing to adopt) and starts from the checkpoint.
+      expect(adopt).not.toHaveBeenCalled();
+      expect(session.close).toHaveBeenCalledOnce();
+    } finally {
+      releaseTurn();
       await closeWarmNativeSessionsForEnvironment({ environmentId: identity, reason: "test cleanup" });
     }
   });
