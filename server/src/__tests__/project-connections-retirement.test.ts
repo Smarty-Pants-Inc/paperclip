@@ -1,5 +1,5 @@
 import request from "supertest";
-import { randomBytes } from "node:crypto";
+import { generateKeyPairSync, randomBytes } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, agents, companySecrets, companySecretVersions, connectionGrants, createDb, heartbeatRuns, issues, projects, toolApplications, toolConnectionInstalls, toolConnections, userCompanyPreferences } from "@paperclipai/db";
@@ -15,18 +15,36 @@ import { connectionManagementService } from "../services/connection-management.j
 import { githubAppFailure } from "../services/github-app-client.js";
 import { approveFixtureCustodySource } from "./helpers/project-connections-custody-setup.js";
 
-const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
+const provider = vi.hoisted(() => {
+  const controls = { verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
 })), acquire: vi.fn(async (_db: unknown, connection: { id: string }) => ({
   token: `synthetic-project-token-${connection.id}`, expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"] },
-})) }));
-// Owned finish now uses the normalized provider seam. Preserve that REAL seam
-// and replace only the external App-client acquisition, as for legacy refresh.
-vi.mock("../services/github-app-client.js", async importOriginal => ({
-  ...await importOriginal<typeof import("../services/github-app-client.js")>(),
-  createGitHubAppClient: () => ({ acquire: async () => ({ ...await provider.verify(), verifiedRegistrationId: "123" }) }),
-}));
+})) };
+  // Genuine approval setup and owned create/finish retain real vault resolution,
+  // JWT signing, App-client verification and normalized provider admission.
+  // Existing fault controls are exercised ONLY at the external HTTP boundary.
+  let verified: Awaited<ReturnType<typeof controls.verify>>;
+  vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+    const path = new URL(String(input)).pathname;
+    if (path === "/app") return Response.json({ id: 123, slug: "project-fixture" });
+    if (path === "/app/installations/456") return Response.json({ id: 456, app_id: 123, suspended_at: null,
+      account: { login: "owner" }, permissions: { contents: "write", pull_requests: "write", issues: "read" } });
+    if (path.endsWith("/access_tokens")) {
+      try { verified = await controls.verify(); }
+      catch { return Response.json({ message: "synthetic token fault" }, { status: 403 }); }
+      return Response.json({ token: verified.token, expires_at: new Date(verified.expiresAt).toISOString() });
+    }
+    if (path.startsWith("/users/")) return Response.json({ id: 123, login: "project-fixture[bot]", type: "Bot" });
+    if (path === "/installation/repositories") return Response.json({ repositories: verified.github.repositories.map(repo => ({
+      id: Number(repo.id), full_name: repo.fullName, private: repo.private,
+    })) });
+    throw new Error(`Unexpected project-retirement provider HTTP path: ${path}`);
+  }));
+  return controls;
+});
+const privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 vi.mock("../services/github-app-credentials.js", async importOriginal => ({
   ...await importOriginal<typeof import("../services/github-app-credentials.js")>(),
   refreshGitHubAppAccess: provider.verify, resolveGitHubAppCredential: provider.acquire,
@@ -53,11 +71,11 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     database = await startEmbeddedPostgresTestDatabase("paperclip-project-retire-"); db = createDb(database.connectionString);
   }, 60_000);
   beforeEach(() => { provider.verify.mockReset(); provider.acquire.mockReset(); });
-  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); vi.unstubAllEnvs(); }, 60_000);
+  afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); }, 60_000);
 
   async function versionOne(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
     await db.insert(companySecretVersions).values({ secretId: f.secret.id, version: 1,
-      material: createLocalEncryptedCipher("write").encrypt(CANARY),
+      material: createLocalEncryptedCipher("write").encrypt(privateKey),
       valueSha256: "synthetic-retirement-version", fingerprintSha256: "synthetic-retirement-version" });
   }
 
