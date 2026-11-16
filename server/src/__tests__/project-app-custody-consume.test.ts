@@ -1,8 +1,10 @@
 import "./helpers/project-connections-approval-http.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, companySecretBindings, createDb, toolConnections } from "@paperclipai/db";
+import { activityLog, companySecretBindings, connectionGrants, createDb, toolConnections } from "@paperclipai/db";
 import { readProjectAppCustody } from "../services/project-app-custody.js";
+import { resolveGitHubAppCredential } from "../services/github-app-credentials.js";
+import { assertProjectConnectionAvailability, lockProjectConnectionIdentities } from "../services/project-connection-arbitration.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { storedConnection } from "./helpers/project-connections-fixture.js";
 import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
@@ -29,16 +31,75 @@ describe("receipt-citing create consumes its source's reservation (RFL 04:5xZ)",
     expect((await storedConnection(db, sourceId)).status).toBe("archived");
   });
 
-  it("RED 2: a foreign create (another project's receipt) still collides with S's reservation, named code, nothing written", async () => {
+  it("RED 2 (05:56Z replacement): an ordinary non-receipt EXCLUSIVE create still collides with both live sources, named code, nothing written", async () => {
     const f = await projectConnectionFixture(db);
     const a = await f.approve(f.a);
     await f.approve(f.b, "456");
     const before = await storedConnection(db, a.sourceId);
-    await expect(f.service.createConnection(f.companyId, f.input(f.b, { exclusive: true }), f.actor()))
-      .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
+    // No consumedSourceConnectionId: this is the ordinary arbiter entry, not a
+    // receipt-citing create. Both projects still see the live S reservations.
+    for (const project of [f.a, f.b]) await expect(assertProjectConnectionAvailability(db, {
+      identity: { companyId: f.companyId, providerHost: "github.com", verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" },
+      projectId: project.id, exclusive: true,
+    })).rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
     expect(await storedConnection(db, a.sourceId)).toEqual(before);
     expect(await owned(f.companyId)).toHaveLength(0);
     expect(await consumedEvents(f.companyId)).toHaveLength(0);
+  });
+
+  it.each(["exclusive-first", "exclusive-alias-A-first", "exclusive-alias-B-first"] as const)("05:56Z RED: %s receipt-citing race has one EXCLUSIVE owner and leaves the loser's S live and unused", async order => {
+    const f = await projectConnectionFixture(db);
+    const a = await f.approve(f.a);
+    const b = await f.approve(f.b, order === "exclusive-first" ? "456" : "457");
+    const sources = new Map([[f.a.id, a.sourceId], [f.b.id, b.sourceId]]);
+    const before = new Map(await Promise.all([...sources].map(async ([projectId, id]) => [projectId, await storedConnection(db, id)] as const)));
+    const inputs = order === "exclusive-first" ? [f.input(f.b, { exclusive: true }), f.input(f.a)]
+      : [f.a, f.b].map((project, i) => f.input(project, { exclusive: true,
+        config: { ...f.input(project).config, methodConfig: { ...f.config(project).methodConfig, installationId: String(456 + i) } } }));
+    if (order === "exclusive-alias-B-first") inputs.reverse();
+    let release!: () => void; let locked!: () => void;
+    const held = new Promise<void>(done => { locked = done; });
+    const proceed = new Promise<void>(done => { release = done; });
+    const holder = db.transaction(async tx => {
+      await lockProjectConnectionIdentities(tx, [{ companyId: f.companyId, providerHost: "github.com", verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" }]);
+      locked(); await proceed;
+    });
+    await held;
+    let done = false;
+    const first = f.service.createConnection(f.companyId, inputs[0]!, f.actor()).then(value => ({ status: "fulfilled" as const, value }), reason => ({ status: "rejected" as const, reason })).finally(() => { done = true; });
+    let reachedLock = false;
+    let second!: ReturnType<typeof Promise.allSettled>;
+    try {
+      const deadline = Date.now() + 5_000;
+      while (!done && Date.now() < deadline) {
+        const waiting = await db.execute(sql`select 1 from pg_locks where locktype = 'advisory' and not granted and database = (select oid from pg_database where datname = current_database())`);
+        if (waiting.length) { reachedLock = true; break; }
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      second = Promise.allSettled([f.service.createConnection(f.companyId, inputs[1]!, f.actor())]);
+    } finally { release(); await holder; }
+    const outcomes = [await first, ...await second];
+    expect(outcomes.filter(result => result.status === "fulfilled")).toHaveLength(1);
+    expect(reachedLock).toBe(true);
+    expect(outcomes.find(result => result.status === "rejected")).toMatchObject({ reason: { status: 409, details: { code: "installation_not_exclusive" } } });
+    const rows = await owned(f.companyId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.config.projectScope).toMatchObject({ exclusive: true });
+    const loserProject = rows[0]!.projectId === f.a.id ? f.b : f.a;
+    const loser = await storedConnection(db, sources.get(loserProject.id)!);
+    expect(loser).toEqual(before.get(loserProject.id));
+    expect(loser.status).not.toBe("archived");
+    expect(loser.config.projectAppApprovalConsumedBy).toBeUndefined();
+    expect(await consumedEvents(f.companyId)).toHaveLength(1);
+    // A ruled winner must remain usable: saved receipt-citing writers must not
+    // mistake the loser's still-live S for an ordinary owned reservation.
+    const winner = rows[0]!;
+    const lead = winner.projectId === f.a.id ? f.leadA : f.leadB;
+    await f.service.finishGalleryAppConnection(f.companyId, winner.id, { access: { agentIds: [lead.id] }, enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [] }, f.actor(lead.id));
+    const current = await storedConnection(db, winner.id);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, winner.id));
+    expect((await resolveGitHubAppCredential(db, current, grant!, false, false, lead.id)).token).toBeTruthy();
+    expect(await storedConnection(db, loser.id)).toEqual(loser);
   });
 
   it("RED 3: a replayed receipt is single-use and refused with a named code", async () => {

@@ -66,7 +66,15 @@ Successful approval/revocation returns HTTP 200 with the value-free receipt:
 }
 ```
 
-Revocation sets `revokedAt`; it never deletes the audit history. Generic create,
+Revocation sets `revokedAt`; it never deletes the audit history. H's same
+session authority may revoke a consumed, archived source S. This records one
+IDs-only `tool_connection.project_app_revoked` activity row, without un-archiving
+S, reopening a reservation or deleting any source/consumer/binding. A repeated
+revoke is idempotent. Approve cannot resurrect a consumed source. The next AND
+every later credential release or forced refresh is refused with
+`project_app_approval_required` (the existing revoked-receipt refusal).
+
+Generic create,
 PATCH, config replacement, gallery/import or plugin connection writers cannot
 mint or alter `config.projectAppApproval` or its protected source pointer.
 
@@ -81,6 +89,27 @@ before reservation, writes the protected project scope and source pointer, and
 creates the organization grant and ordinary take activity atomically. The
 approved lead finishes that saved candidate through the existing finish route.
 The gallery's raw-key form is not a reference-only project create surface.
+
+A receipt-citing create archives and links ONLY its own approval source S, in
+one transaction with its owned connection, grant, take and consumption activity.
+No source is deleted. Failure leaves S live and its receipt unused; replay is
+refused. Under RFL's 05:56Z replacement, receipt-citing creates for the same
+installation OR App registration arbitrate on owned rows. Exactly one EXCLUSIVE
+create wins; the loser's source remains live, unconsumed and readable, with its
+receipt unchanged. Ordinary non-receipt writers still see source reservations
+under the existing alias/exclusivity checks. A receipt never consumes another
+project's approval.
+
+Compatibility with the jointly judged 06:40Z N6 ruling / `e057cf786`: if D's
+migration stage names S as `legacyConnectionId`, consumption keeps S LIVE as a
+linked predecessor and records disposition `predecessor` instead of immediately
+archiving it. Its receipt is still spent in the same transaction. A consumed
+predecessor reserves nothing for other writers and cannot receive a second
+approval. Only its own consuming connection may read custody from it. H may
+revoke it while live too, fencing later releases/refresh exactly as for an
+archived source. D owns eventual archival on migration completion or abort;
+no source is deleted. The custody branch's seam compatibility tests do not
+substitute for the integration branch's full D migration/retirement suite.
 
 Only project-owned connections (`projectId` non-null) require this receipt:
 one internal fact-only reader checks the saved source at first bind, finish,
@@ -97,8 +126,10 @@ configuration and key version. Local receipt mutations and already-authenticated
 installation/repository webhooks invalidate cached verdicts. Revocation and H
 are read from the database on every release, including cache hits. A suspended
 installation, changed stable repository IDs or mismatched verified App identity
-refuses release. Already-exported provider tokens cannot be recalled by a local
-cache invalidation.
+refuses release. A token minted BEFORE local revocation remains valid until
+its provider expiry: a GitHub App installation token lasts at most **60 minutes**.
+The local off switch blocks later releases and refresh/mints; it does not recall
+an already-exported provider token.
 
 The classified manager reference is refused before key resolution and its
 verified numeric App ID after provider verification, including Client-ID aliases

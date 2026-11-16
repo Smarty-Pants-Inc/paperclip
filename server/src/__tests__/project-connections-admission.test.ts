@@ -13,7 +13,7 @@ import * as credentials from "../services/connection-credentials.js";
 import { createToolConnectionSchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
-import { projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
+import { configureProjectFixture, projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 describe("project connection writer admission (round-4 B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -58,6 +58,26 @@ describe("project connection writer admission (round-4 B)", () => {
   }
   const finishInput = (agentId: string) => ({ access: { agentIds: [agentId] }, enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [] });
 
+  async function counts(companyId: string) {
+    return {
+      connections: (await db.select().from(toolConnections).where(eq(toolConnections.companyId, companyId))).length,
+      activity: (await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).length,
+      installs: (await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, companyId))).length,
+      profiles: (await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, companyId))).length,
+    };
+  }
+  // RFL 05:56Z replacement: genuine prerequisites are not action residue.
+  // One exact assertion also catches setup leaks: S plus exactly the three
+  // named activity rows, in addition to the explicitly seeded owned rows.
+  async function setupSnapshot(f: Awaited<ReturnType<typeof approvedProjectConnectionFixture>>, ownedIds: string[] = []) {
+    const { sourceId } = await f.approve();
+    const connections = await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId));
+    const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect({ connectionIds: connections.map(c => c.id).sort(), sources: connections.filter(c => c.projectId === null).map(c => c.id), actions: activity.map(a => a.action).sort() })
+      .toEqual({ connectionIds: [sourceId, ...ownedIds].sort(), sources: [sourceId], actions: ["plugin.config.updated", "tool_connection.created", "tool_connection.project_app_approved"].sort() });
+    return counts(f.companyId);
+  }
+
   it("J19: a viewer's private primary is not the designated human's approval authority", async () => {
     const f = await projectConnectionFixture(db);
     const viewer = `viewer-${randomUUID()}`;
@@ -70,32 +90,39 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J19: another member's private primary and a mismatched responsible human cannot first-bind", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve();
     const member = `member-${randomUUID()}`;
     await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: member, membershipRole: "member", status: "active" });
     await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: member, primaryAgentId: f.outsider.id });
+    const before = await setupSnapshot(f);
     for (const actor of [{ ...f.actor(f.outsider.id), responsibleUserId: member }, { ...f.actor(), responsibleUserId: member }]) {
       await expect(f.service.createConnection(f.companyId, f.input(), actor))
         .rejects.toMatchObject({ status: 403, details: { code: "project_connection_actor_required" } });
     }
-    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await counts(f.companyId)).connections - before.connections).toBe(0);
+    expect((await counts(f.companyId)).activity - before.activity).toBe(0);
   });
 
   it("J19: missing trusted handoff refuses even H's real primary; installer labels are not proof", async () => {
     const f = await projectConnectionFixture(db);
+    await configureProjectFixture(db, f); // manager only: NO source, NO approval
+    const setupActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(setupActivity.map(row => row.action)).toEqual(["plugin.config.updated"]);
     const resolve = vi.spyOn(credentials, "resolveConnectionGrantSecret");
     const verify = vi.spyOn(providerScope, "verifyProjectConnectionGitHubScope");
     for (const installedBy of [undefined, f.human, `different-human-${randomUUID()}`]) {
       const input = f.input();
       input.config = { ...input.config, ...(installedBy ? { installedBy, createdBy: f.human } : {}) };
       await expect(f.service.createConnection(f.companyId, input, f.actor()))
-        .rejects.toMatchObject({ status: 403, details: { code: "project_connection_human_handoff_required" } });
+        .rejects.toMatchObject({ status: 403, details: { code: "project_app_approval_required" } });
     }
     expect(resolve).not.toHaveBeenCalled();
     expect(verify).not.toHaveBeenCalled();
     expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    const afterActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(afterActivity.filter(row => !setupActivity.some(setup => setup.id === row.id))).toHaveLength(0);
+    expect(afterActivity).toEqual(setupActivity);
   });
 
   it("A01: worker cannot self-ratify first bind; actorless service calls cannot bypass it", async () => {
@@ -283,14 +310,15 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it.each(["primary", "lead", "recipient", "key", "returned-repository", "identity"] as const)("A05/M02: %s changes during provider verification refuse before reach", async variant => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
+    const before = await setupSnapshot(f, [connection.id]);
     harness.verify.mockImplementation(async () => {
       if (variant === "primary") await db.update(userCompanyPreferences).set({ primaryAgentId: f.outsider.id }).where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
       if (variant === "lead") await db.update(projects).set({ leadAgentId: f.leadB.id }).where(eq(projects.id, f.a.id));
       if (variant === "recipient") await db.update(agents).set({ reportsTo: f.leadB.id }).where(eq(agents.id, f.worker.id));
-      if (variant === "key") await db.update(companySecrets).set({ latestVersion: 2 }).where(eq(companySecrets.id, f.secret.id));
+      if (variant === "key") await db.update(companySecrets).set({ latestVersion: APPROVED_KEY_VERSION + 1 }).where(eq(companySecrets.id, f.secret.id));
       return { ...harness.verified,
         ...(variant === "returned-repository" ? { repositoryIds: [999] } : {}),
         ...(variant === "identity" ? { identity: { ...harness.verified.identity, verifiedRegistrationId: "987" } } : {}),
@@ -299,22 +327,23 @@ describe("project connection writer admission (round-4 B)", () => {
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
       .rejects.toMatchObject({ status: expect.any(Number) });
     expect(harness.verify).toHaveBeenCalledTimes(1);
-    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
-    expect(await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await counts(f.companyId)).installs - before.installs).toBe(0);
+    expect((await counts(f.companyId)).profiles - before.profiles).toBe(0);
+    expect((await counts(f.companyId)).activity - before.activity).toBe(0);
     expect((await storedConnection(db, connection.id))).toMatchObject({ status: "draft", enabled: false });
   });
 
   it("J02/A05: preserveExistingAccess checks the final recipient union, not only the new worker", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: connection.id, targetType: "agent", targetId: f.outsider.id });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
+    const before = await setupSnapshot(f, [connection.id]);
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, { ...finishInput(f.worker.id), preserveExistingAccess: true }, f.actor()))
       .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
       .toMatchObject([{ targetId: f.outsider.id }]);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await counts(f.companyId)).activity - before.activity).toBe(0);
   });
 
   it("A08/W7: actorless project lead changes cannot rewrite the approved team", async () => {
@@ -388,10 +417,11 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J11/B-RF2-0036-integration: real running-work gate rolls back lead and every retained approval", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
     const live = await f.seedConnection(f.a, { status: "draft", installed: false });
     await f.run(f.a, f.worker.id);
+    const before = await setupSnapshot(f, [archived.connection.id, live.connection.id]);
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
     expect(response.status).toBe(409);
     expect(response.body.details?.code ?? response.body.code).toBe("project_connection_in_use");
@@ -399,7 +429,7 @@ describe("project connection writer admission (round-4 B)", () => {
     for (const { connection } of [archived, live]) {
       expect((await storedConnection(db, connection.id)).config.projectScope).toEqual(f.scope());
     }
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await counts(f.companyId)).activity - before.activity).toBe(0);
   });
 
   it("J03/B-RF2-0036-archived-only: changing the lead preserves the sole connection's terminal archive", async () => {
@@ -454,12 +484,12 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J05/A02: provider IDs equal the requested shard, not just any non-empty approved subset", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.a.id, name: "Second approved repository", repoUrl: "https://github.com/owner/A2.git", metadata: { githubRepositoryId: 102 } });
     const config = { ...connection.config, projectScope: { ...f.scope(), approvedRepositoryIds: [101, 102] } };
     await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connection.id));
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
     // Both IDs are ratified and current, but this connection requested only A
     // (101). A provider reply for approved A2 (102) is still the wrong token.
     harness.verify.mockResolvedValue({ ...harness.verified, repositoryIds: [102] });

@@ -148,8 +148,8 @@ export async function readProjectAppCustody(db: Database, input: {
     if (consumedBy !== undefined) {
       // Single use: an archived consumed source serves ONLY its consumer.
       if (parsed.success && parsed.data.projectId === input.projectId && typeof consumedBy === "string" && consumedBy !== input.connectionId) consumedForProject = consumedBy;
-      // The consumer reads S whether S was archived or retained live as the
-      // judged make-before-break predecessor (D's legacyConnectionId).
+      // e057cf786 / N6: the consumer also reads S retained live as D's
+      // make-before-break predecessor. Nobody else may reuse its receipt.
       if (consumedBy !== input.connectionId) continue;
     } else if (source.status === "archived") continue;
     if (!parsed.success || source.status === "disabled" || source.projectId !== null || !isGitHubAppConnection(source)) continue;
@@ -184,6 +184,37 @@ export async function readProjectAppCustody(db: Database, input: {
   return matches[0]!;
 }
 
+/** N6: a consumed live predecessor is history-in-use, never a reservation.
+ * Revocation/key/grant state cannot reopen that spent source's reservation. */
+export function isConsumedProjectAppApprovalPredecessor(connection: Connection) {
+  const parsed = receiptSchema.safeParse(connection.config[PROJECT_APP_APPROVAL_FIELD]);
+  return connection.projectId === null && !["archived", "disabled"].includes(connection.status)
+    && isGitHubAppConnection(connection) && parsed.success && parsed.data.companyId === connection.companyId
+    && z.string().uuid().safeParse(connection.config[PROJECT_APP_APPROVAL_CONSUMED_BY]).success;
+}
+
+/** RFL 05:56Z: an approval source is not an owned reservation against another
+ * receipt-citing first bind of the same installation OR registration. This is a
+ * value-free classification, never approval for the caller or consumption of S.
+ * The caller's own exact receipt is separately re-read under the create locks. */
+export function isUnconsumedProjectAppApprovalSource(connection: Connection, identity: {
+  companyId: string; verifiedRegistrationId: string; canonicalInstallationKey: string;
+}) {
+  const parsed = receiptSchema.safeParse(connection.config[PROJECT_APP_APPROVAL_FIELD]);
+  if (!parsed.success || parsed.data.revokedAt || connection.projectId !== null
+    || ["archived", "disabled"].includes(connection.status) || !isGitHubAppConnection(connection)
+    || connection.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined
+    || parsed.data.companyId !== connection.companyId || connection.companyId !== identity.companyId) return false;
+  const app = parseGitHubAppConfig(connection.config.methodConfig);
+  return app.installationId === parsed.data.installationId
+    && (!/^[1-9]\d*$/.test(app.appId) || app.appId === parsed.data.appId)
+    && connection.credentialSecretRefs.length === 1
+    && connection.credentialSecretRefs[0]!.secretId === parsed.data.secretRef.secretId
+    && connection.credentialSecretRefs[0]!.configPath === parsed.data.secretRef.configPath
+    && (parsed.data.appId === identity.verifiedRegistrationId
+      || `github.com/github-app-installation/${parsed.data.installationId}` === identity.canonicalInstallationKey);
+}
+
 const approvalClient = createGitHubAppClient();
 /** Called ONLY by the session route. HTTP and key resolution occur before row
  * locks. The exact snapshot, current H and current classifier are rechecked
@@ -193,8 +224,13 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
   const [project] = await db.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId)));
   const [source] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.connectionId)));
   if (!project || project.archivedAt) throw notFound("Active project not found");
-  if (!source || source.projectId !== null || !isGitHubAppConnection(source) || ["archived", "disabled"].includes(source.status)
+  // A consumed source stays archived forever, but H retains the off switch.
+  // This exception is revoke-only: approval cannot resurrect/reuse a spent S.
+  const consumedRevoke = input.action === "revoke" && source?.status === "archived"
+    && z.string().uuid().safeParse(source.config[PROJECT_APP_APPROVAL_CONSUMED_BY]).success;
+  if (!source || source.projectId !== null || !isGitHubAppConnection(source) || source.status === "disabled" || (source.status === "archived" && !consumedRevoke)
     || source.credentialPolicy !== "shared" || source.credentialSource !== "paperclip_vault" || source.credentialSecretRefs.length !== 1) throw notFound("Project App source connection not found");
+  if (input.action === "approve" && source.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== undefined) throw consumed();
   const config = parseGitHubAppConfig(source.config.methodConfig);
   const manager = await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, requireConfigured: true });
   const grants = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.connectionId, source.id)));
@@ -288,7 +324,14 @@ export async function verifyGitHubAppCandidate(db: Db, input: { companyId: strin
   const privateKey = await secretService(db).resolveSecretValue(input.companyId, ref.secretId, version, {
     accessContext: { actorType: "system", actorId: input.actorId, consumerType: "system", consumerId: "project-app-reference-verification" },
   });
-  const result = await approvalClient.acquire(`${input.companyId}:${input.namespace}:${ref.secretId}:${secret.latestVersion}:${version}`, app, privateKey, true);
+  let result: Awaited<ReturnType<typeof approvalClient.acquire>>;
+  try {
+    result = await approvalClient.acquire(`${input.companyId}:${input.namespace}:${ref.secretId}:${secret.latestVersion}:${version}`, app, privateKey, true);
+  } catch (error) {
+    if (input.projectId != null) throw new HttpError(503,
+      "GitHub project App verification is unavailable. No connection was created.", { code: "project_app_verification_unavailable" });
+    throw error;
+  }
   const registrationId = positiveId.safeParse(result.verifiedRegistrationId);
   const ids = repoIds.safeParse((result.github.repositories ?? []).map(repo => Number(repo.id)));
   if (!registrationId.success || !ids.success || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== app.installationId) throw unavailable();
@@ -322,10 +365,8 @@ export async function prepareProjectAppFirstBind(db: Db, input: { companyId: str
 export async function consumeProjectAppApproval(tx: Database, input: {
   companyId: string; projectId: string; sourceConnectionId: string; receiptId: string; connectionId: string;
   actorType: "agent" | "user" | "system"; actorId: string;
-  /** RFL 04:5xZ (3) "archived, or linked as the predecessor": when the create
-   * staged D's make-before-break migration with S as legacyConnectionId, S keeps
-   * serving its existing installs until D's verified activation; the receipt is
-   * still consumed (single use) in this transaction. */
+  /** e057cf786 / N6: D staged S as its make-before-break legacyConnectionId.
+   * Keep S live but linked and single-use until D completes or aborts it. */
   retainAsPredecessor?: boolean;
 }) {
   const [source] = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.sourceConnectionId))).for("update");

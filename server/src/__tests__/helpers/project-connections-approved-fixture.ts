@@ -28,9 +28,8 @@ function sessionApp(db: Db, f: Fixture) {
   return app;
 }
 
-/** C4 config and the approval receipt are written ONLY through their native
- * board-session routes. W1 fixture metadata is not a receipt or a C4 config. */
-export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, installationId = "456") {
+/** Configure C4 through the real session route WITHOUT minting any receipt. */
+export async function configureProjectFixture(db: Db, f: Fixture) {
   let ready = setup.get(f);
   if (!ready) {
     ready = (async () => {
@@ -47,6 +46,12 @@ export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, i
     setup.set(f, ready);
   }
   await ready;
+}
+
+/** C4 config and the approval receipt are written ONLY through their native
+ * board-session routes. W1 fixture metadata is not a receipt or a C4 config. */
+export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, installationId = "456") {
+  await configureProjectFixture(db, f);
   const input = f.input(project); input.projectId = null;
   input.config = { ...input.config, methodConfig: { ...f.config(project).methodConfig, installationId } };
   const source = await request(sessionApp(db, f)).post(`/api/companies/${f.companyId}/tools/connections`).send(input);

@@ -3,6 +3,7 @@ import { connectionGrants, toolApplications, toolConnections, type Db } from "@p
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { DbTransaction } from "./tool-access/types.js";
 import { lockProjectConnectionLifecycle } from "./project-connection-retirement.js";
+import { isConsumedProjectAppApprovalPredecessor, isUnconsumedProjectAppApprovalSource, PROJECT_APP_APPROVAL_SOURCE } from "./project-app-custody.js";
 
 /** Lane A. Provider verification belongs outside this transaction. */
 export type ProjectConnectionIdentity = Readonly<{
@@ -101,11 +102,13 @@ function legacyAliases(connection: Connection) {
 export async function assertProjectConnectionAvailability(
   tx: Db | DbTransaction,
   input: Readonly<{ identity: ProjectConnectionIdentity; projectId: string | null; exclusive: boolean; excludeConnectionId?: string;
-    /** RFL 04:5xZ: ONLY the create citing S's verified receipt (consumed in the
-     * same transaction) ignores S. Every other writer still collides with S. */
+    /** RFL 05:56Z: a verified receipt-citing create ignores live approval
+     * sources of this installation/registration, but consumes ONLY its own S.
+     * Ordinary writers retain the existing reservation checks. */
     consumedSourceConnectionId?: string }>,
 ): Promise<void> {
   const { identity, projectId, exclusive, excludeConnectionId, consumedSourceConnectionId } = input;
+  let receiptCiting = projectId !== null && consumedSourceConnectionId !== undefined;
   assertIdentity(identity);
   if (exclusive && projectId === null) {
     throw unprocessable("Only a project connection can reserve an EXCLUSIVE App", { code: "project_connection_scope_invalid" });
@@ -125,6 +128,11 @@ export async function assertProjectConnectionAvailability(
     }
     if (saved.projectId !== null) {
       if (saved.status === "archived") throw conflict("This project's connection was retired. Create a new approved project connection.", { code: "project_connection_archived" });
+      // The winner's saved protected source pointer retains its receipt-citing
+      // identity at finish/install/profile writers. Otherwise a losing live S
+      // would let create win, then incorrectly block the winner from use. These
+      // callers still re-check custody/admission; this is not authorization.
+      receiptCiting ||= typeof saved.config[PROJECT_APP_APPROVAL_SOURCE] === "string";
       const savedIdentity = projectConnectionIdentityForConnection(saved)!;
       const savedExclusive = object(saved.config.projectScope)!.exclusive;
       if (exclusive && savedExclusive === false) {
@@ -157,7 +165,8 @@ export async function assertProjectConnectionAvailability(
   let duplicate = false;
   let incompatible = false;
   for (const connection of live) {
-    if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId) continue;
+    if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId || isConsumedProjectAppApprovalPredecessor(connection)) continue;
+    if (receiptCiting && isUnconsumedProjectAppApprovalSource(connection, identity)) continue;
     const ownedIdentity = projectConnectionIdentityForConnection(connection);
     const aliases = legacyAliases(connection);
     const grantAliases = aliasesByConnection.get(connection.id);
@@ -205,7 +214,12 @@ export async function assertKnownProjectConnectionCreateAliases(
   // identity for the null row. This is denial-only, so no lock can turn it into
   // approval. B/C must still verify and lock any eventual successful attempt.
   if (input.exclusive && saved.some(connection => {
-    if (connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId) return false;
+    if (connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId || isConsumedProjectAppApprovalPredecessor(connection)) return false;
+    // The protected first-bind scope is server-prepared, never request metadata.
+    // Raw spellings remain denial-only hints for every ordinary create.
+    const receiptIdentity = input.consumedSourceConnectionId && input.projectId !== null
+      ? projectConnectionIdentityForConnection({ companyId: input.companyId, projectId: input.projectId, config: input.config }) : null;
+    if (receiptIdentity && isUnconsumedProjectAppApprovalSource(connection, receiptIdentity)) return false;
     const aliases = legacyAliases(connection);
     return (installationKey !== null && aliases.installationKeys.has(installationKey))
       || (registrationHint !== null && aliases.registrationIds.has(registrationHint));

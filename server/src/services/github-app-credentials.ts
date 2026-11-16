@@ -3,7 +3,7 @@ import { connectionGrants, toolConnections, toolConnectionInstalls, projectWorks
 import { resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership } from "./connection-credentials.js";
 import { HttpError, unprocessable } from "../errors.js";
 import { assertNotManagerApp, projectAppManagerConfigured, readProjectAppCustody } from "./project-app-custody.js";
-import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
+import { assertProjectConnectionAdmission, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
 
 export { isGitHubAppConnection, parseGitHubAppConfig } from "./github-app-client.js";
@@ -67,6 +67,12 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
         || c.credentialSecretRefs.some(ref => ref.configPath !== GITHUB_APP_KEY_PATH
           || !scope.approvedSecretRefs.some(approved => approved.secretId === ref.secretId && approved.configPath === ref.configPath))
         || (!allowDraft && scope.migrationPending)) githubAppFailure();
+      // Preserve the credential owner's named old-H/revoke refusal before any
+      // management/recipient denial. This DB fence runs on cache hits too;
+      // admission itself still checks repository/reference boundaries first.
+      await readProjectAppCustody(db, { companyId: c.companyId, projectId: c.projectId, config: c.config,
+        refs: g.credentialSecretRefs, registrationId: scope.registrationId, connectionId: c.id,
+        repositoryIds: await projectConnectionRepositoryIds(db, c.companyId, c.projectId, config.repositories) });
       // Actorless use cannot manufacture management authority; B validates current
       // approval and recipient reach, while existing finish writers own management.
       await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
@@ -89,17 +95,17 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const ref = g.credentialSecretRefs.find(r => r.configPath === GITHUB_APP_KEY_PATH);
     if (!ref) githubAppFailure();
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
-    // RFL 05:56Z item 3: ONLY a provider acquire() failure on a project
-    // connection becomes 503 project_app_verification_unavailable (E2). Local
-    // denials (saved scope, stable repository IDs, revoked grant, custody) keep
-    // their own github_app_access_unavailable / project_app_* codes.
-    const result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force)
-      .catch((error: unknown) => {
-        const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
-        if (c.projectId && code === "github_app_access_unavailable") throw new HttpError(503,
-          "GitHub project App verification is unavailable. No credential was released.", { code: "project_app_verification_unavailable" });
-        throw error;
-      });
+    const config = parseGitHubAppConfig(c.config.methodConfig);
+    let result: Awaited<ReturnType<typeof client.acquire>>;
+    try {
+      result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, config, secret.value, force);
+    } catch (error) {
+      // Only provider acquire failures are outages. Local pre/post-I/O denials
+      // retain github_app_access_unavailable and never release a credential.
+      if (c.projectId) throw new HttpError(503,
+        "GitHub project App verification is unavailable. No credential was released.", { code: "project_app_verification_unavailable" });
+      throw error;
+    }
     await valid(result.verifiedRegistrationId);
     if (c.projectId) {
       const currentKey = await validateConnectionGrantSecretOwnership(db, c, g, ref);
@@ -140,6 +146,17 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
 }
 
 export async function refreshGitHubAppAccess(db: Db, connection: Connection, force = false) {
+  if (connection.projectId) {
+    // Refresh has no credential recipient. Check the same DB off switch before
+    // any acquisition (or recipient-less use denial), never manufacture a
+    // recipient/management authority to make a refresh succeed.
+    const scope = readProjectConnectionScope(connection)!;
+    const app = parseGitHubAppConfig(connection.config.methodConfig);
+    await readProjectAppCustody(db, { companyId: connection.companyId, projectId: connection.projectId,
+      config: connection.config, refs: connection.credentialSecretRefs, connectionId: connection.id,
+      registrationId: scope.registrationId,
+      repositoryIds: await projectConnectionRepositoryIds(db, connection.companyId, connection.projectId, app.repositories) });
+  }
   const grant = await getGitHubAppGrant(db, connection);
   const result = await resolveGitHubAppCredential(db, connection, grant, connection.status === "draft", force);
   await db.update(connectionGrants).set({ providerTenant: { github: result.github } }).where(and(
