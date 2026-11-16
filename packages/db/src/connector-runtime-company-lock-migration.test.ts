@@ -7,12 +7,22 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const FUNCTIONS = ["paperclip_record_agent_runtime", "paperclip_invalidate_connector_company"];
+// src8 (R2): the multi-agent fanouts 0489 also replaces, each with the migration
+// that last defined it, plus the new row-lock helper (dropped by the DOWN).
+const FANOUTS: Record<string, string> = {
+  paperclip_invalidate_company_agent_runtimes: "./migrations/0354_agent_connection_assignment_hooks.sql",
+  paperclip_invalidate_skill_source_runtimes: "./migrations/0378_environment_skill_runtime_hooks.sql",
+  paperclip_skill_runtime_changed: "./migrations/0378_environment_skill_runtime_hooks.sql",
+  paperclip_environment_runtimes_changed: "./migrations/0378_environment_skill_runtime_hooks.sql",
+  paperclip_connector_runtime_changed: "./migrations/0444_github_access_refresh_runtime_bookkeeping.sql",
+};
+const ALL_FUNCTIONS = [...FUNCTIONS, ...Object.keys(FANOUTS), "paperclip_lock_runtime_agents"];
 const read = (path: string) => readFile(new URL(path, import.meta.url), "utf8");
 
 /** The CREATE statements for FUNCTIONS in one migration file, in file order. */
-async function functionStatements(path: string) {
+async function functionStatements(path: string, names: string[] = FUNCTIONS) {
   return (await read(path)).split("--> statement-breakpoint")
-    .filter(statement => FUNCTIONS.some(name => statement.includes(`CREATE OR REPLACE FUNCTION ${name}(`))).join(";\n");
+    .filter(statement => names.some(name => statement.includes(`CREATE OR REPLACE FUNCTION ${name}(`))).join(";\n");
 }
 
 (support.supported ? describe : describe.skip)("#20805 connector runtime company lock migration (0491)", () => {
@@ -21,7 +31,7 @@ async function functionStatements(path: string) {
     const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
     try {
       const definitions = async () => Object.fromEntries((await sql`SELECT p.proname, pg_get_functiondef(p.oid) AS def FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = ANY(${FUNCTIONS}) ORDER BY p.proname`)
+        JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname = ANY(${ALL_FUNCTIONS}) ORDER BY p.proname`)
         .map(row => [row.proname as string, row.def as string]));
       const revisions = async () => Array.from(await sql`SELECT id, company_id, resource_type, resource_id, action FROM resource_lifecycle_events ORDER BY id`);
       const [company] = await sql`INSERT INTO companies (name, issue_prefix) VALUES ('Lock migration', 'LKM') RETURNING id`;
@@ -36,10 +46,19 @@ async function functionStatements(path: string) {
       expect(head.paperclip_invalidate_connector_company).toContain("pg_advisory_xact_lock(");
       expect(head.paperclip_invalidate_connector_company).not.toContain("FOR NO KEY UPDATE");
       expect(head.paperclip_record_agent_runtime).toContain("pg_advisory_xact_lock_shared(");
+      // R2 (src8): every multi-agent fanout locks its rows before the first record.
+      for (const name of ["paperclip_invalidate_company_agent_runtimes", "paperclip_invalidate_skill_source_runtimes", "paperclip_skill_runtime_changed"])
+        expect(head[name]).toMatch(/FOREACH candidate IN ARRAY ARRAY\(SELECT[\s\S]*FOR NO KEY UPDATE\) LOOP/);
+      expect(head.paperclip_environment_runtimes_changed).toContain("FOR NO KEY UPDATE OF a)) ORDER BY locked.company_id, locked.id LOOP");
+      expect(head.paperclip_connector_runtime_changed.match(/PERFORM paperclip_lock_runtime_agents\(agent_ids\)/g)).toHaveLength(3);
+      expect(head.paperclip_lock_runtime_agents).toContain("ORDER BY id FOR NO KEY UPDATE");
 
       // Previous bodies, from the migration that last defined them.
       await sql.unsafe(await functionStatements("./migrations/0354_agent_connection_assignment_hooks.sql"));
+      for (const [name, path] of Object.entries(FANOUTS)) await sql.unsafe(await functionStatements(path, [name]));
+      await sql`DROP FUNCTION paperclip_lock_runtime_agents(uuid[])`;
       const previous = await definitions();
+      expect(previous.paperclip_lock_runtime_agents).toBeUndefined();
       expect(previous).not.toEqual(head);
       expect(await revisions()).toEqual(seeded);
 
