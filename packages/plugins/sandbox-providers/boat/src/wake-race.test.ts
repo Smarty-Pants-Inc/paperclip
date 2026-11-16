@@ -121,7 +121,7 @@ class FakeBoat {
 
 type Harness = { name: string; boat: FakeBoat; company: string; env: string; emit(eventType: string): Promise<void>;
   acquire(runId: string): Promise<{ providerLeaseId: string | null }>; dbCalls: Array<{ inAcquire: boolean; sql: string }>;
-  warnings: string[] };
+  warnings: string[]; state: Map<string, unknown> };
 
 let acquireDepth = 0;
 let current: Harness | undefined;
@@ -137,7 +137,7 @@ async function settle<T>(promise: Promise<T>, stepMs = 100, limitMs = 180_000): 
   return value as T;
 }
 
-async function harness(name: string): Promise<Harness> {
+async function harness(name: string, spareMax = 3): Promise<Harness> {
   const boat = new FakeBoat(CREATE_LATENCY_MS);
   vi.stubGlobal("fetch", boat.fetch);
   const company = `company-${name}`, env = `environment-${name}`;
@@ -152,7 +152,7 @@ async function harness(name: string): Promise<Harness> {
     claims.add(String(params[0]));
     return { rowCount: 1 };
   } };
-  const instanceConfig = { spares: 1, spareMax: 3, spareDemandWindowMinutes: 10, spareEnvironmentIds: [env], spareIdleMinutes: IDLE_MINUTES };
+  const instanceConfig = { spares: 1, spareMax, spareDemandWindowMinutes: 10, spareEnvironmentIds: [env], spareIdleMinutes: IDLE_MINUTES };
   const warn = (message: string) => { warnings.push(message); boat.record({ kind: "warn", note: message }); };
   await plugin.definition.setup({
     config: { get: async () => instanceConfig },
@@ -173,7 +173,7 @@ async function harness(name: string): Promise<Harness> {
   } as any);
   await plugin.definition.onConfigChanged!(instanceConfig, { companyId: company } as any);
   const h: Harness = {
-    name, boat, company, env, dbCalls, warnings,
+    name, boat, company, env, dbCalls, warnings, state,
     emit(eventType) {
       const handler = eventHandlers.get(eventType);
       if (!handler) throw new Error(`no handler for ${eventType}`);
@@ -251,6 +251,81 @@ afterEach(async (context) => {
   current = undefined;
   vi.unstubAllGlobals();
   vi.useRealTimers();
+});
+
+// Keep reason: recorded daily-work incidents smarty-dev#20869 / #20836.
+// These use real event/acquire handlers, real claim naming and one clock; no
+// provider, server, or persistent-state stand-in is patched into the keeper.
+function liveUnclaimed(h: Harness): Box[] {
+  return [...h.boat.boxes.values()].map(box => h.boat.observe(box)).filter(box =>
+    box.labels.purpose === "spare" && box.state !== "archived" && !box.name.startsWith("paperclip-claim:"));
+}
+
+describe("Boat ready spare create admission (cl-spare-cap)", () => {
+  it("RED-A claimed demand does not exhaust the hourly replacement cap", async () => {
+    const h = await harness("cap-demand", 1);
+    await seed(h);
+    for (let n = 1; n <= 12; n++) {
+      await settle(h.acquire(`claimed-${n}`));
+      await advance(4_000);
+    }
+    const claimed = [...h.boat.boxes.values()].filter(box => box.labels.purpose === "spare" && box.name.startsWith("paperclip-claim:"));
+    expect(claimed, "12 real spare creates were transferred to runs within this hour").toHaveLength(12);
+    const before = h.boat.creates().length;
+    await settle(h.acquire("claim-13"));
+    await advance(5_000);
+    expect(h.boat.creates().length - before, "13th acquire creates exactly one replacement, not zero").toBe(1);
+    expect(liveUnclaimed(h)).toHaveLength(1);
+  });
+
+  it("RED-B unclaimed churn still caps at twelve and records create_capped", async () => {
+    const h = await harness("cap-churn", 1);
+    await seed(h);
+    for (let n = 1; n <= 12; n++) {
+      const [spare] = liveUnclaimed(h);
+      expect(spare, `unclaimed churn spare ${n}`).toBeDefined();
+      // Simulate a provider-side stop; the real wake handler sees the durable
+      // archived inventory row and attempts to replace it.
+      spare.state = "archived";
+      await settle(h.emit("issue.created"));
+      await advance(4_000);
+    }
+    await settle(h.acquire("after-churn"));
+    await advance(5_000);
+    expect(h.boat.creates(), "13th spare create refused").toHaveLength(12);
+    expect(liveUnclaimed(h)).toHaveLength(0);
+    const outcomes = h.state.get(`${h.company}:acquire-outcomes`) as { environments: Array<{ reasons: Record<string, number> }> };
+    expect(outcomes.environments[0].reasons.create_capped, "named acquire outcome is persisted").toBeGreaterThan(0);
+  });
+
+  it("RED-C two claims four seconds apart make exactly two replacements at target one", async () => {
+    const h = await harness("cap-topup", 1);
+    const first = await seed(h);
+    const before = h.boat.creates().length;
+    const firstClaimAt = Date.now();
+    expect((await settle(h.acquire("topup-1"))).providerLeaseId).toBe(first);
+    await advance(firstClaimAt + 4_000 - Date.now());
+    const [second] = liveUnclaimed(h);
+    expect(second).toBeDefined();
+    expect((await settle(h.acquire("topup-2"))).providerLeaseId).toBe(second.id);
+    await advance(5_000);
+    const observed = { liveUnclaimed: liveUnclaimed(h).length, replacementCreates: h.boat.creates().length - before };
+    h.boat.record({ kind: "event", note: "RED-C settled", value: observed });
+    expect(observed).toEqual({ liveUnclaimed: 1, replacementCreates: 2 });
+  });
+
+  it("CONTROL adaptive target remains bounded by spareMax rather than silently becoming a fixed floor", async () => {
+    const h = await harness("cap-adaptive", 3);
+    await seed(h);
+    const before = h.boat.creates().length;
+    const firstClaimAt = Date.now();
+    await settle(h.acquire("adaptive-1"));
+    await advance(firstClaimAt + 4_000 - Date.now());
+    await settle(h.acquire("adaptive-2"));
+    await advance(5_000);
+    expect({ liveUnclaimed: liveUnclaimed(h).length, replacementCreates: h.boat.creates().length - before })
+      .toEqual({ liveUnclaimed: 3, replacementCreates: 4 });
+  });
 });
 
 describe("Boat ready spare wake race (cl-spare-wakerace4)", () => {
