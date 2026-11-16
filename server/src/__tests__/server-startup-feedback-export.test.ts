@@ -1800,7 +1800,7 @@ describe("startServer feedback export wiring", () => {
   // Keep: data safety regression for CONNECTION_ENDED after successful native
   // detach. Capture and directory collection are real; store/pool boundaries are
   // doubles here. The PostgreSQL checkpoint suite covers durable receipt writes.
-  it.each(["warm turn", "session close", "deadline"] as const)("joins a held agent-file checkpoint before pool.end on hot restart (%s)", async source => {
+  it.each(["warm turn", "session close", "deadline", "none pending"] as const)("joins a held agent-file checkpoint before pool.end on hot restart (%s)", async source => {
     loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
     const events: string[] = [];
     let poolEnded = false;
@@ -1865,25 +1865,33 @@ describe("startServer feedback export wiring", () => {
       await settleStartupHousekeeping();
       const end = vi.fn(async () => { poolEnded = true; events.push("pool_end"); });
       for (const result of createDbMock.mock.results) Object.assign(result.value, { $client: { end } });
-      checkpoint = source === "session close" ? directories.collectStopped(row) : directories.checkpointWarm(row);
-      void checkpoint.catch(() => {}); // The RED/timeout path rejects after pool.end.
-      await capturing;
+      if (source !== "none pending") {
+        checkpoint = source === "session close" ? directories.collectStopped(row) : directories.checkpointWarm(row);
+        void checkpoint.catch(() => {}); // The RED/timeout path rejects after pool.end.
+        await capturing;
+      }
       if (source === "deadline") vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
       stopping = server.shutdown();
       await settleStartupHousekeeping();
       expect(drainRuns).not.toHaveBeenCalled();
       expect(drainExecutions).not.toHaveBeenCalled();
-      expect(end, events.join(" -> ")).not.toHaveBeenCalled();
+      if (source !== "none pending") expect(end, events.join(" -> ")).not.toHaveBeenCalled();
       if (source === "deadline") {
-        await vi.advanceTimersByTimeAsync(29_999);
+        await vi.advanceTimersByTimeAsync(19_999);
         expect(end).not.toHaveBeenCalled();
         await vi.advanceTimersByTimeAsync(1);
+        expect(end).toHaveBeenCalled();
+        await stopping;
+        expect(logger.info).toHaveBeenCalledWith(
+          { signal: "SIGTERM", timeoutMs: 20_000 }, "bounded heartbeat execution finalizer drain timed out",
+        );
+        return; // The retained bound intentionally permits teardown at 20 s.
+      }
+      if (source === "none pending") {
         await stopping;
         expect(end).toHaveBeenCalled();
-        expect(logger.info).toHaveBeenCalledWith(
-          { signal: "SIGTERM", timeoutMs: 30_000 }, "bounded heartbeat execution finalizer drain timed out",
-        );
-        return; // The retained bound intentionally permits teardown at 30 s.
+        expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ outcome: "none_pending", durationMs: expect.any(Number), pendingSaves: 0 }), "hot-restart agent-file checkpoint join complete");
+        return;
       }
       release();
       await checkpoint;
@@ -1892,6 +1900,7 @@ describe("startServer feedback export wiring", () => {
       expect(events.indexOf("checkpoint_saved")).toBeLessThan(events.indexOf("checkpoint_receipt"));
       expect(events.indexOf("checkpoint_receipt")).toBeLessThan(events.indexOf("pool_end"));
       expect(end).toHaveBeenCalled();
+      expect(logger.info).toHaveBeenCalledWith(expect.objectContaining({ outcome: "settled", durationMs: expect.any(Number), pendingSaves: 1 }), "hot-restart agent-file checkpoint join complete");
     } finally {
       release();
       releaseExecution();
