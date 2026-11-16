@@ -15,7 +15,8 @@ import { nativePostResultFailureCategory, type NativePostResultFailureCategory }
 import { logger } from "../../middleware/logger.js";
 import { RESTART_WARM_CLOSE_CONCURRENCY } from "../../shutdown.js";
 import { canRestoreMigratedNativeSession } from "./native-workspace-migration.js";
-import { NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore } from "./native-retired-backup-source.js";
+import { NATIVE_BACKUP_SOURCE_STOP_WAIT_MS, NATIVE_PROVIDER_DURABLE_EVENT_TYPES, nativeHarnessBackupManifestSha256, retiredSourceAuthorizesNativeBackupRestore,
+  waitForStoppingBackupSource } from "./native-retired-backup-source.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED,
   nativeCheckpointRecordsCompletedTurn } from "./completed-turn-cleanup.js";
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
@@ -18864,7 +18865,11 @@ async function createRunnerdBackendWithinSessionClaim(
   // checkpoint. The verified backup is reused by the restore, so files are
   // hashed once.
   let retiredSourceBackup: VerifiedHarnessBackup | null = null;
+  // J3-22 primary: the last proof found every gate but the retired class, and
+  // the source still stopping; only then is waiting for that stop worthwhile.
+  let retiredSourceStopping = false;
   const retiredSourceBackupAuthorized = async (): Promise<boolean> => {
+    retiredSourceStopping = false;
     const backup = await verifyNativeHarnessBackupStreamed({ root, execution: input.execution, runnerInstanceId: input.runnerInstanceId });
     const sessionId = nativeSessionKey(input.execution);
     if (!backup || !sessionId) return false;
@@ -18874,6 +18879,7 @@ async function createRunnerdBackendWithinSessionClaim(
       normalizedSessionId: sessionId, manifest: backup.manifest,
       manifestSha256: nativeHarnessBackupManifestSha256(readFileSync(resolve(backup.root, "manifest.json"))),
       targetProviderLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? null,
+      onSourceStopping: () => { retiredSourceStopping = true; },
     });
   };
 
@@ -19148,10 +19154,26 @@ async function createRunnerdBackendWithinSessionClaim(
                         state.providerSessionIdentity,
                         reuseStartedAtMs,
                       );
+                    } else if (backupAvailable && retiredSourceStopping && retiredSourceBackup && remoteTarget.reusableLeaseConfigured === true
+                      && await measureNativeRunnerSpan(input.trace, "sandbox.lease.source_stop_wait", () => waitForStoppingBackupSource(input.db, {
+                        companyId: input.execution.binding.companyId,
+                        sourceProviderLeaseId: retiredSourceBackup!.manifest.sourceProviderLeaseId,
+                        deadlineAtMs: Date.now() + NATIVE_BACKUP_SOURCE_STOP_WAIT_MS }))
+                      && await retiredSourceBackupAuthorized()) {
+                      // J3-22 primary: the backup's source was stopping (its configuration
+                      // changed, no source change). It settled within the bound, and the
+                      // EXISTING retired-source proof now holds (and has claimed the source
+                      // as superseded), so the same thread continues from the backup.
+                      await input.onLog?.("stdout", "[paperclip-runner] The previous sandbox finished stopping; continuing this conversation from its saved state on a new sandbox.\n");
+                      await measureNativeRunnerSpan(input.trace, "sandbox.lease.replacement", restoreVerifiedHarnessBackup, {
+                        attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
+                          lifecycleMode: input.execution.session.lifecyclePolicy.mode, outcome: "created", reason: "source_stop_settled" },
+                      });
                     } else if (backupAvailable) {
                       // A continuation that has a durable backup but no recorded reusable
                       // lease was not provider-confirmed lost. Never silently create a new
-                      // provider session from that ambiguous state.
+                      // provider session from that ambiguous state. (The managed backend
+                      // takes the same-run fresh thread for this refusal: J3-22 floor.)
                       throw nativeReconciliationError("runner_harness_state_mismatch: backup_without_reusable_lease");
                     } else if (restartableBootstrapState(state)) {
                       if (!(await moveInterruptedBootstrapSessionAside()
