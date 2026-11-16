@@ -1,9 +1,11 @@
+import "./helpers/project-connections-approval-http.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, connectionGrants, createDb, toolApplications, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { INSTALLATION, projectConnectionFixture, type OwnedConnectionRow } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 import {
   assertProjectConnectionAvailability,
   lockProjectConnectionIdentities,
@@ -45,7 +47,8 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it("J07: a new project cannot attach after EXCLUSIVE, even through alternate App spelling", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.b); // Both genuine receipts precede the EXCLUSIVE row.
     await f.seedConnection(f.a, { exclusive: true });
     const proposed = f.input(f.b);
     proposed.config = { ...proposed.config, methodConfig: { ...f.config(f.b).methodConfig, appId: "Iv1ProjectClient1234" } };
@@ -70,7 +73,8 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it("J04/A10: duplicate service creates map one conflict and leave one application/grant/take receipt", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(); // Genuine prerequisites, before the unchanged race.
     const wait = barrier(2);
     const results = await Promise.allSettled([0, 1].map(async () => {
       await wait();
@@ -85,7 +89,8 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it("J05: A+B may share installation I without losing each row's distinct project owner", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.a); await f.approve(f.b);
     const results = await Promise.all([f.a, f.b].map(project => f.service.createConnection(f.companyId, f.input(project), f.actor())));
     expect(results.map(result => (result as unknown as { projectId: string }).projectId).sort()).toEqual([f.a.id, f.b.id].sort());
     expect(results[0]!.config?.projectScope).toMatchObject(f.scope(f.a));
@@ -93,14 +98,16 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it.each(["draft", "active"] as const)("J06: %s shared row still reserves installation against another project's EXCLUSIVE take", async status => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.b);
     await f.seedConnection(f.a, { status, installed: false });
     await expect(f.service.createConnection(f.companyId, f.input(f.b, { config: f.config(f.b, true) }), f.actor()))
       .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
   });
 
   it("J08: concurrent shared and EXCLUSIVE writers cannot both commit", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.a); await f.approve(f.b);
     const wait = barrier(2);
     const outcomes = await Promise.allSettled([false, true].map(async exclusive => {
       await wait();
@@ -114,7 +121,8 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it("J09: first EXCLUSIVE registration bind serializes even when installation aliases differ", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.a); await f.approve(f.b, "457");
     const wait = barrier(2);
     const outcomes = await Promise.allSettled([f.a, f.b].map(async (project, index) => {
       const config = f.config(project, true);
@@ -127,7 +135,8 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
   });
 
   it.each(["draft", "disabled"] as const)("J06 production: %s null alias blocks an EXCLUSIVE request before any application/grant write", async status => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(f.b);
     await f.seedConnection(null, { status, installed: false });
     const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId));
     await expect(f.service.createConnection(f.companyId, f.input(f.b, { exclusive: true }), f.actor()))
