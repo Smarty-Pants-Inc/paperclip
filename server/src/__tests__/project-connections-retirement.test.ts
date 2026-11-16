@@ -205,6 +205,28 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       await restartedPush(p, p.legacy.connection.id);
     });
 
+    it("INT-R5/:143 additional PG-boundary probe leaves the frozen migration-marker control independent", async () => {
+      // This positive control proves only that the actual create/receipt writer
+      // is reachable. created() above still separately enforces EVERY frozen
+      // migration marker; its current failure is not relaxed or hidden here.
+      const control = await migration();
+      const created = await control.create();
+      expect(await storedConnection(db, created.id)).toMatchObject({ projectId: control.f.a.id, status: "draft", enabled: false });
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, created.id), eq(activityLog.action, "tool_connection.project_taken")))).toHaveLength(1);
+      const p = await migration();
+      const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId));
+      const beforeInstalls = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id));
+      await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${p.f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'synthetic create receipt failure'; END IF; RETURN NEW; END $$`));
+      await db.execute(sql.raw("CREATE TRIGGER project_red_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_red_receipt_failure()"));
+      try { await expect(p.create()).rejects.toMatchObject({ cause: { code: "P0001", message: "synthetic create receipt failure" } }); }
+      finally { await restoreReceipt(db); }
+      expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId))).toEqual(beforeApplications);
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, p.f.companyId))).toEqual([p.legacy.connection]);
+      expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, p.f.companyId))).toEqual([p.legacy.grant]);
+      expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, p.legacy.connection.id))).toEqual(beforeInstalls);
+      await restartedPush(p, p.legacy.connection.id);
+    });
+
     it.each(["mint", "wrong-repository-id", "stale-approval", "stale-key", "stale-recipient", "finish-install", "receipt"] as const)(
       "RFL/M02 second operation: %s failure preserves pending/non-serving candidate and usable legacy across a new service", async boundary => {
         const p = await migration(); const candidate = await created(p);
