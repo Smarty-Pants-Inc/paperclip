@@ -347,6 +347,7 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     expect(ingressRecord).toContain('"transport":"prp"');
     expect(ingressRecord).toContain('"status":200');
     expect(ingressRecord).toContain('"responseSize":');
+    expect(typeof JSON.parse(ingressRecord.slice(ingressRecord.indexOf("github_access.request ") + "github_access.request ".length)).durationMs).toBe("number");
     for (const secret of [requestSentinel, capability, "server-sentinel"]) {
       expect(ingressRecord).not.toContain(secret);
       expect(ingressRecord).not.toContain(Buffer.from(secret).toString("base64"));
@@ -378,6 +379,26 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
   }
 });
 
+it("routes retained warm broker requests to the active run's persisted log", async () => {
+  const runALog: string[] = [];
+  const runBLog: string[] = [];
+  const logA = vi.fn(async (_stream: "stdout" | "stderr", chunk: string) => { runALog.push(chunk); });
+  const logB = vi.fn(async (_stream: "stdout" | "stderr", chunk: string) => { runBLog.push(chunk); });
+  const b = await broker();
+  const activate = b.activate as unknown as (binding: ReturnType<typeof run>, onLog: typeof logA) => Promise<() => Promise<void>>;
+  const releaseA = await activate(run("warm-run-a"), logA);
+  expect((await request(b)).status).toBe(200);
+  await releaseA();
+  const releaseB = await activate(run("warm-run-b"), logB);
+  expect((await request(b)).status).toBe(200);
+  await releaseB();
+  const requestLines = (lines: string[]) => lines.filter(line => line.includes("github_access.request "));
+  expect(requestLines(runALog)).toHaveLength(1);
+  expect(requestLines(runBLog)).toHaveLength(1);
+  expect(logA).toHaveBeenCalledWith("stderr", expect.stringContaining('"status":200'));
+  expect(logB).toHaveBeenCalledWith("stderr", expect.stringContaining('"status":200'));
+});
+
 it("records callback-bridge request metadata without body, capability, or response secrets", async () => {
   const logs: string[] = [];
   const bodySecret = "bridge-body-sentinel";
@@ -398,6 +419,8 @@ it("records callback-bridge request metadata without body, capability, or respon
     transport: "bridge", fallbackReason: "disconnect" });
   expect(typeof metadata.requestId).toBe("string");
   expect(typeof metadata.responseSize).toBe("number");
+  expect(typeof metadata.durationMs).toBe("number");
+  expect(metadata.durationMs).toBeGreaterThanOrEqual(0);
   expect(metadata.responseSize).toBe(Buffer.byteLength(responseBody));
   for (const secret of [bodySecret, capability, responseSecret]) {
     expect(line).not.toContain(secret);

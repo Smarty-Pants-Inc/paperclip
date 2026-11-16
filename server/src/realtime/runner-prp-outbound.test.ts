@@ -1026,6 +1026,29 @@ describe("runner provider-ingress WebSocket wire", () => {
     } finally { await harness.handle.close(); harness.restore(); }
   });
 
+  it("records one timed request for an outer PRP refusal before credential dispatch", async () => {
+    const recordRequest = vi.fn(async (_record: { frame: unknown; status: number; durationMs: number }) => undefined);
+    const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
+    const harness = await startGithubAccessIngressHarness({
+      getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" }),
+      handleRequest,
+      recordRequest,
+    });
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: "outer-refusal-404", method: "GET",
+        path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=",
+      })), false);
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      const reply = JSON.parse(harness.socket.send.mock.calls[0]![0] as string) as { status: number };
+      expect(reply.status).toBe(404);
+      expect(handleRequest).not.toHaveBeenCalled();
+      expect(recordRequest).toHaveBeenCalledOnce();
+      expect(recordRequest).toHaveBeenCalledWith(expect.objectContaining({ status: 404, durationMs: expect.any(Number) }));
+      expect(recordRequest.mock.calls[0]![0].durationMs).toBeGreaterThanOrEqual(0);
+    } finally { await harness.handle.close(); harness.restore(); }
+  });
+
   it("refuses a github_access.http frame that names another run", async () => {
     const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
     const harness = await startGithubAccessIngressHarness({
