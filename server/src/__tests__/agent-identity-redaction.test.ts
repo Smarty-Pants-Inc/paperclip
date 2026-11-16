@@ -249,3 +249,64 @@ describe("run secret material: short values and identifiers keep ordinary text b
     }
   });
 });
+
+// A guard must never unmask a real credential: many API keys are bare UUIDs,
+// host- or region-shaped. Only a value EQUAL to one of the run's own ids is left
+// unindexed; an all-digit secret masks only where it stands as a whole number.
+describe("run secret material: only the run's own ids are skipped (redact-meta4)", () => {
+  const stream = (redactor: ReturnType<typeof createAgentIdentityRedactor>, text: string, size = 7) => {
+    let output = "";
+    for (let index = 0; index < text.length; index += size) output += redactor.chunk("stdout", text.slice(index, index + size));
+    return output + redactor.finish("stdout");
+  };
+  const agentId = "7f3c2a10-4b5d-4e6f-8a9b-0c1d2e3f4a5b";
+  const runId = "0d6e9b52-31aa-4c1f-9e2d-5b7c8a9f0e1d";
+
+  it("(1) a UUID-shaped secret that is not a known id is masked in output", () => {
+    const uuidKey = "c3a1f0e2-9b8d-4c7e-a6f5-1d2e3f4a5b6c"; // test-only, shaped like many API keys
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [uuidKey, uuidKey.toUpperCase()], [agentId, runId]);
+    const text = `agent ${agentId} run ${runId}\nkey ${uuidKey}\nKEY ${uuidKey.toUpperCase()}\n`;
+    for (const output of [stream(redactor, text), stream(redactor, text, 1), redactor.redact(text), JSON.stringify(redactor.redact({ text }))]) {
+      expect(output).not.toContain(uuidKey);
+      expect(output).not.toContain(uuidKey.toUpperCase());
+      expect(output).toContain(`agent ${agentId} run ${runId}`);
+    }
+  });
+
+  it("(1) an id-valued secret equal to the agent's id is not indexed and output keeps it", () => {
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [agentId, ` ${runId}\n`], [agentId, runId, null, undefined]);
+    expect(redactor.values).toEqual([]);
+    const text = `agent ${agentId} run ${runId}\n`;
+    expect(stream(redactor, text)).toBe(text);
+    expect(redactor.redact({ text })).toEqual({ text });
+  });
+
+  it("(1) host- and region-shaped secrets that are not known values are masked", () => {
+    const host = "k7q2-tenant.vault-proxy.example.net";
+    const region = "us-west-2";
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [host, region], [agentId, "api.internal.example.com", "eu-central-1"]);
+    const text = `connect ${host} in ${region}; public api.internal.example.com in eu-central-1\n`;
+    for (const output of [stream(redactor, text), redactor.redact(text)]) {
+      expect(output).not.toContain(host);
+      expect(output).not.toContain(region);
+      expect(output).toContain("public api.internal.example.com in eu-central-1");
+    }
+  });
+
+  it("(2) a 9-digit secret is masked as a whole number; ordinary numbers, and longer numbers containing it, stay intact", () => {
+    const pin = "482916375";
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [pin], [agentId]);
+    const ordinary = `took 1763297669123 ms; id 1${pin}0 and ${pin}7; 4829163 files; count 12345678\n`;
+    const text = `${ordinary}account=${pin}\n${pin}`;
+    for (const output of [stream(redactor, text), stream(redactor, text, 1), stream(redactor, text, 9), redactor.redact(text)]) {
+      expect(output.startsWith(ordinary)).toBe(true);
+      expect(output.slice(ordinary.length)).toBe("account=***REDACTED***\n***REDACTED***");
+    }
+    expect(stream(redactor, ordinary)).toBe(ordinary);
+    expect(redactRegisteredSecretValues({ ordinary, text: `pin ${pin}.` }, [pin])).toEqual({ ordinary, text: "pin ***REDACTED***." });
+  });
+});

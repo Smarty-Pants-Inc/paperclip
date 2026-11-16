@@ -850,6 +850,36 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(log.includes(longToken)).toBe(false);
   }, 60_000);
 
+  it("redact-meta4 (1)(2): a UUID-shaped env secret that is no id of the run is masked in the stored log; the agent-id env and ordinary numbers stay", async () => {
+    const { randomUUID } = await import("node:crypto");
+    const { syncAgentAdapterEnvBindings } = await import("../services/agent-secret-bindings.js");
+    const f = await seed();
+    const uuidKey = randomUUID(); // test-only: a bare-UUID API key
+    const pin = "482916375"; // test-only
+    const values = { VENDOR_API_KEY: uuidKey, VENDOR_PIN: pin, LANGFUSE_USER_ID: f.agentId };
+    const bindings: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(values)) {
+      const secret = await secretService(db).create(f.companyId, { name: `redact-meta4-${key}-${f.agentId}`, provider: "local_encrypted", value }, { userId: f.userId });
+      bindings[key] = { type: "secret_ref", secretId: secret.id, version: "latest" };
+    }
+    const adapterConfig = { model: "agent-model", env: bindings };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+    const ordinary = `agent ${f.agentId} reported; took 1763297669123 ms; id 1${pin}0\n`;
+    inspect.set(f.agentId, async input => {
+      expect((input.config.env as Record<string, string>).VENDOR_API_KEY === uuidKey).toBe(true);
+      await input.onLog("stdout", ordinary);
+      await input.onLog("stdout", `key ${uuidKey}\npin ${pin}\n`);
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    expect(log).toContain(ordinary);
+    expect(log.includes(uuidKey)).toBe(false);
+    expect(log.includes(`pin ${pin}`)).toBe(false);
+  }, 60_000);
+
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
