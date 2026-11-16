@@ -17,6 +17,7 @@ import {
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { agentRoutes } from "../routes/agents.js";
+import { transactionRetryStats } from "../services/transaction-retry.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -93,8 +94,8 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
   });
   app.use("/api", agentRoutes(db));
   app.use((error: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => {
-    const value = error as { code?: string; message?: string; cause?: { code?: string; message?: string } };
-    console.error(`[agent-hire-route-error] ${JSON.stringify({ code: value?.cause?.code ?? value?.code ?? null, message: value?.cause?.message ?? value?.message ?? String(error) })}`);
+    const value = error as { code?: string; message?: string; detail?: string; where?: string; query?: string; cause?: { code?: string; message?: string; detail?: string; where?: string; query?: string } };
+    console.error(`[agent-hire-route-error] ${JSON.stringify({ code: value?.cause?.code ?? value?.code ?? null, message: value?.cause?.message ?? value?.message ?? String(error), detail: value?.cause?.detail ?? value?.detail ?? null, where: value?.cause?.where ?? value?.where ?? null, query: value?.query ?? null, retried: transactionRetryStats.retried })}`);
     next(error);
   });
   app.use(errorHandler);
