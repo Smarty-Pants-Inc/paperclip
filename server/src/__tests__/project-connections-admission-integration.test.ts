@@ -1,7 +1,9 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import { materializeNativeProviderCapacityRetry } from "../services/native-runtime/native-provider-capacity-retry.js";
+import * as gitCredentials from "../services/git-credentials.js";
+import { prepareHeartbeatExecutionConfiguration, type HeartbeatExecutionConfigurationInput } from "../services/heartbeat/execution-configuration.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { readProjectConnectionRunContext } from "../services/project-connection-run-context.js";
 import { lockProjectConnectionLifecycle } from "../services/project-connection-retirement.js";
@@ -71,6 +73,29 @@ describe("integration J17/J18 production run admission", () => {
     expect(run).not.toBeNull();
     const [stored] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run!.id), eq(heartbeatRuns.companyId, f.companyId)));
     expect(stored!.contextSnapshot?.projectConnectionRunContext).toEqual({ version: 1, issueId: null, projectId: null });
+  });
+
+  it("J14/A07: a real admitted legacy-only run still bypasses managed selection in explicit agent_env mode", async () => {
+    const f = await projectConnectionFixture(db);
+    const run = await service().wakeup(f.leadA.id, { source: "on_demand", triggerDetail: "manual", manualUserWake: true,
+      requestedByActorType: "user", requestedByActorId: f.human });
+    expect(run?.contextSnapshot?.projectConnectionRunContext).toEqual({ version: 1, issueId: null, projectId: null });
+    const selection = vi.spyOn(gitCredentials, "resolveManagedGitHubIdentitySelection");
+    const reachedSecrets = new Error("reached-explicit-agent-secret-boundary");
+    try {
+      const input = {
+        run, agent: { ...f.leadA, adapterConfig: { githubAuthenticationMode: "agent_env" } },
+        task: { issueId: null, context: {}, responsibleUserId: f.human, acceptedPlanContinuationWake: false,
+          acceptedPlanWakeRoutingDecision: null, taskProjectContext: null, routineEnvContext: { routineId: null, env: null } },
+        config: { sourceWorkspaceConfig: { env: {} }, aiBinding: undefined },
+        policy: { trustPreset: { kind: "standard" } }, environment: { selectedEnvironmentForConfig: { driver: "boat" } },
+        services: { secretsSvc: { resolveAdapterConfigForRuntime: async () => { throw reachedSecrets; } }, companySkills: {},
+          appendRunEvent: async () => undefined, finalizeAiConnectionBusyDeferral: async () => undefined },
+        onFailureSecretsResolved: () => undefined, onManagedAiRuntimeAcquired: () => undefined, onIdentityRedactorPrepared: () => undefined,
+      } as unknown as HeartbeatExecutionConfigurationInput;
+      await expect(prepareHeartbeatExecutionConfiguration(db, input)).rejects.toBe(reachedSecrets);
+      expect(selection).not.toHaveBeenCalled();
+    } finally { selection.mockRestore(); }
   });
 
   it("C-2/J17/J18: actual native-capacity successor admits its task project before scheduled-retry commit", async () => {

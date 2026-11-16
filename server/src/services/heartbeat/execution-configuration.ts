@@ -24,7 +24,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
-import { readProjectConnectionRunContext, isProjectConnectionManagedRequired } from "../project-connection-run-context.js";
+import { readProjectConnectionRunContext, isProjectConnectionManagedRequired, hasProjectConnectionOwnership } from "../project-connection-run-context.js";
 import { resolveAssignedConnectionInstructionsForRun, resolveMcpConnectionSkillsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { applyMcpConnectionSkills } from "../mcp-skill-runtime.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
@@ -182,6 +182,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
     companyId: agent.companyId, projectId: taskProjectContext.id,
   }));
   const admittedScope = Object.hasOwn(run.contextSnapshot ?? {}, "projectConnectionRunContext");
+  const ownedScopePresent = admittedScope && await hasProjectConnectionOwnership(db, agent.companyId);
   if (managedRequired) await readProjectConnectionRunContext(db, {
     companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id,
   });
@@ -193,7 +194,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       commentIds: extractWakeCommentIds(context),
       actor: skillActor,
     })),
-    requestedAgentGitHubEnv && !managedRequired && !admittedScope
+    requestedAgentGitHubEnv && !managedRequired && !ownedScopePresent
       ? Promise.resolve<Awaited<ReturnType<typeof resolveManagedGitHubIdentitySelection>>>({ configured: false })
       : time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
           agentId: agent.id, responsibleUserId, allowStandingDelegation: false, heartbeatRunId: run.id,

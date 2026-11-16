@@ -227,6 +227,14 @@ export function errorHandler(
             ...(typeof responseDetails?.code === "string"
               ? { code: responseDetails.code }
               : {}),
+            ...(responseDetails?.code === "project_connection_in_use" && Array.isArray(responseDetails.runs)
+              ? { runs: responseDetails.runs.flatMap(value => {
+                  if (!value || typeof value !== "object") return [];
+                  const run = value as Record<string, unknown>;
+                  if (typeof run.id !== "string" || !/^[0-9a-f-]{36}$/i.test(run.id)) return [];
+                  return [{ id: run.id, href: `/runs/${run.id}` }];
+                }), ...(responseDetails.more === true ? { more: true } : {}) }
+              : {}),
             ...(redactedSkillPolicyDenial &&
             typeof responseDetails?.reason === "string"
               ? { reason: responseDetails.reason }

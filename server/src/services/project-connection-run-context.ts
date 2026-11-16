@@ -178,6 +178,11 @@ export async function requiresProjectConnectionRunContext(db: Executor, companyI
       if (!boundRunIssueId(run) && run.contextSnapshot?.projectId != null) return true;
     }
   }
+  return hasProjectConnectionOwnership(db, companyId);
+}
+
+/** Retained rows, not names/installs or a process-local latch, engage C2. */
+export async function hasProjectConnectionOwnership(db: Executor, companyId: string): Promise<boolean> {
   const [row] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
     eq(toolConnections.companyId, companyId), sql`${toolConnections.projectId} is not null`,
   )).limit(1);
