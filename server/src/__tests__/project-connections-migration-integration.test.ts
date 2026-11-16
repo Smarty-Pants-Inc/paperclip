@@ -1,9 +1,11 @@
+import "./helpers/project-connections-approval-http.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
 import { activityLog, companySecretVersions, createDb, toolConnectionInstalls, toolConnections, toolProfiles } from "@paperclipai/db";
 import * as credentials from "../services/connection-credentials.js";
 import * as scope from "../services/project-connection-provider-scope.js";
-import { projectConnectionFixture, storedConnection, CANARY } from "./helpers/project-connections-fixture.js";
+import { storedConnection, CANARY } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 // Qualified seeded-candidate integration only, NOT the complete create/human
@@ -22,9 +24,9 @@ describe("integration M01/M02 actual pending finish transaction", () => {
       material: { synthetic: true }, valueSha256: "synthetic-migration-proof", fingerprintSha256: "synthetic-migration-proof" });
     const legacy = await f.seedConnection(null);
     const pending = await f.seedConnection(f.a, { status: "draft", installed: false, pending: true, legacyId: legacy.connection.id });
-    vi.spyOn(credentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: CANARY, latestVersion: 1 });
+    vi.spyOn(credentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: CANARY, latestVersion: 2 });
     vi.spyOn(scope, "verifyProjectConnectionGitHubScope").mockResolvedValue({ identity: { companyId: f.companyId,
-      providerHost: "github.com", verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" }, repositoryIds: [101], secretVersion: 1 });
+      providerHost: "github.com", verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" }, repositoryIds: [101], secretVersion: 2 });
     const finish = () => f.service.finishGalleryAppConnection(f.companyId, pending.connection.id,
       { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [f.leadA.id] } }, f.actor());
     return { f, legacy, pending, finish };
