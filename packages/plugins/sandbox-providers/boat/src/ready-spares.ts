@@ -42,6 +42,12 @@ export type ReadySpareOperations = {
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
   refresh(spare: ReadySpare, ttlSeconds: number): Promise<ReadySpare>;
   stop(spare: ReadySpare): Promise<void>;
+  /**
+   * Re-read company activity and return this pool's spare target right now.
+   * The keeper calls it immediately before every POST /stop on a spare, so a
+   * stop decided under an older (idle) view never outruns a newer event.
+   */
+  desired?(): Promise<number>;
   /** Optional provider-side hourly cap check; fail closed on an unknown result. */
   allowCreate?(): Promise<boolean>;
 };
@@ -143,6 +149,18 @@ function isActiveState(state: string): boolean {
   return state === "ready" || state === "idle" || state === "running";
 }
 
+function isTerminalState(state: string): boolean {
+  return state === "archived" || state === "stopped" || state === "error" || state === "cancelled";
+}
+
+/** Why a stop was chosen; the fresh re-read can only veto it, never widen it. */
+type StopPremise = {
+  /** Surplus beyond this target; skipped when the fresh target is larger. */
+  surplusOf?: number;
+  /** An unready box that may be this pool's own in-flight refill. */
+  maybeRefill?: boolean;
+};
+
 function identityMatches(spare: ReadySpare, key: ReadySpareKey): boolean {
   return spare.key.companyId === key.companyId && spare.key.environmentId === key.environmentId && spare.key.configHash === key.configHash
     && spare.labels.owner === `paperclip:${key.companyId}` && spare.labels.environment === key.environmentId
@@ -172,6 +190,7 @@ export class ReadySpareKeeper {
   private readonly recentCreates = new Map<string, Map<string, number>>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
+  private readonly stoppingSpares = new Set<string>();
   private stopping = false;
 
   constructor(
@@ -188,6 +207,39 @@ export class ReadySpareKeeper {
     this.claimStore = undefined;
     this.pools.clear(); this.inFlightCreates.clear(); this.reconciling.clear(); this.activeDesired.clear();
     this.pendingReconciliations.clear(); this.adopting.clear(); this.claiming.clear(); this.inFlightClaims.clear(); this.recentCreates.clear(); this.failures.clear(); this.demandEvents.clear();
+    this.stoppingSpares.clear();
+  }
+
+  /**
+   * The only way the keeper stops a spare. Company activity is re-read
+   * immediately before the POST /stop; a stop whose premise no longer holds is
+   * skipped and the caller keeps the candidate. Returns true when it stopped.
+   */
+  private async stopSpare(key: ReadySpareKey, spare: ReadySpare, operations: ReadySpareOperations, premise: StopPremise = {}): Promise<boolean> {
+    if (operations.desired) {
+      let fresh: number | undefined;
+      try { fresh = await operations.desired(); } catch { fresh = undefined; }
+      const vetoable = premise.surplusOf !== undefined || premise.maybeRefill === true;
+      if (fresh === undefined && vetoable) return false; // Unknown activity is never a reason to stop.
+      if (fresh !== undefined && premise.surplusOf !== undefined && fresh > premise.surplusOf) return false;
+      if (fresh !== undefined && fresh > 0 && premise.maybeRefill && (this.inFlightCreates.get(readySparePoolKey(key)) ?? 0) > 0
+          && spare.labels.configHash === key.configHash && spare.name !== `paperclip-spare:ready:${key.configHash}`
+          && !spare.name.startsWith("paperclip-claim:") && !isTerminalState(spare.state)) return false;
+    }
+    this.stoppingSpares.add(spare.id);
+    try { await operations.stop(spare); }
+    finally { this.stoppingSpares.delete(spare.id); }
+    return true;
+  }
+
+  /** Replace a pool from one inventory pass without dropping candidates that pass did not see. */
+  private commitPool(poolId: string, next: ReadySpare[], listed: readonly ReadySpare[]): void {
+    const listedIds = new Set(listed.map(spare => spare.id));
+    for (const spare of this.pools.get(poolId) ?? []) {
+      if (!listedIds.has(spare.id) && !this.stoppingSpares.has(spare.id) && !next.some(item => item.id === spare.id)) next.push(spare);
+    }
+    if (next.length) this.pools.set(poolId, next);
+    else this.pools.delete(poolId);
   }
 
   ready(key: ReadySpareKey): readonly ReadySpare[] {
@@ -261,12 +313,11 @@ export class ReadySpareKeeper {
     for (const spare of listed) {
       if (this.stopping) return;
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
-      if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
+      if (this.claiming.has(spare.id) || this.stoppingSpares.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (readyAndHealthy(spare, key, this.now())) keep.push(spare);
-      else await operations.stop(spare);
+      else await this.stopSpare(key, spare, operations, { maybeRefill: true });
     }
-    if (keep.length) this.pools.set(poolId, keep);
-    else this.pools.delete(poolId);
+    this.commitPool(poolId, keep, listed);
   }
 
   /**
@@ -287,7 +338,7 @@ export class ReadySpareKeeper {
     const pool = this.pools.get(poolId) ?? [];
     const now = this.now();
     const healthy = pool.filter(spare => readyAndHealthy(spare, key, now));
-    const index = pool.findIndex(spare => !this.claiming.has(spare.id) && readyAndHealthy(spare, key, now));
+    const index = pool.findIndex(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id) && readyAndHealthy(spare, key, now));
     if (index < 0) {
       if (healthy.length || (this.inFlightClaims.get(poolId) ?? 0) > 0) return { outcome: "cold", reason: "claim_conflict" };
       if (this.hasConfigMismatch(key)) return { outcome: "cold", reason: "config_mismatch" };
@@ -326,8 +377,9 @@ export class ReadySpareKeeper {
       && spare.labels.configHash === key.configHash
       && spare.name === `paperclip-spare:ready:${key.configHash}`
       && (spare.state === "ready" || spare.state === "idle"));
-    const eligible = keep.filter(spare => !this.claiming.has(spare.id));
-    const selected = eligible.slice(0, Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired))));
+    const eligible = keep.filter(spare => !this.claiming.has(spare.id) && !this.stoppingSpares.has(spare.id));
+    const target = Math.max(0, Math.min(MAX_READY_SPARES, Math.trunc(desired)));
+    const selected = eligible.slice(0, target);
     for (const surplus of eligible.slice(selected.length)) {
       if (this.stopping) return;
       let current: ReadySpare | undefined;
@@ -339,10 +391,9 @@ export class ReadySpareKeeper {
         || current.labels.configHash !== key.configHash
         || current.name !== `paperclip-spare:ready:${key.configHash}`
         || (current.state !== "ready" && current.state !== "idle") || this.claiming.has(surplus.id)) continue;
-      await operations.stop(current);
+      if (!await this.stopSpare(key, current, operations, { surplusOf: target })) selected.push(current);
     }
-    if (selected.length) this.pools.set(poolId, selected);
-    else this.pools.delete(poolId);
+    this.commitPool(poolId, selected, listed);
   }
 
   /** Re-discover, adopt healthy owned spares, stop stale owned spares, then fill to N. */
@@ -390,7 +441,7 @@ export class ReadySpareKeeper {
       if (spare.labels.owner !== `paperclip:${key.companyId}` || spare.labels.environment !== key.environmentId || spare.labels.purpose !== "spare") continue;
       // An in-flight local claim may not have reached Boat's durable marker yet.
       // Never race a reconcile into stopping or re-adopting it.
-      if (this.claiming.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
+      if (this.claiming.has(spare.id) || this.stoppingSpares.has(spare.id) || spare.name.startsWith("paperclip-claim:")) continue;
       if (strictBoatOnly && (spare.labels.configHash !== key.configHash
           || spare.name !== `paperclip-spare:ready:${key.configHash}`
           || (spare.state !== "ready" && spare.state !== "idle"))) continue;
@@ -399,7 +450,7 @@ export class ReadySpareKeeper {
     }
     for (const stale of toStop) {
       if (this.stopping) return;
-      await operations.stop(stale);
+      await this.stopSpare(key, stale, operations, { maybeRefill: true });
     }
     if (this.stopping) return;
 
@@ -411,7 +462,10 @@ export class ReadySpareKeeper {
     }
     const selected = keep.slice(0, desired);
     for (const surplus of keep.slice(desired)) {
-      if (!strictBoatOnly) { await operations.stop(surplus); continue; }
+      if (!strictBoatOnly) {
+        if (!await this.stopSpare(key, surplus, operations, { surplusOf: desired })) selected.push(surplus);
+        continue;
+      }
       if (this.stopping) return;
       let current: ReadySpare | undefined;
       try { current = await operations.get(surplus); } catch { continue; }
@@ -419,7 +473,7 @@ export class ReadySpareKeeper {
           && current.labels.environment === key.environmentId && current.labels.purpose === "spare"
           && current.labels.configHash === key.configHash && current.name === `paperclip-spare:ready:${key.configHash}`
           && (current.state === "ready" || current.state === "idle") && !this.claiming.has(surplus.id)) {
-        await operations.stop(current);
+        if (!await this.stopSpare(key, current, operations, { surplusOf: desired })) selected.push(current);
       }
     }
     if (selected.length) this.pools.set(poolId, selected);
@@ -460,9 +514,12 @@ export class ReadySpareKeeper {
           const pending = this.pendingReconciliations.get(poolId);
           const effectiveDesired = pending?.desired ?? this.activeDesired.get(poolId) ?? desired;
           const current = this.pools.get(poolId) ?? [];
-          if (this.stopping || current.length >= effectiveDesired) { await operations.stop(spare); return; }
+          if (this.stopping || current.length >= effectiveDesired) {
+            // A refill that a newer event still wants keeps its claim-index entry.
+            if (await this.stopSpare(key, spare, operations, { surplusOf: current.length >= effectiveDesired ? effectiveDesired : 0 }) || this.stopping) return;
+          }
           if (!readyAndHealthy(spare, key, this.now())) {
-            await operations.stop(spare);
+            await this.stopSpare(key, spare, operations);
             throw new Error("Boat spare create did not return a warmed running sandbox");
           }
           const next = this.pools.get(poolId) ?? [];
@@ -538,7 +595,7 @@ export class ReadySpareKeeper {
         if (!readyAndHealthy(spare, spare.key, this.now())) {
           const index = pool.findIndex(item => item.id === spare.id);
           if (index >= 0) pool.splice(index, 1);
-          try { await operations.stop(spare); } catch { /* Expired Boat TTL is the final stop boundary. */ }
+          try { await this.stopSpare(spare.key, spare, operations); } catch { /* Expired Boat TTL is the final stop boundary. */ }
           continue;
         }
         if (Date.parse(spare.expiresAt) > spareThreshold) continue;
@@ -549,7 +606,7 @@ export class ReadySpareKeeper {
         } catch {
           const index = pool.findIndex(item => item.id === spare.id);
           if (index >= 0) pool.splice(index, 1);
-          try { await operations.stop(spare); } catch { /* Boat TTL remains the crash-safe stop. */ }
+          try { await this.stopSpare(spare.key, spare, operations); } catch { /* Boat TTL remains the crash-safe stop. */ }
         }
       }
       if (pool.length) this.pools.set(poolId, pool);

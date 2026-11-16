@@ -182,11 +182,40 @@ function acquireOutcomeTotals(): { spare: number; cold: number } {
   }
   return { spare, cold };
 }
-async function companySpareIsActive(companyId: string, idleMinutes: number): Promise<boolean> {
-  const activity = await loadCompanySpareActivity(companyId);
+function spareActivityIsRecent(activity: CompanySpareActivity, idleMinutes: number): boolean {
   const latest = Math.max(activity.lastActivityAt ?? Number.NEGATIVE_INFINITY,
     activity.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY);
   return Number.isFinite(latest) && Date.now() - latest <= idleMinutes * 60_000;
+}
+async function companySpareIsActive(companyId: string, idleMinutes: number): Promise<boolean> {
+  return spareActivityIsRecent(await loadCompanySpareActivity(companyId), idleMinutes);
+}
+/** Bypass the cache: merge durable state with this worker's newest observation. */
+async function freshCompanySpareActivity(companyId: string): Promise<CompanySpareActivity> {
+  const cached = companySpareActivity.get(companyId) ?? {};
+  let stored: CompanySpareActivity = {};
+  try {
+    const state = await pluginContext?.state?.get?.({ scopeKind: "company", scopeId: companyId,
+      namespace: SPARE_ACTIVITY_NAMESPACE, stateKey: SPARE_ACTIVITY_STATE_KEY });
+    if (state && typeof state === "object" && !Array.isArray(state)) {
+      const value = state as Record<string, unknown>;
+      stored = { lastActivityAt: stateTimestamp(value.lastActivityAt), lastLeaseAcquiredAt: stateTimestamp(value.lastLeaseAcquiredAt) };
+    }
+  } catch { duplexLogger?.warn("Boat spare activity state read failed", { companyId }); }
+  const newest = (a?: number, b?: number) => a === undefined ? b : b === undefined ? a : Math.max(a, b);
+  const lastActivityAt = newest(cached.lastActivityAt, stored.lastActivityAt);
+  const lastLeaseAcquiredAt = newest(cached.lastLeaseAcquiredAt, stored.lastLeaseAcquiredAt);
+  const activity: CompanySpareActivity = { ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
+    ...(lastLeaseAcquiredAt === undefined ? {} : { lastLeaseAcquiredAt }) };
+  companySpareActivity.set(companyId, activity);
+  return activity;
+}
+/** The pool's spare target under a fresh activity read; the keeper asks immediately before every spare stop. */
+async function freshSpareDesired(key: ReadySpareKey): Promise<number> {
+  const activity = await freshCompanySpareActivity(key.companyId);
+  const pool = knownSparePools.get(readySparePoolKey(key));
+  if (shuttingDown || !pool) return 0;
+  return spareActivityIsRecent(activity, pool.idleMinutes) ? pool.desired : 0;
 }
 async function recordCompanySpareActivity(companyId: string, leaseAcquired = false, waitForWake = false): Promise<void> {
   if (!companyId) return;
@@ -822,6 +851,7 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
         providerObservation: { ...(spare.providerObservation ?? {}), ...sandbox } };
     },
     stop: async spare => { await stopSandbox(config, spare.id); },
+    desired: () => freshSpareDesired(key),
     async allowCreate() {
       const inventory = await listBoatSandboxes(config, [["owner", `paperclip:${key.companyId}`], ["purpose", "spare"]]);
       const cutoff = Date.now() - 60 * 60 * 1000;
