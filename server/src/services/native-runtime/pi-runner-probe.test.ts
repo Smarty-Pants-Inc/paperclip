@@ -223,9 +223,17 @@ describe("native Pi probe runner artifact preparation", () => {
     // finally: native_probe_static_manifest_invalid is thrown there and the outer catch reports it with
     // the product's fixed safe metadata message (raw text dropped by design). Pin the failure point
     // instead: the manifest command ran, then no sync-out and no removal.
+    const { logger } = await import("../../middleware/logger.js");
+    const info = vi.spyOn(logger, "info");
     const result = await probeManagedNativePiRunner(f.context);
     expect(result.status).toBe("fail");
     expect(result.checks.map(check => check.code)).toContain("pi_rpc_metadata_failed");
+    // Where the cause IS observable (M2b's log-only timing line): the failure is the static manifest step.
+    const timings = info.mock.calls.map(([fields]) => fields as Record<string, unknown>)
+      .filter(fields => fields?.event === "native_probe_cleanup_timing");
+    expect(timings.length).toBeGreaterThan(0);
+    for (const timing of timings) expect(timing).toMatchObject({ outcome: "failed", failedStep: "static_manifest" });
+    info.mockRestore();
     expect(f.requests.some(request => request.args?.[2] === "paperclip-probe-static-manifest")).toBe(true);
     expect(mocks.syncOut).not.toHaveBeenCalled();
     expect(f.requests.some(request => request.command === "rm" && request.args?.[0] === "-rf")).toBe(false);
