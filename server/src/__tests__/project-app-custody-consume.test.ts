@@ -1,8 +1,9 @@
 import "./helpers/project-connections-approval-http.js";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { activityLog, companySecretBindings, createDb, toolConnections } from "@paperclipai/db";
+import { activityLog, companySecretBindings, connectionGrants, createDb, toolConnections } from "@paperclipai/db";
 import { readProjectAppCustody } from "../services/project-app-custody.js";
+import { resolveGitHubAppCredential } from "../services/github-app-credentials.js";
 import { assertProjectConnectionAvailability, lockProjectConnectionIdentities } from "../services/project-connection-arbitration.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { storedConnection } from "./helpers/project-connections-fixture.js";
@@ -90,6 +91,15 @@ describe("receipt-citing create consumes its source's reservation (RFL 04:5xZ)",
     expect(loser.status).not.toBe("archived");
     expect(loser.config.projectAppApprovalConsumedBy).toBeUndefined();
     expect(await consumedEvents(f.companyId)).toHaveLength(1);
+    // A ruled winner must remain usable: saved receipt-citing writers must not
+    // mistake the loser's still-live S for an ordinary owned reservation.
+    const winner = rows[0]!;
+    const lead = winner.projectId === f.a.id ? f.leadA : f.leadB;
+    await f.service.finishGalleryAppConnection(f.companyId, winner.id, { access: { agentIds: [lead.id] }, enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [] }, f.actor(lead.id));
+    const current = await storedConnection(db, winner.id);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, winner.id));
+    expect((await resolveGitHubAppCredential(db, current, grant!, false, false, lead.id)).token).toBeTruthy();
+    expect(await storedConnection(db, loser.id)).toEqual(loser);
   });
 
   it("RED 3: a replayed receipt is single-use and refused with a named code", async () => {
