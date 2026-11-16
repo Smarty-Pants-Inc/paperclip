@@ -126,6 +126,27 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
     expect(outcomes.find(outcome => outcome.status === "rejected")).toMatchObject({ reason: { status: 409 } });
   });
 
+  it.each(["draft", "disabled"] as const)("J06 production: %s null alias blocks an EXCLUSIVE request before any application/grant write", async status => {
+    const f = await projectConnectionFixture(db);
+    await f.seedConnection(null, { status, installed: false });
+    const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId));
+    await expect(f.service.createConnection(f.companyId, f.input(f.b, { exclusive: true }), f.actor()))
+      .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toEqual(beforeApplications);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.action, "tool_connection.project_taken")))).toHaveLength(0);
+  });
+
+  it("J07 production: a numeric-registration null alias on a different installation cannot join EXCLUSIVE", async () => {
+    const f = await projectConnectionFixture(db);
+    await f.seedConnection(f.a, { exclusive: true });
+    const proposed = f.input(f.a, { projectId: null });
+    proposed.config = { ...proposed.config, methodConfig: { ...f.config().methodConfig, installationId: "457" } };
+    await expect(f.service.createConnection(f.companyId, proposed, f.actor()))
+      .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toHaveLength(1);
+  });
+
   // Direct seam qualification is additional to (not a substitute for) the
   // existing full create-writer cases above. Keep reasons: trust boundary and
   // data safety; races use independent real PostgreSQL transactions.
