@@ -11621,6 +11621,62 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
+  it("never switches a retained PRP session to the callback bridge after ingress authorization drops", async () => {
+    const root = await mkdtemp(join(tmpdir(), "native-prp-sticky-session-"));
+    const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    const previousHome = process.env.PAPERCLIP_HOME;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = root;
+    process.env.PAPERCLIP_HOME = root;
+    const base = {
+      ...execution,
+      provider: { kind: "pi_rpc" as const, model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE },
+      binding: { ...execution.binding, runId: "run-prp-sticky-first", executionWorkspaceId: "workspace-prp-sticky" },
+      session: { ...execution.session, normalizedSessionId: "session-prp-sticky", driverKind: "pi_rpc" as const,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } },
+    } as NativeExecutionInputV1;
+    const next = { ...base, binding: { ...base.binding, runId: "run-prp-sticky-next" } };
+    const target = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: root,
+      effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute: vi.fn() } } as never;
+    const session = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: base.session.normalizedSessionId, providerSessionId: "provider", driverKind: "test",
+      driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    const bridgeStarts: string[] = [];
+    githubAccess.create.mockReset().mockImplementation(async (input: { transport?: string }) => {
+      if (input.transport === "callback_bridge") bridgeStarts.push("callback_bridge");
+      return { env: { PAPERCLIP_GITHUB_BROKER_TOKEN: "stable-session-capability" }, transport: input.transport,
+        ready: true, duplexRequested: false, activate: vi.fn(async () => vi.fn(async () => {})),
+        stop: vi.fn(async () => {}) };
+    });
+    const issueServiceSpy = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({
+      update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })),
+    } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    state.execute.mockReset()
+      .mockImplementationOnce(async options => { await options.onSession?.(session); return result; })
+      .mockImplementationOnce(async options => {
+        expect(options.existingSession).toBe(session);
+        await options.onSession?.(session);
+        return result;
+      });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner-prp-sticky",
+        useRunnerd: true, backend: {} as never, managedGitHub: true, runnerIngressAuthorized: true, runnerExecutionTarget: target });
+      await executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "runner-prp-sticky",
+        useRunnerd: true, backend: {} as never, managedGitHub: true, runnerIngressAuthorized: false, runnerExecutionTarget: target });
+      expect(githubAccess.create).toHaveBeenCalledOnce();
+      expect(githubAccess.create.mock.calls[0]?.[0]).toMatchObject({ transport: "runner_ingress" });
+      expect(bridgeStarts).toEqual([]);
+    } finally {
+      await closeIdleWarmNativeSessionsForRestart();
+      if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+      if (previousHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousHome;
+      await rm(root, { recursive: true, force: true });
+      issueServiceSpy.mockRestore();
+    }
+  });
+
   it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");

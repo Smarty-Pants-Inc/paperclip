@@ -3601,7 +3601,7 @@ it("routes github_access.http only through authenticated PRP without journaling 
     headers: { "cache-control": "no-store", "content-type": "application/json" },
     bodyBase64: Buffer.from(JSON.stringify({ token: sentinel })).toString("base64"),
   }));
-  const unregister = core.setGithubAccessHttpHandler(handler);
+  let unregister = core.setGithubAccessHttpHandler(handler);
   let client: AuthenticatedClient | null = null;
   try {
     await core.start();
@@ -3613,11 +3613,26 @@ it("routes github_access.http only through authenticated PRP without journaling 
     expect(reply).toMatchObject({ protocol: "paperclip.runner", version: 1, requestId, status: 200 });
     expect(Buffer.from(String(reply?.bodyBase64), "base64").toString()).toContain(sentinel);
     expect(handler).toHaveBeenCalledOnce();
+    unregister();
+    sendSecure(client!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId: "github-access-disconnect-gap",
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    const gapReply = await receiveSecure(client!);
+    expect(gapReply).toMatchObject({ protocol: "paperclip.runner", version: 1,
+      requestId: "github-access-disconnect-gap", status: 503 });
+    expect(JSON.parse(Buffer.from(String(gapReply?.bodyBase64), "base64").toString())).toEqual({ error: "GitHub ingress is unavailable" });
+    expect(handler).toHaveBeenCalledOnce();
+    unregister = core.setGithubAccessHttpHandler(handler);
+    sendSecure(client!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId: "github-access-reconnected",
+      method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
+    const reconnectedReply = await receiveSecure(client!);
+    expect(reconnectedReply).toMatchObject({ protocol: "paperclip.runner", version: 1,
+      requestId: "github-access-reconnected", status: 200 });
+    expect(handler).toHaveBeenCalledTimes(2);
     sendSecure(client!, { protocol: "paperclip.runner", version: 1, kind: "github_access.http", requestId,
       method: "POST", path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
     const duplicateReply = await receiveSecure(client!);
     expect(duplicateReply).toMatchObject({ protocol: "paperclip.runner", version: 1, requestId, status: 409 });
-    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledTimes(2);
     expect(handler.mock.calls[0]![0]).toEqual({ kind: "github_access.http", requestId, method: "POST",
       path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json" }, bodyBase64: "e30=" });
     expect(handler.mock.calls[0]![1]).toEqual(identity);

@@ -971,6 +971,28 @@ describe("runner provider-ingress WebSocket wire", () => {
     }
   });
 
+  it.each([
+    { method: "GET", path: "/runtime-tools/github/credentials", requestId: "invalid-method" },
+    { method: "POST", path: "/runtime-tools/github/other", requestId: "invalid-path" },
+  ])("refuses out-of-scope GitHub operations before dispatching credentials: $requestId", async invalid => {
+    const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
+    const harness = await startGithubAccessIngressHarness({
+      getSessionBinding: () => ({ companyId: "company-a", agentId: "agent-a", issueId: "issue-a", runId: "run-a" }),
+      handleRequest,
+    });
+    try {
+      harness.socket.emit("message", Buffer.from(JSON.stringify({
+        kind: "github_access.http", requestId: invalid.requestId, method: invalid.method,
+        path: invalid.path, headers: { "content-type": "application/json" }, bodyBase64: "e30=",
+      })), false);
+      await vi.waitFor(() => expect(harness.socket.send).toHaveBeenCalledOnce(), { timeout: 200 });
+      const reply = JSON.parse(harness.socket.send.mock.calls[0]![0] as string) as { status: number; bodyBase64: string };
+      expect(reply.status).toBe(404);
+      expect(Buffer.from(reply.bodyBase64, "base64").toString()).toContain("Unknown GitHub session operation");
+      expect(handleRequest).not.toHaveBeenCalled();
+    } finally { await harness.handle.close(); harness.restore(); }
+  });
+
   it("refuses a github_access.http frame that names another run", async () => {
     const handleRequest = vi.fn(async () => ({ status: 200, headers: {}, body: Buffer.from("credential") }));
     const harness = await startGithubAccessIngressHarness({

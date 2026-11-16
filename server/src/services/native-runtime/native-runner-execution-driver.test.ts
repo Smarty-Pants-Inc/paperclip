@@ -210,6 +210,65 @@ describe("shared Runner execution driver", () => {
     await registration.release();
   });
 
+  it("keeps the PRP GitHub handler across an ingress disconnect gap and reconnect", async () => {
+    let connections = 1;
+    let connected = true;
+    let finishReconnect!: () => void;
+    const reconnectReady = new Promise<void>(resolve => { finishReconnect = () => { connected = true; connections = 1; resolve(); }; });
+    const core = { activeRunnerConnectionCount: () => connections } as typeof authority;
+    const access = {
+      getSessionBinding: vi.fn((identity: typeof binding) => ({ ...identity })),
+      handleRunnerIngressHttpRequest: vi.fn(async (frame: { requestId: string }) => ({
+        requestId: frame.requestId, status: connected ? 200 : 503,
+        headers: { "content-type": "application/json" },
+        bodyBase64: Buffer.from(JSON.stringify(connected ? { status: "available" } : { error: "GitHub ingress is unavailable" })).toString("base64"),
+      })),
+    };
+    const getAccess = vi.fn(() => access);
+    const ingress = endpoint(), refreshed = endpoint();
+    vi.mocked(ingress.refresh).mockResolvedValue(refreshed);
+    let connectCount = 0;
+    transport.connect.mockImplementation(() => {
+      connectCount += 1;
+      const initial = connectCount === 1;
+      return {
+        ready: initial ? Promise.resolve() : reconnectReady,
+        close: vi.fn(async () => { connected = false; connections = 0; }),
+      };
+    });
+    const driver = createNativeRunnerExecutionDriver({
+      target: { ...sandbox(), getRunnerIngressEndpoint: async () => ingress } as AdapterExecutionTarget,
+      binding, runnerIngressAuthorized: true, prepareRemote: async () => {}, processStarted: Promise.resolve(),
+      getRunnerIngressGitHubAccess: getAccess as never,
+    });
+    const registration = await driver.controlPlaneRegistration!(core);
+    await registration.activate!();
+    await registration.ready!();
+    const frame = { kind: "github_access.http", requestId: "prp-before-disconnect" };
+    const firstRoute = transport.connect.mock.calls[0]![0] as { githubAccess: {
+      handleRequest(value: unknown, sessionBinding: typeof binding): Promise<{ status: number; bodyBase64: string }>;
+    } };
+    expect(await firstRoute.githubAccess.handleRequest(frame, binding)).toMatchObject({ status: 200 });
+
+    connections = 0;
+    const reopen = registration.ensureConnected!({ deadline: Date.now() + 1_000, signal: new AbortController().signal });
+    await vi.waitFor(() => expect(transport.connect).toHaveBeenCalledTimes(2), { timeout: 200 });
+    const reconnectRoute = transport.connect.mock.calls[1]![0] as { githubAccess: {
+      handleRequest(value: unknown, sessionBinding: typeof binding): Promise<{ status: number; bodyBase64: string }>;
+    } };
+    const gap = await reconnectRoute.githubAccess.handleRequest({ ...frame, requestId: "prp-during-disconnect" }, binding);
+    expect(gap.status).toBe(503);
+    expect(JSON.parse(Buffer.from(gap.bodyBase64, "base64").toString())).toEqual({ error: "GitHub ingress is unavailable" });
+
+    finishReconnect();
+    await reopen;
+    expect(await reconnectRoute.githubAccess.handleRequest({ ...frame, requestId: "prp-after-reconnect" }, binding)).toMatchObject({ status: 200 });
+    expect(getAccess).toHaveBeenCalledTimes(2);
+    expect(getAccess.mock.results.map(result => result.value)).toEqual([access, access]);
+    expect(transport.register).not.toHaveBeenCalled();
+    await registration.release();
+  });
+
   it("does not connect after release while the process readiness gate is pending", async () => {
     const ingress = endpoint();
     let started!: () => void;
