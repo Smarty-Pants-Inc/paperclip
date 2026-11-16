@@ -3737,8 +3737,24 @@ exact backup manifest, and no provider event for the session was recorded after
 the backup completed. Normal warm handoffs can leave multiple lease records
 for that allocation. Restore requires one final owner and the existing matching
 predecessor/successor receipts for every earlier owner. Unrelated, live, or
-incompletely linked owners remain ambiguous. The run then fails closed
-with `runner_harness_state_mismatch: backup_without_reusable_lease`.
+incompletely linked owners remain ambiguous. Host preparation then refuses the
+restore with `runner_harness_state_mismatch: backup_without_reusable_lease`.
+
+That refusal no longer fails the run (J3-22 first-run floor). The automatic
+retry of a run that failed with it already continued the conversation on a fresh
+provider thread; the same run now does that itself. It sets the session's
+continuity state aside (as a replacement session does; the source sandbox and
+its files are kept, never deleted), opens a fresh provider thread on the new
+sandbox, records the step on the conversation's provider-identity lineage
+(reason `resume_failed_on_new_box`) and posts one continuation note
+("Continuing from saved history", `restore_unavailable_on_new_box`). The
+backup is never restored here. A session with a turn or runtime request in
+flight, or an active goal, keeps the refusal. The floor's members are a closed
+subset of `FRESH_THREAD_REFUSAL_CODES` (`SAME_RUN_FRESH_THREAD_REFUSAL_CODES`). This
+differs from upstream, which fails the run: upstream's obsolete-lease cleanup
+always destroys the source, so its first run usually meets the `destroyed`
+proof; this fork stops and keeps that source, so the proof is often absent on
+the first run.
 
 A workspace-restore hold also takes a warm sandbox out of reuse. When a run
 that holds a warm lease ends with a workspace-restore failure, the hold stops

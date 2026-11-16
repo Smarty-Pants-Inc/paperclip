@@ -228,3 +228,37 @@ export async function materializePiSessionRecoveryNotice(input: {
   invalid ? "Pi saved-history recovery owner alarm: original file preserved; native session restarted fresh"
     : "Pi saved-history recovery owner alarm: saved history unavailable; native session restarted fresh");
 }
+
+/** J3-22 floor: the person-visible line of a same-run fresh thread. A
+ * continuation, never a failure: the run goes on and answers. */
+export function sameRunFreshThreadNoticeBody(reason: string): string {
+  return "Continuing from saved history: the earlier provider thread could not be restored on this new sandbox, "
+    + "so this reply continues the same conversation in a fresh thread from its saved history. "
+    + `Earlier actions with unknown outcomes are not confirmed or replayed. (${reason})`;
+}
+
+/**
+ * ONE continuation note per run (authorizationReason names the run), written
+ * under the issue lock. The caller's run continues whether or not this write
+ * succeeds; it never replaces or supersedes another notice.
+ */
+export async function writeSameRunFreshThreadNotice(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; runId: string; code: string; reason: string;
+}): Promise<boolean> {
+  const authorizationReason = `same_run_fresh_thread:${input.reason}:${input.runId}`;
+  return db.transaction(async tx => {
+    const [issue] = await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId))).for("no key update");
+    if (!issue) return false;
+    const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
+      eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${authorizationReason}`)).limit(1);
+    if (existing) return false;
+    await issueService(db).addComment(input.issueId, sameRunFreshThreadNoticeBody(input.reason), {}, { authorType: "system",
+      presentation: { kind: "system_notice", tone: "info", density: "compact", detailsDefaultOpen: false },
+      metadata: { version: 1, authorizationReason,
+        sections: [{ rows: [{ type: "run_link", runId: input.runId, agentId: input.agentId, title: "Continued in a fresh thread" }] }] } }, tx);
+    return true;
+  });
+}
