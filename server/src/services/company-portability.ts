@@ -4933,7 +4933,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     input: CompanyPortabilityPreview,
     options?: ImportBehaviorOptions,
     resolvedSource?: ResolvedSource,
-    readOnlySkillInventory = false,
   ): Promise<ImportPlanInternal> {
     const mode = resolveImportMode(options);
     const requestedInclude = normalizeInclude(input.include);
@@ -5115,10 +5114,10 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         existingProjectSlugs.add(existing.urlKey);
       }
 
-      const existingSkills = readOnlySkillInventory
-        ? await db.select({ key: companySkillsTable.key, slug: companySkillsTable.slug })
-          .from(companySkillsTable).where(eq(companySkillsTable.companyId, input.target.companyId))
-        : await companySkills.listFull(input.target.companyId);
+      // Preview/planning must not lazily reconcile bundled or local skills.
+      // The actual package writer reconciles inventory inside its transaction.
+      const existingSkills = await db.select({ key: companySkillsTable.key, slug: companySkillsTable.slug })
+        .from(companySkillsTable).where(eq(companySkillsTable.companyId, input.target.companyId));
       const existingSkillKeys = new Set(existingSkills.map((skill) => skill.key));
       const existingSkillSlugs = new Set(existingSkills.map((skill) => normalizeSkillSlug(skill.slug) ?? skill.slug));
       for (const skill of manifest.skills) {
@@ -5426,7 +5425,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     options?: ImportBehaviorOptions,
   ): Promise<CompanyPortabilityPreviewResult> {
     const attribution = await resolveImportAttribution(input);
-    const plan = await buildPreview(input, options, attribution.source, attribution.authorship !== undefined);
+    const plan = await buildPreview(input, options, attribution.source);
     return attribution.authorship === undefined
       ? plan.preview
       : { ...plan.preview, authorship: attribution.authorship };
@@ -5456,27 +5455,29 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     // Preserve upstream's exact attribution values when no agent is attributed.
     const actorAgentId = actor.type === "agent" ? actor.agentId : legacyAgentId;
     const actorAgentCompanyId = actor.type === "agent" ? actor.companyId : legacyCompanyId;
-    if (actorAgentId && !options?.interactionTransaction) {
-      // Preflight the submitted package before entering the writer. Repeat with
-      // live, transaction-bound services below, after the company lock.
-      const preflight = await buildPreview(input, options);
-      const company = input.target.mode === "existing_company"
-        ? await companies.getById(input.target.companyId)
-        : { id: actorAgentCompanyId!, requireBoardApprovalForNewAgents: preflight.source.manifest.company?.requireBoardApprovalForNewAgents };
-      if (company && preflight.include.agents) for (const entry of preflight.preview.plan.agentPlans) {
-        if (entry.action === "skip") continue;
-        const agent = preflight.selectedAgents.find(agent => agent.slug === entry.slug);
-        if (!agent) continue;
-        const override = input.adapterOverrides?.[entry.slug];
-        await admitAgentActorHire(db, actor, company, {
-          adapterType: override?.adapterType ?? agent.adapterType,
-          adapterConfig: override?.adapterConfig ?? agent.adapterConfig,
-          budgetMonthlyCents: agent.budgetMonthlyCents,
-        }, { permissionGrants: agent.permissionGrants });
+    if (!options?.interactionTransaction) {
+      // Agent preflight is read-only. Repeat admission with live,
+      // transaction-bound services below, after the company lock.
+      if (actorAgentId) {
+        const preflight = await buildPreview(input, options);
+        const company = input.target.mode === "existing_company"
+          ? await companies.getById(input.target.companyId)
+          : { id: actorAgentCompanyId!, requireBoardApprovalForNewAgents: preflight.source.manifest.company?.requireBoardApprovalForNewAgents };
+        if (company && preflight.include.agents) for (const entry of preflight.preview.plan.agentPlans) {
+          if (entry.action === "skip") continue;
+          const agent = preflight.selectedAgents.find(agent => agent.slug === entry.slug);
+          if (!agent) continue;
+          const override = input.adapterOverrides?.[entry.slug];
+          await admitAgentActorHire(db, actor, company, {
+            adapterType: override?.adapterType ?? agent.adapterType,
+            adapterConfig: override?.adapterConfig ?? agent.adapterConfig,
+            budgetMonthlyCents: agent.budgetMonthlyCents,
+          }, { permissionGrants: agent.permissionGrants });
+        }
       }
       const publications: ActivityPublication[] = [];
       const result = await db.transaction(async tx => {
-        const companyIds = [actorAgentCompanyId, input.target.mode === "existing_company" ? input.target.companyId : null]
+        const companyIds = [actorAgentCompanyId, options?.sourceCompanyId, input.target.mode === "existing_company" ? input.target.companyId : null]
           .filter((id): id is string => Boolean(id));
         await tx.select({ id: companiesTable.id }).from(companiesTable).where(inArray(companiesTable.id, companyIds)).orderBy(companiesTable.id).for("no key update");
         return companyPortabilityService(tx as unknown as Db, storage).importBundle(input, actorUserId, {
@@ -5588,8 +5589,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         sourceAgentIdToSlug.set(agent.sourceAgentId, agent.slug);
       }
       // Validate every replayed reference BEFORE company/agent/secret/skill
-      // writes, including board imports which do not use the agent fence's
-      // transaction. Unknown permission KEYS are already stripped with warnings;
+      // writes. Board and agent imports share the same locked transaction.
+      // Unknown permission KEYS are already stripped with warnings;
       // a known grant with an unknown target must never retain a stale ID.
       for (const agent of plan.selectedAgents) {
         if (!plan.preview.plan.agentPlans.some(entry => entry.slug === agent.slug && entry.action !== "skip")) continue;

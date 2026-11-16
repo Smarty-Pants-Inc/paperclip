@@ -7,6 +7,7 @@ import { Readable } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CompanyPortabilityFileEntry } from "@paperclipai/shared";
 import { runnerApiResponseReservations } from "@paperclipai/db";
+import { getTableName } from "drizzle-orm";
 
 const runnerTarget = vi.hoisted(() => ({ driver: "local", platform: "linux", architecture: "x64" }));
 
@@ -35,6 +36,7 @@ const agentSvc = {
 };
 
 const accessSvc = {
+  canUser: vi.fn(async () => true),
   ensureMembership: vi.fn(),
   ensureRoleDefaultGrants: vi.fn(),
   listActiveUserMemberships: vi.fn(),
@@ -135,6 +137,9 @@ vi.mock("../services/agents.js", () => ({
 }));
 
 vi.mock("../services/agent-lifecycle.js", () => ({
+  requestAgentHireInTransaction: (_db: unknown, _publications: unknown, ...args: unknown[]) => agentSvc.create(...args),
+  initializeImportedAgentConfigurationInTransaction: (_db: unknown, _publications: unknown, ...args: unknown[]) => agentSvc.update(...args),
+  scheduleAgentLifecycle: vi.fn(),
   createAgentLifecycle: () => ({
     requestHire: (...args: unknown[]) => agentSvc.create(...args),
     pauseAgent: vi.fn(),
@@ -205,7 +210,27 @@ vi.mock("../routes/org-chart-svg.js", () => ({
   renderOrgChartPng: vi.fn(async () => Buffer.from("png")),
 }));
 
-const { companyPortabilityService, dedupeImportedCompanyName, parseGitHubSourceUrl, renderYamlBlock, renderFrontmatter } = await import("../services/company-portability.js");
+const { companyPortabilityService: actualCompanyPortabilityService, dedupeImportedCompanyName, parseGitHubSourceUrl, renderYamlBlock, renderFrontmatter } = await import("../services/company-portability.js");
+
+// These service-unit tests use explicit service doubles, not PostgreSQL. Model
+// the now-unconditional import transaction and read-only inventory query here;
+// rollback/locking are proved separately by import-no-residue-routes.test.ts.
+function companyPortabilityService(db: any, storage?: Parameters<typeof actualCompanyPortabilityService>[1]) {
+  return actualCompanyPortabilityService(portabilityTestDb(db), storage);
+}
+function portabilityTestDb(db: any) {
+  const originalSelect = db.select?.bind(db);
+  const database = {
+    ...db,
+    select: (...args: unknown[]) => ({ from: (table: unknown) => {
+      if (getTableName(table as Parameters<typeof getTableName>[0]) === "company_skills") return { where: () => companySkillSvc.listFull() };
+      if (getTableName(table as Parameters<typeof getTableName>[0]) === "companies") return { where: () => ({ orderBy: () => ({ for: async () => [] }) }) };
+      return originalSelect ? originalSelect(...args).from(table) : { where: async () => [] };
+    } }),
+    transaction: async (work: (tx: unknown) => Promise<unknown>) => work(database),
+  };
+  return database as any;
+}
 
 function responseAssetDb(reservations: Array<{ id: string }> = []) {
   return { select: () => ({ from: (table: unknown) => ({ where: () => {
@@ -4927,7 +4952,7 @@ describe("company portability", () => {
       const { companyPortabilityService: cappedPortabilityService } =
         await import("../services/company-portability.js");
       const storage = fakeAttachmentStorage();
-      const portability = cappedPortabilityService({} as any, storage as any);
+      const portability = cappedPortabilityService(portabilityTestDb({}), storage as any);
       mockAttachmentExportSources([
         {
           id: "attachment-3",
