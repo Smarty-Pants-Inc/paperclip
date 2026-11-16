@@ -1,8 +1,13 @@
+import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
 import { canonicalNativeRunLogRedactionForms, redactCanonicalNativeRunLogChunk } from "../services/heartbeat/run-log.js";
 import { redactRegisteredSecretValues } from "../services/run-secret-redaction.js";
-import { agentIdentityRedactionVectors } from "./fixtures/agent-identity-redaction-vectors.js";
+import { agentIdentityRedactionVectors, pemBodyWindows, pemTransformForms } from "./fixtures/agent-identity-redaction-vectors.js";
+
+// Fixed budget for 1 MB of streamed output; measured well below this on a
+// shared CI-class host. Do not raise it to hide a quadratic path.
+const PERF_BUDGET_MS = 3_000;
 
 // Data-safety regression: transformed identity output escaped the real run log (#20832).
 describe("identity material and PEM structure", () => {
@@ -105,5 +110,91 @@ describe("identity material and PEM structure", () => {
       const output = redactor.chunk("precision", text.slice(0, 19)) + redactor.chunk("precision", text.slice(19) + "\n") + redactor.finish("precision");
       expect(output).toBe(text + "\n");
     }
+  });
+});
+
+// Gate 5 row 5.5 (M2h3 490ed240, run fd281998): a FAKE PEM bound as a run
+// secret leaked through fold/cut/tr/json transforms, and a fold split the END
+// marker. Each key here is a throwaway generated in the test.
+describe("run-secret and identity PEMs printed through shell transforms", () => {
+  const identity = agentIdentityRedactionVectors();
+  const runSecretPem = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const keys = [
+    { name: "run secret", pem: runSecretPem, windows: pemBodyWindows(runSecretPem) },
+    { name: "agent identity", pem: identity.privateKeyPem, windows: identity.windows },
+  ];
+  // The run secret enters through the same appendable values API that live
+  // preparation and native log recovery use for a run's secrets.
+  const redactorWithRunSecret = () => {
+    const redactor = createAgentIdentityRedactor(identity.privateKeyPem);
+    redactor.values.push(...createAgentIdentityRedactor(runSecretPem).values);
+    redactor.values.sort((left, right) => right.length - left.length);
+    return redactor;
+  };
+  function assertNoKeyText(output: string, windows: string[]) {
+    // Whitespace cannot hide a window: the gate measured the joined output.
+    const compact = output.replace(/\s+/g, "");
+    const leaked = windows.filter(window => compact.includes(window));
+    expect(leaked.length, `${leaked.length}/${windows.length} key-body windows survived`).toBe(0);
+    expect(output.replace(/\r?\n/g, "")).not.toMatch(/(?:BEGIN|END)[A-Z ]*PRIVATE KEY/);
+  }
+  const cases = keys.flatMap(key => pemTransformForms(key.pem).map(form => ({ key: key.name, form: form.name, text: form.text, windows: key.windows })));
+
+  it.each(cases)("hides the $key through $form as one value and as a stream", ({ text, windows }) => {
+    const redactor = redactorWithRunSecret();
+    assertNoKeyText(redactor.redact(text), windows);
+    let streamed = "";
+    for (let index = 0; index < text.length; index += 7) streamed += redactor.chunk("stdout", text.slice(index, index + 7));
+    assertNoKeyText(streamed + redactor.finish("stdout"), windows);
+  });
+
+  it("hides a folded run secret at every chunk boundary", () => {
+    const text = pemTransformForms(runSecretPem).find(form => form.name === "fold -w 20")!.text;
+    const redactor = redactorWithRunSecret();
+    for (let split = 1; split < text.length; split++) {
+      const stream = `split-${split}`;
+      const output = redactor.chunk(stream, text.slice(0, split)) + redactor.chunk(stream, text.slice(split)) + redactor.finish(stream);
+      assertNoKeyText(output, keys[0]!.windows);
+    }
+  });
+
+  it("leaves ordinary base64, hash lists and diffs untouched", () => {
+    const blob = randomBytes(1536).toString("base64");
+    const sums = Array.from({ length: 24 }, (_, index) =>
+      `${createHash("sha256").update(`file-${index}`).digest("hex")}  src/file-${index}.ts`).join("\n") + "\n";
+    const diff = [
+      "diff --git a/src/a.ts b/src/a.ts", "index 3b18e51..a4f2c9d 100644", "--- a/src/a.ts", "+++ b/src/a.ts",
+      "@@ -1,3 +1,3 @@", "-const token = readToken();", "+const token = await readToken();",
+      `+const fixture = "${randomBytes(48).toString("base64")}";`, " export default token;", "",
+    ].join("\n");
+    const redactor = redactorWithRunSecret();
+    for (const text of [blob, blob.match(/.{1,76}/g)!.join("\n") + "\n", blob.match(/.{1,20}/g)!.join("\n"), sums, diff]) {
+      expect(redactor.redact(text)).toBe(text);
+      let streamed = "";
+      for (let index = 0; index < text.length; index += 13) streamed += redactor.chunk("guard", text.slice(index, index + 13));
+      expect(streamed + redactor.finish("guard")).toBe(text);
+    }
+  });
+
+  it("streams 1 MB of mixed output in linear time", () => {
+    const redactor = redactorWithRunSecret();
+    const lines: string[] = [];
+    let size = 0;
+    for (let index = 0; size < 1024 * 1024; index++) {
+      const line = index % 3 === 0 ? randomBytes(57).toString("base64")
+        : index % 3 === 1 ? `${createHash("sha256").update(String(index)).digest("hex")}  file-${index}`
+          : `step ${index}: wrote ${index * 7} bytes to out/${index}.bin`;
+      lines.push(line);
+      size += line.length + 1;
+    }
+    const text = lines.join("\n") + "\n";
+    const started = performance.now();
+    let output = "";
+    for (let index = 0; index < text.length; index += 4096) output += redactor.chunk("bulk", text.slice(index, index + 4096));
+    output += redactor.finish("bulk");
+    const elapsed = performance.now() - started;
+    expect(output).toBe(text);
+    expect(elapsed, `1 MB took ${Math.round(elapsed)} ms`).toBeLessThan(PERF_BUDGET_MS);
   });
 });
