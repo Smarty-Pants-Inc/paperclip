@@ -1,5 +1,4 @@
 import { releaseAbandonedNativeOwners } from "../services/native-runtime/native-failed-run-owner-release.js";
-import { NATIVE_CONTINUATION_REFUSED_ACTION } from "../services/native-continuation-refusal.js";
 import { guardSlackFixtureNetwork } from "./helpers/slack-cloud/transport.js";
 import { chatHistoryActionBlocks } from "./helpers/chat-history-proof.js";
 import type { NativeExecutionInput, NativeSession, NativeSessionBackend, PrpEvent } from "../vendor/paperclip-runner/index.js";
@@ -67015,7 +67014,7 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const quarantined = await getExecutionBlocker(db, companyId, issueId);
       // The retained execution-blocker-read gate explicitly requires the
       // held-conversation guidance for a recovered cleanup quarantine.
-      expect(quarantined).toMatchObject({ canRetry: false, nextAction: NATIVE_CONTINUATION_REFUSED_ACTION,
+      expect(quarantined).toMatchObject({ canRetry: false, nextAction: "Saved work recovered.",
         workspaceRecovery: { message: "Saved work recovered." } });
       await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" })
         .where(eq(heartbeatRuns.id, f.runId));
