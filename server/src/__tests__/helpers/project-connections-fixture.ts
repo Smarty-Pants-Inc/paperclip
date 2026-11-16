@@ -13,6 +13,7 @@ import { toolAccessRoutes } from "../../routes/tool-access.js";
 import { errorHandler } from "../../middleware/index.js";
 import type { ActorInfo } from "../../services/tool-access/types.js";
 import { connectionManagementService } from "../../services/connection-management.js";
+import { ensureHumanRoleDefaultGrants } from "../../services/principal-access-compatibility.js";
 
 // Type-only forward contract: BASE deliberately has no projectId in these types.
 // No missing runtime module, fake implementation, or test-only database DDL.
@@ -27,7 +28,8 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
   await db.insert(companies).values({ id: companyId, name: "Project connection RED", issuePrefix: companyId.slice(0, 8), defaultResponsibleUserId: human });
   const addAgent = async (name: string, reportsTo?: string) => {
     const [agent] = await db.insert(agents).values({ companyId, name, role: "engineer", adapterType: "process", status: "active", reportsTo }).returning();
-    await db.insert(principalPermissionGrants).values(["tools:manage_connections", "agents:hire", "projects:manage"].map(permissionKey => ({ companyId, principalType: "agent", principalId: agent!.id, permissionKey })));
+    await db.insert(companyMemberships).values({ companyId, principalType: "agent", principalId: agent!.id, membershipRole: "member", status: "active" });
+    await db.insert(principalPermissionGrants).values(["tools:manage_connections", "tools:manage_profiles", "agents:configure", "agents:hire", "projects:manage"].map(permissionKey => ({ companyId, principalType: "agent", principalId: agent!.id, permissionKey })));
     return agent!;
   };
   const primary = await addAgent("H primary");
@@ -37,6 +39,7 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
   const outsider = await addAgent("Outside worker", leadB.id);
   await db.insert(authUsers).values({ id: human, name: "Project connection owner fixture", email: `${companyId}@project-fixture.invalid`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
   await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: human, membershipRole: "owner", status: "active" });
+  await ensureHumanRoleDefaultGrants(db, { companyId, principalId: human, membershipRole: "owner", grantedByUserId: human });
   await db.insert(userCompanyPreferences).values({ companyId, userId: human, primaryAgentId: primary.id });
   const addProject = async (name: string, leadAgentId: string, repoId: number) => {
     const [project] = await db.insert(projects).values({ companyId, name, leadAgentId }).returning();
@@ -100,7 +103,7 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
     const app = express(); app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = who === "board" ? { type: "board", userId: human, userName: "H", userEmail: null, isInstanceAdmin: false, source: "session", sessionId: companyId, companyIds: [companyId], memberships: [{ companyId, membershipRole: "owner", status: "active" }] }
-        : { type: "agent", companyId, agentId: who, source: "agent_key", onBehalfOfUserId: human };
+        : { type: "agent", companyId, agentId: who, source: "agent_key", onBehalfOfUserId: human, onBehalfOfMemberships: [{ companyId, membershipRole: "owner", status: "active" }] };
       next();
     });
     app.use("/api", toolAccessRoutes(db)); app.use(errorHandler); return app;
