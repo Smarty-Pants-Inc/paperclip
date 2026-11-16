@@ -246,10 +246,12 @@ describe("#20389 RFL retirement regressions", () => {
     const effects = createAgentLifecycleEffects(), transaction = effects.transaction;
     let attempts = 0;
     effects.transaction = (database, companyId, work) => transaction(database, companyId, async (tx, publications) => {
+      const attempt = ++attempts;
+      if (attempt > 1) await checkout;
       await tx.execute(sql`set local deadlock_timeout = '100ms'`);
       await tx.execute(sql`set local statement_timeout = '15s'`);
       await tx.select().from(agents).where(eq(agents.id, f.workerId)).for("update");
-      if (++attempts === 1) { agentLocked.release(); await runTermination.promise; }
+      if (attempt === 1) { agentLocked.release(); await runTermination.promise; }
       return work(tx, publications);
     });
     const settle = (promise: Promise<unknown>) => promise.then(value => ({ value }), error => ({ error }));
@@ -285,8 +287,10 @@ describe("#20389 RFL retirement regressions", () => {
   it("a rolled-back lifecycle transaction rechecks authorization before retrying PATCH", async () => {
     const f = await seed();
     let transactions = 0, authorizations = 0;
+    let rootTransaction: unknown;
     const wrappedDb = new Proxy(db, { get(target, key, receiver) {
       if (key === "transaction") return ((work, options) => target.transaction(async tx => {
+        rootTransaction = tx;
         const value = await work(tx);
         if (++transactions === 1) throw Object.assign(new Error("forced transaction rollback"), { code: "40P01" });
         return value;
@@ -295,7 +299,7 @@ describe("#20389 RFL retirement regressions", () => {
     } });
     const before = await f.currentAgent();
     const lifecycle = createAgentLifecycle(wrappedDb, {}, async tx => {
-      if ((tx as unknown as { nestedIndex: number }).nestedIndex > 0) return;
+      if (tx !== rootTransaction) return;
       if (++authorizations > 1) throw new Error("scope revoked before retry");
     });
     await expect(lifecycle.updateAndTransition(f.workerId, "terminate", { title: "Must roll back" })).rejects.toThrow("scope revoked before retry");
