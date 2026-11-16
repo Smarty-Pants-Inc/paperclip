@@ -963,12 +963,6 @@ describe("PiRpcDriver", () => {
   });
 });
 
-const managedPackageDeclarations = [
-  "npm:pkg-a",
-  { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] },
-  "/abs/local-pkg",
-];
-
 async function symlinkPathsBelow(directory: string): Promise<string[]> {
   const found: string[] = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
@@ -997,7 +991,13 @@ async function managedPackageFixture(options: { missing?: boolean; agentHomeIsOr
     await writeFile(join(packageA, "extensions", "index.js"), "export const value = 'pkg-a';\n");
     await writeFile(join(packageB, "extensions", "selected.js"), "export const value = 'pkg-b-resource';\n");
   }
-  const packages = options.missing ? ["npm:pkg-not-installed"] : managedPackageDeclarations;
+  const localRoot = join(root, "local-pkg");
+  await mkdir(localRoot);
+  const packages = options.missing ? ["npm:pkg-not-installed"] : [
+    "npm:pkg-a",
+    { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] },
+    localRoot,
+  ];
   await writeFile(join(originalHome, "settings.json"), JSON.stringify({ packages }));
   await writeFile(join(originalHome, "models.json"), JSON.stringify({}));
   vi.stubEnv("PI_CODING_AGENT_DIR", originalHome);
@@ -1019,7 +1019,7 @@ async function managedPackageFixture(options: { missing?: boolean; agentHomeIsOr
       PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
     transportFactory });
   let session: Awaited<ReturnType<PiRpcDriver["openSession"]>> | undefined;
-  return { root, originalHome, agentHome, packageA, packageB, packages, transport, transportFactory,
+  return { root, originalHome, agentHome, packageA, packageB, localRoot, packages, transport, transportFactory,
     async open() {
       session = await driver.openSession({ runId: "managed-packages", normalizedSessionId: "managed-packages", workingDirectory: workspace });
       return session;
@@ -1048,7 +1048,7 @@ describe("Pi managed npm package paths", () => {
       expect(settings.packages).toEqual([
         f.packageA,
         { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] },
-        "/abs/local-pkg",
+        f.localRoot,
       ]);
       await expect(readFile(join(settings.packages[1].source, "extensions/selected.js"), "utf8")).resolves.toBe("export const value = 'pkg-b-resource';\n");
     } finally { await f.close(); }
