@@ -72,6 +72,8 @@ function requestUnixSocket(socketPath, requestPath, options) {
 async function main() {
   let env = { ...process.env };
 ${options.brokerFile ? String.raw`
+  const runnerIngressCapability = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === 'runner_ingress'
+    ? env.PAPERCLIP_GITHUB_BROKER_TOKEN : '';
   delete env.PAPERCLIP_API_URL;
   delete env.PAPERCLIP_API_KEY;
   delete env.PAPERCLIP_GITHUB_BRIDGE_TOKEN;
@@ -84,6 +86,7 @@ ${options.brokerFile ? String.raw`
       env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
     }
   } catch {}
+  if (runnerIngressCapability) env.PAPERCLIP_GITHUB_BROKER_TOKEN = runnerIngressCapability;
 ` : ''}
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   let connected = false;
@@ -217,6 +220,8 @@ export function githubBrokerEnvironment(input: Record<string, unknown>, broker: 
   env.GIT_SSH_COMMAND = "ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes";
   env.SSH_AUTH_SOCK = "";
   env.PAPERCLIP_GITHUB_BROKER_URL = broker.url;
-  env.PAPERCLIP_GITHUB_BROKER_TOKEN = broker.token;
+  const runnerIngressCapability = env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT === "runner_ingress"
+    ? env.PAPERCLIP_GITHUB_BROKER_TOKEN : undefined;
+  env.PAPERCLIP_GITHUB_BROKER_TOKEN = runnerIngressCapability ?? broker.token;
   return env;
 }

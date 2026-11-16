@@ -474,6 +474,9 @@ mod unix_socket {
                         | "x-paperclip-bridge-transport"
                         | "x-paperclip-run-id"
                 )
+                || (name == "x-paperclip-github-capability"
+                    && value.len() <= 4_096
+                    && !value.contains(','))
             {
                 output.insert(name.clone(), Value::String(value.clone()));
             }
