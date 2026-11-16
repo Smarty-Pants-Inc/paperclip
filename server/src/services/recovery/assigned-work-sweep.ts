@@ -18,6 +18,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
@@ -95,7 +96,7 @@ export type AssignedWorkDeps = {
 export type AssignedWorkCheck = {
   verdict: AssignedWorkVerdict;
   outcome: "ok" | "settling" | "repaired" | "settled_lost_run" | "deferred_rate_limit" | "deferred_cap" | "stale_reported" | "left_to_hold_owner" | "left_to_native_recovery" | "changed" | "enqueue_refused"
-    | "waiting_on_recovery";
+    | "waiting_on_recovery" | "left_to_handover";
   retryAt: Date | null;
 };
 
@@ -528,11 +529,12 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
           where sr.company_id = ra.company_id and sr.id::text = ra.evidence->>'latestRunId'
             and sr.finished_at > ${new Date(at.getTime() - STRANDED_CONTINUATION_MAX_AGE_MS).toISOString()}::timestamptz)))`,
       // An assignee that cannot take work (paused, being set up, held) is
-      // its own wait; the predicate names it when anything else asks.
+      // its own wait; the predicate names it when anything else asks. A
+      // retired assignee is not a wait: its task goes to the hand-over worker.
       sql`exists (select 1 from agents a where a.id = ${issues.assigneeAgentId} and a.company_id = ${issues.companyId}
-        and a.status not in ('paused', 'terminated', 'pending_approval')
+        and ((a.status = 'terminated' and a.lifecycle_state = 'terminated') or (a.status not in ('paused', 'terminated', 'pending_approval')
         and a.lifecycle_state not in ('preparing', 'verifying', 'resuming')
-        and jsonb_array_length(a.lifecycle_holds) = 0)`,
+        and jsonb_array_length(a.lifecycle_holds) = 0)))`,
       sql`(${issues.status} <> 'blocked' or ${issues.unblockDescriptor} is null
         or (${issues.unblockDescriptor}->'owner'->>'agentId') = ${issues.assigneeAgentId}::text)`,
     )).orderBy(issues.id).limit(limit);
@@ -545,6 +547,16 @@ export function assignedWorkSweep(db: Db, deps: AssignedWorkDeps) {
     const facts = (await loadFacts(scope.companyId, [issue])).get(issue.id)!;
     const at = now();
     const verdict = evaluateAssignedWork(facts, at);
+    // A retired agent's open task is the hand-over worker's: wake it for that
+    // agent instead of waking an agent that can never run again (#20389).
+    const [assignee] = await db.select({ status: agents.status, lifecycleState: agents.lifecycleState }).from(agents)
+      .where(and(eq(agents.id, issue.assigneeAgentId!), eq(agents.companyId, issue.companyId)));
+    if (assignee?.status === "terminated" && assignee.lifecycleState === "terminated") {
+      await db.transaction(tx => notifyDeliveryWork(tx, DELIVERY_QUEUES.agentHandover, issue.assigneeAgentId!));
+      const handedOver: AssignedWorkCheck = { verdict, outcome: "left_to_handover", retryAt: null };
+      passLog.record(handedOver);
+      return handedOver;
+    }
     const check = await act(issue, facts, verdict, at);
     if (check.retryAt) scope.onDeferredDeadline?.(check.retryAt.getTime());
     passLog.record(check);
