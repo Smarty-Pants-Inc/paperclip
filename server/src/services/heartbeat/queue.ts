@@ -78,7 +78,7 @@ import {
   readNativeReviewAssignmentContext,
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
-import { nativeCleanupHoldsAdmission } from "../native-runtime/native-cleanup-admission-hold.js";
+import { nativeCleanupHoldsAdmission, recordNativeCleanupHold } from "../native-runtime/native-cleanup-admission-hold.js";
 import { classifyAddressedInteractionExecutionCandidate } from "../native-runtime/native-addressed-interaction.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { preserveTaskRemoteWorkspaceWriter } from "../native-runtime/native-failed-workspace-recovery.js";
@@ -1270,6 +1270,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         logger.info({ runId: run.id, agentId: run.agentId, companyId: run.companyId, issueId,
           reason: "native_session_cleanup_settling", cleanupBlock },
         "claimQueuedRun: queued run kept queued while the task's previous session finishes cleanup");
+        // Named once on the held run (#20806); the hold itself stays. A failed
+        // write is retried by the next claim.
+        await recordNativeCleanupHold(db, { run, issueId, cleanupBlock }).catch((err: unknown) =>
+          logger.warn({ err, runId: run.id, issueId }, "could not record the native session cleanup hold on its run"));
         return null;
       }
     }

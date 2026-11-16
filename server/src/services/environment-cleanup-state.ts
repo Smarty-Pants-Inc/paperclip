@@ -61,6 +61,7 @@ export function recoveredCleanupFirstAttemptSql() {
   return sql`(${environmentLeases.failureReason} in ('orphaned_active_lease_recovered', 'retained_orphan_sandbox_released')
     or ${environmentLeases.metadata}->'sandboxStopAndRetain'->>'recoveredOrphanedRunLease' = 'true'
     or ${environmentLeases.metadata}->'sandboxStopAndRetain'->>'warmWindowExpired' = 'true'
+    or ${environmentLeases.metadata}->'sandboxStopAndRetain'->>'nativeCleanupGateOwner' = 'true'
     or ${environmentLeases.metadata}->'workspaceRecoveryCleanup'->>'runId' = ${environmentLeases.heartbeatRunId}::text)
     and coalesce(${environmentLeases.metadata}->>'pendingCleanupRetryAttempts', '0') = '0'
     and coalesce(${environmentLeases.metadata}->>'pendingCleanupInFlight', 'false') <> 'true'`;
