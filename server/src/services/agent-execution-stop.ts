@@ -1,6 +1,6 @@
 import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -9,13 +9,31 @@ import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], onPending?: (invocationId: string) => void) {
   if (!agentIds.length) return true;
-  const pending = (invocationId?: string | null) => { if (invocationId) onPending?.(invocationId); return false; };
-  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
-  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
-  const leases = await db.select().from(environmentLeases).where(or(
+  const condition = inArray(heartbeatRuns.agentId, agentIds);
+  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
+  return executionsHaveStopped(db, condition, or(
     inArray(environmentLeases.heartbeatRunId, runIds),
     inArray(sql`${environmentLeases.metadata}->>'agentId'`, agentIds),
-  ));
+  )!, onPending);
+}
+
+/** Task recovery uses the same Stop proof, scoped to its owners rather than
+ * every unrelated run of the assignee. The caller holds the task and run locks. */
+export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds: string[]) {
+  const ids = [...new Set(runIds)];
+  if (!ids.length) return true;
+  return executionsHaveStopped(db, and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, ids))!,
+    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, undefined, ids.length);
+}
+
+async function executionsHaveStopped(db: Db, condition: SQL, leaseCondition: SQL,
+  onPending?: (invocationId: string) => void, expectedRunCount?: number) {
+  const pending = (invocationId?: string | null) => { if (invocationId) onPending?.(invocationId); return false; };
+  const runs = await db.select().from(heartbeatRuns).where(condition);
+  // A missing or cross-company binding cannot establish execution Stop.
+  if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return false;
+  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
+  const leases = await db.select().from(environmentLeases).where(leaseCondition);
   const pendingLease = leases.find(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed");
   if (pendingLease) return pending(pendingLease.heartbeatRunId);
   const coordinators = await db.select().from(nativeRunFinalizations)

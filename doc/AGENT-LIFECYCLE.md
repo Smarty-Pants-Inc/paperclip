@@ -345,6 +345,13 @@ their existing behavior.
 A cancelled run record does not prove that execution stopped.
 The host also checks process ownership, controller leases, and environment cleanup.
 Required plugin cleanup cannot start while these checks are incomplete.
+Stranded-task recovery uses the same Stop proof before clearing a task's checkout
+or execution owner. A paused or terminated assignee alone does not release those
+locks. Recovery checks both bound runs in the task's company under the task and
+run locks; unrelated runs of the same agent do not block a confirmed release.
+An accepted interaction keeps its existing retry or needs-attention disposition.
+Generic recovery does not create a replacement run while its executor cleans up.
+After cleanup, its saved needs-attention escalation repeats the Stop check.
 
 The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
