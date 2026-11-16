@@ -168,8 +168,14 @@ export async function revalidateProjectConnectionRunContext(db: Executor, contex
  * validation even before the first project-owned connection exists. */
 export async function requiresProjectConnectionRunContext(db: Executor, companyId: string, heartbeatRunId?: string | null): Promise<boolean> {
   if (heartbeatRunId && isUuidLike(heartbeatRunId)) {
+    // Read only the binding keys, never the task text in the snapshot
+    // (listing-memory): issueId/taskId/projectId and the pair's presence.
     const [run] = await db.select({ nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
-      contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      contextSnapshot: sql<Record<string, unknown>>`jsonb_strip_nulls(jsonb_build_object(
+        'issueId', ${heartbeatRuns.contextSnapshot}->'issueId',
+        'taskId', ${heartbeatRuns.contextSnapshot}->'taskId',
+        'projectId', ${heartbeatRuns.contextSnapshot}->'projectId',
+        ${SNAPSHOT_KEY}::text, case when ${heartbeatRuns.contextSnapshot} ? ${SNAPSHOT_KEY} then 'true'::jsonb end))` }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, heartbeatRunId),
     ));
     if (run) {

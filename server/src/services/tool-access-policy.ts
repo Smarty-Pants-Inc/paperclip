@@ -1643,9 +1643,14 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     // caller projectId, or a run's descriptive snapshot. C resolves only the
     // durable task binding; B rechecks the current common admission boundary.
     if (ctx.connectionId) {
-      const [hint] = await db.select().from(toolConnections).where(and(
-        eq(toolConnections.companyId, ctx.companyId), eq(toolConnections.id, ctx.connectionId),
-      ));
+      // Only the owner hint is read here, once per connection per listing
+      // cache (listing-memory: no per-tool full-row read). An owned row is
+      // re-read fresh inside the transaction below before any admission.
+      const hintConnectionId = ctx.connectionId;
+      const [hint] = await cachedRead(cache, `connection-owner:${ctx.companyId}:${hintConnectionId}`, async () =>
+        db.select({ id: toolConnections.id, projectId: toolConnections.projectId }).from(toolConnections).where(and(
+          eq(toolConnections.companyId, ctx.companyId), eq(toolConnections.id, hintConnectionId),
+        )));
       if (hint?.projectId !== null && hint?.projectId !== undefined) {
         const ownedDecision = await db.transaction(async tx => {
         const [connection] = await tx.select().from(toolConnections).where(and(
