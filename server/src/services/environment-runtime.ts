@@ -84,6 +84,8 @@ import { environmentService, KEPT_SANDBOX_LEASE_POLICIES } from "./environments.
 import { instanceSettingsService } from "./instance-settings.js";
 import { hasSandboxSnapshotQualification, qualifiedSandboxSnapshotId, usesManagedCloudSandboxImage, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
+import { loadNativeHarnessBackupLeaseChain, nativeHarnessBackupHasLaterProviderWork,
+  newestNativeHarnessBackupStampOnChain } from "./native-runtime/native-retired-backup-source.js";
 import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
 import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
@@ -1740,6 +1742,27 @@ function createSandboxEnvironmentDriver(
     throw new Error("Reusable sandbox changed during compatible configuration drain; retry acquisition.");
   }
 
+  /**
+   * The stamp that proves custody of an obsolete source's native session. A
+   * warm owner's close stamps the lease row it was admitted on, while a later
+   * turn may have resumed the same allocation as a new row; restore already
+   * reads the newest stamp across that verified chain
+   * (`native-retired-backup-source`), so custody reads the same stamp. A stamp
+   * that provider work recorded after it outdates never proves custody. Rows
+   * that do not form one verified chain ending at this lease keep the
+   * single-row rule.
+   */
+  async function obsoleteLeaseCustodyStamp(lease: EnvironmentLease): Promise<unknown> {
+    const chain = lease.providerLeaseId
+      ? await loadNativeHarnessBackupLeaseChain(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId })
+      : null;
+    if (!chain || chain.tip.id !== lease.id) return lease.metadata?.nativeHarnessBackup;
+    const stamp = newestNativeHarnessBackupStampOnChain(chain);
+    if (!stamp || await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
+      normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt })) return null;
+    return stamp;
+  }
+
   async function cleanupObsoleteReusableSandboxLeases(input: {
     environment: Environment;
     leases: EnvironmentLease[];
@@ -1762,7 +1785,7 @@ function createSandboxEnvironmentDriver(
         && scope.adapterType !== "paperclip_runner" && (AGENT_ADAPTER_TYPES as readonly string[]).includes(scope.adapterType);
       if (!knownNonNative
         && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
-          stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }))) {
+          stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId }))) {
         const [stale] = await db.select().from(environmentLeases).where(and(
           eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
         ));
