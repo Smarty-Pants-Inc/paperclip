@@ -67,6 +67,13 @@ export async function captureProjectConnectionRunContext(db: Executor, input: Ca
     assertBoundRunIssueId(initial);
     const issueId = boundRunIssueId(initial);
     if (input.issueId && input.issueId !== issueId) throw invalid();
+    // Credential/cache reads validate an already admitted pair without taking the
+    // admission lifecycle lock (or reinterpreting a later task move as admission).
+    if (Object.hasOwn(initial.contextSnapshot ?? {}, SNAPSHOT_KEY)) {
+      const saved = savedBinding(initial.contextSnapshot![SNAPSHOT_KEY]);
+      if (saved.issueId !== issueId || saved.projectId !== await taskProject(tx, input.companyId, issueId)) throw invalid();
+      return { companyId: input.companyId, agentId: input.agentId, heartbeatRunId: initial.id, ...saved };
+    }
     // Existing task-before-run ordering, then the common start/retire project row.
     const projectId = await taskProject(tx, input.companyId, issueId, true);
     if (projectId) await lockProjectConnectionLifecycle(tx, { companyId: input.companyId, projectId });
