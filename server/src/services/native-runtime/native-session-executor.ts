@@ -9349,10 +9349,17 @@ function armWarmNativeSessionIdleTimer(
           providerLeaseId: current.providerLeaseId ?? null, closeFailure: describeWarmCloseFailure(error),
           closeAttempt: (current.idleCloseRetries ?? 0) + 1 },
         released ? "idle warm native session detach failed" : "idle warm native session close failed");
-  const redactOutputText = (text: string) => redactSensitiveText(
-    outputRedactor.chunk("diagnostic", text) + outputRedactor.finish("diagnostic"),
-  );
-  if (!isNativeAttemptProviderSupported(input.execution)) {
+        if (released) return;
+        return warmCloseFailureProvesOwnerGone(current, error).then(gone => {
+          if (gone) {
+            logger.warn({ runId: current.runId, issueId: current.issueId, environmentId: current.environmentId,
+              providerLeaseId: current.providerLeaseId ?? null },
+            "warm native session's Runner or sandbox is gone; released its owner");
+            forgetWarmNativeSession(sessionId, current);
+            return;
+          }
+          armWarmIdleCloseRetry(sessionId, current);
+        });
       })
       .finally(() => {
         current.busy = false;
@@ -11531,9 +11538,10 @@ async function executePaperclipNativeSessionAttempt(
   const redactIdentityText = (text: string) => redactSensitiveText(
     identityRedactor.chunk("diagnostic", text) + identityRedactor.finish("diagnostic"),
   );
-            providerTurnWait,
-            getFreshSessionHandoff: input.getFreshSessionHandoff
-              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
+  const redactOutputText = (text: string) => redactSensitiveText(
+    outputRedactor.chunk("diagnostic", text) + outputRedactor.finish("diagnostic"),
+  );
+  if (!isNativeAttemptProviderSupported(input.execution)) {
     throw new Error("paperclip_runner_provider_unsupported");
   }
   if (
@@ -13239,7 +13247,8 @@ async function executePaperclipNativeSessionAttempt(
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner"
               || input.restartRecovery?.kind === "reattach_remote_runner" || scheduledResumeContinuation,
             providerTurnWait,
-            getFreshSessionHandoff: input.getFreshSessionHandoff,
+            getFreshSessionHandoff: input.getFreshSessionHandoff
+              ? () => controllerSteps.measure("fresh_session_handoff", input.getFreshSessionHandoff!) : undefined,
             // A failed seal commits nothing: the messages stay queued for the
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt
