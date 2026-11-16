@@ -10,11 +10,11 @@ export const MAX_CONFIGURED_READY_SPARES = 3;
 export const MAX_READY_SPARE_CREATES_PER_HOUR = 12;
 /**
  * Absolute ceiling on ALL Boat creates (spare + run) per company per rolling
- * hour, whatever the churn rule decides. 60 lets a 50-task burst on a gate run:
- * at most 50 run boxes (one per task, claimed spare or cold) plus at most five
- * spares (MAX_READY_SPARES) is 55, with headroom for a few failed attempts.
+ * hour, whatever the churn rule decides. The default 90 keeps fresh's measured
+ * 48-hour peak of 53 creates/hour below two thirds of the ceiling (60).
+ * Gates override this per company: gate 2 uses 450; gate 4 uses 150.
  */
-export const DEFAULT_CREATE_CEILING_PER_HOUR = 60;
+export const DEFAULT_CREATE_CEILING_PER_HOUR = 90;
 export const MIN_CREATE_CEILING_PER_HOUR = 1;
 export const MAX_CREATE_CEILING_PER_HOUR = 1_000;
 const CREATE_WINDOW_MS = 60 * 60 * 1000;

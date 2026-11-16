@@ -80,12 +80,14 @@ Two hourly limits bound what spares can cost (smarty-dev#20869):
   of this worker's ledger and Boat's inventory of `purpose=spare` boxes created
   in the last hour (which survives worker restarts); proofs of use are this
   worker's, so after a restart a used box counts again until it leaves the hour.
-- **Spare-only ceiling, `createCeilingPerHour` (default 60, 1-1000).** Company
+- **Spare-only ceiling, `createCeilingPerHour` (default 90, 1-1000).** Company
   plugin setting counting ALL creates, spare and run, used or not. At the
   ceiling the spare refill stops, but an ordinary run create is always
   admitted and counted, even above the ceiling (RFL ruling A). A person's run
-  must not be left unanswered by a create-cap refusal. 60 fits a 50-task burst:
-  one run box per task (claimed spare or cold) plus at most five spares is 55.
+  must not be left unanswered by a create-cap refusal. The default 90 keeps
+  fresh's measured 48-hour peak of 53 creates/hour below two thirds of the
+  ceiling (60), as required by RFL's 18:02Z ruling. Gates override this per
+  company: gate 2 uses 450 and gate 4 uses 150.
   The count survives worker restarts: Boat's inventory of this company's
   `purpose=spare` and `purpose=run` boxes created in the last hour (any
   environment, any state) is read at each spare create and, in the background,
