@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -102,6 +102,56 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
   return app;
 }
 
+async function authorizeAgentToCreate(db: Db, companyId: string, agentId: string) {
+  await db.insert(companyMemberships).values({
+    companyId,
+    principalType: "agent",
+    principalId: agentId,
+    membershipRole: "member",
+    status: "active",
+  });
+  await db.insert(principalPermissionGrants).values({
+    companyId,
+    principalType: "agent",
+    principalId: agentId,
+    permissionKey: "agents:create",
+  });
+}
+
+async function seedRootCeo(db: Db, companyId: string) {
+  const [rootCeo] = await db.insert(agents).values({
+    companyId,
+    name: "Default-grant CEO",
+    role: "ceo",
+    adapterType: "process",
+    adapterConfig: {},
+    runtimeConfig: {},
+  }).returning();
+  return rootCeo!;
+}
+
+async function forceDefaultGrantDeadlocks(db: Db, principalId: string, failedAttempts: number) {
+  if (!Number.isInteger(failedAttempts) || failedAttempts < 1) throw new Error("failedAttempts must be a positive integer");
+  await db.execute(sql.raw(`
+    CREATE SEQUENCE agent_hire_default_grant_deadlock_attempts;
+    CREATE FUNCTION agent_hire_default_grant_deadlock() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE attempt bigint;
+    BEGIN
+      IF NEW.principal_id = '${principalId}' AND NEW.permission_key = 'skills:create' THEN
+        attempt := nextval('agent_hire_default_grant_deadlock_attempts');
+        IF attempt <= ${failedAttempts} THEN
+          RAISE EXCEPTION 'forced agent default grant deadlock' USING ERRCODE = '40P01';
+        END IF;
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER agent_hire_default_grant_deadlock
+      BEFORE INSERT ON principal_permission_grants
+      FOR EACH ROW EXECUTE FUNCTION agent_hire_default_grant_deadlock();
+  `));
+}
+
 describeEmbeddedPostgres("agent hire idempotency within a run", () => {
   let db!: Db;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -113,6 +163,9 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
   }, 60_000);
 
   afterEach(async () => {
+    await db.execute(sql.raw("DROP TRIGGER IF EXISTS agent_hire_default_grant_deadlock ON principal_permission_grants"));
+    await db.execute(sql.raw("DROP FUNCTION IF EXISTS agent_hire_default_grant_deadlock()"));
+    await db.execute(sql.raw("DROP SEQUENCE IF EXISTS agent_hire_default_grant_deadlock_attempts"));
     await db.delete(activityLog);
     await db.delete(approvals);
     await db.delete(heartbeatRuns);
@@ -240,6 +293,74 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     expect(secondRunHire.status, JSON.stringify(secondRunHire.body)).toBe(201);
     expect(secondRunHire.body.idempotent).toBeUndefined();
     expect(secondRunHire.body.agent?.name).toBe("Sam 2");
+  });
+
+  it("retries partial company-default grant setup without duplicating any grant set", async () => {
+    const { company, hiringAgent, run } = await seedHiringFixture(db);
+    await authorizeAgentToCreate(db, company.id, hiringAgent.id);
+    const rootCeo = await seedRootCeo(db, company.id);
+    await forceDefaultGrantDeadlocks(db, rootCeo.id, 2);
+    const retryCountBefore = transactionRetryStats.retried;
+    const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
+
+    const response = await request(app).post(`/api/companies/${company.id}/agents`).send({
+      name: "Retry-safe hire",
+      role: "engineer",
+      reportsTo: hiringAgent.id,
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(transactionRetryStats.retried - retryCountBefore).toBe(2);
+
+    const hiredAgentId = response.body.id as string;
+    expect(await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalType, "agent"),
+      eq(companyMemberships.principalId, hiredAgentId),
+    ))).toHaveLength(1);
+    expect(await db.select().from(principalPermissionGrants).where(and(
+      eq(principalPermissionGrants.companyId, company.id),
+      eq(principalPermissionGrants.principalType, "agent"),
+      eq(principalPermissionGrants.principalId, hiredAgentId),
+      eq(principalPermissionGrants.permissionKey, "tasks:assign"),
+    ))).toHaveLength(1);
+    expect(await db.select().from(companyMemberships).where(and(
+      eq(companyMemberships.companyId, company.id),
+      eq(companyMemberships.principalType, "agent"),
+      eq(companyMemberships.principalId, rootCeo.id),
+    ))).toHaveLength(1);
+    const defaultGrantRows = await db.select({ permissionKey: principalPermissionGrants.permissionKey })
+      .from(principalPermissionGrants)
+      .where(and(
+        eq(principalPermissionGrants.companyId, company.id),
+        eq(principalPermissionGrants.principalType, "agent"),
+        eq(principalPermissionGrants.principalId, rootCeo.id),
+      ));
+    expect(defaultGrantRows.map(row => row.permissionKey).sort()).toEqual(["agents:configure", "skills:create"]);
+  });
+
+  it("returns a named retryable error when every default-grant transaction deadlocks", async () => {
+    const { company, hiringAgent, run } = await seedHiringFixture(db);
+    await authorizeAgentToCreate(db, company.id, hiringAgent.id);
+    const rootCeo = await seedRootCeo(db, company.id);
+    await forceDefaultGrantDeadlocks(db, rootCeo.id, 5);
+    const retryCountBefore = transactionRetryStats.retried;
+    const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
+
+    const response = await request(app).post(`/api/companies/${company.id}/agents`).send({
+      name: "Exhausted hire",
+      role: "engineer",
+      reportsTo: hiringAgent.id,
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+    });
+    expect(response.status, JSON.stringify(response.body)).toBe(503);
+    expect(response.body.code).toBe("agent_hire_grant_contention");
+    expect(response.body.details).toMatchObject({ retryable: true });
+    expect(transactionRetryStats.retried - retryCountBefore).toBe(4);
   });
 
   it("creates ten agents concurrently with membership and tasks:assign in five trials", async () => {
