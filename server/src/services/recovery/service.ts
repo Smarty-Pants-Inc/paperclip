@@ -6949,7 +6949,18 @@ export function recoveryService(
         const [locked] = await tx.select({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
           .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id))).for("update");
         if (!locked || locked.checkoutRunId !== issue.checkoutRunId || locked.executionRunId !== issue.executionRunId) return null;
-        for (const runId of new Set([locked.checkoutRunId, locked.executionRunId])) {
+        // Terminal status alone does not prove that execution stopped. Match
+        // checkout's task-before-run order and escalation's task-scoped Stop
+        // gate before releasing either claim or publishing hold-release work.
+        const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
+          .filter((id): id is string => id !== null))];
+        if (ownerRunIds.length) {
+          await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
+          )).orderBy(asc(heartbeatRuns.id)).for("update");
+          if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) return null;
+        }
+        for (const runId of ownerRunIds) {
           if (runId && await nativeManualAdmissionHoldsExecution(tx as unknown as Db,
             { companyId: issue.companyId, runId, issueId: issue.id })) return null;
         }
