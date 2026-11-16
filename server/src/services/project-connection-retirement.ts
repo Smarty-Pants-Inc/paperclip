@@ -8,10 +8,74 @@ import { isUuidLike } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 import { persistActivity } from "./activity-log.js";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
+import { isConsumedProjectAppApprovalPredecessor, PROJECT_APP_APPROVAL_CONSUMED_BY } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import type { ActorInfo, DbTransaction } from "./tool-access/types.js";
 
 type Connection = typeof toolConnections.$inferSelect;
+
+/** N6(iii), RFL 09:36Z. Completion includes the existing recipient-local
+ * legacy cleanup (D's third operation), not just one project's finish. The
+ * replace-set writer holds S's row lock; an install left on S is live reach,
+ * even if another recipient already moved. Never infer completion from the
+ * single consumedBy pointer or remove shared credentials/grants/history.
+ */
+export async function completeProjectConnectionPredecessor(
+  tx: Db | DbTransaction,
+  input: Readonly<{ companyId: string; connectionId: string; actor?: ActorInfo }>,
+): Promise<void> {
+  const [source] = await tx.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.connectionId),
+  )).for("update");
+  if (!source || !isConsumedProjectAppApprovalPredecessor(source)) return;
+  const [liveReach] = await tx.select({ id: toolConnectionInstalls.id }).from(toolConnectionInstalls).where(and(
+    eq(toolConnectionInstalls.companyId, input.companyId), eq(toolConnectionInstalls.connectionId, source.id),
+  )).limit(1);
+  if (liveReach) return;
+  const consumers = await tx.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.companyId),
+    sql`${toolConnections.config}->'projectScope'->>'legacyConnectionId' = ${source.id}`,
+  ));
+  // No completion based on an orphan/aborted/pending link. In particular a
+  // rollback of the last finish cannot make cleanup archive a live source.
+  if (!consumers.some(row => row.id === source.config[PROJECT_APP_APPROVAL_CONSUMED_BY])
+    || consumers.some(row => !row.projectId || row.status !== "active" || !row.enabled
+      || readProjectConnectionScope(row)?.migrationPending !== false)) return;
+  await tx.update(toolConnections).set({ status: "archived", enabled: false, updatedAt: new Date() }).where(and(
+    eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id),
+  ));
+  await persistActivity(tx as Db, { companyId: input.companyId,
+    actorType: input.actor?.actorType ?? "system", actorId: input.actor?.actorId ?? "system",
+    action: "tool_connection.project_app_predecessor_archived", entityType: "tool_connection", entityId: source.id,
+    details: { connectionId: source.id, consumerConnectionIds: consumers.map(row => row.id).sort(), reason: "migration_completed" } });
+}
+
+/** Abort is NOT completion. Undo only this pending candidate's consumption,
+ * on the same retirement transaction as its receipt; do not revoke S's grant,
+ * erase its genuine approval, archive it, or consume any other source.
+ */
+export async function abortProjectConnectionMigration(
+  tx: Db | DbTransaction,
+  input: Readonly<{ connection: Connection; actor?: ActorInfo }>,
+): Promise<void> {
+  const scope = readProjectConnectionScope(input.connection);
+  if (!scope?.migrationPending || !scope.legacyConnectionId) return;
+  const [source] = await tx.select().from(toolConnections).where(and(
+    eq(toolConnections.companyId, input.connection.companyId), eq(toolConnections.id, scope.legacyConnectionId),
+  )).for("update");
+  if (!source || source.config[PROJECT_APP_APPROVAL_CONSUMED_BY] !== input.connection.id) return;
+  if (!isConsumedProjectAppApprovalPredecessor(source)) throw conflict("The migration predecessor changed during abort", { code: "project_connection_state_changed" });
+  const config = { ...source.config }, transportConfig = { ...source.transportConfig };
+  delete config[PROJECT_APP_APPROVAL_CONSUMED_BY];
+  delete transportConfig[PROJECT_APP_APPROVAL_CONSUMED_BY];
+  await tx.update(toolConnections).set({ config, transportConfig, updatedAt: new Date() }).where(and(
+    eq(toolConnections.companyId, source.companyId), eq(toolConnections.id, source.id),
+  ));
+  await persistActivity(tx as Db, { companyId: source.companyId,
+    actorType: input.actor?.actorType ?? "system", actorId: input.actor?.actorId ?? "system",
+    action: "tool_connection.project_app_approval_released", entityType: "tool_connection", entityId: source.id,
+    details: { connectionId: input.connection.id, projectId: input.connection.projectId, reason: "migration_aborted" } });
+}
 
 /** Lane D: both run admission (C) and destructive writers lock the same lifecycle row.
  * Call on the actual transaction, before registration/installation/run/connection
