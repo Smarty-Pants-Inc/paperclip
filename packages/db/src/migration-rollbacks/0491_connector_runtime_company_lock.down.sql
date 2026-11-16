@@ -259,4 +259,18 @@ DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_insert ON agents;
 DROP TRIGGER IF EXISTS paperclip_agent_runtime_lock_manager_update ON agents;
 DROP FUNCTION IF EXISTS paperclip_agent_runtime_lock_manager();
 --> statement-breakpoint
+-- src11: the 0348 skill-pin fanout body, exactly.
+CREATE OR REPLACE FUNCTION paperclip_skill_pins_runtime_changed() RETURNS trigger
+LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+DECLARE company uuid;
+BEGIN
+  IF coalesce(OLD.experimental->'enableBetaSkills', 'false'::jsonb) IS DISTINCT FROM coalesce(NEW.experimental->'enableBetaSkills', 'false'::jsonb) THEN
+    FOR company IN SELECT DISTINCT company_id FROM agents ORDER BY company_id LOOP
+      PERFORM paperclip_invalidate_company_agent_runtimes(company);
+    END LOOP;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
 DROP FUNCTION IF EXISTS paperclip_lock_runtime_agents(uuid[]);
