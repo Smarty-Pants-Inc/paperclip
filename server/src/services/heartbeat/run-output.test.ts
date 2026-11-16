@@ -1,4 +1,4 @@
-import { agentIdentityRedactionVectors } from "../../__tests__/fixtures/agent-identity-redaction-vectors.js";
+import { agentIdentityRedactionVectors, pemBodyWindows, pemTransformForms } from "../../__tests__/fixtures/agent-identity-redaction-vectors.js";
 import { NativeSessionDiagnostics } from "../native-runtime/native-session-diagnostics.js";
 import { withS3FailureDiagnostics } from "../../storage/s3-failure.js";
 import { objectLogFixture } from "./__tests__/object-log-fixture.js";
@@ -330,6 +330,55 @@ describe("transformed identity material at the object-log boundary (#20832)", ()
       expect(value).toHaveLength(44);
       expect(stored).toContain(value);
     }
+  });
+});
+
+// Gate 5 row 5.5: a run secret PEM printed through shell transforms. The run
+// secret joins the identity redactor the way live preparation adds it.
+describe("transformed run-secret and identity PEMs at the object-log boundary", () => {
+  const fixture = agentIdentityRedactionVectors();
+  const runSecretPem = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  const cases = [["run secret", runSecretPem], ["agent identity", fixture.privateKeyPem]].flatMap(([key, pem]) =>
+    pemTransformForms(pem!).flatMap(form => (["diagnostic", "native export"] as const).map(entryPath =>
+      ({ key, pem: pem!, form: form.name, text: form.text, entryPath }))));
+
+  it.each(cases)("redacts the $key through $form via $entryPath before storage", async ({ pem, text, entryPath }) => {
+    const row = { ...newRunRow } as Run;
+    const store = objectLogFixture();
+    const db = createRunRowDb(row) as Db & { select: () => unknown };
+    db.select = (() => ({ from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [] }) }) }) })) as typeof db.select;
+    const identityRedactor = createAgentIdentityRedactor(fixture.privateKeyPem);
+    identityRedactor.values.push(...createAgentIdentityRedactor(runSecretPem).values);
+    identityRedactor.values.sort((left, right) => right.length - left.length);
+    const output = createHeartbeatRunOutput(db, {
+      run: row, runId: row.id, issueId: null, runLogStore: store, identityRedactor, secretKeys: new Set(),
+      appendRunEvent: vi.fn(), getCurrentUserRedactionOptions: async () => ({ enabled: false }),
+    });
+    const handlers = await output.begin(row);
+    const allChunks = [fixture.precision.join("\n") + "\n", text, "\n", fixture.precision.join("\n") + "\n"];
+    let cursor = 0;
+    for (const chunk of allChunks) {
+      if (entryPath === "diagnostic") await handlers.onLog("stdout", chunk);
+      else await handlers.onPersistedNativeLog!(++cursor, formatNativeRunLogEvent({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: row.id,
+        sourceEventId: `source:${cursor}`, sourceInstanceId: "source", sourceKind: "runner",
+        sourceSeq: cursor, normalizedSessionId: "session", eventType: "item.delta", priority: 2,
+        emittedAt: new Date().toISOString(), payload: { text: chunk },
+      }));
+    }
+    await store.finalize(output.handle!);
+    const content = (await store.read(output.handle!, { limitBytes: 512 * 1024 })).content;
+    const stored = content.trim().split("\n").map(line => {
+      const chunk = JSON.parse(line).chunk as string;
+      return entryPath === "diagnostic" ? chunk : JSON.parse(chunk).event.payload.text as string;
+    }).join("");
+    const compact = stored.replace(/\s+/g, "");
+    const windows = pemBodyWindows(pem);
+    const leaked = windows.filter(window => compact.includes(window));
+    expect(leaked.length, `${leaked.length}/${windows.length} key-body windows survived`).toBe(0);
+    expect(stored.replace(/\r?\n/g, "")).not.toMatch(/(?:BEGIN|END)[A-Z ]*PRIVATE KEY/);
+    for (const value of fixture.precision) expect(stored).toContain(value);
   });
 });
 

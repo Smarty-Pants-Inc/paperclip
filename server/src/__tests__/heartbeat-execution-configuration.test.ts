@@ -1,5 +1,5 @@
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { trace } from "@opentelemetry/api";
 import { InMemorySpanExporter, SimpleSpanProcessor, TracerProvider } from "@opentelemetry/sdk-trace";
 import { access, chmod, mkdir, readdir, readFile, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
@@ -17,6 +17,7 @@ import { bindHeartbeatRunnerHomeMode, prepareHeartbeatExecutionConfiguration, ty
 import { buildEffectiveRunSessionConfigMetadata, resolveTaskSessionConfigFreshness } from "../services/heartbeat/workspaces.js";
 import { aiConnectionBindingSchema, type Environment } from "@paperclipai/shared";
 import { secretService } from "../services/secrets.js";
+import { syncAgentAdapterEnvBindings } from "../services/agent-secret-bindings.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as aiRuntime from "../services/ai-connection-runtime.js";
@@ -31,6 +32,7 @@ import { executionWorkspaceService } from "../services/execution-workspaces.js";
 import { buildExecutionWorkspaceAdapterConfig } from "../services/execution-workspace-policy.js";
 import { buildNativeExecutionInput } from "../services/native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../services/native-runtime/runtime-context.test-fixture.js";
+import { pemBodyWindows, pemTransformForms } from "./fixtures/agent-identity-redaction-vectors.js";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -740,6 +742,53 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     expect(input?.context.paperclipSecrets).toBeUndefined();
     expect(JSON.stringify(input?.context.paperclipWake)).not.toContain("untrusted wake instructions");
   });
+
+  // Gate 5 row 5.5 (M2h3 490ed240, run fd281998): a PEM bound as a secret_ref
+  // env printed through shell transforms reached the stored log and events.
+  it("keeps a secret_ref PEM and the agent identity key out of the stored run log and run events", async () => {
+    const f = await seed();
+    // Throwaway key generated here; never a real credential.
+    const fakePem = generateKeyPairSync("rsa", { modulusLength: 2048 })
+      .privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const secret = await secretService(db).create(f.companyId, { name: `fake-pem-${f.agentId}`, provider: "local_encrypted", value: fakePem }, { userId: f.userId });
+    const adapterConfig = { model: "agent-model", env: { FAKE_PEM: { type: "secret_ref", secretId: secret.id, version: "latest" } } };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+    let identityPem = "";
+    inspect.set(f.agentId, async input => {
+      const env = input.config.env as Record<string, string>;
+      expect(env.FAKE_PEM).toBe(fakePem);
+      identityPem = input.agentIdentity?.privateKeyPem ?? "";
+      expect(identityPem).toContain("PRIVATE KEY-----");
+      for (const pem of [fakePem, identityPem]) {
+        for (const form of pemTransformForms(pem)) {
+          // Tool output arrives in arbitrary pieces; 97 never aligns with a line.
+          for (let index = 0; index < form.text.length; index += 97) await input.onLog("stdout", form.text.slice(index, index + 97));
+          await input.onLog("stdout", "\n");
+          await input.onEvent?.({ eventType: "tool.output", stream: "stdout", level: "info", message: form.text, payload: { output: form.text } });
+        }
+      }
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    const strings = (value: unknown): string[] => typeof value === "string" ? [value]
+      : Array.isArray(value) ? value.flatMap(strings)
+        : value && typeof value === "object" ? Object.values(value).flatMap(strings) : [];
+    const events = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, finished.id)))
+      .filter(event => event.eventType === "tool.output").map(event => [event.message, ...strings(event.payload)].join("\n"));
+    expect(events).toHaveLength(14);
+    for (const [name, stored] of [["stored run log", log], ["run events", events.join("\n")]] as const) {
+      const compact = stored.replace(/\s+/g, "");
+      for (const [key, pem] of [["secret_ref PEM", fakePem], ["identity key", identityPem]] as const) {
+        const windows = pemBodyWindows(pem);
+        const leaked = windows.filter(window => compact.includes(window));
+        expect(leaked.length, `${name}: ${leaked.length}/${windows.length} ${key} windows survived`).toBe(0);
+      }
+      expect(stored.replace(/\r?\n/g, ""), name).not.toMatch(/(?:BEGIN|END)[A-Z ]*PRIVATE KEY/);
+    }
+  }, 60_000);
 
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
