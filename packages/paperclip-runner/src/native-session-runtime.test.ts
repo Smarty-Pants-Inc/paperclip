@@ -6768,8 +6768,11 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
-  it("C3 retains launch-profile refusal before every legacy replacement callback", async () => {
-    for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
+  // B3 supersede (#20736, #20787; judge J3-1 revised): a checkpoint that allows
+  // replacement now continues in the same run (next case). Every policy that
+  // does not allow it keeps this typed refusal and starts nothing.
+  it("C3 retains launch-profile refusal before every legacy replacement callback when replacement is not allowed", async () => {
+    for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_governed_wait"] as const) {
       const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: "earlier-driver", identity,
         providerSessionId: "earlier-provider", providerRecoveryPolicy, cursor: "0", activeTurnId: null,
         pendingRuntimeRequests: [], lineage: [] };
