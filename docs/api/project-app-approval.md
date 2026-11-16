@@ -82,6 +82,16 @@ creates the organization grant and ordinary take activity atomically. The
 approved lead finishes that saved candidate through the existing finish route.
 The gallery's raw-key form is not a reference-only project create surface.
 
+A receipt-citing create archives and links ONLY its own approval source S, in
+one transaction with its owned connection, grant, take and consumption activity.
+No source is deleted. Failure leaves S live and its receipt unused; replay is
+refused. Under RFL's 05:56Z replacement, receipt-citing creates for the same
+installation OR App registration arbitrate on owned rows. Exactly one EXCLUSIVE
+create wins; the loser's source remains live, unconsumed and readable, with its
+receipt unchanged. Ordinary non-receipt writers still see source reservations
+under the existing alias/exclusivity checks. A receipt never consumes another
+project's approval.
+
 Only project-owned connections (`projectId` non-null) require this receipt:
 one internal fact-only reader checks the saved source at first bind, finish,
 management/re-scope admission and credential release. Agent, personal, shared

@@ -4885,8 +4885,9 @@ export function toolAccessService(
       const row = await writeToolConnectionHealthChange(db, { companyId, id: connectionId }, async tx => {
         // This is a refusal check against known saved identities, not provider
         // verification or approval of submitted App/client spelling.
-        // Only a receipt-citing project create ignores ITS source S (re-verified
-        // below, consumed in this transaction); every other create collides with S.
+        // RFL 05:56Z: receipt-citing creates arbitrate on OWNED rows, not other
+        // live approval sources for the same installation/registration. Only
+        // this create's own S is re-verified and consumed in this transaction.
         const consumedSourceConnectionId = projectId !== null ? preparedProject?.custody.sourceConnectionId : undefined;
         await assertKnownProjectConnectionCreateAliases(tx, { companyId, projectId, config, consumedSourceConnectionId,
           exclusive: (input as CreateToolConnection & { exclusive?: boolean }).exclusive === true });
@@ -4909,7 +4910,7 @@ export function toolAccessService(
           await assertProjectConnectionAdmission(tx, { companyId, projectId, operation: "create", actor,
             proposedSecretRefs: input.credentialSecretRefs ?? [] });
           // Existing named conflicts (duplicate / EXCLUSIVE) keep their order and
-          // codes; S is ignored only for this receipt's own create.
+          // codes; unconsumed same-identity approval sources are not owned rows.
           await assertProjectConnectionAvailability(tx, { identity, projectId, consumedSourceConnectionId,
             exclusive: asRecord(config.projectScope).exclusive === true });
           // Serialize receipt consumers on S before re-reading it: a concurrent
