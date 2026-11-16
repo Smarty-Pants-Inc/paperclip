@@ -9,10 +9,11 @@ import { ApiError } from "@/api/client";
 import { queryKeys } from "@/lib/queryKeys";
 import { AgentChat } from "./AgentChat";
 
-const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
+const api = vi.hoisted(() => ({ enabled: true, list: vi.fn(), get: vi.fn(), getChat: vi.fn(), listChats: vi.fn(), directory: vi.fn(), ensure: vi.fn(), session: vi.fn() }));
 const agentId = "18c5ad50-9d70-4e24-bd82-337e1d45a414";
 vi.mock("@/api/agents", () => ({ agentsApi: { list: api.list, get: api.get } }));
-vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, ensure: api.ensure } }));
+vi.mock("@/api/agentChats", () => ({ agentChatsApi: { get: api.getChat, list: api.listChats, ensure: api.ensure } }));
+vi.mock("@/api/access", () => ({ accessApi: { listUserDirectory: api.directory } }));
 vi.mock("@/api/auth", () => ({ authApi: { getSession: api.session } }));
 vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompanyId: "company-a" }) }));
 vi.mock("@/hooks/useAgentChatEnabled", () => ({ useAgentChatEnabled: () => ({ enabled: api.enabled, loaded: true }) }));
@@ -43,6 +44,8 @@ async function failRoster(status: number, cached = true) {
 beforeEach(() => {
   vi.clearAllMocks();
   api.enabled = true;
+  api.listChats.mockResolvedValue([{ id: "member-chat", companyId: "company-a", conversationAgentId: agentId, conversationUserId: "member-b", title: "Launch plan", updatedAt: "2026-11-15T12:00:00Z" }]);
+  api.directory.mockResolvedValue({ users: [{ id: "member-b", name: "Member B" }] });
   client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
   client.setQueryData(queryKeys.auth.session, { user: { id: "viewer-a" } });
   api.session.mockResolvedValue({ user: { id: "viewer-a" } });
@@ -117,6 +120,20 @@ it("opens a stale navigation conversation immediately while revalidating in the 
   expect(container.textContent).not.toContain("Loading conversation");
   await waitFor(() => expect(api.getChat).toHaveBeenCalledWith("company-a", agentId));
   expect(api.ensure).not.toHaveBeenCalled();
+});
+
+it("lists all members' conversations with owner names and task links without creating a chat", async () => {
+  api.list.mockResolvedValue([{ id: agentId, companyId: "company-a", name: "Helper" }]);
+  render();
+  await waitFor(() => expect(container.textContent).toContain("All members"));
+  flushSync(() => [...container.querySelectorAll("button")].find(button => button.textContent === "All members")!.click());
+  await waitFor(() => expect(container.textContent).toContain("Member B"));
+  expect(container.textContent).toContain("Launch plan");
+  expect(container.querySelector('a[href="/issues/member-chat"]')).not.toBeNull();
+  expect(api.listChats).toHaveBeenCalledWith("company-a", { agentId, members: "all", limit: 50, offset: 0 });
+  expect(api.ensure).not.toHaveBeenCalled();
+  flushSync(() => [...container.querySelectorAll("button")].find(button => button.textContent === "Mine")!.click());
+  expect(container.textContent).toContain("History for Helper");
 });
 
 it("does not reuse another account's cached conversation", async () => {
