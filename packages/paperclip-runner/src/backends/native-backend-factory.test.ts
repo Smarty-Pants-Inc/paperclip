@@ -514,15 +514,18 @@ describe("native backend factory", () => {
           runnerExitConfirmed: true });
     });
 
+    // SUPERSEDED BY REPLACEMENT (RFL 08:16Z 11-16, F7): the old rows asserted the TL08 bug (lost runner state left unclassified)
     it.each([
-      ["an active turn", { activeTurnId: "turn-in-flight" }],
-      ["a pending runtime request", { pendingRuntimeRequests: [{ requestId: "request-1" }] }],
-    ])("leaves a session that holds %s unclassified", async (_label, inFlight) => {
+      ["an active turn", { activeTurnId: "turn-in-flight" },
+        { failureClass: PROVIDER_STATE_INCOMPATIBLE, resumeStateUnavailable: true }],
+      ["a pending runtime request", { pendingRuntimeRequests: [{ requestId: "request-1" }] },
+        { failureClass: PROVIDER_SIDE_EFFECT_PENDING }],
+    ] as const)("classifies a session that holds %s by its exact class", async (_label, inFlight, expected) => {
       const { backend, snapshot } = statelessRecovery(acpxExecution("claude"));
       const recovered = await backend.recoverSession!({ ...snapshot, ...inFlight } as never, { signal: new AbortController().signal });
       expect(recovered).toMatchObject({ recovered: false, reason: expect.stringContaining("PRP provider resume state is unavailable") });
-      expect(recovered).not.toHaveProperty("failureClass");
-      expect(recovered).not.toHaveProperty("resumeStateUnavailable");
+      expect(recovered).toMatchObject(expected);
+      if (!("resumeStateUnavailable" in expected)) expect(recovered).not.toHaveProperty("resumeStateUnavailable");
     });
 
     // Gate 6 (prp-resume-unavailable): the definite absence is a fact about the
