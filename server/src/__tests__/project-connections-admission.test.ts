@@ -141,7 +141,7 @@ describe("project connection writer admission (round-4 B)", () => {
     expect((await storedConnection(db, connection.id)).enabled).toBe(true);
   });
 
-  it("J02: wrong-project recipient cannot be installed by an otherwise permitted manager", async () => {
+  it("(superseded by replacement: unified guard code, RFL record 22:00Z) J02: wrong-project recipient cannot be installed by an otherwise permitted manager", async () => {
     const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
     // Supersede-by-replacement (NEEDS-RFL W1): a recipient outside the owning
@@ -359,7 +359,7 @@ describe("project connection writer admission (round-4 B)", () => {
     expect((await storedConnection(db, connection.id))).toMatchObject({ status: "draft", enabled: false });
   });
 
-  it("J02/A05: preserveExistingAccess checks the final recipient union, not only the new worker", async () => {
+  it("(superseded by replacement: unified guard code, RFL record 22:00Z) J02/A05: preserveExistingAccess checks the final recipient union, not only the new worker", async () => {
     const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: connection.id, targetType: "agent", targetId: f.outsider.id });
