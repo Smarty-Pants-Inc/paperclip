@@ -107,6 +107,7 @@ vi.mock("@paperclipai/adapter-claude-local/server", async (importOriginal) => {
 // NOTE: ../services/secrets.js is intentionally NOT mocked — the routes resolve
 // against the real embedded-postgres-backed secret service.
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -328,6 +329,7 @@ describeEmbeddedPostgres("agents adapter-config user-secret resolution routes", 
       })
       .expect(200);
 
+    await flushSecretResolutionWrites(db);
     let events = await db.select().from(secretAccessEvents);
     expect(events.length).toBeGreaterThan(0);
     for (const ev of events) {
@@ -359,6 +361,7 @@ describeEmbeddedPostgres("agents adapter-config user-secret resolution routes", 
       })
       .expect(200);
 
+    await flushSecretResolutionWrites(db);
     events = await db.select().from(secretAccessEvents);
     expect(events.length).toBeGreaterThan(0);
     for (const ev of events) {
