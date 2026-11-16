@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, companies, createDb, plugins, toolApplications, toolConnections, toolCatalogEntries, toolProfiles, toolProfileEntries, toolProfileBindings, toolPolicies, resourceLifecycleEvents, type Db } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectWaitsOnCompanyRuntimeHold, holdAgentRowThenCompanyRuntimeShared } from "./helpers/agent-runtime-hold.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 
@@ -186,7 +187,14 @@ describeDatabase("tool definition runtime synchronization", () => {
     await db.update(toolPolicies).set({ config: { ...used.config, trustRule: { ...(used.config?.trustRule as object), revokedAt: new Date().toISOString() } } }).where(eq(toolPolicies.id, rule.id));
     expect((await events()).slice(before.length).map(row => row.resourceId)).toEqual([agentId]);
   });
-  it.each(["profile entry add", "profile entry edit", "profile entry delete", "profile replacement"] as const)("orders %s before action finalization and runtime fanout", async change => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders profile entry add before action finalization and runtime fanout
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders profile entry edit before action finalization and runtime fanout
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders profile entry delete before action finalization and runtime fanout
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders profile replacement before action finalization and runtime fanout
+  it.each(["profile entry add", "profile entry edit", "profile entry delete", "profile replacement"] as const)("orders %s before action finalization and runtime fanout behind an in-flight writer's shared company hold", async change => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
     await db.update(toolConnections).set({ config: { url: "https://mcp.example.test/mcp" } }).where(eq(toolConnections.id, connectionId));
     let description = "Initial search";
     const options = {
@@ -205,7 +213,7 @@ describeDatabase("tool definition runtime synchronization", () => {
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, [agentId, peerId].sort()[0])).for("no key update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, [agentId, peerId].sort()[0]);
       locked(); await resume;
     });
     await held;
@@ -220,6 +228,7 @@ describeDatabase("tool definition runtime synchronization", () => {
       expect(pids.length).toBeGreaterThan(index);
       const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
       expect(row.wait_event_type).toBe("Lock");
+      if (index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
     }, { timeout: 5000 });
     const mutation = run(writer => change === "profile entry add"
       ? writer.addProfileEntry(profile.id, { selectorType: "catalog_entry", effect: "include", catalogEntryId: entry.id, connectionId, applicationId })
@@ -227,11 +236,13 @@ describeDatabase("tool definition runtime synchronization", () => {
       : change === "profile entry delete" ? writer.deleteProfileEntry(profileEntry.id)
       : writer.updateProfile(profile.id, { entries: [{ selectorType: "catalog_entry", effect: "include", catalogEntryId: entry.id, connectionId, applicationId }] }));
     const mutationResult = Promise.allSettled([mutation]);
+    let fanoutSettled = false; void mutationResult.then(() => { fanoutSettled = true; });
     let finishResult: Promise<PromiseSettledResult<unknown>[]> | undefined;
     try {
       await waitForLock(0);
       finishResult = Promise.allSettled([run(writer => writer.finishGalleryAppConnection(companyId, connectionId, { enabledCatalogEntryIds: [entry.id], askFirstCatalogEntryIds: [], reviewedCatalogEntryIds: [entry.id], access: "all_agents" }))]);
       await waitForLock(1);
+      expect(fanoutSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     for (const result of [...await mutationResult, ...await finishResult!]) if (result.status === "rejected") throw result.reason;
     const [updated] = await db.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.id, entry.id));
@@ -381,14 +392,18 @@ describeDatabase("tool definition runtime synchronization", () => {
     expect((await events()).slice(before).map(row => row.resourceId).sort()).toEqual([agentId, peerId].sort());
   });
 
-  it("orders scoped policy reorder before company agent fanout", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders scoped policy reorder before company agent fanout
+  it("orders scoped policy reorder before company agent fanout behind an in-flight writer's shared company hold", async () => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
     const [lower, higher] = [agentId, peerId].sort();
     const policies = await db.insert(toolPolicies).values([higher, lower].map((target, index) => ({ companyId, name: `Scoped ${index}`, policyType: "block" as const, priority: (index + 5) * 100, selectors: { agentId: target } }))).returning();
     let locked!: () => void; let release!: () => void;
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, lower)).for("no key update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, lower);
       locked(); await resume;
     });
     await held;
@@ -403,19 +418,26 @@ describeDatabase("tool definition runtime synchronization", () => {
       expect(pids.length).toBeGreaterThan(index);
       const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
       expect(row.wait_event_type).toBe("Lock");
+      if (index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
     }, { timeout: 5000 });
     const settings = Promise.allSettled([run(client => client.update(toolConnections).set({ name: "Settings race" }).where(eq(toolConnections.id, connectionId)))]);
+    let settingsSettled = false; void settings.then(() => { settingsSettled = true; });
     let reorder: Promise<PromiseSettledResult<unknown>[]> | undefined;
     try {
       await waitForLock(0);
       reorder = Promise.allSettled([run(client => toolAccessPolicyService(client).reorderPolicies(companyId, { policyIds: policies.map(row => row.id) }))]);
       await waitForLock(1);
+      expect(settingsSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     for (const result of [...await settings, ...await reorder!]) if (result.status === "rejected") throw result.reason;
     expect((await toolAccessPolicyService(db).listPolicies(companyId)).map(row => row.id)).toEqual(policies.map(row => row.id));
   }, 15000);
 
-  it("locks old profile references before replacement and application deletion", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): locks old profile references before replacement and application deletion
+  it("locks old profile references before replacement and application deletion behind an in-flight writer's shared company hold", async () => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
     const [application] = await db.insert(toolApplications).values({ companyId, name: "Old application", type: "mcp_http" }).returning();
     const [profile] = await db.insert(toolProfiles).values({ companyId, profileKey: "old-reference", name: "Old reference" }).returning();
     await db.insert(toolProfileBindings).values({ companyId, profileId: profile.id, targetType: "agent", targetId: agentId });
@@ -424,7 +446,7 @@ describeDatabase("tool definition runtime synchronization", () => {
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, [agentId, peerId].sort()[0])).for("no key update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, [agentId, peerId].sort()[0]);
       locked(); await resume;
     });
     await held;
@@ -439,13 +461,16 @@ describeDatabase("tool definition runtime synchronization", () => {
       expect(pids.length).toBeGreaterThan(index);
       const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
       expect(row.wait_event_type).toBe("Lock");
+      if (index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
     }, { timeout: 5000 });
     const replacement = Promise.allSettled([run(service => service.updateProfile(profile.id, { name: "Replacement", entries: [] }))]);
+    let replacementSettled = false; void replacement.then(() => { replacementSettled = true; });
     let deletion: Promise<PromiseSettledResult<unknown>[]> | undefined;
     try {
       await waitForLock(0);
       deletion = Promise.allSettled([run(service => service.deleteApplication(application.id))]);
       await waitForLock(1);
+      expect(replacementSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     for (const result of [...await replacement, ...await deletion!]) if (result.status === "rejected") throw result.reason;
     expect(await db.select().from(toolApplications).where(eq(toolApplications.id, application.id))).toHaveLength(0);
@@ -453,7 +478,11 @@ describeDatabase("tool definition runtime synchronization", () => {
     expect((await db.select().from(toolProfiles).where(eq(toolProfiles.id, profile.id)))[0].name).toBe("Replacement");
   }, 15000);
 
-  it("retries changed old references before taking profile runtime locks", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): retries changed old references before taking profile runtime locks
+  it("retries changed old references before taking profile runtime locks behind an in-flight writer's shared company hold", async () => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
     const [oldApp, newApp] = await db.insert(toolApplications).values(["Old retry app", "New retry app"].map(name => ({ companyId, name, type: "mcp_http" as const }))).returning();
     const [profile] = await db.insert(toolProfiles).values({ companyId, profileKey: "retry-references", name: "Retry references" }).returning();
     await db.insert(toolProfileBindings).values({ companyId, profileId: profile.id, targetType: "agent", targetId: agentId });
@@ -470,6 +499,7 @@ describeDatabase("tool definition runtime synchronization", () => {
     });
     await refsHeld;
     const replacement = Promise.allSettled([toolAccessService(single).updateProfile(profile.id, { name: "Retried replacement", entries: [] })]);
+    let replacementSettled = false; void replacement.then(() => { replacementSettled = true; });
     const waitForLock = (pid: number, query?: string) => vi.waitFor(async () => {
       const [row] = await db.execute(sql`SELECT wait_event_type, query FROM pg_stat_activity WHERE pid = ${pid}`);
       expect(row.wait_event_type).toBe("Lock");
@@ -486,12 +516,13 @@ describeDatabase("tool definition runtime synchronization", () => {
       const agentHeld = new Promise<void>(resolve => { agentLocked = resolve; });
       const agentResume = new Promise<void>(resolve => { releaseAgent = resolve; });
       agentBlocker = db.transaction(async tx => {
-        await tx.select().from(agents).where(eq(agents.id, [agentId, peerId].sort()[0])).for("no key update");
+        await holdAgentRowThenCompanyRuntimeShared(tx, companyId, [agentId, peerId].sort()[0]);
         agentLocked(); await agentResume;
       });
       await agentHeld;
       releaseRef(); await refBlocker;
       await waitForLock(Number(replacementPid.pid), 'update "tool_profiles"');
+      await expectWaitsOnCompanyRuntimeHold(db, Number(replacementPid.pid));
       deletion = Promise.allSettled([db.transaction(async tx => {
         await tx.execute(sql`SET LOCAL lock_timeout = '8s'`);
         const [row] = await tx.execute(sql`SELECT pg_backend_pid() AS pid`);
@@ -500,6 +531,7 @@ describeDatabase("tool definition runtime synchronization", () => {
       })]);
       await vi.waitFor(() => expect(deletionPid).toBeDefined(), { timeout: 5000 });
       await waitForLock(deletionPid!);
+      expect(replacementSettled).toBe(false); // still waiting when the writer commits
       releaseAgent!(); await agentBlocker;
       for (const result of [...await replacement, ...await deletion]) if (result.status === "rejected") throw result.reason;
       expect((await db.select().from(toolProfiles).where(eq(toolProfiles.id, profile.id)))[0]).toMatchObject({ name: "Retried replacement", description: "Concurrent description" });
