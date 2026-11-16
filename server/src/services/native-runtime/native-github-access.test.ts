@@ -399,6 +399,44 @@ it("routes retained warm broker requests to the active run's persisted log", asy
   expect(logB).toHaveBeenCalledWith("stderr", expect.stringContaining('"status":200'));
 });
 
+it("follows the active runner-ingress run and refuses a request on the old session", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "native-github-active-run-"));
+  const execute = vi.fn<CommandManagedRuntimeRunner["execute"]>(async input => ({
+    stdout: input.args?.[1]?.includes("printf") ? "\0/usr/bin:/bin\0" : `${Array.from({ length: 9 }, () => JSON.stringify({ uploaded: false })).join("\n")}\n`,
+    stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString(),
+  }));
+  let access: NativeGitHubAccess | undefined;
+  try {
+    access = await createNativeGitHubAccess({ scope, cwd: root, env: { PATH: process.env.PATH },
+      target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root,
+        runner: { execute }, streamRunLogs: false, effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
+      resolveCredentials: async binding => ({ status: "available", env: { GH_TOKEN: `fixture-${binding.runId}` } }),
+      transport: "runner_ingress",
+    });
+    const refreshed: string[] = [];
+    access.setRunnerIngressCapabilityRefresher(async capability => { refreshed.push(capability); });
+    const releaseA = await access.activate(run("active-run-a"));
+    const tokenA = access.getRunnerIngressCapability()!;
+    expect((await access.handleRunnerIngressHttpRequest({ kind: "github_access.http", requestId: "run-a-request", method: "POST",
+      path: "/runtime-tools/github/credentials", headers: { "x-paperclip-github-capability": tokenA }, bodyBase64: "e30=" },
+    run("active-run-a"))).status).toBe(200);
+    await releaseA();
+
+    const releaseB = await access.activate(run("active-run-b"));
+    const tokenB = access.getRunnerIngressCapability()!;
+    expect(tokenB).not.toBe(tokenA);
+    expect(refreshed).toEqual([tokenA, tokenB]);
+    const activeFrame = { kind: "github_access.http", requestId: "run-b-request", method: "POST",
+      path: "/runtime-tools/github/credentials", headers: { "x-paperclip-github-capability": tokenB }, bodyBase64: "e30=" };
+    expect((await access.handleRunnerIngressHttpRequest(activeFrame, run("active-run-a"))).status).toBe(403);
+    expect((await access.handleRunnerIngressHttpRequest(activeFrame, run("active-run-b"))).status).toBe(200);
+    await releaseB();
+  } finally {
+    await access?.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it("records callback-bridge request metadata without body, capability, or response secrets", async () => {
   const logs: string[] = [];
   const bodySecret = "bridge-body-sentinel";
