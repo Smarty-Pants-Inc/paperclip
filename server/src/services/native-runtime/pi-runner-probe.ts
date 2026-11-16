@@ -6,17 +6,50 @@ import { resolvePaperclipRunnerPiRpcThinkingLevel, type AdapterEnvironmentTestCo
 import { PI_RPC_BUILTIN_THINKING_CATALOG, NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "../../vendor/paperclip-runner/index.js";
 import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileError } from "./provider-profile.js";
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
+import { cachedFileSha256 } from "./off-loop-file-work.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
 
 /** Static launch files a setup probe never needs to copy out: the staged runner
- * binary and Node's compile cache. Their custody is a size + sha256 manifest. */
-const PROBE_STATIC_SYNC_EXCLUSIONS = ["bin/paperclip-runnerd", "pi/node-compile-cache"] as const;
-const PROBE_STATIC_MANIFEST_SCRIPT = 'set -eu; root=$1; shift; cd -- "$root"; for entry in "$@"; do '
-  + '[ -e "$entry" ] || continue; find "$entry" -type f ! -type l -exec sh -c \'for f; do '
-  + 'printf "%s %s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(sha256sum "$f" | cut -d " " -f1)" "$f"; done\' _ {} +; done';
+ * binary (only when its sha256 matches the shipped one) and Node's compile
+ * cache. Their custody is a size + sha256 manifest kept with the evidence. */
+const PROBE_RUNNER_BINARY_ENTRY = "bin/paperclip-runnerd";
+const PROBE_STATIC_SYNC_EXCLUSIONS = [PROBE_RUNNER_BINARY_ENTRY, "pi/node-compile-cache"] as const;
+// Lines '<size> <sha256> <path>' then 'count <n>'; any failing step exits non-zero.
+const PROBE_STATIC_MANIFEST_SCRIPT = 'set -eu; root=$1; shift; cd -- "$root"; '
+  + '{ for entry in "$@"; do if [ -e "$entry" ]; then find "$entry" -type f; fi; done; } | '
+  + '{ n=0; while IFS= read -r f; do size=$(wc -c < "$f"); sha=$(sha256sum "$f"); '
+  + 'printf "%s %s %s\\n" "$(echo $size)" "${sha%% *}" "$f"; n=$((n+1)); done; printf "count %s\\n" "$n"; }';
+
+export type ProbeStaticManifest = { files: { size: number; sha256: string; path: string }[] };
+
+/** Fail closed on any short, empty-sha or foreign line (no sync, no rm). */
+export function parseProbeStaticManifest(stdout: string, entries: readonly string[]): ProbeStaticManifest {
+  const lines = stdout.split("\n").filter(line => line.length > 0);
+  const last = /^count (\d+)$/.exec(lines.pop() ?? "");
+  const files = lines.map(line => {
+    const match = /^(\d+) ([0-9a-f]{64}) (.+)$/.exec(line);
+    if (!match || !entries.some(entry => match[3] === entry || match[3].startsWith(`${entry}/`)) || match[3].split("/").includes(".."))
+      throw new Error("native_probe_static_manifest_invalid");
+    return { size: Number(match[1]), sha256: match[2], path: match[3] };
+  });
+  if (!last || Number(last[1]) !== files.length) throw new Error("native_probe_static_manifest_invalid");
+  return { files };
+}
+
+/** The binary is excluded only on a digest match; otherwise it is evidence. */
+export function probeStaticExclusions(manifest: ProbeStaticManifest, expectedRunnerSha256: string | null) {
+  const found = manifest.files.find(file => file.path === PROBE_RUNNER_BINARY_ENTRY)?.sha256 ?? null;
+  const match = expectedRunnerSha256 !== null && found === expectedRunnerSha256;
+  const excludeEntries = PROBE_STATIC_SYNC_EXCLUSIONS.filter(entry => match || entry !== PROBE_RUNNER_BINARY_ENTRY);
+  const record = [...manifest.files.map(file => `${file.size} ${file.sha256} ${file.path}`),
+    `count ${manifest.files.length}`,
+    `runnerd expected ${expectedRunnerSha256 ?? "unknown"} / found ${found ?? "absent"} / match ${match ? "yes" : "no"}`,
+    `excluded ${excludeEntries.join(" ")}`, ""].join("\n");
+  return { excludeEntries, record };
+}
 
 const SAFE_FAILURES: Record<string, string> = {
   pi_prompt_rejected: "Pi handled or rejected hello without starting a model turn.",
@@ -87,14 +120,16 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           // never authorize removal of the sole copy. The staged runner binary
           // and Node's compile cache are static, not records: record their
           // path, size and sha256 instead of copying ~33 MB per launch.
-          const excludeEntries = PROBE_STATIC_SYNC_EXCLUSIONS;
           const listed = await runner!.execute({ command: "sh", args: ["-c", PROBE_STATIC_MANIFEST_SCRIPT,
-            "paperclip-probe-static-manifest", remoteRoot, ...excludeEntries], bypassSession: true, timeoutMs: 60_000 });
+            "paperclip-probe-static-manifest", remoteRoot, ...PROBE_STATIC_SYNC_EXCLUSIONS], bypassSession: true, timeoutMs: 60_000 });
           requireSuccess(listed);
+          const expectedRunnerSha256 = await cachedFileSha256(runnerBinary).catch(() => null);
+          const { excludeEntries, record } = probeStaticExclusions(
+            parseProbeStaticManifest(listed.stdout ?? "", PROBE_STATIC_SYNC_EXCLUSIONS), expectedRunnerSha256);
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
             targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700, excludeEntries });
           await mkdir(join(runtimeDirectory, "remote-runtime"), { recursive: true, mode: 0o700 });
-          await writeFile(join(runtimeDirectory, "remote-runtime", ".excluded-static-files.txt"), listed.stdout, { mode: 0o600 });
+          await writeFile(join(runtimeDirectory, "remote-runtime", ".excluded-static-files.txt"), record, { mode: 0o600 });
           // Commit the pulled bytes to permanent evidence BEFORE remote rm.
           await cleanupNativeSetupRuntime(runtimeDirectory, true);
           // The remote root can hold a full Pi session history; removal shares the 60 s probe retirement budget.
