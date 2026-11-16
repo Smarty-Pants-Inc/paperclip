@@ -12,7 +12,7 @@ import type { ToolConnection, ToolConnectionInstall, ToolConnectionInstallSnapsh
 import { forbidden, notFound, unprocessable } from "../../../errors.js";
 import { lockProjectConnectionRows } from "../../project-connection-arbitration.js";
 import { assertProjectConnectionAdmission } from "../../project-connection-admission.js";
-import { assertProjectConnectionNotInUse } from "../../project-connection-retirement.js";
+import { assertProjectConnectionNotInUse, completeProjectConnectionPredecessor } from "../../project-connection-retirement.js";
 import { logActivity } from "../../activity-log.js";
 import { assertNotProjectOwnedToolConnection, notProjectOwnedToolConnectionSql } from "../../project-owned-connection-guard.js";
 
@@ -354,6 +354,10 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
                 profileId: profile.id,
               });
           }
+        }
+        if (currentConnection.projectId === null && currentConnection.config.projectAppApprovalConsumedBy !== undefined) {
+          await completeProjectConnectionPredecessor(tx, { companyId: currentConnection.companyId,
+            connectionId: currentConnection.id, actor });
         }
         if (markMcpAccessConfigured || removeIds.length > 0 || additions.length > 0) {
           const binding = actorBinding(actor);
