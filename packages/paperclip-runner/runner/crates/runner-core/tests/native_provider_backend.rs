@@ -2799,6 +2799,199 @@ fn opencode_state_without_a_release_binding_stays_exact() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+// B3 (#20736/#20787): an unclosed Pi chat's state is loaded by a runner whose
+// controller bytes (Node command or proxy bundle) changed across a server
+// restart or deploy. The same rule as OpenCode (#19641) and ACPX (#21220):
+// a settled conversation on an unchanged Pi release re-binds; a changed Pi
+// release or work in flight fails closed. Pi's resident facade is qualified
+// with the OpenCode fixture (see pi_rpc_selects_the_resident_native_facade...).
+fn pi_rpc_config(directory: &Path) -> DurableRunnerConfig {
+    let mut config = opencode_config(directory);
+    config.pi_launch_profile = config.opencode_launch_profile.take();
+    config
+}
+
+/// Replace the qualified Pi proxy with valid new bytes, as a controller
+/// rebuild or deploy does; the Pi executable is unchanged.
+fn rebuild_pi_proxy(directory: &Path, config: &DurableRunnerConfig) -> DurableRunnerConfig {
+    let proxy = directory.join("qualified-opencode-proxy-script");
+    let mut rebuilt = fs::read(&proxy).unwrap();
+    rebuilt.extend_from_slice(b"\n# rebuilt controller proxy\n");
+    #[cfg(unix)]
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&proxy, &rebuilt).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&proxy, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut next = config.clone();
+    next.pi_launch_profile.as_mut().unwrap().proxy_script = qualified_artifact(proxy);
+    next
+}
+
+/// A Pi chat whose turn settled and whose runner was never suspended (a hard
+/// stop before its close reached it).
+fn leave_unclosed_settled_pi_session(directory: &Path, config: &DurableRunnerConfig) {
+    let mut first = NativeProviderCommandExecutor::with_runner_config(directory, config);
+    first
+        .execute(&command(1, "run.prepare", pi_rpc_prepare_payload(directory)))
+        .unwrap();
+    first
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    acknowledge_delivered_events(&mut first);
+    drop(first);
+}
+
+#[test]
+#[cfg(unix)]
+fn settled_pi_session_continues_after_a_controller_proxy_rebuild() {
+    let directory = temporary_directory("pi-settled-proxy-rebuild");
+    let config = pi_rpc_config(&directory);
+    leave_unclosed_settled_pi_session(&directory, &config);
+    let state_path = directory.join("codex-provider-state.json");
+    let saved_binding = |field: &str| -> Value {
+        serde_json::from_slice::<Value>(&fs::read(&state_path).unwrap()).unwrap()[field].clone()
+    };
+    let admitted_digest = saved_binding("piLaunchProfileDigest");
+    let admitted_thread = saved_binding("threadId");
+    assert!(admitted_digest.is_string() && admitted_thread.is_string());
+
+    let rebuilt = rebuild_pi_proxy(&directory, &config);
+    let starts_before = opencode_call_count(&directory, "thread/start");
+    let resumes_before = opencode_call_count(&directory, "thread/resume");
+    let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &rebuilt);
+    recovered
+        .execute(&command(3, "runner.drain", json!({})))
+        .expect("a settled Pi session re-binds to the rebuilt controller proxy");
+    assert_eq!(
+        opencode_call_count(&directory, "thread/resume"),
+        resumes_before + 1,
+        "recovery restores the same Pi conversation",
+    );
+    assert_eq!(
+        opencode_call_count(&directory, "thread/start"),
+        starts_before,
+        "no fresh Pi thread is started",
+    );
+    recovered
+        .execute(&command(4, "turn.start", json!({"text": "Continue the task."})))
+        .unwrap();
+    let observed = poll_opencode_until(&mut recovered, "turn.completed");
+    assert!(observed.iter().any(|event| event.event_type == "turn.completed"));
+    recovered.shutdown().unwrap();
+    drop(recovered);
+
+    // Same thread; the re-bound digest is durable; the release binding holds.
+    assert_eq!(saved_binding("threadId"), admitted_thread);
+    let rebound_digest = saved_binding("piLaunchProfileDigest");
+    assert!(rebound_digest.is_string());
+    assert_ne!(rebound_digest, admitted_digest);
+    assert!(saved_binding("piReleaseDigest").is_string());
+    let mut again = NativeProviderCommandExecutor::with_runner_config(&directory, &rebuilt);
+    again
+        .execute(&command(5, "session.snapshot", json!({})))
+        .unwrap();
+    again.shutdown().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_release_change_still_refuses_a_settled_session() {
+    let directory = temporary_directory("pi-settled-release-change");
+    let config = pi_rpc_config(&directory);
+    leave_unclosed_settled_pi_session(&directory, &config);
+    let state_path = directory.join("codex-provider-state.json");
+    let saved_state = fs::read(&state_path).unwrap();
+
+    let executable = directory.join("qualified-opencode-executable");
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(&executable, "next Pi release\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o500)).unwrap();
+    let mut released = rebuild_pi_proxy(&directory, &config);
+    released.pi_launch_profile.as_mut().unwrap().executable = qualified_artifact(executable);
+    let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &released);
+    let error = recovered
+        .execute(&command(3, "runner.drain", json!({})))
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Pi runner launch profile changed across durable recovery"));
+    assert_eq!(error.classification(), Some(PROVIDER_STATE_INCOMPATIBLE));
+    assert_eq!(fs::read(&state_path).unwrap(), saved_state);
+    drop(recovered);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_proxy_rebuild_refuses_an_active_turn() {
+    let directory = temporary_directory("pi-active-proxy-rebuild");
+    let mut config = pi_rpc_config(&directory);
+    let proxy_script = directory.join("qualified-opencode-proxy-script");
+    fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        &proxy_script,
+        format!(
+            "#!/bin/sh\nexec '{}' --state-file '{}' --call-log '{}' --require-completion-contract --durable-turn-ids --linger-after-turn-start\n",
+            env!("CARGO_BIN_EXE_fake-codex-app-server"),
+            directory.join("fake-opencode-state.json").display(),
+            directory.join("fake-opencode-calls.log").display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&proxy_script, fs::Permissions::from_mode(0o500)).unwrap();
+    config.pi_launch_profile.as_mut().unwrap().proxy_script = qualified_artifact(proxy_script);
+    let mut first = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+    first
+        .execute(&command(1, "run.prepare", pi_rpc_prepare_payload(&directory)))
+        .unwrap();
+    first
+        .execute(&command(2, "session.open", json!({})))
+        .unwrap();
+    first
+        .execute(&command(3, "turn.start", json!({"text": "Edit the file."})))
+        .unwrap();
+    drop(first);
+    let state_path = directory.join("codex-provider-state.json");
+    let saved_state = fs::read(&state_path).unwrap();
+    let saved: Value = serde_json::from_slice(&saved_state).unwrap();
+    assert!(saved["activeProviderTurnId"].is_string(), "the turn is in flight");
+
+    let rebuilt = rebuild_pi_proxy(&directory, &config);
+    let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &rebuilt);
+    let error = recovered
+        .execute(&command(4, "runner.drain", json!({})))
+        .unwrap_err();
+    assert_eq!(error.classification(), Some(PROVIDER_STATE_INCOMPATIBLE));
+    assert_eq!(fs::read(&state_path).unwrap(), saved_state);
+    drop(recovered);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_state_without_a_release_binding_stays_exact() {
+    // State written before the release binding cannot prove which artifact
+    // changed, so a changed profile keeps failing closed (and the runtime's
+    // same-run replacement policy decides).
+    let directory = temporary_directory("pi-legacy-proxy-rebuild");
+    let config = pi_rpc_config(&directory);
+    leave_unclosed_settled_pi_session(&directory, &config);
+    let state_path = directory.join("codex-provider-state.json");
+    let mut legacy: Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("piReleaseDigest");
+    fs::write(&state_path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+    let rebuilt = rebuild_pi_proxy(&directory, &config);
+    let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &rebuilt);
+    let error = recovered
+        .execute(&command(3, "runner.drain", json!({})))
+        .unwrap_err();
+    assert_eq!(error.classification(), Some(PROVIDER_STATE_INCOMPATIBLE));
+    drop(recovered);
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
 fn resumes_opencode_after_cold_state_and_artifact_restore_into_a_new_allocation() {
