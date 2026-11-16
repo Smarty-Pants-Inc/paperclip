@@ -973,9 +973,6 @@ function assertSelectableProviderConfig(config: {
   }
 }
 
-/** Waits between secret-removal row-lock attempts (about 0.6 s in total). */
-const SECRET_REMOVAL_LOCK_RETRY_DELAYS_MS = [20, 40, 80, 160, 320] as const;
-
 export type RemoveSecretOptions = {
   /** Runs after the secret is marked deleted and before its row is removed. */
   beforeDelete?: (secret: typeof companySecrets.$inferSelect) => Promise<void>;
@@ -3531,12 +3528,6 @@ export function secretService(db: Db | DbTransaction) {
         }
       }
     }
-    // The deferred secret-resolution writer (batched audit INSERTs, whose FK
-    // check takes KEY SHARE on this row, and lastResolvedAt UPDATEs) can hold
-    // a short lock right after a run used the secret. Back off between the
-    // bounded NOWAIT attempts instead of retrying immediately, so a removal
-    // right after use does not fail spuriously. A lock that outlives the bound
-    // still gets the same named, retryable conflict.
     for (let attempt = 0; ; attempt++) {
       try {
         await db.transaction(async tx => {
@@ -3552,9 +3543,7 @@ export function secretService(db: Db | DbTransaction) {
       } catch (error) {
         const failure = error as { code?: string; cause?: { code?: string } };
         if ((failure?.cause?.code ?? failure?.code) !== "55P03") throw error;
-        const delayMs = SECRET_REMOVAL_LOCK_RETRY_DELAYS_MS[attempt];
-        if (delayMs === undefined) throw conflict("Secret changed during removal. Retry removal.", { retryable: true });
-        await new Promise(resolve => setTimeout(resolve, delayMs));
+        if (attempt >= 2) throw conflict("Secret changed during removal. Retry removal.", { retryable: true });
       }
     }
     return secret;
