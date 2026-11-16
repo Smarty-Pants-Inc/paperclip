@@ -10,6 +10,7 @@ export const agentIdentityKeys = pgTable("agent_identity_keys", {
   publicKeyPem: text("public_key_pem").notNull(),
   privateKeyMaterial: jsonb("private_key_material").$type<Record<string, unknown>>().notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
 }, (table) => ({
   owner: foreignKey({
     name: "agent_identity_keys_owner_fk",

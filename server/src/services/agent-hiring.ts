@@ -84,7 +84,7 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   const companyId = created.companyId;
   assertEphemeralAgentInstructions({ ...created, name: "" });
   await initializeDurableAgentFiles(txDb, created);
-  await agentIdentityService(txDb).ensureAgentIdentity(companyId, created.id);
+  if (created.status !== "terminated") await agentIdentityService(txDb).ensureAgentIdentity(companyId, created.id);
   // New standard agents receive the standard direct grants at activation.
   // Low-trust and bundled agents keep their explicit, narrower grants.
   if (!options?.setupOnly && created.status !== "pending_approval" && !permissionsImplyLowTrust(created.permissions) &&
