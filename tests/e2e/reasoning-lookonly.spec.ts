@@ -283,3 +283,94 @@ test("look-only reasoning: a paperclip_runner/pi_rpc run's reasoning is inline a
     await closeRegisteredClients(url);
   }
 });
+
+for (const viewport of VIEWPORTS) {
+  test(`agent reasoning setting: Folded, Inline and clear to harness default at ${viewport.name}`, async ({ browser, request }) => {
+    test.setTimeout(180_000);
+    const url = await databaseUrl();
+    const db = createDb(url);
+    const { company, agent } = await seedAgent(request, db);
+    const context = await browser.newContext({ viewport });
+    try {
+      const page = await context.newPage();
+      const agentPath = `/${company.issuePrefix}/agents/${agent.id}/runtime`;
+      const setting = page.getByTestId("agent-display-settings");
+      const agentBefore = await json(await request.get(`/api/agents/${agent.id}`));
+      const revisionsBefore = await json(await request.get(`/api/agents/${agent.id}/config-revisions`));
+      const capture = async (name: string) => {
+        if (!SHOTS) return;
+        await mkdir(SHOTS, { recursive: true });
+        await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: false });
+      };
+      const choose = async (label: string, display: "fold" | "inline" | null) => {
+        if (!new URL(page.url()).pathname.endsWith("/runtime")) await page.goto(agentPath);
+        await expect(setting).toBeVisible({ timeout: 30_000 });
+        const saved = page.waitForResponse((response) => response.request().method() === "PUT"
+          && new URL(response.url()).pathname === `/api/companies/${company.id}/workspace-preferences/me`);
+        await setting.getByRole("radio", { name: label, exact: true }).click();
+        expect((await saved).ok()).toBe(true);
+        await expect(setting.getByRole("radio", { name: label, exact: true })).toHaveAttribute("aria-checked", "true");
+        await expect(setting.getByRole("radio", { name: label, exact: true })).toBeEnabled();
+        const mine = await json(await request.get("/api/workspace-preferences/me"));
+        expect(mine.agentReasoningDisplay?.[agent.id]).toBe(display ?? undefined);
+      };
+      await page.goto(agentPath);
+      await expect(setting.getByRole("radio", { name: "Default for this harness (Inline)", exact: true }))
+        .toHaveAttribute("aria-checked", "true", { timeout: 30_000 });
+      await choose("Folded", "fold");
+      await setting.evaluate((node) => node.scrollIntoView({ block: "center" }));
+      await expect(setting).toBeInViewport();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+      await capture(`setting-agent-page-${viewport.name}`);
+
+      // Open the actual native chat before its run arrives: the preference
+      // must affect the same renderer as daily paperclip_runner/pi_rpc work.
+      const issue = await seedTask(request, db, company.id, agent.id, `setting-${viewport.name}`);
+      const chatPath = `/${company.issuePrefix}/issues/${issue.identifier}`;
+      await page.goto(chatPath);
+      await expect(page.getByText("Reasoning should read inline without a click.").first()).toBeVisible({ timeout: 30_000 });
+      await seedNativeRun(db, company.id, agent.id, issue.id);
+      await expect(page.getByText(REPLY, { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+      await expect(page.locator('[data-reasoning-display="inline"]')).toHaveCount(0);
+      await expect(page.getByText("Reading the runner defaults", { exact: false })).toHaveCount(0);
+      const activityFold = page.getByRole("button", { name: /^Expand ran commands/ });
+      await expect(activityFold).toBeVisible();
+      await activityFold.scrollIntoViewIfNeeded();
+      await capture(`setting-folded-chat-${viewport.name}`);
+      // Folded means available behind a disclosure, not dropped from the transcript.
+      await activityFold.click();
+      await expect(page.getByText("Reading the runner defaults", { exact: false }).first()).toBeVisible();
+      await page.getByRole("button", { name: /^Collapse ran commands/ }).click();
+
+      // Change the choice on the agent page, then reopen the SAME run's chat.
+      // Saved older runs use the existing More run output history control;
+      // this is separate from the reasoning fold preference.
+      const openSavedChat = async (target: Page) => {
+        await target.goto(chatPath);
+        await expect(target.getByText(REPLY, { exact: false }).first()).toBeVisible({ timeout: 30_000 });
+        const history = target.getByRole("button", { name: "More run output", exact: true });
+        if (await history.isVisible()) await history.click();
+        await expect(target.locator('[data-reasoning-display="inline"]')).toHaveCount(2, { timeout: 30_000 });
+        await expect(target.locator(".tc-turn-fold")).toHaveCount(0);
+      };
+      await choose("Inline", "inline");
+      await openSavedChat(page);
+      await page.locator('[data-reasoning-display="inline"]').last().scrollIntoViewIfNeeded();
+      await capture(`setting-inline-chat-${viewport.name}`);
+
+      await choose("Default for this harness (Inline)", null);
+      // A new browser has no cached preference, and still gets the harness default.
+      const fresh = await browser.newContext({ viewport });
+      try { await openSavedChat(await fresh.newPage()); } finally { await fresh.close(); }
+      const agentAfter = await json(await request.get(`/api/agents/${agent.id}`));
+      expect(agentAfter.updatedAt).toBe(agentBefore.updatedAt);
+      expect(agentAfter.adapterConfig).toEqual(agentBefore.adapterConfig);
+      expect(agentAfter.runtimeConfig).toEqual(agentBefore.runtimeConfig);
+      expect(await json(await request.get(`/api/agents/${agent.id}/config-revisions`))).toEqual(revisionsBefore);
+    } finally {
+      await context.close();
+      await request.patch(`/api/companies/${company.id}`, { data: { status: "archived" } }).catch(() => undefined);
+      await closeRegisteredClients(url);
+    }
+  });
+}
