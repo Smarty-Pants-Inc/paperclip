@@ -351,6 +351,9 @@ describe("idle warm ingress owner (#20825)", () => {
     const state: { lastLeaseExpiresAt: string | null; commands: Array<{ status: string }> } = {
       lastLeaseExpiresAt: new Date(expiry).toISOString(), commands: [{ status: "completed" }] };
     const registration = await open({ core: core(state) });
+    // #20825 fix-up (F1): idleness comes from the owner (the transport binds its own predicate).
+    let ownerIdle = true;
+    (registration as { bindOwnerIdle?: (isIdle: () => boolean) => void }).bindOwnerIdle?.(() => ownerIdle);
     registration.activate!(); await registration.ready!();
     const options = transport.connect.mock.calls[0]![0] as { idleWarm?: { isIdle(): boolean; leaseExpiresAtUnixMs(): number | null } };
     expect(options.idleWarm).toBeDefined();
@@ -358,10 +361,48 @@ describe("idle warm ingress owner (#20825)", () => {
     expect(options.idleWarm!.isIdle()).toBe(true);
     state.commands.push({ status: "pending" });
     expect(options.idleWarm!.isIdle()).toBe(false);
+    // F1: runnerd completes turn.start when it accepts the turn; the CP list
+    // then shows nothing pending, but the owner is busy with that turn.
+    state.commands.pop();
+    ownerIdle = false;
+    expect(options.idleWarm!.isIdle()).toBe(false);
     state.lastLeaseExpiresAt = null;
     expect(options.idleWarm!.leaseExpiresAtUnixMs()).toBeNull();
     await registration.release();
   });
+
+  it("F1: an owner that never bound its idleness is never idle, whatever the CP command list says", async () => {
+    const registration = await open({ core: core({ lastLeaseExpiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      commands: [{ status: "completed" }] }) });
+    registration.activate!(); await registration.ready!();
+    const options = transport.connect.mock.calls[0]![0] as { idleWarm?: { isIdle(): boolean } };
+    expect(options.idleWarm!.isIdle()).toBe(false);
+    await registration.release();
+  });
+
+  it.each(["runner_ingress_unavailable", "runner_ingress_auth_failed"] as const)(
+    "F2: an authenticated route's exhausted recovery (%s) rejects the registration with a named mid-turn code", async ingressCode => {
+      let rejectFailure!: (error: Error) => void;
+      const failure = new Promise<never>((_resolve, reject) => { rejectFailure = reject; });
+      void failure.catch(() => undefined);
+      transport.connect.mockReturnValue({ ready: Promise.resolve(), failure, quiesce: vi.fn(), close: vi.fn(async () => {}) });
+      const onIngressUnreachable = vi.fn();
+      const registration = await open({ core: core({ lastLeaseExpiresAt: null, commands: [] }), onIngressUnreachable });
+      registration.activate!();
+      const seen = vi.fn();
+      void registration.failure!.catch(seen);
+      await registration.ready!();
+      rejectFailure(Object.assign(new Error(`${ingressCode}: Runner ingress connection failed.`), { code: ingressCode,
+        causeSummary: { failure: "ECONNREFUSED" } }));
+      await new Promise(resolve => setImmediate(resolve));
+      expect(seen).toHaveBeenCalledOnce();
+      const named = seen.mock.calls[0]![0] as Error & { code?: unknown; ingressCode?: unknown; cause?: unknown };
+      expect(named).toMatchObject({ code: "native_runner_ingress_recovery_exhausted", ingressCode });
+      expect(named.message).toMatch(new RegExp(`^native_runner_ingress_recovery_exhausted: .*ingress=${ingressCode} failure=ECONNREFUSED`));
+      expect(named.cause).toMatchObject({ code: ingressCode });
+      expect(onIngressUnreachable).not.toHaveBeenCalled();
+      await registration.release();
+    });
 
   it("exposes a failure promise right after activate() and reports an unreachable idle owner once", async () => {
     let rejectFailure!: (error: Error) => void;

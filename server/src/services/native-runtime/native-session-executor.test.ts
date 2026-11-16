@@ -16067,6 +16067,51 @@ describe("native session bounded recovery", () => {
     expect(state.execute).toHaveBeenCalledOnce();
     } finally { service.mockRestore(); }
   });
+  // #20825 fix-up (F2): a runner ingress failure after authentication names
+  // itself on the run, whether it reaches the run raw (a request in flight) or
+  // wrapped by the codex notification stream; it is neither "startup" nor a
+  // provider verdict.
+  describe("a post-authentication runner ingress failure names itself on the run (#20825 F2)", () => {
+    const unreachable = "native_runner_ingress_unreachable: The idle warm runner could not be reached before its connection lease neared expiry.";
+    const exhausted = "native_runner_ingress_recovery_exhausted: the runner stayed unreachable for the whole recovery budget (ingress=runner_ingress_unavailable failure=ECONNREFUSED)";
+    const failures = [
+      ["an idle retire, raw", "native_runner_ingress_unreachable",
+        () => Object.assign(new Error(unreachable), { code: "native_runner_ingress_unreachable" })],
+      ["an idle retire, through codex notifications", "native_runner_ingress_unreachable",
+        () => new NativeProviderTerminalFailure("notification_transport_failed", false, `Notification transport failed closed: ${unreachable}`)],
+      ["a busy 7-min exhaustion, raw", "native_runner_ingress_recovery_exhausted",
+        () => Object.assign(new Error(exhausted), { code: "native_runner_ingress_recovery_exhausted", ingressCode: "runner_ingress_unavailable" })],
+      ["a busy 7-min exhaustion, through codex notifications", "native_runner_ingress_recovery_exhausted",
+        () => new NativeProviderTerminalFailure("notification_transport_failed", false, `Notification transport failed closed: ${exhausted}`)],
+      ["a busy 7-min exhaustion, as a wrapped cause", "native_runner_ingress_recovery_exhausted",
+        () => Object.assign(new Error("native session failed"), { cause: Object.assign(new Error(exhausted), { code: "native_runner_ingress_recovery_exhausted" }) })],
+    ] as const;
+
+    it.each(failures)("classifies %s as %s and keeps it a retryable resume", (_label, code, make) => {
+      expect(nativeSessionFailureSourceCode(make())).toBe(code);
+      expect(nativeSessionFailureDisposition(1, new Date(), nativeSessionFailureSourceCode(make())).phase).toBe("retryable_failure");
+    });
+
+    it("still classifies a pre-authentication ingress failure as startup", () => {
+      expect(nativeSessionFailureSourceCode(new Error("runner_ingress_unavailable: Runner ingress connection failed.")))
+        .toBe("runner_ingress_startup_failed");
+    });
+
+    it.each(failures)("writes %s on the run as errorCode %s", async (_label, code, make) => {
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      const failure = make();
+      state.execute.mockReset().mockRejectedValueOnce(failure);
+      state.upsertRecoveryAction.mockReset().mockResolvedValue({});
+      const service = vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => null) } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+      try {
+        await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution, runnerInstanceId: "runner" })).rejects.toBe(failure);
+        expect(updates.find(update => update.table === heartbeatRuns && update.values.error)?.values).toMatchObject({ errorCode: code });
+        expect(updates.find(update => update.table === nativeRunFinalizations && update.values.failureDetail)?.values.failureDetail)
+          .toMatchObject({ originalFailureCode: code });
+      } finally { service.mockRestore(); }
+    });
+  });
+
   it("blocks a denied Cursor task and gives recovery to the operator without another provider attempt", async () => {
     const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
     const failure = new NativePermissionDeclinedError();
