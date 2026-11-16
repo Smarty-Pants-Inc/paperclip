@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { redactSecretShapes } from "./secret-shapes.js";
+import { leakedPemWindows, secretShapePemVectors } from "./secret-shapes-pem.test-fixture.js";
 import { shapeAssignments, shapeNegatives, shapePems, shapeTokens } from "./drivers/pi/pi-shape-redaction.test-fixture.js";
 
 // Keep reason: data-safety trust boundary; these check exact kinds and the pure
@@ -22,6 +23,25 @@ describe("redactSecretShapes", () => {
       for (const text of [`${key}=${value}`, `${key}='${value}'`, `"${key}": "${value}"`]) expect(redactSecretShapes(text)).toBe(text);
     }
   });
+  it.for(secretShapePemVectors().filter(vector => vector.supported))(
+    "hides $keyType $name after an identity redactor erases PEM framing", ({ text, body }) => {
+      // efe82e8f masks markers and >=40-character context runs. It can leave
+      // short rewrapped/escaped runs untouched, even with no configured key.
+      const identityProjected = text.replace(/-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/g, "***REDACTED***")
+        .replace(/[A-Za-z0-9+/=]{40,}/g, "***REDACTED***");
+      for (const input of [text, identityProjected]) {
+        const output = redactSecretShapes(input);
+        expect(leakedPemWindows(output, body)).toBe(0);
+        expect(output).not.toMatch(/-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/);
+        expect(redactSecretShapes(output)).toBe(output);
+      }
+    },
+  );
+  it.for(["***REDACTED***", "***REDACTED*** safe prose.", "safe prose. ***REDACTED***"])(
+    "preserves identity marks without an adjacent PEM-sized body run: %s", text => {
+      expect(redactSecretShapes(text)).toBe(text);
+    },
+  );
   it("preserves a large non-PEM base64-looking dump, including after an orphan END", () => {
     const dump = `${"A".repeat(76)}\n`.repeat(10_000);
     expect(redactSecretShapes(dump)).toBe(dump);

@@ -5,6 +5,7 @@ import { readTaskPanelActivations } from "../plugin-task-panels.js";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { assistant, createPiObservabilityTest, terminal, tool } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-observability.test-fixture.js";
 import { fakePemBody, shapeAssignments, shapePems, shapeTokens } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-shape-redaction.test-fixture.js";
+import { leakedPemWindows, secretShapePemVectors } from "../../../../packages/paperclip-runner/src/secret-shapes-pem.test-fixture.js";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -1078,6 +1079,57 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect(deltas.map(delta => delta.text).join("")).toBe("***REDACTED***");
       expect(deltas.map(delta => (delta.update as { delta: string }).delta).join("")).toBe("***REDACTED***");
     }
+  });
+
+  it.each([false, true])("SHAPE B2: persists unknown PEM after identity redaction (configured=%s)", async configured => {
+    const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+    const runnerId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+      runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha });
+    const binding = { ...identity, completionContractId: contractId, completionContractSha256: contractSha,
+      sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `pem-${identity.runId}` };
+    // A different configured identity must not make these unknown keys safe.
+    const privateKeyPem = configured ? generateKeyPairSync("ed25519").privateKey.export({ type: "pkcs8", format: "pem" }).toString() : undefined;
+    const port = new PaperclipControlPlanePort(db, binding, { privateKeyPem });
+    await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+    const vectors = secretShapePemVectors().filter(vector => vector.supported);
+    const events: PrpEvent[] = vectors.map((vector, index) => ({
+      schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:${index + 1}`,
+      sourceInstanceId: runnerId, sourceKind: "runner", sourceSeq: index + 1, runId: identity.runId,
+      normalizedSessionId: identity.sessionId, turnId: "pem-turn", itemId: `pem-${index}`,
+      // Complete tool receipts exercise composition, not the separately scoped
+      // N1 problem of secrets/markers split across streaming deltas.
+      eventType: "item.completed", priority: 1, emittedAt: new Date().toISOString(),
+      payload: { kind: "commandExecution", text: vector.text, update: { delta: vector.text } },
+    }));
+    for (const event of events) {
+      expect((await port.appendEvent(event)).disposition).toBe("committed");
+      expect((await port.appendEvent(event)).disposition).toBe("duplicate");
+    }
+    const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.sourceSeq));
+    expect(rows).toHaveLength(events.length);
+    for (const [index, row] of rows.entries()) {
+      const event = row.payload!.prpEvent as unknown as PrpEvent;
+      const vector = vectors[index]!;
+      for (const text of [event.payload.text, (event.payload.update as { delta: string }).delta]) {
+        expect(leakedPemWindows(String(text), vector.body), `${vector.keyType} ${vector.name}`).toBe(0);
+        expect(String(text)).not.toMatch(/-----(?:BEGIN|END) [A-Z0-9 ]*PRIVATE KEY-----/);
+      }
+      expect(row.sourcePayloadSha256).toBe(nativeSha256(event));
+      expect(row.sourceSeq).toBe(index + 1);
+      expect(event.itemId).toBe(events[index]!.itemId);
+      expect(events[index]!.payload.text).toBe(vector.text);
+    }
+    // Recreate the port as a process restart would: canonical hash and replay
+    // are unchanged by a second application of either redaction pass.
+    const restarted = new PaperclipControlPlanePort(db, binding, { privateKeyPem });
+    for (const event of events) expect((await restarted.appendEvent(event)).disposition).toBe("duplicate");
+    const conflicting = { ...events[0]!, payload: { text: "different output" } };
+    await expect(restarted.appendEvent(conflicting)).rejects.toThrow(configured
+      ? "native_event_source_payload_conflict" : "native_event_replay_conflict");
+    const freshConflict = new PaperclipControlPlanePort(db, binding, { privateKeyPem });
+    await expect(freshConflict.appendEvent(conflicting)).rejects.toThrow("native_event_replay_conflict");
   });
 
   it("SHAPE: unknown Pi tokens and transformed PEM stay out of persisted events for that run", async () => {
