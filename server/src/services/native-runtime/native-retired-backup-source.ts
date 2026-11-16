@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import { and, eq, gt, inArray, ne, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY } from "../../agent-run-cancellation.js";
+import { writeEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { sandboxLeaseSourceMatches } from "../sandbox-lease-config-compatibility.js";
@@ -148,6 +149,42 @@ function destroyedSource(lease: SourceLease): boolean {
   const termination = lease.metadata?.remoteExecutionTermination as { state?: unknown } | undefined;
   return ["expired", "failed"].includes(lease.status) && hasRemoteTerminationReceipt(lease)
     && termination?.state === "destroyed";
+}
+
+/**
+ * Records a verified backup stamp for the allocation that `leaseId` runs on. A
+ * warm owner's backend names the lease row it was admitted on, but a later turn
+ * may have resumed the same allocation as a new row (a verified handoff), and
+ * single-row readers (resume replacement, the next handoff's carry-forward)
+ * read the current tip. So the stamp goes to the verified chain's tip when
+ * `leaseId` is one of its retired predecessors, and to `leaseId` itself
+ * otherwise (unchanged). Only the tip is written: predecessors are retired and
+ * already read through the chain. The tip write is a compare-and-swap on "still
+ * the tip": a concurrent handoff either commits first (the write misses and the
+ * next attempt re-reads the new tip) or reads the stamped row and carries the
+ * stamp forward. Bounded retries end on the named row, which chain readers
+ * still find, so a stamp is never dropped.
+ */
+export async function recordNativeHarnessBackupStampOnLeaseChain(db: Db, input: {
+  leaseId: string; companyId: string; providerLeaseId: string; runId?: string | null; stamp: unknown;
+}): Promise<boolean> {
+  const write = (leaseId: string, runId: string | null | undefined, tipOnly: boolean) => writeEnvironmentCleanup(db, tx => tx
+    .update(environmentLeases)
+    .set({
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ nativeHarnessBackup: input.stamp })}::jsonb`,
+      updatedAt: new Date(),
+    })
+    .where(tipOnly ? and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, input.companyId),
+      eq(environmentLeases.providerLeaseId, input.providerLeaseId),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`) : eq(environmentLeases.id, leaseId))
+    .returning({ id: environmentLeases.id })
+    .then(rows => rows.length > 0), { companyId: input.companyId, runId: runId ?? undefined, leaseId });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const chain = await loadNativeHarnessBackupLeaseChain(db, input);
+    if (!chain || chain.tip.id === input.leaseId || !chain.predecessors.some(row => row.id === input.leaseId)) break;
+    if (await write(chain.tip.id, chain.tip.heartbeatRunId, true)) return true;
+  }
+  return write(input.leaseId, input.runId, false);
 }
 
 /** Shared by backup restore and compatible environment draining: a valid old
