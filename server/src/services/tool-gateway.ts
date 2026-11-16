@@ -2379,6 +2379,7 @@ export function createToolGatewayService(
     // Never trust a previously attached context on a reusable transport session.
     // Approved operations restore their signed origin after authentication.
     if (!session.runId || !session.agentId) return session;
+    const { runId, agentId } = session;
     if (await requiresProjectConnectionRunContext(db, session.companyId, session.runId)) {
       const bound = await readProjectConnectionRunContext(db, {
         companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId,
@@ -2394,15 +2395,15 @@ export function createToolGatewayService(
       .from(heartbeatRuns)
       .where(
         and(
-          eq(heartbeatRuns.id, session.runId),
+          eq(heartbeatRuns.id, runId),
           eq(heartbeatRuns.companyId, session.companyId),
         ),
       );
     if (!run?.activeIdentityContextId) return session;
     const captured = await captureRunIdentity(db, {
       companyId: session.companyId,
-      agentId: session.agentId,
-      runId: session.runId,
+      agentId,
+      runId,
     }, { readScope: "identity" });
     return {
       ...session,
