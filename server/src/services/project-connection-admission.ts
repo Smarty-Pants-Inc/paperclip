@@ -180,6 +180,9 @@ export async function assertProjectConnectionAdmission(
     return;
   }
   const { project, human, primary } = await currentAuthority(db, companyId, projectId);
+  if (project.archivedAt && !["retire", "disable", "project_update"].includes(operation)) {
+    throw conflict("This project is archived. Its connection cannot grant or release new access.", { code: "project_connection_project_archived" });
+  }
   const actorId = actor?.managementContext?.actor.type === "agent" ? actor.managementContext.actor.agentId : actor?.actorType === "agent" ? actor.actorId : null;
   const responsible = actor?.managementContext?.responsibleUserId ?? actor?.responsibleUserId;
   const actorRequired = () => forbidden(operation === "create" && !scope

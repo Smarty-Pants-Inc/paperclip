@@ -53,7 +53,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
-import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, hasProjectConnectionOwnership } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, requiresProjectConnectionRunContext } from "./project-connection-run-context.js";
 import { assertProjectConnectionAdmission } from "./project-connection-admission.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { GITHUB_APP_MCP_URL } from "./github-app-client.js";
@@ -2036,7 +2036,7 @@ export function createToolGatewayService(
     }
 
     const snapshotIssueId = stringValue(run.issueId);
-    if (!await hasProjectConnectionOwnership(db, input.companyId)) {
+    if (!await requiresProjectConnectionRunContext(db, input.companyId, input.runId)) {
       // Preserve the documented null-purpose gateway contract when no retained
       // project owner exists. Protected companies use only the immutable pair
       // below, and credential acquisition rechecks ownership after async I/O.
@@ -2383,6 +2383,14 @@ export function createToolGatewayService(
     // Never trust a previously attached context on a reusable transport session.
     // Approved operations restore their signed origin after authentication.
     if (!session.runId || !session.agentId) return session;
+    if (await requiresProjectConnectionRunContext(db, session.companyId, session.runId)) {
+      const bound = await readProjectConnectionRunContext(db, {
+        companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId,
+      });
+      // A reusable/persisted MCP session carries routing metadata, not project
+      // authority. Listing, policy and execution all see the SAME saved pair.
+      session = { ...session, issueId: bound.issueId, projectId: bound.projectId };
+    }
     const [run] = await db
       .select({
         activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
@@ -3174,7 +3182,7 @@ export function createToolGatewayService(
   }
 
   async function projectProtectedSession(session: ToolGatewaySession): Promise<boolean> {
-    if (!session.agentId || !await hasProjectConnectionOwnership(db, session.companyId)) return false;
+    if (!session.agentId || !await requiresProjectConnectionRunContext(db, session.companyId, session.runId)) return false;
     if (session.runId) {
       const context = await readProjectConnectionRunContext(db, {
         companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId,
@@ -4412,7 +4420,7 @@ export function createToolGatewayService(
         "Project-owned provider is unsupported", "project_connection_provider_unsupported");
     }
     const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
-    const runContext = github && session.agentId && session.runId && await hasProjectConnectionOwnership(db, session.companyId)
+    const runContext = github && session.agentId && session.runId && await requiresProjectConnectionRunContext(db, session.companyId, session.runId)
       ? await readProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
     const assertProjectSelection = async () => {
       if (!github || !session.agentId) return;

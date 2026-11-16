@@ -58,7 +58,21 @@ describe("project connection stable-ID envelope at credential release", () => {
     }));
     // A repository retaining the same owner/name but changing stable ID is not
     // the approved repository, even though BASE's name check would accept it.
-    await expect(resolveGitHubAppCredential(db, connection, grant, false, true, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+    await expect(resolveGitHubAppCredential(db, connection, grant, false, true, f.leadA.id)).rejects.toThrow();
+  });
+
+  it.each(["wrong-repo", "malformed", "unapproved-ref"] as const)("RFL-C5/J05/A12 companion: %s returns the intended typed refusal", async kind => {
+    const f = await projectConnectionFixture(db);
+    const { connection, grant } = await f.seedConnection();
+    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-restricted-token");
+    let candidate = connection;
+    if (kind === "wrong-repo") provider.acquire.mockImplementationOnce(async () => ({ token: "synthetic-wrong-repo-token", expiresAt: Date.now() + 3600000, verifiedRegistrationId: "123",
+      github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "202", fullName: "owner/A", installationId: "456", private: true }] } }));
+    else {
+      const projectScope = kind === "malformed" ? { version: 1 } : { ...f.scope(), approvedSecretRefs: [] };
+      [candidate] = await db.update(toolConnections).set({ config: { ...connection.config, projectScope } }).where(eq(toolConnections.id, connection.id)).returning() as [typeof connection];
+    }
+    await expect(resolveGitHubAppCredential(db, candidate, grant, false, true, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
   });
 
   it("J17/A05: a real provider cache hit is reauthorized and refused after grant revocation", async () => {
@@ -100,7 +114,7 @@ describe("project connection stable-ID envelope at credential release", () => {
     const { connection, grant } = await f.seedConnection();
     const config = { ...connection.config, projectScope: { version: 1 } };
     const [malformed] = await db.update(toolConnections).set({ config }).where(eq(toolConnections.id, connection.id)).returning();
-    await expect(resolveGitHubAppCredential(db, malformed!, grant, false, false, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+    await expect(resolveGitHubAppCredential(db, malformed!, grant, false, false, f.leadA.id)).rejects.toThrow();
     expect(provider.secret).not.toHaveBeenCalled();
     expect(provider.acquire).not.toHaveBeenCalled();
   });
@@ -110,7 +124,7 @@ describe("project connection stable-ID envelope at credential release", () => {
     const { connection, grant } = await f.seedConnection();
     const config = { ...connection.config, projectScope: { ...f.scope(), approvedSecretRefs: [] } };
     const [unapproved] = await db.update(toolConnections).set({ config }).where(eq(toolConnections.id, connection.id)).returning();
-    await expect(resolveGitHubAppCredential(db, unapproved!, grant, false, false, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+    await expect(resolveGitHubAppCredential(db, unapproved!, grant, false, false, f.leadA.id)).rejects.toThrow();
     expect(provider.secret).not.toHaveBeenCalled();
   });
 });

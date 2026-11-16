@@ -349,7 +349,7 @@ import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers, prepareHeartbeatGitHubEnvironment } from "./heartbeat-github-launchers.js";
-import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, projectConnectionRunSnapshot } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, projectConnectionRunSnapshot, requiresProjectConnectionRunContext } from "./project-connection-run-context.js";
 import {
   cleanupGitHubOperationLaunchers,
   startAdapterExecutionTargetPaperclipBridge,
@@ -2261,10 +2261,11 @@ export function heartbeatService(
       const runtime = await timePreparation("runtime_state", () => ensureRuntimeState(agent));
       const context = parseObject(run.contextSnapshot);
       // Admission already captured the pair; preparation must never establish a new one.
-      const projectConnectionContext = await readProjectConnectionRunContext(db, {
-        companyId: run.companyId, agentId: run.agentId, heartbeatRunId: run.id,
-      });
-      context.projectConnectionRunContext = { version: 1, issueId: projectConnectionContext.issueId, projectId: projectConnectionContext.projectId };
+      const projectConnectionContext = await requiresProjectConnectionRunContext(db, run.companyId, run.id)
+        ? await readProjectConnectionRunContext(db, {
+            companyId: run.companyId, agentId: run.agentId, heartbeatRunId: run.id,
+          }) : null;
+      if (projectConnectionContext) context.projectConnectionRunContext = { version: 1, issueId: projectConnectionContext.issueId, projectId: projectConnectionContext.projectId };
       const authorizeFailedChatRetryExecution = (stage?: "dispatching") =>
         retryChatControlAdmission(async () => {
           executionControl.controller.signal.throwIfAborted();
@@ -3388,7 +3389,7 @@ export function heartbeatService(
       try {
         const startedAt = run.startedAt ?? new Date();
         const runningWithSession = await timePreparation("execution_start", () => db.transaction(async tx => {
-          await revalidateProjectConnectionRunContext(tx, projectConnectionContext);
+          if (projectConnectionContext) await revalidateProjectConnectionRunContext(tx, projectConnectionContext);
           return tx.update(heartbeatRuns)
           .set({
             startedAt,
