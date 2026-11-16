@@ -58,7 +58,8 @@ export type SecretSensitiveRouteFamily =
   | "api_mcp"
   | "chat_endpoint_setup"
   | "tool_app_connect"
-  | "tool_connection_reconnect";
+  | "tool_connection_reconnect"
+  | "plugin_instance_secret_write";
 
 const SECRET_SENSITIVE_HTTP_PATHS: ReadonlyArray<readonly [SecretSensitiveRouteFamily, RegExp]> = [
   ["voice_sessions", /^\/api\/companies\/[^/]+\/voice-sessions(?:\/|$)/],
@@ -67,6 +68,7 @@ const SECRET_SENSITIVE_HTTP_PATHS: ReadonlyArray<readonly [SecretSensitiveRouteF
   ["chat_endpoint_setup", /^\/api\/chat-endpoints\/[^/]+\/setup(?:-secret)?(?:\/|$)/],
   ["tool_app_connect", /^\/api\/companies\/[^/]+\/tools\/apps\/connect(?:\/|$)/],
   ["tool_connection_reconnect", /^\/api\/tool-connections\/[^/]+\/reconnect(?:\/|$)/],
+  ["plugin_instance_secret_write", /^\/api\/companies\/[^/]+\/plugins\/[^/]+\/projects\/[^/]+\/instance-secrets\/[^/]+(?:\/|$)/i],
 ];
 const SECRET_SENSITIVE_HTTP_METHODS = new Set(["POST", "PUT", "PATCH"]);
 

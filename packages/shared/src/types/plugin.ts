@@ -736,6 +736,7 @@ export interface PaperclipPluginManifestV1 {
   };
   /** Durable, acknowledged resource events delivered to onResourceLifecycle. Requires events.subscribe. */
   resourceLifecycle?: Array<"agent" | "project" | "agent_runtime">;
+  instanceSecretKeys?: string[];
   /** Opt into the native pooled-connection catalog, setup, and management UI. */
   aiConnectionRouter?: { name: string; description: string };
   /** Entrypoint paths relative to the package root. */
