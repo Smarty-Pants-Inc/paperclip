@@ -24,6 +24,8 @@ import {
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
+import { HttpError } from "../errors.js";
+import { createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
 import { agentRoutes } from "../routes/agents.js";
 import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError } from "../services/accounting-transaction.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
@@ -31,7 +33,9 @@ import { secretService } from "../services/secrets.js";
 
 // #20389 on the M2hall image line (review-fleet-2 06:37Z): the retry sits in two different places on hire.
 //  (a) The CREATE transaction is the lifecycle's: ONE attempt (ctl6). A persistent 40P01 there reaches the caller
-//      as upstream's named retryable error (AccountingContentionError: HTTP 503, SQLSTATE kept in `code`) and
+//      as the hire-specific named retryable error (HTTP 503, code agent_hire_create_contention) and
+//      keeps the database error only in `cause`.
+//      RFL 07:45Z 11-16: distinct named hire codes
 //      writes nothing: no agent, no binding, no activity, no event.
 //  (b) The GRANT step runs AFTER the create transaction commits, inside #20805's withTransactionRetry (5 attempts).
 //      When a persistent 40P01 exhausts those attempts, the caller gets a NAMED error, never a bare 500. The
@@ -177,7 +181,10 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
     const failed = await request(createApp(wrapped, actor, thrown)).post(`/api/companies/${company.id}/agent-hires`).send(payload);
     expect(state.faults).toBe(1);
     expect(failed.status, JSON.stringify(failed.body)).toBe(503);
-    expect(thrown[0]).toBeInstanceOf(AccountingContentionError);
+    expect(failed.body.code).toBe("agent_hire_create_contention");
+    expect(thrown[0]).toBeInstanceOf(HttpError);
+    expect(thrown[0]).toMatchObject({ status: 503, code: "agent_hire_create_contention", retryable: true, attempts: 1 });
+    expect(sqlStates(thrown[0])).toContain("40P01");
     expect(await db.select().from(agents).where(and(eq(agents.companyId, company.id), eq(agents.name, HIRED)))).toHaveLength(0);
     expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.companyId, company.id)))
       .toHaveLength(bindingsBefore.length);
@@ -188,6 +195,16 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
     expect(retried.status, JSON.stringify(retried.body)).toBe(201);
     expect(await childBindings()).toHaveLength(1);
   }, 60_000);
+
+  it("non-hire lifecycle callers retain upstream AccountingContentionError unchanged", async () => {
+    const { company } = await seedHiringFixture(db);
+    const effects = createAgentLifecycleEffects();
+    const failed = effects.transaction(db, company.id, async tx => {
+      await tx.execute(sql`DO $$ BEGIN RAISE EXCEPTION 'forced deadlock' USING ERRCODE = '40P01'; END $$`);
+    });
+    await expect(failed).rejects.toBeInstanceOf(AccountingContentionError);
+    await expect(failed).rejects.toMatchObject({ status: 503, code: "40P01", attempts: 1 });
+  });
 
   for (const route of ["agent-hires", "agents"] as const) {
     it(`R3(a) ${route}: a persistent 40P01 in the create transaction is one attempt, a named 503, and writes nothing`, async () => {
@@ -206,10 +223,11 @@ describeEmbeddedPostgres("agent hire retry boundary (#20389 on M2hall, R3/R4)", 
         });
         expect(state.faults, "one attempt: the lifecycle create transaction is not retried internally").toBe(1);
         expect(response.status, JSON.stringify(response.body)).toBe(503);
-        expect(response.body).toMatchObject({ error: ACCOUNTING_WRITE_CONTENTION_MESSAGE });
+        expect(response.body).toMatchObject({ error: ACCOUNTING_WRITE_CONTENTION_MESSAGE, code: "agent_hire_create_contention",
+          details: { retryable: true } });
         expect(thrown).toHaveLength(1);
-        expect(thrown[0]).toBeInstanceOf(AccountingContentionError);
-        expect(thrown[0]).toMatchObject({ status: 503, code: "40P01", attempts: 1 });
+        expect(thrown[0]).toBeInstanceOf(HttpError);
+        expect(thrown[0]).toMatchObject({ status: 503, code: "agent_hire_create_contention", retryable: true, attempts: 1 });
         expect(sqlStates(thrown[0])).toContain("40P01");
       } finally { unsubscribe(); }
       const hired = await db.select().from(agents).where(and(eq(agents.companyId, company.id), eq(agents.name, HIRED)));
