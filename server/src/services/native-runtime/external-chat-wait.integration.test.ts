@@ -5696,6 +5696,60 @@ describe("native external-chat response wait", () => {
     } finally { commitGuard.mockRestore(); await Promise.allSettled(writer ? [writer] : []); await writerDb.$client.end({ timeout: 1 }); }
   });
 
+  // #20805 R3 RED (RFL + review-fleet-2 joint addendum 06:43Z): the final status
+  // committer holds its actor row and then the SHARED company runtime hold, so a
+  // company-wide connection disable started between the committer's authorization
+  // check and its commit cannot commit in that window: it waits on the advisory
+  // lock, blocked by the committer, until the committer commits.
+  it("a connection disable cannot commit between the final status committer's authorization check and its commit", async () => {
+    const fixture = await seedPublishedReviewCompletionTurn();
+    const authority = new PaperclipRunnerToolAuthority(db, fixture);
+    const { resolveCompletionContinuation } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/completion-continuation.ts", import.meta.url).href);
+    const result = await resolveCompletionContinuation({ ...fixture.result, continuation: null }, fixture.runId,
+      () => authority.execute({ tool: "get_task_context", callId: randomUUID(), arguments: {} })) as PrpStructuredRunResult;
+    await nativeCompletionFeedback(db, fixture.runId, result);
+    await fixture.port.completeRun({ result, terminal: fixture.terminal, callerResultId: `check-commit-${fixture.runId}` });
+    const [connection] = await db.select().from(toolConnections).where(eq(toolConnections.companyId, fixture.companyId));
+    const applicationName = `check-commit-race-${fixture.runId}`;
+    const writerDb = createDb(externalTestDatabaseUrl ?? temporary!.connectionString, { applicationName });
+    let writer: Promise<unknown> | undefined;
+    let writerFinished = false, triggered = false, heldThroughWindow = false;
+    let lockTypes: unknown[] = [];
+    const realCheck = chatWaitAuthority.resolveExternalChatResponseWaitAuthorizationInTransaction;
+    const checkGuard = vi.spyOn(chatWaitAuthority, "resolveExternalChatResponseWaitAuthorizationInTransaction")
+      .mockImplementation(async (...args) => {
+        const authorization = await realCheck(...args);
+        if (triggered || args[2] !== "nonblocking" || authorization !== "authorized") return authorization;
+        triggered = true;
+        const [committer] = await args[0].execute(sql`select pg_backend_pid() as pid`);
+        // The committer's check passed; it has not committed. Start the maintained
+        // PATCH tool-connections writer now.
+        writer = toolAccessService(writerDb).updateConnection(connection!.id, { enabled: false })
+          .finally(() => { writerFinished = true; });
+        await vi.waitFor(async () => {
+          expect(writerFinished).toBe(false);
+          const waiting = await db.execute(sql`select pid, pg_blocking_pids(pid) as blockers from pg_stat_activity
+            where application_name = ${applicationName} and wait_event_type = 'Lock'`);
+          expect(waiting).toHaveLength(1);
+          expect(waiting[0]!.blockers).toContain(Number(committer!.pid));
+          lockTypes = (await db.execute(sql`select locktype from pg_locks where pid = ${Number(waiting[0]!.pid)} and not granted`)).map(row => row.locktype);
+        }, { timeout: 5000 });
+        await new Promise(resolve => setTimeout(resolve, 300));
+        const still = await db.execute(sql`select 1 from pg_stat_activity where application_name = ${applicationName} and wait_event_type = 'Lock'`);
+        heldThroughWindow = !writerFinished && still.length === 1;
+        return authorization;
+      });
+    try {
+      await finalizeNativeRun({ db, runId: fixture.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      await writer;
+      expect(triggered).toBe(true);
+      expect(lockTypes).toEqual(["advisory"]);
+      expect(heldThroughWindow).toBe(true);
+      expect((await db.select().from(issues).where(eq(issues.id, fixture.issueId)))[0]).toMatchObject({ status: "in_review" });
+      expect((await db.select().from(toolConnections).where(eq(toolConnections.id, connection!.id)))[0]).toMatchObject({ enabled: false });
+    } finally { checkGuard.mockRestore(); await Promise.allSettled(writer ? [writer] : []); await writerDb.$client.end({ timeout: 1 }); }
+  });
+
   it.each((["current", "resume", "reply"] as const).flatMap(turn =>
     (["before_feedback", "before_finalization", "during_commit"] as const).map(phase => ({ turn, phase }))))(
     "rechecks a projected GitHub completion wait $turn $phase", async ({ turn, phase }) => {
