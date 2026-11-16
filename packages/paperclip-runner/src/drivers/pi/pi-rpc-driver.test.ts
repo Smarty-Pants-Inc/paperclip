@@ -1068,10 +1068,13 @@ describe("Pi managed npm package paths", () => {
   it("does not rewrite the original package declaration when the driver uses the original home", async () => {
     const f = await managedPackageFixture({ agentHomeIsOriginal: true });
     try {
-      const before = Buffer.from(JSON.stringify(JSON.parse(await readFile(join(f.originalHome, "settings.json"), "utf8")).packages));
+      const beforeSettings = await readFile(join(f.originalHome, "settings.json"), "utf8");
+      const beforePackages = beforeSettings.match(/"packages":\[[^\]]*\]/)?.[0];
+      expect(beforePackages).toBeDefined();
       await f.open();
-      const after = Buffer.from(JSON.stringify(JSON.parse(await readFile(join(f.originalHome, "settings.json"), "utf8")).packages));
-      expect(after).toEqual(before);
+      const afterSettings = await readFile(join(f.originalHome, "settings.json"), "utf8");
+      const afterPackages = afterSettings.match(/"packages":\[[^\]]*\]/)?.[0];
+      expect(Buffer.from(afterPackages ?? "")).toEqual(Buffer.from(beforePackages!));
     } finally { await f.close(); }
   });
 });
