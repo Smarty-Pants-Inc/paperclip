@@ -9233,6 +9233,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === NATIVE_ADDRESSED_INTERACTION_FAILED ||
     sourceFailureCode === "runner_task_admission_rejected" ||
     sourceFailureCode === "runner_ingress_access_rejected" ||
+    sourceFailureCode === "native_github_access_stale_runner_token" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
     sourceFailureCode === "native_provider_model_rejected" ||
     sourceFailureCode === "native_provider_approval_required" ||
