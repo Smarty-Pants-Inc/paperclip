@@ -34,13 +34,17 @@ export async function completeProjectConnectionPredecessor(
   if (liveReach) return;
   const consumers = await tx.select().from(toolConnections).where(and(
     eq(toolConnections.companyId, input.companyId),
-    sql`${toolConnections.config}->'projectScope'->>'legacyConnectionId' = ${source.id}`,
+    or(sql`${toolConnections.config}->'projectScope'->>'legacyConnectionId' = ${source.id}`,
+      sql`${toolConnections.config}->>'projectAppApprovalSourceId' = ${source.id}`),
   ));
-  // No completion based on an orphan/aborted/pending link. In particular a
-  // rollback of the last finish cannot make cleanup archive a live source.
-  if (!consumers.some(row => row.id === source.config[PROJECT_APP_APPROVAL_CONSUMED_BY])
-    || consumers.some(row => !row.projectId || row.status !== "active" || !row.enabled
-      || readProjectConnectionScope(row)?.migrationPending !== false)) return;
+  // No completion based on an orphan/aborted/pending link. Retained aborted
+  // history is not a live consumer; a later retake must itself finish. A
+  // completed connection's later retirement does not undo its migration.
+  const complete = (row: Connection) => row.projectId !== null && readProjectConnectionScope(row)?.migrationPending !== true
+    && (row.status === "archived" || (row.status === "active" && row.enabled));
+  const consumer = consumers.find(row => row.id === source.config[PROJECT_APP_APPROVAL_CONSUMED_BY]);
+  if (!consumer || !complete(consumer)
+    || consumers.some(row => row.status !== "archived" && !complete(row))) return;
   await tx.update(toolConnections).set({ status: "archived", enabled: false, updatedAt: new Date() }).where(and(
     eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id),
   ));
