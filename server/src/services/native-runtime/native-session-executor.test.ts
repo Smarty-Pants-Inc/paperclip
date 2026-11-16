@@ -21212,16 +21212,19 @@ describe("runnerd provider runtime wiring", () => {
     });
 
     /** leaseDb plus the conversation's task-session row (agent_task_sessions). */
-    async function withConversationRow(base: Db, row: { id: string; sessionParamsJson: Record<string, unknown> }) {
+    async function withConversationRow(base: Db, row: { id: string; sessionParamsJson: Record<string, unknown> },
+      extraRows: Map<unknown, unknown[]> = new Map()) {
       const { agentTaskSessions } = await import("@paperclipai/db");
       const wrap = (db: Record<string, any>): Record<string, any> => ({
         ...db,
         select: (fields?: unknown) => ({
           from: (table: unknown) => {
-            if (table !== agentTaskSessions) return db.select(fields).from(table);
+            if (table !== agentTaskSessions && !extraRows.has(table)) return db.select(fields).from(table);
+            const rows = table === agentTaskSessions ? [structuredClone(row)] : structuredClone(extraRows.get(table)!);
             const query: Record<string, unknown> = {
               then: (resolve: (rows: unknown[]) => unknown, reject?: (error: unknown) => unknown) =>
-                Promise.resolve([structuredClone(row)]).then(resolve, reject),
+                Promise.resolve(rows).then(resolve, reject),
+              catch: (reject: (error: unknown) => unknown) => Promise.resolve(rows).catch(reject),
             };
             for (const method of ["where", "for", "limit", "orderBy"]) query[method] = () => query;
             return query;
@@ -21391,6 +21394,119 @@ describe("runnerd provider runtime wiring", () => {
       onTestFinished(async () => { await registration?.release(); await controller.stop(); });
       registration = await fixture.options.controlPlaneRegistration(controller);
       await expect(registration.checkpoint!("settled")).rejects.toThrow("runner_harness_state_mismatch: provider_identity_changed");
+    });
+
+    it("(d) a fresh start on a new box survives a restart BEFORE any suspended read: the next host preparation resumes the new thread", async () => {
+      // review-fleet-3 F1: the new-box note must be durable in the run that
+      // starts the thread. A stop the pre-drain misses, a cut close, a crash
+      // or a swap leaves no suspended read before the restart.
+      const { nativeHarnessBackups } = await import("@paperclipai/db");
+      const label = "d-new-box";
+      const remoteCwd = join(isolatedStateDirectory, `remote-identity-lineage-${label}`);
+      const current = { ...execution,
+        provider: { kind: "pi_rpc", model: "paperclip/test", profile: QUALIFIED_PI_RPC_PROFILE },
+        binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() },
+        session: { ...execution.session, normalizedSessionId: randomUUID(), driverKind: "pi_rpc",
+          lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+      } as unknown as NativeExecutionInputV1;
+      const runnerInstanceId = `identity-lineage-runner-${label}`;
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        }) };
+        if (command.args?.[0] === "--version" && command.command.endsWith("/opencode"))
+          return { exitCode: 0, timedOut: false, stdout: "1.18.34", stderr: "" };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
+        // The staged provider pack's Node verifier: the fixture pack is trusted.
+        if (command.args?.[0] === "-e") return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+        if (command.args?.[1]?.includes("base64")) {
+          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+          catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+        }
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      });
+      const syncIn = vi.fn(async (..._operations: unknown[]) => undefined);
+      // Only Runner assets are staged; no backup is restored over the session's state.
+      const restoredSessionState = () => JSON.stringify(syncIn.mock.calls).includes(".paperclip-runtime/paperclip-runner/sessions/");
+      const controllerArtifact = join(isolatedStateDirectory, `identity-lineage-runnerd-${label}`);
+      await writeFile(controllerArtifact, "fixture bootstrap artifact");
+      const conversationRunId = randomUUID();
+      const conversation = { id: randomUUID(), sessionParamsJson: {
+        sessionId: current.session.normalizedSessionId,
+        __paperclipPiConversation: { schema: "paperclip.pi-conversation.v1", id: current.session.normalizedSessionId,
+          generation: 1, boundary: { provider: "pi_rpc", cwd: null, workspaceId: null, trust: "trusted" },
+          previousId: null, reason: "first_message", runId: conversationRunId, providerIdentityResets: [] },
+      } as Record<string, unknown> };
+      // SMA-67 05:51Z: the lineage's only backup (f548f509, thread 01a1e203) is
+      // durable, not on this server's disk, so the spare box starts fresh.
+      const db = await withConversationRow(leaseDb(current), conversation,
+        new Map([[nativeHarnessBackups, [{ id: "backup-f548f509" }]]]));
+      const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+      const { packRoot } = await nativePiProviderPackFixture(join(isolatedStateDirectory, `identity-lineage-pack-${label}`));
+      const backend = async (sandboxLeaseAcquisition: { outcome: "created" | "resumed"; providerLeaseId: string }) => {
+        await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
+          runnerRemoteBinaryPath: controllerArtifact, runnerRemoteProviderPackPath: packRoot,
+          runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
+            leaseId: `lease-lineage-${label}`, providerKey: "daytona", reusableLeaseConfigured: true,
+            effectiveCapabilities: { runnerWebSocketIngress: true }, sandboxLeaseAcquisition,
+            runner: { execute: remoteExecute, syncIn },
+            getRunnerIngressEndpoint: async () => ({ kind: "authenticated_websocket", websocketUrl: "wss://sandbox.invalid/runner",
+              secretHeaders: [{ name: "Authorization", value: "fixture-ingress" }], generation: "1", refresh: vi.fn(), close: vi.fn(async () => undefined) }),
+          } as never,
+        });
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        return state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & {
+          prepareExternalRunnerState: () => Promise<void>;
+        };
+      };
+      // Run 1: host preparation on the created spare box (no state of this session) starts fresh.
+      const created = await backend({ outcome: "created", providerLeaseId: "bx_kuxnh4yq" });
+      await expect(created.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(restoredSessionState()).toBe(false);
+      // The run opens thread 01a1e2e9 and suspends on the box. Then the server
+      // stops before ANY suspended read (no checkpoint, no idle or restart close).
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+        createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
+      const runIdentity = { runnerInstanceId, environmentLeaseId: `lease-lineage-${label}`,
+        runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId!,
+        turnId: "turn-new-box", itemId: "item-new-box" };
+      const runnerState = durableRunnerState(runIdentity, "suspended");
+      // The controller's own durable control-plane state for the run, on this server.
+      await mkdir(join(created.stateDirectory!, "control-plane"), { recursive: true });
+      await writeFile(join(created.stateDirectory!, "control-plane", "control-plane-state.json"),
+        JSON.stringify(durableControlPlaneState(runIdentity)));
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(directory.location === "runner" ? join(remoteSession, "runner") : join(remoteSession, "filesystem", directory.name),
+          { recursive: true });
+      await writeFile(join(remoteSession, "runner/runner-state.json"), JSON.stringify(runnerState));
+      await writeFile(join(remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "01a1e2e9",
+        providerSessionId: null, activeProviderTurnId: null, config: { provider: "pi_rpc", driver: "pi_rpc" },
+      }));
+      // Restart: the in-process notes are gone.
+      const lineage = await import("./provider-identity-lineage.js");
+      lineage.clearPendingProviderIdentityBreaksForTest();
+      // A later warm run restored the durable backup locally: it still names 01a1e203.
+      const backupRoot = join(created.stateDirectory!, "failover-backups/current");
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(join(backupRoot, directory.name), { recursive: true });
+      await writeFile(join(backupRoot, "runner/runner-state.json"), JSON.stringify(runnerState));
+      await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+        backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "backup-box",
+        providerSessionIdentity: identityOf("01a1e203"),
+      })));
+      // Run 2 after the restart: host preparation on the same (now resumed) box.
+      const resumed = await backend({ outcome: "resumed", providerLeaseId: "bx_kuxnh4yq" });
+      await expect(resumed.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(restoredSessionState()).toBe(false);
+      expect(JSON.parse(await readFile(join(remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
+        .toBe("01a1e2e9");
+      const stored = (conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>)
+        .providerIdentityResets as Array<Record<string, unknown>>;
+      expect(stored).toEqual([expect.objectContaining({ generation: 1, reason: "resume_failed_on_new_box",
+        runId: current.binding.runId, previousIdentity: identityOf("01a1e203"), identity: identityOf("01a1e2e9") })]);
     });
   });
 
