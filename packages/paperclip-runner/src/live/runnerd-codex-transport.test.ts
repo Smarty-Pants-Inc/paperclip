@@ -7404,3 +7404,110 @@ describe("runner exits that must not relaunch on the same path (#20825)", () => 
       } finally { await owner.cleanup(); }
     }, 60_000);
 });
+
+// #20825 fix-up (judge F1 + review-fleet-2 ADDITION): a Core-dialed warm
+// route may outlive its recovery budget only while its OWNER is idle. The
+// owner's idleness is the transport's own predicate (settled idle warm owner:
+// no provider work in flight, no pending command, its run settled a turn),
+// bound into the registration. runnerd completes turn.start when it ACCEPTS a
+// turn, so the control plane's command list alone calls a running turn idle.
+describe("the owner idleness a Core-dialed warm route reads (#20825 fix-up)", () => {
+  async function startBoundOwner(providerArgs: string[] = []) {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-owner-idle-"));
+    const children: ReturnType<typeof spawn>[] = [];
+    const exits: Promise<void>[] = [];
+    let core!: DurablePrpControlPlane;
+    let ownerIdle: (() => boolean) | null = null;
+    const launch = vi.fn((spec: durableControlPlane.RunnerProcessLaunchSpec): durableControlPlane.RunnerProcessHandle => {
+      if (launch.mock.calls.length > 1) {
+        // A replacement that is still starting: it neither exits nor connects.
+        return { child: { pid: undefined, exitCode: null, kill: () => false },
+          completion: new Promise<durableControlPlane.RunnerProcessResult>(() => {}), isExitConfirmed: () => false };
+      }
+      const child = spawn(spec.command, [...spec.args], { cwd: spec.cwd, env: spec.environment, stdio: "ignore" });
+      children.push(child);
+      exits.push(new Promise(resolveExit => child.once("exit", () => resolveExit())));
+      return {
+        child,
+        completion: new Promise<durableControlPlane.RunnerProcessResult>((resolveExit, rejectExit) => {
+          child.once("error", rejectExit);
+          child.once("exit", (code, signal) => resolveExit({ code, signal, stdout: "", stderr: "" }));
+        }),
+        isExitConfirmed: () => child.exitCode !== null || child.signalCode !== null,
+      };
+    });
+    const bundle = createCapabilityRunnerdCodexTransport({
+      runnerBinary: defaultCapabilityRunnerdBinary(), codexCommand: fakeCodex,
+      codexArgs: fakeCodexArgs(directory, ...providerArgs), stateDirectory: directory,
+      lifecyclePolicy: { mode: "warm", idleTimeoutMs: 60_000 },
+      runnerReconnectGraceMs: 420_000, runnerProcessLauncher: launch,
+      controlPlaneRegistration: async authority => {
+        core = authority;
+        await authority.start();
+        return { release: () => undefined, bindOwnerIdle: (isIdle: () => boolean) => { ownerIdle = isIdle; } };
+      },
+    });
+    bundle.transport.setServerRequestHandler(async () => ({ success: true, contentItems: [] }));
+    await bundle.transport.request("thread/start", { cwd: directory, dynamicTools: [] });
+    const notifications = bundle.transport.notifications()[Symbol.asyncIterator]();
+    let failure: Error | null = null;
+    const drain = () => void (async () => {
+      for (;;) if ((await notifications.next()).done) return;
+    })().catch(error => { failure = error as Error; });
+    const cleanup = async () => {
+      vi.useRealTimers();
+      const providerPid = bundle.evidence().codexPid;
+      if (providerPid) { try { process.kill(providerPid, "SIGKILL"); } catch {} }
+      await bundle.transport.detachControllerForRestart!().catch(() => undefined);
+      for (const child of children) child.kill("SIGKILL");
+      await Promise.all(exits);
+      await rm(directory, { recursive: true, force: true });
+    };
+    return { bundle, launch, children, exits, notifications, drain, core: () => core, ownerIdle: () => ownerIdle,
+      failure: () => failure, diagnostics: () => bundle.evidence().diagnostics, cleanup };
+  }
+
+  it("a busy owner with turn.start accepted is NOT idle to the route, and its runner exit reconnects (loop-fix B agrees)", async () => {
+    const owner = await startBoundOwner(["--hold-turn"]);
+    try {
+      expect(owner.ownerIdle()).not.toBeNull();
+      await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Hold this turn." }] });
+      await expectTurnStarted(owner.notifications);
+      owner.drain();
+      // The control plane's command list says nothing is pending: runnerd
+      // completed turn.start when it accepted the turn.
+      const commands = owner.core().store.state.commands;
+      expect(commands.find(command => command.type === "turn.start")?.status).toBe("completed");
+      expect(commands.some(command => command.status === "pending")).toBe(false);
+      // The owner is busy: the route must keep the fixed 7-min budget.
+      expect(owner.ownerIdle()!()).toBe(false);
+      // The same owner state, seen by runner-exit recovery: it reconnects.
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      owner.children[0]!.kill("SIGKILL");
+      await owner.exits[0];
+      for (let elapsed = 0; elapsed < 10_000; elapsed += 100) {
+        await vi.advanceTimersByTimeAsync(100);
+        await new Promise(resolveTurn => setImmediate(resolveTurn));
+      }
+      expect(owner.launch.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(owner.diagnostics().some(line => line.startsWith("native_runner_idle_warm_owner_exited"))).toBe(false);
+      expect(owner.failure()).toBeNull();
+      expect(owner.ownerIdle()!()).toBe(false);
+    } finally { await owner.cleanup(); }
+  }, 60_000);
+
+  it("the same owner is idle to the route once its run settled the turn", async () => {
+    const owner = await startBoundOwner();
+    try {
+      expect(owner.ownerIdle()).not.toBeNull();
+      // Before any turn settled the owner still has work (startup, first turn).
+      expect(owner.ownerIdle()!()).toBe(false);
+      await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Finish, then stay warm." }] });
+      for (;;) if ((await owner.notifications.next()).value?.method === "turn/completed") break;
+      owner.drain();
+      const deadline = Date.now() + 5_000;
+      while (!owner.ownerIdle()!() && Date.now() < deadline) await new Promise(resolveWait => setTimeout(resolveWait, 25));
+      expect(owner.ownerIdle()!()).toBe(true);
+    } finally { await owner.cleanup(); }
+  }, 60_000);
+});
