@@ -36,7 +36,7 @@ import type {
 import { HarnessCapabilityUnavailableError, HarnessOperationAlreadyTerminalError, HarnessStaleTurnError } from "../../contracts/harness-driver.js";
 import type { NativeSessionCapabilities } from "../../contracts/types.js";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
-import { PROVIDER_PERFORMANCE_DIAGNOSTIC, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
+import { PROVIDER_PERFORMANCE_DIAGNOSTIC, isPiTimeoutCode, type PiTimeoutCode, type ProviderPerformancePhase, type ProviderPerformanceSpan } from "../../contracts/provider-performance.js";
 import { piPerformanceSpanBatches } from "./pi-performance-diagnostics.js";
 import { piToolLimitEntry, piToolLimitMessage } from "./pi-tool-limit-diagnostics.js";
 
@@ -160,7 +160,7 @@ export class PiRpcDriver implements HarnessDriver {
       let outcome: ProviderPerformanceSpan["outcome"] = "failed";
       let attributes: ProviderPerformanceSpan["attributes"];
       try { const result = await work(); outcome = "ok"; return result; }
-      catch (error) { attributes = piBindTimeoutAttributes(error); throw error; }
+      catch (error) { attributes = piTimeoutAttributes(error); throw error; }
       finally {
         const endedAtMs = Math.max(startedAtMs, Date.now());
         spans.push({ name, startedAtMs, endedAtMs, outcome, ...(attributes ? { attributes } : {}) });
@@ -361,7 +361,7 @@ export class PiRpcDriver implements HarnessDriver {
         const send = <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => measure(
           request.type === "bind" ? "runner.pi.open.bind_receipt" : `runner.pi.open.${request.type}` as PiOpenPhase, async () => {
           const timeoutMs = this.#options.startupTimeoutMs ?? 5000;
-          const receipt = await budget.request(remainingMs => (this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs: remainingMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out", input.signal);
+          const receipt = await budget.request(remainingMs => (this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs: remainingMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out", input.signal, "pi_bind_timeout");
           if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
           return receipt;
         });
@@ -495,23 +495,29 @@ class PiAdmissionBudget {
   readonly #expiresAt: number;
   constructor(timeoutMs = 10_000) { this.#expiresAt = performance.now() + timeoutMs; }
 
-  async request<T>(work: (timeoutMs: number) => Promise<T>, perExchangeMs: number, message: string, signal?: AbortSignal): Promise<T> {
+  /** `timeoutCode` is the exchange's own timeout evidence (private bind
+   * exchanges: pi_bind_timeout). A deadline error keeps it when that exchange
+   * timed out; budget exhaustion otherwise records pi_admission_deadline_exceeded. */
+  async request<T>(work: (timeoutMs: number) => Promise<T>, perExchangeMs: number, message: string, signal?: AbortSignal,
+    timeoutCode?: PiTimeoutCode): Promise<T> {
     signal?.throwIfAborted();
     // Node timers have millisecond granularity. Round once at the exchange
     // boundary, not down by a millisecond on every immediate first request.
     const remainingMs = Math.ceil(this.#expiresAt - performance.now());
-    const deadlineError = (detail: string) => new PiNativeAdmissionError("pi_admission_deadline_exceeded", detail);
+    const deadlineError = (detail: string, evidence: PiTimeoutCode = "pi_admission_deadline_exceeded") =>
+      Object.assign(new PiNativeAdmissionError("pi_admission_deadline_exceeded", detail), { timeoutCode: evidence });
     if (remainingMs < 1) throw deadlineError(message);
     const timeoutMs = Math.min(perExchangeMs, remainingMs);
     try {
-      const result = await withAbort(withTimeout(work(timeoutMs), timeoutMs, message), signal);
+      const result = await withAbort(withTimeout(work(timeoutMs), timeoutMs, message, timeoutCode), signal);
       if (performance.now() >= this.#expiresAt) throw deadlineError(message);
       return result;
     } catch (error) {
+      if (error instanceof PiNativeAdmissionError && error.code === "pi_admission_deadline_exceeded") throw error;
       if (!signal?.aborted && remainingMs <= perExchangeMs && error instanceof Error
         && (performance.now() >= this.#expiresAt - 1 || error.message === message
           || error.message === "Pi private request timed out" || error instanceof PiRpcRequestTimeoutError)) {
-        throw deadlineError(error.message);
+        throw deadlineError(error.message, piTimeoutCode(error) === "pi_bind_timeout" ? "pi_bind_timeout" : undefined);
       }
       throw error;
     }
@@ -823,7 +829,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     };
     this.#pendingTimings.add(finish);
     try { const result = await work(); outcome = "ok"; return result; }
-    catch (error) { attributes = piBindTimeoutAttributes(error); throw error; }
+    catch (error) { attributes = piTimeoutAttributes(error); throw error; }
     finally {
       finish(Date.now());
       // An external attachment can succeed indefinitely without a turn. Drain
@@ -953,7 +959,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       const timeoutMs = this.#admissionTimeoutMs ?? 5000;
       const send = (timeoutMs: number) => this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal });
       const receipt = budget
-        ? await budget.request(send, timeoutMs, "Pi private receipt timed out", signal)
+        ? await budget.request(send, timeoutMs, "Pi private receipt timed out", signal, "pi_bind_timeout")
         : await withAbort(withTimeout(send(timeoutMs), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), signal);
       if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
       return receipt;
@@ -2116,9 +2122,16 @@ async function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
   });
 }
 
-function piBindTimeoutAttributes(error: unknown): ProviderPerformanceSpan["attributes"] {
-  return error !== null && typeof error === "object" && (error as { code?: unknown }).code === "pi_bind_timeout"
-    ? { timeoutCode: "pi_bind_timeout" } : undefined;
+/** Only the fixed safe codes cross into spans; never an error message. */
+function piTimeoutCode(error: unknown): PiTimeoutCode | undefined {
+  if (error === null || typeof error !== "object") return undefined;
+  const { timeoutCode, code } = error as { timeoutCode?: unknown; code?: unknown };
+  return isPiTimeoutCode(timeoutCode) ? timeoutCode : isPiTimeoutCode(code) ? code : undefined;
+}
+
+function piTimeoutAttributes(error: unknown): ProviderPerformanceSpan["attributes"] {
+  const timeoutCode = piTimeoutCode(error);
+  return timeoutCode ? { timeoutCode } : undefined;
 }
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string, code?: string): Promise<T> {
