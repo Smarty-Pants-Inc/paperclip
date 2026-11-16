@@ -72,9 +72,44 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
     expect(rows).toHaveLength(1);
   });
 
+  // RFL 11:41Z 11-16: full rows retain generated ids/timestamps, while the
+  // explicit binding fields below name S, its application/grant and audit rows.
+  const byId = <T extends { id: string }>(rows: T[]) => [...rows].sort((a, b) => a.id.localeCompare(b.id));
+  async function approvalSnapshot(f: Awaited<ReturnType<typeof approvedProjectConnectionFixture>>, project = f.a) {
+    const { sourceId, applicationId } = await f.approve(project);
+    const [source] = await db.select().from(toolConnections).where(eq(toolConnections.id, sourceId));
+    const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, applicationId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, sourceId));
+    const receipt = { version: 1, id: expect.any(String), companyId: f.companyId, humanUserId: f.human,
+      projectId: project.id, appId: "123", installationId: "456", repositoryIds: [project.id === f.a.id ? 101 : 202],
+      secretRef: { secretId: f.secret.id, configPath: "credentials.privateKey" }, verifiedAt: expect.any(String), revokedAt: null };
+    expect(source!.config.projectAppApproval).toEqual(receipt);
+    const config = { sourceTemplateKey: "github", connectionMethodKey: "app-installation",
+      methodConfig: f.config(project).methodConfig, projectAppApproval: source!.config.projectAppApproval };
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId)))
+      .toEqual([{ ...source!, id: sourceId, companyId: f.companyId, applicationId, projectId: null,
+        status: "draft", enabled: false, config, transportConfig: config,
+        credentialSecretRefs: f.input(project).credentialSecretRefs, createdByUserId: f.human }]);
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId)))
+      .toEqual([{ ...application!, id: applicationId, companyId: f.companyId, name: source!.name, type: "mcp_stdio", status: "active" }]);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId)))
+      .toEqual([{ ...grant!, companyId: f.companyId, connectionId: sourceId, kind: "organization", status: "active",
+        isDefault: true, credentialSecretRefs: source!.credentialSecretRefs }]);
+    const activity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    const configActivity = activity.find(row => row.action === "plugin.config.updated")!;
+    const created = activity.find(row => row.action === "tool_connection.created")!;
+    const approved = activity.find(row => row.action === "tool_connection.project_app_approved")!;
+    expect(byId(activity)).toEqual(byId([
+      { ...configActivity, companyId: f.companyId, action: "plugin.config.updated", entityType: "plugin", actorType: "user", actorId: f.human },
+      { ...created, companyId: f.companyId, action: "tool_connection.created", entityType: "tool_connection", entityId: sourceId, actorType: "user", actorId: f.human },
+      { ...approved, companyId: f.companyId, action: "tool_connection.project_app_approved", entityType: "tool_connection", entityId: sourceId, actorType: "user", actorId: f.human },
+    ]));
+    return { source: source!, application: application!, grant: grant! };
+  }
+
   it("J04/A10: duplicate service creates map one conflict and leave one application/grant/take receipt", async () => {
     const f = await approvedProjectConnectionFixture(db);
-    await f.approve(); // Genuine prerequisites, before the unchanged race.
+    const setup = await approvalSnapshot(f); // Genuine prerequisites, before the unchanged race.
     const wait = barrier(2);
     const results = await Promise.allSettled([0, 1].map(async () => {
       await wait();
@@ -82,9 +117,23 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
     }));
     expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
     expect(results.find(result => result.status === "rejected")).toMatchObject({ reason: { status: 409 } });
-    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(1);
-    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toHaveLength(1);
-    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(1);
+    const winner = results.find(result => result.status === "fulfilled")!;
+    if (winner.status !== "fulfilled") throw new Error("Expected the one winning create");
+    const connection = winner.value;
+    const [application] = await db.select().from(toolApplications).where(eq(toolApplications.id, connection.applicationId));
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+    // Exactly snapshot + ONE new row per table; S's only allowed changes are
+    // its atomic archive/consumer link and write timestamp. No rows filtered out.
+    expect(byId(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))), "J04 connection delta exactly 1")
+      .toEqual(byId([{ ...setup.source, status: "archived", enabled: false, updatedAt: expect.any(Date),
+        config: { ...setup.source.config, projectAppApprovalConsumedBy: connection.id },
+        transportConfig: { ...setup.source.transportConfig, projectAppApprovalConsumedBy: connection.id } }, connection]));
+    expect(byId(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))), "J04 application delta exactly 1")
+      .toEqual(byId([setup.application, { ...application!, id: connection.applicationId, companyId: f.companyId,
+        name: connection.name, type: "mcp_stdio", status: "active" }]));
+    expect(byId(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))), "J04 grant delta exactly 1")
+      .toEqual(byId([setup.grant, { ...grant!, companyId: f.companyId, connectionId: connection.id, kind: "organization", status: "active",
+        isDefault: true, credentialSecretRefs: connection.credentialSecretRefs }]));
     expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.action, "tool_connection.project_taken")))).toHaveLength(1);
   });
 
@@ -136,13 +185,23 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
 
   it.each(["draft", "disabled"] as const)("J06 production: %s null alias blocks an EXCLUSIVE request before any application/grant write", async status => {
     const f = await approvedProjectConnectionFixture(db);
-    await f.approve(f.b);
-    await f.seedConnection(null, { status, installed: false });
+    const setup = await approvalSnapshot(f, f.b);
+    const ordinary = await f.seedConnection(null, { status, installed: false });
     const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId));
+    const beforeGrants = await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId));
+    const [ordinaryApplication] = await db.select().from(toolApplications).where(eq(toolApplications.id, ordinary.connection.applicationId));
+    expect(byId(beforeApplications)).toEqual(byId([setup.application, { ...ordinaryApplication!,
+      id: ordinary.connection.applicationId, companyId: f.companyId, type: "rest_api", status: "active" }]));
+    // Exactly S's grant plus the original conflicting ordinary null alias.
+    expect(byId(beforeGrants)).toEqual(byId([setup.grant, ordinary.grant]));
+    expect(byId(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))))
+      .toEqual(byId([setup.source, ordinary.connection]));
     await expect(f.service.createConnection(f.companyId, f.input(f.b, { exclusive: true }), f.actor()))
       .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
     expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toEqual(beforeApplications);
-    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(1);
+    expect(byId(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))), `J06 ${status} grant delta exactly 0`)
+      .toEqual(byId(beforeGrants));
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.id, setup.source.id))).toEqual([setup.source]);
     expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.action, "tool_connection.project_taken")))).toHaveLength(0);
   });
 
