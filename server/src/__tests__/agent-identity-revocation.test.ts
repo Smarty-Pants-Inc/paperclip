@@ -112,14 +112,14 @@ describe("agent identity revocation", () => {
     } finally { decrypt.mockRestore(); encrypt.mockRestore(); }
   });
 
-  it("log redactor resolution also refuses a revoked key before decrypting", async () => {
+  // SUPERSEDED BY RFL F1 (11-16 05:59Z, #20832): the redaction path MUST still
+  // build a redactor for a revoked key; every signing/minting use still refuses.
+  it("log redactor resolution still builds for a revoked key (redaction only), while ensure refuses", async () => {
     const { agent } = await fixture();
     await createAgentLifecycle(db).terminateAgent(agent.id);
-    const decrypt = vi.spyOn(localEncryptedProvider, "resolveVersion");
-    try {
-      await expect(agentIdentityService(db).createExistingLogRedactor(companyId, agent.id)).rejects.toMatchObject({ name: "AgentIdentityRevokedError" });
-      expect(decrypt).not.toHaveBeenCalled();
-    } finally { decrypt.mockRestore(); }
+    const redactor = await agentIdentityService(db).createExistingLogRedactor(companyId, agent.id);
+    expect(redactor.values.length).toBeGreaterThan(0);
+    await expect(agentIdentityService(db).ensureAgentIdentity(companyId, agent.id)).rejects.toMatchObject({ name: "AgentIdentityRevokedError" });
   });
 
   it("authority refuses the revoked key with its named reason, independent of agent status", async () => {
