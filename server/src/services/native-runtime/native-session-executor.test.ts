@@ -161,6 +161,12 @@ vi.mock("../usage-receipts.js", async (importOriginal) => ({
 
 const wakeAnchor = vi.hoisted(() => ({ read: vi.fn(async (_db: unknown, _runId: string): Promise<number | null> => null) }));
 vi.mock("./native-run-wake-anchor.js", () => ({ readNativeRunWakeRequestedAtMs: wakeAnchor.read }));
+// J3-22: the same-run fresh thread's ONE continuation note (spied; the rest of the module is real).
+const sameRunFreshThreadNotice = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => true));
+vi.mock("./pi-session-recovery-notice.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./pi-session-recovery-notice.js")>(),
+  writeSameRunFreshThreadNotice: sameRunFreshThreadNotice,
+}));
 
 vi.mock("./native-usage-delivery.js", () => ({
   createNativeUsageDelivery: vi.fn(async () => ({ capture: async () => undefined })),
@@ -24368,6 +24374,253 @@ describe("runnerd provider runtime wiring", () => {
       expect(JSON.parse(await readFile(join(root, "continuity-breaks", archives[0]!, "failover-backups", name, "manifest.json"), "utf8")))
         .toEqual({ priorSession: name });
     }
+  });
+
+  // J3-22 first-run floor (RFL 08:06Z). SMA-60 on M2d a763d193: a DONE task's
+  // chat after an image swap got a created lease; host preparation tried
+  // session.checkpoint.restore, refused it with
+  // runner_harness_state_mismatch: backup_without_reusable_lease (no retired-
+  // source proof yet), the run FAILED (its prepared workspace was then retained:
+  // resultJson.workspaceRestoreFailure='restore_failed') and only the automatic
+  // recovery run answered, 94 s later, on a fresh thread with a "Your message
+  // wasn't answered" note. That retry already takes a fresh thread for this exact
+  // code (FRESH_THREAD_REFUSAL_CODES). The floor moves it into the SAME run: the
+  // refused restore never fails the run; the run continues on a fresh thread of
+  // the same conversation, recorded through J3-17's lineage append (reason
+  // resume_failed_on_new_box), with ONE continuation note.
+  describe("J3-22 floor: a refused restore on a new box answers in the same run", () => {
+    const FLOOR_CODE = "runner_harness_state_mismatch: backup_without_reusable_lease";
+    const identityOf = (threadId: string) =>
+      ({ providerSessionId: threadId, providerBackendSessionId: null, providerSessionIdentity: null });
+
+    async function floorFixture(label: string, proof: "none" | "destroyed" = "none") {
+      const remoteCwd = join(isolatedStateDirectory, `remote-j322-${label}`);
+      const current: NativeExecutionInputV1 = { ...execution,
+        binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(),
+          runId: randomUUID(), executionWorkspaceId: randomUUID() },
+        session: { ...execution.session, normalizedSessionId: randomUUID(), lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300_000 } },
+      };
+      const runnerInstanceId = `j322-runner-${label}`;
+      const backupDirectory = { root: "" };
+      const conversation = { id: randomUUID(), sessionParamsJson: {
+        sessionId: current.session.normalizedSessionId,
+        __paperclipPiConversation: { schema: "paperclip.pi-conversation.v1", id: current.session.normalizedSessionId,
+          generation: 1, boundary: { provider: "codex", cwd: null, workspaceId: null, trust: "trusted" },
+          previousId: null, reason: "first_message", runId: randomUUID(), providerIdentityResets: [] },
+      } as Record<string, unknown> };
+      const base = leaseDb(current), ordinarySelect = base.select.bind(base);
+      if (proof === "destroyed") {
+        // The guard: Paperclip destroyed the source (an authorized restore).
+        base.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+          const sourceRunQuery = Boolean(table === heartbeatRuns && fields && "sourceRunStatus" in fields);
+          if (table !== executionWorkspaces && table !== environmentLeases && table !== heartbeatRunEvents && !sourceRunQuery)
+            return ordinarySelect(fields as never).from(table as never);
+          const manifest = backupDirectory.root ? readFileSync(join(backupDirectory.root, "manifest.json")) : "";
+          const sha = `sha256:${createHash("sha256").update(manifest).digest("hex")}`;
+          const confirmedAt = new Date().toISOString();
+          const source = { id: "source-lease", companyId: current.binding.companyId, heartbeatRunId: "source-run", provider: "daytona",
+            providerLeaseId: "prior-sandbox", status: "expired", cleanupStatus: "success", leasePolicy: "reuse_by_environment",
+            acquiredAt: new Date(Date.now() - 60_000), releasedAt: new Date(Date.now() + 1_000), expiresAt: null,
+            metadata: {
+              nativeHarnessBackup: { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: current.session.normalizedSessionId,
+                runnerInstanceId, sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: "prior-sandbox",
+                authorizedProviderLeaseId: "prior-sandbox", manifestSha256: sha, completedAt: "2026-11-05T05:02:50.000Z" },
+              remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: current.binding.companyId,
+                runId: "source-run", leaseId: "source-lease", provider: "daytona", providerLeaseId: "prior-sandbox",
+                state: "destroyed", confirmedAt },
+            } };
+          const rows = sourceRunQuery ? [{ sourceRunStatus: "succeeded" }]
+            : fields?.run ? [] : table === executionWorkspaces ? [] : table === heartbeatRunEvents ? []
+              : [{ metadata: {}, providerLeaseId: "sandbox-created", companyId: current.binding.companyId,
+                heartbeatRunId: current.binding.runId }, source];
+          const query = { then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+            leftJoin: () => query, innerJoin: () => query, where: () => query, limit: () => query };
+          return query;
+        } })) as unknown as Db["select"];
+      }
+      const { agentTaskSessions } = await import("@paperclipai/db");
+      const wrap = (db: Record<string, any>): Record<string, any> => ({
+        ...db,
+        select: (fields?: unknown) => ({
+          from: (table: unknown) => {
+            if (table !== agentTaskSessions) return db.select(fields).from(table);
+            const query: Record<string, unknown> = {
+              then: (resolve: (rows: unknown[]) => unknown, reject?: (error: unknown) => unknown) =>
+                Promise.resolve([structuredClone(conversation)]).then(resolve, reject),
+            };
+            for (const method of ["where", "for", "limit", "orderBy"]) query[method] = () => query;
+            return query;
+          },
+        }),
+        update: (table: unknown) => table !== agentTaskSessions ? db.update(table) : {
+          set: (values: Record<string, unknown>) => ({ where: async () => { Object.assign(conversation, values); return []; } }),
+        },
+        transaction: async (operation: (tx: unknown) => Promise<unknown>) =>
+          db.transaction((tx: Record<string, any>) => operation(wrap(tx))),
+      });
+      const db = wrap(base as unknown as Record<string, any>) as unknown as Db;
+      const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
+        if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+        }) };
+        if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
+        if (command.args?.[1]?.includes("base64")) {
+          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
+          catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
+        }
+        return { exitCode: 0, timedOut: false, stdout: "", stderr: "" };
+      });
+      const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+        for (const operation of operations) for (const file of operation.files) {
+          await mkdir(dirname(file.targetPath), { recursive: true });
+          await cp(file.sourcePath, file.targetPath, { recursive: true });
+        }
+      });
+      const remoteSession = join(remoteCwd, ".paperclip-runtime/paperclip-runner/sessions",
+        createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
+      // The fake transport: every session open/recovery prepares the host
+      // first (as runnerd-codex-transport does), then the Runner opens its
+      // provider thread on the box.
+      const refusals: unknown[] = [];
+      const prepare = { run: async (): Promise<void> => { throw new Error("prepare not wired"); } };
+      const writeBoxThread = async (threadId: string) => {
+        await mkdir(join(remoteSession, "runner"), { recursive: true });
+        await writeFile(join(remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+          schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId,
+          providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+        }));
+      };
+      const fresh = { kind: "fresh-thread-session", close: vi.fn(async () => undefined) };
+      const restored = { kind: "restored-session", close: vi.fn(async () => undefined) };
+      const openSession = vi.fn(async () => {
+        try { await prepare.run(); } catch (error) { refusals.push(error); throw error; }
+        await writeBoxThread("fresh-provider-thread");
+        return fresh;
+      });
+      const recoverSession = vi.fn(async () => {
+        try { await prepare.run(); } catch (error) {
+          refusals.push(error);
+          // As codex-app-server-driver-impl.ts: a refused prepare is a
+          // recovered:false result carrying the exact refusal code.
+          return { recovered: false, reason: String(error), recoveryRefusalCode: (error as { code?: string }).code };
+        }
+        return { recovered: true, session: restored };
+      });
+      state.createBackend.mockReturnValueOnce({ kind: "test", openSession, recoverSession } as never);
+      const onLog = vi.fn(async () => undefined);
+      const backend = await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true, onLog,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
+          leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
+          effectiveCapabilities: { runnerWebSocketIngress: true },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "sandbox-created" },
+          runner: { execute: remoteExecute, syncIn },
+        } as never,
+      });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      const options = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { prepareExternalRunnerState: () => Promise<void> };
+      prepare.run = options.prepareExternalRunnerState;
+      // The newest backup names the provider thread of the source box.
+      const backupRoot = join(options.stateDirectory!, "failover-backups/current");
+      backupDirectory.root = backupRoot;
+      for (const directory of resolveNativeHarnessPersistenceProfile(current).directories)
+        await mkdir(join(backupRoot, directory.name), { recursive: true });
+      const runnerState = durableRunnerState({ runId: current.binding.runId, normalizedSessionId: current.session.normalizedSessionId,
+        runnerInstanceId, environmentLeaseId: "lease-created" }, "suspended");
+      await writeFile(join(backupRoot, "runner/runner-state.json"), JSON.stringify(runnerState));
+      await writeFile(join(backupRoot, "runner/codex-provider-state.json"), JSON.stringify({
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "retained-provider-thread",
+        providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+      }));
+      await writeFile(join(backupRoot, "codex-home/sentinel.txt"), "retained provider home");
+      await writeFile(join(backupRoot, "manifest.json"), JSON.stringify(buildNativeHarnessBackupManifest({
+        backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "prior-sandbox",
+        providerSessionIdentity: identityOf("retained-provider-thread"),
+      })));
+      const resets = () => (conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>)
+        .providerIdentityResets as Array<Record<string, unknown>>;
+      const snapshot = (overrides: Record<string, unknown> = {}) => ({ backendKind: "runner", driverKind: "codex_app_server",
+        sessionId: "retained-provider-thread", providerSessionId: "retained-provider-thread",
+        identity: { runId: current.binding.runId, sessionId: current.session.normalizedSessionId },
+        workingDirectory: current.workspace.cwd, cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [],
+        providerRecoveryPolicy: "allow_replacement_after_governed_wait", ...overrides }) as never;
+      return { current, backend, options, remoteSession, syncIn, openSession, recoverSession, fresh, restored, refusals,
+        onLog, resets, snapshot, root: options.stateDirectory! };
+    }
+
+    const expectRecordedFreshThread = (fixture: Awaited<ReturnType<typeof floorFixture>>) => {
+      // The refused restore copied nothing onto the new box.
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+      expect(fixture.refusals).toEqual([expect.objectContaining({ code: FLOOR_CODE })]);
+      // Recorded through J3-17's lineage append: one step, old thread -> the box's new thread.
+      expect(fixture.resets()).toEqual([expect.objectContaining({ schema: "paperclip.provider-identity-reset.v1",
+        generation: 1, reason: "resume_failed_on_new_box", companyId: fixture.current.binding.companyId,
+        taskKey: fixture.current.binding.issueId, normalizedSessionId: fixture.current.session.normalizedSessionId,
+        previousIdentity: identityOf("retained-provider-thread"), identity: identityOf("fresh-provider-thread"),
+        runId: fixture.current.binding.runId })]);
+      // ONE person-visible continuation note, named, never a failure note.
+      expect(sameRunFreshThreadNotice).toHaveBeenCalledOnce();
+      expect(sameRunFreshThreadNotice).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+        companyId: fixture.current.binding.companyId, issueId: fixture.current.binding.issueId,
+        agentId: fixture.current.binding.agentId, runId: fixture.current.binding.runId,
+        code: FLOOR_CODE, reason: "restore_unavailable_on_new_box" }));
+      expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("continuing from saved history"));
+      expect(fixture.onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining(FLOOR_CODE));
+    };
+
+    beforeEach(() => { sameRunFreshThreadNotice.mockClear(); });
+
+    it("(no proof) a first message on a created box with an unretired source answers on a recorded fresh thread in the SAME run", async () => {
+      const fixture = await floorFixture("no-proof");
+      await expect(fixture.backend.openSession({ identity: { runId: fixture.current.binding.runId,
+          sessionId: fixture.current.session.normalizedSessionId },
+        workingDirectory: fixture.current.workspace.cwd } as never)).resolves.toBe(fixture.fresh);
+      expect(fixture.openSession).toHaveBeenCalledTimes(2);
+      expectRecordedFreshThread(fixture);
+      // The source box's backup is set aside, never deleted.
+      expect(await readdir(join(fixture.root, "continuity-breaks"))).toHaveLength(1);
+    });
+
+    it("(SMA-60) checkpoint.restore tried and refused while recovering the saved session -> the same run answers on a recorded fresh thread", async () => {
+      const fixture = await floorFixture("sma60");
+      const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
+      expect(recovered).toMatchObject({ recovered: true, session: fixture.fresh });
+      expect(fixture.recoverSession).toHaveBeenCalledOnce();
+      expect(fixture.openSession).toHaveBeenCalledOnce();
+      expectRecordedFreshThread(fixture);
+    });
+
+    it("guard: an AUTHORIZED restore still restores the same thread (no fresh thread, no note)", async () => {
+      const fixture = await floorFixture("authorized", "destroyed");
+      const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
+      expect(recovered).toMatchObject({ recovered: true, session: fixture.restored });
+      expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
+        .toBe("retained-provider-thread");
+      expect(fixture.openSession).not.toHaveBeenCalled();
+      expect(fixture.resets()).toEqual([]);
+      expect(sameRunFreshThreadNotice).not.toHaveBeenCalled();
+    });
+
+    it("guard: a session with a turn in flight keeps the named refusal (no silent replacement)", async () => {
+      const fixture = await floorFixture("in-flight");
+      const recovered = await fixture.backend.recoverSession!(fixture.snapshot({ activeTurnId: "turn-in-flight" }),
+        { signal: new AbortController().signal });
+      expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: FLOOR_CODE });
+      expect(fixture.openSession).not.toHaveBeenCalled();
+      expect(fixture.resets()).toEqual([]);
+      expect(sameRunFreshThreadNotice).not.toHaveBeenCalled();
+    });
+
+    it("guard: a fresh-thread code that is NOT a floor member keeps today's next-run path", async () => {
+      const fixture = await floorFixture("non-member");
+      fixture.recoverSession.mockResolvedValueOnce({ recovered: false, reason: "remote state unavailable",
+        recoveryRefusalCode: "runner_remote_state_unavailable" } as never);
+      const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
+      expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: "runner_remote_state_unavailable" });
+      expect(fixture.openSession).not.toHaveBeenCalled();
+      expect(sameRunFreshThreadNotice).not.toHaveBeenCalled();
+    });
   });
 
   it.each([

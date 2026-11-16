@@ -56,3 +56,25 @@ it.each([undefined, "future_unknown"])("server receives one generic code for old
   expect(runnerPrepareRefusalCode({ runnerCommandResult: { commandType: "run.prepare", status: "failed",
     result: { code: "command_execution_failed", refusalCode, message: "Pi run.prepare launch does not match the runner-owned qualified profile" } } })).toBe("provider_prepare_refused");
 });
+
+// J3-22 floor (RFL 08:06Z): ONE closed set. Its members are FRESH_THREAD_REFUSAL_CODES
+// members whose automatic retry already takes a fresh thread; the floor only moves
+// that fresh thread into the same run. Every other code stays out.
+it("the same-run fresh-thread floor is a closed subset of FRESH_THREAD_REFUSAL_CODES", async () => {
+  const refusal = await import("./runner-reconciliation-refusal.js") as Record<string, unknown>;
+  const members = refusal.SAME_RUN_FRESH_THREAD_REFUSAL_CODES as readonly string[] | undefined;
+  const codeOf = refusal.sameRunFreshThreadCode as ((value: unknown) => string | null) | undefined;
+  expect(members).toContain("runner_harness_state_mismatch: backup_without_reusable_lease");
+  for (const member of members ?? []) expect(FRESH_THREAD_REFUSAL_CODES).toContain(member);
+  const code = "runner_harness_state_mismatch: backup_without_reusable_lease";
+  expect(codeOf?.(nativeReconciliationError(code))).toBe(code);
+  expect(codeOf?.(new Error("opaque", { cause: nativeReconciliationError(code) }))).toBe(code);
+  expect(codeOf?.(code)).toBe(code);
+  // Prose never authorizes; non-members keep today's next-run path.
+  expect(codeOf?.(new Error(code))).toBeNull();
+  for (const other of FRESH_THREAD_REFUSAL_CODES.filter(value => !(members ?? [code]).includes(value))) {
+    expect(codeOf?.(nativeReconciliationError(other))).toBeNull();
+    expect(codeOf?.(other)).toBeNull();
+  }
+  expect(codeOf?.("runner_harness_state_mismatch: provider_identity_changed")).toBeNull();
+});
