@@ -1,4 +1,4 @@
-import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, chown, lstat, mkdir, mkdtemp, readFile, readlink, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -43,6 +43,72 @@ async function fixture() {
   return { root, runtime, file, header, content, driver, snapshot, recover, factory, requests, transport,
     changeNative(id: string, path = file) { nativeId = id; nativeFile = path; },
     async cleanup() { await transport.close(); await rm(root, { recursive: true, force: true }); } };
+}
+
+async function symlinkPathsBelow(directory: string): Promise<string[]> {
+  const found: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) found.push(path);
+    else if (info.isDirectory()) found.push(...await symlinkPathsBelow(path));
+  }
+  return found;
+}
+
+async function managedRecoveryFixture(oldNpmLink = false) {
+  const root = await mkdtemp(join(tmpdir(), "pi-managed-recovery-"));
+  const runtime = join(root, "runtime"); await mkdir(runtime);
+  const workspace = root;
+  const originalHome = join(root, "original-agent");
+  const agentHome = join(root, "managed-agent");
+  await mkdir(originalHome);
+  const packageA = join(originalHome, "npm", "node_modules", "pkg-a");
+  const packageB = join(originalHome, "npm", "node_modules", "@scope", "pkg-b");
+  await mkdir(join(packageA, "extensions"), { recursive: true });
+  await mkdir(join(packageB, "extensions"), { recursive: true });
+  await writeFile(join(packageA, "package.json"), JSON.stringify({ name: "pkg-a", version: "1.0.0" }));
+  await writeFile(join(packageB, "package.json"), JSON.stringify({ name: "@scope/pkg-b", version: "2.0.0" }));
+  await writeFile(join(packageB, "extensions", "selected.js"), "export const value = 'restored-resource';\n");
+  const packages = ["npm:pkg-a", { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"];
+  await writeFile(join(originalHome, "settings.json"), JSON.stringify({ packages }));
+  await writeFile(join(originalHome, "models.json"), JSON.stringify({}));
+  vi.stubEnv("PI_CODING_AGENT_DIR", originalHome);
+  if (oldNpmLink) {
+    await mkdir(agentHome);
+    await symlink(join(originalHome, "npm"), join(agentHome, "npm"));
+    await writeFile(join(agentHome, "settings.json"), JSON.stringify({ packages }));
+  }
+  const file = join(runtime, "conversation.jsonl");
+  const header = { type: "session", version: 3, id: "native-managed", timestamp: new Date().toISOString(), cwd: workspace };
+  const content = JSON.stringify(header) + "\n";
+  await writeFile(file, content, { mode: 0o600 });
+  let closed = false, wake: (() => void) | undefined;
+  const requests: string[] = [];
+  const model = { provider: "paperclip", id: "faux" };
+  const transport = {
+    pid: null, get exited() { return closed; },
+    async request(type: string) {
+      requests.push(type);
+      return { data: type === "get_state" ? { sessionId: header.id, sessionFile: file, model, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+        : type === "get_available_models" ? { models: [model] }
+        : type === "set_model" ? model
+        : type === "get_available_thinking_levels" ? { levels: ["off"] }
+        : type === "prompt" ? { disposition: "handled" } : undefined };
+    },
+    async *events(): AsyncIterable<PiRpcRecord> { while (!closed) await new Promise<void>(resolve => { wake = resolve; }); },
+    async close() { closed = true; wake?.(); },
+  };
+  const factory = vi.fn((_options: PiRpcTransportOptions) => transport as unknown as PiRpcTransport);
+  const driver = new PiRpcDriver({ command: process.execPath, runtimeDirectory: runtime, model: "paperclip/faux", piRpcThinkingLevel: "off",
+    environment: { HOME: root, PI_CODING_AGENT_DIR: agentHome, PI_OFFLINE: "1", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "env",
+      PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+    transportFactory: factory });
+  const snapshot: PersistedHarnessSession & { sessionFile: string } = { driverKind: "pi_rpc", driverSessionId: header.id, providerSessionId: header.id,
+    runId: "run-restored", normalizedSessionId: "conversation", workingDirectory: workspace, activeTurnId: null, lastSourceSequence: 40, sessionFile: file };
+  return { root, originalHome, agentHome, packageA, packageB, packages, file, content, factory, requests, transport,
+    async recover() { return driver.recoverSession!(snapshot, { signal: new AbortController().signal }); },
+    async cleanup() { await transport.close(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); } };
 }
 
 describe("Pi driver verified cold recovery", () => {
@@ -95,6 +161,36 @@ describe("Pi driver verified cold recovery", () => {
       delete (f.snapshot as Partial<typeof f.snapshot>).sessionFile;
       const result = await f.recover(); expect(result.recovered).toBe(true);
       await result.session!.close({ reason: "test" });
+    } finally { await f.cleanup(); }
+  });
+
+  it("restores managed npm packages without a per-session npm symlink", async () => {
+    const f = await managedRecoveryFixture();
+    try {
+      const result = await f.recover(); expect(result.recovered).toBe(true);
+      try {
+        expect(await symlinkPathsBelow(f.agentHome)).toEqual([]);
+        const settings = JSON.parse(await readFile(join(f.agentHome, "settings.json"), "utf8"));
+        expect(settings.packages).toEqual([f.packageA,
+          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"]);
+      } finally { await result.session!.close({ reason: "test" }); }
+    } finally { await f.cleanup(); }
+  });
+
+  it("restores a tree containing the legacy npm link without depending on it", async () => {
+    const f = await managedRecoveryFixture(true);
+    try {
+      const result = await f.recover(); expect(result.recovered).toBe(true);
+      try {
+        expect((await lstat(join(f.agentHome, "npm"))).isSymbolicLink()).toBe(true);
+        expect(await readlink(join(f.agentHome, "npm"))).toBe(join(f.originalHome, "npm"));
+        const settings = JSON.parse(await readFile(join(f.agentHome, "settings.json"), "utf8"));
+        expect(settings.packages).toEqual([f.packageA,
+          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"]);
+        expect(settings.packages.some((entry: unknown) => typeof entry === "string" && entry.startsWith("npm:")
+          || typeof entry === "object" && entry !== null && "source" in entry && String(entry.source).startsWith("npm:"))).toBe(false);
+        await expect(readFile(join(settings.packages[1].source, "extensions/selected.js"), "utf8")).resolves.toBe("export const value = 'restored-resource';\n");
+      } finally { await result.session!.close({ reason: "test" }); }
     } finally { await f.cleanup(); }
   });
 
