@@ -24597,7 +24597,7 @@ describe("runnerd provider runtime wiring", () => {
         companyId: fixture.current.binding.companyId, issueId: fixture.current.binding.issueId,
         agentId: fixture.current.binding.agentId, runId: fixture.current.binding.runId,
         code: FLOOR_CODE, reason: "restore_unavailable_on_new_box" }));
-      expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("continuing from saved history"));
+      expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("continuing in a fresh provider thread"));
       expect(fixture.onLog).not.toHaveBeenCalledWith("stderr", expect.stringContaining(FLOOR_CODE));
     };
 
