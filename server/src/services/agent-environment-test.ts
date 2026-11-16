@@ -30,7 +30,7 @@ import { pluginEnvironmentRequiresAgent } from "./plugin-environment-driver.js";
 
 // The setup check's sandbox lease must outlive box start, the probe (up to 45 s) and
 // its proven retirement (up to 60 s, plus one retained retry): 180 s could expire mid-retirement.
-const NATIVE_SETUP_TEST_LEASE_MS = 360_000;
+const NATIVE_SETUP_TEST_LEASE_MS = 600_000;
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult> {
   const testedAt = new Date().toISOString();
