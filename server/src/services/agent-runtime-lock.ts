@@ -2,7 +2,7 @@ import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
 /**
- * The company connector-runtime lock (migration 0489). Company-wide runtime
+ * The company connector-runtime lock (migration 0491). Company-wide runtime
  * invalidation (membership, grant and connector writes) holds it exclusively and
  * every per-agent runtime revision holds it shared, both until commit.
  *
@@ -20,7 +20,7 @@ export async function lockCompanyAgentRuntime(tx: Pick<Db, "execute">, companyId
  * #20805 R3: the SHARED side of the same lock, for a production path that holds
  * an agent row and needs company-wide runtime changes (connector, grant and
  * membership writes) to wait until it commits. Take it RIGHT AFTER the agent row
- * lock (rows, then this lock; the order of migration 0489). `noWait` mirrors a
+ * lock (rows, then this lock; the order of migration 0491). `noWait` mirrors a
  * NOWAIT row lock: it returns false instead of waiting for an exclusive holder.
  */
 export async function holdCompanyAgentRuntimeShared(tx: Pick<Db, "execute">, companyId: string, options: { noWait?: boolean } = {}) {
