@@ -153,7 +153,8 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     const value = stub(); const release = Promise.withResolvers<void>();
     value.session.close = async () => release.promise;
     const error = await probe(value.driver, { cleanupTimeoutMs: 5 }).catch(error => error);
-    expect(error).toMatchObject({ code: "pi_probe_cleanup_unconfirmed" });
+    expect(error).toMatchObject({ code: "pi_probe_cleanup_unconfirmed", operationError: undefined,
+      probeResult: { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: config.model, providerSessionId: "native-session", helloProbePassed: true } });
     release.resolve(); await error.retired;
   });
   it("retains and retires an opener arriving after both observation deadlines", async () => {
