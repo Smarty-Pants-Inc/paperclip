@@ -24425,7 +24425,7 @@ describe("runnerd provider runtime wiring", () => {
     const identityOf = (threadId: string) =>
       ({ providerSessionId: threadId, providerBackendSessionId: null, providerSessionIdentity: null });
 
-    async function floorFixture(label: string, proof: "none" | "destroyed" = "none") {
+    async function floorFixture(label: string, proof: "none" | "destroyed" | "stopping" | "stuck" = "none") {
       const remoteCwd = join(isolatedStateDirectory, `remote-j322-${label}`);
       const current: NativeExecutionInputV1 = { ...execution,
         binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(),
@@ -24440,7 +24440,63 @@ describe("runnerd provider runtime wiring", () => {
           generation: 1, boundary: { provider: "codex", cwd: null, workspaceId: null, trust: "trusted" },
           previousId: null, reason: "first_message", runId: randomUUID(), providerIdentityResets: [] },
       } as Record<string, unknown> };
-      const base = leaseDb(current), ordinarySelect = base.select.bind(base);
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      const base = leaseDb(current, {}, {}, updates), ordinarySelect = base.select.bind(base);
+      // J3-22 primary: the source lease is RETAINED, its configuration changed (no
+      // source change), and this run's acquisition armed a stop-only stop. The
+      // provider confirms the stop after a few reads ("stopping"), or never ("stuck").
+      const source = { reads: 0, settleAfterReads: proof === "stopping" ? 4 : Number.POSITIVE_INFINITY };
+      const realNow = Date.now.bind(Date);
+      // "stuck": after a few reads the clock passes the 60 s RFL bound.
+      if (proof === "stuck") {
+        const clock = vi.spyOn(Date, "now").mockImplementation(() => realNow() + (source.reads >= 4 ? 61_000 : 0));
+        onTestFinished(() => clock.mockRestore());
+      }
+      if (proof === "stopping" || proof === "stuck") {
+        base.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
+          const sourceRunQuery = Boolean(table === heartbeatRuns && fields && "sourceRunStatus" in fields);
+          if (table !== executionWorkspaces && table !== environmentLeases && table !== heartbeatRunEvents && !sourceRunQuery)
+            return ordinarySelect(fields as never).from(table as never);
+          if (table === environmentLeases && !fields) source.reads += 1;
+          const manifest = backupDirectory.root ? readFileSync(join(backupDirectory.root, "manifest.json")) : "";
+          const sha = `sha256:${createHash("sha256").update(manifest).digest("hex")}`;
+          const stamp = { schema: "paperclip.native-harness-backup-stamp.v2", normalizedSessionId: current.session.normalizedSessionId,
+            runnerInstanceId, sessionScopeSha256: "a".repeat(64), sourceProviderLeaseId: "prior-sandbox",
+            authorizedProviderLeaseId: "prior-sandbox", manifestSha256: sha, completedAt: "2026-11-05T05:02:50.000Z" };
+          const scope = { version: 1, executionWorkspaceId: current.binding.executionWorkspaceId };
+          const settled = source.reads > source.settleAfterReads;
+          const confirmedAt = new Date(realNow()).toISOString();
+          // Acquisition stops every obsolete native source with reason
+          // sandbox_source_changed (ER cleanupObsoleteReusableSandboxLeases); here
+          // the current lease booted the SAME source (an env-only change).
+          const row = { id: "source-lease", companyId: current.binding.companyId, heartbeatRunId: "source-run", provider: "daytona",
+            providerLeaseId: "prior-sandbox", leasePolicy: "reuse_by_environment", environmentId: "environment",
+            acquiredAt: new Date(realNow() - 60_000), expiresAt: null,
+            ...(settled ? { status: "released", cleanupStatus: "success", failureReason: null, releasedAt: new Date(realNow()),
+              metadata: { nativeHarnessBackup: stamp, pluginId: "daytona-plugin", reusableSandboxLease: scope,
+                remoteExecutionTermination: { schema: "paperclip.remote-termination.v1", companyId: current.binding.companyId,
+                  runId: "source-run", leaseId: "source-lease", provider: "daytona", providerLeaseId: "prior-sandbox",
+                  state: "stopped", confirmedAt },
+                sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1", requestId: "stop-request",
+                  companyId: current.binding.companyId, runId: "source-run", leaseId: "source-lease", provider: "daytona",
+                  providerLeaseId: "prior-sandbox", pluginId: "daytona-plugin", method: "environmentStopLease", confirmedAt },
+                pendingCleanupInFlight: false } }
+              : { status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending", releasedAt: new Date(realNow()),
+                metadata: { nativeHarnessBackup: stamp, pluginId: "daytona-plugin", reusableSandboxLease: scope,
+                  sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", requestId: "stop-request",
+                    reason: "sandbox_source_changed", leaseId: "source-lease", providerLeaseId: "prior-sandbox",
+                    pluginId: "daytona-plugin" },
+                  pendingCleanupInFlight: true } }),
+          };
+          const rows = sourceRunQuery ? [{ sourceRunStatus: "succeeded" }]
+            : fields?.run ? [] : table === executionWorkspaces ? [] : table === heartbeatRunEvents ? []
+              : [{ metadata: {}, providerLeaseId: "sandbox-created", companyId: current.binding.companyId,
+                heartbeatRunId: current.binding.runId, environmentId: "environment" }, row];
+          const query = { then: Promise.resolve(rows).then.bind(Promise.resolve(rows)),
+            leftJoin: () => query, innerJoin: () => query, where: () => query, limit: () => query };
+          return query;
+        } })) as unknown as Db["select"];
+      }
       if (proof === "destroyed") {
         // The guard: Paperclip destroyed the source (an authorized restore).
         base.select = ((fields?: Record<string, unknown>) => ({ from: (table: unknown) => {
@@ -24528,7 +24584,8 @@ describe("runnerd provider runtime wiring", () => {
       const restored = { kind: "restored-session", close: vi.fn(async () => undefined) };
       const openSession = vi.fn(async () => {
         try { await prepare.run(); } catch (error) { refusals.push(error); throw error; }
-        await writeBoxThread("fresh-provider-thread");
+        // A restored box resumes its thread; an empty box opens a new one.
+        if (!existsSync(join(remoteSession, "runner/codex-provider-state.json"))) await writeBoxThread("fresh-provider-thread");
         return fresh;
       });
       const recoverSession = vi.fn(async () => {
@@ -24578,7 +24635,7 @@ describe("runnerd provider runtime wiring", () => {
         workingDirectory: current.workspace.cwd, cursor: "0", activeTurnId: null, pendingRuntimeRequests: [], lineage: [],
         providerRecoveryPolicy: "allow_replacement_after_governed_wait", ...overrides }) as never;
       return { current, backend, options, remoteSession, syncIn, openSession, recoverSession, fresh, restored, refusals,
-        onLog, resets, snapshot, root: options.stateDirectory! };
+        onLog, resets, snapshot, root: options.stateDirectory!, updates, source };
     }
 
     const expectRecordedFreshThread = (fixture: Awaited<ReturnType<typeof floorFixture>>) => {
@@ -24668,6 +24725,48 @@ describe("runnerd provider runtime wiring", () => {
       expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: FLOOR_CODE });
       expect(fixture.openSession).not.toHaveBeenCalled();
       expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+    });
+
+    // J3-22 PRIMARY (wanted): a RETAINED source whose fingerprint changed by an env,
+    // skill or instructions write (no source change) is being stopped by this
+    // run's own acquisition. Wait, bounded (at most 60 s, a named constant),
+    // for THAT stop to be confirmed, then ask the EXISTING retired-source proof
+    // again; never restore while the source may still run.
+    it("(b) retained source stopping after a config change -> stop confirmed, then restored on the FIRST run: same providerSessionId and bytes", async () => {
+      const fixture = await floorFixture("primary-b", "stopping");
+      await expect(fixture.backend.openSession({ identity: { runId: fixture.current.binding.runId,
+        sessionId: fixture.current.session.normalizedSessionId } } as never)).resolves.toBe(fixture.fresh);
+      expect(fixture.openSession).toHaveBeenCalledOnce();
+      expect(fixture.refusals).toEqual([]);
+      // Restored only after the stop was confirmed (the source was read while stopping, then settled).
+      expect(fixture.source.reads).toBeGreaterThan(fixture.source.settleAfterReads);
+      expect(fixture.syncIn).toHaveBeenCalled();
+      expect(await readFile(join(fixture.remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
+      // The same provider thread as the backup's manifest, on the new box.
+      expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
+        .toBe("retained-provider-thread");
+      // No fresh thread, no note, no lineage step.
+      expect(fixture.resets()).toEqual([]);
+      expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+      expect(fixture.onLog).toHaveBeenCalledWith("stdout", expect.stringContaining("finished stopping"));
+      // (iii) In the restore's claim, the source's reuse scope moves into a superseded
+      // receipt for this run and box, so reuse never selects the old lease again.
+      const claim = fixture.updates.filter(update => update.table === environmentLeases)[0]?.values.metadata as Record<string, unknown> | undefined;
+      expect(claim).toEqual(expect.objectContaining({ reusableSandboxLeaseSuperseded: expect.objectContaining({
+        supersededByRunId: fixture.current.binding.runId, supersededByProviderLeaseId: "sandbox-created",
+        reusableSandboxLease: { version: 1, executionWorkspaceId: fixture.current.binding.executionWorkspaceId } }) }));
+      expect(claim).not.toHaveProperty("reusableSandboxLease");
+    });
+
+    it("(c) the stop is not confirmed within the bound -> nothing restored; the floor answers in the same run", async () => {
+      const fixture = await floorFixture("primary-c", "stuck");
+      await expect(fixture.backend.openSession({ identity: { runId: fixture.current.binding.runId,
+        sessionId: fixture.current.session.normalizedSessionId } } as never)).resolves.toBe(fixture.fresh);
+      // It waited (read the stopping source more than once) before falling to the floor.
+      expect(fixture.source.reads).toBeGreaterThan(2);
+      expect(fixture.openSession).toHaveBeenCalledTimes(2);
+      expectRecordedFreshThread(fixture);
+      expect(fixture.updates.filter(update => update.table === environmentLeases)).toEqual([]);
     });
 
     it("guard: a fresh-thread code that is NOT member (a) keeps today's next-run path", async () => {
