@@ -193,6 +193,8 @@ export interface HeartbeatRuntimeExecutionInput {
     onPersistedNativeLog?: (cursor: number, chunk: string) => Promise<void>;
     onAdapterEvent: NonNullable<AdapterExecutionContext["onEvent"]>;
     onAdapterMeta: AdapterExecutionContext["onMeta"];
+    /** Commit tool-output events whose text tail is still held, with that tail. */
+    finishAdapterEvents?: () => Promise<void>;
     identityRedactor: ReturnType<typeof createAgentIdentityRedactor>;
     appendIdentityRedactedLog: AdapterExecutionContext["onLog"];
   };
@@ -266,7 +268,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
     const providerDispatch = AsyncLocalStorage.bind(dispatch);
     return measureRunPhase("execution.dispatch_admission", () => dispatchResolvedInteractionContinuationWithAtomicGate(providerDispatch));
   };
-  const { identityRedactor, appendIdentityRedactedLog, onLog, onAdapterEvent, onAdapterMeta } = input.output;
+  const { identityRedactor, appendIdentityRedactedLog, onLog, onAdapterEvent, onAdapterMeta, finishAdapterEvents } = input.output;
   const { executionWorkspacesSvc, instanceSettings, envOrchestrator, upsertTaskSession, getRun, cancelRunInternal, enqueueWakeup, persistRunProcessMetadata, recordCurrentHeartbeatRunRuntimeProgress, dispatchPendingNativeStatusWakeups } = input.services;
   const localAgentJwtScope =
     issueRef?.workMode === "skill_test"
@@ -993,6 +995,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const tail = identityRedactor.finish(stream);
       if (tail) await appendIdentityRedactedLog(stream, tail);
     }
+    await finishAdapterEvents?.();
     const instructionSave = input.instructions.getInstructionSave();
     if (instructionSave) adapterResult.resultJson = { ...adapterResult.resultJson, instructionSave };
 
@@ -1099,6 +1102,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       await completeWorkspace();
     }
   } catch (adapterErr) {
+    // Tool-output events the adapter already sent are committed, never dropped.
+    await finishAdapterEvents?.().catch(() => undefined);
     if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.

@@ -3457,8 +3457,8 @@ export function heartbeatService(
           message: "run started",
         }));
 
-        const { currentUserRedactionOptions, appendIdentityRedactedLog, onLog, onPersistedNativeLog, onAdapterMeta, onAdapterEvent } =
-          await timePreparation("run_output", () => runOutput.begin(currentRun));
+        const { currentUserRedactionOptions, appendIdentityRedactedLog, onLog, onPersistedNativeLog, onAdapterMeta, onAdapterEvent,
+          finishAdapterEvents } = await timePreparation("run_output", () => runOutput.begin(currentRun));
         if (runScopedMentionedSkillKeys.length > 0) {
           await onLog(
             "stdout",
@@ -3734,6 +3734,7 @@ export function heartbeatService(
             onPersistedNativeLog,
             onAdapterEvent,
             onAdapterMeta,
+            finishAdapterEvents,
           },
           services: {
             executionWorkspacesSvc,

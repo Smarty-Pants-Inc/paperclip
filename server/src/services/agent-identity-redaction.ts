@@ -243,6 +243,8 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       else materialStreams.delete(stream);
       return redactRegisteredSecretValues(output, values);
     },
+    /** True while `chunk` still holds text of this stream for its next piece. */
+    holds(stream: string): boolean { return hasPending(stream); },
     // An interrupted partial secret must not be flushed as plaintext.
     finish(stream: string): string {
       const held = pending.get(stream);
