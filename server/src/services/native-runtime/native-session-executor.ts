@@ -12990,6 +12990,12 @@ async function executePaperclipNativeSessionAttempt(
       });
       await trace.measure("runner.port_holders.retire", () => executionContext ? executionContext.wait(retirePortHolders) : retirePortHolders());
     }
+    // A same-run restart reattach that adopted the Runner the previous server
+    // launched keeps that server's GitHub access in its environment. The
+    // broker's in-memory authority is not persisted for adoption
+    // (doc/execution-github-identity.md), so this session retires at run end.
+    const restartAdoptedGitHubRunner = () => needsCoreGitHubAccess(input) && runnerdBackend?.restartAdoptedRunner?.() === true;
+    let restartGitHubAccessNoted = false;
     nativeSessionExecuteStartedAtMs = Date.now();
     native = await trace.measure(
       "native.session.execute",
@@ -13313,6 +13319,10 @@ async function executePaperclipNativeSessionAttempt(
                     lastActivityAt: new Date().toISOString(),
                   });
                 const owner = warmNativeSessions.get(warmSessionId);
+                // #20797: never keep this run's new GitHub access beside the old process as reusable.
+                if (owner?.ownerToken === warmSessionOwnerToken && restartAdoptedGitHubRunner()) {
+                  owner.closeOnReleaseReason ??= "warm native session adopted after a server restart holds stale GitHub access";
+                }
                 if (owner && input.instructionWorkingCopy?.runId && input.instructionWorkingCopy.checkpointWarm) owner.instructionCopy = {
                   runId: input.instructionWorkingCopy.runId, root: input.instructionWorkingCopy.root, targetIdentity: instructionTargetIdentity(input.runnerExecutionTarget),
                   collectStopped: input.instructionWorkingCopy.collectStopped,
@@ -13328,6 +13338,10 @@ async function executePaperclipNativeSessionAttempt(
                   }
                   forgetWarmNativeSession(warmSessionId, existing);
                 }
+              }
+              if (session && !restartGitHubAccessNoted && restartAdoptedGitHubRunner()) {
+                restartGitHubAccessNoted = true;
+                await input.onLog?.("stderr", "[paperclip] GitHub access for this turn is unavailable after a server restart; the session retires at run end (github_access_restart_reattach).\n").catch(() => undefined);
               }
               if (session) {
                 const active: ActiveNativeSession = { session, cancelRequested: false, admissionAbort: new AbortController() };
@@ -17362,6 +17376,8 @@ type ManagedRunnerdBackend = NativeSessionBackend & {
   providerAdmissionPersisted?(signal?: AbortSignal): Promise<void>;
   providerAdmissionRequired?(): boolean;
   providerTurnNeverIssued?(): boolean;
+  /** This backend serves a same-run restart reattach that adopted the previous server's Runner. */
+  restartAdoptedRunner?(): boolean;
 };
 
 async function createRunnerdBackendWithinSessionClaim(
@@ -19578,6 +19594,8 @@ async function createRunnerdBackendWithinSessionClaim(
               signalVerifiedRecoveryProcess(localRecoveryProcess, signal),
           }
         : undefined;
+  const restartAdoptedRunner = Boolean(adoptedProcess) && !releasedAdoption && !input.remoteWarmRecovery
+    && (input.restartRecovery?.kind === "reattach_remote_runner" || input.restartRecovery?.kind === "reattach_existing_runner");
   if (adoptingPersistedRemoteRunner && !adoptedProcess && !input.retainedSandboxOwner && requiresRemoteProviderPack) {
     // Bind the relaunch to the pack this session was admitted with (the saved
     // authority, verified as an exact installed identity), never a newer one.
@@ -20105,6 +20123,7 @@ async function createRunnerdBackendWithinSessionClaim(
       finally { clearTimeout(timer); abort.abort(); }
     },
     sandboxRetention,
+    restartAdoptedRunner: () => replacementBackend ? replacementBackend.restartAdoptedRunner?.() === true : restartAdoptedRunner,
     bindManagedSession: (session, options) => replacementBackend
       ? replacementBackend.bindManagedSession(session, options) : wrapManagedSession(session),
     providerTurnNeverIssued: () => replacementBackend?.providerTurnNeverIssued
