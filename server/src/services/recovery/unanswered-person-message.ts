@@ -23,6 +23,7 @@ import { conversationTurnAnswered } from "../native-runtime/native-governance.js
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 
 /**
@@ -642,7 +643,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
 
-  const held = isNativeContinuationRefusal(run) || HELD_CODES.has(code);
+  // A fresh-thread refusal is continued by the fresh-continuation fallback on
+  // its own (#20925): never the held-conversation "send a new message" note,
+  // as isNativeContinuationRefusal already decides for its own patterns.
+  const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
