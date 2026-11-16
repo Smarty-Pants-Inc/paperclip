@@ -16515,6 +16515,33 @@ describe("native session bounded recovery", () => {
       .toBe("native_session_interrupted");
   });
 
+  // F7a C2 PART B (RFL 11:04Z): TL08 4e25ee88 failed with the Runner's bare
+  // typed absence, thrown by the fresh open (seq 63 runner.control_plane.open
+  // mode=bootstrap failed, seq 67 error "PRP provider resume state is
+  // unavailable"); no replacement was attempted or refused. Today (e3af01cd)
+  // that is the retryable native_session_interrupted (automatic retry). Only the
+  // runtime's refusal after an attempted, denied proof is the permanent name.
+  it("C2: keeps TL08's definite absence, with no replacement attempted, a retryable interruption", () => {
+    const now = new Date("2026-11-16T08:10:57.000Z");
+    const tl08 = Object.assign(new NativeRunnerResumeStateUnavailableError(),
+      { cause: new Error("runner_remote_state_unavailable: exit=66 timedOut=false") });
+    const recoveryComposed = new Error(
+      "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
+    );
+    for (const failure of [tl08, new NativeRunnerResumeStateUnavailableError(), recoveryComposed]) {
+      const code = nativeSessionFailureSourceCode(failure);
+      expect(code, failure.message).toBe("native_session_interrupted");
+      expect(nativeSessionFailureDisposition(1, now, code)).toEqual({
+        phase: "retryable_failure", failureCode: "native_session_interrupted", nextAttemptAt: new Date(now.getTime() + 30_000) });
+    }
+    // Guard: the in-flight refusal after a denied tool-work proof stays named and permanent.
+    const refused = new NativeProviderStateIncompatibleError("NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable");
+    const refusedCode = nativeSessionFailureSourceCode(refused);
+    expect(refusedCode).toBe("native_provider_state_incompatible");
+    expect(nativeSessionFailureDisposition(1, now, refusedCode)).toEqual({
+      phase: "terminal_failure", failureCode: "native_provider_state_incompatible", nextAttemptAt: null });
+  });
+
   // Chaos w-20261111T011704-s9107/t05: after a cut-off ACPX turn start the
   // Runner saved the session closed; three same-run resumes each got the same
   // refusal before the board offered Retry.

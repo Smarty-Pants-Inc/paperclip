@@ -7209,6 +7209,71 @@ describe("executeNativeSession recovery", () => {
       expect(h.openReplacementSession).not.toHaveBeenCalled();
       expect(h.openSession).not.toHaveBeenCalled();
     });
+
+    // F7a C2 PART B (RFL 11:04Z): the PERMANENT name is only for a replacement
+    // that was attempted and refused WITH the proof. Where no replacement is
+    // allowed, the in-flight absence keeps today's (e3af01cd) composed
+    // recovery failure, which the server classifies as the retryable
+    // native_session_interrupted, and the proof is never asked.
+    it.each([
+      ["no recovery policy", {}, undefined],
+      ["same_session_only", { providerRecoveryPolicy: "same_session_only" as const }, undefined],
+      ["the governed wait's policy", { providerRecoveryPolicy: "allow_replacement_after_governed_wait" as const }, undefined],
+      ["a preconfigured home under the plain policy", { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }, "preconfigured" as const],
+    ] as const)("C2: keeps today's retryable recovery failure, not the permanent name, when no replacement is allowed (%s)", async (_label, overrides, homeMode) => {
+      const h = harness({ checkpoint: sameRunCheckpoint(overrides), proof: true,
+        ...(homeMode ? { executionInput: { ...preparedInput(), workspace: { ...preparedInput().workspace, cwd: WORKSPACE },
+          schema: "paperclip.native-execution-input.v7", homeMode } as unknown as NativeExecutionInputV5 } : {}) });
+      const failure = await h.run().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(NativeProviderStateIncompatibleError);
+      expect((failure as Error).message).toBe(
+        "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable");
+      expect(h.recoverSession).toHaveBeenCalledOnce();
+      expect(h.provesNoRunToolWork).not.toHaveBeenCalled();
+      expect(h.openReplacementSession).not.toHaveBeenCalled();
+      expect(h.openSession).not.toHaveBeenCalled();
+      expect(h.openRun).not.toHaveBeenCalled();
+    });
+
+    // C2 guard: replacement allowed, proof attempted and DENIED -> still named.
+    it("C2 guard: names native_provider_state_incompatible when the replacement is allowed and the tool-work proof is denied", async () => {
+      const h = harness({ checkpoint: sameRunCheckpoint({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" }), proof: false });
+      const failure = await h.run().catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(NativeProviderStateIncompatibleError);
+      expect(h.provesNoRunToolWork).toHaveBeenCalledOnce();
+      expect(h.openReplacementSession).not.toHaveBeenCalled();
+    });
+
+    // TL08 4e25ee88 (gcp1 brief tl08-followup-events-4e25ee88.txt seq 56-67):
+    // the absence is raised by the FRESH open (runner.control_plane.open,
+    // mode=bootstrap, failed), with no recovery and no replacement attempted.
+    // The runtime passes the Runner's typed absence through unchanged; the
+    // server's classifier decides its disposition.
+    it("C2 TL08 shape: the fresh open's definite absence escapes before any recovery or replacement, typed and unchanged", async () => {
+      const real = createCodexNativeSessionBackend(executionInput, { runnerInstanceId: "runner-tl08", transportFactory: vi.fn(() => new FakeCodexTransport()) });
+      const absence = definiteAbsence();
+      const openSession = vi.fn(async () => { throw absence; });
+      const openReplacementSession = vi.fn(async () => { throw new Error("no replacement on the fresh open path"); });
+      const recoverSession = vi.fn(async () => ({ recovered: false as const, reason: "no checkpoint" }));
+      const openRun = vi.fn(async () => undefined);
+      const failure = await executeNativeSession({
+        input: executionInput,
+        backend: { descriptor: () => real.descriptor(), openSession, openReplacementSession, recoverSession },
+        controlPlane: {
+          openRun, loadSessionCheckpoint: async () => null, checkpointSession: async () => {},
+          appendEvent: async () => ({ cursor: 0, highestContiguousSourceSeq: 0, disposition: "committed" }),
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }), completeRun: async () => {},
+        } as unknown as ControlPlanePort,
+        runnerInstanceId: "runner-tl08", controlPlaneInstanceId: "control-tl08",
+      }).catch((error: unknown) => error);
+      expect(failure).toBe(absence);
+      expect((failure as Error).message).toBe("PRP provider resume state is unavailable");
+      expect(openSession).toHaveBeenCalledOnce();
+      expect(recoverSession).not.toHaveBeenCalled();
+      expect(openReplacementSession).not.toHaveBeenCalled();
+      expect(openRun).not.toHaveBeenCalled();
+    });
   });
 
   // A remote workspace epoch was abandoned, so the run was assigned a new
