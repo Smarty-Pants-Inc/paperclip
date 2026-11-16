@@ -12,6 +12,7 @@ type Cleanup = {
   retryRetirement?: () => Promise<void>;
   retired: "pending" | "confirmed" | "failed";
   blocksAccount: boolean;
+  verifiedProbeRetirement?: boolean;
   running?: Promise<void>;
   executing?: boolean;
   warned?: boolean;
@@ -67,18 +68,22 @@ function attempt(entry: Cleanup): Promise<void> {
 export function retainAiCredentialCleanup(input: {
   // Accept legacy Google home metadata for compatibility. Only the explicit
   // bindRetainedAiCredentialHome mapping grants home-to-account authority.
-  scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string; blocksAccount?: boolean;
+  scope: RetainedAiCleanupScope; cleanup: () => Promise<void>; retired?: Promise<void>; retryRetirement?: () => Promise<void>; home?: string; blocksAccount?: boolean; verifiedProbeRetirement?: boolean;
 }): void {
   const scopeKey = key(input.scope);
   const entries = retained.get(scopeKey) ?? new Set<Cleanup>();
   if ([...entries].some(entry => entry.cleanup === input.cleanup)) return;
   const entry: Cleanup = { scope: { ...input.scope }, home: input.home, cleanup: input.cleanup, retryRetirement: input.retryRetirement,
-    retired: input.retired ? "pending" : "confirmed", blocksAccount: input.blocksAccount !== false };
+    retired: input.retired ? "pending" : "confirmed", blocksAccount: input.blocksAccount !== false, verifiedProbeRetirement: input.verifiedProbeRetirement };
   entries.add(entry); retained.set(scopeKey, entries);
   if (input.retired) void input.retired.then(() => {
     entry.retired = "confirmed";
     return attempt(entry).catch(() => undefined);
   }, () => { entry.retired = "failed"; warn(entry); });
+}
+
+export function assertNoPendingVerifiedProbeRetirement(scope: RetainedAiCleanupScope): void {
+  if ([...(retained.get(key(scope)) ?? [])].some(entry => entry.verifiedProbeRetirement && entry.blocksAccount)) throw pending();
 }
 
 export async function reconcileRetainedAiCleanup(scope: RetainedAiCleanupScope): Promise<void> {

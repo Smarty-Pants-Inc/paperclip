@@ -27,7 +27,7 @@ import { NativeEnvironmentProbeCleanupError, sanitizeAntigravityCredential } fro
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
-import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup } from "./retained-ai-credential-cleanup.js";
+import { assertNoPendingVerifiedProbeRetirement, bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, reconcileRetainedAiCleanupForHome, retainAiCredentialCleanup } from "./retained-ai-credential-cleanup.js";
 import { logActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 
@@ -647,6 +647,7 @@ export async function withManagedAiProbe<T>(
   const cleanupTouchesAccountState = runtime.attribution.method === "subscription" && input.binding.provider !== "anthropic";
   let retained = false;
   try {
+    if (runtime.retainedCleanupScope) assertNoPendingVerifiedProbeRetirement(runtime.retainedCleanupScope);
     return await probe(runtime);
   }
   catch (error) {
@@ -658,6 +659,12 @@ export async function withManagedAiProbe<T>(
         retained = true;
         const retryRetirement = error.retryCleanup;
         const blocksAccount = cleanupTouchesAccountState;
+        let cleanupFailure: unknown;
+        let cleanupOperation: Promise<void> | undefined;
+        const retainedHome = runtime.home && path.join(runtime.home, "provider");
+        const cleanup = () => cleanupOperation = Promise.resolve().then(runtime.cleanup).then(() => { cleanupFailure = undefined; }, caught => { cleanupFailure = caught; throw caught; });
+        retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: retainedHome, cleanup, retired: error.retired,
+          ...(retryRetirement ? { retryRetirement: () => retryRetirement.call(error) } : {}), blocksAccount, verifiedProbeRetirement: true });
         const recordOutcome = async (outcome: "retired" | "retried" | "retained", reason?: string) => {
           const details = { outcome, ...(reason ? { reason } : {}) };
           const log = outcome === "retained" ? logger.warn.bind(logger) : logger.info.bind(logger);
@@ -680,18 +687,15 @@ export async function withManagedAiProbe<T>(
           for (let attempt = 0; attempt < 3; attempt++) {
             try {
               if (attempt === 0) await error.retired;
-              else if (retryRetirement) await retryRetirement.call(error);
-              else throw failure ?? new Error("Native probe retirement retry is unavailable.");
-              await runtime.cleanup();
+              else if (retainedHome) await reconcileRetainedAiCleanupForHome(retainedHome);
+              else await reconcileRetainedAiCleanup(runtime.retainedCleanupScope!);
+              if (cleanupOperation) await cleanupOperation;
+              if (cleanupFailure !== undefined) throw cleanupFailure;
               await recordOutcome(attempt === 0 ? "retired" : "retried");
               return;
             } catch (caught) { failure = caught; }
           }
           await recordOutcome("retained", safeReason(failure));
-          const retired = Promise.reject(failure ?? new Error("Native probe retirement was not confirmed."));
-          void retired.catch(() => undefined);
-          retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup,
-            retired, ...(retryRetirement ? { retryRetirement: () => retryRetirement.call(error) } : {}), blocksAccount });
         })().catch(backgroundError => {
           logger.warn({ event: "native_probe_retirement_worker_failed", companyId: input.companyId, agentId: input.agentId,
             errorName: backgroundError instanceof Error ? backgroundError.name : "UnknownError" }, "Native probe retirement worker failed");
