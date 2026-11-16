@@ -148,6 +148,7 @@ import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } f
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { withTransactionRetry } from "../services/transaction-retry.js";
+import { AccountingContentionError, isAccountingContentionError, isAccountingRetryable } from "../services/accounting-transaction.js";
 import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -1433,6 +1434,14 @@ export function agentRoutes(
         grantedByUserId,
       );
     }), 5);
+  }
+
+  // #20805's grant retry above stays exactly as it is (five attempts; the grant
+  // runs after the create transaction committed). When a persistent 40P01/40001
+  // exhausts it, the caller gets upstream's named retryable error (HTTP 503,
+  // SQLSTATE in `code`), never a bare 500. The committed agent is unchanged.
+  function namedGrantContention(error: unknown): never {
+    throw isAccountingRetryable(error) && !isAccountingContentionError(error) ? new AccountingContentionError(error, 5) : error;
   }
 
   async function assertCanCreateAgentsForCompany(req: Request, companyId: string, options?: { hiring?: true }) {
@@ -4899,7 +4908,7 @@ export function agentRoutes(
         companyId,
         agent.id,
         actor.actorType === "user" ? actor.actorId : null,
-      );
+      ).catch(namedGrantContention);
 
       if (approval) {
         await logActivity(db, {
@@ -5119,7 +5128,7 @@ export function agentRoutes(
       companyId,
       agent.id,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
+    ).catch(namedGrantContention);
     // Company-wide defaults (root CEO + built-in agents) stay on the create
     // route, outside the retried per-agent grant transaction (review-fleet-2).
     await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);

@@ -15,7 +15,7 @@ import type { AgentLifecycleRequester } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { logActivity, persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
-import { withAccountingTransaction } from "./accounting-transaction.js";
+import { AccountingContentionError, isAccountingContentionError, isAccountingRetryable, withAccountingTransaction } from "./accounting-transaction.js";
 import { AGENT_HANDOVER_PENDING_CODE, pendingAgentHandover } from "./agent-handover-items.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
@@ -73,6 +73,20 @@ export function lifecycleErrorDetail(error: unknown): string {
   return serialized.length <= 512 ? serialized : "[]";
 }
 
+/** The lifecycle's transaction: ONE attempt, no internal retry (#20389 ctl6). A
+ * rollback PostgreSQL proves (40P01/40001) in a root lifecycle transaction reaches
+ * the caller as upstream's named retryable error (HTTP 503, SQLSTATE in `code`,
+ * the database error only in `cause`), never a bare 500; nothing was written and
+ * nothing was published. Inside a caller's transaction the database error goes to
+ * that transaction's owner unchanged. */
+function lifecycleTransaction<T>(db: Db, companyId: string,
+  work: (tx: Db, publications: ActivityPublication[]) => Promise<T>): Promise<T> {
+  if ("nestedIndex" in db) return withAccountingTransaction(db, companyId, work);
+  return withAccountingTransaction(db, companyId, work).catch((error: unknown) => {
+    throw isAccountingRetryable(error) && !isAccountingContentionError(error) ? new AccountingContentionError(error, 1) : error;
+  });
+}
+
 export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): lifecycle.LifecycleEffects {
   return {
     async setupRequiresPreparation(db, companyId, environmentId, profile) {
@@ -119,7 +133,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     // One attempt. The terminal step touches no task row, so it never meets
     // checkout's task-then-agent order; a rollback is retried only by the
     // lifecycle worker's next explicit attempt, which re-reads and re-authorizes.
-    transaction: withAccountingTransaction,
+    transaction: lifecycleTransaction,
     // The terminal step's named effect: in the same transaction as the
     // terminated state and its hand-over marker, write the one terminal audit
     // row for every entry point (POST /terminate and PATCH status alike) and
