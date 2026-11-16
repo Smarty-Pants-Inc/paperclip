@@ -377,6 +377,35 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     expect(provider.verify).not.toHaveBeenCalled();
   });
 
+  // Live finding D-RF2-0011: use the actual route/common writer and saved task,
+  // with no adjacent-contract mocks. Confirmation is data, never authority.
+  it("D-RF2-0011/J11: queued work on A's stored task refuses board retirement with a visible run link and no effects", async () => {
+    const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+    const work = await f.run();
+    await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, work.run.id));
+    const result = await request(f.route()).delete(`/api/tool-connections/${connection.id}`);
+    expect(result.status).toBe(409);
+    expect(result.body).toMatchObject({ code: "project_connection_in_use", runs: [{ id: work.run.id, href: `/runs/${work.run.id}` }] });
+    expect(await storedConnection(db, connection.id)).toEqual(connection);
+    expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))[0]).toEqual(grant);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+  });
+
+  it("D-RF2-0011/A06b: B's agent for the same human cannot confirm A done or retire it while A work is queued", async () => {
+    const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+    const work = await f.run();
+    await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, work.run.id));
+    const result = await request(f.route(f.leadB.id)).delete(`/api/tool-connections/${connection.id}`)
+      .send({ projectDoneConfirmation: { projectId: f.a.id, connectionId: connection.id } });
+    expect(result.status).toBe(403);
+    expect(result.body.code).toBe("project_connection_actor_required");
+    expect(await storedConnection(db, connection.id)).toEqual(connection);
+    expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grant.id)))[0]).toEqual(grant);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+  });
+
   // These additional checks exercise D's actual PostgreSQL transaction and
   // HTTP/remove code with ONLY A/B's not-yet-implemented contracts isolated.
   // They are D data-safety/lock proofs, NOT admission/identity qualification and
@@ -515,6 +544,8 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: wrong.projectDoneConfirmation })).status).toBe(409);
       const confirmation = { projectId: f.a.id, connectionId: connection.id };
       expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: confirmation })).status).toBe(200);
+      const [receipt] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, connection.id), eq(activityLog.action, "tool_connection.archived")));
+      expect(receipt?.details).toMatchObject({ projectDoneConfirmed: true, projectId: f.a.id, connectionId: connection.id });
       // A conflicting retry cannot turn the state-bound receipt into a replay API.
       expect((await request(f.route()).delete(`/api/tool-connections/${connection.id}`).send({ projectDoneConfirmation: wrong.projectDoneConfirmation })).status).toBe(409);
     });
@@ -553,6 +584,20 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       expect(await retirement).toMatchObject({ error: { status: 409, details: { code: "project_connection_in_use" } } });
       expect(await storedConnection(db, connection.id)).toEqual(connection);
       expect(await db.select().from(activityLog).where(eq(activityLog.entityId, connection.id))).toHaveLength(0);
+    });
+
+    it("D/A06 receipt visibility: transactional disable and activation receipts remain visible in the existing activity reader", async () => {
+      const f = await projectConnectionFixture(db); const { connection } = await f.seedConnection();
+      await db.transaction(async tx => {
+        const [disabled] = await tx.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, connection.id)).returning();
+        await writeProjectConnectionReceipt(tx, { connection: disabled!, actor: { actorType: "user", actorId: f.human },
+          action: "tool_connection.updated", reason: "connection_disabled" });
+      });
+      const activity = await f.service.listConnectionActivity(connection.id, f.companyId);
+      expect(activity.lifecycleEvents).toEqual([expect.objectContaining({ connectionId: connection.id, type: "app_paused", actorType: "user", actorId: f.human })]);
+      const p = await pending(); await version(p.f); await activate(p);
+      const activation = await p.f.service.listConnectionActivity(p.candidate.connection.id, p.f.companyId);
+      expect(activation.lifecycleEvents).toEqual([expect.objectContaining({ connectionId: p.candidate.connection.id, type: "app_resumed", actorId: p.f.primary.id })]);
     });
 
     it("D/A10: no activity publication before commit; failed post-commit publication retains one durable receipt", async () => {
