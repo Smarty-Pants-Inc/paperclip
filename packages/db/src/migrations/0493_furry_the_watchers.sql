@@ -1,4 +1,6 @@
 -- online_compatible: no; ADD COLUMN project_id uuid is nullable, with no default or backfill; CREATE UNIQUE INDEX on existing tool_connections is non-concurrent and can block writes while it builds. No DROP, existing-column ALTER, or NOT NULL without default. Older images keep writing project_id NULL and remain schema-compatible after application; do not apply alongside live writers without a staging window.
 -- paperclip:migration-compat requires_staging: nullable additive column preserves old-image reads/writes, but the unchanged non-concurrent unique index on the existing table requires a controlled application window.
+-- lock_timeout: 500ms per acquisition; abort and roll back rather than queue tool/credential reads for 1s. The runner retries transactional SQLSTATE 55P03 at most three times.
+SET LOCAL lock_timeout = '500ms';--> statement-breakpoint
 ALTER TABLE "tool_connections" ADD COLUMN "project_id" uuid;--> statement-breakpoint
 CREATE UNIQUE INDEX "tool_connections_project_live_installation_uq" ON "tool_connections" USING btree ("company_id","project_id",("config" #>> '{projectScope,installationKey}')) WHERE "tool_connections"."project_id" IS NOT NULL AND "tool_connections"."status" <> 'archived' AND ("tool_connections"."config" #>> '{projectScope,installationKey}') IS NOT NULL;

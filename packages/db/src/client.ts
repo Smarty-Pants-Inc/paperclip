@@ -547,6 +547,35 @@ async function runInTransaction(sql: SqlExecutor, action: () => Promise<void>): 
   }
 }
 
+class MigrationLockTimeoutError extends Error {
+  readonly name = "MigrationLockTimeoutError";
+  readonly code = "migration_lock_timeout";
+
+  constructor(readonly migrationFile: string, readonly attempts: number, cause: unknown) {
+    super(`Migration ${migrationFile} aborted after ${attempts} lock timeouts; release blocking transactions and rerun migrations.`, { cause });
+  }
+}
+
+async function runMigrationTransaction(
+  sql: SqlExecutor,
+  migrationFile: string,
+  action: () => Promise<void>,
+): Promise<void> {
+  const maxAttempts = 3;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await runInTransaction(sql, action);
+      return;
+    } catch (error) {
+      if (!(error instanceof postgres.PostgresError) || error.code !== "55P03") throw error;
+      if (attempt === maxAttempts) throw new MigrationLockTimeoutError(migrationFile, attempt, error);
+      // runInTransaction has rolled back DDL and history and released table
+      // locks. Back off outside the transaction so queued readers can proceed.
+      await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** (attempt - 1)));
+    }
+  }
+}
+
 async function latestMigrationCreatedAt(
   sql: SqlExecutor,
   qualifiedTable: string,
@@ -799,7 +828,7 @@ async function applyPendingMigrationsManually(
         } else if (MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS.has(migrationFile)) {
           await applyMigration();
         } else {
-          await runInTransaction(sql, applyMigration);
+          await runMigrationTransaction(sql, migrationFile, applyMigration);
         }
       }
     } finally {
