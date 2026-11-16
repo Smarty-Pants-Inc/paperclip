@@ -297,16 +297,39 @@ describe("project connection writer admission (round-4 B)", () => {
     const f = await projectConnectionFixture(db);
     const legacy = await f.seedConnection(null);
     await approveExistingProjectFixture(db, f, legacy.connection.id);
-    const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
+    const { connection, grant } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
     const harness = composeFinish(f, APPROVED_KEY_VERSION);
     harness.receipt.mockRejectedValue(new Error("synthetic receipt fault"));
     const before = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId));
+    // RFL 11:41Z 11-16: the reused legacy S and explicitly seeded candidate,
+    // plus ONLY C4 config + H approval, are durable setup, not finish residue.
+    const source = await storedConnection(db, legacy.connection.id);
+    const receipt = source.config.projectAppApproval;
+    expect(receipt).toEqual({ version: 1, id: expect.any(String), companyId: f.companyId, humanUserId: f.human,
+      projectId: f.a.id, appId: "123", installationId: "456", repositoryIds: [101],
+      secretRef: { secretId: f.secret.id, configPath: "credentials.privateKey" }, verifiedAt: expect.any(String), revokedAt: null });
+    const byId = <T extends { id: string }>(rows: T[]) => [...rows].sort((a, b) => a.id.localeCompare(b.id));
+    expect(byId(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))))
+      .toEqual(byId([{ ...legacy.connection, updatedAt: source.updatedAt,
+        config: { ...legacy.connection.config, projectAppApproval: receipt },
+        transportConfig: { ...legacy.connection.transportConfig, projectAppApproval: receipt } }, connection]));
+    expect(byId(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))))
+      .toEqual(byId([legacy.grant, grant]));
+    const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    const configured = beforeActivity.find(row => row.action === "plugin.config.updated")!;
+    const approved = beforeActivity.find(row => row.action === "tool_connection.project_app_approved")!;
+    expect(byId(beforeActivity)).toEqual(byId([
+      { ...configured, companyId: f.companyId, action: "plugin.config.updated", entityType: "plugin", actorType: "user", actorId: f.human },
+      { ...approved, companyId: f.companyId, action: "tool_connection.project_app_approved", entityType: "tool_connection",
+        entityId: legacy.connection.id, actorType: "user", actorId: f.human },
+    ]));
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
       .rejects.toThrow("synthetic receipt fault");
     expect((await storedConnection(db, connection.id))).toMatchObject({ status: "draft", enabled: false, config: { projectScope: { migrationPending: true } } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId))).toEqual(before);
     expect(await db.select().from(toolProfiles).where(eq(toolProfiles.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect(byId(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))), "M02 activity delta exactly 0")
+      .toEqual(byId(beforeActivity));
     expect((await storedConnection(db, legacy.connection.id)).enabled).toBe(true);
   });
 
