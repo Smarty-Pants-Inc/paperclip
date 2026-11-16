@@ -107,7 +107,6 @@ import {
   rejectIssueThreadInteractionSchema,
   requestCheckboxConfirmationPayloadSchema,
   requestCheckboxConfirmationResultSchema,
-  requestConfirmationIssueDocumentTargetSchema,
   requestConfirmationPayloadSchema,
   requestConfirmationCustomTargetSchema,
   requestConfirmationIssueAttachmentTargetSchema,
