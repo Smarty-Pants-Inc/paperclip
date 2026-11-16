@@ -12,6 +12,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
+import { HttpError } from "../errors.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { isProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 import { isGitHubDotCom } from "./github-fetch.js";
@@ -768,8 +769,10 @@ export async function resolveManagedGitHubCredential(
     const result = await acquire(selection);
     if (result.credential) return result;
     failure = result;
-  } catch {
-    failure = { configured: true, identitySource: selection.identitySource, error: "GitHub credentials are temporarily unavailable" };
+  } catch (error) {
+    const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
+    failure = { configured: true, identitySource: selection.identitySource,
+      error: typeof code === "string" && code.startsWith("project_app_") ? code : "GitHub credentials are temporarily unavailable" };
   }
   if (context.explicitGrantId) return failure;
   if (selection.connection && isGitHubAppConnection(selection.connection)) return failure;

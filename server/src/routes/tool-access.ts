@@ -94,6 +94,7 @@ import {
 import { isLoopbackHost } from "../url-utils.js";
 import { trustedBoardMutationOrigin } from "../middleware/board-mutation-guard.js";
 import { connectionIntentService } from "../services/connection-intents.js";
+import { projectAppCustodyRoutes } from "./project-app-custody.js";
 import { redactRemoteUrlCredential } from "../services/remote-url-credentials.js";
 import { connectionIntentDeliveryService } from "../services/connection-intent-delivery.js";
 import type { heartbeatService } from "../services/heartbeat.js";
@@ -273,6 +274,7 @@ export function toolAccessRoutes(
   } = {},
 ) {
   const router = Router();
+  router.use(projectAppCustodyRoutes(db));
   const svc = toolAccessService(db, options);
   const policySvc = toolAccessPolicyService(db);
   const connectionIntents = connectionIntentService(db);
