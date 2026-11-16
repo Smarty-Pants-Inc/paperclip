@@ -157,8 +157,9 @@ scenarios:
     capabilities:
       - agents/lifecycle
     context: >-
-      Morgan is an ordinary agent with historical tasks and an active assignment. Termination is
-      board-only.
+      Morgan is an ordinary agent with historical tasks and an active assignment. A board user,
+      or an agent whose configure grant covers Morgan as a strict reporting descendant, may
+      terminate Morgan.
     query: >-
       Retire Morgan, but keep their old work.
     expected_outcome: >-

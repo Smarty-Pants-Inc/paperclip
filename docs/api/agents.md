@@ -198,6 +198,13 @@ POST /api/agents/{agentId}/terminate
 
 Permanently deactivates the agent. **Irreversible.**
 
+Board users, and agent callers whose direct `agents:configure` grant covers a
+strict reporting descendant, can terminate (`PATCH` with `status: "terminated"`
+is the same command). An agent with live reports and no manager, or whose live
+reports the caller could not re-home, is refused with `409 agent_has_live_reports`.
+After Stop and cleanup, the agent shows `handover.code = "agent_handover_pending"`
+until its open tasks and live reports have moved to the nearest active manager.
+
 ## Create API Key
 
 ```
