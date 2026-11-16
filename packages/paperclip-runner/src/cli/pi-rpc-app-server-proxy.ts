@@ -99,6 +99,9 @@ type PiRpcProxySession = Omit<HarnessSession, "attachRun" | "resolveRuntimeReque
   reconnect?(): Promise<void> | void;
   parkReady?(): Promise<{ ready: boolean; reasons: string[] }>;
   compact?(input?: { customInstructions?: string }): Promise<Record<string, unknown>>;
+  /** turn/start's run attach and turn share one native admission budget. */
+  beginTurnAdmission?(): void;
+  endTurnAdmission?(): void;
 };
 
 export interface PiRpcAppServerProxyOptions {
@@ -748,18 +751,24 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
             userMessage.text,
           ].join("\n\n");
         }
-        if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
-        if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
-        if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
-        const piRpcThinkingLevel = parsePiThinkingLevel(
-          params.effort ?? params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
-        );
-        const turnInput = {
-          message: userMessage,
-          model: activeModel,
-          ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
-        } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
-        const turn = await session.startTurn(turnInput);
+        // One receive wait covers this run attach and the turn: one admission budget.
+        const admission = params.paperclipRunId !== undefined ? session : null;
+        admission?.beginTurnAdmission?.();
+        let turn: Awaited<ReturnType<HarnessSession["startTurn"]>>;
+        try {
+          if (params.paperclipRunId !== undefined) await attachRun(params, params.paperclipRunId);
+          if (params.piThinkingLevel !== undefined) throw new Error("Native Pi requires piRpcThinkingLevel, not the ACPX field");
+          if (params.model !== undefined && params.model !== activeModel) throw new Error("Pi turn model differs from the admitted session");
+          const piRpcThinkingLevel = parsePiThinkingLevel(
+            params.effort ?? params.piRpcThinkingLevel ?? environment.PAPERCLIP_PI_THINKING_LEVEL,
+          );
+          const turnInput = {
+            message: userMessage,
+            model: activeModel,
+            ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
+          } as Parameters<HarnessSession["startTurn"]>[0] & { piRpcThinkingLevel?: PiThinkingLevel };
+          turn = await session.startTurn(turnInput);
+        } finally { admission?.endTurnAdmission?.(); }
         recoveryColdStartPending = false;
         activeTurnId = turn.turnId;
         if (recoveryNoticePending) {

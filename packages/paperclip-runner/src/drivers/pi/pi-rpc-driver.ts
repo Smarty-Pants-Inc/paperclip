@@ -657,6 +657,8 @@ export class PiRpcHarnessSession implements HarnessSession {
   #agentTurn: PiTurnState | null = null;
   #streamTurn: PiTurnState | null = null;
   #admitted = true;
+  #shareTurnAdmission = false;
+  #turnAdmissionBudget: PiAdmissionBudget | undefined;
   #failure: Error | null = null;
   #closed = false;
   readonly #timings: { span: ProviderPerformanceSpan; origin: { runId: string; turnId?: string } }[] = [];
@@ -719,6 +721,12 @@ export class PiRpcHarnessSession implements HarnessSession {
     await this.#revokeBinding(budget);
   }
 
+  /** The facade's turn/start attaches its run and starts the turn within one
+   * receive wait: between begin and end, the attach's admission budget is
+   * carried into the next startTurn (one budget per admission, not two). */
+  beginTurnAdmission(): void { this.#shareTurnAdmission = true; this.#turnAdmissionBudget = undefined; }
+  endTurnAdmission(): void { this.#shareTurnAdmission = false; this.#turnAdmissionBudget = undefined; }
+
   async attachRun(input: Parameters<NonNullable<HarnessSession["attachRun"]>>[0] & {
     signal?: AbortSignal;
     baseInstructions?: string;
@@ -729,6 +737,7 @@ export class PiRpcHarnessSession implements HarnessSession {
       await this.#waitForInterrupt(input.runId);
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
       const budget = new PiAdmissionBudget(this.#admissionTimeoutMs);
+      this.#turnAdmissionBudget = this.#shareTurnAdmission ? budget : undefined;
       if (this.#resident) {
         const previous = this.#resident.context;
         const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal, budget, { runId: input.runId });
@@ -1035,7 +1044,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       // A prepared epoch needs a fresh read-only state proof, not another
       // configuration write. A new binding still performs full admission.
       // Both paths prove idle before replacing a handled input's discard gate.
-      const budget = new PiAdmissionBudget(this.#admissionTimeoutMs);
+      const budget = this.#turnAdmissionBudget ?? new PiAdmissionBudget(this.#admissionTimeoutMs);
+      this.#turnAdmissionBudget = undefined;
       if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context, undefined, budget);
       else {
         if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
