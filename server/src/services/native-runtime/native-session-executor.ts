@@ -961,6 +961,15 @@ function forgetWarmNativeSession(scope: string, entry: WarmNativeSession) {
 
 const pluginTaskSessionOwners = new WeakMap<NativeSession, ReturnType<typeof createPluginRunnerTaskOwner>>();
 const sandboxSessionOwners = new WeakMap<NativeSession, SandboxRunnerRetention>();
+// The one definition of "this warm owner has a release/resume pair": a v1
+// plugin task owner whose driver offers releaseResume (plugin-runner-task.ts),
+// or a retained sandbox Runner (its driver; native-runner-execution-driver.ts
+// `releaseResume` = sandboxRetention.driver ?? process.releaseResume). A pair
+// owner is released only by its turn-end finishRelease, under its
+// reconciliation deadline and source proofs.
+function warmOwnerHasReleaseResumePair(session: NativeSession): boolean {
+  return Boolean(pluginTaskSessionOwners.get(session)?.driver.releaseResume || sandboxSessionOwners.get(session)?.driver);
+}
 // Closing a remote owner saves its checkpoint asynchronously. A new turn must
 // not inspect or quarantine that owner's state until the save has finished.
 const closingWarmNativeSessions = new Map<string, Promise<void>>();
@@ -9104,11 +9113,15 @@ async function releaseWarmNativeSession(
   // A late completion or cleanup callback from an older execution must never
   // release a replacement that has since claimed the same logical session.
   if (!entry || entry.ownerToken !== ownerToken) return;
-  if (!failed && entry.closeOnReleaseReason === undefined && !entry.released) {
+  if (!failed && entry.closeOnReleaseReason === undefined && !entry.released
+    && !warmOwnerHasReleaseResumePair(entry.session)) {
     // #20825: tell the retained owner the server released it to idle, while it
     // is still busy here so no admission can attach to it meanwhile. A Runner
     // without a release/resume pair suspends nothing; it only records the fact
-    // that lets its idle runner's exit stand down instead of relaunching.
+    // that lets its idle runner's exit stand down instead of relaunching. A
+    // pair owner is never released here: its release belongs to finishRelease
+    // (deadline + source proofs), and an errored or unconfirmed one there
+    // leaves entry.released false without inviting a second release.
     await Promise.resolve().then(() => entry.session.release?.()).catch(() => undefined);
     if (warmNativeSessions.get(sessionId) !== entry || entry.ownerToken !== ownerToken) return;
   }
@@ -14412,7 +14425,7 @@ async function executePaperclipNativeSessionAttempt(
         ownedSession.closeOnReleaseReason = "registered instruction edits require stopped-provider collection";
       }
       if (retainSession && ownedSession?.ownerToken === warmSessionOwnerToken && !ownedSession.closeOnReleaseReason
-        && (pluginTaskSessionOwners.get(ownedSession.session)?.driver.releaseResume || sandboxSessionOwners.get(ownedSession.session)?.driver)) {
+        && warmOwnerHasReleaseResumePair(ownedSession.session)) {
         const scope = warmSessionId, entry = ownedSession, token = warmSessionOwnerToken;
         entry.finishRelease = async () => {
           const current = () => warmNativeSessions.get(scope) === entry && entry.ownerToken === token;
