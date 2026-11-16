@@ -62,6 +62,15 @@ export async function approveProjectFixture(db: Db, f: Fixture, project = f.a, i
   return { sourceId: source.body.id as string, applicationId: source.body.applicationId as string };
 }
 
+/** Upgrade an existing legacy source without adding a second source/grant.
+ * The receipt still comes only from H's real board-session approval route. */
+export async function approveExistingProjectFixture(db: Db, f: Fixture, sourceId: string, project = f.a) {
+  await configureProjectFixture(db, f);
+  const approval = await request(sessionApp(db, f)).post(`/api/companies/${f.companyId}/tools/connections/${sourceId}/project-app-approval`)
+    .set("Origin", "http://127.0.0.1").send({ action: "approve", projectId: project.id });
+  if (approval.status !== 200) throw new Error(`Genuine existing-source H-session approval failed: ${approval.status} ${JSON.stringify(approval.body)}`);
+}
+
 /** Opt-in wrapper: the old shared fixture remains untouched for custody REDs.
  * Seeded owned rows receive real, server-written approval preconditions. */
 export async function projectConnectionFixture(db: Db, sharedLead = false) {

@@ -11,7 +11,14 @@ vi.hoisted(() => {
     const url = new URL(String(input));
     if (url.origin !== "https://api.github.com") return nativeFetch(input, init);
     const path = url.pathname;
-    if (path === "/app") return Response.json({ id: 123, slug: "project-fixture", client_id: "Iv1syntheticclient" });
+    if (path === "/app") {
+      // J07 uses this second spelling of the SAME provider registration. Model
+      // that exact Client ID at HTTP, not by bypassing provider verification.
+      const jwt = new Headers(init?.headers).get("authorization")?.replace(/^Bearer /i, "");
+      const issuer = jwt ? JSON.parse(Buffer.from(jwt.split(".")[1]!, "base64url").toString()).iss : undefined;
+      return Response.json({ id: 123, slug: "project-fixture",
+        client_id: issuer === "Iv1ProjectClient1234" ? issuer : "Iv1syntheticclient" });
+    }
     if (/^\/app\/installations\/\d+$/.test(path)) return Response.json({ id: Number(path.split("/").at(-1)), app_id: 123,
       suspended_at: null, account: { login: "owner" }, permissions: { contents: "write", pull_requests: "write", issues: "read" } });
     if (path.endsWith("/access_tokens")) {

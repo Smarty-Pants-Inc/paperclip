@@ -13,7 +13,7 @@ import * as credentials from "../services/connection-credentials.js";
 import { createToolConnectionSchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
-import { configureProjectFixture, projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
+import { approveExistingProjectFixture, configureProjectFixture, projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 describe("project connection writer admission (round-4 B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -296,8 +296,9 @@ describe("project connection writer admission (round-4 B)", () => {
   it("M02/A10: owned finish receipt failure rolls back activation, installs and profile, keeping legacy", async () => {
     const f = await projectConnectionFixture(db);
     const legacy = await f.seedConnection(null);
+    await approveExistingProjectFixture(db, f, legacy.connection.id);
     const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
     harness.receipt.mockRejectedValue(new Error("synthetic receipt fault"));
     const before = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId));
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
@@ -518,8 +519,9 @@ describe("project connection writer admission (round-4 B)", () => {
   it("M01-positive: verified finish activates and installs a pending candidate without removing legacy", async () => {
     const f = await projectConnectionFixture(db);
     const legacy = await f.seedConnection(null);
+    await approveExistingProjectFixture(db, f, legacy.connection.id);
     const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
     const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor());
     expect(result.connection).toMatchObject({ status: "active", enabled: true, config: { projectScope: { migrationPending: false } } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toMatchObject([{ targetId: f.worker.id }]);
