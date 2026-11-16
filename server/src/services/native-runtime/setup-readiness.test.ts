@@ -414,6 +414,8 @@ describe("Codex selected native account verification", () => {
     expect(nativeArtifacts.mock.results[0]!.value.prepare).toHaveBeenCalledWith("dial_wss");
     expect(registerPrp).toHaveBeenCalledWith({ companyId: "company", runId: input.transportOptions.prpIdentity.runId, authority: { marker: "native-authority" } });
     expect(remoteLauncher).toHaveBeenCalledWith(expect.objectContaining({ runnerInstanceId: input.transportOptions.prpIdentity.runnerInstanceId }));
+    // A setup check retries one timed-out launch after stopping it (smarty-dev#20916).
+    expect(remoteLauncher).toHaveBeenCalledWith(expect.objectContaining({ retryTimedOutLaunchOnce: true }));
     expect(released).toBe(true);
     expect(sshExecute.mock.calls.at(-1)![0]).toMatchObject({ command: "rm", args: ["-rf", "--", expect.stringContaining("paperclip-native-setup-")] });
     expect(sshExecute.mock.calls.some(([value]) => JSON.stringify(value).includes("company-account"))).toBe(false);

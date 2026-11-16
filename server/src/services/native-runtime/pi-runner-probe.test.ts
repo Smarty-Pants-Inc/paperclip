@@ -173,6 +173,13 @@ describe("native Pi probe runner artifact preparation", () => {
       expect(mocks.cleanupErrors).toEqual([]);
     });
 
+  it("asks the setup launcher to stop and retry one timed-out launch (smarty-dev#20916)", async () => {
+    const f = await fixture("matching");
+    await probeManagedNativePiRunner(f.context);
+    expect(mocks.launch).toHaveBeenCalled();
+    for (const [input] of mocks.launch.mock.calls) expect(input).toMatchObject({ retryTimedOutLaunchOnce: true });
+  });
+
   it("keeps the real strict cleanup archive rejecting symlinks", async () => {
     const f = await fixture("matching");
     const sourcePath = join(f.root, "unsafe-runtime"), targetPath = join(f.root, "checkpoint");

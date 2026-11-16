@@ -1986,6 +1986,88 @@ describe("remote runner process supervision", () => {
     expect(onRunnerProcessSpawned).not.toHaveBeenCalled();
   });
 
+  describe("a harness check's timed-out launch (smarty-dev#20916)", () => {
+    const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "" };
+    const timedOut = { exitCode: null, signal: null, timedOut: true, stdout: "", stderr: "" };
+    function harnessCheckLauncher(options: { launchTimesOut: number; stopProves?: boolean }) {
+      const launches: string[] = [];
+      const stops: string[] = [];
+      let releaseMonitor!: () => void;
+      const monitor = new Promise<void>(resolve => { releaseMonitor = resolve; });
+      const execute = vi.fn(async (input: { args?: string[] }) => {
+        const label = input.args?.[2];
+        if (label === "paperclip-runner-launch") {
+          launches.push(input.args![4]!);
+          return launches.length <= options.launchTimesOut ? timedOut : ok;
+        }
+        if (label === "paperclip-runner-identity-failure-cleanup") {
+          stops.push(input.args![4]!);
+          return options.stopProves === false ? { ...ok, exitCode: 3 } : ok;
+        }
+        if (label === "paperclip-runner-process-identity") {
+          return { ...ok, stdout: `${input.args![4]}\n4321\n2026-11-16T00:00:00.000Z\nrunner-remote\n` };
+        }
+        if (label === "paperclip-runner-monitor") { await monitor; return { ...ok, exitCode: 45 }; }
+        return ok;
+      });
+      const onRunnerProcessSpawned = vi.fn();
+      const handle = createRemoteRunnerProcessLauncher({
+        target: { kind: "remote", transport: "sandbox", environmentId: "environment", leaseId: "lease", remoteCwd: "/workspace" },
+        runner: { execute } as never,
+        remoteBinary: "/runtime/runnerd", processIdentityPath: "/runtime/identity",
+        stateDirectory: "/runtime", diagnosticsDirectory: "/runtime/diagnostics", runnerInstanceId: "runner-remote",
+        ensureArtifact: async () => undefined,
+        onRunnerProcessSpawned,
+        retryTimedOutLaunchOnce: true,
+        processPollMs: 1,
+      } as Parameters<typeof createRemoteRunnerProcessLauncher>[0])({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
+      return { handle, launches, stops, onRunnerProcessSpawned, releaseMonitor };
+    }
+
+    it("stops the first attempt's runnerd, then launches once more and becomes ready", async () => {
+      const { handle, launches, stops, onRunnerProcessSpawned, releaseMonitor } = harnessCheckLauncher({ launchTimesOut: 1 });
+      await vi.waitFor(() => expect(onRunnerProcessSpawned).toHaveBeenCalledTimes(1));
+      expect(handle.child.pid).toBe(4321);
+      expect(launches).toHaveLength(2);
+      expect(launches[0]).not.toBe(launches[1]);
+      // Exactly one stop, of the first attempt's own launch identity, before the retry.
+      expect(stops).toEqual([launches[0]]);
+      releaseMonitor();
+      await handle.completion.catch(() => undefined);
+    });
+
+    it("fails once with the launch timeout code after two timed-out attempts, leaving no runnerd", async () => {
+      const { handle, launches, stops, onRunnerProcessSpawned } = harnessCheckLauncher({ launchTimesOut: 2 });
+      const failure = await handle.completion.then(() => null, (error: unknown) => error) as Error & {
+        code?: string; attempts?: Array<{ attempt: number; durationMs: number; outcome: string }>;
+      };
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure.message).toMatch(/^runner_remote_process_launch_timed_out\b/);
+      expect(failure.code).toBe("runner_remote_process_launch_timed_out");
+      expect(launches).toHaveLength(2);
+      // Each attempt's possible runnerd was stopped by its own identity.
+      expect(stops).toEqual(launches);
+      expect(handle.isExitConfirmed?.()).toBe(true);
+      expect(onRunnerProcessSpawned).not.toHaveBeenCalled();
+      // The cause keeps both attempts and how long each took, and nothing else.
+      expect(failure.attempts).toEqual([
+        { attempt: 1, durationMs: expect.any(Number), outcome: "timed_out" },
+        { attempt: 2, durationMs: expect.any(Number), outcome: "timed_out" },
+      ]);
+      expect(failure.message).toMatch(/2 attempts \(\d+ ms, \d+ ms\)/);
+    });
+
+    it("fails closed without retrying when the first attempt's stop is unproven", async () => {
+      const { handle, launches, stops } = harnessCheckLauncher({ launchTimesOut: 1, stopProves: false });
+      const failure = await handle.completion.then(() => null, (error: unknown) => error) as Error & { code?: string };
+      expect(failure.message).toMatch(/^runner_remote_process_launch_timed_out_cleanup_failed\b/);
+      expect(failure.code).toBe("runner_remote_process_launch_timed_out_cleanup_failed");
+      expect(launches).toHaveLength(1);
+      expect(stops).toEqual([launches[0]]);
+      expect(handle.isExitConfirmed?.()).toBe(false);
+    });
+  });
+
   it("defers an in-flight launch signal until its exact identity is available", async () => {
     let enter!: () => void;
     let release!: () => void;
