@@ -465,4 +465,35 @@ describePg("#20805 agent hire runtime lock", () => {
     evidence("G_TWO_SESSION", { codes });
     expect(codes).not.toContain("40P01");
   }, 30_000);
+
+  // src8 (RFL + review-fleet-2 joint addendum 06:43Z, R2): no such test existed in
+  // 0d98310e..19ca9806 (no setupAgentId/setupId in this file or the lock-order file).
+  it("R2 RED setup completion: a board New Agent dialog completion (setupAgentId, sent twice) racing a 10-wide agent-key hire burst: 0 deadlocks, the draft completes exactly once", async () => {
+    const f = await fixture(20);
+    const setupId = randomUUID();
+    const setup = await request(f.boardApp).post(`/api/companies/${f.companyId}/agents`).send({ setupId, name: "Dialog draft", adapterType: "process" });
+    expect(setup.status, JSON.stringify(setup.body)).toBe(201);
+    const before = { agents: await activeAgentCount(f.companyId), deadlocks: await deadlocks() };
+    const completion = () => request(f.boardApp).post(`/api/companies/${f.companyId}/agent-hires`).send({ setupAgentId: setupId, name: "Dialog draft",
+      role: "engineer", adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } });
+    const hires = Array.from({ length: 10 }, (_, i) => request(f.agentApp).post(`/api/companies/${f.companyId}/agents`).send({ name: `Burst ${i}`,
+      role: "engineer", reportsTo: f.hirer.id, adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }));
+    const [first, second, ...burstResults] = await Promise.all([completion(), completion(), ...hires]);
+    const after = { agents: await activeAgentCount(f.companyId), deadlocks: await deadlocks() };
+    const [draft] = await db.select().from(agents).where(eq(agents.id, setupId));
+    const grants = await grantsOf(f.companyId, [setupId]);
+    const completions = [first!, second!].map(r => ({ status: r.status, idempotent: r.body?.idempotent ?? null, agentId: r.body?.agent?.id ?? null }));
+    evidence("R2_SETUP_COMPLETION_BURST", { completions, burst: burstResults.map(r => r.status), deadlockDelta: after.deadlocks - before.deadlocks,
+      agentDelta: after.agents - before.agents, holds: draft?.lifecycleHolds, memberships: grants.memberships[setupId], assign: grants.assign[setupId] });
+    expect(after.deadlocks - before.deadlocks).toBe(0);
+    expect(burstResults.map(r => r.status)).toEqual(Array(10).fill(201));
+    expect(after.agents - before.agents).toBe(10);
+    // Exactly once: one completion creates (201); the other replays it (200, idempotent).
+    expect(completions.map(c => c.status).sort()).toEqual([200, 201]);
+    expect(completions.find(c => c.status === 200)?.idempotent).toBe(true);
+    expect(completions.every(c => c.agentId === setupId)).toBe(true);
+    expect(draft?.lifecycleHolds ?? []).not.toContain("setup");
+    expect(grants.memberships[setupId]).toBe(1);
+    expect(grants.assign[setupId]).toBe(1);
+  }, 90_000);
 });
