@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -960,5 +960,118 @@ describe("PiRpcDriver", () => {
     expect(mapPiRpcRecord({ type: "agent_settled", aborted: false }, turnId)).toEqual([
       { eventType: "turn.completed", payload: { status: "completed", piAgentSettled: true }, turnId },
     ]);
+  });
+});
+
+const managedPackageDeclarations = [
+  "npm:pkg-a",
+  { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] },
+  "/abs/local-pkg",
+];
+
+async function symlinkPathsBelow(directory: string): Promise<string[]> {
+  const found: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) found.push(path);
+    else if (info.isDirectory()) found.push(...await symlinkPathsBelow(path));
+  }
+  return found;
+}
+
+async function managedPackageFixture(options: { missing?: boolean; agentHomeIsOriginal?: boolean } = {}) {
+  const root = await mkdtemp(join(tmpdir(), "pi-managed-packages-"));
+  const originalHome = join(root, "original-agent");
+  const agentHome = options.agentHomeIsOriginal ? originalHome : join(root, "managed-agent");
+  const workspace = join(root, "workspace");
+  const runtimeDirectory = join(root, "runtime");
+  await Promise.all([mkdir(originalHome, { recursive: true }), mkdir(workspace), mkdir(runtimeDirectory)]);
+  const packageA = join(originalHome, "npm", "node_modules", "pkg-a");
+  const packageB = join(originalHome, "npm", "node_modules", "@scope", "pkg-b");
+  if (!options.missing) {
+    await mkdir(join(packageA, "extensions"), { recursive: true });
+    await mkdir(join(packageB, "extensions"), { recursive: true });
+    await writeFile(join(packageA, "package.json"), JSON.stringify({ name: "pkg-a", version: "1.0.0" }));
+    await writeFile(join(packageB, "package.json"), JSON.stringify({ name: "@scope/pkg-b", version: "2.0.0" }));
+    await writeFile(join(packageA, "extensions", "index.js"), "export const value = 'pkg-a';\n");
+    await writeFile(join(packageB, "extensions", "selected.js"), "export const value = 'pkg-b-resource';\n");
+  }
+  const packages = options.missing ? ["npm:pkg-not-installed"] : managedPackageDeclarations;
+  await writeFile(join(originalHome, "settings.json"), JSON.stringify({ packages }));
+  await writeFile(join(originalHome, "models.json"), JSON.stringify({}));
+  vi.stubEnv("PI_CODING_AGENT_DIR", originalHome);
+  const model = { provider: "paperclip", id: "faux" };
+  const transport = new class extends FailureTransport {
+    override async request(type: string, input?: PiRpcRecord) {
+      this.requests.push({ type, input });
+      if (type === "prompt") this.onPrompt?.();
+      return { data: type === "get_state" ? { sessionId: "native-managed", model, thinkingLevel: "off", isStreaming: false, isCompacting: false, pendingMessageCount: 0 }
+        : type === "set_model" ? model
+        : type === "get_available_models" ? { models: [model] }
+        : type === "get_available_thinking_levels" ? { levels: ["off"] }
+        : type === "prompt" ? { disposition: this.promptDisposition } : type === "steer" ? { disposition: "queued" } : undefined };
+    }
+  }();
+  const transportFactory = vi.fn(() => transport as unknown as PiRpcTransport);
+  const driver = new PiRpcDriver({ command: process.execPath, runtimeDirectory, model: "paperclip/faux", piRpcThinkingLevel: "off",
+    environment: { HOME: root, PI_CODING_AGENT_DIR: agentHome, PI_OFFLINE: "1", PAPERCLIP_PI_RPC_CREDENTIAL_MODE: "env",
+      PAPERCLIP_AI_PROVIDER_URL: "http://127.0.0.1:1", PAPERCLIP_AI_PROVIDER_PROTOCOL: "messages", PAPERCLIP_AI_PROVIDER_AUTH: "none" },
+    transportFactory });
+  let session: Awaited<ReturnType<PiRpcDriver["openSession"]>> | undefined;
+  return { root, originalHome, agentHome, packageA, packageB, packages, transport, transportFactory,
+    async open() {
+      session = await driver.openSession({ runId: "managed-packages", normalizedSessionId: "managed-packages", workingDirectory: workspace });
+      return session;
+    },
+    async close() {
+      await session?.close({ reason: "test cleanup" });
+      vi.unstubAllEnvs();
+      await rm(root, { recursive: true, force: true });
+    } };
+}
+
+describe("Pi managed npm package paths", () => {
+  it("does not create any symlink under a fresh per-session agent home", async () => {
+    const f = await managedPackageFixture();
+    try {
+      await f.open();
+      expect(await symlinkPathsBelow(f.agentHome)).toEqual([]);
+    } finally { await f.close(); }
+  });
+
+  it("rewrites npm declarations to installed roots, preserves filters/local paths, and can read a package resource", async () => {
+    const f = await managedPackageFixture();
+    try {
+      await f.open();
+      const settings = JSON.parse(await readFile(join(f.agentHome, "settings.json"), "utf8"));
+      expect(settings.packages).toEqual([
+        f.packageA,
+        { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] },
+        "/abs/local-pkg",
+      ]);
+      await expect(readFile(join(settings.packages[1].source, "extensions/selected.js"), "utf8")).resolves.toBe("export const value = 'pkg-b-resource';\n");
+    } finally { await f.close(); }
+  });
+
+  it("fails closed for an uninstalled npm package without network access or a partial managed home", async () => {
+    const f = await managedPackageFixture({ missing: true });
+    const fetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network access is forbidden in this test"));
+    try {
+      await expect(f.open()).rejects.toMatchObject({ code: "pi_managed_package_not_installed" });
+      expect(fetch).not.toHaveBeenCalled();
+      expect(f.transportFactory).not.toHaveBeenCalled();
+      await expect(lstat(f.agentHome)).rejects.toMatchObject({ code: "ENOENT" });
+    } finally { fetch.mockRestore(); await f.close(); }
+  });
+
+  it("does not rewrite the original package declaration when the driver uses the original home", async () => {
+    const f = await managedPackageFixture({ agentHomeIsOriginal: true });
+    try {
+      const before = Buffer.from(JSON.stringify(JSON.parse(await readFile(join(f.originalHome, "settings.json"), "utf8")).packages));
+      await f.open();
+      const after = Buffer.from(JSON.stringify(JSON.parse(await readFile(join(f.originalHome, "settings.json"), "utf8")).packages));
+      expect(after).toEqual(before);
+    } finally { await f.close(); }
   });
 });
