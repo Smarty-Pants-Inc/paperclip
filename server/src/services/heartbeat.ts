@@ -349,6 +349,7 @@ import {
   authorizeFailedChatRunRetryWake,
 } from "./durable-chat-wakeup.js";
 import { prepareHeartbeatGitHubLaunchers, prepareHeartbeatGitHubEnvironment } from "./heartbeat-github-launchers.js";
+import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
 import {
   cleanupGitHubOperationLaunchers,
   startAdapterExecutionTargetPaperclipBridge,
@@ -2253,6 +2254,11 @@ export function heartbeatService(
       }
       const runtime = await timePreparation("runtime_state", () => ensureRuntimeState(agent));
       const context = parseObject(run.contextSnapshot);
+      // Capture before preparation/provider I/O; workspace/wake project hints remain display-only.
+      const projectConnectionContext = await captureProjectConnectionRunContext(db, {
+        companyId: run.companyId, agentId: run.agentId, heartbeatRunId: run.id,
+      });
+      context.projectConnectionRunContext = { version: 1, issueId: projectConnectionContext.issueId, projectId: projectConnectionContext.projectId };
       const authorizeFailedChatRetryExecution = (stage?: "dispatching") =>
         retryChatControlAdmission(async () => {
           executionControl.controller.signal.throwIfAborted();
@@ -3374,8 +3380,9 @@ export function heartbeatService(
       } = { current: null };
       try {
         const startedAt = run.startedAt ?? new Date();
-        const runningWithSession = await timePreparation("execution_start", () => db
-          .update(heartbeatRuns)
+        const runningWithSession = await timePreparation("execution_start", () => db.transaction(async tx => {
+          await revalidateProjectConnectionRunContext(tx, projectConnectionContext);
+          return tx.update(heartbeatRuns)
           .set({
             startedAt,
             sessionIdBefore:
@@ -3385,7 +3392,8 @@ export function heartbeatService(
           })
           .where(eq(heartbeatRuns.id, run.id))
           .returning()
-          .then((rows) => rows[0] ?? null));
+          .then((rows) => rows[0] ?? null);
+        }));
         if (runningWithSession) run = runningWithSession;
 
         // Pause Durability: flip to "running" ONLY if the agent is still invokable.
@@ -3494,16 +3502,18 @@ export function heartbeatService(
         const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
           defer: !useAgentGitHubEnv && nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
           target: executionTarget, cwd: executionWorkspace.cwd,
-          env: Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
+          agentId: agent.id, runId: run.id, projectAuthority: { db, companyId: agent.companyId },
+          env: { ...Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
             (entry): entry is [string, string] => typeof entry[1] === "string")),
+            ...(useAgentGitHubEnv ? { PAPERCLIP_GITHUB_AUTH_MODE: "agent_env" } : {}) },
           hostCredentials: useHostGitHub,
           networkAccess: trustPreset.kind === "standard" && process.env.PAPERCLIP_RUNNER_NETWORK_ACCESS !== "disabled",
         }));
-        if (useAgentGitHubEnv) githubEnvironment.env.PAPERCLIP_GITHUB_AUTH_MODE = "agent_env";
         runtimeConfig = { ...runtimeConfig, env: githubEnvironment.env };
         if (!useHostGitHub && !providerApiPlacement) {
           const githubLaunchers = await timePreparation("github_launchers", () => prepareHeartbeatGitHubLaunchers({
             native: agent.adapterType === "paperclip_runner", githubConfigured: githubSelection.configured,
+            projectAuthority: { db, companyId: agent.companyId },
             agentId: agent.id, runId: run.id, target: executionTarget, cwd: executionWorkspace.cwd,
             env: githubEnvironment.env, brokerUrl: configuredPaperclipApiBaseUrl() ?? "",
             ...(activeEnvironmentLease ? { preparation: {
