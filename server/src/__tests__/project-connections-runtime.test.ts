@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
-import { connectionGrants, createDb, heartbeatRuns, issues, projects, userCompanyPreferences, toolCatalogEntries, toolGatewaySessions, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
+import { connectionGrants, createDb, heartbeatRuns, issues, projects, userCompanyPreferences, toolCatalogEntries, toolPolicies, toolGatewaySessions, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
 
@@ -133,6 +133,38 @@ describe("project connection task-derived selection and no legacy fallback (roun
     if (kind === "legacy_oauth") expect(secrets.resolveSecretValue).toHaveBeenCalledTimes(1);
     else expect(provider.acquire).toHaveBeenCalledTimes(1);
     expect(secrets.getByName).not.toHaveBeenCalled();
+  });
+
+  it("RFL-C4/J14: unrelated owned project cannot break a working personal null MCP connection", async () => {
+    const f = await projectConnectionFixture(db);
+    const legacy = await f.seedConnection(null);
+    await db.update(toolConnections).set({ credentialPolicy: "per_user", healthStatus: "ok" }).where(eq(toolConnections.id, legacy.connection.id));
+    await db.update(connectionGrants).set({ kind: "user", isDefault: false, subjectUserId: f.human }).where(eq(connectionGrants.id, legacy.grant.id));
+    await db.insert(toolCatalogEntries).values({ companyId: f.companyId, applicationId: legacy.connection.applicationId,
+      connectionId: legacy.connection.id, name: "get_file_contents", toolName: "get_file_contents", riskLevel: "read", isReadOnly: true,
+      inputSchema: { type: "object", properties: { repository: { type: "string" } } }, versionHash: "personal-null-v1" });
+    const bound = await f.run(f.b);
+    await db.update(heartbeatRuns).set({ responsibleUserId: f.human, contextSnapshot: { issueId: bound.issue.id,
+      projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: f.b.id } } }).where(eq(heartbeatRuns.id, bound.run.id));
+    const dispatch = vi.fn(async (_url: string | URL, init?: RequestInit) => {
+      const request = JSON.parse(String(init?.body)) as { id?: string | number; method: string };
+      return Response.json({ jsonrpc: "2.0", id: request.id, result: request.method === "initialize"
+        ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "synthetic-personal-mcp", version: "1" } }
+        : { content: [{ type: "text", text: "synthetic personal read" }] } });
+    });
+    await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow fixture read", policyType: "allow", selectors: { riskLevel: "read" } });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, bound.issue.id));
+    const gateway = createToolGatewayService(db, { remoteHttpRequest: dispatch });
+    const session = await gateway.createSession({ companyId: f.companyId, agentId: f.leadA.id, runId: bound.run.id });
+    const tool = (await gateway.listToolsForSession(session.token)).find(item => item.connectionId === legacy.connection.id);
+    expect(tool).toBeDefined();
+    expect((await gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: { repository: "owner/B" } })).status).toBe("completed");
+    await f.seedConnection(f.a, { status: "archived", installed: false });
+    provider.acquire.mockClear(); dispatch.mockClear();
+    expect((await gateway.executeTool({ sessionToken: session.token, tool: tool!.name, parameters: { repository: "owner/B" } })).status).toBe("completed");
+    expect(provider.acquire).toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalled();
+    expect(dispatch.mock.calls.some(([, init]) => new Headers(init?.headers).get("authorization") === `Bearer synthetic-installation-token-${legacy.connection.id}`)).toBe(true);
   });
 
   it("A07: persists a projectless admission pair, ignoring a taskless snapshot project", async () => {
