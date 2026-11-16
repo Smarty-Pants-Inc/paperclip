@@ -229,6 +229,7 @@ const SAFE_NATIVE_RUN_SPAN_ATTRIBUTE_KEYS = new Set([
   "stateSource",
   "strategy",
   "target",
+  "timeoutCode",
 ]);
 
 export function nativeRunFailureCheck(error: unknown): string | undefined {
