@@ -1375,20 +1375,15 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
         status: "idle",
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "agent-admin-user", responsibleUserId: "agent-admin-user", claudeLogin: { storedSessionId: null, ownerUserId: "agent-admin-user", applyExistingWithoutClaim: false } },
-    );
-    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
-      companyId,
-      "agent",
-      agentId,
-      "tasks:assign",
-      true,
-      "agent-admin-user",
+      { memberGrant: { grantedByUserId: "agent-admin-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "agent-admin-user", responsibleUserId: "agent-admin-user", claudeLogin: { storedSessionId: null, ownerUserId: "agent-admin-user", applyExistingWithoutClaim: false } },
     );
     expect(mockBuiltInAgentService.ensureCompanyDefaultAgentGrants).toHaveBeenCalledWith(companyId);
   });
@@ -1440,20 +1435,15 @@ describe("agent permission routes", () => {
       }));
 
     expect([200, 201]).toContain(res.status);
-    expect(mockAccessService.ensureMembership).toHaveBeenCalledWith(
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    // This mock is the requestHire boundary, whose memberGrant is forwarded to initializeAgentHire.
+    // The real-row audit cases in agent-hire-auth-inheritance-routes cover active/member and tasks:assign.
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
+    expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
-      "agent",
-      agentId,
-      "member",
-      "active",
-    );
-    expect(mockAccessService.setPrincipalPermission).toHaveBeenCalledWith(
-      companyId,
-      "agent",
-      agentId,
-      "tasks:assign",
-      true,
-      "board-user",
+      expect.objectContaining({ name: "Builder", status: "idle" }),
+      { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
   }, 15_000);
 
@@ -1499,6 +1489,9 @@ describe("agent permission routes", () => {
       }));
 
     expect([200, 201]).toContain(res.status);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
@@ -1510,7 +1503,7 @@ describe("agent permission routes", () => {
           },
         },
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
   });
 
@@ -1539,6 +1532,9 @@ describe("agent permission routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockEnsureOpenCodeModelConfiguredAndAvailable).not.toHaveBeenCalled();
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
@@ -1547,7 +1543,7 @@ describe("agent permission routes", () => {
           model: DEFAULT_OPENCODE_LOCAL_MODEL,
         }),
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
   });
 
@@ -1577,6 +1573,9 @@ describe("agent permission routes", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     expect(mockEnsureOpenCodeModelConfiguredAndAvailable).not.toHaveBeenCalled();
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
@@ -1586,7 +1585,7 @@ describe("agent permission routes", () => {
           model: "anthropic/claude-sonnet-4-5",
         }),
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
   });
 
@@ -1614,6 +1613,9 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status).toBe(201);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.agent.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
@@ -1631,6 +1633,7 @@ describe("agent permission routes", () => {
         createdByAgentId: null,
         interactionTexts: [expect.any(String)],
         createdByUserId: "board-user", responsibleUserId: "board-user",
+        memberGrant: { grantedByUserId: "board-user" },
         claudeLogin: {
           storedSessionId: null,
           ownerUserId: "board-user",
@@ -2009,12 +2012,15 @@ describe("agent permission routes", () => {
       }));
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.id).toBe(agentId);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       companyId,
       expect.objectContaining({
         defaultEnvironmentId: environmentId,
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
     );
   });
 
@@ -2095,13 +2101,16 @@ describe("agent permission routes", () => {
         }));
 
       expect(res.status, JSON.stringify(res.body)).toBe(201);
+      // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+      expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+      expect(res.body.id).toBe(agentId);
       expect(mockAgentService.create).toHaveBeenCalledWith(
         companyId,
         expect.objectContaining({
           adapterType: expectedAdapterType,
           defaultEnvironmentId: environmentId,
         }),
-        { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
+        { memberGrant: { grantedByUserId: "board-user" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "board-user", responsibleUserId: "board-user", claudeLogin: { storedSessionId: null, ownerUserId: "board-user", applyExistingWithoutClaim: false } },
       );
       if (["codex_local", "claude_local", "opencode_local", "pi_local"].includes(adapterCase.adapterType)) {
         if (adapterCase.adapterType === "codex_local") expect(mockAgentService.create.mock.calls[0][1].adapterConfig).toMatchObject({ provider: "codex" });
