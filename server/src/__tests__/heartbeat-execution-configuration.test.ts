@@ -790,6 +790,36 @@ describePostgres("heartbeat execution configuration through adapter dispatch", (
     }
   }, 60_000);
 
+  it("rf4 independent judge: ordinary base64 and hashes survive after a plain secret_ref token", async () => {
+    const { randomBytes } = await import("node:crypto");
+    const { writeFileSync } = await import("node:fs");
+    const { syncAgentAdapterEnvBindings } = await import("../services/agent-secret-bindings.js");
+    const f = await seed();
+    const fakeToken = randomBytes(30).toString("base64"); // 40 random ASCII bytes; test-only
+    const blob = randomBytes(1536).toString("base64");
+    const sums = Array.from({ length: 24 }, (_, i) => `${createHash("sha256").update(`file-${i}`).digest("hex")}  src/file-${i}.ts`);
+    const secret = await secretService(db).create(f.companyId, { name: `rf4-token-${f.agentId}`, provider: "local_encrypted", value: fakeToken }, { userId: f.userId });
+    const adapterConfig = { model: "agent-model", env: { RF4_TEST_VALUE: { type: "secret_ref", secretId: secret.id, version: "latest" } } };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, f.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc: secretService(db), companyId: f.companyId, agentId: f.agentId, adapterConfig });
+    inspect.set(f.agentId, async input => {
+      expect((input.config.env as Record<string,string>).RF4_TEST_VALUE === fakeToken).toBe(true);
+      await input.onLog("stdout", fakeToken + "\n");
+      await input.onLog("stdout", "!rf4-boundary!\n");
+      await input.onLog("stdout", blob + "\n");
+      await input.onLog("stdout", sums.join("\n") + "\n");
+    });
+    const { finished } = await execute(f);
+    expect(finished.status, finished.error ?? undefined).toBe("succeeded");
+    const log = (await heartbeat.readLog(finished.id, { limitBytes: 8 * 1024 * 1024 })).content.trim().split("\n")
+      .map(line => JSON.parse(line).chunk as string).join("");
+    const row = { blobBytes: blob.length, blobUnchanged: log.includes(blob), sha256LinesTotal: sums.length,
+      sha256LinesUnchanged: sums.filter(line => log.includes(line)).length, tokenStillPresent: log.includes(fakeToken) };
+    if (process.env.RF4_OUT) writeFileSync(process.env.RF4_OUT + "/post-secret-live-" + (process.env.RF4_REVISION ?? "local") + ".json", JSON.stringify(row, null, 2) + "\n");
+    console.log("RF4_POST_SECRET_LIVE", JSON.stringify(row));
+    expect(row.blobUnchanged && row.sha256LinesUnchanged === row.sha256LinesTotal, "ordinary stdout masked after secret_ref token ended").toBe(true);
+  }, 60_000);
+
   it("delivers the selected credential in an isolated home and removes it after completion", async () => {
     vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
     const f = await seed(true);
