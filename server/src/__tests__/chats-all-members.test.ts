@@ -5,6 +5,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, authUsers, companies, companyMemberships, createDb, issueComments, issueReadStates, issues, issueThreadInteractions } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
+import { authorizationService } from "../services/authorization.js";
 import { errorHandler } from "../middleware/index.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
@@ -51,7 +52,7 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
       { id: privateChat, companyId, title: "Private conversation", conversationAgentId: agentId, conversationUserId: privateOwner, createdByUserId: privateOwner, visibility: "private" },
       { id: otherChat, companyId, title: "Other agent conversation", conversationAgentId: otherAgentId, conversationUserId: member, createdByUserId: member },
       { id: legacyChat, companyId, title: "Legacy conversation", conversationAgentId: agentId, conversationUserId: randomUUID() },
-    ].map(row => ({ ...row, assigneeAgentId: row.conversationAgentId, conversationState: "waiting", status: "in_review" })));
+    ].map(row => ({ ...row, assigneeAgentId: row.conversationAgentId, conversationState: "waiting" as const, status: "in_review" })));
     // Current schema forbids NULL. Simulate only the review's legacy-data case
     // in this isolated database; production schema remains unchanged.
     await db.execute(sql`alter table issues alter column visibility drop not null`);
@@ -96,7 +97,13 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
   });
   it("requires a visible agent in this company", async () => {
     expect((await list(appFor(), { agentId: foreignAgentId })).status).toBe(404);
-    expect((await list(appFor(member), { agentId: hiddenAgentId })).status).toBe(404);
+    // A stale companyIds assertion must not bypass the canonical agent read.
+    // This base treats agentVisibility.private as assignment policy, not a
+    // board read restriction, so do not invent a different list-only policy.
+    const noMembership = randomUUID();
+    expect((await authorizationService(db).decide({ actor: { type: "board", source: "session", userId: noMembership },
+      action: "agent:read", resource: { type: "agent", companyId, agentId: hiddenAgentId } })).allowed).toBe(false);
+    expect((await list(appFor(noMembership), { agentId: hiddenAgentId })).status).toBe(404);
     expect((await request(appFor()).get(path()).query({ members: "all" })).status).toBe(400);
   });
   it("bounds pages and validates limits", async () => {
