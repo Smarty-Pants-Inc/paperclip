@@ -1,3 +1,4 @@
+import "./helpers/project-connections-approval-http.js";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
@@ -9,6 +10,7 @@ import { activateProjectConnectionMigration, assertProjectConnectionNotInUse, lo
 import { toolAccessService } from "../services/tool-access.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
@@ -308,7 +310,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   });
 
   it("A06b: B lead acting for the same human gets readable 403, not board removal authority", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection();
     const result = await request(f.route(f.leadB.id)).delete(`/api/tool-connections/${connection.id}`);
     expect(result.status).toBe(403);
@@ -393,7 +395,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   });
 
   it("D-RF2-0011/A06b: B's agent for the same human cannot confirm A done or retire it while A work is queued", async () => {
-    const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+    const f = await approvedProjectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
     const work = await f.run();
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, work.run.id));
     const result = await request(f.route(f.leadB.id)).delete(`/api/tool-connections/${connection.id}`)
