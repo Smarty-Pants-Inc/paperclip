@@ -163,8 +163,18 @@ export async function assertProjectConnectionAdmission(
     return;
   }
   const { connection, actor, operation, companyId, projectId } = input;
-  if (connection) assertProjectConnectionSupported(connection);
   const scope = connection ? readProjectConnectionScope(connection) : null;
+  const archivedRetireRetry = connection?.status === "archived" && operation === "retire";
+  if (connection) {
+    // Retirement intentionally clears active key refs. A same-row retry still
+    // validates the retained provider shape/approval, using its historical ref
+    // only for structural validation, never for lookup or credential release.
+    const retained = archivedRetireRetry && !connection.enabled
+      && connection.credentialRefs.length === 0 && connection.credentialSecretRefs.length === 0
+      ? { ...connection, credentialSecretRefs: (scope?.approvedSecretRefs ?? []).map(ref => ({ ...ref })) }
+      : connection;
+    assertProjectConnectionSupported(retained);
+  }
   if (connection?.status === "archived" && operation !== "retire" && operation !== "project_update") {
     throw conflict("This project's connection was retired. Create a new approved project connection.", { code: "project_connection_archived" });
   }
@@ -210,6 +220,10 @@ export async function assertProjectConnectionAdmission(
       { targetAgentIds: [...(input.targetAgentIds ?? [])] },
     );
   } else if (!input.targetAgentIds?.length) throw forbidden("Project credential use requires an explicit server-derived recipient", { code: "project_connection_target_outside_project" });
+  // Current actor authority above is still required. The actual retire writer
+  // now verifies the archived state and matching durable receipt; removed live
+  // grants/refs must not make an authorized idempotent retry fail admission.
+  if (archivedRetireRetry) return;
   await assertProjectConnectionRecipients(db, companyId, projectId, lead.id, input.targetAgentIds ?? []);
   if (!scope) {
     // A new take must not launder a lead/worker's workspace edit into approval.
