@@ -161,3 +161,49 @@ describe("Pi admission budget timeout evidence (F1)", () => {
     expect(parseProviderPerformanceSpans(row("PRIVATE nonce"), 3)[0]!.attributes).toBeUndefined();
   });
 });
+
+// Each segment below fits the budget alone; only one shared budget fails the
+// sum. A mutation that gives any segment its own budget therefore succeeds.
+describe("Pi admission budget sharing beyond the open path's private exchanges (F3)", () => {
+  it("attach path: inventory, bind and re-admission spend one budget (kills M1b)", async () => {
+    const f = await fixture(); const session = await f.released();
+    // 400 + 400 + (150 + 150 + 100) = 1200 ms > 1000 ms; any two segments = 800 ms.
+    Object.assign(f.exchangeDelays, { tool_inventory: 400, bind: 400 });
+    f.transport.delays = { set_model: 150, get_available_thinking_levels: 150, set_thinking_level: 100 };
+    const { error, elapsedMs } = await elapsed(session.attachRun({ runId: "run-b" }));
+    expect(error).toMatchObject({ code: "pi_admission_deadline_exceeded" });
+    expect(elapsedMs).toBeLessThan(BUDGET_MS + 400);
+    expect(f.commands.map(command => command.type)).toContain("bind");
+    expect(f.transport.commands).not.toContain("prompt");
+  });
+
+  it("attach path control: the same exchanges admit when their sum fits the budget", async () => {
+    const f = await fixture(); const session = await f.released();
+    Object.assign(f.exchangeDelays, { tool_inventory: 200, bind: 200 });
+    f.transport.delays = { set_model: 100, get_available_thinking_levels: 100, set_thinking_level: 50 };
+    await expect(session.attachRun({ runId: "run-b" })).resolves.toBeUndefined();
+  });
+
+  it("open path: a model/thinking admission RPC is cut at the shared budget, not by its own fresh budget (kills M1c)", async () => {
+    const f = await fixture();
+    // 150 + 150 ms, then set_thinking_level needs 900 ms: each RPC fits a fresh
+    // 1000 ms budget, but the shared budget expires inside set_thinking_level.
+    f.transport.delays = { set_model: 150, get_available_thinking_levels: 150, set_thinking_level: 900 };
+    const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { error, elapsedMs } = await elapsed(f.open());
+    expect(error).toMatchObject({ code: "pi_admission_deadline_exceeded", timeoutCode: "pi_admission_deadline_exceeded" });
+    expect(elapsedMs).toBeLessThan(BUDGET_MS + 400);
+    expect(stderrSpans(stderr).filter(span => span.name === "runner.pi.open.admission"))
+      .toEqual([expect.objectContaining({ outcome: "failed", attributes: { timeoutCode: "pi_admission_deadline_exceeded" } })]);
+    expect(f.commands).toEqual([]);
+    expect(f.transport.commands).not.toContain("get_available_models");
+    expect(f.transport.commands).not.toContain("prompt");
+  });
+
+  it("open path control: the same RPCs admit when their sum fits the budget", async () => {
+    const f = await fixture();
+    Object.assign(f.exchangeDelays, { tool_inventory: 200 });
+    f.transport.delays = { set_model: 100, get_available_thinking_levels: 100, set_thinking_level: 100, get_available_models: 100 };
+    await expect(f.open()).resolves.toBeDefined();
+  });
+});
