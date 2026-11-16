@@ -7,6 +7,7 @@ import { assertAgentConnectionInstallAccess, assertAgentToolAssignmentInteractio
 import { connectionActorUserId } from "./tool-access/actor.js";
 import { getGitHubAppGrant, isGitHubAppConnection, parseGitHubAppConfig, refreshGitHubAppAccess } from "./github-app-credentials.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH } from "./github-app-client.js";
+import { assertNotProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 import { restConnectorFor } from "./connectors/rest-registry.js";
 import { createConnectionCredentialValidation } from "./tool-access/connections/credential-validation.js";
 import { assertManagedGrantReactivationAccess, createConnectionGrants } from "./tool-access/connections/grants.js";
@@ -1641,6 +1642,7 @@ export function toolAccessService(
           ),
         );
       if (!connection) throw notFound("Incomplete app connection not found");
+      assertNotProjectOwnedToolConnection(connection);
       assertSupportedConnection(connection);
       if (input.resumeConnectionId && connection.status !== "draft") {
         throw conflict("Only an incomplete app connection can resume setup", {
@@ -3240,6 +3242,7 @@ export function toolAccessService(
   ): Promise<FinishToolAppResult> {
     await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
+    assertNotProjectOwnedToolConnection(connection);
     await assertConnectorConnectionSetupEnabled(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
@@ -3694,6 +3697,7 @@ export function toolAccessService(
   ): Promise<ToolConnectionHealthCheckResult> {
     await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
+    assertNotProjectOwnedToolConnection(connection);
     assertSupportedConnection(connection);
     await assertConnectorConnectionSetupEnabled(connection);
     await assertExperimentalConnectorSetupEnabled(connection.config.sourceTemplateKey, connection.status !== "draft");

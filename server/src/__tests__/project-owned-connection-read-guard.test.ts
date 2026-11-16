@@ -229,6 +229,39 @@ describe("project-owned tool connections on an image without the #20717 writer (
     expect(after).toMatchObject({ c_scope: true, t_scope: true });
   });
 
+  it("refuses project-owned setup resume, reconnect, replacement key and finish before writes or credential use", async () => {
+    const f = await seed();
+    const owned = await seedApp(f, true);
+    const svc = toolAccessService(db);
+    const actor = { actorType: "user", actorId: "owner" } as const;
+    app.secret.mockClear();
+    app.acquire.mockClear();
+    const refused = { status: 403, details: { code: OWNED_CODE, connectionId: owned.connection.id } };
+    await expect(svc.connectGalleryApp(f.companyId, {
+      galleryKey: "github", connectionMethodKey: "app-installation",
+      reconnectConnectionId: owned.connection.id, credentialValues: {},
+    } as never, actor)).rejects.toMatchObject(refused);
+    await expect(svc.reconnectGalleryApp(owned.connection.id, f.companyId, {
+      credentialValues: { "credentials.privateKey": "replacement-fixture-private-key" },
+    }, actor)).rejects.toMatchObject(refused);
+    await expect(svc.finishGalleryAppConnection(f.companyId, owned.connection.id, {
+      enabledCatalogEntryIds: [owned.entry.id], askFirstCatalogEntryIds: [],
+      access: { agentIds: [f.other, f.loose] },
+    }, actor)).rejects.toMatchObject(refused);
+    await db.update(toolConnections).set({ status: "draft" }).where(eq(toolConnections.id, owned.connection.id));
+    const [draft] = await db.select().from(toolConnections).where(eq(toolConnections.id, owned.connection.id));
+    await expect(svc.connectGalleryApp(f.companyId, {
+      galleryKey: "github", connectionMethodKey: "app-installation",
+      resumeConnectionId: owned.connection.id, credentialValues: {},
+    } as never, actor)).rejects.toMatchObject(refused);
+    const [after] = await db.select().from(toolConnections).where(eq(toolConnections.id, owned.connection.id));
+    expect(after).toEqual(draft);
+    const [grant] = await db.select().from(connectionGrants).where(eq(connectionGrants.id, owned.grant.id));
+    expect(grant).toEqual(owned.grant);
+    expect(app.secret).not.toHaveBeenCalled();
+    expect(app.acquire).not.toHaveBeenCalled();
+  });
+
   it("detects ownership from the envelope alone, in either config, whatever its value (no schema read)", () => {
     expect(isProjectOwnedToolConnection({ config: { projectScope: { version: 1 } }, transportConfig: {} })).toBe(true);
     expect(isProjectOwnedToolConnection({ config: {}, transportConfig: { projectScope: { version: 1 } } })).toBe(true);
