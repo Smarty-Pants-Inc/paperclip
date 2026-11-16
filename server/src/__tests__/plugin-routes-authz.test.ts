@@ -1,6 +1,12 @@
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// Route graph collection is fixture setup, not part of the examples request's
+// 20s budget. vi.mock declarations below are hoisted for these imports too.
+// The lazy import made the first case pay for the entire server dependency
+// graph (including custody admission) while later cases used the module cache.
+import { pluginRoutes } from "../routes/plugins.js";
+import { errorHandler } from "../middleware/index.js";
 
 const mockRegistry = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -54,11 +60,6 @@ async function createApp(
     captureJsonContext?: (context: unknown, body: unknown) => void;
   } = {},
 ) {
-  const [{ pluginRoutes }, { errorHandler }] = await Promise.all([
-    import("../routes/plugins.js"),
-    import("../middleware/index.js"),
-  ]);
-
   const loader = {
     installPlugin: vi.fn(),
     ...loaderOverrides,
