@@ -12,7 +12,7 @@ import { readPaperclipSkillSyncPreference, resolvePaperclipDesiredSkillNames, re
 import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
-import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../agent-identity.js";
 import { readAiConnectionConfigurationFailure, readAiCredentialAccessFailure } from "../ai-connection-configuration-failure.js";
 import { AI_AUTH_ENV_KEYS, isAiConnectionBusy, prepareManagedAiRuntime, stripAiAuthBindings } from "../ai-connection-runtime.js";
@@ -217,6 +217,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       trustPreset,
     }));
   onFailureSecretsResolved(() => collectRunFailureSecretValues(resolvedConfig.env, secretKeys));
+  // The run's declared secrets join the live window index here, where they are
+  // resolved, the same way native log recovery adds registered run secrets.
+  const resolvedEnv = parseObject(resolvedConfig.env);
+  addRunSecretMaterial(identityRedactor, [...secretKeys].flatMap(key =>
+    typeof resolvedEnv[key] === "string" && resolvedEnv[key] ? [resolvedEnv[key] as string] : []));
   if (useAgentGitHubEnv && !["GH_TOKEN", "GITHUB_TOKEN"].some(key => {
     const value = parseObject(resolvedConfig.env)[key];
     return typeof value === "string" && value.trim().length > 0;

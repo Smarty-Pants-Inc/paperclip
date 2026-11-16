@@ -12,7 +12,7 @@ import { canonicalNativeRunLogRedactionForms, redactCanonicalNativeRunLogChunk }
 import { beginIdleTrackedWork } from "../task-admission.js";
 import { agentIdentityService } from "../agent-identity.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
-import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { addRunSecretMaterial } from "../agent-identity-redaction.js";
 import { logger } from "../../middleware/logger.js";
 import { createNativeRunLogExporter, nativeRunLogPrefixCursor, nativeRunLogSourceWhere } from "./native-run-log-export.js";
 
@@ -126,9 +126,7 @@ export async function recoverSettledNativeRunLog(
       agentIdentityService(db).createExistingLogRedactor(companyId, binding[2]!),
       createRunSecretRedactionRegistry(db).redactionValuesForRun(companyId, runId),
     ]);
-    for (const value of secrets)
-      identityRedactor.values.push(...createAgentIdentityRedactor(value).values);
-    identityRedactor.values.sort((left, right) => right.length - left.length);
+    addRunSecretMaterial(identityRedactor, secrets);
     const handle = await store.begin({
       companyId,
       agentId: binding[2]!,
