@@ -1,6 +1,6 @@
 import { resolveDefaultPiRpcThinkingLevel } from "../pi-rpc-default-thinking.js";
 import { PI_RPC_BUILTIN_THINKING_CATALOG } from "../drivers/pi/pi-thinking-catalog.js";
-import { admitPiProbeSession, probePiNativeEnvironment, PiEnvironmentProbeCleanupError } from "../drivers/pi/pi-environment-probe.js";
+import { admitPiProbeSession, probePiNativeEnvironment, PiEnvironmentProbeCleanupError, PI_PROBE_CLEANUP_BUDGET_MS } from "../drivers/pi/pi-environment-probe.js";
 import { resolvePiNativeConfig } from "../drivers/pi/pi-native-config.js";
 import { parsePiRpcProfile, parsePiThinkingLevel, QUALIFIED_PI_RPC_PROFILE } from "../drivers/pi/qualified-profile.js";
 import type { RunnerAttachmentDownloadGrant } from "../contracts/harness-driver.js";
@@ -9717,7 +9717,7 @@ const retainedNativeProbeCleanups = new Set<{ run: () => Promise<void> }>();
 // Native setup probes must still prove physical retirement (and #20417 trace
 // custody) before cleanup completes; a slow retirement waits longer instead of
 // failing the setup check.
-export const NATIVE_PROBE_CLEANUP_BUDGET_MS = 60_000;
+export const NATIVE_PROBE_CLEANUP_BUDGET_MS = PI_PROBE_CLEANUP_BUDGET_MS;
 function probeCleanupBudget(timeoutMs = NATIVE_PROBE_CLEANUP_BUDGET_MS): number {
   return Number.isFinite(timeoutMs) && timeoutMs > 0
     ? Math.min(timeoutMs, NATIVE_PROBE_CLEANUP_BUDGET_MS) : NATIVE_PROBE_CLEANUP_BUDGET_MS;

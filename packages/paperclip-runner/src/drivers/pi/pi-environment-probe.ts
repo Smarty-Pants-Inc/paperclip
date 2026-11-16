@@ -88,6 +88,9 @@ export async function observePiNativeHello(options: PiProbeObservation): Promise
     }
 }
 
+/** Upper bound for proving the probe session's physical retirement (#20417 custody kept). */
+export const PI_PROBE_CLEANUP_BUDGET_MS = 60_000;
+
 /**
  * Native setup Test, following runnerd-codex-transport.ts:9005-9242.
  * The caller supplies the SAME admitted/prepared driver used by a real run,
@@ -134,7 +137,7 @@ export async function probePiNativeEnvironment(options: {
     clearTimeout(timer);
     controller.abort(operationError ?? new Error("Pi hello probe complete."));
     const cleanupController = new AbortController();
-    const cleanupTimer = setTimeout(() => cleanupController.abort(new Error("Pi probe retirement timed out.")), Math.max(1, Math.min(options.cleanupTimeoutMs ?? 10_000, 10_000)));
+    const cleanupTimer = setTimeout(() => cleanupController.abort(new Error("Pi probe retirement timed out.")), Math.max(1, Math.min(options.cleanupTimeoutMs ?? PI_PROBE_CLEANUP_BUDGET_MS, PI_PROBE_CLEANUP_BUDGET_MS)));
     // Match the retained native cleanup contract (runnerd-codex-transport.ts:
     // 8973-9002): a wait deadline must not abandon the original late opener or
     // close. A retry joins an existing attempt; only a rejected attempt resets.
