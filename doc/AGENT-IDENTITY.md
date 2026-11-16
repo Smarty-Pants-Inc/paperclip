@@ -29,9 +29,16 @@ restarts preserve the keypair.
 Termination sets `revoked_at` in the same transaction that changes agent status
 and records `agent.identity.revoked` with only `keyId` in its details. It retains
 the public key and encrypted private material; repeated termination does not
-replace the timestamp or emit another revocation. Private-key resolution fails
-with `AgentIdentityRevokedError` before decryption, and a terminated agent cannot
-provision a first key. Revoked keys are never silently reissued.
+replace the timestamp or emit another revocation. Private-key resolution for
+signing or run preparation fails with `AgentIdentityRevokedError` before decryption,
+and a terminated agent cannot provision a first key. Revoked keys are never silently
+reissued. Migration `0490` also marks retained keys of agents terminated before
+revocation support shipped, without changing existing timestamps or deleting keys.
+
+Log redaction is not signing authority: its dedicated factory may decrypt and
+validate a retained revoked key only to build a redactor. This keeps late output
+and native log recovery censored after termination; it does not return a usable
+identity or permit a new run.
 
 Revocation does not erase copies of a private key already delivered to a runtime
 or make its signatures cryptographically unverifiable. Relying parties must
