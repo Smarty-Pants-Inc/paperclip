@@ -1,9 +1,10 @@
+import "./helpers/project-connections-approval-http.js";
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
 import { activityLog, createDb, toolApplications, toolConnections, toolConnectionInstalls, toolProfiles } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { projectConnectionFixture } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 // Keep the non-route hiring writer real; only unrelated durable instruction /
 // identity provisioning is stubbed. No actual secret or host identity is used.
