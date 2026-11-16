@@ -1,7 +1,7 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
 import { assertNotManagerApp, assertProjectAppReceiptInput, prepareProjectAppFirstBind, readProjectAppCustody, verifyGitHubAppCandidate } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
-import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
+import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, stageProjectConnectionMigration, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { assertKnownProjectConnectionCreateAliases, assertProjectConnectionAvailability, lockProjectConnectionIdentities, mapProjectConnectionUniquenessError, projectConnectionIdentityForConnection } from "./project-connection-arbitration.js";
 import { verifyProjectConnectionGitHubScope, type VerifiedProjectConnectionProviderScope } from "./project-connection-provider-scope.js";
 import { resolveConnectionGrantSecret } from "./connection-credentials.js";
@@ -4908,6 +4908,8 @@ export function toolAccessService(
           if (custody.receipt.id !== preparedProject!.custody.receipt.id || !key || key.latestVersion !== preparedProject!.secretVersion) throw conflict("The approved project App changed during first binding", { code: "project_app_approval_state_changed" });
           await assertProjectConnectionAvailability(tx, { identity, projectId,
             exclusive: asRecord(config.projectScope).exclusive === true });
+          config = await stageProjectConnectionMigration(tx, { companyId, projectId, sourceConnectionId: custody.sourceConnectionId,
+            config, status: input.status ?? "draft", enabled: input.enabled ?? false });
         }
         if (verifiedCandidate) {
           await assertNotManagerApp(tx, { companyId, refs: input.credentialSecretRefs ?? [], verifiedAppId: verifiedCandidate.verified.identity.verifiedRegistrationId });
