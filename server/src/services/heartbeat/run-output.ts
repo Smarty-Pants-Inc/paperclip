@@ -30,6 +30,12 @@ export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 
 type Run = typeof heartbeatRuns.$inferSelect;
+/** Server receipt of one adapter event: when it arrived and its per-run order. */
+type AdapterEventReceiptStamp = { receivedAt: string; adapterEventIndex: number };
+// Server-owned fields go on after redaction: they carry no adapter text, and
+// the adapter cannot set them.
+const withReceiptStamp = (payload: Record<string, unknown> | undefined, stamp: AdapterEventReceiptStamp) =>
+  ({ ...payload, ...stamp });
 type CanonicalNativeLog = { kind: "canonical_native"; sourceCursor: number };
 
 export interface HeartbeatRunOutputInput {
@@ -339,7 +345,12 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     // released tail: one adapter event stays one committed event.
     const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]> }>();
     const holds = (id: string) => identityRedactor.holds?.(id) ?? false;
-    const appendToolOutputEvent = async (raw: AdapterRuntimeEvent, redacted: AdapterRuntimeEvent, eventType: string) => {
+    const appendToolOutputEvent = async (
+      raw: AdapterRuntimeEvent,
+      redacted: AdapterRuntimeEvent,
+      eventType: string,
+      stamp: AdapterEventReceiptStamp,
+    ) => {
       const rawPayload: Record<string, unknown> = raw.payload ?? {};
       const call = TOOL_CALL_KEYS.map(key => rawPayload[key]).find(value => typeof value === "string") ?? null;
       const key = JSON.stringify([eventType, raw.stream ?? null, call]);
@@ -372,7 +383,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         level: redacted.level,
         color: redacted.color,
         message: visit(raw.message, redacted.message, ["message"]) as string | undefined,
-        payload: visit(raw.payload, redacted.payload, ["payload"]) as Record<string, unknown> | undefined,
+        payload: withReceiptStamp(visit(raw.payload, redacted.payload, ["payload"]) as Record<string, unknown> | undefined, stamp),
       };
       if (held.size) toolOutputStreams.set(key, { event, held });
       else await appendRunEvent(currentRun, event);
@@ -396,21 +407,35 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       }
     };
 
+    // Receipt stamp: a held tool event commits after later events of other
+    // streams, so stored seq order is not the adapter's order. Every received
+    // adapter event takes the next index here, at receipt and before any
+    // redaction or hold; a replay of a source event id already received is
+    // dropped, so its one row keeps the first stamp.
+    let adapterEventIndex = 0;
+    const receivedSourceEventIds = new Set<string>();
     const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
+      const sourceEventId = event.payload?.sourceEventId;
+      if (typeof sourceEventId === "string" && sourceEventId) {
+        if (receivedSourceEventIds.has(sourceEventId)) return;
+        receivedSourceEventIds.add(sourceEventId);
+      }
+      adapterEventIndex += 1;
+      const stamp: AdapterEventReceiptStamp = { receivedAt: new Date().toISOString(), adapterEventIndex };
       const raw = event;
       event = identityRedactor.redact(event);
       const eventType = event.eventType.trim();
       // This namespace attests host-owned handoff cleanup. Legacy adapters do
       // not carry nativeSource identities, so they must never author it.
       if (!eventType || eventType.startsWith("legacy.case_handoff_")) return;
-      if (TOOL_OUTPUT_EVENT.test(eventType)) return appendToolOutputEvent(raw, event, eventType);
+      if (TOOL_OUTPUT_EVENT.test(eventType)) return appendToolOutputEvent(raw, event, eventType, stamp);
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,
         level: event.level,
         color: event.color,
         message: event.message,
-        payload: event.payload,
+        payload: withReceiptStamp(event.payload, stamp),
       });
     };
 
