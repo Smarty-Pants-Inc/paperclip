@@ -59,6 +59,16 @@ export function restoreUnavailableOnNewBoxCode(value: unknown): typeof RESTORE_U
   return code === RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE ? code : null;
 }
 
+/**
+ * F20 (gate-6 dress): the runner's launch-profile refusal of a box's legacy
+ * state on the managed backend's OPEN path (no checkpoint of this run). Taken
+ * there only (NSE openSession); never on the recover path.
+ */
+export const LAUNCH_PROFILE_MISMATCH_CODE: FreshThreadRefusalCode & "native_runner_launch_profile_mismatch" =
+  "native_runner_launch_profile_mismatch";
+/** The person-visible, named reason of that open's continuation note. */
+export const LAUNCH_PROFILE_CHANGED_REASON = "launch_profile_changed" as const;
+
 export function isFreshThreadRefusal(run: { errorCode?: string | null; error?: string | null; resultJson?: Record<string, unknown> | null }): boolean {
   // Older controller rows saved the exact reserved code in `error` under the
   // generic reconciliation envelope. They need the SAME strict stop gate,
