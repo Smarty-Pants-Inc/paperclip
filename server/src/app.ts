@@ -43,6 +43,7 @@ import { agentProfileAvatarRoutes } from "./routes/agent-profile-avatar.js";
 import { museTransportRoutes, museBoardRoutes } from "./routes/muse.js";
 import { museQualificationRoutes } from "./routes/muse-qualification.js";
 import { startMuseMaintenance } from "./services/muse-maintenance.js";
+import { startAgentHandoverRecovery } from "./services/agent-handover.js";
 import { grokBotRoutes } from "./routes/grok-bot.js";
 import { createGrokRoutineDispatcher } from "./services/grok-bot/dispatcher.js";
 import { dotRunnerRoutes } from "./routes/dot-runner.js";
@@ -1280,6 +1281,10 @@ export async function createApp(
     nextRunAt: () => agentLifecycle.nextRunAt(),
   });
   agentLifecycle.setWake(agentLifecycleDelivery.wake);
+  // #20389: retired agents hand over open tasks and live reports item by item,
+  // woken by the terminal step's commit. Pre-fix retirements are only listed
+  // unless PAPERCLIP_AGENT_HANDOVER_REPAIR_PRE_FIX=true.
+  startAgentHandoverRecovery(db, deliveryWork);
   const clientMirror = startMcpClientMirrorSync(db, deliveryWork, mcpConfig?.origin,{authorizationOrigin:mcpConfig?.authorizationOrigin});
   const unregisterMcpOwners = registerIdleMcpOwners(db, { config: mcpConfig, personal: publicMcpEvents, dot: dotMcpEvents, clientMirrorInstanceId:clientMirror.instanceId });
   startMcpRevocationIndexSync(db, deliveryWork);
