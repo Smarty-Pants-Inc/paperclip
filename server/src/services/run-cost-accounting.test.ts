@@ -481,6 +481,37 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readCostAccountingWork(db, startedAt.getTime() + 120_001, directory)).toEqual({ pending: false, nextRunAt: null });
   });
 
+  it("reports empty and held-partial passes as unchanged, then reports immediate receipt settlement", async () => {
+    const replay = vi.spyOn(usageReceipts, "replayUsageReceipts").mockResolvedValue({ replayed: 0, failed: 0 });
+    try {
+      const recover = createCostAccountingReconciler(db);
+      expect(await recover()).toMatchObject({ changed: 0, failed: 0 });
+      const sourceId = randomUUID();
+      const owner = await seed({ usageJson: { accountingReceiptSourceId: sourceId, accountingReceiptSequence: 0,
+        accountingReceiptReady: false, inputTokens: 5 } });
+      expect(await recover()).toMatchObject({ scanned: 0, accounted: 0, changed: 0, failed: 0 });
+      expect(await readCostAccountingWork(db, Date.now(), directory)).toEqual({ pending: false, nextRunAt: null });
+      await persistUsageReceipt(db, receipt(owner, sourceId, 1, 0.02));
+      expect(await recover()).toMatchObject({ accounted: 1, changed: 1, failed: 0 });
+      expect((await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, owner.runId)))[0].costCents).toBe(2);
+      expect(await recover()).toMatchObject({ changed: 0, failed: 0 });
+    } finally { replay.mockRestore(); }
+  });
+
+  it("counts stale marker repair even though no new charge posts", async () => {
+    const { runId } = await seed({ costAccountedAt: new Date(), usageJson: { accountingReceiptReady: false } });
+    expect(await createCostAccountingReconciler(db)()).toMatchObject({ accounted: 0, changed: 1, failed: 0 });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0].costAccountingPending).toBe(false);
+    expect(await db.select().from(costEvents)).toEqual([]);
+  });
+
+  it("includes spool and interrupted-service recovery and contained spool failures in progress", async () => {
+    const replay = vi.spyOn(usageReceipts, "replayUsageReceipts").mockResolvedValue({ replayed: 2, failed: 1 });
+    try {
+      expect(await createCostAccountingReconciler(db, {}, async () => 3)()).toMatchObject({ changed: 5, failed: 1 });
+    } finally { replay.mockRestore(); }
+  });
+
   it("shares service and run recovery across overlapping signals", async () => {
     let release!: () => void;
     const recover = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
