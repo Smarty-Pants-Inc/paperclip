@@ -8,7 +8,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import * as usageReceipts from "../usage-receipts.js";
 import { issueService } from "../issues.js";
 import { NativeRunCoordinatorStore } from "../native-runtime/native-run-coordinator-store.js";
-import { finalizeNativeRun } from "../native-runtime/native-run-finalizer.js";
+import { finalizeNativeRun, recoverCommittedNativeChatResponse } from "../native-runtime/native-run-finalizer.js";
 import { nativeResponsePresentationWork } from "../native-runtime/native-response-presentation-work.js";
 import { createHeartbeatLifecycle, type HeartbeatLifecycleDependencies } from "./run-lifecycle.js";
 import { createHeartbeatRunPreparation } from "./run-preparation.js";
@@ -193,6 +193,13 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(run.resultJson?.responsePublication).toBeUndefined();
     expect(await db.select().from(chatPublications).where(eq(chatPublications.endpointId, f.endpointId))).toEqual([]);
     expect(await nativeResponsePresentationWork(db).load({ companyId: f.companyId, issueId: f.issueId })).toEqual([]);
+    // Repeated recovery (a second and third finalizer projection plus a direct
+    // recovery attempt each time) still leaves exactly one task comment.
+    for (let attempt = 2; attempt <= 3; attempt++) {
+      await finalizeNativeRun({ db, runId: f.runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
+      await recoverCommittedNativeChatResponse(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId });
+    }
+    expect((await replies(f.issueId, f.runId)).map(comment => comment.id)).toEqual([comments[0]!.id]);
   });
 
   it("does not post a Slack reply locally from the durable finalizer's terminal projection", async () => {
