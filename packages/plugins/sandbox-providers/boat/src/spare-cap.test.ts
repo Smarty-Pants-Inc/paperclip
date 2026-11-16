@@ -18,6 +18,7 @@ vi.mock("node:timers/promises", () => ({
 }));
 
 import plugin from "./plugin.js";
+import { ReadySpareKeeper } from "./ready-spares.js";
 
 const apiKey = "boat_wake_race_test";
 const baseConfig = { apiKey, type: "small", ttlSeconds: 1800, reuseLease: false, labels: {} };
@@ -498,7 +499,8 @@ describe("Spare create cap: proof of use, refusal event and hourly ceiling", () 
 });
 
 // Review-fleet-2 judge of 7cb44662 (smarty-dev#20869), kept as permanent tests.
-// F1 (loop v): the hour's RUN creates must survive a worker restart.
+// F1 (loop v): the hour's RUN creates must survive a worker restart. F2: a
+// cold/unbound execute earns no credit, and runs alone can fill the ceiling.
 const boatCreatesBefore = (h: Harness, seq = Number.POSITIVE_INFINITY) =>
   h.boat.log.filter(e => e.kind === "boat" && e.method === "POST" && e.path === "/sandboxes" && e.seq < seq).length;
 const kindOf = (e: LogEntry) => (e.value as { kind?: string } | undefined)?.kind;
@@ -568,5 +570,64 @@ describe("Judge F1/F2: the all-create count survives a restart; unbound use and 
     expect(health.details).toMatchObject({ createCapped: expect.arrayContaining([
       expect.objectContaining({ kind: "run", reason: "ceiling", companyId: h.company, ceiling: CEILING }),
     ]) });
+  });
+
+  it("CREDIT-UNBOUND a cold run box's execute earns no proof-of-use credit; a bound hire earns exactly one despite repeats", async () => {
+    const original = ReadySpareKeeper.prototype.markUsed;
+    const calls: Array<{ company: string; id: string; credited: boolean }> = [];
+    const spy = vi.spyOn(ReadySpareKeeper.prototype, "markUsed").mockImplementation(function (this: ReadySpareKeeper, company, id) {
+      const credited = original.call(this, company, id); calls.push({ company, id, credited }); return credited;
+    });
+    try {
+      const h = await harness("unbound-credit", 1);
+      await seed(h);
+      // The seed's cold run box was never a claimed spare: a step on it is not use.
+      const cold = [...h.boat.boxes.values()].find(box => box.labels.purpose === "run")!;
+      expect((await execute(h, cold.id)).exitCode).toBe(0);
+      expect(calls, "an unbound/cold execute never reaches the credit ledger").toHaveLength(0);
+      const lease = await settle(h.acquire("bound-hire"));
+      expect(h.boat.boxes.get(lease.providerLeaseId!)!.labels.purpose).toBe("spare");
+      await execute(h, lease.providerLeaseId!); await execute(h, lease.providerLeaseId!);
+      await advance(20_000); await release(h, lease.providerLeaseId!); await advance(5_000);
+      expect(calls).toEqual([{ company: h.company, id: lease.providerLeaseId, credited: true }]);
+      expect(h.boat.creates()).toHaveLength(2);
+      h.boat.record({ kind: "event", note: "CREDIT-UNBOUND", value: { calls, spareCreates: h.boat.creates().length, runCreates: h.boat.creates("run").length } });
+    } finally { spy.mockRestore(); }
+  });
+
+  it("CEILING-RUN-HEAVY run creates alone fill the ceiling: the next run alarms kind=run, then a spare is refused", async () => {
+    const CEILING = 6;
+    const h = await harness("ceiling-run-heavy", 1, { createCeilingPerHour: CEILING, spares: 0 });
+    for (let n = 0; n < CEILING; n++) {
+      const lease = await settle(h.acquire(`run-heavy-${n}`));
+      expect(h.boat.boxes.get(lease.providerLeaseId!)?.labels.purpose).toBe("run");
+      expect((await execute(h, lease.providerLeaseId!)).exitCode).toBe(0);
+      await release(h, lease.providerLeaseId!);
+    }
+    expect(h.boat.creates()).toHaveLength(0);
+    expect(h.boat.creates("run")).toHaveLength(CEILING);
+    expect(cappedEvents(h), "under the ceiling nothing alarms").toHaveLength(0);
+    const over = await settle(h.acquire("run-heavy-over"));
+    expect(over.providerLeaseId, "the over-ceiling run is admitted (ruling A)").toBeTruthy();
+    expect(h.boat.creates("run")).toHaveLength(CEILING + 1);
+    const runEvents = cappedEvents(h, "ceiling").filter(e => kindOf(e) === "run");
+    expect(runEvents, "the run-only hour reaches the ceiling alarm").toHaveLength(1);
+    expect(runEvents[0].value).toMatchObject({ companyId: h.company, environmentId: h.env, kind: "run", reason: "ceiling",
+      allCreates: CEILING, runCreates: CEILING, spareCreates: 0, ceiling: CEILING });
+    const health = await settle(plugin.definition.onHealth!());
+    expect(health.status).toBe("degraded");
+    // Turn spares on: the next acquire runs cold and the hour the runs filled
+    // refuses its spare refill.
+    h.config.spares = 1;
+    await settle(Promise.resolve(plugin.definition.onConfigChanged!(h.config, { companyId: h.company } as any)));
+    const spared = await settle(h.acquire("run-heavy-spares-on"));
+    expect(h.boat.boxes.get(spared.providerLeaseId!)?.labels.purpose).toBe("run");
+    await advance(5_000);
+    expect(h.boat.creates(), "no spare is created above a run-filled ceiling").toHaveLength(0);
+    const spareEvents = cappedEvents(h, "ceiling").filter(e => kindOf(e) === "spare");
+    expect(spareEvents.length).toBeGreaterThan(0);
+    expect(spareEvents[0].value).toMatchObject({ companyId: h.company, environmentId: h.env, kind: "spare", reason: "ceiling",
+      allCreates: CEILING + 2, spareCreates: 0, ceiling: CEILING });
+    h.boat.record({ kind: "event", note: "CEILING-RUN-HEAVY", value: { run: runEvents[0].value, spare: spareEvents[0].value, health } });
   });
 });
