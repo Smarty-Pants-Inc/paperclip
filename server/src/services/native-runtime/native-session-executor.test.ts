@@ -21344,6 +21344,7 @@ describe("runnerd provider runtime wiring", () => {
 
     async function resumedSandboxWithStaleBackup(input: {
       label: string; boxThread: string; backupThread: string; resets: unknown[];
+      onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     }) {
       const remoteCwd = join(isolatedStateDirectory, `remote-identity-lineage-${input.label}`);
       const current: NativeExecutionInputV1 = { ...execution,
@@ -21377,7 +21378,7 @@ describe("runnerd provider runtime wiring", () => {
       } as Record<string, unknown> };
       const db = await withConversationRow(leaseDb(current), conversation);
       const backend = async () => {
-        await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true,
+        await createRunnerdBackend({ db, execution: current, runnerInstanceId, runnerIngressAuthorized: true, onLog: input.onLog,
           runnerRemoteBinaryPath: controllerArtifact, runnerRemoteCodexPath: controllerArtifact,
           runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
             leaseId: priorIdentity.environmentLeaseId, providerKey: "daytona", reusableLeaseConfigured: true,
@@ -21487,6 +21488,52 @@ describe("runnerd provider runtime wiring", () => {
       expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
         .toBe("01a1e2e9");
       expect(lineage).not.toBeNull();
+    });
+
+    // #20853 PART 2 (ii): the ONE person-visible line is keyed on the provider
+    // identity actually changing (a new lineage record), never on configFreshness.reset.
+    const closeCheckpoint = async (fixture: Awaited<ReturnType<typeof resumedSandboxWithStaleBackup>>) => {
+      const controller = new DurablePrpControlPlane({ stateDirectory: join(fixture.options.stateDirectory!, "control-plane"),
+        identity: fixture.options.prpIdentity! as ConstructorParameters<typeof DurablePrpControlPlane>[0]["identity"],
+        expectedRunnerVersion: "identity-lineage-fixture", expectedRunnerDigest: `sha256:${"a".repeat(64)}` });
+      const registration = await fixture.options.controlPlaneRegistration(controller);
+      onTestFinished(async () => { await registration.release(); await controller.stop(); });
+      return Promise.resolve(registration.checkpoint!("settled")).then(() => null, (error: unknown) => error);
+    };
+    const restartLines = (onLog: ReturnType<typeof vi.fn>) => onLog.mock.calls
+      .filter(([stream, chunk]) => stream === "stdout" && String(chunk).includes("The agent restarted its session"));
+    const lineageScope = (current: NativeExecutionInputV1) => ({ companyId: current.binding.companyId, agentId: current.binding.agentId,
+      taskKey: current.binding.issueId, normalizedSessionId: current.session.normalizedSessionId! });
+
+    it("(#20853 ii) a recorded new thread puts exactly one plain line in the run log; a retried capture says nothing again", async () => {
+      const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => undefined);
+      const fixture = await resumedSandboxWithStaleBackup({ label: "line", boxThread: "01a1e2e9", backupThread: "01a1e203", resets: [], onLog });
+      const lineage = await import("./provider-identity-lineage.js");
+      await lineage.noteProviderIdentityBreak(fixture.db, lineageScope(fixture.current), "resume_failed_on_new_box", fixture.current.binding.runId);
+      expect(String(await closeCheckpoint(fixture) ?? "")).not.toContain("provider_identity_changed");
+      // No handoff was asked for in this fixture, so the line makes no claim about the earlier messages.
+      expect(restartLines(onLog)).toEqual([["stdout", "[paperclip] The agent restarted its session because its earlier session "
+        + "could not be resumed on a new machine.\n"]]);
+      // A retried capture and the next host preparation of the same state: no second record, no second line.
+      expect(String(await closeCheckpoint(fixture) ?? "")).not.toContain("provider_identity_changed");
+      await expect(fixture.options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(restartLines(onLog)).toHaveLength(1);
+      expect((fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>).providerIdentityResets)
+        .toHaveLength(1);
+    });
+
+    it("(#20853 K6) a restore that kept the same thread records nothing and says nothing, even with a pending config break", async () => {
+      const onLog = vi.fn(async (_stream: "stdout" | "stderr", _chunk: string) => undefined);
+      const fixture = await resumedSandboxWithStaleBackup({ label: "k6", boxThread: "01a1e203", backupThread: "01a1e203", resets: [], onLog });
+      const lineage = await import("./provider-identity-lineage.js");
+      // configFreshness.reset:true at the Paperclip layer does not mean a new provider thread.
+      await lineage.noteProviderIdentityBreak(fixture.db, lineageScope(fixture.current), "config_changed", fixture.current.binding.runId);
+      onTestFinished(() => lineage.clearPendingProviderIdentityBreaksForTest());
+      await expect(fixture.options.prepareExternalRunnerState()).resolves.toBeUndefined();
+      expect(String(await closeCheckpoint(fixture) ?? "")).not.toContain("provider_identity_changed");
+      expect(restartLines(onLog)).toEqual([]);
+      expect((fixture.conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>).providerIdentityResets)
+        .toEqual([]);
     });
 
     it("(b) without a recorded break, the same idle close still refuses the newer thread", async () => {
