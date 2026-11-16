@@ -1,3 +1,4 @@
+import { projectConnectionAdmissionSnapshot, projectConnectionRunSnapshot } from "../project-connection-run-context.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -3521,6 +3522,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );
+          const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+            companyId: agent.companyId, agentId, issueId, contextSnapshot: enrichedContextSnapshot,
+          });
 
           if (executionWaitRequestId) {
             const [pending] = await tx.select().from(agentWakeupRequests).where(and(
@@ -5222,13 +5226,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
-              contextSnapshot: adoptedComments.length
-                ? withQueuedCommentIdsInRunContext(
-                    enrichedContextSnapshot,
-                    adoptedCommentIds,
-                    adoptedComments.map((wake) => wake.id),
-                  )
-                : enrichedContextSnapshot,
+              contextSnapshot: {
+                ...(adoptedComments.length
+                  ? withQueuedCommentIdsInRunContext(
+                      enrichedContextSnapshot,
+                      adoptedCommentIds,
+                      adoptedComments.map((wake) => wake.id),
+                    )
+                  : enrichedContextSnapshot),
+                projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext,
+              },
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
@@ -5426,7 +5433,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: projectConnectionRunSnapshot(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
@@ -5454,6 +5461,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     const queueOutcome = await db.transaction(async (tx) => {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId: agent.companyId, agentId, issueId: readNonEmptyString(enrichedContextSnapshot.issueId),
+        contextSnapshot: enrichedContextSnapshot,
+      });
       await lockAgentLifecycleAuthority(tx as unknown as Db, opts.managementActor, agent);
       await notifyRunDispatch(tx, { companyId: agent.companyId });
       await tx.execute(
@@ -5534,7 +5545,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: { ...enrichedContextSnapshot,
+            projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext },
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })
