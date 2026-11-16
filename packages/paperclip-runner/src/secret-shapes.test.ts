@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { redactSecretShapes } from "./secret-shapes.js";
 import { leakedPemWindows, secretShapePemVectors } from "./secret-shapes-pem.test-fixture.js";
 import { identityMarkPrecisionInputs } from "./secret-shapes-identity.test-fixture.js";
@@ -7,6 +7,14 @@ import { shapeAssignments, shapeNegatives, shapePems, shapeTokens } from "./driv
 // Keep reason: data-safety trust boundary; these check exact kinds and the pure
 // pass independently of the Pi projector's older, generic diagnostic masking.
 describe("redactSecretShapes", () => {
+  it("fails closed on any scanner exception, never returning raw text", () => {
+    const replace = vi.spyOn(String.prototype, "replace").mockImplementationOnce(() => {
+      throw new RangeError("Maximum call stack size exceeded");
+    });
+    try {
+      expect(redactSecretShapes(`ghp_${"FakeToken9".repeat(4)}`)).toBe("[REDACTED:unscannable]");
+    } finally { replace.mockRestore(); }
+  });
   it.for([...shapeTokens, ...shapePems])("replaces the whole $kind value ($label)", ({ kind, value }) => {
     expect(redactSecretShapes(value)).toBe(`[REDACTED:${kind}]`);
     expect(redactSecretShapes(redactSecretShapes(value))).toBe(`[REDACTED:${kind}]`);

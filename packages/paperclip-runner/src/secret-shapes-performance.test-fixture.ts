@@ -53,4 +53,18 @@ export function secretShapePerformanceInputsAt(bytes: number) {
   }))];
 }
 
+// N-1/N-3 shapes called out by the judge, in addition to the original corpus.
+// Assignment-heavy scans have a separate, explicit linear-cost budget.
+export function judgeSecretShapePerformanceInputsAt(bytes: number) {
+  const fill = (unit: string) => unit.repeat(Math.ceil(bytes / unit.length)).slice(0, bytes);
+  return [
+    { name: "judge: identity mark with continuous escaped slashes", text: `***REDACTED***${fill(String.raw`\/`)}`, budgetMs: 100 },
+    { name: "judge: identity mark with continuous base64", text: `***REDACTED***${fill("Ab9/")}`, budgetMs: 100 },
+    { name: "judge: repeated identity marks and escaped body lines", text: fill(`***REDACTED***\\n${String.raw`Ab9\/`.repeat(9)}\\n`), budgetMs: 100 },
+    { name: "judge: shell assignments with bounded overlapping KEY names", text: fill(`${"a".repeat(64)}KEY${"KEY".repeat(21)}='value'\n`), budgetMs: bytes / mb * 250 },
+    { name: "judge: JSON assignments with bounded overlapping KEY names", text: fill(`"${"a".repeat(64)}KEY${"KEY".repeat(21)}": "value",\n`), budgetMs: bytes / mb * 250 },
+    { name: "judge: repeated assignment-name near misses", text: fill(`${"KEY".repeat(43)}!\n`), budgetMs: bytes / mb * 250 },
+  ];
+}
+
 export const secretShapePerformanceInputs = secretShapePerformanceInputsAt(mb);
