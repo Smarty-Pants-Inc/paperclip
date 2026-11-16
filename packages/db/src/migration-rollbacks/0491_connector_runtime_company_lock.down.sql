@@ -235,4 +235,23 @@ BEGIN
 END;
 $$;
 --> statement-breakpoint
+-- src11: the 0347 row-level BEFORE file-event trigger and its body, exactly.
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_files_changed ON activity_log;
+--> statement-breakpoint
+CREATE OR REPLACE FUNCTION paperclip_agent_runtime_files_changed() RETURNS trigger
+LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+DECLARE revision bigint;
+BEGIN
+  IF NEW.entity_type = 'agent' AND NEW.action IN ('agent.files_updated', 'agent.instructions_path_updated',
+    'agent.instructions_bundle_updated', 'agent.instructions_file_updated', 'agent.instructions_file_deleted', 'plugin.managed_agent.reset') THEN
+    revision := paperclip_record_agent_runtime(NEW.company_id, NEW.entity_id::uuid);
+    NEW.details := coalesce(NEW.details, '{}'::jsonb) || jsonb_build_object('agentRuntimeRevision', revision::text);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+--> statement-breakpoint
+CREATE TRIGGER paperclip_agent_runtime_files_changed BEFORE INSERT ON activity_log
+  FOR EACH ROW EXECUTE FUNCTION paperclip_agent_runtime_files_changed();
+--> statement-breakpoint
 DROP FUNCTION IF EXISTS paperclip_lock_runtime_agents(uuid[]);
