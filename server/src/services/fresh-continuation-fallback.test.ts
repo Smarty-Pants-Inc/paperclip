@@ -2047,4 +2047,112 @@ suite("fresh-continuation fallback", () => {
     const [next] = await successors(f.runId);
     expect(await readFreshWorkspaceReadiness(db, next!)).toMatchObject({ mode: "fresh_isolated_workspace" });
   }, 60_000);
+  // smarty-dev#20925 (TES-468 chain b5064b28 -> 72aca045 -> f93bf1b8 -> 193fb0eb):
+  // a native run that died in workspace PREPARATION never reached the controller
+  // (no finalization owner row, no nativeControllerRecovery). Its follow-up that
+  // tried exact controller recovery was refused with a FRESH_THREAD code. The
+  // task must go straight to one fresh thread from saved history, promptly,
+  // with no blank notice, no "send a new message" note and no person message.
+  async function preparationDeathChain() {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "adapter_failed",
+      error: "Could not exclude agent files from task Git staging" });
+    const sessionId = randomUUID();
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", responsibleUserId: userId }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "What did we decide about the release notes?", createdAt: new Date(Date.now() - 7 * 60_000) }).returning();
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.runId));
+    const failedAt = new Date(Date.now() - 6 * 60_000);
+    await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, executionStage: "preparing", nativePhase: null,
+      finishedAt: failedAt, startedAt: new Date(failedAt.getTime() - 30_000), createdAt: new Date(failedAt.getTime() - 40_000),
+      resultJson: { stopReason: "adapter_failed" }, runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const refusedAt = new Date(Date.now() - 30_000);
+    const [refused] = await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", issueId: f.issueId,
+      nativeIssueId: f.issueId, nativeSessionId: sessionId, runtimeMode: "native", status: "failed", retryOfRunId: f.runId,
+      errorCode: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+      error: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
+      createdAt: new Date(failedAt.getTime() + 1_000), startedAt: new Date(refusedAt.getTime() - 7_000), finishedAt: refusedAt,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed", retryReason: "issue_continuation_needed",
+        wakeCommentId: message!.id } }).returning();
+    // The DB shape of hold b7a25c82: the refused follow-up's reconciliation
+    // hold, its saved-work recovery exhausted, workspace restore evidence kept.
+    const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId!));
+    await db.update(issueRecoveryActions).set({ createdAt: refusedAt, updatedAt: refusedAt,
+      fingerprint: `native-continuation:${refused!.id}`,
+      evidence: { ...hold!.evidence, runId: refused!.id, originalFailureCode: refused!.errorCode,
+        nativeFailureBlock: { runId: refused!.id, statusVersion: 4 }, workspaceRestoreFailure: "restore_unsafe_archive",
+        systemRecovery: { ...createSystemRecovery(refused!.id), state: "exhausted", attempts: 3,
+          failure: { code: "export_interrupted", retryClass: "retry_transient", evidenceFingerprint: "export" } } } })
+      .where(eq(issueRecoveryActions.id, f.actionId!));
+    return { ...f, sessionId, refusedRunId: refused!.id, messageId: message!.id };
+  }
+
+  it("#20925 a preparation death refused at exact recovery continues on a fresh thread at once, with no blank or resend note", async () => {
+    const f = await preparationDeathChain();
+    const personMessages = async () => db.select().from(issueComments)
+      .where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "user")));
+    // The held sweep's first check, about a minute after the refusal: no
+    // exact-recovery wait remains for a run that never reached the controller.
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.refusedRunId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "continued" });
+    await occupySlot();
+    await deliver();
+    const next = await successors(f.refusedRunId);
+    expect(next).toHaveLength(1);
+    expect(next[0]!.contextSnapshot).toMatchObject({ issueId: f.issueId, previousRunId: f.refusedRunId, forceFreshSession: true,
+      wakeReason: "issue_recovery_action_restored" });
+    // Exactly once: later checks and sweeps add nothing.
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.refusedRunId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: expect.stringMatching(/^(already_continued|successor_exists)$/) });
+    expect(await continueHeldExecutions(db)).toMatchObject({ continued: 0 });
+    await deliver();
+    expect(await successors(f.refusedRunId)).toHaveLength(1);
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+    for (const note of notes) expect(note.body.trim()).not.toBe("");
+    expect(notes.map(note => note.body).join("\n")).not.toMatch(/Send a new message to try again/);
+    expect(await personMessages()).toHaveLength(1);
+  }, 60_000);
+
+  it("#20925 while the fresh continuation is due, no note tells the person to send a new message to try again", async () => {
+    const f = await preparationDeathChain();
+    const visible = async () => (await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      eq(issueComments.authorType, "system")))).filter(note => !note.deletedAt);
+    // The unanswered sweep may run before the held sweep, and again later
+    // while the continuation is still queued.
+    for (const ahead of [30_000, 3 * 60_000]) {
+      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
+    }
+    await continueHeldExecutions(db);
+    await occupySlot();
+    await deliver();
+    for (const ahead of [30_000, 4 * 60_000]) {
+      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + ahead) });
+    }
+    expect(await successors(f.refusedRunId)).toHaveLength(1);
+    for (const note of await visible()) {
+      expect(note.body.trim()).not.toBe("");
+      // RFL (e): the held-conversation note that told TES-468 to resend. The
+      // ordinary "wasn't answered" note stays as judged (see result.md).
+      expect(note.body).not.toMatch(/Send a new message to try again/i);
+      expect(JSON.stringify(note.metadata ?? {})).not.toMatch(/Send a new message to try again/i);
+    }
+  }, 60_000);
+
+  it("#20925 the held sweep picks up a preparation death refused at exact recovery and continues it within its first pass", async () => {
+    const f = await preparationDeathChain();
+    expect(await heldExecutionsAwaitingFreshContinuation(db, new Date(), 10))
+      .toEqual([expect.objectContaining({ id: f.actionId, runId: f.refusedRunId })]);
+    expect(await continueHeldExecutions(db)).toMatchObject({ continued: 1 });
+    expect((await holdRow(f.actionId!)).evidence).toMatchObject({ freshContinuation: { sourceRunId: f.refusedRunId } });
+  }, 60_000);
+
+  it("#20925 a refused follow-up of a run that DID reach the controller keeps the bounded exact-recovery wait", async () => {
+    const f = await preparationDeathChain();
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId, issueId: f.issueId, phase: "terminal_failure",
+      recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
+    expect(await ensureFreshContinuation(db, { companyId, runId: f.refusedRunId, trigger: "held_recovery" }))
+      .toMatchObject({ kind: "exact_recovery_pending", reason: "workspace_recovery_owns_restore" });
+  }, 60_000);
 });
