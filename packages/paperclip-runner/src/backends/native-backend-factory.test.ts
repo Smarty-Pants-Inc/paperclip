@@ -496,6 +496,7 @@ describe("native backend factory", () => {
           reason: expect.stringContaining("PRP provider resume state is unavailable"),
           failureClass: PROVIDER_STATE_INCOMPATIBLE,
           resumeStateUnavailable: true,
+          identityChangeReason: "runner_state_lost",
         });
     });
 
@@ -513,14 +514,46 @@ describe("native backend factory", () => {
           runnerExitConfirmed: true });
     });
 
+    // Gate 6 (prp-resume-unavailable): the definite absence is a fact about the
+    // Runner, not about the turn. An in-flight turn no longer drops the class
+    // (which fell through to a bare retryable interruption); the runtime decides
+    // by its policy and a durable no-tool-call proof. A pending runtime request
+    // is an unsettled side effect and stops by name.
     it.each([
-      ["an active turn", { activeTurnId: "turn-in-flight" }],
-      ["a pending runtime request", { pendingRuntimeRequests: [{ requestId: "request-1" }] }],
-    ])("leaves a session that holds %s unclassified", async (_label, inFlight) => {
+      ["ACPX Claude", acpxExecution("claude")],
+      ["Pi", piRpcExecution()],
+    ])("names the definite absence of a %s session with an active turn, for the runtime ladder", async (_label, input) => {
+      const { backend, snapshot } = statelessRecovery(input);
+      const recovered = await backend.recoverSession!({ ...snapshot, activeTurnId: "turn-in-flight" } as never, { signal: new AbortController().signal });
+      expect(recovered).toEqual({
+        recovered: false,
+        reason: expect.stringContaining("PRP provider resume state is unavailable"),
+        failureClass: PROVIDER_STATE_INCOMPATIBLE,
+        resumeStateUnavailable: true,
+        identityChangeReason: "runner_state_lost",
+      });
+    });
+
+    it("names a replaced box's exit 66 as resume_failed_on_new_box", async () => {
+      const transport = new FakeCodexTransport();
+      transport.rejectMethods.set("initialize", Object.assign(new NativeRunnerResumeStateUnavailableError(),
+        { cause: new Error("runner_remote_state_unavailable: exit=66 timedOut=false") }));
+      const backend = createNativeSessionBackend(acpxExecution("claude"), {
+        codexTransportFactory: () => transport,
+        environment: { ...process.env, PAPERCLIP_WORKSPACE_CWD: WORKSPACE },
+      });
+      const { snapshot } = statelessRecovery(acpxExecution("claude"));
+      await expect(backend.recoverSession!({ ...snapshot, activeTurnId: "turn-in-flight" } as never, { signal: new AbortController().signal }))
+        .resolves.toMatchObject({ failureClass: PROVIDER_STATE_INCOMPATIBLE, resumeStateUnavailable: true,
+          identityChangeReason: "resume_failed_on_new_box" });
+    });
+
+    it("stops a session that holds a pending runtime request by name: side effect pending", async () => {
       const { backend, snapshot } = statelessRecovery(acpxExecution("claude"));
-      const recovered = await backend.recoverSession!({ ...snapshot, ...inFlight } as never, { signal: new AbortController().signal });
-      expect(recovered).toMatchObject({ recovered: false, reason: expect.stringContaining("PRP provider resume state is unavailable") });
-      expect(recovered).not.toHaveProperty("failureClass");
+      const recovered = await backend.recoverSession!({ ...snapshot, activeTurnId: "turn-in-flight",
+        pendingRuntimeRequests: [{ requestId: "request-1" }] } as never, { signal: new AbortController().signal });
+      expect(recovered).toMatchObject({ recovered: false, reason: expect.stringContaining("PRP provider resume state is unavailable"),
+        failureClass: PROVIDER_SIDE_EFFECT_PENDING });
       expect(recovered).not.toHaveProperty("resumeStateUnavailable");
     });
   });

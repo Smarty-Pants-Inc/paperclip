@@ -103,6 +103,7 @@ import {
   NativeProviderStateIncompatibleError,
   NativeProviderTerminalFailure,
   NativeGovernedWaitSettlementPendingError,
+  NativeRunnerResumeStateUnavailableError,
   NativeSessionProtocolIntegrityError,
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
@@ -16421,6 +16422,28 @@ describe("native session bounded recovery", () => {
     });
     // Only the typed runner class is deterministic; the same text stays retryable.
     expect(nativeSessionFailureSourceCode(new Error(failure.message))).toBe("native_session_interrupted");
+  });
+
+  // Gate 6 (prp-resume-unavailable): the Runner's definite absence of saved
+  // state used to reach here as a bare retryable interruption, retry with the
+  // same empty state until retry_exhausted, and never answer. Retry starts fresh.
+  it("names the Runner's definite absence of resume state instead of a bare retryable interruption", () => {
+    const runtimeComposed = new Error(
+      "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
+    );
+    // Route B: the typed class itself, thrown outside recoverSession.
+    const typed = Object.assign(new NativeRunnerResumeStateUnavailableError(),
+      { cause: new Error("runner_remote_state_unavailable: exit=66 timedOut=false") });
+    for (const failure of [runtimeComposed, typed, new Error("runner reattach failed", { cause: typed })]) {
+      const code = nativeSessionFailureSourceCode(failure);
+      expect(code, failure.message).toBe("native_provider_state_incompatible");
+      // The retry loop stops at the first definite absence.
+      expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
+        phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
+    }
+    // Prose that only resembles the class stays generic.
+    expect(nativeSessionFailureSourceCode(new Error("native_session_recovery_failed: Error: PRP provider resume state is unavailable")))
+      .toBe("native_session_interrupted");
   });
 
   // Chaos w-20261111T011704-s9107/t05: after a cut-off ACPX turn start the

@@ -339,3 +339,145 @@ describe("D-B5 RFL refreshTools caller trace", () => {
     expect(withExecutorFlag).toMatchObject({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" });
   });
 });
+
+// Gate 6 (prp-resume-unavailable, fresh's image). F1: the warm controller's
+// same-run load (loadWarmNativeCheckpoint's sameRunRecovery branch) returned the
+// session snapshot as is, and a session snapshot never carries a policy. Fill an
+// absent one with the SAME nativeProviderRecoveryPolicy the rebind uses.
+// F3: a replacement on a definite absence is RECORDED with the #20853 PART 2
+// record shape (minimal writer here, for merge with fresh-thread-20853g) and
+// ONE person-visible line, so the next idle close/backup can link identities.
+describe("gate 6: same-run recovery policy and the recorded replacement", () => {
+  // Loaded per row so this file's other rows still load before the module exists.
+  const loadIdentityRecord = () => import("./native-provider-identity-record.js");
+  const sameRunSnapshot = (f: ReturnType<typeof fixture>, extra: Partial<PersistedNativeSession> = {}): PersistedNativeSession => ({
+    ...f.snapshot("done"), identity: { ...f.snapshot("done").identity, runId: f.current.binding.runId },
+    semanticResult: null, cursor: "3", activeTurnId: "turn-inflight", ...extra,
+  });
+  async function warmSameRunLoad(f: ReturnType<typeof fixture>, checkpoint: PersistedNativeSession) {
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      await options.onCheckpoint?.(checkpoint);
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {} });
+    let warm: PersistedNativeSession | null | undefined;
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      warm = options.persistedSession;
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {} });
+    return warm;
+  }
+
+  it.each([
+    ["a first-turn fresh open", {}, "allow_replacement_after_resume_failure"],
+    ["an unfinished goal (guard: same_session_only never replaces)", { goal: { status: "active", objective: "Still unfinished" } as PersistedNativeSession["goal"] }, "same_session_only"],
+  ] as const)("fills an absent policy on a same-run warm checkpoint: %s", async (_label, extra, expected) => {
+    const f = fixture(home);
+    const checkpoint = sameRunSnapshot(f, extra);
+    expect(checkpoint).not.toHaveProperty("providerRecoveryPolicy");
+    const warm = await warmSameRunLoad(f, checkpoint);
+    // Same-run: the identity is NOT rebound and the turn state is kept.
+    expect(warm).toMatchObject({ identity: checkpoint.identity, activeTurnId: "turn-inflight", cursor: "3" });
+    expect(warm?.providerRecoveryPolicy).toBe(expected);
+    expect(warm?.providerRecoveryPolicy).toBe(nativeResume.nativeProviderRecoveryPolicy(checkpoint as unknown as Record<string, unknown>));
+  });
+
+  it("keeps a same-run warm checkpoint's own policy", async () => {
+    const f = fixture(home);
+    const warm = await warmSameRunLoad(f, sameRunSnapshot(f, { providerRecoveryPolicy: "allow_replacement_after_governed_wait" }));
+    expect(warm?.providerRecoveryPolicy).toBe("allow_replacement_after_governed_wait");
+  });
+
+  async function replacedRun(f: ReturnType<typeof fixture>, identityChangeReason: "resume_failed_on_new_box" | "runner_state_lost",
+    replacement = { driver: "db5-driver-replacement", provider: "db5-provider-replacement" },
+    previous = { driver: "db5-driver-session", provider: "db5-provider-session" }) {
+    const logs: string[] = [];
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      await options.onContinuityBreak?.({ reason: "NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
+        previousDriverSessionId: previous.driver, previousProviderSessionId: previous.provider,
+        replacementDriverSessionId: replacement.driver, replacementProviderSessionId: replacement.provider,
+        identityChangeReason } as Parameters<NonNullable<RuntimeOptions["onContinuityBreak"]>>[0]);
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {},
+      onLog: async (_stream: string, text: string) => { logs.push(text); } });
+    return logs;
+  }
+  // The identity object NSE:18490 compares, exactly as the durable provider
+  // state of each session produces it (never a hand-written shape).
+  const durableIdentity = (f: ReturnType<typeof fixture>, threadId: string, providerSessionId: string) =>
+    nativeExecutor.providerSessionIdentityFromDurableProviderState({ execution: f.current, providerState: {
+      schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "session_open", threadId, providerSessionId,
+      activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" } } });
+
+  it.each(["resume_failed_on_new_box", "runner_state_lost"] as const)("records a %s replacement with the #20853 PART 2 shape and one person-visible line", async reason => {
+    const identityRecord = await loadIdentityRecord();
+    const f = fixture(home);
+    const logs = await replacedRun(f, reason);
+    const root = nativeExecutor.scopedRunnerdStateRoot(f.current);
+    const records = identityRecord.readNativeProviderIdentityRecords(root);
+    expect(records).toHaveLength(1);
+    const previousIdentity = durableIdentity(f, "db5-driver-session", "db5-provider-session");
+    const identity = durableIdentity(f, "db5-driver-replacement", "db5-provider-replacement");
+    expect(records[0]).toEqual({ schema: "paperclip.native-provider-identity-record.v1", generation: 1,
+      companyId: f.companyId, taskId: f.issueId, normalizedSessionId: f.sessionId, runId: f.current.binding.runId,
+      previousIdentity, identity, reason, recordedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/) });
+    expect(identityRecord.isRecordedProviderIdentityChain(records, { companyId: f.companyId, taskId: f.issueId,
+      normalizedSessionId: f.sessionId, previous: previousIdentity, current: identity })).toBe(true);
+    // Never an unrelated or reversed chain.
+    expect(identityRecord.isRecordedProviderIdentityChain(records, { companyId: f.companyId, taskId: f.issueId,
+      normalizedSessionId: f.sessionId, previous: identity, current: previousIdentity })).toBe(false);
+    expect(identityRecord.isRecordedProviderIdentityChain(records, { companyId: f.companyId, taskId: randomUUID(),
+      normalizedSessionId: f.sessionId, previous: previousIdentity, current: identity })).toBe(false);
+    const personLines = logs.filter(line => line.startsWith(identityRecord.NATIVE_PROVIDER_IDENTITY_PERSON_LINE_PREFIX));
+    expect(personLines).toHaveLength(1);
+    expect(personLines[0]).not.toMatch(/driver|session=|db5-/);
+  });
+
+  it("chains a second replacement as generation 2, and records nothing when the provider session did not change", async () => {
+    const identityRecord = await loadIdentityRecord();
+    const f = fixture(home);
+    await replacedRun(f, "resume_failed_on_new_box");
+    await replacedRun(f, "runner_state_lost", { driver: "db5-driver-third", provider: "db5-provider-third" },
+      { driver: "db5-driver-replacement", provider: "db5-provider-replacement" });
+    const root = nativeExecutor.scopedRunnerdStateRoot(f.current);
+    const records = identityRecord.readNativeProviderIdentityRecords(root);
+    expect(records.map(r => [r.generation, r.reason])).toEqual([[1, "resume_failed_on_new_box"], [2, "runner_state_lost"]]);
+    // The original identity reaches the third through both recorded links.
+    expect(identityRecord.isRecordedProviderIdentityChain(records, { companyId: f.companyId, taskId: f.issueId,
+      normalizedSessionId: f.sessionId, previous: durableIdentity(f, "db5-driver-session", "db5-provider-session"),
+      current: durableIdentity(f, "db5-driver-third", "db5-provider-third") })).toBe(true);
+    const unchanged = await (async () => {
+      const g = fixture(home);
+      const logs: string[] = [];
+      provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+        await options.onContinuityBreak?.({ reason: "r", previousDriverSessionId: "same", previousProviderSessionId: "same",
+          replacementDriverSessionId: "same", replacementProviderSessionId: "same", identityChangeReason: "runner_state_lost" } as Parameters<NonNullable<RuntimeOptions["onContinuityBreak"]>>[0]);
+        return completed(g.current);
+      });
+      await nativeExecutor.executePaperclipNativeSession({ db: g.dbFor(g.current), execution: g.current,
+        runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {},
+        onLog: async (_stream: string, text: string) => { logs.push(text); } });
+      return { records: identityRecord.readNativeProviderIdentityRecords(nativeExecutor.scopedRunnerdStateRoot(g.current)), logs };
+    })();
+    expect(unchanged.records).toEqual([]);
+    expect(unchanged.logs.filter(line => line.startsWith(identityRecord.NATIVE_PROVIDER_IDENTITY_PERSON_LINE_PREFIX))).toEqual([]);
+  });
+
+  // SMA-67's failure mode: after a replacement the next idle close/backup is
+  // refused as runner_harness_state_mismatch: provider_identity_changed
+  // (NSE:18490-18498). The record above links the identities; the gate itself
+  // consulting it is dev-lead's NSE:18495 change. Expected RED BY NAME until it
+  // lands; that commit removes the .fails.
+  it.fails("needs dl-identity-changed: the next backup accepts the recorded replacement's identity transition", async () => {
+    const f = fixture(home);
+    await replacedRun(f, "resume_failed_on_new_box");
+    expect(nativeExecutor.providerSessionIdentityTransitionIsAllowed({ execution: f.current,
+      previous: durableIdentity(f, "db5-driver-session", "db5-provider-session"),
+      current: durableIdentity(f, "db5-driver-replacement", "db5-provider-replacement") })).toBe(true);
+  });
+});

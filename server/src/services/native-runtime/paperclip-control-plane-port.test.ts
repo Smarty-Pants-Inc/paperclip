@@ -33,6 +33,7 @@ import {
   nativeRunResults,
   statusDecisionEffects,
   statusDecisions,
+  toolInvocations,
   workAssessments,
 } from "@paperclipai/db";
 import {
@@ -52,6 +53,7 @@ import {
 import { startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres.js";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
+import { nativeProviderRecoveryPolicy } from "./native-session-resume.js";
 import { nativeSha256 } from "./canonical.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { finalizeNativeRun, repairCommittedNativeChatResponse } from "./native-run-finalizer.js";
@@ -455,6 +457,118 @@ describe("PaperclipControlPlanePort conformance", () => {
         status: "pending", result: null, effectiveResolverPolicy: "human_only", continuationPolicy: "none", sourceRunId: identity.runId,
       });
     } finally { releaseObserver(); await outcome; if (terminalWasRecorded) await observerDone; }
+  });
+
+  // Gate 6 (prp-resume-unavailable) F1: the session snapshot a runner writes
+  // never carries providerRecoveryPolicy, so every same-run checkpoint (a retry
+  // attempt >= 2, a restart recovery, a first-turn fresh open) lost it and its
+  // definite-absence recovery could never be replaced. The ONE same-run load
+  // fills an absent policy with the rebind's own nativeProviderRecoveryPolicy.
+  async function sameRunCheckpointRun(checkpoint: (identity: typeof CONTROL_PLANE_CONFORMANCE_OPEN.identity) => Record<string, unknown>) {
+    const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+    const runnerId = randomUUID();
+    const saved = checkpoint(identity);
+    await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+      runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+      runnerProfileJson: { sessionCheckpoint: saved } });
+    const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+      completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: "same-run-policy" });
+    return { identity, runnerId, saved, port };
+  }
+  const inFlightSameRunCheckpoint = (identity: typeof CONTROL_PLANE_CONFORMANCE_OPEN.identity) => ({
+    backendKind: "runner", driverKind: "pi_rpc", sessionId: "pi-driver-a", providerSessionId: "pi-driver-a", identity,
+    cursor: "3", semanticResult: null, terminal: null, activeTurnId: "turn-inflight", terminalTurns: [],
+    pendingRuntimeRequests: [], dispositionOnlyRecoveryConsumed: false, dispositionOnlyRecoveryTurnId: null, goal: null, lineage: [],
+  });
+
+  it.each([
+    ["a first-turn fresh open (no goal)", {}, "allow_replacement_after_resume_failure"],
+    ["an unfinished goal (guard: computed same_session_only never replaces)", { goal: { status: "active", objective: "Still running" } }, "same_session_only"],
+  ] as const)("fills an absent providerRecoveryPolicy on the same-run checkpoint it loads: %s", async (_label, extra, expected) => {
+    const f = await sameRunCheckpointRun(identity => ({ ...inFlightSameRunCheckpoint(identity), ...extra }));
+    expect(f.saved).not.toHaveProperty("providerRecoveryPolicy");
+    const loaded = await f.port.loadSessionCheckpoint();
+    expect(loaded?.providerRecoveryPolicy).toBe(expected);
+    // The SAME computation the cross-run rebind uses, not a second policy.
+    expect(loaded?.providerRecoveryPolicy).toBe(nativeProviderRecoveryPolicy(f.saved));
+    expect(loaded).toMatchObject({ ...f.saved, providerRecoveryPolicy: expected });
+    // Filled at load, never written back: the stored checkpoint is the runner's.
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.identity.runId));
+    expect((row!.runnerProfileJson as Record<string, unknown>).sessionCheckpoint).toEqual(f.saved);
+  });
+
+  it("keeps a policy the checkpoint already carries", async () => {
+    const f = await sameRunCheckpointRun(identity => ({ ...inFlightSameRunCheckpoint(identity),
+      providerRecoveryPolicy: "allow_replacement_after_governed_wait" }));
+    expect((await f.port.loadSessionCheckpoint())?.providerRecoveryPolicy).toBe("allow_replacement_after_governed_wait");
+  });
+
+  it("gives a retry attempt >= 2 of a cross-run-rebound checkpoint its policy after attempt 1's snapshot dropped it", async () => {
+    // Attempt 1 starts from the rebound checkpoint (policy computed at rebind),
+    // then the runner checkpoints its session snapshot, which has no policy.
+    const f = await sameRunCheckpointRun(identity => ({ ...inFlightSameRunCheckpoint(identity), cursor: null, activeTurnId: null,
+      providerRecoveryPolicy: "allow_replacement_after_resume_failure" }));
+    await f.port.openRun({ identity: f.identity, backendKind: "runner", sourceInstanceId: f.runnerId });
+    const { providerRecoveryPolicy: _dropped, ...attemptOneSnapshot } = { ...inFlightSameRunCheckpoint(f.identity),
+      providerRecoveryPolicy: undefined };
+    await f.port.checkpointSession(attemptOneSnapshot as never, { signal: new AbortController().signal });
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.identity.runId));
+    expect((row!.runnerProfileJson as Record<string, unknown>).sessionCheckpoint).not.toHaveProperty("providerRecoveryPolicy");
+    const attemptTwo = new PaperclipControlPlanePort(db, { ...f.identity, completionContractId: contractId,
+      completionContractSha256: contractSha, sourceInstanceId: f.runnerId, controlPlaneSourceInstanceId: "same-run-policy-2" });
+    expect(await attemptTwo.loadSessionCheckpoint()).toMatchObject({ activeTurnId: "turn-inflight",
+      providerRecoveryPolicy: "allow_replacement_after_resume_failure" });
+  });
+
+  // F2 (review-fleet-3): an empty pendingRuntimeRequests does not prove that no
+  // tool ran. Only durable rows across runner instances can: no tool
+  // invocation, no tool/semantic-tool/delegation/MCP-app/terminal/hook event and
+  // no item whose kind is not known to be inert (fail closed on unknown kinds).
+  describe("provesNoRunToolWork", () => {
+    async function toolProofRun(events: Array<[PrpEvent["eventType"], Record<string, unknown>]>) {
+      const f = await sameRunCheckpointRun(inFlightSameRunCheckpoint);
+      await f.port.openRun({ identity: f.identity, backendKind: "runner", sourceInstanceId: f.runnerId });
+      let sourceSeq = 0;
+      for (const [eventType, payload] of events) {
+        sourceSeq += 1;
+        await f.port.appendEvent({ schema: "paperclip.prp.event.v1", sourceEventId: `${f.runnerId}:${sourceSeq}`,
+          sourceInstanceId: f.runnerId, sourceSeq, sourceKind: "runner", runId: f.identity.runId,
+          normalizedSessionId: f.identity.sessionId, turnId: "turn-inflight", eventType, schemaVersion: 1, priority: 0,
+          emittedAt: new Date().toISOString(), payload } as PrpEvent, { signal: new AbortController().signal });
+      }
+      return f;
+    }
+    const inertTurn: Array<[PrpEvent["eventType"], Record<string, unknown>]> = [
+      ["turn.started", {}],
+      ["item.started", { kind: "reasoning", channel: "detail", text: "" }],
+      ["item.completed", { kind: "reasoning", channel: "detail", text: "thinking" }],
+      ["item.started", { kind: "agentMessage", channel: "unknown", text: "" }],
+      ["item.delta", { kind: "agentMessage", channel: "unknown", text: "Hel" }],
+    ];
+
+    it("proves a run whose interrupted turn only thought and wrote text", async () => {
+      const f = await toolProofRun(inertTurn);
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(true);
+      // Stricter than the governed-wait proof, which any provider event denies.
+      await expect(f.port.provesNoRunProviderWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
+
+    it.each([
+      ["a Pi bash command item", ["item.started", { kind: "commandExecution", toolName: "bash", item: { type: "tool_use", id: "t1", name: "bash" } }]],
+      ["a Pi tool item", ["item.started", { kind: "tool", toolName: "edit", item: { type: "tool_use", id: "t2", name: "edit" } }]],
+      ["an item of unknown kind", ["item.completed", { kind: "somethingNew" }]],
+      ["an item without a kind", ["item.started", {}]],
+    ] as const)("denies the proof for %s", async (_label, event) => {
+      const f = await toolProofRun([...inertTurn, event as unknown as [PrpEvent["eventType"], Record<string, unknown>]]);
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
+
+    it("denies the proof for a recorded tool invocation", async () => {
+      const f = await toolProofRun(inertTurn);
+      await db.insert(toolInvocations).values({ companyId: f.identity.companyId, runId: f.identity.runId, toolName: "paperclip_api" });
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
   });
 
   async function terminalObserverFixture(options: {
