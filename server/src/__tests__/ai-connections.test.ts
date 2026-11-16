@@ -607,6 +607,29 @@ describe("managed AI connections", () => {
     }
   });
 
+  it("records a delayed successful native probe retirement after answering", async () => {
+    const owner = "pi-probe-retirement-completed";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await service.save(companyId, owner, { provider: "anthropic", method: "api_key", ownership: "personal", name: owner, apiKey: "fixture", loginSessionId: "fixture", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "messages", auth: "bearer", baseUrl: "https://gateway.example/v1", models: [] } }, "fixture-native-pi-key");
+    const probeInput = { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "anthropic", method: "api_key", mode: "delegated", ...account } as const, config: { provider: "pi_rpc", model: "paperclip/faux" } };
+    const retirement = Promise.withResolvers<void>();
+    const probe = async () => {
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")]);
+      Object.assign(error, { probeSuccessResult: "hello-verified" });
+      throw error;
+    };
+    try {
+      await expect(withManagedAiProbe(db, probeInput, probe)).resolves.toBe("hello-verified");
+      retirement.resolve();
+      await vi.waitFor(async () => {
+        const record = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, agentId), eq(activityLog.action, "agent.native_probe_retirement")));
+        expect(record.some(row => (row.details as Record<string, unknown> | null)?.outcome === "retired")).toBe(true);
+      }, { timeout: 2_000 });
+    } finally { retirement.resolve(); }
+  });
+
   it("allows the same account to run while retired Codex probe cleanup is pending or fails", async () => {
     const owner = "retired-probe-retry", otherOwner = "retired-probe-other";
     const auth = (user: string, hour: string) => JSON.stringify({ tokens: { account_id: user, id_token: "identity", access_token: `access-${hour}`, refresh_token: `refresh-${hour}` }, last_refresh: `2026-09-10T${hour}:00:00Z` });

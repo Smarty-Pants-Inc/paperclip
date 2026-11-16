@@ -5,6 +5,7 @@ import { join, posix } from "node:path";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "@paperclipai/shared";
 import * as localCredentialFile from "../local-ai-credential-file.js";
 import * as codexCredentials from "@paperclipai/adapter-codex-local/server";
+import * as runnerProbe from "../../vendor/paperclip-runner/index.js";
 const { prepareIsolatedCodexHome } = await import(new URL("../../../../packages/paperclip-runner/src/drivers/runtime-context-materializer.ts", import.meta.url).href);
 const { execute, nativeProbe, selectedRunner, selectedRemoteRunner, sshExecute, sshRunner, nativeArtifacts, remoteLauncher, registerPrp, ingressConnect } = vi.hoisted(() => ({ execute: vi.fn(), nativeProbe: vi.fn(), selectedRunner: vi.fn(), selectedRemoteRunner: vi.fn(), sshExecute: vi.fn(), sshRunner: vi.fn(), nativeArtifacts: vi.fn(), remoteLauncher: vi.fn(), registerPrp: vi.fn(), ingressConnect: vi.fn() }));
 const nativeProbeRuntimeDirectories = vi.hoisted(() => [] as string[]);
@@ -69,6 +70,26 @@ describe("Codex selected native account verification", () => {
     vi.unstubAllEnvs();
     for (const root of nativeProbeRuntimeDirectories) await rm(root, { recursive: true, force: true });
   });
+  it("preserves a verified Pi hello as the result when only runner retirement remains pending", async () => {
+    const retired = Promise.withResolvers<void>();
+    void retired.promise.catch(() => {});
+    nativeProbe.mockImplementationOnce(async input => {
+      await mkdir(join(input.runtimeDirectory, "pi"), { mode: 0o700 });
+      await writeFile(join(input.runtimeDirectory, "pi", "history.jsonl"), "raw history\\n", { mode: 0o600 });
+      await writeFile(join(input.runtimeDirectory, "pi", "provider-trace.jsonl"), "raw provider trace\\n", { mode: 0o600 });
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retired.promise, undefined, [new Error("fixture retirement timed out")]);
+      Object.assign(error, { probeResult: { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: "paperclip/claude-opus-5-5", helloProbePassed: true } });
+      throw error;
+    });
+    const selected = { ...context, config: { provider: "pi_rpc", env: { PAPERCLIP_AI_PROVIDER_KEY: "selected-pi-key" } } };
+    const failure = await testNativeRunnerAuthentication(selected, "pi_rpc", "paperclip/claude-opus-5-5").catch(error => error);
+    expect(failure).toMatchObject({ probeSuccessResult: { status: "pass", checks: [expect.objectContaining({ code: "pi_rpc_hello_probe_passed" })] } });
+    const runtimeDirectory = nativeProbe.mock.calls[0]![0].runtimeDirectory;
+    expect(await readFile(join(runtimeDirectory, "pi", "history.jsonl"), "utf8")).toBe("raw history\\n");
+    expect(await readFile(join(runtimeDirectory, "pi", "provider-trace.jsonl"), "utf8")).toBe("raw provider trace\\n");
+    retired.resolve();
+  });
+
   it.each([
     [null, "pi_rpc_hello_probe_passed", null],
     ["Authentication required: no API key for provider", "pi_rpc_hello_probe_auth_required", "harness_auth_failed"],
