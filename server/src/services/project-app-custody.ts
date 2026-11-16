@@ -215,7 +215,11 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
   const [project] = await db.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId)));
   const [source] = await db.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, input.connectionId)));
   if (!project || project.archivedAt) throw notFound("Active project not found");
-  if (!source || source.projectId !== null || !isGitHubAppConnection(source) || ["archived", "disabled"].includes(source.status)
+  // A consumed source stays archived forever, but H retains the off switch.
+  // This exception is revoke-only: approval cannot resurrect/reuse a spent S.
+  const consumedRevoke = input.action === "revoke" && source?.status === "archived"
+    && z.string().uuid().safeParse(source.config[PROJECT_APP_APPROVAL_CONSUMED_BY]).success;
+  if (!source || source.projectId !== null || !isGitHubAppConnection(source) || source.status === "disabled" || (source.status === "archived" && !consumedRevoke)
     || source.credentialPolicy !== "shared" || source.credentialSource !== "paperclip_vault" || source.credentialSecretRefs.length !== 1) throw notFound("Project App source connection not found");
   const config = parseGitHubAppConfig(source.config.methodConfig);
   const manager = await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, requireConfigured: true });
