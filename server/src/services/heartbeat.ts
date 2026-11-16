@@ -4360,6 +4360,13 @@ export function heartbeatService(
         const handoff = await pendingCaseHandoffForRun(db, run.id);
         if (handoff) await recordCaseHandoffExecutionReleased(db, run.id, handoff.issueId);
       }
+      if (latestRun?.runtimeMode === "legacy") {
+        // Escalation rechecks Stop proof itself. Scratch/handoff readiness is
+        // not authority to release this task's execution ownership.
+        await runLifecycle.settlePlanApprovalResumeFailureAfterStop(latestRun).catch(err => {
+          logger.error({ err, runId: run.id }, "failed to settle plan-approval recovery after execution cleanup");
+        });
+      }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
       if (latestRun?.runtimeMode === "legacy" && ["failed", "timed_out"].includes(latestRun.status) &&

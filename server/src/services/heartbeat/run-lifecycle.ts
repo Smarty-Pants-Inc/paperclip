@@ -981,17 +981,21 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       attempt: input.attempt,
       maxAttempts: input.maxAttempts,
     });
-    await recovery.escalateStrandedAssignedIssue({
+    const escalated = await recovery.escalateStrandedAssignedIssue({
       issue,
       previousStatus: issue.status,
       latestRun: input.run,
       comment: body,
     });
-    await addPlanApprovalResumeFailureCommentOnce({
-      issueId: issue.id,
-      run: input.run,
-      body,
-    });
+    // A refused escalation retains its saved disposition, not a premature
+    // task comment that the post-cleanup escalation would publish again.
+    if (escalated) {
+      await addPlanApprovalResumeFailureCommentOnce({
+        issueId: issue.id,
+        run: input.run,
+        body,
+      });
+    }
 
     const recoveryActionId = await getActiveRecoveryActionId(
       issue.companyId,
@@ -1008,6 +1012,19 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       }),
     });
     return interaction.id;
+  }
+
+  /** The first failure report can precede controller/lease cleanup. Reuse its
+   * saved disposition after Stop settlement, rather than release task ownership
+   * while the executor still owns it or lose the needs-attention escalation. */
+  async function settlePlanApprovalResumeFailureAfterStop(run: typeof heartbeatRuns.$inferSelect) {
+    if (!["failed", "timed_out"].includes(run.status)) return null;
+    const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    const interaction = await getAcceptedPlanApprovalInteractionForRun(run, issueId);
+    const failure = parseObject(parseObject(interaction?.result).resumeFailure);
+    if (failure.status !== "needs_attention" || failure.runId !== run.id) return null;
+    return escalatePlanApprovalResumeFailureNeedsAttention({ run, issueId,
+      attempt: countValue(failure.attempt), maxAttempts: countValue(failure.maxAttempts) });
   }
 
   async function completeSkillTestRunForHeartbeatOutcome(input: {
@@ -3221,6 +3238,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   return {
     appendRunEvent,
     escalatePlanApprovalResumeFailureNeedsAttention,
+    settlePlanApprovalResumeFailureAfterStop,
     recordPlanApprovalResumeFailureRetry,
     setRunStatusIfRunning,
     setWakeupStatus,
