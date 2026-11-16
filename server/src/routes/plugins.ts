@@ -27,6 +27,7 @@ import { trustedBoardMutationOrigin } from "../middleware/board-mutation-guard.j
 import { authorizationService } from "../services/authorization.js";
 import { fileURLToPath } from "node:url";
 import { Router } from "express";
+import { assertBoardSession } from "./board-session.js";
 import type { Request, Response } from "express";
 import { and, desc, eq, gte, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -2399,6 +2400,16 @@ export function pluginRoutes(
     if (!body?.configJson || typeof body.configJson !== "object" || Array.isArray(body.configJson)) {
       res.status(400).json({ error: '"configJson" is required and must be an object' });
       return;
+    }
+
+    // C4's manager classification is trusted only when written by a real
+    // board session. Full replacement cannot let a board key erase it either.
+    if (plugin.pluginKey === "paperclipai.plugin-row12-installer") {
+      const previous = await registry.getConfig(plugin.id, companyId);
+      if (Object.hasOwn(body.configJson, "managerAppId") || Object.hasOwn(body.configJson, "managerKeyAnchorProjectId")
+        || Object.hasOwn(previous?.configJson ?? {}, "managerAppId") || Object.hasOwn(previous?.configJson ?? {}, "managerKeyAnchorProjectId")) {
+        assertBoardSession(req, "project_app_manager_config_session_required");
+      }
     }
 
     // Strip devUiUrl unless the caller is an instance admin. devUiUrl activates

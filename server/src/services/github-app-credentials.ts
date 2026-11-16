@@ -1,7 +1,8 @@
 import { and, eq, sql } from "drizzle-orm";
 import { connectionGrants, toolConnections, toolConnectionInstalls, projectWorkspaces, type Db } from "@paperclipai/db";
 import { resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership } from "./connection-credentials.js";
-import { unprocessable } from "../errors.js";
+import { HttpError, unprocessable } from "../errors.js";
+import { assertNotManagerApp, readProjectAppCustody } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
 
@@ -9,6 +10,9 @@ export { isGitHubAppConnection, parseGitHubAppConfig } from "./github-app-client
 type Connection = typeof toolConnections.$inferSelect;
 type Grant = typeof connectionGrants.$inferSelect;
 const client = createGitHubAppClient();
+// Project provider verdicts must not inherit the ordinary five-minute token
+// lifetime. The existing client still supplies JWT, scope and HTTP validation.
+const projectClient = createGitHubAppClient(fetch, Date.now, 60_000);
 
 function matchesOwnership(connection: Connection, grant: Grant) {
   return connection.credentialPolicy === "per_user"
@@ -46,6 +50,7 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
       || JSON.stringify(c.config) !== JSON.stringify(connection.config)
       || JSON.stringify(c.credentialSecretRefs) !== JSON.stringify(connection.credentialSecretRefs)
       || JSON.stringify(g.credentialSecretRefs) !== JSON.stringify(grant.credentialSecretRefs)) githubAppFailure();
+    await assertNotManagerApp(db, { companyId: c.companyId, refs: g.credentialSecretRefs, appId: parseGitHubAppConfig(c.config.methodConfig).appId });
     if (c.projectId) {
       const scope = readProjectConnectionScope(c);
       const config = parseGitHubAppConfig(c.config.methodConfig);
@@ -82,7 +87,8 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const ref = g.credentialSecretRefs.find(r => r.configPath === GITHUB_APP_KEY_PATH);
     if (!ref) githubAppFailure();
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
-    const result = await client.acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
+    const result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
+    await assertNotManagerApp(db, { companyId: c.companyId, refs: g.credentialSecretRefs, verifiedAppId: result.verifiedRegistrationId });
     await valid();
     if (c.projectId) {
       const currentKey = await validateConnectionGrantSecretOwnership(db, c, g, ref);
@@ -108,12 +114,18 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
         || repositories.some(repo => repo.installationId !== config.installationId || !config.repositories.includes(repo.fullName.toLowerCase()))
         || (result.verifiedRegistrationId !== undefined && result.verifiedRegistrationId !== scope.registrationId)
         || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== config.installationId) githubAppFailure("repositories");
+      await readProjectAppCustody(db, { companyId: c.companyId, projectId: c.projectId, config: c.config,
+        refs: g.credentialSecretRefs, registrationId: result.verifiedRegistrationId, repositoryIds: ids });
       await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
         targetAgentIds: agentId ? [agentId] : [], proposedSecretRefs: g.credentialSecretRefs, proposedRepositoryIds: ids });
       await valid();
     }
     return result;
   } catch (error) {
+    const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
+    if (typeof code === "string" && code.startsWith("project_app_")) throw error;
+    if (connection.projectId && code === "github_app_access_unavailable") throw new HttpError(503,
+      "GitHub project App verification is unavailable. No credential was released.", { code: "project_app_verification_unavailable" });
     rethrowGitHubAppFailure(error);
   }
 }
