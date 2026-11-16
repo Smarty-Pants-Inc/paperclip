@@ -40,7 +40,8 @@ function localDuplexChannel(command: readonly string[], cwd: string): CommandMan
 async function broker(resolveCredentials = vi.fn(async (binding: ReturnType<typeof run>) => ({
   status: "available", env: { GH_TOKEN: `fixture-${binding.runId}` },
 })), remote = false, bridgeUnavailable = false, onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
-duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder }) {
+duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; recorder?: DuplexObservabilityRecorder },
+fallbackReason?: "capability_absent" | "ingress_unready" | "disconnect") {
   const root = await mkdtemp(path.join(tmpdir(), "native-github-reuse-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const bin = path.join(root, "real-bin");
@@ -69,7 +70,7 @@ duplex?: { enabled?: boolean; capability: boolean; unavailable?: boolean; record
     } } : {}) } : null;
   const bridgeModes: (string | undefined)[] = [];
   const result = await createNativeGitHubAccess({ scope, target, cwd: root,
-    env: { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, PAPERCLIP_API_KEY: "old-run-api-key" }, resolveCredentials, onLog },
+    env: { PATH: `${bin}:${path.dirname(process.execPath)}:/usr/bin:/bin`, PAPERCLIP_API_KEY: "old-run-api-key" }, resolveCredentials, onLog, fallbackReason },
     bridgeUnavailable ? async () => { throw new Error("fixture bridge unavailable"); } : async input => {
       const bridge = await startAdapterExecutionTargetPaperclipBridge(input);
       bridgeModes.push(bridge?.env.PAPERCLIP_API_BRIDGE_MODE);
@@ -282,6 +283,8 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     stderr: "", exitCode: 0, signal: null, timedOut: false, pid: null, startedAt: new Date().toISOString(),
   }));
   const startBridge = vi.fn(async () => null);
+  const records: string[] = [];
+  const resolveCredentials = vi.fn(async () => ({ status: "available", env: { GH_TOKEN: "server-sentinel" } }));
   let access: NativeGitHubAccess | undefined;
   try {
     access = await createNativeGitHubAccess({
@@ -289,7 +292,8 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
       target: { kind: "remote", transport: "sandbox", providerKey: "test", remoteCwd: root,
         runner: { execute }, streamRunLogs: false,
         effectiveCapabilities: { runnerWebSocketIngress: true } } as never,
-      resolveCredentials: async () => ({ status: "available", env: { GH_TOKEN: "server-sentinel" } }),
+      resolveCredentials,
+      onLog: async (_stream, chunk) => { records.push(chunk); },
       transport: "runner_ingress",
     }, startBridge as never);
     expect(access.ready).toBe(true);
@@ -300,12 +304,20 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     expect(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN).toMatch(/^[a-f0-9]{64}$/);
     expect(access.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN).toBe(access.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
     expect(JSON.stringify(access.env)).not.toContain("server-sentinel");
+    const requestSentinel = "body-sentinel-never-log";
+    const capability = access.env.PAPERCLIP_GITHUB_BROKER_TOKEN!;
     const frame = { kind: "github_access.http" as const, requestId: "ingress-request-1", method: "POST",
       path: "/runtime-tools/github/credentials", headers: { "content-type": "application/json",
-        "x-paperclip-github-capability": access.env.PAPERCLIP_GITHUB_BROKER_TOKEN! }, bodyBase64: "e30=" };
-    const idle = await access.handleRunnerIngressHttpRequest(frame, run("ingress-run"));
+        "x-paperclip-github-capability": capability }, bodyBase64: Buffer.from(requestSentinel).toString("base64") };
+    const idle = await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-idle" }, run("ingress-run"));
     expect(idle.status).toBe(403);
     const release = await access.activate(run("ingress-run"));
+    for (const invalid of [{ method: "GET", requestId: "ingress-invalid-method" },
+      { path: "/runtime-tools/github/other", requestId: "ingress-invalid-path" }]) {
+      const refused = await access.handleRunnerIngressHttpRequest({ ...frame, ...invalid }, run("ingress-run"));
+      expect(refused.status).toBe(404);
+    }
+    expect(resolveCredentials).not.toHaveBeenCalled();
     expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-forged-run", runId: "other-run" },
       run("ingress-run"))).status).toBe(403);
     expect((await access.handleRunnerIngressHttpRequest({ ...frame, requestId: "ingress-auth-header",
@@ -317,12 +329,56 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
     expect(JSON.parse(Buffer.from(reply.bodyBase64, "base64").toString())).toEqual({
       status: "available", env: { GH_TOKEN: "server-sentinel" },
     });
+    const requestRecords = records.filter(chunk => chunk.includes("github_access.request "));
+    expect(requestRecords).toHaveLength(7);
+    for (const requestId of ["ingress-idle", "ingress-invalid-method", "ingress-invalid-path", "ingress-forged-run",
+      "ingress-auth-header", "ingress-wrong-capability", "ingress-request-1"]) {
+      expect(requestRecords.some(chunk => chunk.includes(`"requestId":"${requestId}"`))).toBe(true);
+    }
+    const ingressRecord = requestRecords.find(chunk => chunk.includes('"requestId":"ingress-request-1"') && chunk.includes('"status":200'))!;
+    expect(ingressRecord).toContain('"method":"POST"');
+    expect(ingressRecord).toContain('"path":"/runtime-tools/github/credentials"');
+    expect(ingressRecord).toContain('"transport":"prp"');
+    expect(ingressRecord).toContain('"status":200');
+    expect(ingressRecord).toContain('"responseSize":');
+    for (const secret of [requestSentinel, capability, "server-sentinel"]) {
+      expect(ingressRecord).not.toContain(secret);
+      expect(ingressRecord).not.toContain(Buffer.from(secret).toString("base64"));
+    }
     expect(typeof access.handleRunnerIngressHttpRequest).toBe("function");
     await release();
   } finally {
     await access?.stop();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+it("records callback-bridge request metadata without body, capability, or response secrets", async () => {
+  const logs: string[] = [];
+  const bodySecret = "bridge-body-sentinel";
+  const responseSecret = "bridge-response-sentinel";
+  const resolver = vi.fn(async () => ({ status: "available", env: { GH_TOKEN: responseSecret } }));
+  const b = await broker(resolver, false, false, async (_stream, chunk) => { logs.push(chunk); }, undefined, "disconnect");
+  await b.activate(run("bridge-run"));
+  const capability = b.env.PAPERCLIP_GITHUB_BRIDGE_TOKEN!;
+  const response = await request(b, { body: `${bodySecret}:${capability}`, headers: {
+    authorization: `Bearer ${capability}`, "content-type": "application/octet-stream",
+  } });
+  const responseBody = await response.text();
+  const records = logs.filter(chunk => chunk.includes("github_access.request "));
+  expect(records).toHaveLength(1);
+  const line = records[0]!;
+  const metadata = JSON.parse(line.slice(line.indexOf("github_access.request ") + "github_access.request ".length)) as Record<string, unknown>;
+  expect(metadata).toMatchObject({ method: "POST", path: "/runtime-tools/github/credentials", status: 200,
+    transport: "bridge", fallbackReason: "disconnect" });
+  expect(typeof metadata.requestId).toBe("string");
+  expect(typeof metadata.responseSize).toBe("number");
+  expect(metadata.responseSize).toBe(Buffer.byteLength(responseBody));
+  for (const secret of [bodySecret, capability, responseSecret]) {
+    expect(line).not.toContain(secret);
+    expect(line).not.toContain(Buffer.from(secret).toString("base64"));
+  }
+  expect(JSON.parse(responseBody)).toEqual({ status: "available", env: { GH_TOKEN: responseSecret } });
 });
 
 it.each([403, 409, 500])("preserves denial/steering without leaking errors (%s)", async (status) => {
