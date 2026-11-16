@@ -37,7 +37,7 @@ describe("managed GitHub launchers", () => {
     const managed = path.join(root, "managed"), real = path.join(root, "real");
     await mkdir(managed); await mkdir(real);
     await writeFile(path.join(managed, "git"), githubLauncherSource({ interpreterPath: process.execPath }), { mode: 0o700 });
-    await writeFile(path.join(real, "git"), `#!${process.execPath}\nprocess.stdout.write(process.env.PAPERCLIP_GITHUB_BROKER_TOKEN || "");\n`, { mode: 0o700 });
+    await writeFile(path.join(real, "git"), `#!${process.execPath}\nprocess.stdout.write(process.env.GH_TOKEN || "");\n`, { mode: 0o700 });
     const socketPath = path.join(root, "runner.sock");
     let socketRequests = 0, fallbackRequests = 0;
     let received: { method?: string; url?: string; body?: string; capability?: string; tokenInChild?: string } = {};
@@ -49,7 +49,12 @@ describe("managed GitHub launchers", () => {
         received = { method: req.method, url: req.url, body: Buffer.concat(chunks).toString("utf8"),
           capability: req.headers["x-paperclip-github-capability"] as string | undefined };
         res.setHeader("content-type", "application/json");
-        res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "operation-token" } }));
+        if (socketRequests === 1) {
+          res.statusCode = 503;
+          res.end(JSON.stringify({ error: "native_github_access_stale_runner_token" }));
+        } else {
+          res.end(JSON.stringify({ status: "available", env: { GH_TOKEN: "operation-token" } }));
+        }
       });
     });
     await new Promise<void>(resolve => socketServer.listen(socketPath, resolve));
@@ -59,16 +64,15 @@ describe("managed GitHub launchers", () => {
     cleanups.push(() => new Promise<void>(resolve => fallbackServer.close(() => resolve())));
     const { port } = fallbackServer.address() as { port: number };
     const env = {
-      ...githubBrokerEnvironment({ PAPERCLIP_GITHUB_ACCESS_TRANSPORT: "runner_ingress",
-        PAPERCLIP_GITHUB_BROKER_TOKEN: "session-capability" }, { url: `http://127.0.0.1:${port}`, token: "" }),
+      ...githubBrokerEnvironment({ PAPERCLIP_GITHUB_ACCESS_TRANSPORT: "runner_ingress" }, { url: `http://127.0.0.1:${port}`, token: "" }),
       PAPERCLIP_GITHUB_RUNNER_SOCKET: socketPath,
       PATH: `${managed}${path.delimiter}${real}${path.delimiter}${process.env.PATH}`,
     };
     const result = await exec(path.join(managed, "git"), ["remote", "-v"], { cwd: root, env });
-    expect(socketRequests, result.stderr).toBe(1);
-    expect(result.stdout).toBe("session-capability");
+    expect(socketRequests, result.stderr).toBe(2);
+    expect(result.stdout).toBe("operation-token");
     expect(received).toEqual({ method: "POST", url: "/runtime-tools/github/credentials", body: "{}",
-      capability: "session-capability" });
+      capability: undefined });
     expect(fallbackRequests).toBe(0);
   });
 

@@ -297,6 +297,7 @@ it("selects runner-ingress GitHub access without starting or polling the callbac
       transport: "runner_ingress",
     }, startBridge as never);
     expect(access.ready).toBe(true);
+    expect(access.env).not.toHaveProperty("PAPERCLIP_GITHUB_BROKER_TOKEN");
     expect(startBridge).not.toHaveBeenCalled();
     expect(execute.mock.calls.some(([call]) => (call.args ?? []).join(" ").includes("paperclip-bridge/queue"))).toBe(false);
     expect(access.env.PAPERCLIP_GITHUB_ACCESS_TRANSPORT).toBe("runner_ingress");

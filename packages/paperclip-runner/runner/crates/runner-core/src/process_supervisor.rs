@@ -1718,6 +1718,56 @@ mod tests {
     }
 
     #[test]
+    fn github_access_children_blank_capability_and_remove_ingress_from_bridge_mode() {
+        const GUARD: &str = "PAPERCLIP_TEST_GITHUB_ENV_BOUNDARY_CHILD";
+        const CASE: &str = "PAPERCLIP_TEST_GITHUB_ENV_BOUNDARY_CASE";
+        if std::env::var_os(GUARD).is_none() {
+            for case in ["runner_ingress", "bridge"] {
+                let mut child = Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "process_supervisor::tests::github_access_children_blank_capability_and_remove_ingress_from_bridge_mode",
+                    ])
+                    .env(GUARD, "1")
+                    .env(CASE, case)
+                    .env("PAPERCLIP_GITHUB_BROKER_TOKEN", "fixture-session-capability");
+                if case == "bridge" {
+                    child
+                        .env("PAPERCLIP_GITHUB_RUNNER_SOCKET", "/tmp/stale-runner.sock")
+                        .env("PAPERCLIP_GITHUB_ACCESS_TRANSPORT", "callback_bridge");
+                }
+                let output = child.output().unwrap();
+                assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr));
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+            return;
+        }
+
+        let case = std::env::var(CASE).unwrap();
+        if case == "runner_ingress" {
+            crate::durable::github_access::install_provider_environment(Path::new(
+                "/tmp/paperclip-test-runner-ingress.sock",
+            )).unwrap();
+        }
+        let mut command = Command::new("/usr/bin/env");
+        crate::durable::github_access::apply_provider_environment(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let environment = String::from_utf8(output.stdout).unwrap();
+        if case == "runner_ingress" {
+            assert!(environment.contains("PAPERCLIP_GITHUB_RUNNER_SOCKET=/tmp/paperclip-test-runner-ingress.sock"));
+            assert!(environment.contains("PAPERCLIP_GITHUB_ACCESS_TRANSPORT=runner_ingress"));
+            assert!(environment.contains("PAPERCLIP_GITHUB_BROKER_TOKEN=\n"));
+            assert!(!environment.contains("fixture-session-capability"));
+        } else {
+            assert!(!environment.contains("PAPERCLIP_GITHUB_RUNNER_SOCKET="));
+            assert!(!environment.contains("PAPERCLIP_GITHUB_ACCESS_TRANSPORT="));
+        }
+    }
+
+    #[test]
     fn supervised_children_receive_the_active_github_access_environment() {
         const GUARD: &str = "PAPERCLIP_TEST_GITHUB_ENV_CHILD";
         const CASE: &str = "PAPERCLIP_TEST_GITHUB_ENV_CASE";
