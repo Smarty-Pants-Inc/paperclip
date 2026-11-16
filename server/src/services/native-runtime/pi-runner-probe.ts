@@ -123,7 +123,9 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           const listed = await runner!.execute({ command: "sh", args: ["-c", PROBE_STATIC_MANIFEST_SCRIPT,
             "paperclip-probe-static-manifest", remoteRoot, ...PROBE_STATIC_SYNC_EXCLUSIONS], bypassSession: true, timeoutMs: 60_000 });
           requireSuccess(listed);
-          const expectedRunnerSha256 = await cachedFileSha256(runnerBinary).catch(() => null);
+          // cachedFileSha256 returns "sha256:<hex>" (as matchesControllerRunnerArtifact strips it).
+          const expectedRunnerSha256 = await cachedFileSha256(runnerBinary)
+            .then(digest => /^sha256:[0-9a-f]{64}$/.test(digest) ? digest.slice("sha256:".length) : null, () => null);
           const { excludeEntries, record } = probeStaticExclusions(
             parseProbeStaticManifest(listed.stdout ?? "", PROBE_STATIC_SYNC_EXCLUSIONS), expectedRunnerSha256);
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
