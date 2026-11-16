@@ -92,6 +92,11 @@ function createApp(db: Db, actor: Express.Request["actor"]) {
     next();
   });
   app.use("/api", agentRoutes(db));
+  app.use((error: unknown, _req: express.Request, _res: express.Response, next: express.NextFunction) => {
+    const value = error as { code?: string; message?: string; cause?: { code?: string; message?: string } };
+    console.error(`[agent-hire-route-error] ${JSON.stringify({ code: value?.cause?.code ?? value?.code ?? null, message: value?.cause?.message ?? value?.message ?? String(error) })}`);
+    next(error);
+  });
   app.use(errorHandler);
   return app;
 }
@@ -238,6 +243,7 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
 
   it("creates ten agents concurrently with membership and tasks:assign in five trials", async () => {
     const trials: Array<{ statuses: number[]; errors: unknown[] }> = [];
+    const failures: Array<{ trial: number; statuses: number[]; errors: unknown[] }> = [];
 
     for (let trial = 0; trial < 5; trial += 1) {
       const { company, hiringAgent, run } = await seedHiringFixture(db);
@@ -268,10 +274,10 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
       const statuses = responses.map(response => response.status);
       const errors = responses.filter(response => response.status !== 201).map(response => response.body);
       trials.push({ statuses, errors });
+      if (errors.length > 0) failures.push({ trial: trial + 1, statuses, errors });
       console.info(`[concurrent-agent-create] ${JSON.stringify({ trial: trial + 1, companyId: company.id, statuses, errors })}`);
 
-      expect(statuses, JSON.stringify({ trial: trial + 1, errors })).toEqual(Array(10).fill(201));
-      const created = responses.map(response => response.body.id as string);
+      const created = responses.filter(response => response.status === 201).map(response => response.body.id as string);
       for (const agentId of created) {
         expect(await db.select().from(companyMemberships).where(and(
           eq(companyMemberships.companyId, company.id),
@@ -288,5 +294,6 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     }
 
     expect(trials).toHaveLength(5);
+    expect(failures, JSON.stringify(failures)).toEqual([]);
   });
 });
