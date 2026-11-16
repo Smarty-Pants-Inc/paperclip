@@ -66,12 +66,60 @@ export const NATIVE_INERT_RUN_EVENT_TYPES = [
   "runner.connected", "runner.reconnected", "runner.disconnected", "runner.diagnostic", "runner.suspending",
   "runner.suspended", "runner.reconciled", "runner.attachment.settled", "runner.backpressure", "runner.draining",
   "runner.stopped",
-  "run.attached", "run.detached", "run.performance.span", "run.performance.budget_exceeded",
+  "run.attached", "run.detached", "run.performance.budget_exceeded",
   "usage.reported", "context.compacted", "model.route.changed", "model.verification.updated", "runtime.phase.changed",
   "provider.notice.recorded", "sandbox.metric", "workspace.ready",
   "native.process_start_requested", "native.process_identity_recorded", "native.recovery.transition",
   "native.recovery.execution_reclaimed", "native.diagnostic",
 ] as const;
+
+/** The event type of Paperclip's own run spans (native-run-trace.ts). It is NOT
+ * inert as a type: Paperclip records a tool execution server-side as
+ * run.performance.span { span: "tool.execute" } (native-tool-trace.ts), while
+ * the tool events themselves ride the Runner stream a lost box cuts
+ * (review-fleet-5 C1). A span row proves only with an inert span name below. */
+export const NATIVE_RUN_SPAN_EVENT_TYPE = "run.performance.span";
+
+/**
+ * CLOSED allow-list of span names known to be INERT: task, environment,
+ * provider-pack, harness-state, Runner startup/transport, provider session and
+ * turn timings, none of which records a tool call or a result. Every other
+ * span name denies the proof, including the action spans tool.execute,
+ * tool.request.input_stream, completion.request.first (a finish/block tool
+ * started), completion.tool_accepted, completion.result_committed and
+ * native.result.finalize, and any name this list does not know yet. The list
+ * per emitted name (inert / action, by line) is in the C1 result (TL08).
+ */
+export const NATIVE_INERT_RUN_SPAN_NAMES = [
+  "task.run", "task.run.measured", "task.provider_session", "task.provider_session.measured", "task.prepare",
+  "task.settle", "skills.prepare", "heartbeat.queue", "heartbeat.prepare_before_environment",
+  "heartbeat.prepare_after_environment", "comment.to_run_created", "question_response.to_run_created",
+  "environment.acquire", "environment.startup", "environment.workspace.realize", "sandbox.lease.acquisition",
+  "native.coordinator.claim", "native.session.execute", "native.controller.warm_owner_identity_check",
+  "provider_pack.select", "provider_pack.discover", "provider_pack.verify", "provider_pack.verify_preinstalled",
+  "provider_pack.verify_uploaded", "provider_pack.link_preinstalled", "provider_pack.clear_stale",
+  "provider_pack.upload", "provider_pack.verify_memo_hit", "provider_pack.source", "provider_pack.directory.verify",
+  "provider_pack.archive.verify", "provider_pack.archive.probe", "provider_pack.archive.reuse",
+  "provider_pack.archive.verify_missing", "provider_pack.archive.transfer", "provider_pack.archive.extract",
+  "harness_state.inspect", "harness_state.path_check", "harness_state.launch_material", "harness_state.reuse",
+  "stage.asset.runtime_context", "stage.asset.codex_skills.verify", "stage.asset.codex_skills", "stage.asset.ca_bundle",
+  "runner.artifact.discover", "runner.artifact.prepare", "runner.prp.authenticate", "runner.prp.route.register",
+  "runner.runtime.stage", "runner.launch.prepare", "runner.control_plane.open", "runner.process.dispatch",
+  "runner.process.launch", "runner.process.identity_failure_cleanup", "runner.port_holders.retire",
+  "runner.session.startup", "runner.session.bootstrap", "runner.session.resume", "runner.transport.connect",
+  "runner.transport.attach", "runner.transport.selected", "runner.turn.submit", "runner.turn.submitted_to_started",
+  "runner.event.persist", "runner.pi.attach", "runner.pi.bind", "runner.pi.begin_turn", "runner.pi.interrupt_wait",
+  "runner.pi.prompt_to_started", "runner.pi.admission.get_state", "runner.pi.admission.set_model",
+  "runner.pi.admission.get_available_thinking_levels", "runner.pi.admission.set_thinking_level",
+  "runner.pi.open.total", "runner.pi.open.native_mcp_config", "pi.request.sent",
+  "provider.runtime", "provider.session.load", "provider.session.resume", "provider.session.continuity_break",
+  "provider.turn.queue", "provider.time_to_first_agent_event", "agent.turn", "task.time_to_first_agent_activity",
+  "task.time_to_first_token", "response.first_nonempty_text",
+] as const;
+
+/** Controller waits measured only inside the resume and submit windows, before
+ * turn.started (native-controller-step-timing.ts flush: native.controller.<phase>.<step>). */
+export const NATIVE_INERT_RUN_SPAN_PREFIXES = ["native.controller.resume.", "native.controller.submit."] as const;
 
 /** No recorded tool call or side-effecting provider work across every runner
  * instance of this run. Unlike provesNoNativeRunProviderWork, a turn that only
@@ -89,7 +137,11 @@ export async function provesNoNativeRunToolWork(db: Pick<Db, "execute">, input: 
     exists (select 1 from ${heartbeatRunEvents} event where event.company_id = ${companyId} and event.run_id = ${runId}
       and not (event.event_type in (${list(NATIVE_INERT_RUN_EVENT_TYPES)})
         or (event.event_type in (${list(NATIVE_ITEM_EVENT_TYPES)})
-          and coalesce(event.payload->'prpEvent'->'payload'->>'kind', '') in (${list(NATIVE_INERT_ITEM_KINDS)})))) as "toolEvent",
+          and coalesce(event.payload->'prpEvent'->'payload'->>'kind', '') in (${list(NATIVE_INERT_ITEM_KINDS)}))
+        or (event.event_type = ${NATIVE_RUN_SPAN_EVENT_TYPE}
+          and (coalesce(event.payload->>'span', '') in (${list(NATIVE_INERT_RUN_SPAN_NAMES)})
+            or ${sql.join(NATIVE_INERT_RUN_SPAN_PREFIXES.map(prefix =>
+              sql`starts_with(coalesce(event.payload->>'span', ''), ${prefix})`), sql` or `)})))) as "toolEvent",
     exists (select 1 from ${toolInvocations} invocation where invocation.company_id = ${companyId}
       and invocation.run_id = ${runId}) as "toolInvocation"`);
   input.signal?.throwIfAborted();
