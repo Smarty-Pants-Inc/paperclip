@@ -67,6 +67,7 @@ export class WsJsonWireConnection implements PrpWireConnection {
   #pendingJson: unknown[] = [];
   #closeReason: TransportCloseReason | null = null;
   #lastInboundAt = Date.now();
+  #closeRequested: number | null = null;
 
   constructor(readonly socket: WebSocket) {
     socket.on("pong", () => {
@@ -76,7 +77,7 @@ export class WsJsonWireConnection implements PrpWireConnection {
     socket.on("message", (data, isBinary) => {
       this.#lastInboundAt = Date.now();
       if (isBinary) {
-        this.close(1003);
+        this.#closeSocket(1003);
         return;
       }
       try {
@@ -87,7 +88,7 @@ export class WsJsonWireConnection implements PrpWireConnection {
           this.#onJson(value);
         }
       } catch {
-        this.close(1007);
+        this.#closeSocket(1007);
       }
     });
     socket.on("close", (code, reason) => {
@@ -104,7 +105,27 @@ export class WsJsonWireConnection implements PrpWireConnection {
     }
   }
 
+  /**
+   * The close code a holder of this wire asked for while the socket was still
+   * open: the control plane refusing the connection (it closes the wire), or
+   * this module's own deadline. Null when the peer or the network closed it,
+   * or for this wire's own frame-protocol closes (#20825).
+   */
+  get closeRequested(): number | null {
+    return this.#closeRequested;
+  }
+
   close(code = 1000): void {
+    if (
+      this.#closeRequested === null &&
+      (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING)
+    ) {
+      this.#closeRequested = code;
+    }
+    this.#closeSocket(code);
+  }
+
+  #closeSocket(code: number): void {
     if (
       this.socket.readyState === WebSocket.OPEN ||
       this.socket.readyState === WebSocket.CONNECTING
@@ -534,6 +555,8 @@ export function connectRunnerPrpIngress(input: {
     };
     while (!abort.signal.aborted) {
       let dialStarted = false;
+      // Set only when the control plane itself closed an unauthenticated wire.
+      let controlPlaneRefused = false;
       try {
         input.onStateChange?.(attempt === 0 ? "connecting" : "reconnecting");
         if (abort.signal.aborted) return;
@@ -566,6 +589,10 @@ export function connectRunnerPrpIngress(input: {
           signal: abort.signal,
         });
         if (!authenticated) {
+          // Before this module closes it: did the control plane already close
+          // the wire (an explicit refusal), or did the peer, the network or
+          // the deadline end the handshake?
+          controlPlaneRefused = !abort.signal.aborted && opened.wire.closeRequested !== null;
           opened.wire.close(1008);
           throw new RunnerIngressConnectionError(
             "runner_ingress_auth_failed",
@@ -645,8 +672,13 @@ export function connectRunnerPrpIngress(input: {
         // control plane (for example its welcome's checkpoint flush fails the
         // owner fence) will not authenticate on a later dial either. Retire at
         // this first failed handshake instead of spending the lease silently.
-        const refusedIdleReconnect = leaseFailureCode === null && idleOwner()
+        // Only an explicit refusal counts: a peer drop (1006) or a slow
+        // authentication before auth is a handshake loss, redialed below.
+        const refusedIdleReconnect = leaseFailureCode === null && idleOwner() && controlPlaneRefused
           && failure instanceof RunnerIngressConnectionError && failure.code === "runner_ingress_auth_failed";
+        // An idle owner redials a handshake loss within its idle window, like a transport failure.
+        const idleRedialable = transportFailure || (dialStarted && !controlPlaneRefused && leaseFailureCode === null
+          && failure instanceof RunnerIngressConnectionError && failure.code === "runner_ingress_auth_failed");
         if (
           !refusedIdleReconnect &&
           leaseFailureCode === null &&
@@ -683,7 +715,7 @@ export function connectRunnerPrpIngress(input: {
         // has time opens another window (up to lease expiry minus the margin)
         // instead of going terminal with nobody left to dial (#20825).
         if (
-          !refusedIdleReconnect && !floorRetry && transportFailure && leaseFailureCode === null
+          !refusedIdleReconnect && !floorRetry && idleRedialable && leaseFailureCode === null
           && Date.now() >= retryDeadline && idleOwner()
         ) {
           const retireAt = idleRetireAt();
@@ -749,7 +781,7 @@ export function connectRunnerPrpIngress(input: {
           // The window ended during this backoff. An idle owner opens another
           // window if one fits before the lease's retirement point.
           if (
-            window !== "startup" && leaseFailureCode === null && transportFailure && idleOwner()
+            window !== "startup" && leaseFailureCode === null && idleRedialable && idleOwner()
           ) {
             const retireAt = idleRetireAt();
             if (retireAt !== null && Date.now() < retireAt) {
