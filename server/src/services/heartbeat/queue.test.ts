@@ -23,6 +23,10 @@ import { callbacks as runControlCallbacks } from "./__tests__/run-control-fixtur
 
 import { createHeartbeatQueueTestDependencies as callbacks } from "../../__tests__/helpers/heartbeat-queue.js";
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../delivery-work-notifications.js";
+import { createDeliveryWorkCoordinator } from "../delivery-work-coordinator.js";
+import { notifyExecutionRunWork } from "../execution-control-notifications.js";
+import { idleWorkSnapshot } from "../task-admission.js";
+import { registerDeferredReceiptWork } from "./deferred-receipt-work.js";
 
 function guardedDatabase() {
   const access = vi.fn(() => { throw new Error("Unexpected queue database access"); });
@@ -554,6 +558,108 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     const promotedPayload = await buildPaperclipWakePayload({ db, companyId: f.company.id, contextSnapshot: promotedContext });
     expect(promotedPayload?.fallbackFetchNeeded).toBe(true);
   });
+
+  it.each(["projected", "in-process"] as const)(
+    "queues fleet_reply on T after R1 finishes when the same agent's R2 on U finishes with the plugin wake (%s completion)", async completion => {
+    // SMA-84: requestWakeup has no wakeCommentIds. The registered worker,
+    // not an explicit resumeQueuedRuns sweep, must reconsider that receipt.
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issue.id,
+      contextSnapshot: { issueId: f.issue.id, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, f.run.id));
+    const [otherIssue] = await db.insert(issues).values({ companyId: f.company.id, title: "U",
+      status: "in_progress", assigneeAgentId: f.agent.id }).returning();
+    const [otherRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      status: "running", runtimeMode: "native", nativeIssueId: otherIssue.id, startedAt: new Date(),
+      contextSnapshot: { issueId: otherIssue.id, wakeReason: "issue_assigned" } }).returning();
+    await db.update(issues).set({ executionRunId: otherRun.id }).where(eq(issues.id, otherIssue.id));
+    const pluginId = randomUUID(), pluginKey = `fleet-bridge-${pluginId}`;
+    await db.insert(plugins).values({ id: pluginId, pluginKey, packageName: pluginKey, version: "1", status: "ready",
+      manifestJson: { id: pluginKey, apiVersion: 1, displayName: "Fleet Bridge", version: "1.0.0",
+        description: "Reply delivery", author: "Queue test", entrypoints: { worker: "worker.js" },
+        categories: [], capabilities: [] } });
+    const [reply] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id,
+      authorAgentId: f.agent.id, body: "The fleet reply is ready." }).returning();
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(f.agent);
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false, enableNativeRunner: true } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+    const admission = createWakeQueue(db, {
+      resolveResponsibleUserId: async () => "queue-test-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(admission.createAdmissionTransactionScope);
+    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
+    const controls = runControlCallbacks(db);
+    vi.mocked(controls.wakeQueue.releaseIssueExecution).mockImplementation(admission.releaseIssueExecution);
+    deps.releaseIssueExecutionAndPromote.mockImplementation(createHeartbeatRunControl(db, controls).releaseIssueExecutionAndPromote);
+    const queue = createHeartbeatQueue(db, deps);
+    const errors: unknown[] = [];
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true,
+      onError: error => { errors.push(error); } });
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"], shouldAdvanceTime: true });
+    try {
+      await registerDeferredReceiptWork(db, coordinator, {
+        resume: scope => queue.resumeDeferredExecutionReceipts(scope), settleTaskChat: async () => {},
+        createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false,
+      }, () => true).ready;
+      // Persist the same terminal/finalization/lock-release handoff as native
+      // completion; all admission and promotion SQL below remains real.
+      const finish = async (runId: string, issueId: string) => {
+        await db.transaction(async tx => {
+          await tx.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+          await tx.insert(nativeRunFinalizations).values({ companyId: f.company.id, runId, issueId, phase: "committed" });
+          await tx.update(issues).set({ executionRunId: null, executionAgentNameKey: null, executionLockedAt: null })
+            .where(eq(issues.id, issueId));
+          await notifyExecutionRunWork(tx, { companyId: f.company.id });
+        });
+        // Control: the in-process release drains plugin wakes already. Native
+        // projection/recovery can leave only the durable worker to resume them.
+        if (completion === "in-process") await deps.releaseIssueExecutionAndPromote(
+          { id: runId, companyId: f.company.id }, { suppressImmediateRecovery: true });
+      };
+      // Admit the wake and finish R2 concurrently while R1 still owns T.
+      // This is requestWakeup's exact heartbeat contract
+      // (plugin-host-services.ts), including its actor/key.
+      const [requested] = await Promise.all([
+        queue.enqueueWakeup(f.agent.id, { source: "assignment", triggerDetail: "system", reason: "fleet_reply",
+          payload: { issueId: f.issue.id, mutation: "plugin_wakeup", pluginId, pluginKey,
+            contextSource: "plugin.issue.requestWakeup" }, idempotencyKey: `fleet-reply:${reply.id}`,
+          requestedByActorType: "system", requestedByActorId: pluginId,
+          contextSnapshot: { issueId: f.issue.id, taskId: f.issue.id, wakeReason: "fleet_reply",
+            source: "plugin.issue.requestWakeup", pluginId, pluginKey } }),
+        finish(otherRun.id, otherIssue.id),
+      ]);
+      expect(requested).toBeNull();
+      const [receipt] = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agent.id)))
+        .filter(wake => wake.idempotencyKey === `fleet-reply:${reply.id}`);
+      expect(receipt).toMatchObject({ source: "assignment", reason: "issue_execution_deferred",
+        status: "deferred_issue_execution", runId: null, claimedAt: null, finishedAt: null, coalescedCount: 0 });
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.waitFor(() => { expect(idleWorkSnapshot().active).toBe(0); expect(coordinator.nextWakeAt()).toBeNull(); });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0].status).toBe("running");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.status, "queued"))).toHaveLength(0);
+
+      await finish(f.run.id, f.issue.id);
+      await vi.advanceTimersByTimeAsync(31_000);
+      await vi.waitFor(async () => {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agent.id));
+        const followups = runs.filter(run => run.contextSnapshot?.wakeReason === "fleet_reply");
+        const [saved] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
+        expect(followups, JSON.stringify({ runs: runs.map(run => ({ id: run.id, status: run.status,
+          issueId: run.contextSnapshot?.issueId, wakeReason: run.contextSnapshot?.wakeReason })),
+          receipt: { status: saved.status, runId: saved.runId, reason: saved.reason } })).toHaveLength(1);
+        expect(followups[0]).toMatchObject({ status: "queued", contextSnapshot: { issueId: f.issue.id } });
+        expect(saved).toMatchObject({ status: "queued", runId: followups[0].id });
+      });
+      expect(errors).toEqual([]);
+    } finally {
+      await coordinator.stop();
+      vi.useRealTimers();
+    }
+  }, 60_000);
 
   async function pendingPredecessorFixture() {
     const f = await fixture("queued");
