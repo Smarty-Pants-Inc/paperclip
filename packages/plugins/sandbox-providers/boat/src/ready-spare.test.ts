@@ -358,7 +358,7 @@ describe("Boat ready spare", () => {
     expect(afterShutdown.some(call => call.method === "POST" && call.body?.labels?.purpose === "spare")).toBe(false);
   });
 
-  it("starts no spare timer or inventory work when the company spare count is zero", async () => {
+  it("(superseded by replacement: C3 sweep timer, RFL record 19:18Z) starts no spare timer or inventory work when the company spare count is zero", async () => {
     const f = fixture();
     const timer = vi.spyOn(globalThis, "setInterval");
     await setup(0);
