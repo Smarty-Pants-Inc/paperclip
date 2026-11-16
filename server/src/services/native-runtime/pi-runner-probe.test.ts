@@ -173,6 +173,38 @@ describe("native Pi probe runner artifact preparation", () => {
       expect(mocks.cleanupErrors).toEqual([]);
     });
 
+  it("allows 15-second remote-root removal within the setup check and requests the 60-second retirement budget", async () => {
+    const f = await fixture("matching");
+    const execute = f.runner.execute.bind(f.runner);
+    let delayedRemoval = false;
+    vi.spyOn(f.runner, "execute").mockImplementation(async request => {
+      if (request.command === "rm" && request.args?.[0] === "-rf") {
+        f.requests.push(request);
+        if (!delayedRemoval) {
+          delayedRemoval = true;
+          vi.useFakeTimers();
+          try {
+            const completion = new Promise<void>(resolve => setTimeout(resolve, 15_000));
+            await vi.advanceTimersByTimeAsync(15_000);
+            await completion;
+          } finally {
+            vi.useRealTimers();
+          }
+        }
+        return { exitCode: 0, timedOut: false, signal: null, pid: null,
+          startedAt: new Date().toISOString(), stdout: "", stderr: "" };
+      }
+      return execute(request);
+    });
+    try {
+      expect((await probeManagedNativePiRunner(f.context)).status).toBe("pass");
+      const removal = f.requests.find(request => request.command === "rm" && request.args?.[0] === "-rf");
+      expect(removal?.timeoutMs).toBeGreaterThanOrEqual(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  }, 30_000);
+
   it("keeps the real strict cleanup archive rejecting symlinks", async () => {
     const f = await fixture("matching");
     const sourcePath = join(f.root, "unsafe-runtime"), targetPath = join(f.root, "checkpoint");
