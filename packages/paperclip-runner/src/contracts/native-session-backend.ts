@@ -92,6 +92,12 @@ export interface NativeSessionRecoveryResult {
   refreshWaitForTurn?: HarnessSessionRecoveryResult["refreshWaitForTurn"];
   prepareRefusalCode?: HarnessSessionRecoveryResult["prepareRefusalCode"];
   recoveryRefusalCode?: HarnessSessionRecoveryResult["recoveryRefusalCode"];
+  /**
+   * The backend answered recovery with a FRESH provider thread (no saved
+   * conversation loaded, J3-22 member (a)): the runtime prompts it as a fresh
+   * open, with the fresh envelope and the saved-history handoff.
+   */
+  freshThread?: boolean;
 }
 
 /** Runner-owned cause: the process was restored, but its active turn was lost. */

@@ -17160,6 +17160,16 @@ export async function createRunnerdBackend(input: {
   chatAttachmentReadScope?: NativeChatAttachmentReadScope;
   restartRecovery?: NativeRestartRecoveryClaim;
   recoveryPurpose?: "execution" | "stop_cleanup";
+  /**
+   * J3-22 member (a): the run's memoized saved-history handoff loader, the same
+   * one the runtime prepends to a fresh thread's first prompt. With the three
+   * run kinds that never send it (compaction, goal control, goal heartbeat), it
+   * tells the continuation note whether the fresh thread gets the history.
+   */
+  getFreshSessionHandoff?: () => Promise<string | null>;
+  sessionGoalControl?: NativeSessionGoalControl | null;
+  resumeSessionGoalHeartbeat?: boolean;
+  sessionCompaction?: { requestId: string; contextTokensBefore?: number } | null;
   durableEnvironmentLeaseId?: string;
   remoteWarmRecovery?: Omit<RemoteWarmSessionRecovery, "revalidate"> & { revalidate: () => Promise<void> };
   retainedPluginTaskOwner?: ReturnType<typeof createPluginRunnerTaskOwner>;
@@ -19642,11 +19652,18 @@ async function createRunnerdBackendWithinSessionClaim(
     await input.trace?.record({ name: "provider.session.restore_unavailable_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
       attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
         refusalCode: code, reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON } });
+    // The runtime prompts this fresh thread as a fresh open (the wrapper marks
+    // a recovered one freshThread): its first turn carries the saved-history
+    // handoff exactly when this run prompts a turn and the run's memoized loader
+    // returns one. Only then may the note say the thread was given the history.
+    const historyHandedOff = !input.sessionCompaction && !input.sessionGoalControl && !input.resumeSessionGoalHeartbeat
+      && Boolean(await input.getFreshSessionHandoff?.().catch(() => null));
     await input.onLog?.("stdout", `[paperclip-runner] continuing in a fresh provider thread: the backup could not be restored on this `
-      + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON}).\n`);
+      + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON})`
+      + `${historyHandedOff ? ", handed the saved conversation history" : ""}.\n`);
     const { companyId, issueId, agentId, runId } = input.execution.binding;
     await writeRestoreUnavailableContinuationNotice(input.db, { companyId, issueId, agentId, runId, code,
-      reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON }).catch(async (error: unknown) => {
+      reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, historyHandedOff }).catch(async (error: unknown) => {
       await input.onLog?.("stderr", `[paperclip-runner] continuation note not written: ${
         redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
     });
@@ -20367,7 +20384,9 @@ async function createRunnerdBackendWithinSessionClaim(
             workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }));
           await recordRestoreUnavailableFreshThread();
           await recordAdmittedProviderPack(fresh, snapshot.identity, false);
-          return { recovered: true, session: fresh };
+          // freshThread: the runtime prompts it as a fresh open (fresh envelope
+          // plus the saved-history handoff), not as the resumed old thread.
+          return { recovered: true, session: fresh, freshThread: true };
         }
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));

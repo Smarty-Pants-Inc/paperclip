@@ -2586,6 +2586,14 @@ export async function executeNativeSession(
       || settlement.turnId !== event.turnId)) throw new NativeSessionProtocolIntegrityError("source_event_replay_conflict");
   }
   let recovered = false;
+  // J3-22 member (a): the backend answered recovery with a FRESH provider
+  // thread (NativeSessionRecoveryResult.freshThread). Only the first prompt
+  // treats it as a fresh open. The backend marks it only for an idle rebound
+  // checkpoint (no turn, terminal, result, runtime request, governed wait,
+  // disposition recovery or goal), so the recovered-only branches below
+  // (restart continuation, disposition-only recovery, goal heartbeat,
+  // governed-wait replay) have nothing to act on.
+  let recoveredFreshThread = false;
   let session: NativeSession | null = null;
   let continuityBreak: {
     reason: string;
@@ -2780,6 +2788,7 @@ export async function executeNativeSession(
     } else {
       session = recovery.session;
       recovered = true;
+      recoveredFreshThread = recovery.freshThread === true;
     }
   }
   if (session === null) {
@@ -3314,10 +3323,14 @@ export async function executeNativeSession(
         } else if (shouldStartFreshTurn && recovered && checkpointedInterruption) {
           await startRestartContinuation();
         } else if (shouldStartFreshTurn) {
-          let modelEnvelope = recovered
-            ? buildNativeModelEnvelope(input, { resumedSession: true })
-            : buildNativeModelEnvelope(input);
-          if (!recovered && options.getFreshSessionHandoff && "task" in modelEnvelope) {
+          // A fresh provider thread (a fresh open, or a recovery the backend
+          // answered with a fresh thread) has none of the earlier conversation:
+          // it gets the fresh envelope and the saved-history handoff.
+          const freshThreadPrompt = !recovered || recoveredFreshThread;
+          let modelEnvelope = freshThreadPrompt
+            ? buildNativeModelEnvelope(input)
+            : buildNativeModelEnvelope(input, { resumedSession: true });
+          if (freshThreadPrompt && options.getFreshSessionHandoff && "task" in modelEnvelope) {
             const handoff = await options.getFreshSessionHandoff();
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }

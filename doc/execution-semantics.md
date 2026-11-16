@@ -3747,10 +3747,14 @@ continuity state aside (as a replacement session does; the source sandbox and
 its files are kept, never deleted), opens a fresh provider thread on the new
 sandbox, records the step on the conversation's provider-identity lineage
 (reason `resume_failed_on_new_box`) and posts one continuation note
-("Continuing in a fresh thread", `restore_unavailable_on_new_box`). Only a
-fresh open (no saved session loaded) sends the saved-history handoff; a fresh
-thread taken while recovering the saved session gets this run's message only,
-so the note does not claim the earlier context. The
+("Continuing in a fresh thread", `restore_unavailable_on_new_box`). On both
+paths the fresh thread's first turn carries the saved-history handoff ("Fresh
+session handoff"), as any fresh open does: a fresh thread taken while
+recovering the saved session is returned marked `freshThread`, so the runtime
+prompts it as a fresh open, not as the resumed old thread. The note says the
+thread was given the saved conversation history only when that handoff is sent
+(the run prompts a turn and a handoff is available); otherwise it does not
+claim the earlier context. The
 backup is never restored here. A recovered checkpoint is taken only when it is
 idle in the shape a new run's rebind leaves (no turn, terminal, result, runtime
 request, governed wait, disposition recovery or goal); any of those keeps the
