@@ -55,6 +55,8 @@ import { startRecoveryPostgres } from "../../__tests__/helpers/recovery-postgres
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { nativeProviderRecoveryPolicy } from "./native-session-resume.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+import { createNativeRunTrace } from "./native-run-trace.js";
+import { createNativeToolTrace } from "./native-tool-trace.js";
 import { nativeSha256 } from "./canonical.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
 import { finalizeNativeRun, repairCommittedNativeChatResponse } from "./native-run-finalizer.js";
@@ -588,6 +590,59 @@ describe("PaperclipControlPlanePort conformance", () => {
       const f = await toolProofRun(inertTurn);
       await db.insert(toolInvocations).values({ companyId: f.identity.companyId, runId: f.identity.runId, toolName: "paperclip_api" });
       await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
+
+    // review-fleet-5 C1: Paperclip persists its own tool execution server-side as
+    // run.performance.span { span: "tool.execute" } (native-tool-trace.ts), while
+    // the tool events ride the box stream that a lost Runner cuts. A turn whose
+    // ONLY record of a tool call is that span is tool work: the proof fails and
+    // the turn is named native_provider_state_incompatible, never replaced.
+    // The rows are written through the real trace and run-event persistence.
+    async function persistSpans(f: Awaited<ReturnType<typeof toolProofRun>>, write: (trace: ReturnType<typeof createNativeRunTrace>) => Promise<void>) {
+      const trace = createNativeRunTrace({ runId: f.identity.runId, startedAtMs: Date.now(), onEvent: event =>
+        appendHeartbeatRunEvent(db, { companyId: f.identity.companyId, agentId: f.identity.agentId, runId: f.identity.runId,
+          eventType: event.eventType, stream: event.stream, level: event.level, message: event.message,
+          payload: event.payload as Record<string, unknown> }).then(() => undefined) });
+      await write(trace);
+      const rows = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.identity.runId),
+          eq(heartbeatRunEvents.eventType, "run.performance.span")));
+      return rows.map(row => (row.payload as Record<string, unknown> | null)?.span);
+    }
+
+    it("denies the proof for an in-flight turn whose only record of a tool call is a tool.execute span", async () => {
+      const f = await toolProofRun([["turn.started", {}]]);
+      const spans = await persistSpans(f, async trace => {
+        await createNativeToolTrace(trace).execute({ callId: "call-1", tool: "mcp__paperclip__paperclip_api" }, async () => "ok");
+      });
+      expect(spans).toHaveLength(1); // the persisted span (its name may be stored redacted)
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
+
+    it.each([
+      ["tool.execute", { operation: "other" }],
+      ["tool.request.input_stream", { operation: "other" }],
+      ["completion.request.first", {}],
+      ["completion.tool_accepted", {}],
+      ["completion.result_committed", {}],
+      ["future.unknown_span", {}],
+    ] as const)("denies the proof for an in-flight turn that recorded a %s span", async (span, attributes) => {
+      const f = await toolProofRun(inertTurn);
+      await persistSpans(f, trace => trace.record({ name: span, parentName: "agent.turn", startedAtMs: Date.now(),
+        endedAtMs: Date.now(), attributes }));
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(false);
+    });
+
+    it("still proves a turn whose spans are only inert controller, startup and turn timings", async () => {
+      const f = await toolProofRun(inertTurn);
+      const inert = ["task.prepare", "environment.startup", "native.coordinator.claim", "runner.session.startup",
+        "runner.session.resume", "runner.turn.submit", "runner.pi.attach", "runner.pi.begin_turn", "agent.turn",
+        "provider.time_to_first_agent_event"];
+      const spans = await persistSpans(f, async trace => {
+        for (const name of inert) await trace.record({ name, startedAtMs: Date.now(), endedAtMs: Date.now() });
+      });
+      expect([...spans].sort()).toEqual([...inert].sort()); // rows share created_at; order is not the claim
+      await expect(f.port.provesNoRunToolWork({ signal: new AbortController().signal })).resolves.toBe(true);
     });
   });
 
