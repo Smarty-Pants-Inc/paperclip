@@ -475,12 +475,12 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J05/A02: provider IDs equal the requested shard, not just any non-empty approved subset", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.a.id, name: "Second approved repository", repoUrl: "https://github.com/owner/A2.git", metadata: { githubRepositoryId: 102 } });
     const config = { ...connection.config, projectScope: { ...f.scope(), approvedRepositoryIds: [101, 102] } };
     await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connection.id));
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
     // Both IDs are ratified and current, but this connection requested only A
     // (101). A provider reply for approved A2 (102) is still the wrong token.
     harness.verify.mockResolvedValue({ ...harness.verified, repositoryIds: [102] });
