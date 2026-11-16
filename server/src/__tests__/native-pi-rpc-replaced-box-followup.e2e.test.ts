@@ -7,6 +7,12 @@
 // writer (pi-conversation-record.ts:86,161-163; heartbeat/runtime-selection.ts:546).
 // G-warm-reviewer-shape: diagnostic rejected key, NOT an authorized GitHub wait.
 // SB-cold: keep-green same allocation/disk with killed Runner and Pi.
+// SMA-60 (J3-22 member (a)): governed wait + a CURRENT failover backup (the
+// controller drains gracefully, as a deploy does) + image swap: host
+// preparation refuses that backup on the NEW box (backup_without_reusable_lease,
+// no retired-source proof). The ORIGINAL run must answer on a fresh thread
+// with exactly one continuation note, no failed run, the J3-17 lineage step
+// recorded; the NEXT message must resume that new thread.
 // Real: DB resume admission, two OS controller processes with different bootIds,
 // surviving controller state, default sandbox driver/commands, runnerd, TLS PRP
 // preview, qualified Pi 1.5.2 and its JSONL, native history handoff and events.
@@ -197,6 +203,8 @@ type RecoveryCase = {
   expected: ExpectedOutcome; box: "replaced" | "same-box-cold";
   responseWait?: "board" | "github-review-shape";
   piConversationFile?: "present" | "absent";
+  /** SMA-60: a graceful controller drain leaves a current backup that the new box refuses. */
+  restoreRefused?: true;
   /** Expected red BY NAME (org 11:23Z): the piece it waits for, its image and owner. */
   awaits?: string;
 };
@@ -213,11 +221,15 @@ const recoveryCases: RecoveryCase[] = [{ name: "deployed: warm envelope + DB che
 { name: "G-warm-reviewer-shape (diagnostic: no GitHub authority)",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "record", box: "replaced", responseWait: "github-review-shape" },
 { name: "SB-cold: warm envelope + DB checkpoint, done, same box with cold runner",
-  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" }];
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" },
+{ name: "SMA-60: governed wait, CURRENT backup, image swap -> restore refused on the new box, the original run answers on a fresh thread",
+  localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "present", control: "none",
+  expected: "answers-no-history", box: "replaced", responseWait: "board", piConversationFile: "present", restoreRefused: true }];
 const runRecoveryCase = async (scenario: RecoveryCase) => {
   const governedWait = scenario.priorRun === "yielded-response-wake";
   const reviewerShape = scenario.responseWait === "github-review-shape";
   const sameBoxCold = scenario.box === "same-box-cold";
+  const restoreRefused = scenario.restoreRefused === true;
   expect(process.platform).toBe("linux");
   expect(process.env.TMPDIR, "dedicated parent-owned TMPDIR required").toBeTruthy();
   const runnerBinary = process.env.PAPERCLIP_RUNNER_BINARY;
@@ -271,6 +283,7 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
   let generation = 1;
   const allocationIds = [`image-A-${randomUUID()}`, `image-B-${randomUUID()}`];
   const allocations = new Map(allocationIds.map(id => [id, "running" as "running" | "stopped"]));
+  const destroyRefusals: string[] = [];
   const leaseActive = new Map<string, boolean>();
   const model = createServer((req, res) => {
     let body = ""; req.setEncoding("utf8"); req.on("data", chunk => { body += chunk; });
@@ -432,7 +445,17 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         expect(allocations.get(allocationId)).toBe("running");
         return { providerLeaseId: allocationId, expiresAt: new Date(Date.now() + 86_400_000).toISOString(), metadata: { remoteCwd } };
       }
-      if (method === "environmentDestroyLease") throw new Error("box destroy is forbidden in row R");
+      if (method === "environmentDestroyLease") {
+        // SMA-60: with a current backup (custody verified) the runtime asks to
+        // destroy the obsolete image-A box; this provider KEEPS it (as a kept
+        // Boat box does) and refuses. No termination receipt exists, so no
+        // retired-source proof: host preparation refuses the backup by name.
+        if (restoreRefused && String(input.providerLeaseId) === allocationIds[0]) {
+          destroyRefusals.push(String(input.providerLeaseId));
+          throw new Error("provider keeps the old box: destroy refused");
+        }
+        throw new Error("box destroy is forbidden in row R");
+      }
       if (method === "environmentStopLease" || method === "environmentReleaseLease") {
         const id = String(input.providerLeaseId); allocations.set(id, "stopped"); leaseActive.set(id, false);
         // A stale image's stop must not kill B's process generation.
@@ -689,11 +712,24 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     // after its accepted turn deliberately avoids graceful drain generating a
     // backup absent from the incident evidence. Product closure is used only at
     // final cleanup. No PAPERCLIP_HOME/runner-state-root rotation or file edits.
+    if (restoreRefused) {
+      // SMA-60: a deploy drains the controller gracefully; its product closure
+      // leaves a CURRENT failover backup of the warm session. No file is made
+      // or removed by the fixture.
+      const closed = await A.call("close");
+      expect(closed.error, JSON.stringify(closed)).toBeUndefined();
+      stage("SMA-60: controller A drained gracefully", { closed: closed.result, backups: backupInventory() });
+    }
     A.child.kill("SIGKILL"); await A.stopped;
     expect(A.child.signalCode).toBe("SIGKILL");
     expect(existsSync(stateRoot), "bind-mounted durable-sessions survives A").toBe(true);
-    if (checkpointBeforeRestart) expect((await readFile(checkpointPath)).equals(checkpointBeforeRestart)).toBe(true);
-    expect(backupInventory()).toEqual(backupsBeforeRestart);
+    if (restoreRefused) {
+      console.log(`E2E-PI-BACKUPS: ${JSON.stringify({ scenario, afterDrain: backupInventory(), createdByFixture: false, removedByFixture: false })}`);
+      expect(backupInventory().some(entry => entry.endsWith("manifest.json")), "SMA-60 prerequisite: a CURRENT backup with its manifest").toBe(true);
+    } else {
+      if (checkpointBeforeRestart) expect((await readFile(checkpointPath)).equals(checkpointBeforeRestart)).toBe(true);
+      expect(backupInventory()).toEqual(backupsBeforeRestart);
+    }
     const B = await startController();
     expect(B.identity.bootId).not.toBe(A.identity.bootId); expect(B.identity.pid).not.toBe(A.identity.pid);
     stage("real controller restart, same durable root and authority", { A: A.identity, B: B.identity, stateRoot, home: process.env.PAPERCLIP_HOME });
@@ -890,7 +926,67 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     if (!governedWait) expect(admission.checkpoint?.providerRecoveryPolicy, "Paul's plain 17/19 admission policy").toBe("allow_replacement_after_resume_failure");
     expect(targets.find(target => target.runId === next.runId)?.acquisition).toMatchObject({ outcome: sameBoxCold ? "resumed" : "created", providerLeaseId: allocationIds[sameBoxCold ? 0 : 1] });
 
-    if (governedWait) {
+    let nextWorkspaceRestored = false;
+    if (restoreRefused) {
+      // SMA-60 TARGET (J3-22 member (a)): the ORIGINAL run answers on a fresh
+      // thread of the same conversation; exactly ONE continuation note; no
+      // failed run; the J3-17 lineage step recorded. Then the NEXT message
+      // resumes that new thread.
+      expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
+      expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
+      expect(persisted?.error ?? null).toBeNull(); expect(persisted?.errorCode ?? null).toBeNull();
+      const logs = stages.map(record).filter(entry => entry.kind === "log" && entry.runId === next.runId).map(entry => String(entry.text));
+      expect(logs.some(text => text.includes("continuing from saved history") && text.includes("backup_without_reusable_lease")),
+        "the refused restore (backup_without_reusable_lease) was met and continued in this run").toBe(true);
+      expect(readdirSync(join(stateRoot, "continuity-breaks")), "the refused backup set aside once, never deleted").toHaveLength(1);
+      const finalCheckpoint = record(record(persisted?.runnerProfileJson).sessionCheckpoint);
+      const freshProviderSessionId = finalCheckpoint.providerSessionId;
+      expect(freshProviderSessionId).toBeTruthy();
+      expect(freshProviderSessionId, "fresh provider thread, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
+      expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
+      const continuationNote = (runId: string) => ({ authorizationReason: `restore_unavailable_fresh_thread:restore_unavailable_on_new_box:${runId}` });
+      expect(notes, "exactly ONE continuation note").toHaveLength(1);
+      expect(notes[0]?.body).toMatch(/^Continuing from saved history: the earlier provider thread could not be restored on this new sandbox/);
+      expect(record(notes[0]?.metadata)).toMatchObject(continuationNote(next.runId));
+      const [taskSessionAfter] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
+        eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issueId)));
+      const lineage = record(readPiConversation(taskSessionAfter?.sessionParamsJson)).providerIdentityResets as Array<Record<string, unknown>> | undefined;
+      console.log(`E2E-PI-SMA60-LINEAGE: ${JSON.stringify({ runId: next.runId, freshProviderSessionId, lineage })}`);
+      expect(lineage, "J3-17 lineage record written").toEqual([expect.objectContaining({ reason: "resume_failed_on_new_box", runId: next.runId })]);
+      expect(JSON.stringify(lineage![0]!.identity)).toContain(String(freshProviderSessionId));
+      // The run completed: finalize it as the heartbeat does, then the NEXT message.
+      await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, next.runId));
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.runId));
+      await nextOptions.sync.restoreWorkspace(); nextWorkspaceRestored = true;
+      await heartbeat.releaseEnvironmentLeasesForRun({ runId: next.runId, companyId, agentId, status: "succeeded", providerResourceDisposition: "keep_running" });
+      const [secondComment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
+        body: `Second message. ${followupPrompt}` }).returning();
+      const second = await seed(secondComment!.body, B.identity, first.native.normalizedSessionId, secondComment!.id);
+      activeRunId = second.runId; followupRunId = second.runId;
+      const secondAdmission = await admitFollowup(second);
+      expect(secondAdmission.selected.id, "the next message resumes from the answered run").toBe(next.runId);
+      expect(secondAdmission.admission.checkpoint?.providerSessionId, "admitted on the NEW thread").toBe(freshProviderSessionId);
+      const secondOptions = await executionOptions(second);
+      const secondOutcome = await B.call("execute", secondOptions.input);
+      const [secondPersisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second.runId));
+      const secondEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, second.runId));
+      const secondNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(row => row.authorType === "system");
+      const secondCheckpoint = record(record(secondPersisted?.runnerProfileJson).sessionCheckpoint);
+      console.log(`E2E-PI-SMA60-SECOND: ${JSON.stringify({ runId: second.runId, outcome: secondOutcome, error: secondPersisted?.error ?? null,
+        errorCode: secondPersisted?.errorCode ?? null, providerSessionId: secondCheckpoint.providerSessionId ?? null, freshProviderSessionId,
+        notes: secondNotes.map(note => note.body), acquisition: secondOptions.target.sandboxLeaseAcquisition })}`);
+      await writeFile(join(root, "second-message-outcome.json"), JSON.stringify({ secondOutcome, secondPersisted, secondEvents, secondNotes }, null, 2));
+      expect(secondOutcome.error, JSON.stringify(secondOutcome)).toBeUndefined();
+      expect(secondOutcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
+      expect(secondPersisted?.error ?? null).toBeNull(); expect(secondPersisted?.errorCode ?? null).toBeNull();
+      expect(secondCheckpoint.providerSessionId, "the next message RESUMES the same new thread").toBe(freshProviderSessionId);
+      expect(JSON.stringify({ secondOutcome, secondPersisted, secondEvents }), "no provider_identity_changed refusal")
+        .not.toContain("provider_identity_changed");
+      expect(secondNotes.map(note => note.id), "no second note").toEqual(notes.map(note => note.id));
+      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+      expect(allRuns.filter(run => run.status === "failed" || run.error != null), "0 failed runs").toEqual([]);
+      await secondOptions.sync.restoreWorkspace();
+    } else if (governedWait) {
       // G TARGETS: both answer, never a fresh-thread refusal. G1 resumes the
       // surviving Pi history; G2 starts without history and explains it once.
       expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
@@ -973,9 +1069,15 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(persistedEvidence).not.toContain("recoveryRefusalCode");
       expect(persistedEvidence).not.toContain('"code":"runner_remote_state_unavailable"');
     }
-    expect(providerCalls.some(call => call.method === "environmentDestroyLease"), "never destroy either box").toBe(false);
-    await nextOptions.sync.restoreWorkspace();
-    stage(governedWait ? "GREEN: governed-wait replaced-box follow-up answered"
+    if (restoreRefused) {
+      // The only destroy asked for is image-A's, and the provider refused it: both boxes are kept.
+      expect(providerCalls.filter(call => call.method === "environmentDestroyLease").map(call => String(record(call.input).providerLeaseId)))
+        .toEqual(destroyRefusals);
+      expect(new Set(destroyRefusals), "only the old image-A box was asked for").toEqual(new Set([allocationIds[0]]));
+    } else expect(providerCalls.some(call => call.method === "environmentDestroyLease"), "never destroy either box").toBe(false);
+    if (!nextWorkspaceRestored) await nextOptions.sync.restoreWorkspace();
+    stage(restoreRefused ? "GREEN: SMA-60 refused restore answered in the original run; next message resumed the new thread"
+      : governedWait ? "GREEN: governed-wait replaced-box follow-up answered"
       : sameBoxCold ? "GREEN: same-box cold-runner follow-up answered without replay or history re-send"
       : "GREEN: replaced-box follow-up answered from real history handoff", { runId: next.runId, failedStateReads });
   } catch (error) { failure = error; throw error; }
@@ -1012,7 +1114,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
     await writeFile(join(root, "requests.jsonl"), requests.map(bounded).join("\n") + "\n");
     await writeFile(join(root, "processes.json"), JSON.stringify({ spawned, piBirths, remainingOwned: [...spawned, ...piBirths].filter(sameBirth) }, null, 2));
     console.log(`Pi replaced-box evidence retained: ${root}`);
-    if (providerCalls.some(call => call.method === "environmentDestroyLease")) errors.push(new Error("forbidden provider destroy was requested"));
+    if (providerCalls.some(call => call.method === "environmentDestroyLease"
+      && !(restoreRefused && destroyRefusals.includes(String(record(call.input).providerLeaseId))))) errors.push(new Error("forbidden provider destroy was requested"));
     if (failure) await writeFile(join(root, "failure.txt"), failure instanceof Error ? failure.stack ?? failure.message : String(failure));
     if (errors.length) throw new AggregateError([...(failure ? [failure] : []), ...errors], "replaced-box body/cleanup failed; evidence retained");
   }
