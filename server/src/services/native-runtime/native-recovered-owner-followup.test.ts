@@ -273,8 +273,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
    */
   function expectFreshSandboxFallback(message: string, prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
     followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
-    expect(message).toBe(`The previous run's session on this sandbox could not be retired (${RESTARTED_OWNER_REFUSAL}). `
-      + "The next attempt starts on a fresh sandbox.");
+    expect(message).toBe(`The previous run's session on this sandbox could not be retired (${RESTARTED_OWNER_REFUSAL}).`);
     const typed = findNativePredecessorRetirementUnproven(followUp.failures.at(-1));
     expect(typed).toBeInstanceOf(NativePredecessorRetirementUnprovenError);
     expect(typed!.code).toBe(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE);
@@ -906,6 +905,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
     const followUp = await admitFollowUp(prior);
     await recordPriorLeaseOnSameSandbox(prior, followUp, "live");
+    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
     expectFreshSandboxFallback(await followUp.start("resumed", undefined, true), prior, followUp);
     expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: restarted_sandbox_runner_generation_not_lost/);
     // As for every refused prior owner, the controller root is kept aside, not rotated.
@@ -917,7 +917,14 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
   // The restart proves only that the process is gone. A journal with work
   // still owed (a pending command, an unanswered tool or its undelivered
   // answer) keeps the owner held.
-  it.each(["pending-command", "unanswered-tool", "pending-tool-result"] as const)(
+  it.each([
+    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
+    "pending-command",
+    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
+    "unanswered-tool",
+    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
+    "pending-tool-result",
+  ] as const)(
     "keeps the owner of a restarted sandbox held when its journal is unsettled (%s)", async control => {
       const prior = await seedRecoveredPriorRun(control, { provider: "codex", lifecycle: "warm" });
       const followUp = await admitFollowUp(prior);
