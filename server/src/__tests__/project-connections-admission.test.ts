@@ -34,10 +34,8 @@ describe("project connection writer admission (round-4 B)", () => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection();
     // The saved actor, not a route-only check, is needed by the writer.
-    await expect(f.service.updateConnection(connection.id, { enabled: false }, {
-      actor: { type: "agent", companyId: f.companyId, agentId: f.leadB.id, source: "agent_key" },
-      responsibleUserId: f.human, reauthorize: async () => undefined,
-    } as Parameters<typeof f.service.updateConnection>[2])).rejects.toMatchObject({ status: 403, details: { code: "project_connection_actor_required" } });
+    await expect(f.management(connection.id, f.leadB.id).then(context => f.service.updateConnection(connection.id, { enabled: false }, context)))
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_actor_required" } });
     expect((await storedConnection(db, connection.id)).enabled).toBe(true);
   });
 
@@ -67,15 +65,18 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("A04: null adoption, reparent, owner clearing and direct archive are not generic PATCH", async () => {
-    const f = await projectConnectionFixture(db);
-    for (const [from, to] of [[null, f.a], [f.a, f.b], [f.a, null]] as const) {
-      const { connection } = await f.seedConnection(from);
-      const patch = { projectId: to?.id ?? null, name: "must not silently strip ownership" };
-      await expect(f.service.updateConnection(connection.id, patch)).rejects.toMatchObject({ status: 409 });
+    for (const direction of ["adopt", "reparent", "clear"] as const) {
+      // Each direction has its own project, so the uniqueness backstop does not
+      // become a fixture error once the earlier mutation assertions turn green.
+      const f = await projectConnectionFixture(db);
+      const { connection } = await f.seedConnection(direction === "adopt" ? null : f.a);
+      const patch = { projectId: direction === "adopt" ? f.a.id : direction === "reparent" ? f.b.id : null, name: "must not silently strip ownership" };
+      await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, patch, context))).rejects.toMatchObject({ status: 409 });
       expect((await storedConnection(db, connection.id)).name).toBe(connection.name);
     }
+    const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection();
-    await expect(f.service.updateConnection(connection.id, { status: "archived" })).rejects.toMatchObject({ status: 409 });
+    await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, { status: "archived" }, context))).rejects.toMatchObject({ status: 409 });
   });
 
   it("J15: a primary cannot turn the trusted manager App classification into a project connection", async () => {
@@ -97,7 +98,7 @@ describe("project connection writer admission (round-4 B)", () => {
   it("A14-promotion: live shared to EXCLUSIVE is a typed refusal, not a hidden implementation", async () => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection();
-    await expect(f.service.updateConnection(connection.id, { config: f.config(f.a, true) }))
+    await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, { config: f.config(f.a, true) }, context)))
       .rejects.toMatchObject({ status: 409, details: { code: "project_connection_exclusive_promotion_unsupported" } });
     expect((await storedConnection(db, connection.id)).config).toEqual(connection.config);
   });

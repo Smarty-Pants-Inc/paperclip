@@ -88,7 +88,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   it("M03/A04: resetting migrationPending on an activated row is refused without altering its history", async () => {
     const f = await projectConnectionFixture(db);
     const { connection } = await f.seedConnection();
-    await expect(f.service.updateConnection(connection.id, { config: { ...connection.config, projectScope: { ...f.scope(), migrationPending: true, legacyConnectionId: connection.id } } }))
+    await expect(f.management(connection.id).then(context => f.service.updateConnection(connection.id, { config: { ...connection.config, projectScope: { ...f.scope(), migrationPending: true, legacyConnectionId: connection.id } } }, context)))
       .rejects.toMatchObject({ status: 409 });
     expect((await storedConnection(db, connection.id)).config).toEqual(connection.config);
   });

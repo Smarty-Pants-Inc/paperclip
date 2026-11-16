@@ -12,6 +12,7 @@ import { toolAccessService } from "../../services/tool-access.js";
 import { toolAccessRoutes } from "../../routes/tool-access.js";
 import { errorHandler } from "../../middleware/index.js";
 import type { ActorInfo } from "../../services/tool-access/types.js";
+import { connectionManagementService } from "../../services/connection-management.js";
 
 // Type-only forward contract: BASE deliberately has no projectId in these types.
 // No missing runtime module, fake implementation, or test-only database DDL.
@@ -57,6 +58,10 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
     projectScope: scope(project, exclusive),
   });
   const actor = (agentId = primary.id): ActorInfo => ({ actorType: "agent", actorId: agentId, responsibleUserId: human });
+  const management = (connectionId: string, agentId = primary.id) => connectionManagementService(db).authorize(
+    { type: "agent", companyId, agentId, source: "agent_key", onBehalfOfUserId: human },
+    "connections:configure", { type: "connection_management", companyId, connectionId, operation: "PATCH /tool-connections/:connectionId" },
+  );
   const input = (project = a, overrides: Partial<OwnedConnectionInput> = {}): OwnedConnectionInput => ({
     projectId: project.id, name: `Project ${project.name} ${randomUUID()}`, transport: "rest_api",
     connectionPurpose: "tool", ownership: "customer", connectionKind: "managed", authKind: "none",
@@ -100,7 +105,7 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
     });
     app.use("/api", toolAccessRoutes(db)); app.use(errorHandler); return app;
   };
-  return { companyId, human, primary, leadA, leadB, worker, outsider, a, b, secret: secret!, scope, config, input, actor, seedConnection, run, route, service: toolAccessService(db), addAgent };
+  return { companyId, human, primary, leadA, leadB, worker, outsider, a, b, secret: secret!, scope, config, input, actor, management, seedConnection, run, route, service: toolAccessService(db), addAgent };
 }
 
 export async function storedConnection(db: Db, id: string) {
