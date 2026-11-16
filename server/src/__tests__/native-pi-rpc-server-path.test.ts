@@ -406,6 +406,41 @@ describe("native Pi RPC server path: saved agent to runner launch", () => {
     expect(runnerEnvironment.PI_CODING_AGENT_DIR).toBe(agentDir);
   });
 
+  // Keep reason: #20833 must be fixed before the local/remote launch split;
+  // provider launch options are captured at the real runnerd backend boundary.
+  it.each(["local", "remote sandbox"] as const)("Langfuse agent identity reaches the %s Pi launch", async target => {
+    const { secretService } = await vi.importActual<typeof import("../services/secrets.js")>("../services/secrets.js");
+    const { resolveExecutionRunAdapterConfig } = await import("../services/heartbeat/run-preparation.js");
+    const { resolvedConfig, configuredTaskEnvironment } = await resolveExecutionRunAdapterConfig({
+      companyId, agentId, adapterType: "paperclip_runner", environmentId: "environment",
+      environmentEnv: { LANGFUSE_BASE_URL: { type: "plain", value: "https://langfuse.example.test" } },
+      executionRunConfig: piConfig, projectEnv: null, secretsSvc: secretService(launchDb()),
+    });
+    const runnerEnvironment = {
+      ...configuredEnvironmentProjection(configuredTaskEnvironment),
+      ...buildNativeProviderEnvironment(resolvedConfig.env as NodeJS.ProcessEnv, process.env, root),
+    };
+    const { packRoot } = await providerPack();
+    const execute = vi.fn(async (command: { args?: string[] }) => ({
+      exitCode: 0, signal: null, timedOut: false, stderr: "",
+      stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+        schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd", packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+        durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+      }) : command.args?.[0] === "--version" ? "1.18.34\n" : "",
+    }));
+    await createRunnerdBackend({ db: launchDb(), execution: executionFor({ adapterConfig: resolvedConfig }),
+      runnerInstanceId: "langfuse-user-id", runnerEnvironment, runnerRemoteProviderPackPath: packRoot,
+      ...(target === "remote sandbox" ? {
+        runnerIngressAuthorized: true, runnerRemoteBinaryPath: mocks.runnerBinary,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace", environmentId: "environment", leaseId: "lease",
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn: vi.fn(async () => undefined) } } as never,
+      } : { runnerExecutionTarget: { kind: "local" as const } }),
+    });
+    const launch = capturedLaunch();
+    expect(launch.environment?.LANGFUSE_USER_ID).toBe(agentId);
+    expect(launch.environment?.LANGFUSE_BASE_URL).toBe("https://langfuse.example.test");
+  });
+
   it("case 3 ACPX Pi control: keeps ACPX Pi and its legacy thinking/permission launch options unchanged", async () => {
     const execution = executionFor({ adapterConfig: { provider: "acpx", acpxAgent: "pi", model: "anthropic/claude-opus-5-5", piThinkingLevel: "high", acpxPermissionMode: "approve-all" } });
     await createRunnerdBackend({ db: launchDb(), execution, runnerInstanceId: "server-path-acpx-pi" });
