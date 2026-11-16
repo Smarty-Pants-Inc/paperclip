@@ -7,7 +7,7 @@ import request from "supertest";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, agentApiKeys, approvals, authUsers, budgetIncidents, budgetPolicies, companies,
-  companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants, routineRuns, routineTriggers,
+  companyMemberships, createDb, heartbeatRuns, issues, principalPermissionGrants, routineRuns, routineTriggers, routines as routinesTable,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, type Db } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -156,8 +156,15 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
       activity, authority, task, currentTask, events, unsubscribe, handover, token };
   }
 
-  const lockWaits = async (table: string) => (await db.execute(sql`select pid, query from pg_stat_activity
-    where datname = current_database() and wait_event_type = 'Lock' and query like ${`%from "${table}"%`}`)) as unknown as { pid: number; query: string }[];
+  // A row-lock waiter holds (or waits for) the tuple lock on that table; long query texts are truncated.
+  const lockWaits = async (table: string) => (await db.execute(sql`select a.pid, a.query from pg_stat_activity a
+    where a.datname = current_database() and a.wait_event_type = 'Lock' and (a.query like ${`%from "${table}"%`}
+      or exists (select 1 from pg_locks l where l.pid = a.pid and l.locktype = 'tuple' and l.relation = ${table}::regclass))`)) as unknown as { pid: number; query: string }[];
+  const messages = (error: unknown) => {
+    const all: string[] = [];
+    for (let cause = error as any, depth = 0; cause && typeof cause === "object" && depth < 6; cause = cause.cause, depth++) all.push(String(cause.message));
+    return all.join(" <- ");
+  };
   async function until(check: () => Promise<boolean>, settled?: Promise<unknown>) {
     let stopped = false;
     void settled?.then(() => { stopped = true; });
@@ -301,7 +308,7 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     await db.execute(sql`insert into b6_forced_failures values ('agent.terminated', ${f.workerId})`);
     const { effects, counter } = countedEffects();
     const failed = await settle(createLifecycleStore(db, effects).change(f.workerId, "complete", { version, owner }));
-    expect(failed.error?.message).toContain("forced agent.terminated failure");
+    expect(messages(failed.error)).toContain("forced agent.terminated failure");
     // No internal retry: one attempt, and the pre-completion state is exactly kept.
     expect(counter.attempts).toBe(1);
     const after = await f.current(f.workerId);
@@ -322,8 +329,10 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
   it("F4 replacement: a rolled-back lifecycle transaction publishes nothing; a separate explicit retry rechecks authority and publishes committed effects once", async () => {
     const f = await seed();
     let transactions = 0, authorizations = 0, allow = true;
+    let rootTransaction: unknown;
     const wrappedDb = new Proxy(db, { get(target, key, receiver) {
       if (key === "transaction") return ((work, options) => target.transaction(async tx => {
+        rootTransaction = tx;
         const value = await work(tx);
         if (++transactions === 1) throw Object.assign(new Error("forced transaction rollback"), { code: "40P01" });
         return value;
@@ -331,7 +340,9 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
       return Reflect.get(target, key, receiver);
     } });
     const before = await f.current(f.workerId), activity = await f.activity();
-    const lifecycle = createAgentLifecycle(wrappedDb, {}, async () => {
+    // Count the request's own (root) authorization; the nested store savepoint re-runs the same check.
+    const lifecycle = createAgentLifecycle(wrappedDb, {}, async tx => {
+      if (tx !== rootTransaction) return;
       authorizations++;
       if (!allow) throw new Error("scope revoked before the explicit retry");
     });
@@ -440,14 +451,15 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     await f.retire();
     // The lead takes the task through the ordinary route first: assignment, then checkout.
     const deadlocksBefore = await deadlocks();
+    // The contender run first: its foreign key takes a key-share lock on the lead's row.
+    const leadRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: leadRunId, companyId: f.companyId, agentId: f.leadId, status: "running", contextSnapshot: { issueId: task.id } });
     const held = barrier(), release = barrier();
     const blocker = db.transaction(async tx => {
       await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, f.leadId)).for("update");
       held.release(); await release.promise;
     });
     await held.promise;
-    const leadRunId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: leadRunId, companyId: f.companyId, agentId: f.leadId, status: "running", contextSnapshot: { issueId: task.id } });
     let checkout: Promise<Settled> | undefined, item: Promise<Settled> | undefined;
     try {
       checkout = settle(issueService(db).checkout(task.id, f.leadId, ["todo", "in_progress"], leadRunId));
@@ -474,13 +486,13 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     const deadlocksBefore = await deadlocks();
     const held = barrier(), release = barrier();
     // Park the item after its task lock: it then needs the manager's row.
+    const leadRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: leadRunId, companyId: f.companyId, agentId: f.leadId, status: "running", contextSnapshot: { issueId: task.id } });
     const blocker = db.transaction(async tx => {
       await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, f.leadId)).for("update");
       held.release(); await release.promise;
     });
     await held.promise;
-    const leadRunId = randomUUID();
-    await db.insert(heartbeatRuns).values({ id: leadRunId, companyId: f.companyId, agentId: f.leadId, status: "running", contextSnapshot: { issueId: task.id } });
     let checkout: Promise<Settled> | undefined, item: Promise<Settled> | undefined;
     try {
       item = settle((await f.handover()).processAgent(f.workerId));
@@ -655,23 +667,49 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
   }, 90_000);
 
   // ---- W2 + condition 6: agents retired BEFORE the fix: a DRY LIST first, repair only on explicit enable ----
-  it("pre-fix retirements: the dry list counts them (ids only); repair runs only when explicitly enabled, then on the first pass", async () => {
+  it("pre-fix retirements (default): the reconcile scan only produces a DRY LIST of counts and ids; nothing is repaired", async () => {
     const f = await seed({ reports: 1 });
     const tasks = [await f.task("T1", "todo"), await f.task("T2", "blocked")];
     // Retired before the fix: terminated, no marker, work and a live report left behind.
     await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, f.workerId));
-    const before = await f.roster();
-    const dry = await (await f.handover()).dryList();
-    expect(dry).toMatchObject({ agents: 1, tasks: 2, reports: 1, agentIds: [f.workerId],
+    const before = await f.roster(), activity = await f.activity();
+    const dry = await (await f.handover()).dryList({ companyId: f.companyId });
+    expect(dry).toEqual({ agents: 1, tasks: 2, reports: 1, agentIds: [f.workerId],
       taskIds: tasks.map(task => task.id).sort(), reportIds: [f.reportIds[0]] });
     await (await f.handover()).processPending();
     expect(await f.roster()).toEqual(before);
     for (const task of tasks) expect(await f.currentTask(task.id)).toMatchObject({ assigneeAgentId: f.workerId });
+    expect(await f.activity()).toEqual(activity);
+    f.unsubscribe();
+  }, 60_000);
+
+  it("pre-fix retirements (repair explicitly enabled): a terminated agent with 2 open tasks and 1 live report is repaired on the FIRST pass", async () => {
+    const f = await seed({ reports: 1 });
+    const tasks = [await f.task("T1", "todo"), await f.task("T2", "blocked")];
+    await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(eq(agents.id, f.workerId));
     await (await f.handover({ repairUnmarked: true })).processPending();
     for (const task of tasks) expect(await f.currentTask(task.id)).toMatchObject({ assigneeAgentId: f.leadId });
     expect(await f.current(f.reportIds[0]!)).toMatchObject({ reportsTo: f.leadId });
     expect(await f.activity("issue.reassigned")).toHaveLength(2);
     expect(await f.activity("agent.reports_to_changed")).toHaveLength(1);
+    expect(marker(await f.current(f.workerId))).toBeUndefined();
+    expect(await (await f.handover()).dryList({ companyId: f.companyId })).toMatchObject({ agents: 0, tasks: 0, reports: 0 });
+    f.unsubscribe();
+  }, 60_000);
+
+  it("routines (RF2-0510 row 15): the recovery worker PAUSES a retired agent's active routine with one activity row, never re-homes it", async () => {
+    const f = await seed();
+    const routines = routineService(db, { heartbeat: { wakeup: async () => null }, runtimeEnv: {} } as never);
+    const routine = await routines.create(f.companyId, { title: "Retired agent's routine", assigneeAgentId: f.workerId, priority: "medium",
+      status: "active", concurrencyPolicy: "coalesce_if_active", catchUpPolicy: "skip_missed", variables: [] }, {});
+    await f.retire();
+    const service = await f.handover();
+    await service.processAgent(f.workerId);
+    await service.processAgent(f.workerId);
+    const [after] = await db.select().from(routinesTable).where(eq(routinesTable.id, routine.id));
+    expect(after).toMatchObject({ status: "paused", assigneeAgentId: f.workerId });
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, routine.id), eq(activityLog.action, "routine.paused"))))
+      .toEqual([expect.objectContaining({ actorType: "system", details: expect.objectContaining({ reason: "agent_terminated", retiredAgentId: f.workerId }) })]);
     f.unsubscribe();
   }, 60_000);
 
