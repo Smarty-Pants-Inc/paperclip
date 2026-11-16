@@ -139,6 +139,17 @@ describe("project connection stable-ID envelope at credential release", () => {
     expect(provider.acquire).not.toHaveBeenCalled();
   });
 
+  it("INT-R2/R07: retain the exact unapproved-reference typed refusal alongside the frozen assertion", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection, grant } = await f.seedConnection();
+    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-restricted-token");
+    provider.secret.mockClear(); provider.acquire.mockClear();
+    const [unapproved] = await db.update(toolConnections).set({ config: { ...connection.config, projectScope: { ...f.scope(), approvedSecretRefs: [] } } }).where(eq(toolConnections.id, connection.id)).returning();
+    await expect(resolveGitHubAppCredential(db, unapproved!, grant, false, false, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+    expect(provider.secret).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
   it("J15: manager App cannot be exported by bypassing the ordinary selector", async () => {
     const f = await projectConnectionFixture(db);
     const { connection, grant } = await f.seedConnection();
