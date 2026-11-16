@@ -1,6 +1,6 @@
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
-import { hasTaskStopPending, STOP_PENDING_SCHEMA } from "./recovery/stop-pending.js";
+import { hasTaskStopPending, STOP_PENDING_SCHEMA, withTaskStopPendingInstruction } from "./recovery/stop-pending.js";
 import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
@@ -96,8 +96,9 @@ export type ResolveIssueRecoveryActionInput = {
  * by an older release could ask a person to inspect the run's environment. */
 function readModelNextAction(row: IssueRecoveryActionRow): string {
   const system = readSystemRecovery(row.evidence);
-  return system?.state === "exhausted" && row.evidence?.workspaceRecovery
+  const nextAction = system?.state === "exhausted" && row.evidence?.workspaceRecovery
     ? exhaustedSystemRecoveryAction(system, row.evidence) : row.nextAction;
+  return withTaskStopPendingInstruction(row, nextAction);
 }
 
 function toReadModel(row: IssueRecoveryActionRow): IssueRecoveryAction {

@@ -30,6 +30,13 @@ export function hasTaskStopPending(action: { evidence: Record<string, unknown> }
   const value = action.evidence.stopPending;
   return Boolean(value && typeof value === "object" && "schema" in value && value.schema === STOP_PENDING_SCHEMA);
 }
+/** Keep the protected Stop instruction in the ordinary card's nextAction.
+ * Read-model copy (for example an exhausted workspace) remains secondary, not
+ * a replacement for this independent obligation. Do not duplicate saved copy. */
+export function withTaskStopPendingInstruction(action: { evidence: Record<string, unknown> }, nextAction: string): string {
+  if (!hasTaskStopPending(action) || nextAction.includes(STOP_PENDING_ACTION)) return nextAction;
+  return `${STOP_PENDING_ACTION}\n\n${nextAction}`;
+}
 function stopPending(action: typeof issueRecoveryActions.$inferSelect): StopPending | null {
   const value = action.evidence.stopPending;
   return value && typeof value === "object" && "schema" in value && value.schema === STOP_PENDING_SCHEMA
