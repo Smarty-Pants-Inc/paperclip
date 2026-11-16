@@ -8,6 +8,7 @@ import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileEr
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { cachedFileSha256 } from "./off-loop-file-work.js";
 import { logger } from "../../middleware/logger.js";
+import { summarizeDiagnosticError } from "./diagnostic-error-summary.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 
@@ -156,6 +157,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           } catch (error) {
             timing.outcome = "failed";
             timing.failedStep = step;
+            try { timing.error = summarizeDiagnosticError(error); } catch { /* log only: never replace the real error */ }
             timing[`${step}Ms`] = Date.now() - stepStarted;
             throw error;
           } finally {
