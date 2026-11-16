@@ -175,7 +175,7 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
   });
 
   it.each([{ userComment: true }, { userComment: false }])(
-    "after exhaustion continues in a fresh run, with no executor note and no fresh-thread note (user comment: $userComment)",
+    "after exhaustion continues in a fresh run, with no executor note and no fresh-thread note (user comment: $userComment) (superseded by replacement: r104c, rf4 verdict 16:40Z; RFL record 16:51Z)",
     async ({ userComment }) => {
       const seeded = await seed({ userComment });
       await fail(seeded, new Error(PREPARE_NEVER_CONNECTED));
