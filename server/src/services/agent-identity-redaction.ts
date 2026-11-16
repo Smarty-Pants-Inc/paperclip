@@ -6,13 +6,54 @@ const PEM_RUN_MIN = 40;
 const PRIVATE_KEY_MARKERS = ["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "DSA PRIVATE KEY",
   "OPENSSH PRIVATE KEY", "ENCRYPTED PRIVATE KEY"].flatMap(label =>
   ["BEGIN", "END"].map(edge => `-----${edge} ${label}-----`));
-const markerPattern = new RegExp(PRIVATE_KEY_MARKERS.join("|"), "g");
+// `fold -w N` and `cut -c` split or truncate markers ("-----END PRIVATE KEY\n-----").
+// A marker may carry one line break between any two characters and may lose its
+// trailing dashes. Built only from the constant labels above, never from private
+// data; each optional break is a fixed choice, so matching stays linear.
+const LINE_BREAK = "(?:\\r?\\n)?";
+const markerPattern = new RegExp(PRIVATE_KEY_MARKERS.map(marker => {
+  const head = marker.slice(0, -5);
+  return [...head].join(LINE_BREAK) + `(?:${LINE_BREAK}-){0,5}`;
+}).join("|"), "g");
 const markerPrefixes = new Set(PRIVATE_KEY_MARKERS.flatMap(marker =>
   Array.from({ length: marker.length - 1 }, (_, index) => marker.slice(0, index + 1))));
 const maxMarkerLength = Math.max(...PRIVATE_KEY_MARKERS.map(marker => marker.length));
+// A held marker prefix may contain up to one CRLF per character.
+const maxMarkerSpan = (maxMarkerLength - 1) * 3;
+// Base64 pieces separated by at most this much whitespace (fold, wrapped output)
+// are matched as one candidate against the known key-body windows.
+const MAX_JOIN_WHITESPACE = 2;
+const isBase64Start = (text: string) => /^[A-Za-z0-9+/=]/.test(text);
+const trailingWhitespace = (text: string) => text.length - text.replace(/[ \t\r\n]+$/, "").length;
+/** Longest tail that could still become a (possibly line-broken) marker. */
+const heldMarkerLength = (tail: string) => {
+  for (let index = Math.max(0, tail.length - maxMarkerSpan); index < tail.length; index++) {
+    if (tail[index] === "-" && markerPrefixes.has(tail.slice(index).replace(/[\r\n]/g, ""))) return tail.length - index;
+  }
+  return 0;
+};
 
 type MaterialStream = { context: boolean; token: string; suppressed: boolean; marker: string };
 const newMaterialStream = (): MaterialStream => ({ context: false, token: "", suppressed: false, marker: "" });
+
+/**
+ * Add a run's secret values to a redactor's exact values and key-body window
+ * index. Live preparation and native log recovery both use this, so the two
+ * paths cannot drift on how a run secret is matched.
+ */
+export function addRunSecretMaterial(redactor: { values: string[] }, secrets: Iterable<string>) {
+  const known = new Set(redactor.values);
+  for (const secret of new Set(secrets)) {
+    // Keep the whole secret; drop derived lines too short to mean anything
+    // (a JSON secret's "{" line would otherwise mask every brace).
+    for (const value of createAgentIdentityRedactor(secret).values) {
+      if (known.has(value) || (value !== secret && value.length < 8)) continue;
+      known.add(value);
+      redactor.values.push(value);
+    }
+  }
+  redactor.values.sort((left, right) => right.length - left.length);
+}
 
 /** Keep private material in memory only; do not copy it into run snapshots. */
 export function createAgentIdentityRedactor(privateKeyPem?: string) {
@@ -58,30 +99,50 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     const segment = (text: string) => {
       for (const match of text.matchAll(/[A-Za-z0-9+/=]+|[^A-Za-z0-9+/=]+/g)) {
         const run = match[0];
-        if (!/^[A-Za-z0-9+/=]/.test(run)) {
-          output += flushToken(state) + run;
+        if (!isBase64Start(run)) {
+          // A short whitespace gap keeps held pieces one candidate: folded key
+          // lines are shorter than a window. Any other separator ends it.
+          if (state.token && !state.suppressed && /^[ \t\r\n]+$/.test(run) &&
+            trailingWhitespace(state.token) + run.length <= MAX_JOIN_WHITESPACE) state.token += run;
+          else output += flushToken(state) + run;
           continue;
         }
         if (state.suppressed) continue;
-        const token = state.token + run;
-        let known = false;
+        const raw = state.token + run;
+        // The held token is bounded (a window prefix plus a sub-threshold run,
+        // with at most two whitespace characters per piece).
+        const joined = state.token.replace(/[ \t\r\n]/g, "") + run;
+        const contiguous = raw.length - raw.replace(/[A-Za-z0-9+/=]+$/, "").length;
+        let known = -1;
         // Fixed-width Set lookups: linear in output size, never a regex made
         // from private data or a search over every window for every character.
-        for (let index = 0; index + MATERIAL_WINDOW <= token.length; index++) {
-          if (materialWindows.has(token.slice(index, index + MATERIAL_WINDOW))) { known = true; break; }
+        for (let index = 0; index + MATERIAL_WINDOW <= joined.length; index++) {
+          if (materialWindows.has(joined.slice(index, index + MATERIAL_WINDOW))) { known = index; break; }
         }
-        if (known || (state.context && token.length >= PEM_RUN_MIN)) {
+        if (known >= 0 || (state.context && contiguous >= PEM_RUN_MIN)) {
+          // Redact from the first known window, or for structural context only
+          // the contiguous run; earlier held pieces are ordinary output.
+          let start = raw.length - contiguous;
+          if (known >= 0) {
+            start = 0;
+            for (let seen = 0; seen < known || !isBase64Start(raw[start]!); start++) if (isBase64Start(raw[start]!)) seen++;
+          }
+          output += raw.slice(0, start);
           output += REDACTED_EVENT_VALUE;
           state.context = true;
           state.token = "";
           state.suppressed = true;
-        } else if (state.context) state.token = token;
-        else {
-          let held = Math.min(MATERIAL_WINDOW - 1, token.length);
-          while (held && !materialPrefixes.has(token.slice(-held))) held--;
-          output += held ? token.slice(0, -held) : token;
-          state.token = held ? token.slice(-held) : "";
+          continue;
         }
+        // Hold the longest joined suffix that can still begin a window and,
+        // inside PEM context, the current run that may still reach PEM_RUN_MIN.
+        let held = Math.min(MATERIAL_WINDOW - 1, joined.length);
+        while (held && !materialPrefixes.has(joined.slice(-held))) held--;
+        let rawHeld = 0;
+        for (let seen = 0; seen < held; rawHeld++) if (isBase64Start(raw[raw.length - 1 - rawHeld]!)) seen++;
+        rawHeld = Math.max(rawHeld, state.context ? contiguous : 0);
+        output += raw.slice(0, raw.length - rawHeld);
+        state.token = raw.slice(raw.length - rawHeld);
       }
     };
     // Exact whole PEMs historically produce one marker. Project each as one
@@ -94,12 +155,11 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     for (const match of text.matchAll(markerPattern)) {
       segment(text.slice(cursor, match.index));
       output += flushToken(state) + REDACTED_EVENT_VALUE;
-      state.context = match[0].startsWith("-----BEGIN");
+      state.context = match[0].replace(/[\r\n]/g, "").startsWith("-----BEGIN");
       cursor = match.index + match[0].length;
     }
     const tail = text.slice(cursor);
-    let held = Math.min(maxMarkerLength - 1, tail.length);
-    while (held && !markerPrefixes.has(tail.slice(-held))) held--;
+    const held = heldMarkerLength(tail);
     segment(held ? tail.slice(0, -held) : tail);
     if (held) {
       output += flushToken(state);
