@@ -144,8 +144,10 @@ describe("project connection writer admission (round-4 B)", () => {
   it("J02: wrong-project recipient cannot be installed by an otherwise permitted manager", async () => {
     const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
+    // Supersede-by-replacement (NEEDS-RFL W1): a recipient outside the owning
+    // project is refused with the merged guard's SAME code.
     await expect(f.service.putConnectionInstalls(connection.id, { installs: [{ targetType: "agent", targetId: f.outsider.id }] }, f.actor()))
-      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_not_supported_by_this_server", connectionId: connection.id } });
   });
 
   it("J03/J16: native create parsing preserves the nullable owner without removing baseline grants", async () => {
@@ -363,8 +365,9 @@ describe("project connection writer admission (round-4 B)", () => {
     await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: connection.id, targetType: "agent", targetId: f.outsider.id });
     composeFinish(f, APPROVED_KEY_VERSION);
     const before = await setupSnapshot(f, [connection.id]);
+    // Supersede-by-replacement (NEEDS-RFL W2): same refusal, merged guard code.
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, { ...finishInput(f.worker.id), preserveExistingAccess: true }, f.actor()))
-      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_not_supported_by_this_server", connectionId: connection.id } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
       .toMatchObject([{ targetId: f.outsider.id }]);
     expect((await counts(f.companyId)).activity - before.activity).toBe(0);
