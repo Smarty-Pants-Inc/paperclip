@@ -1212,5 +1212,144 @@ describe("native provider startup retry", () => {
       });
       expect(record(state.run.runnerProfileJson).sessionCheckpoint).toMatchObject({ providerSessionId: piSessionId });
     });
+
+    // The checkpoint and events Pi's session.open itself leaves, as stored for
+    // GAT-8: the open emits session.started, the goal capability and snapshot,
+    // then the root thread_lineage and model items (sourceSeq 1-5), so the
+    // checkpoint already carries cursor "5" and that one root lineage entry.
+    // turn.submitted and the startup diagnostics follow; turn.start then failed
+    // in session.revalidate, before the Pi driver's turn.started and prompt.
+    describe("the stored shape of a Pi session.open that never sent a prompt (#20887)", () => {
+      const openedPiSessionId = "01a1e3f6-d6ca-77ad-8486-30ab91707c83";
+      const rootLineage = (threadId: string) => ({ role: null, depth: 0, status: "unknown", nickname: null,
+        threadId, parentThreadId: null, providerSessionId: threadId });
+      const turnStartFailure = "PRP command turn.start failed: " + JSON.stringify({
+        commandId: "command_turn_start", commandType: "turn.start", controllerSeq: 3,
+        result: { code: "command_execution_failed", message: "Codex turn/start failed: Codex session.revalidate failed: "
+          + JSON.stringify({ code: -32000, message: "Pi private request timed out" }) },
+        status: "failed",
+      });
+      async function failAfterObservedPiOpen(seeded: Seeded, options: {
+        provider?: "pi_rpc" | "codex"; lineage?: unknown[]; promptEvent?: string; semanticResult?: unknown;
+      } = {}) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, seeded.runId));
+        const source = seeded.runnerInstanceId;
+        const sourceEvent = (sourceSeq: number, eventType: string, extra: Record<string, unknown> = {}) => ({
+          companyId, runId: seeded.runId, agentId: seeded.agentId, seq: 100 + sourceSeq * 2, eventType, stream: "system",
+          sourceInstanceId: source, sourceEventId: `${source}:${seeded.runId}:${sourceSeq}`, sourceSeq,
+          payload: { prpEvent: { sourceSeq, sourceKind: "runner", eventType, ...extra } },
+        });
+        const projection = (after: number, eventType: string) => ({ companyId, runId: seeded.runId,
+          agentId: seeded.agentId, seq: 101 + after * 2, eventType, stream: "system",
+          payload: { prpSourceSeq: after, prpSourceInstanceId: source } });
+        provider.execute.mockReset().mockImplementation(async () => {
+          const checkpoint = {
+            backendKind: "runner", driverKind: options.provider === "codex" ? "codex_app_server" : "pi_rpc",
+            sessionId: openedPiSessionId, identity: { companyId, agentId: seeded.agentId, issueId: seeded.issueId,
+              runId: seeded.runId, sessionId: run!.nativeSessionId },
+            providerSessionId: openedPiSessionId, workingDirectory: "/tmp", cursor: "5",
+            semanticResult: options.semanticResult ?? null, terminal: null, activeTurnId: null, terminalTurns: [],
+            dispositionOnlyRecoveryConsumed: false, dispositionOnlyRecoveryTurnId: null, pendingRuntimeRequests: [],
+            goal: null, lineage: options.lineage ?? [rootLineage(openedPiSessionId)],
+          };
+          await db.update(heartbeatRuns).set({
+            runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+              || ${JSON.stringify({ sessionCheckpoint: checkpoint })}::jsonb`,
+          }).where(eq(heartbeatRuns.id, seeded.runId));
+          await db.insert(heartbeatRunEvents).values([
+            sourceEvent(1, "session.started", { payload: { driverSessionId: openedPiSessionId, providerSessionId: openedPiSessionId } }),
+            sourceEvent(2, "session.capabilities.updated"), projection(2, "session.capabilities.updated"),
+            sourceEvent(3, "session.goal.snapshot"), projection(3, "session.goal.snapshot"),
+            sourceEvent(4, "item.completed", { itemId: `thread:${openedPiSessionId}`,
+              payload: { kind: "thread_lineage", lineage: rootLineage(openedPiSessionId) } }),
+            sourceEvent(5, "item.completed", { itemId: `${openedPiSessionId}:model`, payload: { kind: "model" } }),
+            sourceEvent(6, "turn.submitted"),
+            sourceEvent(7, "harness.diagnostic", { payload: { code: "provider_startup_ownership", startup: { phase: "intent" } } }),
+            sourceEvent(8, "harness.diagnostic", { payload: { code: "provider_startup_ownership", startup: { phase: "spawned" } } }),
+            ...(options.promptEvent ? [sourceEvent(9, options.promptEvent)] : []),
+          ]);
+          throw new Error(turnStartFailure);
+        });
+        await expect(executePaperclipNativeSession({
+          db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId,
+          backend: {
+            descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+            openSession: async () => { throw new Error("Unexpected provider session call"); },
+          },
+        })).rejects.toThrow("PRP command turn.start failed");
+      }
+      async function expectExactResume(seeded: Seeded) {
+        const state = await read(seeded);
+        expect(state.coordinator).toMatchObject({
+          phase: "retryable_failure",
+          failureDetail: expect.objectContaining({ recoveryMode: "exact_checkpoint_resume", providerSessionEstablished: true }),
+        });
+        expect(record(state.run.runnerProfileJson).sessionCheckpoint).toMatchObject({ providerSessionId: openedPiSessionId });
+      }
+
+      it("drops the open-only checkpoint and opens attempt 2 fresh", async () => {
+        const seeded = await seedPiRun();
+        await failAfterObservedPiOpen(seeded);
+        let state = await read(seeded);
+        expect(state.coordinator).toMatchObject({
+          phase: "retryable_failure",
+          failureDetail: expect.objectContaining({ recoveryMode: "bootstrap_retry", providerSessionEstablished: false,
+            originalFailureCode: "native_session_interrupted" }),
+        });
+        expect(record(state.run.runnerProfileJson).sessionCheckpoint).toBeUndefined();
+
+        const observed: { checkpoint?: unknown } = {};
+        provider.execute.mockReset().mockImplementation(async (options: {
+          persistedSession?: unknown; controlPlane: { loadSessionCheckpoint?: () => Promise<unknown> };
+        }) => {
+          observed.checkpoint = options.persistedSession ?? await options.controlPlane.loadSessionCheckpoint?.() ?? null;
+          throw new Error("transport_reconnect_grace_exceeded: second attempt observed");
+        });
+        await expect(executePaperclipNativeSession({
+          db, execution: seeded.execution, runnerInstanceId: seeded.runnerInstanceId, leaseOwner: await claimRetry(seeded),
+          backend: {
+            descriptor: async () => { throw new Error("Unexpected provider descriptor call"); },
+            openSession: async () => { throw new Error("Unexpected provider session call"); },
+          },
+        })).rejects.toThrow("second attempt observed");
+        expect(provider.execute).toHaveBeenCalledOnce();
+        expect(observed.checkpoint).toBeNull();
+        state = await read(seeded);
+        expect(state.coordinator.attempt).toBe(2);
+        expect(JSON.stringify(state.coordinator.failureDetail)).not.toMatch(/provider_identity_changed|native_adopted_provider_identity_mismatch/);
+      });
+
+      it("keeps exact resume once the Pi driver published turn.started", async () => {
+        const seeded = await seedPiRun();
+        await failAfterObservedPiOpen(seeded, { promptEvent: "turn.started" });
+        await expectExactResume(seeded);
+      });
+
+      it("keeps exact resume when the lineage holds a child thread", async () => {
+        const seeded = await seedPiRun();
+        await failAfterObservedPiOpen(seeded, { lineage: [rootLineage(openedPiSessionId), { role: "worker", depth: 1,
+          status: "unknown", nickname: null, threadId: "pi-child-thread", parentThreadId: openedPiSessionId,
+          providerSessionId: openedPiSessionId }] });
+        await expectExactResume(seeded);
+      });
+
+      it("keeps exact resume when the lineage root is a different thread", async () => {
+        const seeded = await seedPiRun();
+        await failAfterObservedPiOpen(seeded, { lineage: [rootLineage("pi-other-root-thread")] });
+        await expectExactResume(seeded);
+      });
+
+      it("keeps exact resume when the checkpoint holds a semantic result", async () => {
+        const seeded = await seedPiRun();
+        await failAfterObservedPiOpen(seeded, { semanticResult: { schema: "paperclip.run_result.v1", status: "completed" } });
+        await expectExactResume(seeded);
+      });
+
+      it("leaves a codex checkpoint of the same shape on exact resume", async () => {
+        const seeded = await seedPiRun("codex");
+        await failAfterObservedPiOpen(seeded, { provider: "codex" });
+        await expectExactResume(seeded);
+      });
+    });
   });
 });
