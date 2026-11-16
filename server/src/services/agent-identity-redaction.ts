@@ -68,6 +68,9 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
   const indexedValues = new Set<string>();
   const completePemValues: string[] = [];
   const materialWindows = new Set<string>();
+  // Windows of key material (a value with a BEGIN marker). Only these, or a
+  // BEGIN marker, open key-block context; a plain secret masks only itself.
+  const keyBlockWindows = new Set<string>();
   const materialPrefixes = new Set<string>();
   // `values` is intentionally appendable: execution preparation and native log
   // recovery add identities/registered secrets after constructing the redactor.
@@ -79,8 +82,10 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       const decoded = value.replace(/\\r\\n|\\n|\\r/g, "\n");
       const body = decoded.split(/\r?\n/).filter(line => line && !line.startsWith("-----")).join("").replace(/=+$/, "");
       if (!/^[A-Za-z0-9+/]+$/.test(body)) continue;
+      const keyBlock = decoded.includes("-----BEGIN ");
       for (let index = 0; index + MATERIAL_WINDOW <= body.length; index++) {
         const window = body.slice(index, index + MATERIAL_WINDOW);
+        if (keyBlock) keyBlockWindows.add(window);
         if (materialWindows.has(window)) continue;
         materialWindows.add(window);
         for (let size = 1; size < MATERIAL_WINDOW; size++) materialPrefixes.add(window.slice(0, size));
@@ -114,10 +119,12 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
         const joined = state.token.replace(/[ \t\r\n]/g, "") + run;
         const contiguous = raw.length - raw.replace(/[A-Za-z0-9+/=]+$/, "").length;
         let known = -1;
+        let knownKeyBlock = false;
         // Fixed-width Set lookups: linear in output size, never a regex made
         // from private data or a search over every window for every character.
         for (let index = 0; index + MATERIAL_WINDOW <= joined.length; index++) {
-          if (materialWindows.has(joined.slice(index, index + MATERIAL_WINDOW))) { known = index; break; }
+          const window = joined.slice(index, index + MATERIAL_WINDOW);
+          if (materialWindows.has(window)) { known = index; knownKeyBlock = keyBlockWindows.has(window); break; }
         }
         if (known >= 0 || (state.context && contiguous >= PEM_RUN_MIN)) {
           // Redact from the first known window, or for structural context only
@@ -129,7 +136,9 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
           }
           output += raw.slice(0, start);
           output += REDACTED_EVENT_VALUE;
-          state.context = true;
+          // A plain secret (no marker, no END to close context) must not leave
+          // context open: later ordinary base64 or hashes would be masked.
+          if (knownKeyBlock) state.context = true;
           state.token = "";
           state.suppressed = true;
           continue;

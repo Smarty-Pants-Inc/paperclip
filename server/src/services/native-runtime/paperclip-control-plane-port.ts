@@ -1,7 +1,7 @@
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
-import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
 import { and, asc, eq, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -110,6 +110,13 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     options: {
       /** Runtime-only secret; never part of the persisted binding. */
       privateKeyPem?: string;
+      /**
+       * Runtime-only: the run's live redaction material (the heartbeat
+       * redactor's values, which hold the run's resolved secret env values).
+       * Indexed like the identity so folded or split output is matched before
+       * an event is committed. Never part of the persisted binding.
+       */
+      runSecretMaterial?: Iterable<string>;
       /** Synchronous revocation fence for a controller handing off on restart. */
       assertControllerActive?: () => void;
       /** Read-only admission may finish an existing startup solely for restart detachment. */
@@ -127,6 +134,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertControllerActive = options.assertControllerActive;
     this.#assertRunAdmissionActive = options.assertRunAdmissionActive ?? options.assertControllerActive;
     this.#identityRedactor = createAgentIdentityRedactor(options.privateKeyPem);
+    addRunSecretMaterial(this.#identityRedactor, options.runSecretMaterial ?? []);
     this.#binding = structuredClone(binding);
     this.#onCommittedEvent = options.onCommittedEvent;
     this.#onEventPersistence = options.onEventPersistence;

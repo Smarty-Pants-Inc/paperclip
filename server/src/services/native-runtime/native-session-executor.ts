@@ -10804,6 +10804,12 @@ async function executePaperclipNativeSessionUnnoticed(input: {
   dotWorkspaceRoot?: string;
   observability?: ProviderObservabilityLaunch;
   runnerEnvironment?: NodeJS.ProcessEnv;
+  /**
+   * Runtime-only: the heartbeat redactor's live material (the run's resolved
+   * secret env values among it). The control-plane port indexes it so native
+   * events never commit a run secret; never persisted.
+   */
+  runSecretMaterial?: readonly string[];
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
   managedAiCredentialIdentity?: string;
@@ -12185,6 +12191,7 @@ async function executePaperclipNativeSessionAttempt(
     },
     {
       privateKeyPem: input.runnerEnvironment?.PAPERCLIP_AGENT_PRIVATE_KEY,
+      runSecretMaterial: input.runSecretMaterial,
       assertControllerActive,
       assertRunAdmissionActive,
       taskSessionPublication: input.taskSessionPublication,
