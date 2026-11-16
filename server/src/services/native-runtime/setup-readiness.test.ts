@@ -71,13 +71,14 @@ describe("Codex selected native account verification", () => {
     for (const root of nativeProbeRuntimeDirectories) await rm(root, { recursive: true, force: true });
   });
   it("preserves a verified Pi hello as the result when only runner retirement remains pending", async () => {
-    const retired = Promise.withResolvers<void>();
-    void retired.promise.catch(() => {});
+    let resolveRetired!: () => void;
+    const retired = new Promise<void>(resolve => { resolveRetired = resolve; });
+    void retired.catch(() => {});
     nativeProbe.mockImplementationOnce(async input => {
       await mkdir(join(input.runtimeDirectory, "pi"), { mode: 0o700 });
       await writeFile(join(input.runtimeDirectory, "pi", "history.jsonl"), "raw history\\n", { mode: 0o600 });
       await writeFile(join(input.runtimeDirectory, "pi", "provider-trace.jsonl"), "raw provider trace\\n", { mode: 0o600 });
-      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retired.promise, undefined, [new Error("fixture retirement timed out")]);
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retired, undefined, [new Error("fixture retirement timed out")]);
       Object.assign(error, { probeResult: { provider: "pi_rpc", providerDriver: "pi_rpc", effectiveModel: "paperclip/claude-opus-5-5", helloProbePassed: true }, retirementOnly: true });
       throw error;
     });
@@ -87,7 +88,7 @@ describe("Codex selected native account verification", () => {
     const runtimeDirectory = nativeProbe.mock.calls[0]![0].runtimeDirectory;
     expect(await readFile(join(runtimeDirectory, "pi", "history.jsonl"), "utf8")).toBe("raw history\\n");
     expect(await readFile(join(runtimeDirectory, "pi", "provider-trace.jsonl"), "utf8")).toBe("raw provider trace\\n");
-    retired.resolve();
+    resolveRetired();
   });
 
   it.each([
