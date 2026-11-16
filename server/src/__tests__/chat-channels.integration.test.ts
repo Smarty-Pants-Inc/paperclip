@@ -62175,6 +62175,70 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .find(delivery => delivery.eventKind === "message_updated")).toMatchObject({ state: "processed" });
   });
 
+  it("stores a chat edit notice when the sender limit splits a surrogate pair", async () => {
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-LIFECYCLE-SURROGATE-SENDER",
+      id: "slack:C-LIFECYCLE-SURROGATE-SENDER:7031.1",
+      name: "lifecycle-surrogate-sender",
+    });
+    const original = makeMessage({
+      id: "7031.1", text: "@maya original request", mentioned: true,
+    });
+    await deliverMessage({
+      callbacks, endpointId: endpoint.id, thread: channel.thread,
+      message: original, trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id);
+    if (!callbacks.onMessageUpdated) throw new Error("Slack edit callback was not registered");
+
+    const handle = `${"a".repeat(319)}😀${"b".repeat(100)}`;
+    expect(handle).toHaveLength(421);
+    await callbacks.onMessageUpdated({
+      endpointId: endpoint.id,
+      provider: "slack",
+      thread: channel.thread,
+      previousMessage: original,
+      message: {
+        ...makeMessage({ id: original.id, text: "@maya keep this correction", userName: handle }),
+        metadata: {
+          dateSent: new Date("2026-09-06T10:00:00.000Z"),
+          edited: true,
+          editedAt: new Date("2026-09-06T10:01:00.000Z"),
+        },
+      } as Message,
+    });
+
+    const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
+    const comments = await readIssueCommentsByIssueId(conversation.issueId);
+    const edits = comments.filter(comment => comment.body.startsWith("An external message was edited:"));
+    expect(edits).toHaveLength(1);
+    expect(edits[0].body).toBe("An external message was edited:\n\n@maya keep this correction");
+    expect(edits[0].authorType).toBe("system");
+    expect(edits[0].sourceTrust).toMatchObject({
+      preset: "low_trust_review", disposition: "quarantined", sourceIssueId: conversation.issueId,
+    });
+    const metadata = issueCommentMetadataSchema.parse(edits[0].metadata);
+    const sender = metadata.externalSource?.sender;
+    expect(sender).toEqual(expect.any(String));
+    if (typeof sender !== "string") throw new Error("Stored sender metadata is missing");
+    expect(sender.length).toBeLessThanOrEqual(320);
+    expect(/[\uD800-\uDBFF]$/.test(sender)).toBe(false);
+    const toWellFormed = (sender as string & { toWellFormed?: () => string }).toWellFormed;
+    if (toWellFormed) expect(sender).toBe(toWellFormed.call(sender));
+    expect(metadata.sections).toEqual([{
+      title: "Outside sender",
+      rows: [
+        { type: "key_value", label: "Channel", value: "slack" },
+        { type: "key_value", label: "Sender", value: sender },
+      ],
+    }]);
+    expect((await readChatDeliveriesByEndpointId(endpoint.id))
+      .find(delivery => delivery.eventKind === "message_updated")).toMatchObject({ state: "processed" });
+  });
+
   it("redacts lifecycle edits and ignores reactions after channel reach is revoked", async () => {
     const fixture = await seedCompany();
     const { callbacks, endpoint, service } =

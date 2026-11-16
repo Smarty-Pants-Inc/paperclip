@@ -712,6 +712,42 @@ describe("AgentMail durable email pipeline", () => {
     }]);
     expect(f.wakeup).toHaveBeenCalledTimes(1);
   });
+  it("stores an inbound email when the sender limit splits a surrogate pair", async () => {
+    const f = await fixture();
+    const displayName = `${"a".repeat(319)}😀${"b".repeat(100)}`;
+    expect(displayName).toHaveLength(421);
+    const from = `${displayName} <sender@example.test>`;
+    await f.receive(f.message("surrogate-from", "surrogate-from-thread", {
+      from,
+      text: "Keep this email when a surrogate pair straddles the sender limit",
+    }));
+
+    const comments = await db.select().from(issueComments)
+      .where(eq(issueComments.companyId, f.companyId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("Keep this email when a surrogate pair straddles the sender limit");
+    expect(comments[0].authorType).toBe("system");
+    expect(comments[0].sourceTrust).toMatchObject({
+      preset: "low_trust_review", disposition: "quarantined", sourceIssueId: comments[0].issueId,
+    });
+    const metadata = issueCommentMetadataSchema.parse(comments[0].metadata);
+    const sender = metadata.externalSource?.sender;
+    expect(sender).toEqual(expect.any(String));
+    if (typeof sender !== "string") throw new Error("Stored sender metadata is missing");
+    expect(sender.length).toBeLessThanOrEqual(320);
+    expect(/[\uD800-\uDBFF]$/.test(sender)).toBe(false);
+    const toWellFormed = (sender as string & { toWellFormed?: () => string }).toWellFormed;
+    if (toWellFormed) expect(sender).toBe(toWellFormed.call(sender));
+    expect(metadata.externalSource).toEqual({ channel: "email", sender });
+    expect(metadata.sections).toEqual([{
+      title: "Outside sender",
+      rows: [
+        { type: "key_value", label: "Channel", value: "email" },
+        { type: "key_value", label: "Sender", value: sender },
+      ],
+    }]);
+    expect(f.wakeup).toHaveBeenCalledTimes(1);
+  });
   it("persists an email child and immutable intent before sending and deduplicates retries", async () => {
     const f = await fixture();
     const parent = await issueService(db).create(f.companyId, {
