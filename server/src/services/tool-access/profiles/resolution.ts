@@ -1,6 +1,7 @@
 import { and, asc, eq, inArray, or, sql, type AnyColumn } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, toolCatalogEntries, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
+import { agents, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
+import { readProjectConnectionScope } from "../../project-connection-admission.js";
 import type { ToolCatalogEntry, ToolConnection, ToolProfileEffectiveSummary, ToolProfileWithDetails } from "@paperclipai/shared";
 import { effectiveToolProfileBindings, profileIdsInBindingOrder } from "../../tool-profile-binding-precedence.js";
 import { buildProfileDetails, profileCatalogColumns, profileCatalogMatcher, toProfileBinding, toProfileEntry, type ProfileCatalogEntry, type ProfileEntryMatch, type ProfileCatalogMatch } from "./projection.js";
@@ -64,6 +65,28 @@ function resolveCatalogAccess(
 }
 
 export function createToolProfileResolver(db: Db, { assertOptionalAgent, resolveInstalledConnectionsForAgent, toCatalogEntry }: ProfileAssignmentDependencies) {
+  async function projectEligibleCatalog<T extends { connectionId: string }>(companyId: string, agentId: string, catalog: T[]): Promise<T[]> {
+    if (catalog.length === 0) return catalog;
+    const connections = await db.select().from(toolConnections).where(and(
+      eq(toolConnections.companyId, companyId), inArray(toolConnections.id, [...new Set(catalog.map(entry => entry.connectionId))]),
+    ));
+    const owned = connections.filter(connection => connection.projectId !== null);
+    if (owned.length === 0) return catalog;
+    const installs = await db.select({ connectionId: toolConnectionInstalls.connectionId }).from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, companyId), inArray(toolConnectionInstalls.connectionId, owned.map(connection => connection.id)),
+      eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, agentId),
+    ));
+    const explicitlyInstalled = new Set(installs.map(install => install.connectionId));
+    const unavailable = new Set(owned.filter(connection => {
+      const scope = readProjectConnectionScope(connection);
+      return !scope || scope.migrationPending === true || !connection.enabled || connection.status !== "active"
+        || !explicitlyInstalled.has(connection.id);
+    }).map(connection => connection.id));
+    // Read-only profile summaries are not run/project authority. C selects the
+    // authenticated task scope and policy checks B admission again at dispatch.
+    return catalog.filter(entry => !unavailable.has(entry.connectionId));
+  }
+
   async function readEffectiveProfileState(companyId: string, agentId: string) {
     await assertOptionalAgent(
       companyId,
@@ -141,7 +164,7 @@ export function createToolProfileResolver(db: Db, { assertOptionalAgent, resolve
           ),
         )
         .orderBy(asc(toolProfileEntries.createdAt)),
-      loadCatalog(),
+      Promise.resolve(loadCatalog()).then(catalog => projectEligibleCatalog(companyId, agentId, catalog)),
       db
         .select({ id: agents.id })
         .from(agents)
@@ -192,7 +215,7 @@ export function createToolProfileResolver(db: Db, { assertOptionalAgent, resolve
     if (activeProfiles.length === 0 || connectionIds.length === 0) {
       return { allowedConnectionIds: [], installedConnections: await resolveInstalledConnectionsForAgent(companyId, agentId) };
     }
-    const catalog = await db.select({
+    const catalog = await projectEligibleCatalog(companyId, agentId, await db.select({
       id: toolCatalogEntries.id,
       applicationId: toolCatalogEntries.applicationId,
       connectionId: toolCatalogEntries.connectionId,
@@ -200,7 +223,7 @@ export function createToolProfileResolver(db: Db, { assertOptionalAgent, resolve
       riskLevel: toolCatalogEntries.riskLevel,
     }).from(toolCatalogEntries).where(and(
       eq(toolCatalogEntries.companyId, companyId), eq(toolCatalogEntries.status, "active"), inArray(toolCatalogEntries.connectionId, connectionIds),
-    ));
+    )));
     const entries = catalog.length === 0 ? [] : await db.select({
       profileId: toolProfileEntries.profileId,
       effect: toolProfileEntries.effect,

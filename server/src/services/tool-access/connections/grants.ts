@@ -9,10 +9,13 @@ import type { ActorInfo, DbTransaction } from "../types.js";
 import { oauthConfig } from "../oauth/metadata.js";
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, connectionGrantMembers, connectionGrantDelegations, connectionGrants, authUsers, companyMemberships, toolAccessAuditEvents, toolConnections } from "@paperclipai/db";
+import { agents, connectionGrantMembers, connectionGrantDelegations, connectionGrants, authUsers, companyMemberships, toolAccessAuditEvents, toolConnectionInstalls, toolConnections } from "@paperclipai/db";
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../../../errors.js";
 import { isPaperclipCloudConnectorStrategy } from "../../paperclip-cloud-connector.js";
 import { vercelTokenRequest, type VercelConnectClient } from "../../vercel-connect.js";
+import { lockProjectConnectionRows } from "../../project-connection-arbitration.js";
+import { assertProjectConnectionAdmission, type ProjectConnectionOperation } from "../../project-connection-admission.js";
+import { assertProjectConnectionNotInUse } from "../../project-connection-retirement.js";
 
 import type { createConnectionCredentialValidation } from "./credential-validation.js";
 type GrantDependencies = {
@@ -27,6 +30,20 @@ export async function assertManagedGrantReactivationAccess(
   grant: typeof connectionGrants.$inferSelect,
   actor?: ActorInfo,
 ) {
+  if (connection.projectId !== null) {
+    await assertProjectConnectionAdmission(db, {
+      companyId: connection.companyId, projectId: connection.projectId,
+      operation: "reconnect", actor, connection,
+      proposedSecretRefs: grant.credentialSecretRefs,
+    });
+    const savedGrants = await db.select({ id: connectionGrants.id, kind: connectionGrants.kind })
+      .from(connectionGrants).where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id)));
+    // Revocation clears isDefault; approved same-reference reconnect may restore
+    // the sole organization identity, never add/repoint a second identity.
+    if (grant.kind !== "organization" || savedGrants.length !== 1 || savedGrants[0]?.id !== grant.id) {
+      throw unprocessable("Project Apps support one default organization identity", { code: "project_connection_provider_unsupported" });
+    }
+  }
   if (grant.kind === "user" || (grant.status === "active"
     && !grant.revokedAt && !grant.revokedByUserId && !grant.revokedByAgentId)) return;
   const principal: AuthorizationActor = actor?.managementContext?.actor ?? {
@@ -52,6 +69,24 @@ export async function assertManagedGrantReactivationAccess(
 }
 
 export function createConnectionGrants(db: Db, { getConnectionRow, assertSecretRefs, vercelConnect }: GrantDependencies) {
+  async function lockOwnedGrantMutation(tx: DbTransaction, connection: typeof toolConnections.$inferSelect,
+    actor: ActorInfo | undefined, operation: ProjectConnectionOperation,
+    proposedSecretRefs?: readonly Readonly<{ secretId: string; configPath: string }>[]) {
+    if (connection.projectId === null) return connection;
+    const [current] = await lockProjectConnectionRows(tx, [connection]);
+    const installs = await tx.select().from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, current!.companyId), eq(toolConnectionInstalls.connectionId, current!.id),
+    ));
+    if (installs.some(install => install.targetType !== "agent")) throw forbidden(
+      "Project connections require explicit project agent installs", { code: "project_connection_target_outside_project" });
+    await actor?.managementContext?.reauthorize();
+    await assertProjectConnectionAdmission(tx, {
+      companyId: current!.companyId, projectId: current!.projectId, operation, actor, connection: current!,
+      targetAgentIds: installs.map(install => install.targetId), proposedSecretRefs,
+    });
+    return current!;
+  }
+
   return {
     listConnectionGrants: async (idOrUid: string, companyId?: string) => {
       const connection = await getConnectionRow(idOrUid, companyId);
@@ -183,6 +218,13 @@ replaceConnectionGrantMembers: async (
       ];
       const binding = actorBinding(actor);
       const members = await db.transaction(async (tx) => {
+        const current = await lockOwnedGrantMutation(tx, connection, actor, "update");
+        if (current.projectId !== null) {
+          // Human audience edits are not a second project-use assignment path.
+          // Narrowing the saved audience can also remove running work's access.
+          await assertProjectConnectionNotInUse(tx, { companyId: current.companyId,
+            projectId: current.projectId, connectionId: current.id, actor });
+        }
         // Serialize replacements before taking the current audience snapshot.
         // Otherwise a second replacement could read the old rows, wait behind
         // an in-flight replacement, and then miss locking a newly-added member.
@@ -321,6 +363,11 @@ replaceConnectionGrantMembers: async (
         throw badRequest("AI credentials use the connection's human access settings, not agent delegation");
       }
       return db.transaction(async (tx) => {
+        await lockOwnedGrantMutation(tx, connection, managementContext ? { managementContext,
+          actorType: managementContext.audit.actorType, actorId: managementContext.audit.actorId,
+          responsibleUserId: managementContext.responsibleUserId } : undefined, "install");
+        if (connection.projectId !== null) throw unprocessable(
+          "Project Apps do not support personal identities or delegations", { code: "project_connection_provider_unsupported" });
         // Membership removal/suspension takes this same row lock before sweeping
         // personal grants. Whichever operation wins is therefore authoritative:
         // removal deletes a delegation committed first, while creation that runs
@@ -420,6 +467,10 @@ replaceConnectionGrantMembers: async (
       await actor?.managementContext?.reauthorize();
       const connection = await getConnectionRow(idOrUid);
       const delegation = await db.transaction(async tx => {
+        const current = await lockOwnedGrantMutation(tx, connection, actor, "update");
+        if (current.projectId !== null) await assertProjectConnectionNotInUse(tx, {
+          companyId: current.companyId, projectId: current.projectId, connectionId: current.id, actor,
+        });
         const [grant] = await tx.select({ id: connectionGrants.id }).from(connectionGrants)
           .where(and(eq(connectionGrants.id, grantId), eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id)))
           .for("update");
@@ -429,6 +480,7 @@ replaceConnectionGrantMembers: async (
         if (!target) return undefined;
         await tx.select({ id: agents.id }).from(agents)
           .where(and(eq(agents.companyId, connection.companyId), eq(agents.id, target.agentId))).for("no key update");
+        await actor?.managementContext?.reauthorize();
         const [removed] = await tx
           .delete(connectionGrantDelegations)
           .where(
@@ -470,47 +522,40 @@ replaceConnectionGrantMembers: async (
         connection.companyId,
         input.credentialSecretRefs ?? [],
       );
-      if (input.isDefault) {
-        await db
-          .update(connectionGrants)
-          .set({ isDefault: false, updatedAt: new Date() })
-          .where(
-            and(
-              eq(connectionGrants.connectionId, connection.id),
-              eq(connectionGrants.kind, "organization"),
-            ),
-          );
-      }
       const binding = actorBinding(actor);
-      const [grant] = await db
-        .insert(connectionGrants)
-        .values({
-          companyId: connection.companyId,
-          connectionId: connection.id,
-          kind: "organization",
+      const grant = await db.transaction(async tx => {
+        const current = await lockOwnedGrantMutation(tx, connection, actor, "install", input.credentialSecretRefs);
+        if (current.projectId !== null) {
+          const existing = await tx.select({ id: connectionGrants.id }).from(connectionGrants).where(and(
+            eq(connectionGrants.companyId, current.companyId), eq(connectionGrants.connectionId, current.id),
+          ));
+          // A default flip cannot smuggle in a second identity, alternate key or
+          // installation. Even revoked identities are retained, not repointed.
+          if (existing.length > 0 || input.isDefault !== true || input.providerTenant !== undefined) {
+            throw unprocessable("Project Apps support one fixed default organization identity", { code: "project_connection_provider_unsupported" });
+          }
+        }
+        if (input.isDefault) await tx.update(connectionGrants)
+          .set({ isDefault: false, updatedAt: new Date() }).where(and(
+            eq(connectionGrants.companyId, current.companyId), eq(connectionGrants.connectionId, current.id),
+            eq(connectionGrants.kind, "organization"),
+          ));
+        const [created] = await tx.insert(connectionGrants).values({
+          companyId: current.companyId, connectionId: current.id, kind: "organization",
           providerTenant: input.providerTenant,
-          credentialSecretRefs: input.credentialSecretRefs ?? [],
-          status: "active",
-          isDefault: input.isDefault ?? false,
-          createdByAgentId:
-            binding.actorType === "agent" ? binding.actorId : null,
+          credentialSecretRefs: input.credentialSecretRefs ?? (current.projectId !== null ? current.credentialSecretRefs : []),
+          status: "active", isDefault: input.isDefault ?? false,
+          createdByAgentId: binding.actorType === "agent" ? binding.actorId : null,
           createdByUserId: connectionActorUserId(actor),
-        })
-        .returning();
-      if (!grant) throw new Error("Failed to create connection installation");
-      await db.insert(toolAccessAuditEvents).values({
-        companyId: connection.companyId,
-        connectionId: connection.id,
-        actorType: binding.actorType ?? "system",
-        actorId: binding.actorId,
-        action: "connection_grant.created",
-        outcome: "success",
-        reasonCode: "grant_created",
-        details: {
-          grantId: grant.id,
-          kind: grant.kind,
-          isDefault: grant.isDefault,
-        },
+        }).returning();
+        if (!created) throw new Error("Failed to create connection installation");
+        await tx.insert(toolAccessAuditEvents).values({
+          companyId: current.companyId, connectionId: current.id,
+          actorType: binding.actorType ?? "system", actorId: binding.actorId,
+          action: "connection_grant.created", outcome: "success", reasonCode: "grant_created",
+          details: { grantId: created.id, kind: created.kind, isDefault: created.isDefault },
+        });
+        return created;
       });
       return toConnectionGrant(grant);
     },
@@ -536,6 +581,7 @@ replaceConnectionGrantMembers: async (
       if (!currentGrant) throw notFound("Connection grant not found");
       let providerRevocation = "not_applicable";
       if (
+        connection.projectId === null &&
         connection.credentialSource === "vercel_connect" &&
         connection.externalCredential
       ) {
@@ -559,7 +605,7 @@ replaceConnectionGrantMembers: async (
           }
         }
       } else if (
-        isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy)
+        connection.projectId === null && isPaperclipCloudConnectorStrategy(oauthConfig(connection).strategy)
       ) {
         // Google revocation is client-wide for a user. The managed Workspace
         // profiles intentionally share one Paperclip-owned client, so revoking
@@ -569,7 +615,11 @@ replaceConnectionGrantMembers: async (
         providerRevocation = "local_only_shared_client";
       }
       const grant = await db.transaction(async (tx) => {
-        await notifyGitHubCredentialChange(tx, connection);
+        const current = await lockOwnedGrantMutation(tx, connection, actor, "disable");
+        if (current.projectId !== null) await assertProjectConnectionNotInUse(tx, {
+          companyId: current.companyId, projectId: current.projectId, connectionId: current.id, actor,
+        });
+        await notifyGitHubCredentialChange(tx, current);
         const [lockedGrant] = await tx.select({ id: connectionGrants.id }).from(connectionGrants)
           .where(and(eq(connectionGrants.id, grantId), eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.connectionId, connection.id)))
           .for("update");
@@ -577,6 +627,7 @@ replaceConnectionGrantMembers: async (
         await tx.select({ id: agents.id }).from(agents)
           .where(and(eq(agents.companyId, connection.companyId), notInArray(agents.status, ["pending_approval", "terminated"])))
           .orderBy(agents.id).for("no key update");
+        await actor?.managementContext?.reauthorize();
         const removedDelegations = await tx
           .delete(connectionGrantDelegations)
           .where(
