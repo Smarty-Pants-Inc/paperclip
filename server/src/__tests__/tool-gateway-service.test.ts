@@ -53,6 +53,7 @@ import { bindVerifiedToolApprovalArguments, claimToolTestApproval, releaseToolAp
 import { materializeNativeInteractionResponses } from "../services/native-runtime/native-interaction-bridge.js";
 import { toolActionDeliveryService } from "../services/tool-action-delivery.js";
 import { secretService } from "../services/secrets.js";
+import { flushSecretResolutionWrites } from "../services/secret-resolution-writes.js";
 import { toolAccessService } from "../services/tool-access.js";
 import {
   createToolGatewayService,
@@ -236,6 +237,9 @@ describeEmbeddedPostgres("tool gateway service", () => {
   });
 
   async function clearFixtures() {
+    // Runtime secret audits are deferred; drain before removing their parents,
+    // matching the ruled int2 gateway teardown without discarding any audit.
+    await flushSecretResolutionWrites(db);
     vi.unstubAllEnvs();
     await db.delete(activityLog);
     await db.delete(agentWakeupRequests);
@@ -261,6 +265,7 @@ describeEmbeddedPostgres("tool gateway service", () => {
   }
 
   afterAll(async () => {
+    if (db) await flushSecretResolutionWrites(db);
     await db?.$client.end({ timeout: 1 });
     await tempDb?.cleanup();
   });
