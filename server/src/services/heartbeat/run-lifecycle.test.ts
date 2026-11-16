@@ -234,6 +234,16 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
       expect(await events()).toBe(eventsBefore);
     });
 
+  // Guard for the #20825 refusal: a native run failed as retryable is retried
+  // under the same run, and that retry's runner identity must still be recorded.
+  it("still records a same-run retry's process identity on a retryable native failure", async () => {
+    const { run } = await fixture({ status: "failed", nativePhase: "retryable_failure", finishedAt: new Date() });
+    const persisted = await persistHeartbeatRunProcessMetadata(db, run.id, {
+      pid: 4300, processGroupId: null, startedAt: "2026-11-16T04:20:00.000Z", targetKind: "remote" });
+    expect(persisted?.processPid).toBe(4300);
+    expect(persisted?.processStartedAt?.toISOString()).toBe("2026-11-16T04:20:00.000Z");
+  });
+
   it("keeps one terminal outcome and reports only the winner of competing writes", async () => {
     const { run } = await fixture();
     const deps = callbacks(db);
