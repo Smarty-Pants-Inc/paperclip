@@ -704,6 +704,13 @@ export interface RunnerProcessResult {
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
+  /**
+   * The runner's durable lifecycle read after a confirmed exit, as bounded
+   * codes (never message text). Remote launchers report every exit with a
+   * null code, so this is how an owner tells a graceful exit from one that
+   * needs a fresh bootstrap.
+   */
+  runnerLifecycle?: { lifecycle: string; recoverableFailure: string | null };
 }
 
 export interface RunnerProcessHandle {
