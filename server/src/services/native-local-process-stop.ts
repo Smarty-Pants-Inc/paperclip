@@ -9,7 +9,8 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notificatio
 import { nativeSessionProviderEvidence } from "./native-runtime/native-session-resume.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import os from "node:os";
-import { currentProcessSpaceHash } from "./controller-process-identity.js";
+import { currentProcessSpaceHash, UNKNOWN_PROCESS_SPACE } from "./controller-process-identity.js";
+import { NATIVE_SESSION_PROVIDER_EVENT_TYPES } from "./native-runtime/native-session-resume.js";
 import { proveOwnerGone } from "./owner-proof.js";
 
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-process-start-events.js";
@@ -493,6 +494,8 @@ export async function discoverSettledNativeRunProcesses(db: Db, input: {
   } while (after);
   return { released };
 }
+
+const providerEventTypes = () => sql.join(NATIVE_SESSION_PROVIDER_EVENT_TYPES.map(type => sql`${type}`), sql`, `);
 
 export const SHUTDOWN_SETTLED_PROCESS_RELEASE_LIMIT = 500;
 const SHUTDOWN_SETTLED_PROCESS_STATEMENT_TIMEOUT_MS = 2_000;
