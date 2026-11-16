@@ -15,7 +15,7 @@ import type { AgentLifecycleRequester } from "@paperclipai/shared";
 import { and, eq } from "drizzle-orm";
 import { logActivity, persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
-import { withAccountingTransaction } from "./accounting-transaction.js";
+import { AccountingContentionError, isAccountingRetryable, withAccountingTransaction } from "./accounting-transaction.js";
 import { AGENT_HANDOVER_PENDING_CODE, pendingAgentHandover } from "./agent-handover-items.js";
 import { budgetServiceInTransaction, policyBlocks, type BudgetServiceHooks } from "./budgets.js";
 import { recordAgentStatusEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
@@ -81,7 +81,17 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     // One attempt. The terminal step touches no task row, so it never meets
     // checkout's task-then-agent order; a rollback is retried only by the
     // lifecycle worker's next explicit attempt, which re-reads and re-authorizes.
-    transaction: withAccountingTransaction,
+    transaction: async (database, companyId, work) => {
+      try { return await withAccountingTransaction(database, companyId, work); }
+      catch (error) {
+        if (!isAccountingRetryable(error)) throw error;
+        // Reuse upstream's SQL-free 503, including its SQLSTATE code, without
+        // replaying the lifecycle transaction. HTTP callers may explicitly retry.
+        const contention = new AccountingContentionError(error, 1);
+        contention.details = { code: contention.code, retryable: true };
+        throw contention;
+      }
+    },
     // The terminal step's named effect: in the same transaction as the
     // terminated state and its hand-over marker, write the one terminal audit
     // row for every entry point (POST /terminate and PATCH status alike) and
