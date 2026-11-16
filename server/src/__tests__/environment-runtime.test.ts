@@ -72,6 +72,7 @@ import { traceparentFromContextToken } from "../instrumentation.ts";
 import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
 import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
 import { createNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
+import { retiredSourceAuthorizesNativeBackupRestore } from "../services/native-runtime/native-retired-backup-source.ts";
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
@@ -5140,6 +5141,142 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     }
     await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
       .resolves.toMatchObject({ stdout: `served:${config[key]}` });
+  });
+
+  // b8626bba (gate 5, 11-16): a warm owner admitted on lease L1; a later turn
+  // resumed the SAME box as a new row L2 (verified handoff chain); the close
+  // stamped L1. The recall's obsolete cleanup must read the newest stamp on the
+  // lease CHAIN for that box (native-retired-backup-source's rule), and the
+  // writer must stamp the chain tip. Keep: place-losing custody bug.
+  it.each(["kept", "writer stamps tip", "other box stamp", "other company stamp", "later provider work", "no stamp"] as const)(
+    "stamp chain: obsolete cleanup reads the newest stamp across a resumed lease chain: %s", async scenario => {
+    const pluginId = randomUUID();
+    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
+    const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
+    const issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Warm Pi conversation", status: "in_progress", assigneeAgentId: agentId });
+    await insertSandboxProviderPlugin(pluginId, { environmentDrivers: [{
+      driverKey: "fake-plugin", kind: "sandbox_provider", displayName: "Stamp chain fixture", supportsReusableLeases: true,
+      configSchema: { type: "object" },
+    }] });
+    let acquisitions = 0;
+    const calls: string[] = [];
+    const workerManager = {
+      isRunning: () => true,
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        calls.push(method);
+        if (method === "environmentAcquireLease") {
+          return { providerLeaseId: `stamp-chain-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" } };
+        }
+        if (method === "environmentResumeLease") return {
+          providerLeaseId: params.providerLeaseId, metadata: { ...params.config, remoteCwd: "/workspace" },
+        };
+        // A real provider confirms the destroy; that receipt is the 'destroyed' class.
+        if (method === "environmentDestroyLease") return { providerLeaseId: params.providerLeaseId, state: "destroyed" };
+        if (method === "environmentReleaseLease") return undefined;
+        throw new Error(`Unexpected stamp-chain method: ${method}`);
+      }),
+    } as unknown as PluginWorkerManager;
+    const runtimeWithPlugin = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
+    const acquire = (selectedEnvironment: Environment, selectedRunId: string) => runtimeWithPlugin.acquireRunLease({
+      companyId, environment: selectedEnvironment, issueId, agentId, adapterType: "paperclip_runner",
+      heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
+    });
+    const normalizedSessionId = randomUUID(), runnerInstanceId = "stamp-chain-runner", sessionScopeId = `stamp-chain-scope-${randomUUID()}`;
+    const settle = (settledRunId: string) => db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date(), runtimeMode: "native", nativeSessionId: normalizedSessionId })
+      .where(eq(heartbeatRuns.id, settledRunId));
+
+    // L1: the warm owner's ADMISSION.
+    const admitted = await acquire(environment, runId);
+    const providerLeaseId = admitted.lease.providerLeaseId!;
+    await runtimeWithPlugin.releaseRunLeases(runId);
+    await settle(runId);
+    // L2: a later turn resumes the SAME box as a NEW lease row.
+    const refreshRunId = randomUUID();
+    await insertRunningManualRun(refreshRunId, companyId, agentId);
+    const resumed = await acquire(environment, refreshRunId);
+    expect(resumed.lease.providerLeaseId).toBe(providerLeaseId);
+    expect(resumed.lease.id).not.toBe(admitted.lease.id);
+    expect(resumed.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "resumed" });
+    expect(resumed.lease.metadata?.nativeHarnessBackup).toBeUndefined();
+
+    const backupBase = await mkdtemp(path.join(os.tmpdir(), "stamp-chain-backup-"));
+    const previousStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+    process.env.PAPERCLIP_RUNNER_STATE_DIR = backupBase;
+    try {
+      const current = path.join(backupBase, createHash("sha256").update(sessionScopeId).digest("hex"), "failover-backups", "current");
+      await mkdir(path.join(current, "runner"), { recursive: true });
+      await mkdir(path.join(current, "pi"), { recursive: true });
+      await mkdir(path.join(current, "pi-agent"), { recursive: true });
+      await writeFile(path.join(current, "runner", "runner-state.json"), "warm owner checkpoint");
+      await writeFile(path.join(current, "pi", `${normalizedSessionId}.jsonl`), '{"role":"user","content":"refresh"}\n');
+      const manifest = buildNativeHarnessBackupManifest({ backupRoot: current, runnerInstanceId,
+        sourceProviderLeaseId: providerLeaseId, providerSessionIdentity: { providerSessionId: "pi-thread" },
+        execution: { provider: { kind: "pi_rpc" }, binding: { companyId, runId, issueId, agentId, executionWorkspaceId: null },
+          workspace: { cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null },
+          session: { normalizedSessionId, driverKind: "pi_rpc", protocolVersion: 1, lifecyclePolicy: { mode: "warm", idleTimeoutMs: 300000 } },
+        } as never });
+      const manifestPath = path.join(current, "manifest.json");
+      await writeFile(manifestPath, JSON.stringify(manifest));
+      const stampFor = (authorizedProviderLeaseId: string) => createNativeHarnessBackupStamp({ manifestPath, sessionScopeId,
+        normalizedSessionId, runnerInstanceId, authorizedProviderLeaseId, completedAt: manifest.completedAt });
+      const stamp = stampFor(providerLeaseId);
+
+      // The stop's close. The warm owner's backend still names L1.
+      if (scenario === "writer stamps tip") {
+        const { recordNativeHarnessBackupStampOnLeaseChain } = await import("../services/native-runtime/native-retired-backup-source.ts") as any;
+        expect(typeof recordNativeHarnessBackupStampOnLeaseChain).toBe("function");
+        await recordNativeHarnessBackupStampOnLeaseChain(db, { leaseId: admitted.lease.id, companyId, providerLeaseId, stamp });
+        // The current lease at the stop carries the stamp for the recall.
+        expect((await environmentService(db).getLeaseById(resumed.lease.id))?.metadata?.nativeHarnessBackup).toEqual(stamp);
+      } else if (scenario === "other box stamp") {
+        await environmentService(db).updateLeaseMetadata(admitted.lease.id, { ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata,
+          nativeHarnessBackup: stampFor("another-box") });
+      } else if (scenario === "other company stamp") {
+        // Same box id and a valid stamp, but another company's row: never custody.
+        const otherCompanyId = randomUUID();
+        await db.insert(companies).values({ id: otherCompanyId, name: "Other", issuePrefix: `S${otherCompanyId.slice(0, 5)}` });
+        await db.insert(environmentLeases).values({ companyId: otherCompanyId, environmentId: environment.id, provider: "fake-plugin",
+          providerLeaseId, leasePolicy: "reuse_by_environment", status: "expired", cleanupStatus: "success",
+          metadata: { agentId, nativeHarnessBackup: stamp } });
+      } else if (scenario !== "no stamp") {
+        // As observed live: the close's stamp lands on the ADMISSION row L1.
+        await environmentService(db).updateLeaseMetadata(admitted.lease.id, { ...(await environmentService(db).getLeaseById(admitted.lease.id))!.metadata,
+          nativeHarnessBackup: stamp });
+      }
+      await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: refreshRunId, seq: 1, eventType: "provider.event",
+        createdAt: new Date(Date.parse(stamp.completedAt) + (scenario === "later provider work" ? 1000 : -1000)) });
+      await runtimeWithPlugin.releaseRunLeases(refreshRunId);
+      await settle(refreshRunId);
+
+      // The recall: a fingerprint-changing acquisition runs obsolete cleanup on L2.
+      const changed = { ...environment, config: { ...providerConfig, region: "us" } };
+      await environmentService(db).update(environment.id, { config: changed.config });
+      const recallRunId = randomUUID();
+      await insertRunningManualRun(recallRunId, companyId, agentId);
+      const recall = await acquire(changed, recallRunId);
+      expect(recall.lease.providerLeaseId).not.toBe(providerLeaseId);
+      const l2 = await environmentService(db).getLeaseById(resumed.lease.id);
+      if (scenario === "kept" || scenario === "writer stamps tip") {
+        expect(calls).toContain("environmentDestroyLease");
+        expect(l2).toMatchObject({ status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch" });
+        // KEPT: the backup restores onto the new box through the existing 'destroyed' class.
+        await expect(retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId: recallRunId, normalizedSessionId,
+          manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId },
+          manifestSha256: stamp.manifestSha256, targetProviderLeaseId: recall.lease.providerLeaseId })).resolves.toBe(true);
+      } else {
+        // Stop-and-keep as today: nothing destroyed, no restore authority.
+        expect(calls).not.toContain("environmentDestroyLease");
+        expect(l2?.failureReason).not.toBe("lease_fingerprint_mismatch");
+        expect(l2?.status).not.toBe("expired");
+      }
+    } finally {
+      if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      else process.env.PAPERCLIP_RUNNER_STATE_DIR = previousStateDirectory;
+      await rm(backupBase, { recursive: true, force: true });
+    }
   });
 
   // Keep: J3-24 timing-only environment edits must preserve retained chat state
