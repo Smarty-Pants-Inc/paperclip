@@ -3,6 +3,7 @@ import { isSandboxLeaseStartDeniedError } from "../services/retained-sandbox-abs
 import { logger } from "../middleware/logger.js";
 import { allowlistedErrnoCode, allowlistedIngressReason, allowlistedSyscall, finiteSafeInteger } from "./ingress-error-summary.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "../services/native-runtime/native-runner-recovery-contract.js";
+import { controlPlaneLeaseExpiresAtUnixMs } from "./runner-control-plane-lease.js";
 import type { RunnerIngressEndpoint } from "@paperclipai/adapter-utils/runner-connectivity";
 import type {
   DurablePrpControlPlane,
@@ -32,11 +33,21 @@ const MIN_ROUTE_REACQUIRE_DELAY_MS = 1_000;
 // the run "running" forever. runnerd answers every ping with a pong.
 const DEFAULT_LIVENESS_INTERVAL_MS = 20_000;
 const DEFAULT_LIVENESS_TIMEOUT_MS = 90_000;
+// #20825: an idle warm owner keeps redialing after the recovery budget until
+// its connection lease nears expiry. runnerd's listen_ws listener has one
+// admission slot; a dead socket holds it until runnerd next writes (its lease
+// renewal, up to 30 min later). Retire this long before runnerd's own lease
+// expiry exit, so no relaunch loop starts behind a retired owner.
+const DEFAULT_IDLE_WARM_RETIRE_MARGIN_MS = 2 * 60_000;
+const DEFAULT_IDLE_WARM_MAX_BACKOFF_MS = 60_000;
 
 export type RunnerIngressFailureCode =
   | "runner_ingress_unavailable"
   | "runner_ingress_auth_failed"
-  | "runner_connection_lease_expired";
+  | "runner_connection_lease_expired"
+  /** An idle warm owner could not reach its runner before its lease neared expiry. */
+  | "native_runner_ingress_unreachable";
+
 
 export class RunnerIngressConnectionError extends Error {
   constructor(
@@ -306,12 +317,40 @@ async function openEndpoint(input: {
   });
 }
 
+const BOUNDED_ERROR_NAMES = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "AbortError"]);
+
+/**
+ * One bounded failure code for every dial failure, never "other": an errno,
+ * the upgrade's HTTP status, the handshake timeout, our own closed set, or the
+ * error's constructor name. Only fixed strings and integers reach the log.
+ */
+export function ingressFailureCode(error: unknown): string {
+  const value = typeof error === "object" && error !== null
+    ? error as Record<string, unknown>
+    : {};
+  const errno = allowlistedErrnoCode(value.code);
+  if (errno !== "other") return errno;
+  const statusCode = finiteSafeInteger(value.statusCode);
+  if (statusCode !== null && statusCode >= 100 && statusCode <= 599) return `upgrade_${statusCode}`;
+  if (error instanceof RunnerIngressConnectionError) return error.code;
+  const message = error instanceof Error ? error.message : "";
+  // ws reports its own handshake timeout without an errno code.
+  if (message === "Opening handshake has timed out") return "handshake_timeout";
+  if (message === "runner ingress operation deadline elapsed") return "route_refresh_deadline_elapsed";
+  if (message === "runner ingress operation was cancelled") return "cancelled";
+  const reason = allowlistedIngressReason(message);
+  if (reason) return reason;
+  const name = error instanceof Error ? error.name : "";
+  return BOUNDED_ERROR_NAMES.has(name) ? `error_${name}` : "error_unclassified";
+}
+
 function ingressErrorSummary(error: unknown): {
   code: string;
   errno: number | null;
   syscall: string;
   statusCode: number | null;
   reason: string | null;
+  failure: string;
 } {
   const value = typeof error === "object" && error !== null
     ? error as Record<string, unknown>
@@ -325,6 +364,7 @@ function ingressErrorSummary(error: unknown): {
     // Raw transport prose can carry credentials (an Authorization header, a
     // URL inside a sentence). Log only a machine reason code, never prose.
     reason: allowlistedIngressReason(message),
+    failure: ingressFailureCode(error),
   };
 }
 
@@ -361,6 +401,24 @@ export interface RunnerPrpOutboundHandle {
   /** Stop liveness and reconnect work, preserving an established receive/ACK path. */
   quiesce(): void;
   close(): Promise<void>;
+  /**
+   * A turn needs the runner now: end any pending backoff and dial at once.
+   * Returns false when this handle no longer dials (terminal, quiesced or closed).
+   * Optional so existing handle doubles stay valid; this module always sets it.
+   */
+  redialNow?(): boolean;
+}
+
+/** An idle warm owner's long redial policy (#20825). */
+export interface RunnerIngressIdleWarmPolicy {
+  /** True while no turn or command is in flight on this owner. */
+  isIdle: () => boolean;
+  /** The control plane's lease expiry; defaults to controlPlaneLeaseExpiresAtUnixMs. */
+  leaseExpiresAtUnixMs?: () => number | null;
+  /** Retire this long before the lease expires. */
+  marginMs?: number;
+  /** Upper bound on the backoff between dials after the recovery budget. */
+  maxBackoffMs?: number;
 }
 
 /**
@@ -377,6 +435,12 @@ export function connectRunnerPrpIngress(input: {
   /** Silence after which an authenticated connection is treated as lost. */
   livenessTimeoutMs?: number;
   random?: () => number;
+  /**
+   * An idle warm owner does not give up at the end of the recovery budget: it
+   * redials at a capped backoff until its lease expiry minus a margin, then
+   * fails with `native_runner_ingress_unreachable` so its owner retires it.
+   */
+  idleWarm?: RunnerIngressIdleWarmPolicy;
   onStateChange?: (
     state: "connecting" | "authenticated" | "reconnecting" | "failed" | "closed",
     failureCode?: RunnerIngressFailureCode,
@@ -390,10 +454,17 @@ export function connectRunnerPrpIngress(input: {
   const startupDeadline = startupBudgetStartedAt + startupBudgetMs;
   const recoveryGraceMs = input.recoveryGraceMs ?? DEFAULT_RECOVERY_GRACE_MS;
   const random = input.random ?? Math.random;
+  const idleWarm = input.idleWarm;
+  const idleMarginMs = idleWarm?.marginMs ?? DEFAULT_IDLE_WARM_RETIRE_MARGIN_MS;
+  const idleMaxBackoffMs = Math.max(1, idleWarm?.maxBackoffMs ?? DEFAULT_IDLE_WARM_MAX_BACKOFF_MS);
+  const readLeaseExpiry = idleWarm?.leaseExpiresAtUnixMs ?? (() => controlPlaneLeaseExpiresAtUnixMs(input.authority));
   let readyResolve!: () => void;
   let readyReject!: (error: unknown) => void;
   let readySettled = false;
   let stopLiveness = () => {};
+  let loopEnded = false;
+  // A pending backoff sleep; redialNow() ends it early.
+  let wakeBackoff: (() => void) | null = null;
   const ready = new Promise<void>((resolve, reject) => {
     readyResolve = resolve;
     readyReject = reject;
@@ -409,6 +480,21 @@ export function connectRunnerPrpIngress(input: {
   void failure.catch(() => undefined);
   void ready.catch(() => undefined);
 
+  const backoff = async (ms: number): Promise<void> => {
+    if (abort.signal.aborted) return;
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        abort.signal.removeEventListener("abort", finish);
+        if (wakeBackoff === finish) wakeBackoff = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      abort.signal.addEventListener("abort", finish, { once: true });
+      wakeBackoff = finish;
+    });
+  };
+
   const loop = (async () => {
     let attempt = 0;
     let failedAttemptNumber = 0;
@@ -420,6 +506,32 @@ export function connectRunnerPrpIngress(input: {
     // authenticated frame. Keep the authority's reason so the run log and the
     // terminal error name it instead of a generic transport loss.
     let leaseFailureCode: RunnerIngressFailureCode | null = null;
+    // Budget windows. The startup window logs every failed attempt (it is at
+    // most a minute). A recovery window, and each idle extension window after
+    // it, logs its first failure only: one bounded line per window.
+    // openWindow() reassigns this from a closure; keep the declared union
+    // so control-flow narrowing does not pin it to the initial value.
+    let window = "startup" as "startup" | "recovery" | "idle_extension";
+    let windowStartedAt = startupBudgetStartedAt;
+    let windowAttempts = 0;
+    let windowLogged = false;
+    let extensionAttempt = 0;
+    let authenticatedOnce = false;
+    const idleOwner = () => idleWarm !== undefined && authenticatedOnce && idleWarm.isIdle();
+    const idleRetireAt = (): number | null => {
+      const expiresAt = readLeaseExpiry();
+      return expiresAt === null ? null : expiresAt - idleMarginMs;
+    };
+    const openWindow = (kind: "recovery" | "idle_extension", deadline: number) => {
+      window = kind;
+      windowStartedAt = Date.now();
+      windowAttempts = 0;
+      windowLogged = false;
+      recoveryDeadline = deadline;
+      nextAttemptDeadline = deadline;
+      connectAttempts = 0;
+      minimumAttempts = kind === "recovery" ? minimumConnectAttempts(deadline - Date.now()) : 1;
+    };
     while (!abort.signal.aborted) {
       let dialStarted = false;
       try {
@@ -440,6 +552,7 @@ export function connectRunnerPrpIngress(input: {
           onWire: (wire) => {
             dialStarted = true;
             connectAttempts += 1;
+            windowAttempts += 1;
             ownedWires.add(wire);
             wire.socket.once("close", () => ownedWires.delete(wire));
           },
@@ -466,7 +579,17 @@ export function connectRunnerPrpIngress(input: {
         }
         input.onStateChange?.("authenticated");
         if (abort.signal.aborted) return;
+        if (window !== "startup" && windowLogged) {
+          logger.info({
+            event: "runner_ingress_reconnected",
+            window,
+            attemptsInWindow: windowAttempts,
+            windowElapsedMs: Math.max(0, Date.now() - windowStartedAt),
+          }, "runner ingress reconnected");
+        }
+        authenticatedOnce = true;
         attempt = 0;
+        extensionAttempt = 0;
         leaseFailureCode = null;
         stopLiveness = opened.wire.monitorLiveness({
           intervalMs: input.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS,
@@ -479,10 +602,8 @@ export function connectRunnerPrpIngress(input: {
           stopLiveness();
         }
         if (abort.signal.aborted) return;
-        recoveryDeadline = Date.now() + recoveryGraceMs;
-        nextAttemptDeadline = recoveryDeadline;
-        connectAttempts = 0;
-        minimumAttempts = minimumConnectAttempts(recoveryGraceMs);
+        // Every authenticated connection that closes starts a fresh budget.
+        openWindow("recovery", Date.now() + recoveryGraceMs);
         const leaseFailure = input.authority.connectionLeaseFailure ?? null;
         if (leaseFailure) {
           leaseFailureCode = "runner_connection_lease_expired";
@@ -498,13 +619,19 @@ export function connectRunnerPrpIngress(input: {
         // Intentional close() is not a failed attempt; log only real failures.
         failedAttemptNumber += 1;
         const summary = ingressErrorSummary(error);
-        logger.warn({
-          event: "runner_ingress_connect_attempt_failed",
-          attempt: failedAttemptNumber,
-          elapsedMs: Math.max(0, Date.now() - startupBudgetStartedAt),
-          remainingBudgetMs: Math.max(0, recoveryDeadline - Date.now()),
-          ...summary,
-        }, "runner ingress connect attempt failed");
+        if (window === "startup" || !windowLogged) {
+          windowLogged = true;
+          logger.warn({
+            event: "runner_ingress_connect_attempt_failed",
+            attempt: failedAttemptNumber,
+            window,
+            elapsedMs: Math.max(0, Date.now() - startupBudgetStartedAt),
+            remainingBudgetMs: Math.max(0, recoveryDeadline - Date.now()),
+            ...summary,
+          }, window === "startup"
+            ? "runner ingress connect attempt failed"
+            : "runner ingress connect attempt failed; further failures in this budget window are not logged");
+        }
         let failure: unknown = error;
         const statusCode =
           typeof error === "object" && error !== null && "statusCode" in error
@@ -514,7 +641,14 @@ export function connectRunnerPrpIngress(input: {
         const transportFailure = leaseFailureCode === null
           && (statusCode === null || statusCode >= 500)
           && !(failure instanceof RunnerIngressConnectionError && failure.code !== "runner_ingress_unavailable");
+        // An idle warm runner that answers the dial but is refused by the
+        // control plane (for example its welcome's checkpoint flush fails the
+        // owner fence) will not authenticate on a later dial either. Retire at
+        // this first failed handshake instead of spending the lease silently.
+        const refusedIdleReconnect = leaseFailureCode === null && idleOwner()
+          && failure instanceof RunnerIngressConnectionError && failure.code === "runner_ingress_auth_failed";
         if (
+          !refusedIdleReconnect &&
           leaseFailureCode === null &&
           (statusCode === 401 || statusCode === 403) &&
           Date.now() < recoveryDeadline
@@ -545,11 +679,25 @@ export function connectRunnerPrpIngress(input: {
         const floorRetry = transportFailure && dialStarted
           && connectAttempts < minimumAttempts && Date.now() >= recoveryDeadline;
         let retryDeadline = floorRetry ? Date.now() + HANDSHAKE_TIMEOUT_MS : recoveryDeadline;
-        if (leaseFailureCode === null && Date.now() < retryDeadline) {
-          const base = RECONNECT_DELAYS_MS[
-            Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)
-          ]!;
+        // The recovery budget is spent. An idle warm owner whose lease still
+        // has time opens another window (up to lease expiry minus the margin)
+        // instead of going terminal with nobody left to dial (#20825).
+        if (
+          !refusedIdleReconnect && !floorRetry && transportFailure && leaseFailureCode === null
+          && Date.now() >= retryDeadline && idleOwner()
+        ) {
+          const retireAt = idleRetireAt();
+          if (retireAt !== null && Date.now() < retireAt) {
+            openWindow("idle_extension", Math.min(Date.now() + recoveryGraceMs, retireAt));
+            retryDeadline = recoveryDeadline;
+          }
+        }
+        if (!refusedIdleReconnect && leaseFailureCode === null && Date.now() < retryDeadline) {
+          const base = window === "idle_extension"
+            ? Math.min(idleMaxBackoffMs, RECONNECT_DELAYS_MS.at(-1)! * 2 ** Math.min(extensionAttempt, 16))
+            : RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)]!;
           attempt += 1;
+          if (window === "idle_extension") extensionAttempt += 1;
           // No catch-up sleeps after a stalled dial; the floor permits at most
           // two extra dials. Inside a short cold budget retain the old 250/500ms
           // cadence instead of spending the entire budget on the added spacing.
@@ -559,10 +707,11 @@ export function connectRunnerPrpIngress(input: {
             const retryDelay = transportFailure && routeDelay < retryDeadline - Date.now()
               ? routeDelay
               : Math.max(1, Math.round(base * jitter));
-            await delay(
-              Math.min(retryDelay, Math.max(1, retryDeadline - Date.now())),
-              abort.signal,
-            );
+            await backoff(Math.min(
+              window === "idle_extension" ? idleMaxBackoffMs : Number.POSITIVE_INFINITY,
+              retryDelay,
+              Math.max(1, retryDeadline - Date.now()),
+            ));
           }
           if (abort.signal.aborted) return;
           // Expiry can become known while the backoff timer is pending.
@@ -597,12 +746,31 @@ export function connectRunnerPrpIngress(input: {
               continue;
             }
           }
+          // The window ended during this backoff. An idle owner opens another
+          // window if one fits before the lease's retirement point.
+          if (
+            window !== "startup" && leaseFailureCode === null && transportFailure && idleOwner()
+          ) {
+            const retireAt = idleRetireAt();
+            if (retireAt !== null && Date.now() < retireAt) {
+              openWindow("idle_extension", Math.min(Date.now() + recoveryGraceMs, retireAt));
+              nextAttemptDeadline = recoveryDeadline;
+              continue;
+            }
+          }
         }
+        const retiringIdleOwner = leaseFailureCode === null && idleOwner();
         const terminal =
           leaseFailureCode !== null
             ? new RunnerIngressConnectionError(
                 leaseFailureCode,
                 "The runner's connection lease expired before it was renewed.",
+                { cause: failure },
+              )
+            : retiringIdleOwner
+            ? new RunnerIngressConnectionError(
+                "native_runner_ingress_unreachable",
+                "The idle warm runner could not be reached before its connection lease neared expiry.",
                 { cause: failure },
               )
             : failure instanceof RunnerIngressConnectionError
@@ -617,6 +785,16 @@ export function connectRunnerPrpIngress(input: {
         if (failure instanceof Error) {
           Object.assign(terminal, { causeSummary: ingressErrorSummary(failure) });
         }
+        // The give-up is a decision; make it visible once, with bounded fields.
+        logger.warn({
+          event: retiringIdleOwner ? "runner_ingress_retired" : "runner_ingress_recovery_exhausted",
+          code: terminal.code,
+          failure: ingressFailureCode(failure),
+          window,
+          attempts: failedAttemptNumber,
+          elapsedMs: Math.max(0, Date.now() - startupBudgetStartedAt),
+          leaseExpiresAtUnixMs: idleWarm ? readLeaseExpiry() : null,
+        }, retiringIdleOwner ? "runner ingress unreachable; retiring the idle warm owner" : "runner ingress recovery exhausted");
         if (!readySettled) {
           readySettled = true;
           readyReject(terminal);
@@ -626,7 +804,7 @@ export function connectRunnerPrpIngress(input: {
         return;
       }
     }
-  })();
+  })().finally(() => { loopEnded = true; });
 
   return {
     ready,
@@ -635,6 +813,11 @@ export function connectRunnerPrpIngress(input: {
       stopLiveness();
       // Established wires removed their handshake abort listener. Keep their ACK path.
       abort.abort();
+    },
+    redialNow() {
+      if (loopEnded || abort.signal.aborted) return false;
+      wakeBackoff?.();
+      return true;
     },
     async close() {
       abort.abort();
@@ -656,3 +839,5 @@ export function connectRunnerPrpIngress(input: {
 }
 
 export const __runnerPrpOutboundTesting = { awaitWithinDeadline };
+
+export { controlPlaneLeaseExpiresAtUnixMs };
