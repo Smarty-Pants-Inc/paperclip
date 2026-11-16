@@ -9668,7 +9668,7 @@ export function nativeSessionFailureSourceCode(
     // is runner loss, not a provider verdict on its session. A warm owner's
     // runner that exits between two turns of one run is the same loss (#20825).
     if (error.providerCode === "notification_transport_failed"
-      && /^Notification transport failed closed: native_runner_(?:(?:process|idle_warm_owner)_exited|replacement_exited_before_authentication): /.test(error.message))
+      && /^Notification transport failed closed: (?:native_runner_(?:(?:process|idle_warm_owner)_exited|replacement_exited_before_authentication)|transport_reconnect_grace_exceeded): /.test(error.message))
       return "native_runner_process_exited";
     return "native_provider_terminal_failed";
   }
@@ -9736,7 +9736,7 @@ export function nativeSessionFailureSourceCode(
     return "native_event_replay_conflict";
   }
   if (
-    /native_runner_process_exited|native_runner_idle_warm_owner_exited|native_runner_replacement_exited_before_authentication|runnerd exited|runner process failed/i.test(
+    /native_runner_process_exited|native_runner_idle_warm_owner_exited|native_runner_replacement_exited_before_authentication|transport_reconnect_grace_exceeded|runnerd exited|runner process failed/i.test(
       message,
     )
   ) {
