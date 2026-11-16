@@ -8,7 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations, issueComments,
+  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations, issueComments, agentTaskSessions,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -28,6 +28,8 @@ import {
   findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementUnprovenError,
 } from "./predecessor-retirement.js";
 import * as refusalCodes from "./runner-reconciliation-refusal.js";
+import * as lineage from "./provider-identity-lineage.js";
+import { PI_CONVERSATION_KEY } from "./pi-conversation-record.js";
 import { PRIOR_OWNER_FENCE_REFUSED } from "../native-local-process-stop.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
@@ -1231,6 +1233,38 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       expect(await followUp.start(outcome, undefined, false, floor)).toBe(ADMITTED);
       expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.issueId, prior.issueId))).toHaveLength(1);
     }, 60_000);
+
+  // review-fleet-3 (1), J3-23 x J3-17: the same-run fresh thread is recorded
+  // through the lineage, so the NEXT idle close / restart of this box, which
+  // still meets the old thread's backup, chains the old identity to the new
+  // thread instead of refusing it as provider_identity_changed.
+  it("records SMA-66's same-run fresh thread on the lineage, so the next restart chains the old backup to it", async () => {
+    const { prior, followUp, floor } = await seedSuspendNeverFinished("retained");
+    // Conversation C (Pi keeps it across the retry, runtime-selection.ts:543-544).
+    const scope = { companyId, agentId, taskKey: prior.issueId, normalizedSessionId: prior.native.normalizedSessionId };
+    await db.insert(agentTaskSessions).values({ companyId, agentId, adapterType: "paperclip_runner", taskKey: prior.issueId,
+      sessionParamsJson: { sessionId: prior.native.normalizedSessionId, [PI_CONVERSATION_KEY]: {
+        schema: "paperclip.pi-conversation.v1", id: prior.native.normalizedSessionId, generation: 1,
+        boundary: { provider: "pi_rpc", cwd: "/workspace", workspaceId: null, trust: "trusted" },
+        previousId: null, reason: "first_message", runId: prior.runId, providerIdentityResets: [] } } });
+    expect(await followUp.start("created", undefined, false, floor)).toBe(ADMITTED);
+    // The server restarts before the box's first suspended read: in-process notes are gone.
+    lineage.clearPendingProviderIdentityBreaksForTest();
+    const oldBackup = { providerSessionId: "provider-session-before-recovery", providerBackendSessionId: null, providerSessionIdentity: null };
+    const freshThread = { providerSessionId: "fresh-thread-after-floor", providerBackendSessionId: null, providerSessionIdentity: null };
+    // Another box never inherits this box's note.
+    expect(await lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous: oldBackup, current: freshThread,
+      providerLeaseId: "some-other-box" })).toBe(false);
+    // The executor's own decision at that read (native-session-executor.ts, provider_identity_changed).
+    expect(await lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous: oldBackup, current: freshThread,
+      providerLeaseId: followUp.providerLeaseId })).toBe(true);
+    expect(await lineage.readProviderIdentityResets(db, scope)).toEqual([expect.objectContaining({ generation: 1,
+      reason: "forced_fresh_session", runId: followUp.runId, previousIdentity: oldBackup, identity: freshThread })]);
+    expect(await lineage.readPendingProviderIdentityBreak(db, scope)).toBeNull();
+    // A later restart reads the recorded chain alone.
+    expect(await lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous: oldBackup, current: freshThread,
+      providerLeaseId: followUp.providerLeaseId })).toBe(true);
+  }, 60_000);
 
   it.each([
     { label: "its prior lease is still active", status: "active" as const },
