@@ -2750,22 +2750,29 @@ export async function executeNativeSession(
         throw new NativeRunnerRefreshRequiredError(recovery.refreshWaitForTurn === true, recovery.prepareRefusalCode);
       }
       // The Runner proved its saved state definitely absent while this run's
-      // turn was in flight (a replaced box, or lost controller state). Every
-      // retry reads the same empty state, so it is never a bare retryable
-      // interruption. A replacement could repeat or lose that turn's external
-      // effect, so it is allowed only by the replacement policy AND a durable
-      // proof that the run recorded no tool call; otherwise it is named, and the
-      // person's Retry continues in a fresh provider session.
+      // turn was in flight (a replaced box, or lost controller state). A
+      // replacement could repeat or lose that turn's external effect, so it is
+      // allowed only by the replacement policy AND a durable proof that the run
+      // recorded no tool call. Only a replacement that was allowed and then
+      // refused by that proof is named (permanent); the person's Retry
+      // continues in a fresh provider session. Without a replacement policy the
+      // absence keeps today's composed recovery failure (retryable, F7a C2).
       if (
         recovery.failureClass === PROVIDER_STATE_INCOMPATIBLE &&
         recovery.resumeStateUnavailable === true &&
-        persistedTurnInFlight(providerRecoveryCheckpoint) &&
-        !(replacementAllowed && await inFlightTurnRecordedNoToolWork({
+        persistedTurnInFlight(providerRecoveryCheckpoint)
+      ) {
+        if (!replacementAllowed) {
+          const failure = new Error(`native_session_recovery_failed: ${recovery.reason ?? "unknown"}`);
+          if (recovery.runnerExitConfirmed === true) {
+            Object.defineProperty(failure, "runnerExitConfirmed", { value: true, enumerable: false });
+          }
+          throw failure;
+        }
+        if (!await inFlightTurnRecordedNoToolWork({
           controlPlane: options.controlPlane,
           timeoutMs: recoveryTimeoutMs,
-        }))
-      ) {
-        throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
+        })) throw new NativeProviderStateIncompatibleError(recovery.reason ?? "unknown");
       }
       const governedWaitFollowUpLostState = !replacementAllowed && await governedWaitFollowUpMayStartFresh({
         input,

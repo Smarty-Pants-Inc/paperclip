@@ -207,7 +207,6 @@ import {
   NativeProviderTerminalFailure,
   NativeGovernedWaitSettlementPendingError,
   NativeRunnerSourceReconciliationRequiredError,
-  isRunnerResumeStateUnavailable,
   NativeSessionCleanupQuarantinedError,
   NativeSessionCloseUnrecoverableError,
   NativeSessionProtocolIntegrityError,
@@ -9500,12 +9499,12 @@ export function nativeSessionFailureSourceCode(
   if (error instanceof NativeGovernedWaitSettlementPendingError) return "native_governed_wait_settlement_pending";
   if (error instanceof NativeProviderStateIncompatibleError) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
   if (error instanceof NativeProviderSideEffectPendingError) return NATIVE_PROVIDER_SIDE_EFFECT_PENDING;
-  // The Runner's definite absence of saved state for this session: every retry
-  // reads the same empty state. Typed class anywhere in the chain (route B), or
-  // the runtime's exact composition of that class's own name (route A, an
-  // older runner that still reports it unclassified). Retry starts fresh.
-  if (isRunnerResumeStateUnavailable(error)
-    || (error instanceof Error && error.message === RUNTIME_COMPOSED_RESUME_STATE_UNAVAILABLE)) return NATIVE_PROVIDER_STATE_INCOMPATIBLE;
+  // F7a C2: the Runner's definite absence is named (permanent) ONLY when the
+  // runtime attempted a replacement and the tool-work proof refused it; that
+  // refusal arrives as NativeProviderStateIncompatibleError above. Every other
+  // surfacing (the typed class from a fresh open, as TL08 4e25ee88, or the
+  // runtime's composed recovery failure without a replacement policy) keeps
+  // today's retryable classification below.
   if (error instanceof NativeProviderTerminalFailure) {
     if (error.providerCode === "approval_required") return "native_provider_approval_required";
     // Failed terminals retain their security meaning across the provider facade.
@@ -9638,9 +9637,6 @@ export function nativeSessionFailureSourceCode(
   if (runnerIngressConnectionFailure(error)) return "runner_ingress_startup_failed";
   return "native_session_interrupted";
 }
-
-const RUNTIME_COMPOSED_RESUME_STATE_UNAVAILABLE =
-  "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable";
 
 function runnerIngressConnectionFailure(error: unknown, depth = 0): boolean {
   if (!error || typeof error !== "object" || depth > 5) return false;
