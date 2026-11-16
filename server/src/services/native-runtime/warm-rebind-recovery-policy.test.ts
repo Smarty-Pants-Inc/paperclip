@@ -29,8 +29,9 @@ import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
+  agentTaskSessions,
   budgetReservations,
   completionContracts,
   heartbeatRuns,
@@ -52,6 +53,7 @@ import { buildNativeExecutionInput } from "./native-execution-input.js";
 import * as nativeExecutor from "./native-session-executor.js";
 import * as nativeResume from "./native-session-resume.js";
 import * as controllerRecovery from "./native-controller-recovery.js";
+import * as lineage from "./provider-identity-lineage.js";
 import { resolveHeartbeatNativeRuntimeMode } from "./runtime-mode.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 
@@ -438,5 +440,85 @@ describe("gate 6: same-run recovery policy and the person-visible replacement li
       runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {},
       onLog: async (_stream: string, text: string) => { logs.push(text); } });
     expect(logs.filter(line => line.startsWith(PERSON_LINE_PREFIX))).toEqual([]);
+  });
+
+  // SMA-67's failure mode (F7b): after a replacement the next idle close/backup
+  // met the older backup's identity and was refused as
+  // runner_harness_state_mismatch: provider_identity_changed (NSE:18495). The
+  // replacement now writes through J3-17's ONE record type
+  // (provider-identity-lineage.ts), so that gate accepts the recorded chain.
+  describe("SMA-67: the next backup after a definite-absence replacement (J3-17 lineage)", () => {
+    // The identity objects the backup gate compares, exactly as each session's
+    // durable provider state produces them (never a hand-written shape).
+    const durableIdentity = (f: ReturnType<typeof fixture>, threadId: string, providerSessionId: string) =>
+      nativeExecutor.providerSessionIdentityFromDurableProviderState({ execution: f.current, providerState: {
+        schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "session_open", threadId, providerSessionId,
+        activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" } } });
+    /** The conversation's task-session row and its issue: only what J3-17's
+     * lineage read and append query; the lineage logic itself stays real. */
+    function conversationDb(f: ReturnType<typeof fixture>) {
+      const row = { id: randomUUID(), sessionParamsJson: { sessionId: f.sessionId, __paperclipPiConversation: {
+        schema: "paperclip.pi-conversation.v1", id: f.sessionId, generation: 1,
+        boundary: { provider: "codex", cwd: null, workspaceId: null, trust: "trusted" },
+        previousId: null, reason: "first_message", runId: f.current.binding.runId } } as Record<string, unknown> };
+      const select = () => ({ from: (table: unknown) => {
+        const rows = table === agentTaskSessions ? [structuredClone(row)]
+          : table === issues ? [{ id: f.issueId, companyId: f.companyId }] : [];
+        const query: Record<string, unknown> = { then: (resolve: (value: unknown[]) => unknown, reject?: (error: unknown) => unknown) =>
+          Promise.resolve(rows).then(resolve, reject) };
+        for (const method of ["where", "for", "limit", "orderBy"]) query[method] = () => query;
+        return query;
+      } });
+      const update = (table: unknown) => ({ set: (values: Record<string, unknown>) => ({ where: async () => {
+        if (table === agentTaskSessions) Object.assign(row, values);
+        return [];
+      } }) });
+      const db: Record<string, unknown> = { select, update };
+      db.transaction = async (work: (tx: unknown) => Promise<unknown>) => work(db);
+      const resets = () => ((row.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>)
+        .providerIdentityResets ?? []) as Array<Record<string, unknown>>;
+      return { db: db as unknown as Db, resets };
+    }
+
+    it("accepts the recorded resume_failed_on_new_box replacement's identity transition, recorded once through J3-17's append", async () => {
+      const f = fixture(home);
+      onTestFinished(() => lineage.clearPendingProviderIdentityBreaksForTest());
+      const logs = await replacedRun(f, "resume_failed_on_new_box");
+      const previous = durableIdentity(f, "db5-driver-session", "db5-provider-session");
+      const current = durableIdentity(f, "db5-driver-replacement", "db5-provider-replacement");
+      // The unchanged upstream check alone still refuses this transition ...
+      expect(nativeExecutor.providerSessionIdentityTransitionIsAllowed({ execution: f.current, previous, current })).toBe(false);
+      // ... and the backup gate's recorded-chain decision (NSE:18495) accepts it.
+      const { db, resets } = conversationDb(f);
+      const scope = nativeExecutor.providerIdentityLineageScope(f.current);
+      await expect(lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous, current })).resolves.toBe(true);
+      expect(resets()).toEqual([{ schema: lineage.PROVIDER_IDENTITY_RESET_SCHEMA, generation: 1, companyId: f.companyId,
+        taskKey: f.issueId, normalizedSessionId: f.sessionId, previousIdentity: previous, identity: current,
+        reason: "resume_failed_on_new_box", recordedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/), runId: f.current.binding.runId }]);
+      // A server restart loses the in-process note: the durable record alone accepts it.
+      lineage.clearPendingProviderIdentityBreaksForTest();
+      await expect(lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous, current })).resolves.toBe(true);
+      expect(resets()).toHaveLength(1);
+      // Never the reversed or an unrelated transition.
+      await expect(lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope, previous: current, current: previous })).resolves.toBe(false);
+      // Still ONE person-visible line, and no second record store.
+      expect(logs.filter(line => line.startsWith(PERSON_LINE_PREFIX))).toHaveLength(1);
+      expect(await readdir(nativeExecutor.scopedRunnerdStateRoot(f.current)).catch(() => [] as string[]))
+        .not.toContain("provider-identity-records.json");
+    });
+
+    it("a runner_state_lost replacement notes no step of its own (J3-17's record type has no such reason): the gate still refuses", async () => {
+      const f = fixture(home);
+      onTestFinished(() => lineage.clearPendingProviderIdentityBreaksForTest());
+      await replacedRun(f, "runner_state_lost");
+      expect(lineage.PROVIDER_IDENTITY_RESET_REASONS as readonly string[]).not.toContain("runner_state_lost");
+      const scope = nativeExecutor.providerIdentityLineageScope(f.current);
+      expect(lineage.pendingProviderIdentityBreak(scope)).toBeNull();
+      const { db, resets } = conversationDb(f);
+      await expect(lineage.recordedProviderIdentityTransitionIsAllowed({ db, scope,
+        previous: durableIdentity(f, "db5-driver-session", "db5-provider-session"),
+        current: durableIdentity(f, "db5-driver-replacement", "db5-provider-replacement") })).resolves.toBe(false);
+      expect(resets()).toEqual([]);
+    });
   });
 });
