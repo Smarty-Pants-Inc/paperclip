@@ -1,3 +1,4 @@
+import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
@@ -86,6 +87,13 @@ describe("persistent agent directories", () => {
     await db.insert(principalPermissionGrants).values({ companyId, principalType: "user", principalId: userId, permissionKey: "agents:configure", scope: { agentIds: [agentId] } });
     await fs.mkdir(path.dirname(path.join(root, entryFile)), { recursive: true });
     await fs.writeFile(path.join(root, entryFile), initial);
+  });
+
+  gitExclusionRetryContract(async (runId, executionTarget) => {
+    if (!await copies.get(companyId, runId)) {
+      await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
+    }
+    return copies.prepare({ companyId, agentId, runId, cwd: home, target: executionTarget });
   });
 
   describe("post-save directory cleanup worker", () => {

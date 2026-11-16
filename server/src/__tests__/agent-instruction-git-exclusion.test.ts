@@ -75,6 +75,40 @@ it.each(["directory", "file"])("rejects a symlink at the runtime exclusion %s", 
   expect(await fs.readFile(externalFile, "utf8")).toBe("untouched\n");
 });
 
+// Deterministically place another writer between lstat and mkdir in the real
+// child program. No scheduling-dependent concurrent-process race is required.
+it.each(["directory", "symlink", "file"] as const)("revalidates a raced runtime exclusion %s", async kind => {
+  await git(root, "init");
+  const outside = path.join(root, "outside");
+  await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, ".gitignore"), "untouched\n");
+  const injectRace = String.raw`
+const raceFs=require('node:fs'),racePath=require('node:path');
+const mkdir=raceFs.mkdirSync;
+raceFs.mkdirSync=(name,options)=>{
+  raceFs.mkdirSync=mkdir;
+  const kind=process.argv[2];
+  if(kind==='directory')mkdir(name,options);
+  else if(kind==='symlink')raceFs.symlinkSync(racePath.join(process.argv[1],'outside'),name);
+  else raceFs.writeFileSync(name,'not a directory');
+  return mkdir(name,options);
+};
+`;
+  const result = execFile(process.execPath, ["-e", injectRace + instructionGitExcludeProgram, root, kind]);
+  if (kind === "directory") {
+    await expect(result).resolves.toMatchObject({ stderr: "" });
+    await assertPrivateFilesIgnored(root);
+  } else {
+    await expect(result).rejects.toThrow("Unsafe runtime exclusion directory");
+    expect(await fs.readFile(path.join(outside, ".gitignore"), "utf8")).toBe("untouched\n");
+  }
+});
+
+it("does not swallow mkdir errors other than EEXIST", async () => {
+  const failMkdir = "require('node:fs').mkdirSync=()=>{throw Object.assign(Error('disk full'),{code:'ENOSPC'})};\n";
+  await expect(execFile(process.execPath, ["-e", failMkdir + instructionGitExcludeProgram, root])).rejects.toThrow("disk full");
+});
+
 it("replaces a linked ignore file without writing through its external inode", async () => {
   const externalFile = path.join(root, "outside-ignore"), workspace = path.join(root, "workspace");
   const runtime = path.join(workspace, ".paperclip-runtime");
