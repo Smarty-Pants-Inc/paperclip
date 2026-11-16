@@ -3761,6 +3761,20 @@ always destroys the source, so its first run usually meets the `destroyed`
 proof; this fork stops and keeps that source, so the proof is often absent on
 the first run.
 
+When the source was retained and only its configuration changed (an env, skill
+or instructions write, no source change), the same acquisition that created the
+new sandbox has just asked the source to stop and keep its files (status
+`pending_cleanup`, stop-only intent). Restoring while it may still run is never
+allowed. When every other part of the proof holds and that exact stop is in
+flight (claimed and dispatched by its stop owner), host preparation first waits,
+at most `NATIVE_BACKUP_SOURCE_STOP_WAIT_MS` (60 s), for it to settle, then asks
+the same retired-source proof again. A stop that no owner has claimed yet is not
+waited for. A settled stop (`released` with a
+stopped receipt) meets the idle-source class, whose claim marks the source as
+superseded for this run and sandbox before the backup is restored; the
+conversation then continues on the same provider thread. A stop that does not
+settle in time restores nothing and takes the fresh-thread path above.
+
 A workspace-restore hold also takes a warm sandbox out of reuse. When a run
 that holds a warm lease ends with a workspace-restore failure, the hold stops
 the sandbox under a stop-and-retain receipt, changes the lease policy to
