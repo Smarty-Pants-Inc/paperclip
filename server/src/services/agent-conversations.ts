@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "./project-connection-run-context.js";
 import { isContextCompactionRun } from "./context-compaction.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
@@ -205,7 +206,7 @@ export async function prepareConversationTurn(
     // same session-generation context into the normal native runtime.
     if (isContextCompactionRun(context)) {
       const next = { ...context, conversationSessionGeneration: generation, conversationMode: true };
-      await tx.update(heartbeatRuns).set({ contextSnapshot: next }).where(eq(heartbeatRuns.id, run.id));
+      await tx.update(heartbeatRuns).set({ contextSnapshot: projectConnectionRunSnapshot(next) }).where(eq(heartbeatRuns.id, run.id));
       return { context: next, reset: false, conversation: true };
     }
     const commentId =
@@ -342,7 +343,7 @@ export async function prepareConversationTurn(
     };
     await tx
       .update(heartbeatRuns)
-      .set({ contextSnapshot: next })
+      .set({ contextSnapshot: projectConnectionRunSnapshot(next) })
       .where(eq(heartbeatRuns.id, run.id));
     return { context: next, reset, conversation: true };
   });

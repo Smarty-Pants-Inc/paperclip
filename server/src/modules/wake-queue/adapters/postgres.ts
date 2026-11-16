@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot, projectConnectionRunSnapshot } from "../../../services/project-connection-run-context.js";
 import { pendingContinuationCommentInput } from "../../../services/continuation-comment-input.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
@@ -630,6 +631,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async finalizePromotedWake(input) {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId: input.companyId, agentId: input.deferredAgent.id, issueId: input.issue.id, contextSnapshot: input.contextSnapshot,
+      });
       await notifyChatRunMilestones(tx, { companyId: input.companyId, issueId: input.issue.id });
       const newRun = await tx
         .insert(heartbeatRuns)
@@ -643,7 +647,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           retryOfRunId: input.authorizedFailedChatRetry
             ? readNonEmptyString(input.contextSnapshot.retryOfRunId)
             : null,
-          contextSnapshot: input.contextSnapshot,
+          contextSnapshot: admissionSnapshot,
           responsibleUserId: input.responsibleUserId,
           sessionIdBefore: input.sessionBefore,
           continuationAttempt: readContinuationAttempt(input.contextSnapshot.livenessContinuationAttempt),
@@ -651,6 +655,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .returning()
         .then((rows) => rows[0]);
 
+      await captureProjectConnectionRunContext(tx, {
+        companyId: input.companyId, agentId: input.deferredAgent.id, heartbeatRunId: newRun.id,
+      });
       // `claimDeferredWakeForPromotion` already moved this row off
       // `deferred_issue_execution` inside this same transaction, so no
       // concurrent claimer can still match that guard; this extra `runId is
@@ -764,6 +771,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     },
 
     async queueReviewParticipantRecoveryRun({ companyId, issue, finishingRun, recoveryAgent, sessionBefore, now }) {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId, agentId: recoveryAgent.id, issueId: issue.id, contextSnapshot: { issueId: issue.id },
+      });
       await notifyStatusCardIssueChange(tx, companyId);
       const executionState = parseIssueExecutionState(issue.executionState);
       const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
@@ -808,6 +818,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             {
               issueId: issue.id,
               taskId: issue.id,
+              projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext,
               wakeReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               retryReason: EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON,
               source: "issue.execution_review_recovery",
@@ -842,6 +853,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
 
+      await captureProjectConnectionRunContext(tx, { companyId, agentId: recoveryAgent.id, heartbeatRunId: queuedRun.id });
       return toRunSummary(queuedRun);
     },
 
@@ -856,6 +868,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       sessionBefore,
       now,
     }) {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId, agentId: recoveryAgent.id, issueId: issue.id, contextSnapshot,
+      });
       await notifyChatRunMilestones(tx, { companyId, issueId: issue.id });
       const commentInput = await pendingContinuationCommentInput(tx, { companyId, issueId: issue.id, contextSnapshot: finishingRun.contextSnapshot });
       const wakeupRequest = await tx
@@ -885,7 +900,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: { ...contextSnapshot, ...commentInput },
+          contextSnapshot: { ...contextSnapshot, ...commentInput, projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext },
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: finishingRun.id,
@@ -909,6 +924,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         })
         .where(and(eq(issues.id, issue.id), eq(issues.companyId, companyId)));
 
+      await captureProjectConnectionRunContext(tx, { companyId, agentId: recoveryAgent.id, heartbeatRunId: queuedRun.id });
       return toRunSummary(queuedRun);
     },
   };
@@ -1178,7 +1194,7 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
         eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.runId, current.id), eq(agentWakeupRequests.status, primary.status)));
       const mergedRun = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: input.mergedContextSnapshot, updatedAt: now })
+        .set({ contextSnapshot: projectConnectionRunSnapshot(input.mergedContextSnapshot), updatedAt: now })
         .where(
           and(
             eq(heartbeatRuns.id, input.activeExecutionRunId),
@@ -1396,6 +1412,13 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           )
           .orderBy(asc(issues.id));
 
+        // All task rows are already locked above. Acquire project lifecycle
+        // rows in stable order before any subordinate run/coalescing operation.
+        for (const issue of [...candidateIssues].sort((a, b) => (a.projectId ?? "").localeCompare(b.projectId ?? "") || a.id.localeCompare(b.id))) {
+          await projectConnectionAdmissionSnapshot(tx, {
+            companyId: input.companyId, agentId: run.agentId, issueId: issue.id, contextSnapshot: { issueId: issue.id },
+          });
+        }
         for (const issue of candidateIssues) {
           if (issue.executionRunId === run.id || issue.checkoutRunId === run.id) {
             await notifyExternalConversationSettlement(tx, { companyId: input.companyId, issueId: issue.id });

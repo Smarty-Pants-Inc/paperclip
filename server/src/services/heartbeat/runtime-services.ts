@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "../project-connection-run-context.js";
 import { eq } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -126,7 +127,7 @@ export async function startHeartbeatRuntimeServices(db: Db, input: RuntimeServic
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: projectConnectionRunSnapshot(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
@@ -189,7 +190,7 @@ export async function recordHeartbeatAdapterRuntimeServices(db: Db, input: Runti
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: projectConnectionRunSnapshot(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));

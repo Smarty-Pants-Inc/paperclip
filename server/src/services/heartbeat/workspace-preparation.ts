@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "../project-connection-run-context.js";
 import { NATIVE_REMOTE_RECOVERY_LEASE_MISMATCH, remoteRecoveryLeaseMismatch } from "../native-runtime/remote-recovery-lease-mismatch.js";
 import { readInheritedRunnerRetainedSandbox } from "../native-runtime/native-inherited-runner-retry.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -1440,7 +1441,7 @@ async function prepareHeartbeatWorkspaceLocked(db: Db, input: HeartbeatWorkspace
     await db
       .update(heartbeatRuns)
       .set({
-        contextSnapshot: context,
+        contextSnapshot: projectConnectionRunSnapshot(context),
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id));
