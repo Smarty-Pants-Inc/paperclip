@@ -15,6 +15,7 @@ import { secretService } from "../../secrets.js";
 import type { OAuthCredentialStore } from "./credential-store.js";
 
 import type { FinishConnectionSetup } from "../catalog/contracts.js";
+import { assertProjectConnectionOAuthUnsupported } from "../connections/setup-policy.js";
 
 type Dependencies = {
   getConnectionRow(idOrUid: string, companyId?: string): Promise<typeof toolConnections.$inferSelect>;
@@ -46,6 +47,7 @@ async function finalizeOAuthAccess(
     if (requestingAgentId)
       await assertAgentsInCompany(companyId, [requestingAgentId]);
     let connection = await getConnectionRow(connectionId, companyId);
+    assertProjectConnectionOAuthUnsupported(connection);
     const preFinalizeLifecycle = {
       status: connection.status,
       enabled: connection.enabled,

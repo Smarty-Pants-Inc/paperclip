@@ -179,6 +179,9 @@ export const updateToolApplicationSchema = createToolApplicationSchema.partial()
 export type UpdateToolApplication = z.infer<typeof updateToolApplicationSchema>;
 
 export const createToolConnectionSchema = z.object({
+  projectId: z.string().guid().nullable().optional(),
+  // Request intent only. Approval and reservations are server-written.
+  exclusive: z.boolean().optional(),
   agentInstructions: connectionAgentInstructionsSchema.nullable().optional(),
   applicationId: z.string().guid().optional(),
   applicationName: z.string().trim().min(1).max(160).optional(),
@@ -421,6 +424,8 @@ export const googleWorkspaceServiceSelectionSchema = z.object({
 }).strict().refine(value => Object.keys(value).length > 0, "Select at least one Google service");
 
 export const connectToolAppSchema = z.object({
+  projectId: z.string().guid().nullable().optional(),
+  exclusive: z.boolean().optional(),
   workspaceServices: googleWorkspaceServiceSelectionSchema.optional(),
   agentInstructions: connectionAgentInstructionsSchema.nullable().optional(),
   galleryKey: z.string().trim().min(1).max(120).optional(),

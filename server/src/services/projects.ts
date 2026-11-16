@@ -9,6 +9,8 @@ import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   projects,
+  toolConnections,
+  toolConnectionInstalls,
   executionWorkspaces,
   projectAccessMembers,
   projectGoals,
@@ -46,6 +48,9 @@ import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig }
 import { resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { recordProjectLifecycleEvent, recordResourceCreationEvent } from "./resource-lifecycle-events.js";
 import { hasUnsettledProjectCharges } from "../modules/execution-admission/index.js";
+import { assertProjectConnectionAdmission, assertProjectConnectionRecipients, readProjectConnectionScope } from "./project-connection-admission.js";
+import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse } from "./project-connection-retirement.js";
+import type { ActorInfo } from "./tool-access/types.js";
 
 type ProjectTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
@@ -1048,16 +1053,52 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     update: async (
       id: string,
       data: Partial<typeof projects.$inferInsert> & { goalIds?: string[] },
+      actor?: ActorInfo,
     ): Promise<ProjectWithGoals | null> => db.transaction(async tx => {
       const db = tx as unknown as Db;
       const { goalIds: inputGoalIds, ...projectData } = data;
       const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
       const existingProject = await db
-        .select({ id: projects.id, companyId: projects.companyId, name: projects.name, archivedAt: projects.archivedAt, executionWorkspacePolicy: projects.executionWorkspacePolicy })
+        .select({ id: projects.id, companyId: projects.companyId, name: projects.name, leadAgentId: projects.leadAgentId, archivedAt: projects.archivedAt, executionWorkspacePolicy: projects.executionWorkspacePolicy })
         .from(projects)
         .where(eq(projects.id, id)).for("update")
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
+      if (projectData.leadAgentId !== undefined && projectData.leadAgentId !== existingProject.leadAgentId) {
+        // The root row is already locked, in the same order as connection
+        // admission/retirement. Re-read authority and explicit installs only
+        // after this wait, and commit all retained envelopes with the project.
+        const owned = await tx.select().from(toolConnections).where(and(
+          eq(toolConnections.companyId, existingProject.companyId), eq(toolConnections.projectId, id),
+        )).orderBy(asc(toolConnections.id));
+        if (owned.length) {
+          for (const connection of owned) {
+            const installs = await tx.select().from(toolConnectionInstalls).where(and(
+              eq(toolConnectionInstalls.companyId, existingProject.companyId), eq(toolConnectionInstalls.connectionId, connection.id),
+            ));
+            const targets = installs.map(install => install.targetId);
+            await assertProjectConnectionAdmission(tx, { companyId: existingProject.companyId, projectId: id,
+              operation: "project_update", actor, connection, targetAgentIds: targets });
+            await lockProjectConnectionLifecycle(tx, { companyId: existingProject.companyId, projectId: id });
+            if (installs.some(install => install.targetType !== "agent") || !projectData.leadAgentId) {
+              throw conflict("Reconcile this project's explicit recipients and choose an active approved lead before changing it.", { code: "project_connection_target_outside_project" });
+            }
+            // Approval does not automatically transfer the old team's access.
+            // Check both the new lead and every retained recipient against the
+            // proposed subtree before touching any approval envelope.
+            await assertProjectConnectionRecipients(tx, existingProject.companyId, id, projectData.leadAgentId, [projectData.leadAgentId, ...targets]);
+            await assertProjectConnectionNotInUse(tx, { companyId: existingProject.companyId, projectId: id,
+              connectionId: connection.id, actor, projectDoneConfirmation: actor?.projectDoneConfirmation });
+          }
+          for (const connection of owned) {
+            const config = { ...connection.config, projectScope: { ...readProjectConnectionScope(connection)!, approvedLeadAgentId: projectData.leadAgentId } };
+            const transportConfig = { ...connection.transportConfig, projectScope: config.projectScope };
+            await tx.update(toolConnections).set({ config, transportConfig, updatedAt: new Date() }).where(and(
+              eq(toolConnections.companyId, existingProject.companyId), eq(toolConnections.id, connection.id),
+            ));
+          }
+        }
+      }
       projectData.executionWorkspacePolicy = withoutLegacyProjectEnvironment(projectData.executionWorkspacePolicy);
       const currentStorage = parseProjectExecutionWorkspacePolicy(existingProject.executionWorkspacePolicy)?.storageProviderPluginId;
       if (projectData.executionWorkspacePolicy !== undefined) {
@@ -1165,6 +1206,12 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     remove: async (id: string) => db.transaction(async tx => {
       const project = await lockProjectRootMutation(tx, id);
       if (!project) return null;
+      // There is deliberately no project FK: retained connection ownership is
+      // credential policy, including archived and pending history. Never orphan
+      // it by deleting the project from an owner-unaware path.
+      const [ownedConnection] = await tx.select({ id: toolConnections.id }).from(toolConnections)
+        .where(and(eq(toolConnections.companyId, project.companyId), eq(toolConnections.projectId, id))).limit(1);
+      if (ownedConnection) throw conflict("This project has retained tool-connection ownership. Archive the project instead of deleting its credential policy.", { code: "project_connection_history_retained" });
       const [retained] = await tx.select({ id: executionWorkspaces.id }).from(executionWorkspaces)
         .where(eq(executionWorkspaces.projectId, id)).limit(1);
       if (retained) throw conflict("This project still supplies access policy for retained task workspaces. Archive the project or explicitly clean up its workspaces before deleting it.");

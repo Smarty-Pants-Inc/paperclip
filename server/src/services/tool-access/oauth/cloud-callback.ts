@@ -26,6 +26,7 @@ import type { RefreshConnectionCatalog } from "../catalog/contracts.js";
 
 import { toApplication } from "../applications/projection.js";
 import { groupedActions } from "../catalog/action-summary.js";
+import { assertProjectConnectionOAuthUnsupported } from "../connections/setup-policy.js";
 
 type Dependencies = {
   now: () => Date;
@@ -56,6 +57,7 @@ export function createCloudOAuthCallback(db: Db, dependencies: Dependencies) {
       stateRow.connectionId,
       stateRow.companyId,
     );
+    assertProjectConnectionOAuthUnsupported(connection);
     const preCloudCallbackLifecycle = {
       status: connection.status,
       enabled: connection.enabled,

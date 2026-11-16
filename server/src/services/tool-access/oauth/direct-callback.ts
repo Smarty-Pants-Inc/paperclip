@@ -24,7 +24,7 @@ import type { OAuthStateStore } from "./state.js";
 import type { OAuthCredentialStore } from "./credential-store.js";
 import type { OAuthCatalogCompletion } from "./catalog-completion.js";
 import type { RefreshConnectionCatalog, CheckConnectionHealth } from "../catalog/contracts.js";
-import type { ConnectionSetupPolicy } from "../connections/setup-policy.js";
+import { assertProjectConnectionOAuthUnsupported, type ConnectionSetupPolicy } from "../connections/setup-policy.js";
 
 import { toApplication } from "../applications/projection.js";
 import { groupedActions } from "../catalog/action-summary.js";
@@ -81,6 +81,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
       // RFC 9207: an error from a server other than the one we sent the user to
       // is neither acted on nor shown.
       const errorConnection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);
+      assertProjectConnectionOAuthUnsupported(errorConnection);
       const savedIssuer = oauthConfig(errorConnection).issuer;
       assertOAuthCallbackIssuer(errorConnection, { issuer: typeof savedIssuer === "string" ? savedIssuer : null }, input.iss);
       await rejectPendingOAuthInteraction(stateRow, input.actor);
@@ -106,6 +107,7 @@ export function createDirectOAuthCallback(db: Db, dependencies: Dependencies) {
       stateRow.connectionId,
       stateRow.companyId,
     );
+    assertProjectConnectionOAuthUnsupported(connection);
     // Reauthorization refreshes credentials and catalog without rebuilding the
     // operator's action profile, policy rules, or access bindings.
     const shouldFinalizeDefaults = connection.status === "draft";
