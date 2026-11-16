@@ -203,9 +203,14 @@ BEGIN
       WHERE q.target_type = ''agent''' INTO agent_ids USING ignored;
     PERFORM paperclip_lock_runtime_agents(agent_ids);
     FOR binding IN EXECUTE query USING ignored LOOP
+      -- R2 (src11, rf4 F2): a company this transaction already invalidated holds the
+      -- exclusive lock and recorded every active agent; record no agent of it again,
+      -- so no agent row is locked after that lock (the de-dup every other branch has).
       IF binding.target_type = 'agent' THEN
-        SELECT id INTO candidate FROM agents WHERE company_id = binding.company_id AND id::text = binding.target_id;
-        IF FOUND THEN PERFORM paperclip_record_agent_runtime(binding.company_id, candidate); END IF;
+        IF current_setting('paperclip.runtime_' || replace(binding.company_id::text, '-', '_'), true) IS DISTINCT FROM pg_current_xact_id()::text THEN
+          SELECT id INTO candidate FROM agents WHERE company_id = binding.company_id AND id::text = binding.target_id;
+          IF FOUND THEN PERFORM paperclip_record_agent_runtime(binding.company_id, candidate); END IF;
+        END IF;
       ELSE PERFORM paperclip_invalidate_connector_company(binding.company_id);
       END IF;
     END LOOP;
