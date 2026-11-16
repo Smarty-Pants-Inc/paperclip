@@ -1,5 +1,6 @@
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
+import { STOP_PENDING_SCHEMA } from "./recovery/stop-pending.js";
 import { notifyNativeRecoveryNotices } from "./native-recovery-notice-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
@@ -605,6 +606,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       eq(issueRecoveryActions.companyId, input.companyId),
       eq(issueRecoveryActions.sourceIssueId, input.sourceIssueId),
       inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+      // A new task path, terminal task or generic board disposition is not
+      // Stop proof. Only the guarded task release removes this diagnostic.
+      sql`coalesce(${issueRecoveryActions.evidence}->'stopPending'->>'schema', '') <> ${STOP_PENDING_SCHEMA}`,
     ];
     if (input.actionId) {
       predicates.push(eq(issueRecoveryActions.id, input.actionId));
