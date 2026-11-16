@@ -63,7 +63,9 @@ describe("#20389 primary-agent publication across lifecycle retries", () => {
           // Mirrors agent-lifecycle-publication-once: explicit requests, never an
           // internal replay. Every failed request is one 40P01 and leaves exact rows intact.
           for (let failedRequests = 0; failedRequests < (exhaust ? ACCOUNTING_TRANSACTION_ATTEMPTS : 1); failedRequests++) {
-            await expect(run()).rejects.toMatchObject({
+            const error = await run().catch((e) => e);
+            expect(error).toBeInstanceOf(AccountingContentionError);
+            expect(error).toMatchObject({
               name: AccountingContentionError.name, status: 503, code: "40P01", attempts: 1,
             });
             expect(attempts).toBe(failedRequests + 1);

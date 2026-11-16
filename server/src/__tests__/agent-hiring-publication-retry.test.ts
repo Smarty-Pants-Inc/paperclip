@@ -74,7 +74,9 @@ describe("#20389 RFL F5 hire/approval publication retry", () => {
           // Keep the original eight-rollback pressure, but each rollback belongs to a
           // separate caller request: lifecycleTransaction must never replay it itself.
           for (let failedRequests = 0; failedRequests < (exhaust ? ACCOUNTING_TRANSACTION_ATTEMPTS : 1); failedRequests++) {
-            await expect(run()).rejects.toMatchObject({
+            const error = await run().catch((e) => e);
+            expect(error).toBeInstanceOf(AccountingContentionError);
+            expect(error).toMatchObject({
               name: AccountingContentionError.name, status: 503, code: "40P01", attempts: 1,
             });
             expect(attempts).toBe(failedRequests + 1);
