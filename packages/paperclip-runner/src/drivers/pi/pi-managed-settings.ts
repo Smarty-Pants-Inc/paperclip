@@ -1,6 +1,7 @@
 import { lstat, mkdir, readFile, stat } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { writePrivateFile } from "../private-file.js";
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -13,8 +14,14 @@ async function readSettings(path: string): Promise<Record<string, unknown>> {
     if (Buffer.byteLength(text, "utf8") > 60 * 1024) throw new Error();
     const settings: unknown = JSON.parse(text);
     if (!record(settings) || (settings.compaction !== undefined && !record(settings.compaction))) throw new Error();
+    if (settings.packages !== undefined && !Array.isArray(settings.packages)) {
+      throw Object.assign(new Error("Pi settings packages must be an array; refusing to overwrite settings (content redacted)"), {
+        code: "pi_managed_packages_invalid",
+      });
+    }
     return settings;
   } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "pi_managed_packages_invalid") throw error;
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw new Error("Pi settings.json could not be read as bounded JSON; refusing to overwrite it (content redacted)");
   }
@@ -57,17 +64,45 @@ async function installedNpmPackageRoot(source: string, originalAgentHome: string
   return root;
 }
 
-async function rewriteManagedPackages(settings: Record<string, unknown>, originalAgentHome: string): Promise<{
+async function installedLocalPackageRoot(source: string, settingsHome: string): Promise<string> {
+  const normalized = source.trim();
+  const path = normalized.startsWith("file://") ? fileURLToPath(normalized)
+    : normalized === "~" ? homedir() : normalized.startsWith("~/") ? join(homedir(), normalized.slice(2)) : normalized;
+  const root = resolve(settingsHome, path);
+  try {
+    const info = await stat(root);
+    // Pi accepts both package directories and individual extension files.
+    if (info.isDirectory() || info.isFile()) return root;
+  } catch { /* Report the same named failure for missing or unreadable local roots. */ }
+  throw Object.assign(new Error("Pi managed local package is missing or unreadable (source redacted)"), {
+    code: "pi_managed_local_package_missing",
+  });
+}
+
+async function rewriteManagedPackages(settings: Record<string, unknown>, originalAgentHome: string,
+  managedAgentHome: string, hasSettings: boolean): Promise<{
   settings: Record<string, unknown>; changed: boolean;
 }> {
   if (!Array.isArray(settings.packages)) return { settings, changed: false };
+  const sameHome = resolve(originalAgentHome) === resolve(managedAgentHome);
   let changed = false;
   const packages: unknown[] = [];
   for (const entry of settings.packages) {
     const source = typeof entry === "string" ? entry
       : record(entry) && typeof entry.source === "string" ? entry.source : undefined;
-    if (!source?.startsWith("npm:")) { packages.push(entry); continue; }
-    const installed = await installedNpmPackageRoot(source, originalAgentHome);
+    if (source === undefined) { packages.push(entry); continue; }
+    let installed: string;
+    if (source.startsWith("npm:")) {
+      // Same-home declarations already use Pi's own installed npm directory.
+      installed = sameHome ? source : await installedNpmPackageRoot(source, originalAgentHome);
+    } else if (/^(git:|github:|https?:|ssh:|builtin:)/.test(source.trim())) {
+      packages.push(entry); continue;
+    } else {
+      // Relative local sources belong to the settings file that declared them,
+      // not the managed home into which the declaration is being copied.
+      const root = await installedLocalPackageRoot(source, hasSettings ? managedAgentHome : originalAgentHome);
+      installed = hasSettings || sameHome || isAbsolute(source) ? source : root;
+    }
     if (typeof entry === "string") packages.push(installed);
     else packages.push({ ...entry, source: installed });
     changed ||= installed !== source;
@@ -102,10 +137,9 @@ export async function configurePiManagedCompaction(input: {
   const base = !hasSettings && !sameHome
     ? inheritImage ? (original.packages === undefined ? {} : { packages: original.packages }) : original
     : settings;
-  // Validate every package before creating or writing the managed home: Pi must
-  // never fall back to installing a missing npm source during startup.
-  const rewritten = sameHome ? { settings: base, changed: false }
-    : await rewriteManagedPackages(base, originalAgentHome);
+  // Validate local roots and relocated npm sources before writing settings: Pi
+  // must neither silently lose a local package nor install a missing npm source.
+  const rewritten = await rewriteManagedPackages(base, originalAgentHome, input.agentHome, hasSettings);
   const hasExplicitReserve = explicitReserve(settings, input.model) !== undefined;
   if (hasExplicitReserve) {
     if (!rewritten.changed) return;
