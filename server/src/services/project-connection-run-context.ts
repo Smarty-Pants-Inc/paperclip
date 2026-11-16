@@ -162,8 +162,21 @@ export async function revalidateProjectConnectionRunContext(db: Executor, contex
   if (current.issueId !== context.issueId || current.projectId !== context.projectId) throw invalid();
 }
 
-/** Legacy-only companies retain their existing null-purpose runtime paths. */
-export async function hasProjectConnectionOwnership(db: Executor, companyId: string): Promise<boolean> {
+/** Legacy-only, pre-seam runs retain their null-purpose runtime paths. Saved
+ * admission pairs and conflicting/taskless project hints still require strict
+ * validation even before the first project-owned connection exists. */
+export async function requiresProjectConnectionRunContext(db: Executor, companyId: string, heartbeatRunId?: string | null): Promise<boolean> {
+  if (heartbeatRunId && isUuidLike(heartbeatRunId)) {
+    const [run] = await db.select({ nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId,
+      contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, heartbeatRunId),
+    ));
+    if (run) {
+      if (Object.hasOwn(run.contextSnapshot ?? {}, SNAPSHOT_KEY)) return true;
+      try { assertBoundRunIssueId(run); } catch { return true; }
+      if (!boundRunIssueId(run) && run.contextSnapshot?.projectId != null) return true;
+    }
+  }
   const [row] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
     eq(toolConnections.companyId, companyId), sql`${toolConnections.projectId} is not null`,
   )).limit(1);

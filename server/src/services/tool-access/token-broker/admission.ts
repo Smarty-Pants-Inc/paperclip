@@ -1,6 +1,6 @@
 import type { DbTransaction } from "../types.js";
 import { captureRunIdentity, runIdentityBrokerFields } from "../../run-identity.js";
-import { readProjectConnectionRunContext, hasProjectConnectionOwnership } from "../../project-connection-run-context.js";
+import { readProjectConnectionRunContext, requiresProjectConnectionRunContext } from "../../project-connection-run-context.js";
 import { and, eq, gte, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { connectionTokenIssuances, companyMemberships, heartbeatRuns, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
@@ -138,7 +138,7 @@ export function createTokenBrokerAdmission(db: Db, now: () => Date) {
         "Responsible user is no longer authorized for company write access",
       );
     }
-    const projectContext = await hasProjectConnectionOwnership(db, input.companyId)
+    const projectContext = await requiresProjectConnectionRunContext(db, input.companyId, input.runId)
       ? await readProjectConnectionRunContext(db, {
           companyId: input.companyId, agentId: input.agentId, heartbeatRunId: input.runId,
         })

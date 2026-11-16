@@ -75,10 +75,12 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     }
     return { c, g };
   };
-  const { c, g } = await valid();
-  const ref = g.credentialSecretRefs.find(r => r.configPath === GITHUB_APP_KEY_PATH);
-  if (!ref) githubAppFailure();
   try {
+    // The initial saved-scope check shares the provider boundary's existing
+    // value-free failure contract, just like post-I/O and cache validation.
+    const { c, g } = await valid();
+    const ref = g.credentialSecretRefs.find(r => r.configPath === GITHUB_APP_KEY_PATH);
+    if (!ref) githubAppFailure();
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
     const result = await client.acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
     await valid();
