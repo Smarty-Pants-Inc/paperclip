@@ -18850,6 +18850,10 @@ async function createRunnerdBackendWithinSessionClaim(
                               ? "sandbox_filesystem"
                               : "new_sandbox",
                       bytesTransferred: 0,
+                      // A created (or claimed spare) lease that keeps a current backup unrestored says why.
+                      ...(sandboxLeaseAcquisition?.outcome === "created" && backupAvailable && !restoreIntoCreatedSandbox
+                        ? { restoreSkippedReason: remoteTarget.reusableLeaseConfigured !== true ? "reuse_unconfigured"
+                          : retiredSourceBackup ? "source_not_retired" : "backup_unverified" } : {}),
                     },
                   });
                   if (sandboxLeaseAcquisition?.outcome === "resumed" && adoptedProcess &&
