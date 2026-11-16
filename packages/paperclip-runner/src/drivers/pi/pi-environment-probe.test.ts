@@ -34,6 +34,7 @@ function stub(options: { events?: PrpEvent[]; first?: PrpEvent; cleanupError?: E
   return { driver: { openSession } as Pick<HarnessDriver, "openSession">, session, openSession, startTurn, close };
 }
 const probe = (driver: Pick<HarnessDriver, "openSession">, overrides: Partial<Parameters<typeof probePiNativeEnvironment>[0]> = {}) => probePiNativeEnvironment({ driver, config, runId: "probe-run", normalizedSessionId: "probe-session", workingDirectory: "/prepared/selected-remote-target", timeoutMs: 1000, cleanupTimeoutMs: 100, ...overrides });
+const probeWithDefaultCleanupBudget = (driver: Pick<HarnessDriver, "openSession">) => probePiNativeEnvironment({ driver, config, runId: "probe-run", normalizedSessionId: "probe-session", workingDirectory: "/prepared/selected-remote-target", timeoutMs: 1000 });
 
 describe("ordinary native Pi setup hello through the run's configured driver", () => {
   it("opens the original target, subscribes before start, observes response + terminal and retires", async () => {
@@ -163,6 +164,32 @@ describe("ordinary native Pi setup hello through the run's configured driver", (
     expect(error.retryCleanup()).toBe(error.retired);
     release.resolve(value.session); await error.retired;
     expect(value.close).toHaveBeenCalledOnce(); expect(value.startTurn).not.toHaveBeenCalled();
+  });
+  it("uses the default cleanup budget for a 15-second Pi session close", async () => {
+    vi.useFakeTimers();
+    try {
+      const value = stub();
+      value.session.close = vi.fn(async () => { await new Promise(resolve => setTimeout(resolve, 15_000)); });
+      const operation = probeWithDefaultCleanupBudget(value.driver).then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(15_000);
+      await expect(operation).resolves.toMatchObject({ value: { helloProbePassed: true } });
+      expect(value.session.close).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
+  });
+  it("still fails with PiEnvironmentProbeCleanupError when default-budget close takes 70 seconds", async () => {
+    vi.useFakeTimers();
+    try {
+      const value = stub();
+      value.session.close = vi.fn(async () => { await new Promise(resolve => setTimeout(resolve, 70_000)); });
+      const operation = probeWithDefaultCleanupBudget(value.driver).then(value => ({ value }), error => ({ error }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      const settled = await operation;
+      const error = settled.error;
+      expect(error).toBeInstanceOf(PiEnvironmentProbeCleanupError);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await error.retired;
+      expect(value.session.close).toHaveBeenCalledOnce();
+    } finally { vi.useRealTimers(); }
   });
   it("can retry rejected retirement on the SAME session without opening a second target", async () => {
     const value = stub(); let attempts = 0;
