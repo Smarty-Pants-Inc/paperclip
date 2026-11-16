@@ -35,6 +35,22 @@ export async function readRemoteRunnerRecoveryProbe(input: {
   readOnly: boolean;
   stall?: RemoteRunnerPluginStall;
 }) {
+  return retryRemoteRunnerRecoveryAttempt({ ...input,
+    attempt: timeoutMs => input.runner.execute({ ...input.request, readOnlyProbe: input.readOnly, timeoutMs }) });
+}
+
+/**
+ * The bounded retry a recovery probe runs under: each attempt gets at most
+ * 10s and never more than the time left before the deadline; a timed-out
+ * attempt is probe_timeout, a thrown one probe_transport_failed.
+ */
+export async function retryRemoteRunnerRecoveryAttempt<T extends { timedOut: boolean }>(input: {
+  stage: RemoteRunnerRecoveryDiagnostic["stage"];
+  deadline: number;
+  readOnly: boolean;
+  stall?: RemoteRunnerPluginStall;
+  attempt: (timeoutMs: number) => Promise<T>;
+}): Promise<T> {
   let lastError: unknown = new RemoteRunnerRecoveryError({
     stage: input.stage, reason: "probe_timeout",
   });
@@ -45,11 +61,7 @@ export async function readRemoteRunnerRecoveryProbe(input: {
     const remaining = deadline() - Date.now();
     if (!Number.isFinite(remaining) || remaining <= 0) break;
     try {
-      const result = await input.runner.execute({
-        ...input.request,
-        readOnlyProbe: input.readOnly,
-        timeoutMs: Math.min(10_000, remaining),
-      });
+      const result = await input.attempt(Math.min(10_000, remaining));
       if (!result.timedOut) return result;
       lastError = new RemoteRunnerRecoveryError({ stage: input.stage, reason: "probe_timeout" });
     } catch (error) {

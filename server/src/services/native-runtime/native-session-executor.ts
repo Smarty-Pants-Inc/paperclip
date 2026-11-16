@@ -322,7 +322,7 @@ import {
   describeExitedRemoteRunner, describeExitedRemoteRunnerReason, describeExitedRemoteRunnerRunLog, exitedRunnerRequestedFreshBootstrap, readRemoteRunnerRecoveryError,
   remoteRecoveryProbeReason, runnerStateRequestsFreshBootstrap,
 } from "./remote-runner-recovery-diagnostics.js";
-import { isPluginRpcTimeout, readRemoteRunnerRecoveryProbe, REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS, remoteRunnerPluginStall, type RemoteRunnerPluginStall } from "./remote-runner-recovery-probe.js";
+import { isPluginRpcTimeout, readRemoteRunnerRecoveryProbe, retryRemoteRunnerRecoveryAttempt, REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS, remoteRunnerPluginStall, type RemoteRunnerPluginStall } from "./remote-runner-recovery-probe.js";
 import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettledRemoteWarmControlState, summarizePostTerminalEvents, type RemoteWarmSessionRecovery, unsettledControllerCommands, waitForLiveWarmSessionOwner } from "./remote-warm-session-recovery.js";
 import { assertNativeWarmIngressRetirement, nativeWarmIngressAllocation, nativeWarmIngressIdentity, type NativeWarmIngressClaim, type NativeWarmIngressOwner } from "./native-warm-ingress-ownership.js";
 import { resolveNativeStagedAttachmentRecovery, type NativeStagedAttachmentRecovery } from "./native-staged-attachment-recovery.js";
@@ -16219,29 +16219,56 @@ export async function readRemoteRunnerStateFile(input: {
     };
     const checked = await runReadProbe(request);
     if (checked.exitCode !== 0 || checked.timedOut) throw unavailable(checked);
-    const staging = mkdtempSync(join(tmpdir(), "paperclip-native-state-"));
-    try {
-      chmodSync(staging, 0o700);
-      const localPath = join(staging, "state.json");
+    const syncOut = runner.syncOut;
+    // Each attempt transfers into its own private staging directory, so a retry
+    // never parses bytes an earlier failed attempt left behind. A transfer cannot
+    // be cancelled: when the attempt's time runs out it is abandoned, and its
+    // staging directory is removed again once that transfer settles.
+    const transferAttempt = async (timeoutMs?: number) => {
+      const staging = mkdtempSync(join(tmpdir(), "paperclip-native-state-"));
+      const removeStaging = () => rmSync(staging, { recursive: true, force: true });
       try {
-        await runner.syncOut([{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
-      } catch (transferError) {
-        // A native transfer keeps state bytes off command output. If it fails,
-        // run the same read solely as an error/absence probe with stdout sent to
-        // /dev/null; this retains the command path's exit/stderr distinction
-        // without ever returning state bytes through the runner result.
-        const diagnosticRequest = { ...request,
-          args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}; base64 < '${escapedPath}' > /dev/null`] };
-        let diagnostic: Awaited<ReturnType<typeof runner.execute>>;
-        try { diagnostic = await runReadProbe(diagnosticRequest); } catch { throw transferError; }
-        if (diagnostic.exitCode !== 0 || diagnostic.timedOut) throw unavailable(diagnostic);
-        throw transferError;
+        chmodSync(staging, 0o700);
+        const localPath = join(staging, "state.json");
+        const transfer = syncOut.call(runner, [{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
+        if (timeoutMs === undefined) await transfer;
+        else {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const abandoned = await Promise.race([transfer.then(() => false),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), timeoutMs); })])
+            .finally(() => clearTimeout(timer));
+          if (abandoned) {
+            const removeLate = () => {
+              try { removeStaging(); } catch (error) { logger.warn({ err: error }, "native session state staging cleanup failed"); }
+            };
+            void transfer.then(removeLate, removeLate);
+            return { timedOut: true, bytes: "" };
+          }
+        }
+        chmodSync(localPath, 0o600);
+        return { timedOut: false, bytes: readFileSync(localPath, "utf8") };
+      } finally {
+        removeStaging();
       }
-      chmodSync(localPath, 0o600);
-      return record(JSON.parse(readFileSync(localPath, "utf8")));
-    } finally {
-      rmSync(staging, { recursive: true, force: true });
+    };
+    let bytes: string;
+    try {
+      bytes = (input.recoveryDeadline === undefined ? await transferAttempt()
+        : await retryRemoteRunnerRecoveryAttempt({ stage: "runner_state", deadline: input.recoveryDeadline,
+            readOnly: true, stall: input.stall, attempt: transferAttempt })).bytes;
+    } catch (transferError) {
+      // A native transfer keeps state bytes off command output. If it fails,
+      // run the same read solely as an error/absence probe with stdout sent to
+      // /dev/null; this retains the command path's exit/stderr distinction
+      // without ever returning state bytes through the runner result.
+      const diagnosticRequest = { ...request,
+        args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}; base64 < '${escapedPath}' > /dev/null`] };
+      let diagnostic: Awaited<ReturnType<typeof runner.execute>>;
+      try { diagnostic = await runReadProbe(diagnosticRequest); } catch { throw transferError; }
+      if (diagnostic.exitCode !== 0 || diagnostic.timedOut) throw unavailable(diagnostic);
+      throw transferError;
     }
+    return record(JSON.parse(bytes));
   }
   logger.warn("session state read via command; output retained by provider");
   const fallbackRequest = { ...request, args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}; base64 < '${escapedPath}'`] };
