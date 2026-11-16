@@ -34,7 +34,7 @@ const readySpares = new ReadySpareKeeper();
 type KnownSparePool = { key: ReadySpareKey; ttlSeconds: number; desired: number; baseDesired: number; spareMax: number; demandWindowMinutes: number;
   idleMinutes: number; operations: ReadySpareOperations; idleStopped: boolean };
 type CompanySpareActivity = { lastActivityAt?: number; lastLeaseAcquiredAt?: number };
-type AcquireOutcomeReason = "no_ready_spare" | "refill_in_flight" | "env_not_listed" | "config_mismatch" | "claim_conflict" | "spares_disabled" | "idle";
+type AcquireOutcomeReason = "no_ready_spare" | "create_capped" | "refill_in_flight" | "env_not_listed" | "config_mismatch" | "claim_conflict" | "spares_disabled" | "idle";
 type AcquireOutcomeCounts = { spare: number; cold: number; reasons: Partial<Record<AcquireOutcomeReason, number>> };
 type CompanyAcquireOutcomes = Map<string, AcquireOutcomeCounts>;
 const knownSparePools = new Map<string, KnownSparePool>();
@@ -132,7 +132,7 @@ async function loadCompanyAcquireOutcomes(companyId: string): Promise<CompanyAcq
           if (typeof value.environmentId !== "string" || !value.environmentId) continue;
           const reasons: AcquireOutcomeCounts["reasons"] = {};
           if (value.reasons && typeof value.reasons === "object" && !Array.isArray(value.reasons)) {
-            for (const reason of ["no_ready_spare", "refill_in_flight", "env_not_listed", "config_mismatch", "claim_conflict", "spares_disabled", "idle"] as const) {
+            for (const reason of ["no_ready_spare", "create_capped", "refill_in_flight", "env_not_listed", "config_mismatch", "claim_conflict", "spares_disabled", "idle"] as const) {
               const count = (value.reasons as Record<string, unknown>)[reason];
               if (Number.isInteger(count) && Number(count) >= 0) reasons[reason] = Number(count);
             }
@@ -858,6 +858,12 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       let recent = 0;
       for (const sandbox of inventory) {
         if (sandbox.labels.owner !== `paperclip:${key.companyId}` || sandbox.labels.purpose !== "spare") throw new Error("Boat hourly spare inventory returned foreign ownership");
+        // Labels survive the transfer to a run. The durable claim name, not
+        // purpose=spare or terminal state, distinguishes demand from churn.
+        if (typeof sandbox.name === "string" && sandbox.name.startsWith("paperclip-claim:")) {
+          readySpares.observeClaimed(key.companyId, sandbox.id);
+          continue;
+        }
         const createdAt = Date.parse(sandbox.createdAt);
         if (!Number.isFinite(createdAt)) return false;
         if (createdAt >= cutoff) recent++;

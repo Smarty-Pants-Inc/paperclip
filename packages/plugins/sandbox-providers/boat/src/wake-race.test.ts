@@ -314,6 +314,22 @@ describe("Boat ready spare create admission (cl-spare-cap)", () => {
     expect(observed).toEqual({ liveUnclaimed: 1, replacementCreates: 2 });
   });
 
+  it("CONTROL claimed and archived company spares in other environments are real demand, not churn", async () => {
+    const h = await harness("cap-other-env", 1);
+    const first = await seed(h);
+    const template = h.boat.boxes.get(first)!;
+    for (let n = 0; n < 12; n++) {
+      const id = `bx_historical_${n}`;
+      h.boat.boxes.set(id, { ...template, id, name: `paperclip-claim:historical-${n}:attempt`,
+        labels: { ...template.labels, environment: `other-env-${n}` }, state: n % 2 ? "ready" : "archived" });
+    }
+    const before = h.boat.creates().length;
+    expect((await settle(h.acquire("after-other-env-demand"))).providerLeaseId).toBe(first);
+    await advance(5_000);
+    expect(h.boat.creates().length - before).toBe(1);
+    expect(liveUnclaimed(h)).toHaveLength(1);
+  });
+
   it("CONTROL adaptive target remains bounded by spareMax rather than silently becoming a fixed floor", async () => {
     const h = await harness("cap-adaptive", 3);
     await seed(h);

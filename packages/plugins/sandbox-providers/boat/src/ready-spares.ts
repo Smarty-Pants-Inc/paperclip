@@ -58,7 +58,7 @@ export type ReadySpareClaimStore = {
 
 export type ReadySpareClaimResult =
   | { outcome: "spare"; spare: ReadySpare }
-  | { outcome: "cold"; reason: "no_ready_spare" | "refill_in_flight" | "config_mismatch" | "claim_conflict" };
+  | { outcome: "cold"; reason: "no_ready_spare" | "create_capped" | "refill_in_flight" | "config_mismatch" | "claim_conflict" };
 
 export type ReadySpareClaimDatabase = {
   namespace: string;
@@ -187,7 +187,10 @@ export class ReadySpareKeeper {
   private readonly adopting = new Map<string, Promise<void>>();
   private readonly claiming = new Set<string>();
   private readonly inFlightClaims = new Map<string, number>();
+  // Pending/failed starts retain their reservation token. Successful creates
+  // use the provider ID, so transferring one to a run releases only that start.
   private readonly recentCreates = new Map<string, Map<string, number>>();
+  private readonly createCappedUntil = new Map<string, number>();
   private readonly failures = new Map<string, { count: number; retryAt: number }>();
   private readonly demandEvents = new Map<string, number[]>();
   private readonly stoppingSpares = new Set<string>();
@@ -199,6 +202,11 @@ export class ReadySpareKeeper {
     private claimStore?: ReadySpareClaimStore,
   ) {}
 
+  /** A durable provider claim (including another worker's) is demand, not churn. */
+  observeClaimed(companyId: string, spareId: string): void {
+    this.recentCreates.get(companyId)?.delete(spareId);
+  }
+
   setClaimStore(claimStore: ReadySpareClaimStore | undefined): void { this.claimStore = claimStore; }
   start(): void { this.stopping = false; }
   stop(): void { this.stopping = true; }
@@ -207,7 +215,7 @@ export class ReadySpareKeeper {
     this.claimStore = undefined;
     this.pools.clear(); this.inFlightCreates.clear(); this.reconciling.clear(); this.activeDesired.clear();
     this.pendingReconciliations.clear(); this.adopting.clear(); this.claiming.clear(); this.inFlightClaims.clear(); this.recentCreates.clear(); this.failures.clear(); this.demandEvents.clear();
-    this.stoppingSpares.clear();
+    this.stoppingSpares.clear(); this.createCappedUntil.clear();
   }
 
   /**
@@ -342,6 +350,7 @@ export class ReadySpareKeeper {
     if (index < 0) {
       if (healthy.length || (this.inFlightClaims.get(poolId) ?? 0) > 0) return { outcome: "cold", reason: "claim_conflict" };
       if (this.hasConfigMismatch(key)) return { outcome: "cold", reason: "config_mismatch" };
+      if (this.now() < (this.createCappedUntil.get(poolId) ?? 0)) return { outcome: "cold", reason: "create_capped" };
       if (this.isRefilling(key)) return { outcome: "cold", reason: "refill_in_flight" };
       return { outcome: "cold", reason: "no_ready_spare" };
     }
@@ -353,6 +362,10 @@ export class ReadySpareKeeper {
       const claimToken = `paperclip-claim:${attemptId}`;
       if (!await claimStore.reserve(spare, claimToken, runId) || this.stopping) return { outcome: "cold", reason };
       const claimed = await operations.claim(spare, claimToken, ttlSeconds);
+      if (claimed) {
+        this.observeClaimed(key.companyId, spare.id);
+        this.createCappedUntil.delete(poolId);
+      }
       return claimed && !this.stopping ? { outcome: "spare", spare } : { outcome: "cold", reason };
     } catch {
       return { outcome: "cold", reason };
@@ -494,23 +507,41 @@ export class ReadySpareKeeper {
       const recent = this.recentCreates.get(key.companyId) ?? new Map<string, number>();
       for (const [token, at] of recent) if (this.now() - at >= 60 * 60 * 1000) recent.delete(token);
       this.recentCreates.set(key.companyId, recent);
-      if (recent.size >= this.maxCreatesPerHour) break;
       const reservation = randomUUID();
       recent.set(reservation, this.now());
       if (operations.allowCreate) {
         let allowed = false;
         try { allowed = await operations.allowCreate(); } catch { allowed = false; }
-        if (!allowed || this.stopping) { recent.delete(reservation); break; }
+        if (!allowed || this.stopping) {
+          recent.delete(reservation);
+          if (!allowed) this.createCappedUntil.set(poolId, this.now() + 60 * 60 * 1000);
+          break;
+        }
+      }
+      // The provider inventory check also releases starts durably claimed by
+      // other workers. Check the local ledger afterwards, including this new
+      // reservation, so failed/unknown starts still cannot bypass the cap.
+      if (recent.size > this.maxCreatesPerHour) {
+        recent.delete(reservation);
+        this.createCappedUntil.set(poolId, Math.min(...recent.values()) + 60 * 60 * 1000);
+        break;
       }
       if (this.stopping) { recent.delete(reservation); break; }
+      this.createCappedUntil.delete(poolId);
       reservations.push(reservation);
     }
     if (!reservations.length) return;
     this.inFlightCreates.set(poolId, (this.inFlightCreates.get(poolId) ?? 0) + reservations.length);
     try {
-      const results = await Promise.allSettled(reservations.map(async () => {
+      const results = await Promise.allSettled(reservations.map(async reservation => {
         try {
           const spare = await operations.create(key);
+          const recent = this.recentCreates.get(key.companyId);
+          const createdAt = recent?.get(reservation);
+          if (recent && createdAt !== undefined) {
+            recent.delete(reservation);
+            recent.set(spare.id, createdAt);
+          }
           const pending = this.pendingReconciliations.get(poolId);
           const effectiveDesired = pending?.desired ?? this.activeDesired.get(poolId) ?? desired;
           const current = this.pools.get(poolId) ?? [];

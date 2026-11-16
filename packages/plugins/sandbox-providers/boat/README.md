@@ -22,6 +22,9 @@ Every acquire records exactly one outcome (`spare` when a warm spare is claimed,
 otherwise `cold` with a reason) in company-scoped plugin state by environment,
 and emits one structured `[boat] acquire outcome=...` log line without secrets.
 Counts are exposed in the plugin health message alongside its existing status.
+A cache miss after a known hourly admission refusal reports `create_capped`
+(next to `no_ready_spare` and `refill_in_flight`). This cached diagnostic expires
+or clears on a successful admission; it never blocks a new admission check.
 
 A company is active after any lease acquire, resume or release handled by this
 plugin, or any `agent.run.started`, `agent.run.finished`, `agent.run.failed`,
@@ -62,10 +65,21 @@ replacement starts immediately after a claim. After a worker restart, the first
 acquire asynchronously rediscovers candidates by labels; if it has no in-memory
 candidate, that acquire creates normally and a later acquire may claim the adopted
 spare. Mismatched, stopped, expired or unfinished unclaimed spares are stopped,
-never deleted. At most three spares are configured
-per company/environment and no more than 12 spare create attempts per company
-per rolling hour are allowed. Failed starts use exponential backoff (up to 15
-minutes). A provider-side Boat TTL is applied at create and refreshed when less
+never deleted. The configured floor is at most three per company/environment;
+the demand target is bounded by `spareMax` (at most five). Reconciliation is
+coalesced per pool and subtracts the live ready inventory and in-flight creates
+before starting replacements. With `spares=1, spareMax=1`, each claim needs one
+replacement; with the default maximum of three, the documented demand policy
+can also grow the pool beyond its floor.
+
+The company-wide rolling-hour cap of 12 counts only unclaimed spare creates:
+ready/creating spares and failed, stopped or archived unclaimed churn. A spare
+transferred to a run is real demand and no longer consumes that cap, even after
+it stops and even when it belongs to another environment. Boat's durable
+`paperclip-claim:` name distinguishes that transfer because labels are immutable.
+Local pending and failed attempts still reserve quota, including starts that
+failed before Boat returned an ID. Failed starts use exponential backoff (up to
+15 minutes). A provider-side Boat TTL is applied at create and refreshed when less
 than half remains (maintenance checks every 15 seconds); if the plugin worker
 dies, Boat auto-stops the spare when that TTL expires. The immutable expiry
 label records the initial create deadline; Boat's refreshed `archiveAfter` is

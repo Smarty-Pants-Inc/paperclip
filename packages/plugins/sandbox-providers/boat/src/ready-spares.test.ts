@@ -335,6 +335,34 @@ describe("Boat ready spare keeper", () => {
     expect(ops).not.toHaveProperty("delete");
   });
 
+  it("releases a successful create reservation only when a claim transfers it to a run", async () => {
+    const keeper = new ReadySpareKeeper(() => start, 1, claimStore());
+    const first = operations();
+    await keeper.reconcile(key, 1, first.ops);
+    const secondKey = { ...key, environmentId: "env-b" };
+    const second = operations();
+    await keeper.reconcile(secondKey, 1, second.ops);
+    expect(second.ops.create).not.toHaveBeenCalled();
+    await expect(keeper.claim(key, "demand", 1800, first.ops)).resolves.toBeDefined();
+    await keeper.reconcile(secondKey, 1, second.ops);
+    expect(second.ops.create).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases durable claims observed from another worker without discarding failed starts", async () => {
+    const keeper = new ReadySpareKeeper(() => start, 1);
+    const first = operations();
+    await keeper.reconcile(key, 1, first.ops);
+    keeper.observeClaimed(key.companyId, first.inventory[0].id);
+    const secondKey = { ...key, environmentId: "env-b" };
+    const second = operations();
+    await keeper.reconcile(secondKey, 1, second.ops);
+    expect(second.ops.create).toHaveBeenCalledTimes(1);
+    keeper.observeClaimed("another-company", second.inventory[0].id);
+    const third = operations();
+    await keeper.reconcile({ ...key, environmentId: "env-c" }, 1, third.ops);
+    expect(third.ops.create).not.toHaveBeenCalled();
+  });
+
   it("caps creates per company per rolling hour and exponentially backs off failed creates", async () => {
     let now = start;
     const keeper = new ReadySpareKeeper(() => now, 1);
