@@ -37,6 +37,67 @@ export async function provesNoNativeRunProviderWork(db: Pick<Db, "execute">, inp
     && row.acceptedResult === false && row.finalizedResult === false);
 }
 
+/** Item kinds a provider only thinks, writes or accounts with. Any other item
+ * kind (a command, a tool, a file change, an MCP or dynamic tool call, or a kind
+ * this list does not know yet) counts as tool work: the proof fails closed. */
+export const NATIVE_INERT_ITEM_KINDS = ["agentMessage", "reasoning", "usage", "userMessage", "contextCompaction", "warning"] as const;
+
+/** Item event types; each proves only with an inert item kind (above). */
+export const NATIVE_ITEM_EVENT_TYPES = ["item.started", "item.delta", "item.updated", "item.completed", "item.failed"] as const;
+
+/**
+ * CLOSED allow-list of run event types known to be INERT: controller, Runner,
+ * harness, session and turn lifecycle, accounting and diagnostics, none of
+ * which acts outside the provider's own conversation (review-fleet-3 F7-1).
+ * Every other event type, including any type this list does not know yet,
+ * denies the proof: a tool, semantic tool, delegation, MCP app, terminal or
+ * hook event, an issue, workspace diff/change/file, artifact, research,
+ * runtime request, interaction, attention, status decision, external
+ * provider, run result/terminal, response publication, task-history or
+ * child-task read, tool-gateway delivery, goal or plan. The list per emitted
+ * literal (inert / side-effecting) is in the F7 result (TL08).
+ */
+export const NATIVE_INERT_RUN_EVENT_TYPES = [
+  "lifecycle",
+  "turn.submitted", "turn.accepted", "turn.started", "turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled",
+  "session.starting", "session.started", "session.resuming", "session.resumed", "session.reconciled", "session.updated",
+  "session.failed", "session.closed", "session.capabilities.updated",
+  "harness.starting", "harness.ready", "harness.diagnostic", "harness.exited",
+  "runner.connected", "runner.reconnected", "runner.disconnected", "runner.diagnostic", "runner.suspending",
+  "runner.suspended", "runner.reconciled", "runner.attachment.settled", "runner.backpressure", "runner.draining",
+  "runner.stopped",
+  "run.attached", "run.detached", "run.performance.span", "run.performance.budget_exceeded",
+  "usage.reported", "context.compacted", "model.route.changed", "model.verification.updated", "runtime.phase.changed",
+  "provider.notice.recorded", "sandbox.metric", "workspace.ready",
+  "native.process_start_requested", "native.process_identity_recorded", "native.recovery.transition",
+  "native.recovery.execution_reclaimed", "native.diagnostic",
+] as const;
+
+/** No recorded tool call or side-effecting provider work across every runner
+ * instance of this run. Unlike provesNoNativeRunProviderWork, a turn that only
+ * started, thought and wrote text still proves it. Every run event must be on
+ * the closed inert list (an item only with an inert kind); anything else,
+ * known side-effecting or unknown, denies the proof. An empty
+ * pendingRuntimeRequests alone is NOT this proof. A read failure denies it. */
+export async function provesNoNativeRunToolWork(db: Pick<Db, "execute">, input: {
+  companyId: string; runId: string; signal?: AbortSignal;
+}): Promise<boolean> {
+  input.signal?.throwIfAborted();
+  const { companyId, runId } = input;
+  const list = (values: readonly string[]) => sql.join(values.map(value => sql`${value}`), sql`, `);
+  const result = await db.execute(sql`select
+    exists (select 1 from ${heartbeatRunEvents} event where event.company_id = ${companyId} and event.run_id = ${runId}
+      and not (event.event_type in (${list(NATIVE_INERT_RUN_EVENT_TYPES)})
+        or (event.event_type in (${list(NATIVE_ITEM_EVENT_TYPES)})
+          and coalesce(event.payload->'prpEvent'->'payload'->>'kind', '') in (${list(NATIVE_INERT_ITEM_KINDS)})))) as "toolEvent",
+    exists (select 1 from ${toolInvocations} invocation where invocation.company_id = ${companyId}
+      and invocation.run_id = ${runId}) as "toolInvocation"`);
+  input.signal?.throwIfAborted();
+  const rows = (Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? []) as Array<Record<string, unknown>>;
+  const row = rows[0];
+  return Boolean(row && row.toolEvent === false && row.toolInvocation === false);
+}
+
 export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "execute"> &
   Partial<Pick<EnvironmentRuntimeService, "readPredecessorSandboxRecord">>;
 type ProofDb = Pick<Db, "select" | "execute">;

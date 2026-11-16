@@ -106,4 +106,13 @@ export interface ControlPlanePort {
    * recovery refusal unchanged.
    */
   provesNoRunProviderWork?(options: FinalizeControlPlaneOperationOptions): Promise<boolean>;
+  /**
+   * Durable proof, across every runner instance, that this run recorded no
+   * tool call or other side-effecting provider work: no tool invocation, and
+   * every run event on a CLOSED list of known-inert types (an item only with a
+   * kind known to be inert); any other event type, known or not, denies it.
+   * An empty pendingRuntimeRequests alone does not prove that no tool ran. A port without this proof never replaces a
+   * session whose turn was in flight.
+   */
+  provesNoRunToolWork?(options: FinalizeControlPlaneOperationOptions): Promise<boolean>;
 }

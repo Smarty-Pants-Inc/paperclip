@@ -569,8 +569,10 @@ export class NativeRunnerSourceReconciliationRequiredError extends Error {
 /** The Runner keeps no control-plane state for the saved session: none is
  * live and no archived authority epoch matches it. A new sandbox whose
  * harness backup was never saved has nothing to resume, and recovering again
- * reads the same empty state. The driver classifies it only for a session
- * with no turn or runtime request in flight. */
+ * reads the same empty state. This definite absence is a fact about the Runner,
+ * not the turn: the driver classifies it even with a turn in flight (the
+ * runtime then needs a durable no-tool-call proof to replace), and a pending
+ * runtime request makes it an unsettled side effect that stops by name. */
 export class NativeRunnerResumeStateUnavailableError extends Error {
   readonly code = "native_runner_resume_state_unavailable";
   constructor() {
@@ -583,6 +585,22 @@ export function isRunnerResumeStateUnavailable(error: unknown, depth = 0): boole
   if (!error || typeof error !== "object" || depth > 5) return false;
   if (error instanceof NativeRunnerResumeStateUnavailableError) return true;
   return isRunnerResumeStateUnavailable((error as { cause?: unknown }).cause, depth + 1);
+}
+
+/** Why a definite absence happened, for the recorded provider identity change:
+ * a replaced box's reader exits 66 (no runner/runner-state.json on the box);
+ * otherwise the controller's own control-plane state and its archive are gone. */
+export type RunnerResumeStateUnavailableReason = "resume_failed_on_new_box" | "runner_state_lost";
+
+export function runnerResumeStateUnavailableReason(error: unknown): RunnerResumeStateUnavailableReason | undefined {
+  if (!isRunnerResumeStateUnavailable(error)) return undefined;
+  for (let current: unknown = error, depth = 0; current && typeof current === "object" && depth <= 5;
+    current = (current as { cause?: unknown }).cause, depth += 1) {
+    if (current instanceof Error && /^runner_remote_state_unavailable: exit=66 timedOut=false(?:\s|$)/.test(current.message)) {
+      return "resume_failed_on_new_box";
+    }
+  }
+  return "runner_state_lost";
 }
 
 export function runnerRefreshWaitForTurn(error: unknown, depth = 0): boolean {
@@ -600,8 +618,11 @@ export interface HarnessSessionRecoveryResult {
   failureClass?: RunnerRecoveryFailureClass;
   /** Set only with PROVIDER_STATE_INCOMPATIBLE: the Runner proved it holds no
    * saved state for this session (NativeRunnerResumeStateUnavailableError) and
-   * the checkpoint had no turn or runtime request in flight. */
+   * the checkpoint had no runtime request pending. A turn may still be in
+   * flight: the runtime replaces it only with a durable no-tool-call proof. */
   resumeStateUnavailable?: true;
+  /** With a definite absence: which state was lost (recorded on replacement). */
+  identityChangeReason?: RunnerResumeStateUnavailableReason;
   runnerExitConfirmed?: true;
   refreshWaitForTurn?: true;
   prepareRefusalCode?: RunnerPrepareRefusalCode;
