@@ -112,7 +112,8 @@ it.each([0, 42000, 120000])("preserves an explicit managed-home reserve of %i", 
   expect(f.settings).toEqual(settings);
 });
 
-it("respects the user's original Pi reserve while preserving package declarations", async () => {
+// SUPERSEDE REQUESTED (RFL): row A carries packages by design
+it("respects the user's original Pi reserve without importing unrelated settings", async () => {
   const f = await fixture({ providers: { paperclip: provider({ contextWindow: 1000000 }) } }, {}, true, false,
     { user: { compaction: { reserveTokens: 54321 }, packages: ["do-not-import"] } });
   expect(f.settings).toEqual({ packages: ["do-not-import"], compaction: { reserveTokens: 54321 } });
