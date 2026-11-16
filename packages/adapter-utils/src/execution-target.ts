@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { githubLauncherSource } from "./github-launcher.js";
+import { GitExecutionError, gitExecutionAttempt, retryGitExecution, type GitExecutionAttempt, type GitExecutionWarning } from "./git-execution-retry.js";
 import { ACP_PROCESS_TERMINAL_SIGNALS, type ACP_PROCESS_TERMINAL_SOURCES } from "./acpx-engine/constants.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {
@@ -1767,8 +1768,19 @@ async function githubOperationLauncherBasePath(
   return remotePath;
 }
 
+export class ExecutionTargetGitContextError extends GitExecutionError {
+  override readonly name = "ExecutionTargetGitContextError";
+  readonly reason = "EXECUTION_TARGET_GIT_CONTEXT_FAILED";
+
+  constructor(runId: string, attempts: readonly GitExecutionAttempt[]) {
+    super("Could not read execution-target Git context", runId, attempts);
+  }
+}
+
 /** Read only execution-target Git context; never import the controller's credentials into SSH. */
 export async function prepareGitHubExecutionEnvironment(input: {
+  runId?: string;
+  onWarning?: (details: GitExecutionWarning, message: string) => void;
   target: AdapterExecutionTarget | null | undefined;
   cwd: string;
   env: Record<string, string>;
@@ -1847,15 +1859,25 @@ if [ -n "$top" ] && [ "$(cd "$top" && pwd -P)" = "$cwd" ]; then
 fi
 printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
 `;
-    const result = await adapterExecutionTargetCommandRunner(remote).execute({
-      command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
-      // The caller's cwd belongs to the controller. Copied sandbox/SSH
-      // workspaces can live at a different path on the execution target.
-      cwd: remote.remoteCwd, timeoutMs: 15_000,
+    const runId = input.runId ?? "unknown";
+    const started = performance.now();
+    // The read-only probe shares exclusion's safe diagnostics and one retry.
+    // Keep 15 s per attempt: about 31 s plus RPC overhead in the worst case,
+    // not a hard wall-clock deadline.
+    const result = await retryGitExecution({
+      execute: () => adapterExecutionTargetCommandRunner(remote).execute({
+        command: "sh", args: ["-c", probe, "paperclip-git-context", input.hostCredentials ? "host" : "managed"],
+        // The caller's cwd belongs to the controller. Copied sandbox/SSH
+        // workspaces can live at a different path on the execution target.
+        cwd: remote.remoteCwd, timeoutMs: 15_000,
+      }),
+      error: attempts => new ExecutionTargetGitContextError(runId, attempts),
+      warn: input.onWarning ?? ((details, message) => console.warn(details, message)),
+      warningMessage: "Execution-target Git context read failed",
     });
-    if (result.exitCode !== 0) throw new Error("Could not read execution-target Git context");
     const payload = result.stdout.split("\0PAPERCLIP_GIT_CONTEXT_V1\0")[1]?.split("\0PAPERCLIP_GIT_CONTEXT_END\0")[0];
-    if (payload === undefined) throw new Error("Could not read execution-target Git context");
+    // A successful but malformed response is not a transient exec failure.
+    if (payload === undefined) throw new ExecutionTargetGitContextError(runId, [gitExecutionAttempt(result, started)]);
     discovered = {};
     const records = payload.split("\0");
     const roots: string[] = [];
