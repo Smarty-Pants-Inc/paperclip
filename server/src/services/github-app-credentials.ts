@@ -116,7 +116,7 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
         || (result.verifiedRegistrationId !== undefined && result.verifiedRegistrationId !== scope.registrationId)
         || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== config.installationId) githubAppFailure("repositories");
       await readProjectAppCustody(db, { companyId: c.companyId, projectId: c.projectId, config: c.config,
-        refs: g.credentialSecretRefs, registrationId: result.verifiedRegistrationId, repositoryIds: ids });
+        refs: g.credentialSecretRefs, registrationId: result.verifiedRegistrationId, repositoryIds: ids, connectionId: c.id });
       await assertProjectConnectionAdmission(db, { companyId: c.companyId, projectId: c.projectId, operation: "use", connection: c,
         targetAgentIds: agentId ? [agentId] : [], proposedSecretRefs: g.credentialSecretRefs, proposedRepositoryIds: ids });
       await valid(result.verifiedRegistrationId);
