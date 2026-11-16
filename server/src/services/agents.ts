@@ -69,11 +69,14 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         }
         await assertAgentInteraction(tx, { companyId: existing.companyId, actorAgentId: options?.actorAgentId,
           operation: "configure", targetAgentId: id, lock: "update" });
-        // #20805: the permission write (shared runtime hold) is followed by grant
-        // writes in afterUpdate (exclusive); take the exclusive hold first.
-        await lockCompanyAgentRuntime(tx, existing.companyId);
         const [current] = await tx.select().from(agents).where(eq(agents.id, id)).for("update");
         if (!current) return null;
+        // #20805: the permission write (shared runtime hold) is followed by grant
+        // writes in afterUpdate (exclusive); take the exclusive hold before the
+        // first agent write. R2 (src8): rows first, like the hire. Nothing above
+        // writes an agent runtime row (the interaction checks and the SELECT ...
+        // FOR UPDATE fire no trigger), so no shared hold exists yet to upgrade.
+        await lockCompanyAgentRuntime(tx, current.companyId);
         if (current.status === "pending_approval") throw conflict("Pending approval agent permissions cannot be changed before board approval");
         const protectedPermissions = preserveAgentInteractionPermissions(current.permissions, permissions);
         await notifyAttentionRetentionWork(tx, { companyId: current.companyId });

@@ -31,6 +31,10 @@ export async function prepareAgentHire(db: Db, companyId: string, input: CreateA
   assertNoInitialAgentInteractionPermissions(input.permissions);
   await assertAgentInteraction(db, { companyId, actorAgentId: options?.createdByAgentId, actorCompanyId: options?.createdByAgentCompanyId,
     operation: "mention", texts: [JSON.stringify(input), ...(options?.interactionTexts ?? [])], lock: "update" });
+  // #20805 R2 (src8): the new row's reports_to foreign key takes a KEY SHARE on
+  // the manager row. Take it here, before the company lock, so the hire never
+  // waits for an existing agent row while it holds the exclusive lock.
+  if (input.reportsTo) await db.select({ id: agents.id }).from(agents).where(eq(agents.id, input.reportsTo)).for("key share");
   // #20805: after the hirer (and setup draft, records.ts) row locks, before the
   // agent row write and the grant writes. One lock, independent of company size.
   await lockCompanyAgentRuntime(db, companyId);
@@ -184,9 +188,16 @@ export async function ensureNewAgentMembership(db: Db, companyId: string, agentI
 
 export async function prepareAgentHireApproval(txDb: Db, existing: AgentHireRecord, approvedPayload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch> {
   // #20805: approval activates the agent row (a shared runtime hold) and then
-  // writes its grants (an exclusive one). Take the exclusive hold first.
-  await lockCompanyAgentRuntime(txDb, existing.companyId);
+  // writes its grants (an exclusive one), so it takes the exclusive hold before
+  // its first agent write. R2 (src8): rows first, like the hire. The approved
+  // agent's row (and a new manager's key share) are locked by plain SELECT ...
+  // FOR, which fires no runtime trigger, so no shared hold exists yet to upgrade.
   const approvedPatch = approvedPayload ? configPatchFromApprovalPayload(approvedPayload) : {};
+  await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, existing.id)).for("no key update");
+  const approvedManager = (approvedPatch as { reportsTo?: unknown }).reportsTo;
+  if (typeof approvedManager === "string")
+    await txDb.select({ id: agents.id }).from(agents).where(eq(agents.id, approvedManager)).for("key share");
+  await lockCompanyAgentRuntime(txDb, existing.companyId);
   const patch = { ...approvedPatch } as AgentConfigurationPatch;
   const hasApprovedAdapterConfig = Object.prototype.hasOwnProperty.call(patch, "adapterConfig") && isPlainRecord(patch.adapterConfig);
   if (
