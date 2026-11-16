@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -7,7 +7,7 @@ import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 
 const mocks = vi.hoisted(() => ({ probe: vi.fn(), resolveBinary: vi.fn(), launch: vi.fn(),
-  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { regular: boolean; bytes: string }[] }));
+  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { binaryArchived: boolean; binaryBytes: string | null; source: string[]; missing: string[]; copied: string[] }[] }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({
   ...await original<object>(), probeNativeRunnerEnvironment: mocks.probe,
 }));
@@ -32,8 +32,16 @@ vi.mock("./native-session-executor.js", async original => {
     syncRemoteRunnerDirectoryOut: mocks.syncOut.mockImplementation(async (input: Parameters<typeof actual.syncRemoteRunnerDirectoryOut>[0]) => {
       try {
         await actual.syncRemoteRunnerDirectoryOut(input);
+        // M2: a runner binary whose sha matches the staged one is not copied
+        // out (its size + sha256 go in the manifest); the records are.
         const archived = join(input.targetPath, "bin", "paperclip-runnerd");
-        mocks.archives.push({ regular: (await lstat(archived)).isFile(), bytes: await readFile(archived, "utf8") });
+        const excluded = input.excludeEntries ?? [];
+        const source = (await readdir(input.sourcePath, { recursive: true })).filter(entry =>
+          !excluded.some(prefix => entry === prefix || entry.startsWith(`${prefix}/`))).sort();
+        const target = new Set(await readdir(input.targetPath, { recursive: true }));
+        const binaryArchived = await lstat(archived).then(stat => stat.isFile(), () => false);
+        mocks.archives.push({ binaryArchived, binaryBytes: binaryArchived ? await readFile(archived, "utf8") : null,
+          source, missing: source.filter(entry => !target.has(entry)), copied: [...target].sort() });
       } catch (error) { mocks.cleanupErrors.push(String(error)); throw error; }
     }),
   };
@@ -147,8 +155,84 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.requests.some(request => request.stdin !== undefined)).toBe(false);
     expect(await readFile(f.installed, "utf8")).toBe(script);
     expect(mocks.syncOut).toHaveBeenCalledTimes(2);
-    expect(mocks.archives).toEqual([0, 1].map(() => ({ regular: true, bytes: script })));
-    for (const [input] of mocks.syncOut.mock.calls) expect(input.excludeEntries).toBeUndefined();
+    expect(mocks.archives.map(archive => archive.binaryArchived)).toEqual([false, false]);
+    for (const [input] of mocks.syncOut.mock.calls) expect(input.excludeEntries).toEqual(["bin/paperclip-runnerd", "pi/node-compile-cache"]);
+    const manifests = await retainedStaticManifests(f.root);
+    expect(manifests).toHaveLength(2);
+    for (const manifest of manifests) {
+      expect(manifest).toMatch(/^\d+ [0-9a-f]{64} bin\/paperclip-runnerd$/m);
+      expect(Number(/^count (\d+)$/m.exec(manifest)?.[1])).toBe(manifest.split("\n").filter(line => /^\d+ [0-9a-f]{64} \S/.test(line)).length);
+      expect(manifest).toMatch(/^runnerd expected [0-9a-f]{64} \/ found [0-9a-f]{64} \/ match yes$/m);
+    }
+  });
+
+  it("copies every record file and excludes only the two static entries", async () => {
+    const f = await fixture("matching");
+    // Plant a Pi session record and a compile-cache file in each box root.
+    const execute = f.runner.execute.bind(f.runner);
+    vi.spyOn(f.runner, "execute").mockImplementation(async request => {
+      const result = await execute(request);
+      const root = request.command === "mkdir" ? request.args?.[4] : undefined;
+      if (root?.includes("/.paperclip-runtime/")) {
+        await mkdir(join(root, "pi", "node-compile-cache"), { recursive: true });
+        await writeFile(join(root, "pi", "setup-record.jsonl"), "{}\n");
+        await writeFile(join(root, "pi", "node-compile-cache", "blob"), "cache");
+      }
+      return result;
+    });
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(mocks.cleanupErrors).toEqual([]);
+    expect(result.status).toBe("pass");
+    // Deny list only: every box file outside the two excluded entries is copied.
+    for (const archive of mocks.archives) {
+      expect({ missing: archive.missing, some: archive.source.length > 0 }).toEqual({ missing: [], some: true });
+      expect(archive.copied).toContain("pi/setup-record.jsonl");
+      expect(archive.copied).not.toContain("pi/node-compile-cache/blob");
+    }
+  });
+
+  it("copies the box binary as evidence when its sha differs from the staged runner", async () => {
+    const f = await fixture("matching");
+    const execute = f.runner.execute.bind(f.runner);
+    vi.spyOn(f.runner, "execute").mockImplementation(async request => {
+      const result = await execute(request);
+      return request.args?.[2] === "paperclip-probe-static-manifest"
+        ? { ...result, stdout: result.stdout.replace(/^(\d+) [0-9a-f]{64} bin\/paperclip-runnerd$/m, `$1 ${"0".repeat(64)} bin/paperclip-runnerd`) }
+        : result;
+    });
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(mocks.cleanupErrors).toEqual([]);
+    expect(result.status).toBe("pass");
+    expect(mocks.archives.map(archive => archive.binaryArchived)).toEqual([true, true]);
+    // The old byte check, kept where the binary is still copied.
+    expect(mocks.archives.map(archive => archive.binaryBytes)).toEqual([script, script]);
+    for (const [input] of mocks.syncOut.mock.calls) expect(input.excludeEntries).toEqual(["pi/node-compile-cache"]);
+    for (const manifest of await retainedStaticManifests(f.root)) expect(manifest).toMatch(/ \/ found 0{64} \/ match no$/m);
+  });
+
+  it("fails closed with no copy and no removal when the static manifest has no count line", async () => {
+    const f = await fixture("matching");
+    const execute = f.runner.execute.bind(f.runner);
+    vi.spyOn(f.runner, "execute").mockImplementation(async request => {
+      const result = await execute(request);
+      return request.args?.[2] === "paperclip-probe-static-manifest"
+        ? { ...result, stdout: result.stdout.replace(/^count \d+\n?$/m, "") }
+        : result;
+    });
+    // This fixture's probe mock never calls onCleanupConfirmed, so cleanup runs from the probe's own
+    // finally: native_probe_static_manifest_invalid is thrown there and the outer catch reports it with
+    // the product's fixed safe metadata message (raw text dropped by design). Pin the failure point
+    // instead: the manifest command ran, then no sync-out and no removal.
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("fail");
+    expect(result.checks.map(check => check.code)).toContain("pi_rpc_metadata_failed");
+    expect(f.requests.some(request => request.args?.[2] === "paperclip-probe-static-manifest")).toBe(true);
+    expect(mocks.syncOut).not.toHaveBeenCalled();
+    expect(f.requests.some(request => request.command === "rm" && request.args?.[0] === "-rf")).toBe(false);
+    expect(await retainedStaticManifests(f.root)).toEqual([]);
+    expect((await readdir(join(f.root, "state"), { recursive: true })).filter(entry => entry.endsWith("remote-runtime"))).toEqual([]);
+    const remoteRoot = f.requests.find(request => request.command === "mkdir")?.args?.[4];
+    expect(remoteRoot && await lstat(remoteRoot).then(stat => stat.isDirectory(), () => false)).toBe(true);
   });
 
   it.each(["wrong-sha", "missing"] as const)("uploads and passes with a %s preinstalled runner", async image => {
@@ -233,3 +317,10 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.requests).toEqual([]);
   });
 });
+
+async function retainedStaticManifests(root: string): Promise<string[]> {
+  const state = join(root, "state");
+  const entries = await readdir(state, { recursive: true });
+  return Promise.all(entries.filter(entry => entry.endsWith(".excluded-static-files.txt")).sort()
+    .map(entry => readFile(join(state, entry), "utf8")));
+}
