@@ -404,6 +404,20 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     } else await replacement?.cleanupWorkspaceSnapshot?.();
     return adopted;
   }
+  /** A checkpoint that changed no file writes nothing. It still rechecks the
+   * run's save authority, so a revoked editor stops reusing a warm directory.
+   * A low-trust run never had that authority and has nothing to save here:
+   * recheck the read access that admitted its copy instead of failing a save
+   * that does not exist. A changed tree still goes through store.apply and is
+   * refused there with the named reason. */
+  async function unchangedCheckpoint(row: Copy) {
+    try { await store.locked(row.companyId, row.agentId, actor(row), true, async () => undefined); }
+    catch (error) {
+      const reason = error instanceof HttpError && error.status === 403 ? (error.details as { reason?: unknown } | undefined)?.reason : null;
+      if (reason !== "deny_low_trust_boundary") throw error;
+      await store.locked(row.companyId, row.agentId, actor(row), false, async () => undefined);
+    }
+  }
   async function checkpoint(row: Copy, target?: AdapterExecutionTarget | null, stopped = false): Promise<Copy> {
     if (!await owns(row) || row.state === "superseded") return row;
     target ??= transports.get(key(row))?.target;
@@ -425,7 +439,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const changed = nextHash !== row.baseHash;
         const { storageWarning } = changed
           ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
-          : await store.locked(row.companyId, row.agentId, actor(row), true, async () => ({
+          : await unchangedCheckpoint(row).then(() => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
           }));
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
