@@ -493,10 +493,12 @@ describe("project connection writer admission (round-4 B)", () => {
     // Both IDs are ratified and current, but this connection requested only A
     // (101). A provider reply for approved A2 (102) is still the wrong token.
     harness.verify.mockResolvedValue({ ...harness.verified, repositoryIds: [102] });
+    // RFL 07:41Z: tenth exact zero-residue replacement, after genuine setup.
+    const before = await setupSnapshot(f, [connection.id]);
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor()))
       .rejects.toMatchObject({ status: 403, details: { code: "project_connection_repository_not_approved" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    expect((await counts(f.companyId)).activity - before.activity).toBe(0);
   });
 
   it("J05-positive: finish permits a requested shard inside a larger primary approval", async () => {
