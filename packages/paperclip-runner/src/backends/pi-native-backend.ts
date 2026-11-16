@@ -5,6 +5,7 @@ import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE
 import type { NativeExecutionInput } from "../contracts/native-execution.js";
 import type { NativeSessionBackend } from "../contracts/native-session-backend.js";
 import { PiRpcDriver, type PiRpcDriverOptions } from "../drivers/pi/pi-rpc-driver.js";
+import { piAdmissionTimeoutMs } from "../drivers/pi/pi-native-config.js";
 import { HarnessDriverBackend } from "./harness-driver-backend.js";
 import { nativeSystemInstructions, nativeTaskConstraints } from "./runtime-context.js";
 
@@ -23,6 +24,7 @@ export function createPiNativeSessionBackend(
   return new HarnessDriverBackend(new PiRpcDriver({
     ...options,
     environment: options.environment,
+    startupTimeoutMs: piAdmissionTimeoutMs(options.environment ?? {}, options.startupTimeoutMs),
     piRpcThinkingLevel: resolveDefaultPiRpcThinkingLevel(input.provider.piRpcThinkingLevel, input.provider.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG),
     systemInstructions: nativeSystemInstructions(input),
     runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,

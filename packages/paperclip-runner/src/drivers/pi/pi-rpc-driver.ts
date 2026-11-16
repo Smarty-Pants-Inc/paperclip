@@ -70,6 +70,7 @@ export interface PiRpcDriverOptions {
   runnerInstanceId?: string;
   shutdownTimeoutMs?: number;
   killTimeoutMs?: number;
+  /** One shared post-startup admission budget; also caps each exchange. */
   startupTimeoutMs?: number;
   /** First RPC of a new Pi process (startup + extension load), default 60 s. */
   processStartupTimeoutMs?: number;
@@ -332,11 +333,11 @@ export class PiRpcDriver implements HarnessDriver {
     let transport: PiRpcTransport | undefined;
     try {
       let port!: PiRpcAdmissionPort;
+      let budget!: PiAdmissionBudget;
       const ready = await measure("runner.pi.open.pi_spawn_to_get_state", async () => {
         transport = this.#options.transportFactory?.(transportOptions) ?? new PiRpcTransport(transportOptions);
         // --session loads an existing file too: no saved selection bypasses live
         // admission. The broker/models.json bootstrap above remains first.
-        port = piAdmissionPort(transport, this.#options.startupTimeoutMs);
         // Pi answers RPC only after it has started and loaded its extensions. On
         // a cold box (lazy snapshot files, no compile cache yet) that alone took
         // 6.6-12.4 s, so the first request of a NEW process waits for startup
@@ -346,6 +347,10 @@ export class PiRpcDriver implements HarnessDriver {
         return record(await withAbort(withTimeout(transport.request("get_state", {}, { timeoutMs: startupTimeoutMs }),
           startupTimeoutMs, "Pi RPC startup timed out"), input.signal).then(response => response.data));
       });
+      // Cold process readiness has its own bound. Every subsequent RPC and
+      // private exchange in this admission spends this same monotonic budget.
+      budget = new PiAdmissionBudget(this.#options.startupTimeoutMs);
+      port = piAdmissionPort(transport!, this.#options.startupTimeoutMs, undefined, budget);
       if (recovery) {
         // Check native readback before model/config mutation, not just the argv.
         const live = ready;
@@ -356,7 +361,7 @@ export class PiRpcDriver implements HarnessDriver {
         const send = <C extends PiBindCommand>(request: C): Promise<PiBindResponse<C>> => measure(
           request.type === "bind" ? "runner.pi.open.bind_receipt" : `runner.pi.open.${request.type}` as PiOpenPhase, async () => {
           const timeoutMs = this.#options.startupTimeoutMs ?? 5000;
-          const receipt = await withAbort(withTimeout((this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), input.signal);
+          const receipt = await budget.request(remainingMs => (this.#options.bindRequest ?? sendPiBindRequest)(resident!.socketPath, request, { timeoutMs: remainingMs, signal: input.signal }), timeoutMs, "Pi private receipt timed out", input.signal);
           if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
           return receipt;
         });
@@ -384,7 +389,7 @@ export class PiRpcDriver implements HarnessDriver {
       // Discovery is separate from inference. Keep catalog/auth contents private;
       // the receipt exposes only qualified version, provider names and auth shape.
       const providers = await measure("runner.pi.open.available_models", async () => {
-        const discovery = await withAbort(withTimeout(transport!.request("get_available_models"), this.#options.startupTimeoutMs ?? 10_000, "Pi metadata timed out"), input.signal);
+        const discovery = await budget.request(timeoutMs => transport!.request("get_available_models", {}, { timeoutMs }), this.#options.startupTimeoutMs ?? 10_000, "Pi metadata timed out", input.signal);
         const models = record(discovery.data).models;
         if (!Array.isArray(models) || models.length > 100_000) throw new PiNativeAdmissionError("pi_metadata_invalid", "Pi omitted its model/provider metadata.");
         return [...new Set(models.flatMap(value => typeof record(value).provider === "string" && /^[A-Za-z0-9._-]{1,80}$/u.test(record(value).provider as string) ? [record(value).provider as string] : []))].sort();
@@ -418,7 +423,7 @@ export class PiRpcDriver implements HarnessDriver {
         callbacks,
         bindRequest: this.#options.bindRequest ?? sendPiBindRequest,
       });
-      if (this.#options.deferInitialBinding) await measure("runner.pi.open.settle", () => session.releaseInitialBindingForRecovery());
+      if (this.#options.deferInitialBinding) await measure("runner.pi.open.settle", () => session.releaseInitialBindingForRecovery(budget));
       return session;
     } catch (error) {
       await callbacks?.close().catch(() => undefined);
@@ -485,11 +490,40 @@ interface PiSessionState {
 
 const PI_PROCESS_STARTUP_TIMEOUT_MS = 60_000;
 
+/** Admission-local, never session-lifetime: no exchange can reset the clock. */
+class PiAdmissionBudget {
+  readonly #expiresAt: number;
+  constructor(timeoutMs = 10_000) { this.#expiresAt = performance.now() + timeoutMs; }
+
+  async request<T>(work: (timeoutMs: number) => Promise<T>, perExchangeMs: number, message: string, signal?: AbortSignal): Promise<T> {
+    signal?.throwIfAborted();
+    // Node timers have millisecond granularity. Round once at the exchange
+    // boundary, not down by a millisecond on every immediate first request.
+    const remainingMs = Math.ceil(this.#expiresAt - performance.now());
+    const deadlineError = (detail: string) => new PiNativeAdmissionError("pi_admission_deadline_exceeded", detail);
+    if (remainingMs < 1) throw deadlineError(message);
+    const timeoutMs = Math.min(perExchangeMs, remainingMs);
+    try {
+      const result = await withAbort(withTimeout(work(timeoutMs), timeoutMs, message), signal);
+      if (performance.now() >= this.#expiresAt) throw deadlineError(message);
+      return result;
+    } catch (error) {
+      if (!signal?.aborted && remainingMs <= perExchangeMs && error instanceof Error
+        && (performance.now() >= this.#expiresAt - 1 || error.message === message
+          || error.message === "Pi private request timed out" || error instanceof PiRpcRequestTimeoutError)) {
+        throw deadlineError(error.message);
+      }
+      throw error;
+    }
+  }
+}
+
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000,
-  measure?: <T>(name: ProviderPerformancePhase, work: () => Promise<T>) => Promise<T>): PiRpcAdmissionPort {
+  measure?: <T>(name: ProviderPerformancePhase, work: () => Promise<T>) => Promise<T>,
+  budget = new PiAdmissionBudget(timeoutMs)): PiRpcAdmissionPort {
   return { request: async ({ type, ...params }, signal) => {
     const work = async () => {
-      const response = await withAbort(withTimeout(transport.request(type, params), timeoutMs, "Pi RPC admission timed out"), signal);
+      const response = await budget.request(remainingMs => transport.request(type, params, { timeoutMs: remainingMs }), timeoutMs, "Pi RPC admission timed out", signal);
       return response.data;
     };
     return measure ? measure(`runner.pi.admission.${type}` as ProviderPerformancePhase, work) : work();
@@ -671,11 +705,11 @@ export class PiRpcHarnessSession implements HarnessSession {
    * This is only called before exposing a cold recovery session to its caller.
    * The next attach must bind/admit afresh; prepared-context checks stay strict.
    */
-  async releaseInitialBindingForRecovery(): Promise<void> {
+  async releaseInitialBindingForRecovery(budget = new PiAdmissionBudget(this.#admissionTimeoutMs)): Promise<void> {
     const binding = this.#resident?.binding;
     if (!binding) return;
     if (!binding.initial || this.#activeTurn) throw new Error("Pi recovery cannot release an active binding");
-    await this.#sendBind({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+    await this.#sendBind({ schema: 1, type: "settle", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin }, undefined, budget);
     await this.#revokeBinding();
   }
 
@@ -688,9 +722,10 @@ export class PiRpcHarnessSession implements HarnessSession {
     return this.#measure("runner.pi.attach", () => this.#serialize(async () => {
       await this.#waitForInterrupt(input.runId);
       if (!input.runId || input.runId.length > 240) throw new Error("Pi RPC attach requires a valid run id");
+      const budget = new PiAdmissionBudget(this.#admissionTimeoutMs);
       if (this.#resident) {
         const previous = this.#resident.context;
-        const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal, { runId: input.runId });
+        const inventory = await this.#sendBind({ schema: 1, type: "tool_inventory", nonce: randomUUID(), sessionId: this.#normalizedSessionId }, input.signal, budget, { runId: input.runId });
         const context = bindingContext(input.baseInstructions !== undefined ? input.baseInstructions : previous.baseInstructions,
           input.dynamicTools,
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous,
@@ -700,7 +735,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         if (this.#resident.binding) {
           if (input.runId !== this.#runId || JSON.stringify(context) !== JSON.stringify(previous)) throw new Error("Pi prepared binding context cannot change before its turn");
           await this.#reusePreparedAdmission(input.signal);
-        } else await this.#prepareBinding(input.runId, context, input.signal);
+        } else await this.#prepareBinding(input.runId, context, input.signal, budget);
       } else {
         // Direct env/native providers retain their existing behavior. They do
         // not gain a managed broker secrecy or dynamic-refresh guarantee.
@@ -709,7 +744,7 @@ export class PiRpcHarnessSession implements HarnessSession {
           input.dynamicTools,
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
-        await this.#admit(input.signal, input.runId);
+        await this.#admit(input.signal, input.runId, budget);
         await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
         await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
         this.#initialContext = context;
@@ -848,13 +883,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #validatePreparedAdmission(signal?: AbortSignal): Promise<void> {
-    if (!this.#resident?.binding) return this.#admit(signal);
+  async #validatePreparedAdmission(signal?: AbortSignal, budget = new PiAdmissionBudget(this.#admissionTimeoutMs)): Promise<void> {
+    if (!this.#resident?.binding) return this.#admit(signal, this.#runId, budget);
     await this.#reusePreparedAdmission(signal);
     this.#admitted = false;
     try {
       await validatePiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs,
-        (name, work) => this.#measure(name, work)), this.#config, this.#identity, signal);
+        (name, work) => this.#measure(name, work), budget), this.#config, this.#identity, signal);
       if (this.#closed || this.#failure || this.#transport.exited) throw this.#failure ?? new Error("Pi RPC session is closed");
       this.#admitted = true;
     } catch (error) {
@@ -864,13 +899,13 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #admit(signal?: AbortSignal, runId = this.#runId): Promise<void> {
+  async #admit(signal?: AbortSignal, runId = this.#runId, budget = new PiAdmissionBudget(this.#admissionTimeoutMs)): Promise<void> {
     if (this.#closed) throw new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new PiNativeAdmissionError("pi_session_busy", "Pi session already has an active turn; refusing admission.");
     this.#admitted = false;
     try {
       const identity = await admitPiRpcSession(piAdmissionPort(this.#transport, this.#admissionTimeoutMs,
-        (name, work) => this.#measure(name, work, { runId })), this.#config, signal);
+        (name, work) => this.#measure(name, work, { runId }), budget), this.#config, signal);
       if (identity.providerSessionId !== this.#providerSessionId) throw new PiNativeAdmissionError("pi_session_identity_changed", "Pi session identity changed during re-admission.");
       if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
       this.#recordAdmission(identity);
@@ -882,7 +917,7 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #prepareBinding(runId: string, context: PiRunContext, signal?: AbortSignal): Promise<void> {
+  async #prepareBinding(runId: string, context: PiRunContext, signal?: AbortSignal, budget = new PiAdmissionBudget(this.#admissionTimeoutMs)): Promise<void> {
     const resident = this.#resident!;
     if (this.#closed || this.#failure) throw this.#failure ?? new Error("Pi RPC session is closed");
     if (this.#activeTurn) throw new Error("Pi RPC session already has an active turn");
@@ -900,9 +935,9 @@ export class PiRpcHarnessSession implements HarnessSession {
       if (!validateBindRequest(request)) throw new Error("Pi binding configuration rejected");
       // sendPiBindRequest validates exact nonce/session/epoch/content receipts.
       // Never retry a lost ACK: its native state is uncertain, so retire it.
-      await this.#sendBind(request, signal);
+      await this.#sendBind(request, signal, budget);
       resident.epoch = origin.epoch;
-      await this.#admit(signal, runId);
+      await this.#admit(signal, runId, budget);
       await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
       await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
       resident.context = context;
@@ -912,11 +947,14 @@ export class PiRpcHarnessSession implements HarnessSession {
     }
   }
 
-  async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal,
+  async #sendBind<C extends PiBindCommand>(request: C, signal?: AbortSignal, budget?: PiAdmissionBudget,
     origin = { runId: "runId" in request ? request.runId : this.#runId }): Promise<PiBindResponse<C>> {
     const work = async () => {
       const timeoutMs = this.#admissionTimeoutMs ?? 5000;
-      const receipt = await withAbort(withTimeout(this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal }), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), signal);
+      const send = (timeoutMs: number) => this.#bindRequest(this.#resident!.socketPath, request, { timeoutMs, signal });
+      const receipt = budget
+        ? await budget.request(send, timeoutMs, "Pi private receipt timed out", signal)
+        : await withAbort(withTimeout(send(timeoutMs), timeoutMs, "Pi private receipt timed out", "pi_bind_timeout"), signal);
       if (!validateBindReceipt(receipt, request)) throw new Error("Pi private receipt mismatch");
       return receipt;
     };
@@ -977,16 +1015,17 @@ export class PiRpcHarnessSession implements HarnessSession {
       // A prepared epoch needs a fresh read-only state proof, not another
       // configuration write. A new binding still performs full admission.
       // Both paths prove idle before replacing a handled input's discard gate.
-      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
+      const budget = new PiAdmissionBudget(this.#admissionTimeoutMs);
+      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context, undefined, budget);
       else {
         if (!this.#admitted) throw new Error("Pi RPC session requires fresh admission before input");
-        await this.#validatePreparedAdmission();
+        await this.#validatePreparedAdmission(undefined, budget);
       }
       const binding = this.#resident?.binding;
       const origin = binding?.origin ?? { runId: this.#runId, turnId: `pi-turn-${randomUUID()}` };
       if (binding && !binding.initial) {
         try {
-          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin }, undefined, budget);
         } catch (error) { await this.#fenceFailure(error); throw error; }
       }
       const turn: PiTurnState = { ...origin, projector: createPiEventProjector({ ...origin, includeThinking: true }), lastText: "", hasToolCalls: false, agentEnded: false, failed: false, settled: false };
@@ -1074,13 +1113,14 @@ export class PiRpcHarnessSession implements HarnessSession {
       await this.#interrupting;
       if (input.customInstructions !== undefined && typeof input.customInstructions !== "string") throw new Error("Pi compaction instructions must be a string");
       if (this.#failure) throw this.#failure;
-      await this.#admit(); // compact itself aborts active work: prove idle first.
-      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context);
+      const budget = new PiAdmissionBudget(this.#admissionTimeoutMs);
+      await this.#admit(undefined, this.#runId, budget); // compact itself aborts active work: prove idle first.
+      if (this.#resident && !this.#resident.binding) await this.#prepareBinding(this.#runId, this.#resident.context, undefined, budget);
       const binding = this.#resident?.binding;
       let prepared = binding?.initial === true;
       try {
         if (binding && !binding.initial) {
-          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin });
+          await this.#sendBind({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: this.#normalizedSessionId, ...binding.origin }, undefined, budget);
           prepared = true;
         }
         // No host tool/callback authority is activated by a summary operation.
