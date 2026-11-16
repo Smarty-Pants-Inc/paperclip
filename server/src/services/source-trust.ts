@@ -77,8 +77,12 @@ export function buildLowTrustSourceTrust(input: {
  * authorization; pair it with buildLowTrustSourceTrust (smarty-dev#20830).
  */
 export function externalSourceCommentMetadata(input: { channel: string; sender: string | null | undefined }) {
-  const channel = input.channel.trim().slice(0, 40) || "unknown";
-  const sender = input.sender?.trim().slice(0, 320) || null;
+  const trimAndTruncate = (value: string, limit: number) => {
+    const truncated = value.trim().slice(0, limit);
+    return /[\uD800-\uDBFF]$/.test(truncated) ? truncated.slice(0, -1) : truncated;
+  };
+  const channel = trimAndTruncate(input.channel, 40) || "unknown";
+  const sender = input.sender ? trimAndTruncate(input.sender, 320) || null : null;
   return {
     version: 1 as const,
     externalSource: { channel, sender },
