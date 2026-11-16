@@ -4985,6 +4985,8 @@ export function toolAccessService(
         // consumption activity commit together, or none of them do.
         if (projectId !== null) await consumeProjectAppApproval(tx, { companyId, projectId, sourceConnectionId: consumedSourceConnectionId!,
           receiptId: preparedProject!.custody.receipt.id, connectionId: row.id,
+          retainAsPredecessor: asRecord(config.projectScope).migrationPending === true
+            && asRecord(config.projectScope).legacyConnectionId === consumedSourceConnectionId,
           actorType: actor?.actorType === "user" ? "user" : actor?.actorType === "agent" ? "agent" : "system", actorId: actor?.actorId ?? "system" });
         return row;
       }).catch(error => { throw mapProjectConnectionUniquenessError(error); });
