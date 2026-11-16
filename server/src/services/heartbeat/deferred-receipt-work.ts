@@ -86,6 +86,15 @@ export function registerDeferredReceiptWork(
               sql`jsonb_typeof(${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}') = 'array'
                 and ${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
               sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+              // Plugin requestWakeup saves input without comment IDs. Keep
+              // reconstruction aligned with the stranded-queue admission scan.
+              sql`(${agentWakeupRequests.payload}->>'mutation' = 'plugin_wakeup'
+                and ${agentWakeupRequests.payload}->>'pluginId' = ${agentWakeupRequests.payload}#>>'{_paperclipWakeContext,pluginId}'
+                and ${agentWakeupRequests.payload}->>'pluginKey' = ${agentWakeupRequests.payload}#>>'{_paperclipWakeContext,pluginKey}'
+                and ${agentWakeupRequests.payload}->>'pluginId' is not null
+                and ${agentWakeupRequests.payload}->>'pluginKey' is not null
+                and ${agentWakeupRequests.requestedByActorType} = 'system'
+                and ${agentWakeupRequests.requestedByActorId} = ${agentWakeupRequests.payload}->>'pluginId')`,
               dependencyResolvedWakePayloadSql,
               assignmentWakePayloadSql,
               sql`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId}
