@@ -19,6 +19,7 @@ import type { RefreshConnectionCatalog } from "../catalog/contracts.js";
 
 import { toApplication } from "../applications/projection.js";
 import { groupedActions } from "../catalog/action-summary.js";
+import { assertProjectConnectionOAuthUnsupported } from "../connections/setup-policy.js";
 
 type Dependencies = {
   now: () => Date;
@@ -38,6 +39,8 @@ export function createVercelOAuthCallback(db: Db, dependencies: Dependencies) {
     actor?: ActorInfo;
   }): Promise<ConnectToolAppResult> {
     const stateRow = await consumeOAuthState(input.state, input.actor);
+    let connection = await getConnectionRow(stateRow.connectionId, stateRow.companyId);
+    assertProjectConnectionOAuthUnsupported(connection);
     if (stateRow.codeVerifier !== "vercel-connect") {
       throw badRequest("OAuth state does not belong to a Vercel Connect flow");
     }
@@ -58,10 +61,6 @@ export function createVercelOAuthCallback(db: Db, dependencies: Dependencies) {
       throw vercelConnectHttpError(
         new VercelConnectClientError("vercel_connect_unavailable", 503),
       );
-    let connection = await getConnectionRow(
-      stateRow.connectionId,
-      stateRow.companyId,
-    );
     const credential = vercelCredentialFor(connection);
     if (
       credential.principalMode !== "user" ||

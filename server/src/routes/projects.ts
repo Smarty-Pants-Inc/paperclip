@@ -40,6 +40,7 @@ import { externalObjectService } from "../services/external-objects.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo } from "./authz.js";
 import { ensureProjectAccessMember } from "../services/projects.js";
+import { connectionRequestActor } from "./connection-management-authz.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   listConfiguredRuntimeServiceEntries,
@@ -544,7 +545,7 @@ export function projectRoutes(db: Db) {
     }
     const configurationWarnings = body.env !== undefined
       ? protectedEnvironmentKeyWarnings(await listProtectedEnvironmentKeyHolders(db), body.env, "env") : [];
-    const project = await svc.update(id, body);
+    const project = await svc.update(id, body, connectionRequestActor(req));
     if (!project) {
       res.status(404).json({ error: "Project not found" });
       return;
