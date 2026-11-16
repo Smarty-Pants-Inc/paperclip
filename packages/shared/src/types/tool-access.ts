@@ -166,6 +166,8 @@ export interface ToolApplication {
 }
 
 export interface ToolConnection {
+  /** Server projections include null for legacy connections; optional for older clients. */
+  projectId?: string | null;
   agentInstructions?: import("../connection-instructions.js").ConnectionAgentInstructions | null;
   id: string;
   companyId: string;

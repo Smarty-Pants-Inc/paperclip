@@ -9,6 +9,7 @@ import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   projects,
+  toolConnections,
   executionWorkspaces,
   projectAccessMembers,
   projectGoals,
@@ -1165,6 +1166,12 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     remove: async (id: string) => db.transaction(async tx => {
       const project = await lockProjectRootMutation(tx, id);
       if (!project) return null;
+      // There is deliberately no project FK: retained connection ownership is
+      // credential policy, including archived and pending history. Never orphan
+      // it by deleting the project from an owner-unaware path.
+      const [ownedConnection] = await tx.select({ id: toolConnections.id }).from(toolConnections)
+        .where(and(eq(toolConnections.companyId, project.companyId), eq(toolConnections.projectId, id))).limit(1);
+      if (ownedConnection) throw conflict("This project has retained tool-connection ownership. Archive the project instead of deleting its credential policy.", { code: "project_connection_history_retained" });
       const [retained] = await tx.select({ id: executionWorkspaces.id }).from(executionWorkspaces)
         .where(eq(executionWorkspaces.projectId, id)).limit(1);
       if (retained) throw conflict("This project still supplies access policy for retained task workspaces. Archive the project or explicitly clean up its workspaces before deleting it.");

@@ -6,8 +6,8 @@ import { notifyAttentionRetentionWork } from "./retention-work-notifications.js"
 import { notifySkillVersionRetention, notifySkillVersionPinChange } from "./skill-version-retention-notifications.js";
 import { agentAppearanceSchema, randomAgentAppearance } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
-import { agents, companyMemberships, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { agents, companyMemberships, toolConnections, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { lockCompanyAgentRuntime } from "./agent-runtime-lock.js";
 import { isTransientLockContention } from "./transient-lock-contention.js";
 import { notifyMuseContactVerification } from "../modules/external-agents/index.js";
@@ -101,6 +101,16 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   publications?: ActivityPublication[]) {
   const tx = txDb;
   const companyId = created.companyId;
+  // This is also called by non-route hires. Validate every resolved pool member
+  // before any identity, file, permission or installation side effect.
+  if (options?.aiConnectionInstall) {
+    const install = options.aiConnectionInstall;
+    const ids = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
+    const connections = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, ids))).for("share");
+    if (connections.length !== ids.length || connections.some(connection => connection.connectionPurpose !== "ai" || connection.projectId != null)) {
+      throw unprocessable("AI hires require same-company AI connections, including every pool member. TOOL connections cannot be installed through AI setup.", { code: "ai_connection_purpose_required" });
+    }
+  }
   assertEphemeralAgentInstructions({ ...created, name: "" });
   await initializeDurableAgentFiles(txDb, created);
   if (created.status !== "terminated") await agentIdentityService(txDb).ensureAgentIdentity(companyId, created.id, publications);
