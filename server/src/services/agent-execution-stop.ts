@@ -17,17 +17,19 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], onP
   )!, onPending);
 }
 
-/** Task recovery uses the same Stop proof, scoped to its owners rather than
- * every unrelated run of the assignee. The caller holds the task and run locks. */
+/** Task recovery uses read-only Stop proof, scoped to its owners rather than
+ * unrelated runs of the assignee. The caller holds task/run locks: coordinator
+ * writes here would invert native reacquisition's coordinator -> run order.
+ * Expired coordinator settlement remains the agent lifecycle owner's duty. */
 export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds: string[]) {
   const ids = [...new Set(runIds)];
   if (!ids.length) return true;
   return executionsHaveStopped(db, and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, ids))!,
-    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, undefined, ids.length);
+    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, undefined, ids.length, false);
 }
 
 async function executionsHaveStopped(db: Db, condition: SQL, leaseCondition: SQL,
-  onPending?: (invocationId: string) => void, expectedRunCount?: number) {
+  onPending?: (invocationId: string) => void, expectedRunCount?: number, settleCoordinators = true) {
   const pending = (invocationId?: string | null) => { if (invocationId) onPending?.(invocationId); return false; };
   const runs = await db.select().from(heartbeatRuns).where(condition);
   // A missing or cross-company binding cannot establish execution Stop.
@@ -80,6 +82,9 @@ async function executionsHaveStopped(db: Db, condition: SQL, leaseCondition: SQL
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return pending(run.id);
   }
+  // Task/run-lock callers only read proof. They must never wait for a
+  // coordinator write while a native owner waits for their run lock.
+  if (!settleCoordinators) return true;
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {
     const [cleared] = await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null, updatedAt: now })
