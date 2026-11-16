@@ -958,6 +958,9 @@ describe("agent skill routes", () => {
 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     const createdAgentId = expectResponseId(res.body.id);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(createdAgentId).toBe((await mockAgentService.create.mock.results[0].value).id);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({
@@ -967,7 +970,7 @@ describe("agent skill routes", () => {
           }),
         }),
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "local-board", responsibleUserId: "local-board", claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "local-board" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "local-board", responsibleUserId: "local-board", claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
     );
     expect(mockTrackAgentCreated).toHaveBeenCalledWith(
       expect.anything(),
@@ -1014,12 +1017,15 @@ describe("agent skill routes", () => {
     expect(res.body).toMatchObject({
       role: "security",
     });
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(createdAgentId).toBe((await mockAgentService.create.mock.results[0].value).id);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({
         role: "security",
       }),
-      { runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "local-board", responsibleUserId: "local-board", claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
+      { memberGrant: { grantedByUserId: "local-board" }, runnerResolved: true, aiConnectionInstall: undefined, createdByAgentId: null, interactionTexts: [expect.any(String)], createdByUserId: "local-board", responsibleUserId: "local-board", claudeLogin: { storedSessionId: null, ownerUserId: "local-board", applyExistingWithoutClaim: false } },
     );
     expect(mockTrackAgentCreated).toHaveBeenCalledWith(
       expect.anything(),
@@ -1460,6 +1466,9 @@ describe("agent skill routes", () => {
       });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
+    // SUPERSEDED BY REPLACEMENT (#20805 F2, review-fleet-2 + RFL 08:40Z 11-16): grant now inside the hire transaction
+    expect(mockAgentService.create).toHaveBeenCalledTimes(1);
+    expect(res.body.agent.id).toBe((await mockAgentService.create.mock.results[0].value).id);
     expect(mockAgentService.create).toHaveBeenCalledWith(
       "company-1",
       expect.objectContaining({
@@ -1476,6 +1485,7 @@ describe("agent skill routes", () => {
         createdByAgentId: null,
         interactionTexts: [expect.any(String)],
         createdByUserId: "local-board", responsibleUserId: "local-board",
+        memberGrant: { grantedByUserId: "local-board" },
         claudeLogin: {
           storedSessionId: null,
           ownerUserId: "local-board",
