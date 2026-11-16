@@ -403,6 +403,30 @@ describePg("#20805 agent hire runtime lock", () => {
     expect(grants.memberships[agentId]).toBe(1);
   }, 60_000);
 
+  it("RED w: company default grants that keep deadlocking defer with the named warning; the create stands, complete", async () => {
+    const f = await fixture(1);
+    const [ceo] = await db.insert(agents).values({ companyId: f.companyId, name: "Root CEO", role: "ceo", adapterType: "process" }).returning();
+    const name = `defer_${f.companyId.replace(/-/g, "")}`;
+    await db.execute(sql.raw(`CREATE FUNCTION ${name}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.principal_id = '${ceo!.id}' AND NEW.permission_key = 'skills:create' THEN
+        RAISE EXCEPTION 'injected default grant deadlock' USING ERRCODE = '40P01'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER ${name} BEFORE INSERT ON principal_permission_grants FOR EACH ROW EXECUTE FUNCTION ${name}();`));
+    let response: request.Response;
+    try {
+      response = await request(f.agentApp).post(`/api/companies/${f.companyId}/agents`).send({ name: "Deferred defaults", role: "engineer",
+        reportsTo: f.hirer.id, adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } });
+    } finally {
+      await db.execute(sql.raw(`DROP TRIGGER IF EXISTS ${name} ON principal_permission_grants; DROP FUNCTION IF EXISTS ${name}();`));
+    }
+    const agentId = response!.body?.id as string | undefined;
+    const grants = agentId ? await grantsOf(f.companyId, [agentId]) : null;
+    evidence("W_DEFERRED", { status: response!.status, warnings: response!.body?.warnings ?? null, error: response!.body?.error ?? null, grants });
+    expect(response!.status, JSON.stringify(response!.body)).toBe(201);
+    expect(response!.body.warnings).toEqual([expect.objectContaining({ code: "company_default_grants_deferred" })]);
+    expect(grants!.memberships[agentId!]).toBe(1);
+    expect(grants!.assign[agentId!]).toBe(1);
+  }, 60_000);
+
   it("behaviour kept (audit e): a pending-approval hire still gets membership + tasks:assign stamped with the board user, but not the standard grants", async () => {
     const f = await fixture(1);
     await db.update(companies).set({ requireBoardApprovalForNewAgents: true }).where(eq(companies.id, f.companyId));
