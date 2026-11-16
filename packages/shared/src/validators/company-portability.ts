@@ -71,6 +71,7 @@ export const portabilityBlobManifestEntrySchema = z.object({
 });
 
 export const portabilityAgentManifestEntrySchema = z.object({
+  sourceAgentId: z.string().min(1).optional(),
   runner: z.enum(["auto", "paperclip", "legacy"]).optional(),
   slug: z.string().min(1),
   name: z.string().min(1),

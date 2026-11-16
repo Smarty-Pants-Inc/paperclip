@@ -430,6 +430,7 @@ Example uses:
 - adapter env inputs and defaults
 - runtime settings
 - permissions
+- source agent IDs used only as permission-scope rewrite keys (`agents.<slug>.sourceAgentId`)
 - budgets
 - approval policies
 - project execution workspace policies
@@ -438,6 +439,7 @@ Example uses:
 Rules:
 
 - the base package must remain readable without the extension
+- `sourceAgentId` is optional provenance, never the ID to create at the destination. Import remaps agent references in permission scopes after all agents exist, before checking the importing actor's delegation authority. References outside the imported selection must identify an existing target-company agent; otherwise the import refuses with a named 422 before writing anything. Older packages without source IDs can retain only valid target-company references, not stale source-company IDs.
 - tools that do not understand a vendor extension should ignore it
 - Paperclip tools may emit the vendor extension by default as a sidecar while keeping the base markdown clean
 

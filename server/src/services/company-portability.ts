@@ -874,6 +874,34 @@ type PortableAgentPermissionGrant = CompanyPortabilityAgentManifestEntry["permis
 
 const VALID_PERMISSION_KEYS = new Set<PermissionKey>(PERMISSION_KEYS);
 
+// Include the legacy aliases understood by authorization.scopeAllows, not only
+// the three forms accepted by the strict agent grant editor. Other scope data
+// (projects, users, connections, etc.) belongs to its own resource namespace.
+const PORTABLE_GRANT_AGENT_ID_KEYS = [
+  "agentId", "agentIds", "assigneeAgentId", "assigneeAgentIds", "targetAgentId", "targetAgentIds",
+  "managerAgentId", "managerAgentIds", "managedSubtreeAgentId", "managedSubtreeAgentIds",
+  "subtreeAgentId", "subtreeAgentIds", "subtreeRootAgentId", "subtreeRootAgentIds",
+] as const;
+
+function remapPortableGrantScope(
+  scope: Record<string, unknown> | null,
+  resolveAgentId: (id: string) => string,
+): Record<string, unknown> | null {
+  if (!scope) return null;
+  const remapped = { ...scope };
+  const mapValue = (value: unknown, map: (id: string) => string): unknown =>
+    Array.isArray(value) ? value.map(entry => mapValue(entry, map))
+      : typeof value === "string" && value.trim() ? map(value.trim()) : value;
+  for (const key of PORTABLE_GRANT_AGENT_ID_KEYS) {
+    if (Object.hasOwn(scope, key)) remapped[key] = mapValue(scope[key], resolveAgentId);
+  }
+  if (Object.hasOwn(scope, "allow")) remapped.allow = mapValue(scope.allow, rule => {
+    const match = /^(agent|subtree):(.+)$/.exec(rule);
+    return match ? `${match[1]}:${resolveAgentId(match[2]!)}` : rule;
+  });
+  return remapped;
+}
+
 function normalizePortablePermissionGrants(value: unknown, warnings: string[], slug: string): PortableAgentPermissionGrant[] {
   if (!Array.isArray(value)) return [];
   return value.flatMap((entry): PortableAgentPermissionGrant[] => {
@@ -3281,6 +3309,7 @@ function buildManifestFromPackageFiles(
     const title = asString(frontmatter.title);
 
     manifest.agents.push({
+      sourceAgentId: asString(extension.sourceAgentId) ?? undefined,
       slug,
       name: asString(frontmatter.name) ?? title ?? slug,
       path: agentPath,
@@ -4336,6 +4365,8 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         }
 
         const extension = stripEmptyValues({
+          // Rewrite key only: the importer always mints a fresh destination ID.
+          sourceAgentId: agent.id,
           role: agent.role !== "agent" ? agent.role : undefined,
           icon: agent.icon ?? null,
           appearance: agent.appearance == null ? undefined : portableAgentAppearance(agent.appearance, warnings, slug),
@@ -5531,6 +5562,32 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
     const importedAutomationPausedAt = pauseAutomations ? new Date() : null;
     const warnings = [...plan.preview.warnings];
     const include = plan.include;
+    const preImportAgentRows = input.target.mode === "existing_company"
+      ? await agents.list(input.target.companyId) : [];
+    const preImportAgentIds = new Set(preImportAgentRows.map(agent => agent.id));
+    const sourceAgentIdToSlug = new Map<string, string>();
+    if (include.agents) {
+      for (const agent of plan.selectedAgents) {
+        if (!agent.sourceAgentId) continue;
+        const entry = plan.preview.plan.agentPlans.find(entry => entry.slug === agent.slug);
+        if (!entry || (entry.action === "skip" && !entry.existingAgentId)) continue;
+        if (sourceAgentIdToSlug.has(agent.sourceAgentId)) {
+          throw unprocessable(`Ambiguous source agent ID ${agent.sourceAgentId} in imported package`);
+        }
+        sourceAgentIdToSlug.set(agent.sourceAgentId, agent.slug);
+      }
+      // Validate every replayed reference BEFORE company/agent/secret/skill
+      // writes, including board imports which do not use the agent fence's
+      // transaction. Unknown permission KEYS are already stripped with warnings;
+      // a known grant with an unknown target must never retain a stale ID.
+      for (const agent of plan.selectedAgents) {
+        if (!plan.preview.plan.agentPlans.some(entry => entry.slug === agent.slug && entry.action !== "skip")) continue;
+        for (const grant of importedGrants(agent, agent)) remapPortableGrantScope(grant.scope, id => {
+          if (sourceAgentIdToSlug.has(id) || preImportAgentIds.has(id)) return id;
+          throw unprocessable(`Cannot import permission grant ${grant.permissionKey} for agent ${agent.slug}: unknown agent ID ${id}`);
+        });
+      }
+    }
 
     if (include.agents) {
       const importedAgentSlugs = new Set(
@@ -5799,7 +5856,7 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
       const preImportExistingSlugToAgentId = new Map<string, string>();
       const preImportExistingAgentIds = new Set<string>();
       const agentStatusById = new Map<string, string | null | undefined>();
-      const existingAgents = await agents.list(targetCompany.id);
+      const existingAgents = preImportAgentRows;
       for (const existing of existingAgents) {
         const slug = normalizeAgentUrlKey(existing.name) ?? existing.id;
         existingSlugToAgentId.set(slug, existing.id);
@@ -5979,9 +6036,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
             } catch (err) {
               warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
             }
-            if (actor.type !== "agent") await applyImportedAgentPermissionGrants(
-              targetCompany.id, updated.id, importedGrants(updated, manifestAgent), actorUserId ?? null,
-            );
             agentStatusById.set(updated.id, updated.status ?? agentStatusById.get(updated.id) ?? null);
             await secrets.syncEnvBindingsForTarget?.(
               targetCompany.id,
@@ -6024,9 +6078,6 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
           } catch (err) {
             warnings.push(`Failed to materialize instructions bundle for ${manifestAgent.slug}: ${err instanceof Error ? err.message : String(err)}`);
           }
-          if (actor.type !== "agent") await applyImportedAgentPermissionGrants(
-            targetCompany.id, created.id, importedGrants(created, manifestAgent), actorUserId ?? null,
-          );
           agentStatusById.set(created.id, created.status ?? (pauseAutomations ? "paused" : "idle"));
           await secrets.syncEnvBindingsForTarget?.(
             targetCompany.id,
@@ -6079,20 +6130,32 @@ export function companyPortabilityService(db: Db, storage?: StorageService) {
         // A package's permission replay is not a platform activation default.
         // Validate against the final reporting tree, still inside the locked
         // import transaction, so a bad grant rolls back every bundle agent.
-        if (actor.type === "agent") for (const manifestAgent of plan.selectedAgents) {
+        for (const manifestAgent of plan.selectedAgents) {
           const entry = resultAgents.find(entry => entry.slug === manifestAgent.slug && entry.action !== "skipped");
           if (!entry?.id) continue;
           // Creation admission can validate submitted env and secret access,
           // but report authority needs the actual saved target and final tree.
           // Match the live report-runtime gate; an imported root is not a report.
-          const importedAgent = await agents.getById(entry.id);
-          if (importedAgent?.adapterType === "paperclip_runner"
+          const importedAgent = actor.type === "agent" ? await agents.getById(entry.id) : null;
+          if (actor.type === "agent" && importedAgent?.adapterType === "paperclip_runner"
             && isReportRuntimeEnv(importedAgent.adapterConfig.env)
             && Object.keys(importedAgent.adapterConfig.env as Record<string, unknown>).length > 0
             && !await canConfigureReportRuntime(db, actor, importedAgent)) {
             throw forbidden(REPORT_ENV_REFUSAL);
           }
-          const grants = importedGrants(manifestAgent, manifestAgent);
+          const grants = importedGrants(manifestAgent, manifestAgent).map(grant => ({
+            ...grant,
+            scope: remapPortableGrantScope(grant.scope, id => {
+              const slug = sourceAgentIdToSlug.get(id);
+              const importedId = slug
+                ? importedSlugToAgentId.get(slug)
+                  ?? plan.preview.plan.agentPlans.find(entry => entry.slug === slug)?.existingAgentId
+                : undefined;
+              if (importedId) return importedId;
+              if (!slug && preImportExistingAgentIds.has(id)) return id;
+              throw unprocessable(`Cannot import permission grant ${grant.permissionKey} for agent ${manifestAgent.slug}: unknown agent ID ${id}`);
+            }),
+          }));
           await assertAgentActorPermissionGrants(db, actor, targetCompany.id, grants, entry.id);
           await applyImportedAgentPermissionGrants(targetCompany.id, entry.id, grants, actorUserId ?? null);
         }

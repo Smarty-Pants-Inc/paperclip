@@ -212,6 +212,8 @@ export interface CompanyPortabilityIssueManifestEntry {
 }
 
 export interface CompanyPortabilityAgentManifestEntry {
+  /** Source-side rewrite key for permission scopes, never a destination ID. */
+  sourceAgentId?: string;
   runner?: AgentRunnerChoice;
   slug: string;
   name: string;

@@ -2069,6 +2069,7 @@ describe("company portability", () => {
             "    adapter:",
             "      type: process",
             "      config: {}",
+            "    sourceAgentId: agent-imported",
             "    permissionGrants:",
             "      - permissionKey: agents:suggest-changes",
             "      - permissionKey: skills:create",
