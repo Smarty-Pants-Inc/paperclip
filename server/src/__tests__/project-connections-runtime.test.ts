@@ -17,7 +17,7 @@ vi.mock("../services/github-app-credentials.js", async importOriginal => ({
 import { createGitRemoteAuthProvider, resolveManagedGitHubCredential, resolveManagedGitHubIdentitySelection } from "../services/git-credentials.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { prepareHeartbeatGitHubEnvironment, prepareHeartbeatGitHubLaunchers } from "../services/heartbeat-github-launchers.js";
-import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired } from "../services/project-connection-run-context.js";
+import { captureProjectConnectionRunContext, readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, projectConnectionRunSnapshot } from "../services/project-connection-run-context.js";
 
 function detectableFallback() {
   return { getByName: vi.fn(async () => ({ id: "synthetic-legacy-secret" })), resolveSecretValue: vi.fn(async () => "synthetic-legacy-token") };
@@ -51,7 +51,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const prepare = vi.fn(async (input: { env: Record<string, string> }) => input.env);
     const broker = vi.fn(() => "synthetic-broker-capability");
     const result = await prepareHeartbeatGitHubLaunchers({
-      runId: bound.run.id, cwd: process.env.TMPDIR!, native: false, githubConfigured: false,
+      runId: bound.run.id, target: null, cwd: process.env.TMPDIR!, native: false, githubConfigured: false,
       agentId: f.leadA.id, brokerUrl: "http://synthetic.invalid/broker", createBrokerToken: broker,
       env: { PATH: "/synthetic/bin", PAPERCLIP_GITHUB_AUTH_MODE: "agent_env", GH_TOKEN: "synthetic-agent-token", GITHUB_TOKEN: "synthetic-host-token" },
       projectAuthority: { db, companyId: f.companyId },
@@ -64,8 +64,45 @@ describe("project connection task-derived selection and no legacy fallback (roun
     expect(provider.acquire).not.toHaveBeenCalled();
     await expect(prepareHeartbeatGitHubEnvironment({ runId: bound.run.id, agentId: f.leadA.id,
       projectAuthority: { db, companyId: f.companyId }, cwd: process.env.TMPDIR!,
-      defer: false, hostCredentials: true, env: { GH_TOKEN: "synthetic-host-token" },
+      target: null, networkAccess: true, defer: false, hostCredentials: true, env: { GH_TOKEN: "synthetic-host-token" },
     })).rejects.toThrow("project_connection_unavailable");
+  });
+
+  it("RFL-C2/J18: first credential use cannot lazily admit an unadmitted taskless run", async () => {
+    const f = await projectConnectionFixture(db);
+    await f.seedConnection(null);
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id,
+      status: "running", contextSnapshot: { projectId: f.b.id } }).returning();
+    const result = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, {
+      agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: run!.id,
+    });
+    expect(result).toMatchObject({ configured: true, error: "project_connection_run_context_invalid" });
+    expect(result.credential).toBeUndefined();
+    const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(stored!.contextSnapshot).not.toHaveProperty("projectConnectionRunContext");
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
+  it("RFL-C2/A05: admission pair A survives snapshot replacement and a task move before first use refuses", async () => {
+    const f = await projectConnectionFixture(db);
+    const bound = await f.run();
+    const saved = { version: 1, issueId: bound.issue.id, projectId: f.a.id };
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: bound.issue.id, projectConnectionRunContext: saved } })
+      .where(eq(heartbeatRuns.id, bound.run.id));
+    await db.update(heartbeatRuns).set({ contextSnapshot: projectConnectionRunSnapshot({ issueId: bound.issue.id,
+      projectId: f.b.id, projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: f.b.id } }) })
+      .where(eq(heartbeatRuns.id, bound.run.id));
+    const [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, bound.run.id));
+    expect(stored!.contextSnapshot?.projectConnectionRunContext).toEqual(saved);
+    await db.update(issues).set({ projectId: f.b.id }).where(eq(issues.id, bound.issue.id));
+    await expect(readProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: bound.run.id }))
+      .rejects.toMatchObject({ status: 403, details: { code: "project_connection_run_context_invalid" } });
+    const result = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, {
+      agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id,
+    });
+    expect(result).toMatchObject({ configured: true, error: "project_connection_run_context_invalid" });
+    expect(result.credential).toBeUndefined();
+    expect(provider.acquire).not.toHaveBeenCalled();
   });
 
   it("A07: persists a projectless admission pair, ignoring a taskless snapshot project", async () => {

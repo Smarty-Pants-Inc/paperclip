@@ -24,7 +24,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { prepareConnectionInstructionDelivery } from "../connection-instructions.js";
 import { applyConnectorSkills, prepareConnectorSkillDelivery, resolveConnectorAssignments } from "../connector-runtime.js";
 import { resolveManagedGitHubIdentitySelection } from "../git-credentials.js";
-import { captureProjectConnectionRunContext, isProjectConnectionManagedRequired } from "../project-connection-run-context.js";
+import { readProjectConnectionRunContext, isProjectConnectionManagedRequired } from "../project-connection-run-context.js";
 import { resolveAssignedConnectionInstructionsForRun, resolveMcpConnectionSkillsForRun } from "../native-runtime/assigned-mcp-tools.js";
 import { applyMcpConnectionSkills } from "../mcp-skill-runtime.js";
 import { recordFailedSkillPreparation, type NativeRunHistoricalSpan } from "../native-runtime/native-run-trace.js";
@@ -175,7 +175,7 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // Only the persisted agent setting selects this mode, never a task override.
   const agentAdapterConfig = parseObject(agent.adapterConfig);
   const requestedAgentGitHubEnv = agentAdapterConfig.githubAuthenticationMode === "agent_env";
-  const runProject = await captureProjectConnectionRunContext(db, { companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id });
+  const runProject = await readProjectConnectionRunContext(db, { companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id });
   const managedRequired = Boolean(runProject.projectId && await isProjectConnectionManagedRequired(db, {
     companyId: agent.companyId, projectId: runProject.projectId,
   }));
