@@ -170,7 +170,9 @@ const root=path.join(cwd,'.paperclip-runtime'),filename=path.join(root,'.gitigno
 const stat=(name)=>{try{return fs.lstatSync(name)}catch(e){if(e.code==='ENOENT')return null;throw e}};
 const directory=stat(root);
 if(directory && (directory.isSymbolicLink() || !directory.isDirectory()))throw Error('Unsafe runtime exclusion directory');
-if(!directory)fs.mkdirSync(root,{mode:0o700});
+if(!directory){try{fs.mkdirSync(root,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}}
+const created=stat(root);
+if(!created || created.isSymbolicLink() || !created.isDirectory())throw Error('Unsafe runtime exclusion directory');
 const existing=stat(filename);
 if(existing && (existing.isSymbolicLink() || !existing.isFile()))throw Error('Unsafe runtime exclusion file');
 const temporary=path.join(root,'.ignore-'+crypto.randomUUID()+'.tmp');

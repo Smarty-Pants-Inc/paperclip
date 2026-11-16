@@ -3076,6 +3076,18 @@ preparation fails. The executor keeps release and environment-cleanup ordering;
 a separate release closure defers cleanup failures without replacing run results.
 See `tests/e2e/instruction-working-copy/README.md` for isolated browser acceptance.
 
+Remote Git exclusion for both working-copy formats is owned by
+`server/src/services/agent-instruction-git-exclusion.ts`. Each execution retains
+its 15-second timeout. A timeout or non-zero exit gets one retry after one second,
+except an unsafe-path failure, which is never retried. Two timeouts therefore
+spend approximately 31 seconds in this step (16 seconds more than before).
+`AgentInstructionGitExclusionError` retains the run ID and both attempts' timeout,
+exit, signal, and duration fields. Warnings carry the same bounded diagnostics;
+stderr is classified as `unsafe`, `eexist`, `enoent`, or `other`, never logged or
+retained verbatim. Directory creation tolerates a concurrent creator only after
+rechecking that the runtime path is a directory, not a symlink. Existing run
+failure, cleanup, and next-try policy remains unchanged.
+
 Task assignment Markdown is rendered by `server/src/services/heartbeat/task-markdown.ts`.
 `heartbeat.ts` re-exports it for existing callers. Keep prompt
 formatting changes in the renderer and its tests, separate from run orchestration.
