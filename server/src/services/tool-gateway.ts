@@ -53,6 +53,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
+import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { GITHUB_APP_MCP_URL } from "./github-app-client.js";
 import { extractRemoteMcpPending } from "./remote-mcp-pending.js";
@@ -2029,61 +2030,20 @@ export function createToolGatewayService(
     }
 
     const snapshotIssueId = stringValue(run.issueId);
-    const snapshotProjectId = stringValue(run.projectId);
-    if (
-      (input.issueId && snapshotIssueId && input.issueId !== snapshotIssueId) ||
-      (input.projectId &&
-        snapshotProjectId &&
-        input.projectId !== snapshotProjectId)
-    ) {
+    if (input.issueId && input.issueId !== snapshotIssueId) {
       throw new ToolGatewayHttpError(
         403,
         "Supplied run context does not match stored heartbeat context",
         "run_context_mismatch",
       );
     }
-    const issueId = snapshotIssueId ?? input.issueId ?? null;
-    let projectId = snapshotProjectId ?? input.projectId ?? null;
-    if (issueId) {
-      const [issue] = await db
-        .select({ companyId: issues.companyId, projectId: issues.projectId })
-        .from(issues)
-        .where(eq(issues.id, issueId))
-        .limit(1);
-      if (!issue || issue.companyId !== input.companyId) {
-        throw new ToolGatewayHttpError(
-          403,
-          "Issue context is outside the run company",
-          "run_context_mismatch",
-        );
-      }
-      if (projectId && issue.projectId && projectId !== issue.projectId) {
-        throw new ToolGatewayHttpError(
-          403,
-          "Project context does not match issue context",
-          "run_context_mismatch",
-        );
-      }
-      projectId = projectId ?? issue.projectId;
+    const bound = await captureProjectConnectionRunContext(db, {
+      companyId: input.companyId, agentId: input.agentId, heartbeatRunId: input.runId,
+    });
+    if (input.projectId && input.projectId !== bound.projectId) {
+      throw new ToolGatewayHttpError(403, "Supplied project does not match this run's bound task", "run_context_mismatch");
     }
-    if (projectId) {
-      const [project] = await db
-        .select({ companyId: projects.companyId })
-        .from(projects)
-        .where(eq(projects.id, projectId))
-        .limit(1);
-      if (!project || project.companyId !== input.companyId) {
-        throw new ToolGatewayHttpError(
-          403,
-          "Project context is outside the run company",
-          "run_context_mismatch",
-        );
-      }
-    }
-    return {
-      issueId,
-      projectId,
-    };
+    return { issueId: bound.issueId, projectId: bound.projectId };
   }
 
   async function writeAudit(input: {
@@ -3177,6 +3137,14 @@ export function createToolGatewayService(
     return tool;
   }
 
+  async function projectProtectedSession(session: ToolGatewaySession): Promise<boolean> {
+    if (!session.agentId) return false;
+    const [owned] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
+      eq(toolConnections.companyId, session.companyId), sql`${toolConnections.projectId} is not null`,
+    )).limit(1);
+    return Boolean(owned);
+  }
+
   async function findToolForSession(
     session: ToolGatewaySession,
     toolName: string,
@@ -3204,7 +3172,7 @@ export function createToolGatewayService(
     const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
     if (guestBotConnection && tool.connectionId && (tool.connectionId !== guestBotConnection || tool.providerType !== "paperclip_github_chat"))
       throw new ToolGatewayHttpError(403, "Sponsored GitHub runs can only use their bot's governed connection; sponsorship does not grant personal credentials", "guest_connection_denied");
-    if (session.identityContextId && session.agentId && tool.connectionId) {
+    if ((session.identityContextId || await projectProtectedSession(session)) && session.agentId && tool.connectionId) {
       const [connection] = await db
         .select()
         .from(toolConnections)
@@ -3224,6 +3192,7 @@ export function createToolGatewayService(
           {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
+            heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
             allowStandingDelegation: false,
           },
         );
@@ -3283,6 +3252,7 @@ export function createToolGatewayService(
               {
                 agentId: session.agentId,
                 responsibleUserId: session.responsibleUserId,
+                heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
                 allowStandingDelegation: false,
                 excludeGrantId: original.id,
               },
@@ -3404,7 +3374,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     tools: ToolGatewayDescriptor[],
   ): Promise<ToolGatewayDescriptor[]> {
-    if (!session.identityContextId || !session.agentId) return tools;
+    if (!session.agentId || (!session.identityContextId && !await projectProtectedSession(session))) return tools;
     const githubIds = new Set(tools.flatMap(tool =>
       tool.connectionId && asRecord(tool.providerMetadata)?.sourceTemplateKey === "github"
         ? [tool.connectionId] : [],
@@ -3412,6 +3382,7 @@ export function createToolGatewayService(
     if (!githubIds.size) return tools;
     const selected = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
       agentId: session.agentId, responsibleUserId: session.responsibleUserId, allowStandingDelegation: false,
+      heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
     });
     return tools.filter(tool => !tool.connectionId || !githubIds.has(tool.connectionId)
       || tool.connectionId === selected.grant?.connectionId);
@@ -4390,6 +4361,23 @@ export function createToolGatewayService(
     grant: typeof connectionGrants.$inferSelect,
     resolveOptions: { forceRefresh?: boolean } = {},
   ): Promise<Record<string, string>> {
+    const projectProtected = await projectProtectedSession(session);
+    const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
+    const runContext = projectProtected && github && session.agentId && session.runId
+      ? await captureProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
+    const assertProjectSelection = async () => {
+      if (!projectProtected || !github || !session.agentId) return;
+      if (runContext) await revalidateProjectConnectionRunContext(db, runContext);
+      const selection = await resolveManagedGitHubIdentitySelection(db, session.companyId, {
+        agentId: session.agentId, responsibleUserId: session.responsibleUserId,
+        heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
+        explicitGrantId: grant.id, allowStandingDelegation: false,
+      });
+      if (selection.grant?.id !== grant.id || selection.connection?.id !== connection.id) {
+        throw new ToolGatewayHttpError(409, selection.error ?? "Project GitHub connection is unavailable", "project_connection_use_denied");
+      }
+    };
+    await assertProjectSelection();
     const tracked =
       session.identityContextId &&
       (connection.config.sourceTemplateKey === "github" ||
@@ -4405,6 +4393,7 @@ export function createToolGatewayService(
               grant,
               resolveOptions,
             );
+      await assertProjectSelection();
       if (tracked)
         await db
           .update(runIdentityContexts)
@@ -4916,17 +4905,18 @@ export function createToolGatewayService(
       ? (session.responsibleUserId ?? null)
       : (run?.responsibleUserId ?? session.responsibleUserId ?? null);
     if (
-      session.identityContextId &&
+      (session.identityContextId || await projectProtectedSession(session)) &&
       session.agentId &&
       (connection.config.sourceTemplateKey === "github" ||
         connection.transportConfig?.sourceTemplateKey === "github")
     ) {
       const captured = githubOperationCredentials.get(session);
-      const selected = captured && !isGitHubAppConnection(connection)
+      const selected = captured && !isGitHubAppConnection(connection) && !await projectProtectedSession(session)
         ? { grant: captured.grant, error: undefined }
         : await resolveManagedGitHubIdentitySelection(db, session.companyId, {
             agentId: session.agentId,
             responsibleUserId: session.responsibleUserId,
+            heartbeatRunId: session.runId, issueId: session.runId ? undefined : session.issueId,
             allowStandingDelegation: false,
           });
       if (!selected.grant || selected.grant.connectionId !== connection.id) {

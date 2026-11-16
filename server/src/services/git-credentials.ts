@@ -16,6 +16,8 @@ import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
+import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
+import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, type ProjectConnectionRunContext } from "./project-connection-run-context.js";
 
 /**
  * Server-side git credentials for managed project checkouts and execution-workspace base
@@ -343,6 +345,9 @@ export function createGitRemoteAuthProvider(
         } };
       }
     }
+    // A run/issue context and retained ownership are DB facts, not factory-local memory.
+    // Re-resolve on every operation, including cached legacy/null credentials.
+    if (db && (context?.heartbeatRunId || context?.issueId)) credentialPromise = null;
     credentialPromise ??= resolveCredential();
     const credential = await credentialPromise;
     if (credential?.refreshPerOperation) credentialPromise = null;
@@ -360,6 +365,8 @@ export async function resolveManagedGitHubIdentitySelection(
     allowStandingDelegation?: boolean;
     excludeGrantId?: string;
     explicitGrantId?: string;
+    heartbeatRunId?: string | null;
+    issueId?: string | null;
   },
 ): Promise<{
   configured: boolean;
@@ -368,6 +375,23 @@ export async function resolveManagedGitHubIdentitySelection(
   connection?: typeof toolConnections.$inferSelect;
   error?: string;
 }> {
+  let runContext: ProjectConnectionRunContext | undefined;
+  let managedRequired = false;
+  try {
+    if (context.heartbeatRunId || context.issueId) {
+      runContext = await captureProjectConnectionRunContext(db, {
+        companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
+      });
+      managedRequired = Boolean(runContext.projectId && await isProjectConnectionManagedRequired(db, {
+        companyId, projectId: runContext.projectId,
+      }));
+    }
+  } catch {
+    return { configured: true, error: "project_connection_run_context_invalid: The saved run/task project is unavailable or changed; restart this run" };
+  }
+  const unavailable = () => ({ configured: managedRequired, ...(managedRequired ? {
+    error: "project_connection_unavailable: This project's managed GitHub connection is unavailable or retired",
+  } : {}) });
   const connections = await db.select().from(toolConnections).where(and(
     eq(toolConnections.companyId, companyId),
     or(
@@ -382,14 +406,21 @@ export async function resolveManagedGitHubIdentitySelection(
       : {};
     return config.sourceTemplateKey === "github" || transportConfig.sourceTemplateKey === "github";
   });
-  if (githubConnections.length === 0) return { configured: false };
+  if (githubConnections.length === 0) return unavailable();
 
   const connectionIds = githubConnections.map((connection) => connection.id);
   const installs = await db.select().from(toolConnectionInstalls).where(and(
     eq(toolConnectionInstalls.companyId, companyId),
     inArray(toolConnectionInstalls.connectionId, connectionIds),
   ));
-  const eligibleConnectionIds = new Set(githubConnections.filter((connection) => installs.some((install) =>
+  const eligibleConnectionIds = new Set(githubConnections.filter(connection => {
+    if (!connection.projectId) return !managedRequired;
+    if (connection.status === "archived") return false;
+    if (runContext?.projectId && connection.projectId !== runContext.projectId) return false;
+    // Pending migration candidates have no serving reach, even if a stray install exists.
+    const scope = connection.config.projectScope as { migrationPending?: unknown } | undefined;
+    return scope?.migrationPending !== true;
+  }).filter((connection) => installs.some((install) =>
     install.connectionId === connection.id && (
       (install.targetType === "company" && install.targetId === companyId)
       || (install.targetType === "agent" && install.targetId === context.agentId)
@@ -399,11 +430,10 @@ export async function resolveManagedGitHubIdentitySelection(
   // this run. Treating the company-wide connection as configured here would
   // make unrelated agents fail before their adapter starts and would also
   // suppress their otherwise-eligible legacy credential fallback.
-  if (eligibleConnectionIds.size === 0) return { configured: false };
+  if (eligibleConnectionIds.size === 0) return unavailable();
   const grants = await db.select().from(connectionGrants).where(and(
     eq(connectionGrants.companyId, companyId),
     inArray(connectionGrants.connectionId, [...eligibleConnectionIds]),
-    context.explicitGrantId ? eq(connectionGrants.id, context.explicitGrantId) : undefined,
     or(eq(connectionGrants.kind, "agent"), eq(connectionGrants.kind, "user"), eq(connectionGrants.kind, "organization")),
   ));
   const dedicated = context.agentId
@@ -443,8 +473,27 @@ export async function resolveManagedGitHubIdentitySelection(
     const audience = sharedAudience.filter(member => member.grantId === grant.id);
     return audience.length === 0 || audience.some(member => member.subjectId === context.responsibleUserId);
   });
-  const candidates = dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared;
-  const identitySource = dedicated.length > 0 || candidates === shared ? "dedicated" as const : "personal" as const;
+  // Scope ambiguity precedes explicit grants, identity preference and health/newness.
+  if (!runContext?.projectId) {
+    const byInstallation = new Map<string, Set<string>>();
+    try {
+      for (const grant of [...dedicated, ...personal, ...delegated, ...shared]) {
+        const connection = githubConnections.find(c => c.id === grant.connectionId);
+        if (!connection?.projectId) continue;
+        const scope = readProjectConnectionScope(connection);
+        if (!scope) return { configured: true, error: "project_connection_scope_invalid" };
+        const projects = byInstallation.get(scope.installationKey) ?? new Set<string>();
+        projects.add(connection.projectId);
+        byInstallation.set(scope.installationKey, projects);
+      }
+    } catch { return { configured: true, error: "project_connection_scope_invalid" }; }
+    const conflicting = [...byInstallation.values()].filter(ids => ids.size > 1);
+    if (conflicting.length) return { configured: true, error:
+      `project_connection_scope_ambiguous: More than one project matches this installation (${[...new Set(conflicting.flatMap(ids => [...ids]))].sort().join(", ")}); use a run bound to the intended project's task` };
+  }
+  const hinted = (items: typeof grants) => context.explicitGrantId ? items.filter(g => g.id === context.explicitGrantId) : items;
+  const candidates = hinted(dedicated.length > 0 ? dedicated : personal.length > 0 ? personal : delegated.length > 0 ? delegated : shared);
+  const identitySource = dedicated.length > 0 || (personal.length === 0 && delegated.length === 0) ? "dedicated" as const : "personal" as const;
   // Reconnecting can create another connection/grant for the same GitHub
   // account. Ambiguity is about provider identities, not the number of rows.
   // Only trust GitHub's stable account ID; equal logins or missing metadata
@@ -513,6 +562,16 @@ export async function resolveManagedGitHubIdentitySelection(
     return { configured: true, identitySource, error: "The managed GitHub connection is unavailable" };
   }
   if (grant.status !== "active") return { configured: true, identitySource, error: "The managed GitHub identity must be reconnected" };
+  if (connection.projectId) {
+    try {
+      await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, operation: "use", connection,
+        targetAgentIds: context.agentId ? [context.agentId] : [], proposedSecretRefs: grant.credentialSecretRefs });
+    } catch { return { configured: true, identitySource, error: "project_connection_use_denied: The project's approval or recipient is no longer current" }; }
+  }
+  if (runContext) {
+    try { await revalidateProjectConnectionRunContext(db, runContext); }
+    catch { return { configured: true, identitySource, error: "project_connection_run_context_invalid" }; }
+  }
   return { configured: true, identitySource, grant, connection };
 }
 
@@ -525,6 +584,8 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   companyId: string;
   agentId: string;
   responsibleUserId?: string | null;
+  heartbeatRunId?: string | null;
+  issueId?: string | null;
   connections: T[];
 }): Promise<T[]> {
   const githubConnections = input.connections.filter((connection) => {
@@ -540,6 +601,7 @@ export async function filterResolvedGitHubConnectionsForRun<T extends {
   const selection = await resolveManagedGitHubIdentitySelection(input.db, input.companyId, {
     agentId: input.agentId,
     responsibleUserId: input.responsibleUserId ?? null,
+    heartbeatRunId: input.heartbeatRunId, issueId: input.issueId,
   });
   const selectedConnectionId = selection.grant?.connectionId ?? null;
   const githubIds = new Set(githubConnections.map((connection) => connection.id));
@@ -561,6 +623,12 @@ export async function resolveManagedGitHubCredential(
     explicitGrantId?: string;
   },
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
+  let captured: ProjectConnectionRunContext | undefined;
+  try {
+    if (context.heartbeatRunId || context.issueId) captured = await captureProjectConnectionRunContext(db, {
+      companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
+    });
+  } catch { return { configured: true, error: "project_connection_run_context_invalid" }; }
   const selection = await resolveManagedGitHubIdentitySelection(db, companyId, context);
   if (!selection.configured) return { configured: false };
   if (!selection.grant) return { configured: true, identitySource: selection.identitySource, error: selection.error };
@@ -578,7 +646,8 @@ export async function resolveManagedGitHubCredential(
     const appConnection = selection.connection;
     if (appConnection && isGitHubAppConnection(appConnection)) {
       const app = await resolveGitHubAppCredential(db, appConnection, grant, false, false, context.agentId);
-      if (grant.kind === "organization") {
+      if (captured) await revalidateProjectConnectionRunContext(db, captured);
+      if (grant.kind === "organization" || appConnection.projectId) {
         const current = await resolveManagedGitHubIdentitySelection(db, companyId, context);
         if (current.grant?.id !== grant.id) throw new Error("The shared GitHub App audience changed during acquisition");
       }
@@ -645,6 +714,7 @@ export async function resolveManagedGitHubCredential(
     } else {
       token = await secrets.resolveSecretValue(companyId, accessRef.secretId, accessRef.versionSelector ?? "latest", { accessContext });
     }
+    if (captured) await revalidateProjectConnectionRunContext(db, captured);
     return {
       configured: true, identitySource: selection.identitySource,
       credential: {

@@ -12,7 +12,7 @@ import {
 } from "@paperclipai/db";
 import { conflict, forbidden } from "../errors.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
-import { boundRunIssueId, boundRunIssueIdSql, runTaskContextColumn } from "./run-task-binding.js";
+import { assertBoundRunIssueId, boundRunIssueId, boundRunIssueIdSql, runTaskContextColumn } from "./run-task-binding.js";
 import { isUuidLike } from "@paperclipai/shared";
 import { queuedCommentIdsFromRunContext, queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 import { queuedInteractionId } from "./queued-interaction-response.js";
@@ -82,6 +82,7 @@ function assertRunTaskIdentity(run: {
   issueId?: string | null;
   contextSnapshot?: Record<string, unknown> | null;
 } | undefined) {
+  if (run) assertBoundRunIssueId(run);
   const issueId = run?.nativeIssueId ?? run?.issueId ?? run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
   const legacyIssueId = run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId;
   if ([issueId, legacyIssueId].some(id => id !== undefined && id !== null &&
