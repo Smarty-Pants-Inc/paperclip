@@ -94,7 +94,17 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const ref = g.credentialSecretRefs.find(r => r.configPath === GITHUB_APP_KEY_PATH);
     if (!ref) githubAppFailure();
     const secret = await resolveConnectionGrantSecret(db, c, g, ref, { actorType: "system", actorId: g.subjectAgentId ?? undefined, consumerType: "tool_connection", consumerId: c.id });
-    const result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force);
+    // RFL 05:56Z item 3: ONLY a provider acquire() failure on a project
+    // connection becomes 503 project_app_verification_unavailable (E2). Local
+    // denials (saved scope, stable repository IDs, revoked grant, custody) keep
+    // their own github_app_access_unavailable / project_app_* codes.
+    const result = await (c.projectId ? projectClient : client).acquire(`${c.companyId}:${c.id}:${g.id}:${secret.latestVersion}`, parseGitHubAppConfig(c.config.methodConfig), secret.value, force)
+      .catch((error: unknown) => {
+        const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
+        if (c.projectId && code === "github_app_access_unavailable") throw new HttpError(503,
+          "GitHub project App verification is unavailable. No credential was released.", { code: "project_app_verification_unavailable" });
+        throw error;
+      });
     await valid(result.verifiedRegistrationId);
     if (c.projectId) {
       const currentKey = await validateConnectionGrantSecretOwnership(db, c, g, ref);
@@ -130,8 +140,6 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
   } catch (error) {
     const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
     if (typeof code === "string" && code.startsWith("project_app_")) throw error;
-    if (connection.projectId && code === "github_app_access_unavailable") throw new HttpError(503,
-      "GitHub project App verification is unavailable. No credential was released.", { code: "project_app_verification_unavailable" });
     rethrowGitHubAppFailure(error);
   }
 }
