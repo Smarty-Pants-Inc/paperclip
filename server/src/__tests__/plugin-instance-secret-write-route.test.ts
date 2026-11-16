@@ -476,6 +476,24 @@ describePostgres("W1 board-session-only project instance-secret write", () => {
       url(state === "archived" ? f.archivedId : randomUUID()));
   });
 
+  // review-fleet-2 01:11Z: a REAL project of another company in the path, by a board session
+  // that is admin of company A only. Company A's path cannot reach it (the project lookup is
+  // scoped to the path's company), and company B's path refuses A's admin before any lookup.
+  it("W1 (f) refuses a cross-company project id: another company's project in company A's path, with no row in either company", async () => {
+    await saved();
+    const otherCompanyId = randomUUID();
+    const otherProjectId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId, name: `W1 other ${otherCompanyId}`, issuePrefix: `X${otherCompanyId.replace(/-/g, "").slice(0, 7)}`.toUpperCase(),
+    });
+    await db.insert(projects).values({ id: otherProjectId, companyId: otherCompanyId, name: "W1 another company's project", env: {} });
+    const otherBefore = await db.select().from(companySecrets).where(eq(companySecrets.companyId, otherCompanyId));
+    await refused(f.board, 404, "instance_secret_project_missing", url(otherProjectId));
+    await refused(f.board, 403, "instance_secret_write_admin_required", url(otherProjectId, KEY, f.pluginId, otherCompanyId));
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.companyId, otherCompanyId))).toEqual(otherBefore);
+    expect(await db.select().from(companySecrets).where(eq(companySecrets.ownerProjectId, otherProjectId))).toEqual([]);
+  });
+
   it("W1 (g) refuses keys absent from the manifest allow-list without changing rows", async () => {
     await refused(f.board, 422, "instance_secret_key_undeclared", url(f.projectId, "undeclared_key"));
     await saved();
