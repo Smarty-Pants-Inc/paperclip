@@ -99,7 +99,7 @@ async function currentAuthority(db: Database, companyId: string, projectId: stri
 
 /** Final recipients must be explicit members of the lead's current reporting
  * subtree. Another distinct project's lead is a boundary, not an inherited team. */
-async function assertRecipients(db: Database, companyId: string, projectId: string, leadId: string, ids: readonly string[]) {
+export async function assertProjectConnectionRecipients(db: Database, companyId: string, projectId: string, leadId: string, ids: readonly string[]) {
   const roster = await db.select().from(agents).where(eq(agents.companyId, companyId));
   const memberships = await db.select().from(companyMemberships).where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.principalType, "agent"), eq(companyMemberships.status, "active")));
   const active = new Set(memberships.map(m => m.principalId));
@@ -201,7 +201,7 @@ export async function assertProjectConnectionAdmission(
       { targetAgentIds: [...(input.targetAgentIds ?? [])] },
     );
   } else if (!input.targetAgentIds?.length) throw forbidden("Project credential use requires an explicit server-derived recipient", { code: "project_connection_target_outside_project" });
-  await assertRecipients(db, companyId, projectId, lead.id, input.targetAgentIds ?? []);
+  await assertProjectConnectionRecipients(db, companyId, projectId, lead.id, input.targetAgentIds ?? []);
   if (!scope) {
     // A new take must not launder a lead/worker's workspace edit into approval.
     // The primary's original server-written snapshot survives archive. Match
