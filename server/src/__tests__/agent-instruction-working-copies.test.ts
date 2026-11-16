@@ -1,4 +1,5 @@
 import { gitExclusionRetryContract } from "./helpers/git-exclusion-retry-contract.js";
+import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
@@ -82,11 +83,14 @@ describe("registered run instruction copies", () => {
   });
 
   gitExclusionRetryContract(async (runId, executionTarget) => {
-    if (!await copies.get(companyId, runId)) {
+    if (!(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).length) {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
     }
     return copies.prepare({ legacy: true, companyId, agentId, runId, cwd: home, target: executionTarget });
-  });
+  }, async () => {
+    await db.update(agentInstructionWorkingCopies).set({ state: "saved", processStoppedAt: new Date(), nextAttemptAt: null,
+      receipt: null }).where(eq(agentInstructionWorkingCopies.companyId, companyId));
+  }, (runId, error) => queueGitExclusionNextTry(db, companyId, agentId, userId, runId, error));
 
   describe("stopped instruction collection worker", () => {
     afterEach(async () => {

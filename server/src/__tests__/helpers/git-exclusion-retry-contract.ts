@@ -9,6 +9,8 @@ import { logger } from "../../middleware/logger.js";
 // boundary. Exercise each real prepare entry point, not only a retry helper.
 export function gitExclusionRetryContract(
   prepare: (runId: string, target: execution.AdapterExecutionTarget) => Promise<unknown>,
+  cleanup: () => Promise<void>,
+  nextTry: (runId: string, error: Error) => Promise<string>,
 ) {
   describe("remote Git exclusion retry contract", () => {
     const secret = "secret-that-must-not-reach-the-error-or-log";
@@ -24,7 +26,7 @@ export function gitExclusionRetryContract(
         additionalSourceDirs: {}, additionalSourceFailures: [], workspaceSyncSnapshot: null, restoreWorkspace: async () => {},
       }));
     });
-    afterEach(() => { vi.restoreAllMocks(); });
+    afterEach(async () => { vi.restoreAllMocks(); await cleanup(); });
 
     function stub(results: Array<typeof success>) {
       let calls = 0;
@@ -91,9 +93,11 @@ export function gitExclusionRetryContract(
       expect(warnings).toHaveBeenLastCalledWith(expect.objectContaining({ runId, reason: "AGENT_INSTRUCTION_GIT_EXCLUSION_FAILED", ...attempts[1], attempts, willRetry: false }), expect.any(String));
       expect(JSON.stringify(error)).not.toContain(secret);
       expect(JSON.stringify(warnings.mock.calls)).not.toContain(secret);
-      // The existing same-run re-preparation path must remain reachable; this
-      // explicit next try is not an unbounded third attempt in the failed call.
-      await expect(prepare(runId, target)).resolves.toMatchObject({ state: "prepared" });
+      // The existing durable failure/release path queues exactly one next try.
+      // Its preparation is a separate call, never a third attempt in this one.
+      const successorRunId = await nextTry(runId, error);
+      expect(exec.count()).toBe(2);
+      await expect(prepare(successorRunId, target)).resolves.toMatchObject({ state: "prepared" });
       expect(exec.count()).toBe(3);
     });
   });
