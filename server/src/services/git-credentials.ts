@@ -415,8 +415,10 @@ export async function resolveManagedGitHubIdentitySelection(
     ),
   ));
   const githubConnections = connections.filter((connection) => {
-    // RFL C3: a project-owned connection is never a run's company identity.
-    if (isProjectOwnedToolConnection(connection)) return false;
+    // S2 (#20717 reader+writer): an envelope without project_id is never a
+    // run's identity. A project_id row is narrowed below (explicit install,
+    // run project) and admitted after selection.
+    if (!connection.projectId && isProjectOwnedToolConnection(connection)) return false;
     const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};
     const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
       ? connection.transportConfig as Record<string, unknown>
@@ -439,8 +441,9 @@ export async function resolveManagedGitHubIdentitySelection(
     return scope?.migrationPending !== true;
   }).filter((connection) => installs.some((install) =>
     install.connectionId === connection.id && (
-      (install.targetType === "company" && install.targetId === companyId)
-      || (install.targetType === "agent" && install.targetId === context.agentId)
+      // A company install never makes a project-owned row a company default.
+      (!connection.projectId && install.targetType === "company" && install.targetId === companyId)
+      || (install.targetType === "agent" && Boolean(context.agentId) && install.targetId === context.agentId)
     )
   )).map((connection) => connection.id));
   // A GitHub connection installed only for another agent is not configured for

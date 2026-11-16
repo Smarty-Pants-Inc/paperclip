@@ -13,7 +13,7 @@ import { assertAgentConnectionInstallAccess, assertAgentToolAssignmentInteractio
 import { connectionActorUserId } from "./tool-access/actor.js";
 import { getGitHubAppGrant, isGitHubAppConnection, parseGitHubAppConfig, refreshGitHubAppAccess } from "./github-app-credentials.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH } from "./github-app-client.js";
-import { assertNotProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
+import { admitProjectOwnedConnection, assertNotProjectOwnedToolConnection, projectOwnedConnectionError } from "./project-owned-connection-guard.js";
 import { restConnectorFor } from "./connectors/rest-registry.js";
 import { createConnectionCredentialValidation } from "./tool-access/connections/credential-validation.js";
 import { assertManagedGrantReactivationAccess, createConnectionGrants } from "./tool-access/connections/grants.js";
@@ -1660,7 +1660,8 @@ export function toolAccessService(
         );
       if (!connection) throw notFound("Incomplete app connection not found");
       if (connection.projectId) {
-        await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, connection, operation: "reconnect", actor });
+        // F1: a caller the owning project does not admit gets the guard code.
+        await admitProjectOwnedConnection(db, { companyId, projectId: connection.projectId, connection, operation: "reconnect", actor });
         // Owned setup uses the saved, reference-only draft. Gallery credential
         // replacement must not erase its server-owned envelope or create raw keys.
         throw conflict("Finish the saved project candidate, or create a new approved take. Gallery reconnect cannot replace its approval.", { code: "project_connection_scope_protected" });
@@ -3273,7 +3274,8 @@ export function toolAccessService(
   ): Promise<FinishToolAppResult> {
     await actor?.managementContext?.reauthorize();
     const connection = await getConnectionRow(connectionId, companyId);
-    if (connection.projectId) await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, connection, operation: "finish", actor,
+    // F1: a caller or recipient outside the owning project gets the guard code.
+    if (connection.projectId) await admitProjectOwnedConnection(db, { companyId, projectId: connection.projectId, connection, operation: "finish", actor,
       targetAgentIds: input.access === "all_agents" ? [companyId] : input.access.agentIds });
     // Reader F1 (kept) for an envelope the writer cannot attribute to a project.
     else assertNotProjectOwnedToolConnection(connection);
@@ -3308,7 +3310,7 @@ export function toolAccessService(
           || verifiedProject.identity.verifiedRegistrationId !== scope.registrationId || verifiedProject.identity.canonicalInstallationKey !== scope.installationKey) {
           throw conflict("The provider identity differs from this project's approved App", { code: "project_connection_state_changed" });
         }
-        await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, connection, operation: "finish", actor,
+        await admitProjectOwnedConnection(db, { companyId, projectId: connection.projectId, connection, operation: "finish", actor,
           targetAgentIds: input.access === "all_agents" ? [companyId] : input.access.agentIds, proposedRepositoryIds: verifiedProject.repositoryIds });
       } else await refreshGitHubAppAccess(db, connection);
     }
@@ -3445,7 +3447,7 @@ export function toolAccessService(
       const recheckProjectFinish = async (targets: readonly string[]) => {
         if (!connection.projectId || !verifiedProject || !verifiedGrant) return;
         if (connectionSetupMutationFingerprint(lockedConnection) !== connectionSetupMutationFingerprint(connection)) throw conflict("The project connection changed during verification. Retry with current state.", { code: "project_connection_state_changed" });
-        await assertProjectConnectionAdmission(tx, { companyId, projectId: connection.projectId, connection: lockedConnection, operation: "finish", actor,
+        await admitProjectOwnedConnection(tx, { companyId, projectId: connection.projectId, connection: lockedConnection, operation: "finish", actor,
           targetAgentIds: targets, proposedRepositoryIds: verifiedProject.repositoryIds });
         const [grant] = await tx.select().from(connectionGrants).where(and(eq(connectionGrants.id, verifiedGrant.id), eq(connectionGrants.companyId, companyId))).for("update");
         if (!grant || grant.status !== "active" || stableHash(grant.credentialSecretRefs) !== stableHash(verifiedGrant.credentialSecretRefs)
@@ -3802,7 +3804,8 @@ export function toolAccessService(
     if (!connection.projectId) assertNotProjectOwnedToolConnection(connection);
     assertSupportedConnection(connection);
     if (connection.projectId) {
-      await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, connection, operation: "reconnect", actor });
+      // F1: a caller the owning project does not admit gets the guard code.
+      await admitProjectOwnedConnection(db, { companyId, projectId: connection.projectId, connection, operation: "reconnect", actor });
       if (Object.values(input.credentialValues).some(value => value.trim())) throw forbidden("Project connections accept approved references only. Rotate the same secret through the existing vault; retire and retake for a new reference.", { code: "project_connection_reference_not_approved" });
     }
     await assertConnectorConnectionSetupEnabled(connection);
@@ -5034,8 +5037,10 @@ export function toolAccessService(
       const [id, input, actor] = args;
       const connection = await getConnectionRow(id);
       if (connection.projectId) {
-        if (input.installs.some(target => target.targetType !== "agent")) throw forbidden("Project connections require explicit agent recipients", { code: "project_connection_target_outside_project" });
-        await assertProjectConnectionAdmission(db, { companyId: connection.companyId, projectId: connection.projectId, connection, operation: "install", actor,
+        // S6: a recipient or caller outside the owning project gets the guard
+        // code; the writer's other install refusals keep their codes.
+        if (input.installs.some(target => target.targetType !== "agent")) throw projectOwnedConnectionError(connection.id);
+        await admitProjectOwnedConnection(db, { companyId: connection.companyId, projectId: connection.projectId, connection, operation: "install", actor,
           targetAgentIds: input.installs.map(target => target.targetId) });
       }
       return connectionInstalls.putConnectionInstalls(...args);
@@ -5044,7 +5049,7 @@ export function toolAccessService(
       const [id, input, actor] = args;
       const connection = await getConnectionRow(id);
       if (connection.projectId) {
-        await assertProjectConnectionAdmission(db, { companyId: connection.companyId, projectId: connection.projectId, connection, operation: "install", actor,
+        await admitProjectOwnedConnection(db, { companyId: connection.companyId, projectId: connection.projectId, connection, operation: "install", actor,
           proposedSecretRefs: input.credentialSecretRefs ?? [] });
         throw forbidden("A project App has one verified installation and one organization authorization. Create a separately approved take instead.", { code: "project_connection_reference_not_approved" });
       }

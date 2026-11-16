@@ -272,7 +272,7 @@ import {
   verifyToolArgumentsSignature,
 } from "./tool-content-guards.js";
 import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.js";
-import { notProjectOwnedToolConnectionSql } from "./project-owned-connection-guard.js";
+import { filterProjectOwnedConnectionsForAgent, notProjectOwnedToolConnectionSql } from "./project-owned-connection-guard.js";
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -1664,6 +1664,10 @@ export function createToolGatewayService(
   async function connectedMcpToolsForCompany(
     companyId: string,
     selectedConnectionIds?: string[],
+    // S3: an agent-facing listing narrows project-owned rows to the owning
+    // project's team with an explicit install. Execution paths keep them and
+    // rely on the S4 decision and S1 mint, which apply the same gate.
+    audience?: { agentId: string | null | undefined },
   ): Promise<ToolGatewayDescriptor[]> {
     if (selectedConnectionIds?.length === 0) return [];
     // Read each connection and application row once. Selecting them in the
@@ -1716,12 +1720,15 @@ export function createToolGatewayService(
             and(
               inArray(toolConnections.id, connectionIds),
               connectedMcpConnectionFilter(companyId),
-              // RFL C3: filter ownership on the one-per-connection read, not
-              // the catalog query. The join below drops every excluded row.
+              // S3: filter ownership on the one-per-connection read, not the
+              // catalog query. The join below drops every excluded row. Rows
+              // without an attributable owner are dropped here for everyone.
               notProjectOwnedToolConnectionSql(),
             ),
           );
-        return { connectionRows, catalogRows };
+        if (!audience) return { connectionRows, catalogRows };
+        const reachable = new Set((await filterProjectOwnedConnectionsForAgent(tx, connectionRows.map(row => row.connection), audience.agentId)).map(row => row.id));
+        return { connectionRows: connectionRows.filter(row => reachable.has(row.connection.id)), catalogRows };
       },
       { isolationLevel: "repeatable read", accessMode: "read only" },
     );
@@ -1851,8 +1858,9 @@ export function createToolGatewayService(
   async function connectedMcpToolsForConnection(
     companyId: string,
     connectionId: string,
+    audience?: { agentId: string | null | undefined },
   ): Promise<ToolGatewayDescriptor[]> {
-    return (await connectedMcpToolsForCompany(companyId)).filter(
+    return (await connectedMcpToolsForCompany(companyId, undefined, audience)).filter(
       (tool) => tool.connectionId === connectionId,
     );
   }
@@ -3219,7 +3227,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
-    const connectedTools = (await connectedMcpToolsForCompany(session.companyId)).filter(isModelVisibleTool);
+    const connectedTools = (await connectedMcpToolsForCompany(session.companyId, undefined, { agentId: session.agentId })).filter(isModelVisibleTool);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
     const githubBotTools = await githubBotToolsForSession(db, session);
@@ -3444,7 +3452,7 @@ export function createToolGatewayService(
   /** Shared connection descriptors and task restrictions; no provider calls. */
   async function connectionToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
     const guestBotConnection = await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
-    let connectedTools = (await measureRunPhase("connectors.discovery.connections", async () => githubToolsForContext(session, await connectedMcpToolsForCompany(session.companyId))))
+    let connectedTools = (await measureRunPhase("connectors.discovery.connections", async () => githubToolsForContext(session, await connectedMcpToolsForCompany(session.companyId, undefined, { agentId: session.agentId }))))
       .filter(isModelVisibleTool)
       .filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
     const connectionIds = [...new Set(connectedTools.flatMap((tool) => tool.connectionId ? [tool.connectionId] : []))];
@@ -11372,7 +11380,7 @@ export function createToolGatewayService(
       await assertAgentInCompany(binding.companyId, binding.agentId);
       if (await githubGuestBotConnectionForSession(db, session)) return [];
       const tools = await measureRunPhase("connectors.browser_use.catalog", async () => {
-        const candidates = await connectedMcpToolsForCompany(binding.companyId, connections.map(connection => connection.id));
+        const candidates = await connectedMcpToolsForCompany(binding.companyId, connections.map(connection => connection.id), { agentId: binding.agentId });
         const decisions = await decideToolsForListing(candidates, tool => policyInputForTool({ session, tool }));
         return decisions.filter(({ decision }) => decision.allowed || decision.decision === "require_approval").map(({ tool }) => tool);
       });
@@ -11402,6 +11410,7 @@ export function createToolGatewayService(
       const tools = await connectedMcpToolsForConnection(
         input.companyId,
         input.connectionId,
+        { agentId: input.agentId },
       );
       const decisions = (
         await decideToolsForListing(tools, (tool) =>

@@ -9,12 +9,11 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { toolAccessAuditEvents, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import type { ToolConnection, ToolConnectionInstall, ToolConnectionInstallSnapshot, PutToolConnectionInstalls } from "@paperclipai/shared";
-import { forbidden, notFound, unprocessable } from "../../../errors.js";
+import { notFound, unprocessable } from "../../../errors.js";
 import { lockProjectConnectionRows } from "../../project-connection-arbitration.js";
-import { assertProjectConnectionAdmission } from "../../project-connection-admission.js";
 import { assertProjectConnectionNotInUse, completeProjectConnectionPredecessor } from "../../project-connection-retirement.js";
 import { logActivity } from "../../activity-log.js";
-import { assertNotProjectOwnedToolConnection, notProjectOwnedToolConnectionSql } from "../../project-owned-connection-guard.js";
+import { admitProjectOwnedConnection, assertNotProjectOwnedToolConnection, filterProjectOwnedConnectionsForAgent, notProjectOwnedToolConnectionSql, projectOwnedConnectionError } from "../../project-owned-connection-guard.js";
 
 type InstallDependencies = {
   now: () => Date;
@@ -137,12 +136,15 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         and(
           eq(toolConnections.companyId, companyId),
           inArray(toolConnections.id, connectionIds),
-          // RFL C3: never part of an agent's effective connections here.
+          // S5: an envelope without project_id is never effective here.
           notProjectOwnedToolConnectionSql(),
         ),
       )
       .orderBy(asc(toolConnections.name));
-    return rows.map((row) => ({
+    // S5: a project_id row is effective only for an agent inside its own
+    // project's team with an explicit install (a company install never counts).
+    const reachable = await filterProjectOwnedConnectionsForAgent(db, rows, agentId);
+    return reachable.map((row) => ({
       ...toConnection(row),
       installs: installRows
         .filter((install) => install.connectionId === row.id)
@@ -159,8 +161,9 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
     ): Promise<ToolConnectionInstallSnapshot> => {
       await actor?.managementContext?.reauthorize();
       const connection = await getConnectionRow(connectionId);
-      // RFL C3: this image cannot apply a project owner's recipient rules.
-      assertNotProjectOwnedToolConnection(connection);
+      // S6: an envelope without project_id has no owner to admit recipients
+      // (fail closed). A project_id row is admitted below on the transaction.
+      if (!connection.projectId) assertNotProjectOwnedToolConnection(connection);
       const requested = new Map(
         input.installs.map((install) => [
           `${install.targetType}:${install.targetId}`,
@@ -250,10 +253,12 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           // Check the COMPLETE replace-set after all waits, not just additions
           // authorized by the route. Company reach never implicitly enrolls a
           // project's future hires or unrelated agents.
+          // S6: a recipient or caller outside the owning project is refused
+          // with the guard's code; the writer's other refusals keep theirs.
           if ([...requested.values()].some(install => install.targetType !== "agent")) {
-            throw forbidden("Project connections require explicit project agent installs", { code: "project_connection_target_outside_project" });
+            throw projectOwnedConnectionError(currentConnection.id);
           }
-          await assertProjectConnectionAdmission(tx, {
+          await admitProjectOwnedConnection(tx, {
             companyId: currentConnection.companyId, projectId: currentConnection.projectId,
             operation: "install", actor, connection: currentConnection,
             targetAgentIds: [...requested.values()].map(install => install.targetId),

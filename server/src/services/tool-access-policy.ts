@@ -61,7 +61,7 @@ import {
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
-import { isProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
+import { isAgentInOwningProjectTeam, isProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 import { canonicalToolArguments, readSignedToolArgumentsPayload, toolRequestIdentityHash } from "./tool-content-guards.js";
 
 class RejectedInvocationAdmission extends Error {
@@ -1242,6 +1242,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
             transport: toolConnections.transport,
             config: toolConnections.config,
             transportConfig: toolConnections.transportConfig,
+            projectId: toolConnections.projectId,
           })
           .from(toolConnections)
           .where(eq(toolConnections.id, contextConnectionId)));
@@ -1251,10 +1252,14 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       if (!connection.enabled || connection.status === "disabled" || connection.status === "archived") {
         return { ok: false, redaction, decision: decision("deny", "deny_disabled_connection", "Connection is disabled.", [], [], { redactionPlan: redaction.redactionPlan }) };
       }
-      // RFL C3: this image cannot apply a project owner's admission rules, so
-      // no actor, policy, profile or grant can reach a project-owned row here.
-      if (isProjectOwnedToolConnection(connection)) {
-        return { ok: false, redaction, decision: decision("deny", "deny_project_owned_connection", "Connection belongs to a project and cannot be used by this server version.", [], [], { redactionPlan: redaction.redactionPlan }) };
+      // S4 (#20717 reader+writer): ahead of profiles, policies and grants, a
+      // project-owned row is denied by name to every actor outside its own
+      // project's team (and to everyone when it has no attributable owner).
+      // An agent inside the team still needs the writer's full admission in
+      // decideInternal (explicit install, run project, approval, pending).
+      if (isProjectOwnedToolConnection(connection) && (!connection.projectId
+        || !await isAgentInOwningProjectTeam(db as Db, { companyId: connection.companyId, projectId: connection.projectId }, agentId))) {
+        return { ok: false, redaction, decision: decision("deny", "deny_project_owned_connection", "Connection belongs to a project; only that project's admitted agents can use it.", [], [], { redactionPlan: redaction.redactionPlan }) };
       }
       applicationId = connection.applicationId;
       connectionTransport = connection.transport;

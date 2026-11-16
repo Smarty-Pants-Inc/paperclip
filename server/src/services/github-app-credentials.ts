@@ -5,7 +5,7 @@ import { HttpError, unprocessable } from "../errors.js";
 import { assertNotManagerApp, projectAppManagerConfigured, readProjectAppCustody } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
-import { assertNotProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
+import { assertNotProjectOwnedToolConnection, assertProjectOwnedConnectionAudience, isProjectOwnedConnectionRefusal } from "./project-owned-connection-guard.js";
 
 export { isGitHubAppConnection, parseGitHubAppConfig } from "./github-app-client.js";
 type Connection = typeof toolConnections.$inferSelect;
@@ -47,10 +47,15 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     const [c] = await db.select({ ...getTableColumns(toolConnections), hasProjectAppManager: projectAppManagerConfigured(toolConnections.companyId) })
       .from(toolConnections).where(and(eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id)));
     const [g] = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, connection.companyId), eq(connectionGrants.id, grant.id)));
-    // RFL C3: every App token for an agent, run, tool call or MCP header is
-    // minted here. A project-owned row (current or as passed) never yields one.
-    assertNotProjectOwnedToolConnection(connection);
-    if (c) assertNotProjectOwnedToolConnection(c);
+    // S1 (#20717 reader+writer): every App token for an agent, run, tool call
+    // or MCP header is minted here. An envelope without project_id (as passed
+    // or current) never yields one. A project_id row yields one only to an
+    // agent inside its own project's team, and then only after the writer's
+    // full admission below; anyone else gets the guard code.
+    if (!connection.projectId) assertNotProjectOwnedToolConnection(connection);
+    if (c && !c.projectId) assertNotProjectOwnedToolConnection(c);
+    const owner = c ?? connection;
+    if (owner.projectId && !allowDraft) await assertProjectOwnedConnectionAudience(db, owner, agentId);
     if (!c || !g || !isGitHubAppConnection(c) || g.connectionId !== c.id || !matchesOwnership(c, g) || g.kind !== grant.kind || g.subjectUserId !== grant.subjectUserId
       || c.projectId !== connection.projectId || c.credentialPolicy !== connection.credentialPolicy || g.subjectAgentId !== grant.subjectAgentId || g.status !== "active" || (allowDraft ? c.status !== "draft" : (!c.enabled || c.status !== "active"))
       || JSON.stringify(c.config) !== JSON.stringify(connection.config)
@@ -86,9 +91,12 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
     if (!allowDraft) {
       const installs = await db.select().from(toolConnectionInstalls).where(and(eq(toolConnectionInstalls.companyId, c.companyId), eq(toolConnectionInstalls.connectionId, c.id)));
       const targetAgentId = agentId ?? (g.kind === "agent" ? g.subjectAgentId : null);
+      // A project-owned row is reachable only through an explicit install for
+      // this agent; a company install never widens it (never company-wide).
+      const owned = c.projectId != null;
       if (!installs.some(install =>
-        (install.targetType === "company" && install.targetId === c.companyId)
-        || (install.targetType === "agent" && (!targetAgentId || install.targetId === targetAgentId))
+        (!owned && install.targetType === "company" && install.targetId === c.companyId)
+        || (install.targetType === "agent" && (owned ? install.targetId === agentId : (!targetAgentId || install.targetId === targetAgentId)))
       )) githubAppFailure();
     }
     return { c, g };
@@ -146,6 +154,7 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
   } catch (error) {
     const code = error instanceof HttpError ? (error.details as { code?: unknown } | undefined)?.code : undefined;
     if (typeof code === "string" && code.startsWith("project_app_")) throw error;
+    if (isProjectOwnedConnectionRefusal(error)) throw error;
     rethrowGitHubAppFailure(error);
   }
 }
