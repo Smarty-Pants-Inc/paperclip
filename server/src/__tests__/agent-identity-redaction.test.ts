@@ -1,6 +1,6 @@
 import { createHash, generateKeyPairSync, randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
+import { addRunSecretMaterial, createAgentIdentityRedactor } from "../services/agent-identity-redaction.js";
 import { canonicalNativeRunLogRedactionForms, redactCanonicalNativeRunLogChunk } from "../services/heartbeat/run-log.js";
 import { redactRegisteredSecretValues } from "../services/run-secret-redaction.js";
 import { agentIdentityRedactionVectors, pemBodyWindows, pemTransformForms } from "./fixtures/agent-identity-redaction-vectors.js";
@@ -196,5 +196,56 @@ describe("run-secret and identity PEMs printed through shell transforms", () => 
     const elapsed = performance.now() - started;
     expect(output).toBe(text);
     expect(elapsed, `1 MB took ${Math.round(elapsed)} ms`).toBeLessThan(PERF_BUDGET_MS);
+  });
+});
+
+// Integrity: a run secret indexes ordinary text only when it can be told
+// apart from it; short values and identifiers never mask stored log text.
+describe("run secret material: short values and identifiers keep ordinary text byte-equal (redact-meta)", () => {
+  const stream = (redactor: ReturnType<typeof createAgentIdentityRedactor>, text: string) => {
+    let output = "";
+    for (let index = 0; index < text.length; index += 7) output += redactor.chunk("stdout", text.slice(index, index + 7));
+    return output + redactor.finish("stdout");
+  };
+  const agentId = "7f3c2a10-4b5d-4e6f-8a9b-0c1d2e3f4a5b";
+  const ordinary = `test 1 passed in v1.2.3 (11 files)\nagent ${agentId} on api.internal.example.com in us-east-1\n`;
+
+  it("(5) a short env secret leaves an ordinary log line byte-equal", () => {
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, ["1", "v1", "abc1234"]);
+    expect(stream(redactor, ordinary)).toBe(ordinary);
+    expect(redactor.redact(ordinary)).toBe(ordinary);
+  });
+
+  it("(6) a long secret in the same run is still masked in the log and in events", () => {
+    const secret = randomBytes(30).toString("base64");
+    const eight = "Zq8#rT2!";
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, ["1", "v1", agentId, secret, eight]);
+    const text = `${ordinary}token=${secret}\npass=${eight}\n`;
+    for (const output of [stream(redactor, text), redactor.redact(text), JSON.stringify(redactor.redact({ text }))]) {
+      expect(output).not.toContain(secret);
+      expect(output).not.toContain(eight);
+      expect(output).toContain(ordinary.trimEnd().replace(/\n/g, output.startsWith("{") ? "\\n" : "\n"));
+    }
+  });
+
+  it("(8) an identifier-valued secret (UUID, a known id, a host name, a region) is not indexed and stays visible", () => {
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [agentId, agentId.toUpperCase(), "api.internal.example.com", "us-east-1", "europe-west4", "env-prod-blue"],
+      ["env-prod-blue"]);
+    expect(redactor.values).toEqual([]);
+    const text = `${ordinary}environment env-prod-blue\n`;
+    expect(stream(redactor, text)).toBe(text);
+    expect(redactor.redact({ text })).toEqual({ text });
+  });
+
+  it("(8) the identifier guard never drops secret-shaped values", () => {
+    const jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    const redactor = createAgentIdentityRedactor();
+    addRunSecretMaterial(redactor, [jwt, "sk-live-abcdef0123456789", "postgres://u:p4ss@db.example.com/x"]);
+    for (const value of [jwt, "sk-live-abcdef0123456789", "postgres://u:p4ss@db.example.com/x"]) {
+      expect(redactor.redact(`x ${value} y`)).not.toContain(value);
+    }
   });
 });

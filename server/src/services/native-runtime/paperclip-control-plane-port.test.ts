@@ -1156,6 +1156,120 @@ describe("PaperclipControlPlanePort conformance", () => {
     expect(rows.every(row=>row.nativeStoredWindows===0 && row.markers===0), "native DB event leaks; see count-only report").toBe(true);
   }, 60_000);
 
+  describe("run secret material never rewrites protocol metadata (redact-meta)", () => {
+    const openPort = async (material: string[] | ((ids: { runId: string; sessionId: string; runnerId: string }) => string[])) => {
+      const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+      const runnerId = randomUUID();
+      const runSecretMaterial = typeof material === "function" ? material({ runId: identity.runId, sessionId: identity.sessionId, runnerId }) : material;
+      await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+        status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+        runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+        contextSnapshot: { issueId: identity.issueId } });
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `redact-meta-${identity.runId}` },
+      { runSecretMaterial });
+      await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+      const event = (seq: number, turnId: string, itemId: string, eventType: "item.delta" | "item.completed", text?: string): PrpEvent => ({
+        schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceEventId: `${runnerId}:${seq}`, sourceSeq: seq,
+        sourceInstanceId: runnerId, sourceKind: "runner", runId: identity.runId, normalizedSessionId: identity.sessionId,
+        turnId, itemId, eventType, priority: eventType === "item.delta" ? 1 : 0, emittedAt: new Date(Date.UTC(2026, 10, 16, 0, 0, seq)).toISOString(),
+        payload: eventType === "item.delta" ? { itemId, kind: "commandExecution", text: text ?? "" } : { itemId },
+      } as PrpEvent);
+      const rows = async () => db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.seq));
+      return { identity, runnerId, port, event, rows };
+    };
+    // PostgreSQL jsonb does not keep key order; compare the envelope with sorted keys.
+    const envelope = (event: Record<string, unknown>) => Object.fromEntries(Object.entries(event)
+      .filter(([key]) => key !== "payload" && key !== "debug").sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0));
+
+    it("(1) a run secret '1' commits events 1..3 in order with no binding mismatch", async () => {
+      const { port, event, rows } = await openPort(["1"]);
+      const sent = [event(1, "turn-1", "item-1", "item.delta", "step 1 of 3\n"), event(2, "turn-1", "item-1", "item.delta", "step 2 of 3\n"),
+        event(3, "turn-1", "item-1", "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      const persisted = await rows();
+      expect(persisted.map(row => row.sourceEventId)).toEqual(sent.map(value => value.sourceEventId));
+      expect(persisted.map(row => (row.payload as any).prpEvent.sourceSeq)).toEqual([1, 2, 3]);
+      expect(persisted.map(row => envelope((row.payload as any).prpEvent))).toEqual(sent.map(value => envelope(value as any)));
+    });
+
+    it("(2) a run secret 'v1' leaves the committed schema, ids and source hash byte-equal to the input metadata", async () => {
+      const { port, event, rows } = await openPort(["v1"]);
+      const sent = [event(1, "turn-v1", "item-v1", "item.delta", "output\n"), event(2, "turn-v1", "item-v1", "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      const persisted = await rows();
+      expect(persisted).toHaveLength(2);
+      for (const [index, row] of persisted.entries()) {
+        const committed = (row.payload as any).prpEvent;
+        expect(JSON.stringify(envelope(committed))).toBe(JSON.stringify(envelope(sent[index] as any)));
+        expect(committed.schema).toBe("paperclip.prp.event.v1");
+        expect(row.sourceEventId).toBe(sent[index]!.sourceEventId);
+        expect(row.sourcePayloadSha256).toBe(nativeSha256(committed));
+      }
+    });
+
+    it("(3) the same run secret inside an output field is still masked while the metadata carrying it stays intact", async () => {
+      const secret = `rm${randomUUID().replace(/-/g, "")}`; // 34 chars, test-only, not an identifier
+      const { port, event, rows } = await openPort([secret]);
+      const sent = [event(1, `turn-${secret}`, `item-${secret}`, "item.delta", `token=${secret}\nordinary line\n`),
+        event(2, `turn-${secret}`, `item-${secret}`, "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      const persisted = await rows();
+      expect(persisted).toHaveLength(2);
+      for (const [index, row] of persisted.entries()) {
+        const committed = (row.payload as any).prpEvent;
+        expect(envelope(committed)).toEqual(envelope(sent[index] as any));
+        expect(JSON.stringify(committed.payload).includes(secret)).toBe(false);
+      }
+      const text = persisted.map(row => (row.payload as any).prpEvent).map(event => (event.payload.text ?? "") +
+        ((event.payload.outputTails ?? []) as any[]).map(tail => tail.payload.text ?? "").join("")).join("");
+      expect(text).toContain("ordinary line");
+      expect(text).toContain("***REDACTED***");
+    });
+
+    it("(4) cursor, hash and sequence stay consistent across a redacted event and its retry", async () => {
+      const secret = `rm${randomUUID().replace(/-/g, "")}`;
+      const { port, event, rows } = await openPort(["1", "v1", secret]);
+      const sent = [event(1, "turn-1", "item-1", "item.delta", "before 1\n"), event(2, "turn-1", "item-1", "item.delta", `mid ${secret} v1\n`),
+        event(3, "turn-1", "item-1", "item.delta", "after 1\n"), event(4, "turn-1", "item-1", "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      await port.appendEvent(sent[1]!); // retry of the redacted event: same receipt, no new row
+      const persisted = await rows();
+      expect(persisted.map(row => row.sourceEventId)).toEqual(sent.map(value => value.sourceEventId));
+      expect(persisted.map(row => row.seq)).toEqual([...persisted.map(row => row.seq)].sort((a, b) => a - b));
+      expect(new Set(persisted.map(row => row.seq)).size).toBe(4);
+      for (const [index, row] of persisted.entries()) {
+        const committed = (row.payload as any).prpEvent;
+        expect(envelope(committed)).toEqual(envelope(sent[index] as any));
+        expect(row.sourcePayloadSha256).toBe(nativeSha256(committed));
+      }
+      expect(JSON.stringify(persisted.map(row => row.payload)).includes(secret)).toBe(false);
+      expect((persisted[0]!.payload as any).prpEvent.payload.text).toBe("before 1\n");
+    });
+
+    it("(8)/(9) an id-valued secret (the agent's or the run's own UUID) commits events intact and leaves the id visible", async () => {
+      const agentId = CONTROL_PLANE_CONFORMANCE_OPEN.identity.agentId;
+      const { port, event, rows } = await openPort([agentId]);
+      const sent = [event(1, `turn-${agentId}`, `item-${agentId}`, "item.delta", `agent ${agentId} started\n`),
+        event(2, `turn-${agentId}`, `item-${agentId}`, "item.completed")];
+      for (const value of sent) await port.appendEvent(value);
+      const persisted = await rows();
+      expect(persisted).toHaveLength(2);
+      for (const [index, row] of persisted.entries()) expect((row.payload as any).prpEvent).toEqual(sent[index]);
+      // The run's own ids bound as secrets beside a real long secret.
+      const longSecret = `rm${randomUUID().replace(/-/g, "")}`;
+      const own = await openPort(ids => [ids.runId, ids.sessionId, ids.runnerId, longSecret]);
+      const ownSent = own.event(1, "turn-own", "item-own", "item.delta", `run ${own.identity.runId} key ${longSecret}\n`);
+      await own.port.appendEvent(ownSent);
+      const ownRows = await own.rows();
+      expect(ownRows).toHaveLength(1);
+      const committed = (ownRows[0]!.payload as any).prpEvent;
+      expect(envelope(committed)).toEqual(envelope(ownSent as any));
+      expect(committed.payload.text).toContain(`run ${own.identity.runId} key `);
+      expect(committed.payload.text.includes(longSecret)).toBe(false);
+    });
+  });
+
   it("runs the unchanged package conformance suite against Paperclip persistence", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const committedEventIds: string[] = [];
