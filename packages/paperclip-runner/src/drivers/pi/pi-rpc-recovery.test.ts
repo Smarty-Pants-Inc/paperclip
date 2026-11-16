@@ -70,7 +70,9 @@ async function managedRecoveryFixture(oldNpmLink = false) {
   await writeFile(join(packageA, "package.json"), JSON.stringify({ name: "pkg-a", version: "1.0.0" }));
   await writeFile(join(packageB, "package.json"), JSON.stringify({ name: "@scope/pkg-b", version: "2.0.0" }));
   await writeFile(join(packageB, "extensions", "selected.js"), "export const value = 'restored-resource';\n");
-  const packages = ["npm:pkg-a", { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"];
+  const localRoot = join(root, "local-pkg");
+  await mkdir(localRoot);
+  const packages = ["npm:pkg-a", { source: "npm:@scope/pkg-b", extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, localRoot];
   await writeFile(join(originalHome, "settings.json"), JSON.stringify({ packages }));
   await writeFile(join(originalHome, "models.json"), JSON.stringify({}));
   vi.stubEnv("PI_CODING_AGENT_DIR", originalHome);
@@ -106,7 +108,7 @@ async function managedRecoveryFixture(oldNpmLink = false) {
     transportFactory: factory });
   const snapshot: PersistedHarnessSession & { sessionFile: string } = { driverKind: "pi_rpc", driverSessionId: header.id, providerSessionId: header.id,
     runId: "run-restored", normalizedSessionId: "conversation", workingDirectory: workspace, activeTurnId: null, lastSourceSequence: 40, sessionFile: file };
-  return { root, originalHome, agentHome, packageA, packageB, packages, file, content, factory, requests, transport,
+  return { root, originalHome, agentHome, packageA, packageB, localRoot, packages, file, content, factory, requests, transport,
     async recover() { return driver.recoverSession!(snapshot, { signal: new AbortController().signal }); },
     async cleanup() { await transport.close(); vi.unstubAllEnvs(); await rm(root, { recursive: true, force: true }); } };
 }
@@ -172,7 +174,7 @@ describe("Pi driver verified cold recovery", () => {
         expect(await symlinkPathsBelow(f.agentHome)).toEqual([]);
         const settings = JSON.parse(await readFile(join(f.agentHome, "settings.json"), "utf8"));
         expect(settings.packages).toEqual([f.packageA,
-          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"]);
+          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, f.localRoot]);
       } finally { await result.session!.close({ reason: "test" }); }
     } finally { await f.cleanup(); }
   });
@@ -186,7 +188,7 @@ describe("Pi driver verified cold recovery", () => {
         expect(await readlink(join(f.agentHome, "npm"))).toBe(join(f.originalHome, "npm"));
         const settings = JSON.parse(await readFile(join(f.agentHome, "settings.json"), "utf8"));
         expect(settings.packages).toEqual([f.packageA,
-          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, "/abs/local-pkg"]);
+          { source: f.packageB, extensions: ["extensions/selected.js"], skills: ["skills/selected/SKILL.md"] }, f.localRoot]);
         expect(settings.packages.some((entry: unknown) => typeof entry === "string" && entry.startsWith("npm:")
           || typeof entry === "object" && entry !== null && "source" in entry && String(entry.source).startsWith("npm:"))).toBe(false);
         await expect(readFile(join(settings.packages[1].source, "extensions/selected.js"), "utf8")).resolves.toBe("export const value = 'restored-resource';\n");
