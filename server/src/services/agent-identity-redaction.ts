@@ -97,6 +97,9 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
   // BEGIN marker, open key-block context; a plain secret masks only itself.
   const keyBlockWindows = new Set<string>();
   const materialPrefixes = new Set<string>();
+  // Values with at least one key-body window: the material scan masks these
+  // from their first window. Every other value is matched whole only.
+  const windowedValues = new Set<string>();
   // `values` is intentionally appendable: execution preparation and native log
   // recovery add identities/registered secrets after constructing the redactor.
   const indexMaterial = () => {
@@ -108,6 +111,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       const body = decoded.split(/\r?\n/).filter(line => line && !line.startsWith("-----")).join("").replace(/=+$/, "");
       if (!/^[A-Za-z0-9+/]+$/.test(body)) continue;
       const keyBlock = decoded.includes("-----BEGIN ");
+      if (body.length >= MATERIAL_WINDOW) windowedValues.add(value);
       for (let index = 0; index + MATERIAL_WINDOW <= body.length; index++) {
         const window = body.slice(index, index + MATERIAL_WINDOW);
         if (keyBlock) keyBlockWindows.add(window);
@@ -233,10 +237,29 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       // An all-digit value masks only as a whole number: hold a complete one at
       // the end until the next character shows whether the number continues.
       else for (const value of values) if (isDigitValue(value) && text.endsWith(value)) held = Math.max(held, value.length);
+      // Never cut through a value: hold from the start of any value the cut
+      // would split (one ending inside the held prefix of another value).
+      let cut = text.length - held;
+      for (let moved = held > 0; moved;) {
+        moved = false;
+        for (const value of values) {
+          const start = value ? text.indexOf(value, Math.max(0, cut - value.length + 1)) : -1;
+          if (start >= 0 && start < cut) { cut = start; moved = true; }
+        }
+      }
+      held = text.length - cut;
       if (held) pending.set(stream, text.slice(-held));
       else pending.delete(stream);
       const state = materialStreams.get(stream) ?? newMaterialStream();
-      let output = scanMaterial(held ? text.slice(0, -held) : text, state);
+      // Match whole values before the material scan: its hold can keep a
+      // value's last characters (a base64 suffix that may begin a key window)
+      // for the next chunk, and the whole-value replace below would then see
+      // only a part. Windowed values stay with the scan, which masks them from
+      // their first window and keeps whole PEM projection and key context.
+      indexMaterial();
+      const scanned = redactRegisteredSecretValues(held ? text.slice(0, -held) : text,
+        values.filter(value => !windowedValues.has(value)));
+      let output = scanMaterial(scanned, state);
       // A held exact-value prefix still proves the preceding token ended.
       if (held && !/^[A-Za-z0-9+/=]/.test(text.slice(-held))) output += flushToken(state);
       if (state.context || state.token || state.marker || state.suppressed) materialStreams.set(stream, state);

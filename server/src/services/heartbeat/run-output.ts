@@ -335,17 +335,34 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     // chunks. Their text fields share onLog's per-stream hold (chunk/finish),
     // keyed by event type, stream and tool call; every other field is redacted
     // whole, as for any event. An event whose text ends in a held suffix is
-    // committed when the next event of its stream arrives, or at finish with the
-    // released tail: one adapter event stays one committed event.
-    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]> }>();
+    // committed when the next event of the run arrives, or at finish with the
+    // released tail: one adapter event stays one committed event, and events
+    // commit in adapter order. A held tail released by a later event of its own
+    // stream lands in that event; if its stream never sends again, finish
+    // commits the tail alone in an event of that stream (`committed`).
+    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]>; committed: boolean }>();
     const holds = (id: string) => identityRedactor.holds?.(id) ?? false;
+    // Before any later event of the run is committed, commit the older held
+    // event as it stands. Its stream keeps the hold, so a secret split across
+    // that stream's events is still matched; the event's place is kept.
+    const commitHeldEvents = async () => {
+      for (const [key, entry] of toolOutputStreams) {
+        if (entry.committed) continue;
+        await appendRunEvent(currentRun, entry.event);
+        const { eventType, stream, level, color, payload } = entry.event;
+        const callKeys = Object.fromEntries(TOOL_CALL_KEYS.filter(name => payload?.[name] !== undefined)
+          .map(name => [name, payload![name]]));
+        toolOutputStreams.set(key, { held: entry.held, committed: true,
+          event: { eventType, stream, level, color, ...(Object.keys(callKeys).length ? { payload: callKeys } : {}) } });
+      }
+    };
     const appendToolOutputEvent = async (raw: AdapterRuntimeEvent, redacted: AdapterRuntimeEvent, eventType: string) => {
       const rawPayload: Record<string, unknown> = raw.payload ?? {};
       const call = TOOL_CALL_KEYS.map(key => rawPayload[key]).find(value => typeof value === "string") ?? null;
       const key = JSON.stringify([eventType, raw.stream ?? null, call]);
+      await commitHeldEvents();
       const previous = toolOutputStreams.get(key);
       toolOutputStreams.delete(key);
-      if (previous) await appendRunEvent(currentRun, previous.event);
       const held = new Map([...previous?.held ?? []].filter(([id]) => holds(id)));
       // Walk the raw event beside its whole-redacted copy: streamed text is
       // chunked from the raw value, anything else keeps the redacted value.
@@ -374,13 +391,16 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         message: visit(raw.message, redacted.message, ["message"]) as string | undefined,
         payload: visit(raw.payload, redacted.payload, ["payload"]) as Record<string, unknown> | undefined,
       };
-      if (held.size) toolOutputStreams.set(key, { event, held });
+      if (held.size) toolOutputStreams.set(key, { event, held, committed: false });
       else await appendRunEvent(currentRun, event);
     };
     const finishAdapterEvents = async () => {
-      const streams = [...toolOutputStreams.values()];
+      // The event still held arrived before finish: it commits before the
+      // tails of streams whose events were already committed in order.
+      const streams = [...toolOutputStreams.values()].sort((left, right) => Number(left.committed) - Number(right.committed));
       toolOutputStreams.clear();
-      for (const { event, held } of streams) {
+      for (const { event, held, committed } of streams) {
+        let released = false;
         for (const [id, path] of held) {
           const tail = identityRedactor.finish?.(id) ?? "";
           if (!tail) continue;
@@ -391,8 +411,10 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
           }
           const field = path[path.length - 1]!;
           target[field] = `${typeof target[field] === "string" ? target[field] : ""}${tail}`;
+          released = true;
         }
-        await appendRunEvent(currentRun, event);
+        // An event already committed in order gets only its released tail.
+        if (!committed || released) await appendRunEvent(currentRun, event);
       }
     };
 
@@ -404,6 +426,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       // not carry nativeSource identities, so they must never author it.
       if (!eventType || eventType.startsWith("legacy.case_handoff_")) return;
       if (TOOL_OUTPUT_EVENT.test(eventType)) return appendToolOutputEvent(raw, event, eventType);
+      await commitHeldEvents();
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,
