@@ -6915,22 +6915,34 @@ export function recoveryService(
     // A native failure that schedules a same-run resume marks its run failed
     // but keeps both task locks for that resume. Clearing them lets another
     // run take the task first, and then the resume can never run. Only a
-    // closed task releases them here.
+    // closed task releases them here. A phase label on a run that the native
+    // resume owner cannot claim (notably cancelled) is not an owner. Let that
+    // task reach the same guarded Stop inspection and bounded diagnostic below.
+    // Match claimNativeSessionResumptions' run-status gate in both the snapshot
+    // and the write fence, without changing eligible same-run retry behavior.
     const pendingResumeLock = sql<boolean>`exists (select 1 from ${nativeRunFinalizations} pending_resume
+      inner join ${heartbeatRuns} resume_run on resume_run.id = pending_resume.run_id
+        and resume_run.company_id = pending_resume.company_id
       where pending_resume.company_id = ${issues.companyId}
         and pending_resume.run_id in (${issues.checkoutRunId}, ${issues.executionRunId})
         and pending_resume.phase = 'retryable_failure'
-        and pending_resume.result_id is null)`;
+        and pending_resume.result_id is null
+        and resume_run.runtime_mode = 'native'
+        and resume_run.status in ('running', 'failed'))`;
     const lockRunLive = sql<boolean>`exists (select 1 from ${heartbeatRuns} lock_run
       where lock_run.id in (${issues.checkoutRunId}, ${issues.executionRunId})
         and lock_run.status not in (${sql.join([...TERMINAL_HEARTBEAT_RUN_STATUSES].map(status => sql`${status}`), sql`, `)}))`;
     const pendingResumeRunIds = new Set(referencedRunIds.length === 0 ? [] : (await db
       .select({ runId: nativeRunFinalizations.runId })
       .from(nativeRunFinalizations)
+      .innerJoin(heartbeatRuns, and(eq(heartbeatRuns.id, nativeRunFinalizations.runId),
+        eq(heartbeatRuns.companyId, nativeRunFinalizations.companyId)))
       .where(and(
         inArray(nativeRunFinalizations.runId, referencedRunIds),
         eq(nativeRunFinalizations.phase, "retryable_failure"),
         isNull(nativeRunFinalizations.resultId),
+        eq(heartbeatRuns.runtimeMode, "native"),
+        inArray(heartbeatRuns.status, ["running", "failed"]),
       ))).map(row => row.runId));
 
     for (const issue of candidates) {
