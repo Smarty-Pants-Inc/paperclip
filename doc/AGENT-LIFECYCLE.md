@@ -136,7 +136,10 @@ retries PostgreSQL-confirmed `40P01` and `40001` rollbacks. Each attempt reacqui
 the company mutex, rechecks authorization and creates a fresh activity-publication
 buffer. Configuration secret-binding activities and completion's task-access
 and reassignment activities use that buffer: live events publish only after the
-final commit, never from a rolled-back attempt.
+final commit, never from a rolled-back attempt. So do hire and hire-decision
+activities (secret bindings, agent identity, primary-agent initialization and
+clearing), including writes from nested hire, approval, rejection and
+configure-then-transition savepoints, which join the root buffer.
 Nested lifecycle writes propagate contention to that root boundary;
 they do not retry inside an already-held outer transaction. Exhaustion leaves
 completion uncommitted and reports a retryable conflict. Assignment cancels only

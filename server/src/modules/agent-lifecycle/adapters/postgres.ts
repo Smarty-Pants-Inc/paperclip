@@ -213,7 +213,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
         details: { keyId },
       });
     }
-    await effects.clearPrimary(tx, agent.companyId, agent.id);
+    await effects.clearPrimary(tx, agent.companyId, agent.id, publications);
   }
   if (command === "approve") await effects.recordCreation(tx, agent.companyId, agent.id);
   if (next === "pausing" || next === "resuming" || next === "terminating" || next === "rejected") {

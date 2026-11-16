@@ -4,7 +4,7 @@ import { hireApprovalService as approvalRecords, type HireDecisionTarget } from 
 import { agents, companies } from "@paperclipai/db";
 import { and, asc, desc, eq, gt, inArray, lte, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { LifecycleEffects } from "./adapters/effects.js";
+import { joinLifecycleTransaction, type LifecycleEffects } from "./adapters/effects.js";
 export type { LifecycleEffects } from "./adapters/effects.js";
 import { updateAgentConfiguration } from "./adapters/configuration.js";
 import type { AgentConfigurationPatch, UpdateAgentOptions } from "../../lib/agent-records.js";
@@ -105,7 +105,7 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
       if (!existing) return null;
       const agent = await effects.transaction(db, existing.companyId, async (tx, publications) => {
         await updateAgentConfiguration(tx, effects, id, data, options, publications);
-        await createLifecycleStore(tx, effects).change(id, command, { reason: command === "resume" ? "user" : "manual" });
+        await createLifecycleStore(tx, joinLifecycleTransaction(effects, publications)).change(id, command, { reason: command === "resume" ? "user" : "manual" });
         return agentRecords(tx, effects).getById(id);
       });
       scheduleAgentLifecycle(db, id);

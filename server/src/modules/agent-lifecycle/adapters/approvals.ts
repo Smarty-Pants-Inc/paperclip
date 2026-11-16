@@ -5,7 +5,7 @@ import { unprocessable } from "../../../errors.js";
 import { approvalResolutionRecords, resolvableApprovalStatuses } from "../../../lib/approval-records.js";
 import { agentRecords } from "./records.js";
 import { createLifecycleStore } from "./postgres.js";
-import type { LifecycleEffects } from "./effects.js";
+import { joinLifecycleTransaction, type LifecycleEffects } from "./effects.js";
 
 export type HireDecisionTarget = string | { approvalId: string };
 type HireDecisionResult = {
@@ -27,7 +27,10 @@ export function hireApprovalService(db: Db, effects: LifecycleEffects) {
     const companyId = initial.companyId;
     // Hire decisions acquire the company lock before changing an approval or agent.
     return effects.transaction(db, companyId, async (tx, publications) => {
-      const records = agentRecords(tx, effects);
+      // Nested record and lifecycle writes join this root buffer, so a retried
+      // or exhausted decision publishes nothing from a rolled-back attempt.
+      const joined = joinLifecycleTransaction(effects, publications);
+      const records = agentRecords(tx, joined, publications);
       let approvalId = typeof target === "string" ? null : target.approvalId;
       if (typeof target === "string") {
         const [open] = await tx.select({ id: approvals.id }).from(approvals).where(and(
@@ -83,7 +86,7 @@ export function hireApprovalService(db: Db, effects: LifecycleEffects) {
         if (approval) await records.rejectPendingHire(agentId);
         else {
           const before = await records.getById(agentId);
-          await createLifecycleStore(tx, effects).change(agentId, "reject");
+          await createLifecycleStore(tx, joined).change(agentId, "reject");
           applied = before?.lifecycleState !== "rejected";
         }
       }

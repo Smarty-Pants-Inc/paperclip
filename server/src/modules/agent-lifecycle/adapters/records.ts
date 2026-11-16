@@ -6,8 +6,12 @@ import { agents, agentApiKeys, companies, type Db } from "@paperclipai/db";
 import { conflict, notFound } from "../../../errors.js";
 import { agentRecordQueries, type CreateAgentOptions, type CreateAgentData } from "../../../lib/agent-records.js";
 import { isAgentSetupDraft, canConfigureAgentConnection } from "../domain/policy.js";
+import type { ActivityPublication } from "../../../types/activity-publication.js";
 
-export function agentRecords(db: Db, effects: LifecycleEffects) {
+/** When `db` is a caller-owned transaction, pass its root post-commit
+ * `publications` so writes made through these records publish only after
+ * that root commits, never from a rolled-back attempt. */
+export function agentRecords(db: Db, effects: LifecycleEffects, publications?: ActivityPublication[]) {
   const { getById } = agentRecordQueries(db);
 
   return {
@@ -61,7 +65,7 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           : tx.insert(agents).values(values))
           .returning()
           .then((rows) => rows[0]);
-        await effects.initializeHire(txDb, created, options);
+        await effects.initializeHire(txDb, created, options, publications);
         if (!options?.setupOnly && status !== "pending_approval" && status !== "terminated"
           && created.budgetMonthlyCents > 0 && options?.initialBudgetPolicyUserId) {
           await effects.setAgentBudget(txDb, publications, companyId, created.id, created.budgetMonthlyCents, options.initialBudgetPolicyUserId);
@@ -88,13 +92,13 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
         throw conflict("Only agents in error status can have their error cleared");
       }
 
-      const updated = await effects.transaction(db, existing.companyId, async tx => {
+      const updated = await effects.transaction(db, existing.companyId, async (tx, publications) => {
         const [current] = await tx.select({ status: agents.status, lifecycleState: agents.lifecycleState })
           .from(agents).where(and(eq(agents.id, id), eq(agents.companyId, existing.companyId))).for("no key update");
         if (current?.status !== "error" || current.lifecycleState !== "ready") {
           throw conflict("Only agents in error status can have their error cleared");
         }
-        await effects.beforeStatusChange(tx, existing.companyId, id, "error", "idle");
+        await effects.beforeStatusChange(tx, existing.companyId, id, "error", "idle", publications);
         const [saved] = await tx.update(agents).set({
           status: "idle", pauseReason: null, pausedAt: null, errorReason: null, updatedAt: new Date(),
         }).where(and(eq(agents.id, id), eq(agents.status, "error"), eq(agents.lifecycleState, "ready"))).returning();
@@ -109,12 +113,12 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
       const [pending] = await db.select({ companyId: agents.companyId, status: agents.status }).from(agents)
         .where(and(eq(agents.id, id), eq(agents.lifecycleState, "pending_approval"))).for("update");
       if (!pending) return [];
-      await effects.beforeStatusChange(db, pending.companyId, id, pending.status, "terminated");
+      await effects.beforeStatusChange(db, pending.companyId, id, pending.status, "terminated", publications);
       const rows = await db.update(agents).set({ status: "terminated", lifecycleState: "rejected",
         lifecycleVersion: sql`${agents.lifecycleVersion} + 1`, lifecycleOperation: null,
         updatedAt: new Date() }).where(and(eq(agents.id, id), eq(agents.lifecycleState, "pending_approval"))).returning();
       for (const row of rows) {
-        await effects.clearPrimary(db, row.companyId, id);
+        await effects.clearPrimary(db, row.companyId, id, publications);
         await db.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.agentId, id));
         await effects.recordStatus(db, row.companyId, id, "pending_approval", "terminated");
       }
@@ -140,7 +144,7 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
-        await effects.completeHireApproval(txDb, updated, existing);
+        await effects.completeHireApproval(txDb, updated, existing, publications);
         await effects.recordCreation(txDb, existing.companyId, updated.id);
         const agent = await agentRecordQueries(txDb).getById(updated.id);
         if (!agent) {
