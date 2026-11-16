@@ -147,8 +147,11 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
-import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError, isAccountingContentionError, isAccountingRetryable } from "../services/accounting-transaction.js";
-import { isRetryableTransactionError, withTransactionRetry } from "../services/transaction-retry.js";
+import { ACCOUNTING_WRITE_CONTENTION_MESSAGE, AccountingContentionError } from "../services/accounting-transaction.js";
+import { transactionRetryStats } from "../services/transaction-retry.js";
+import { isTransientLockContention, postgresErrorCode, retryTransientLockContention } from "../services/transient-lock-contention.js";
+import { AGENT_HIRE_ATTEMPTS, AgentHireContentionError, COMPANY_DEFAULT_GRANTS_DEFERRED } from "../services/agent-lifecycle.js";
+import { ensureNewAgentMembership } from "../services/agent-hiring.js";
 import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -1427,50 +1430,50 @@ export function agentRoutes(
     };
   }
 
-  async function applyDefaultAgentTaskAssignGrant(
+  /** Replay of an already-created hire: re-asserts its membership and tasks:assign
+   * (agents created before #20805 could commit without them). One transaction,
+   * no retry loop; contention answers the named 503. */
+  async function repairReplayedHireMembership(
     companyId: string,
     agentId: string,
     grantedByUserId: string | null,
   ) {
     try {
-      await withTransactionRetry(db, () => db.transaction(async (tx) => {
-        const txAccess = accessService(tx as unknown as Db);
-        await txAccess.ensureMembership(companyId, "agent", agentId, "member", "active");
-        await txAccess.setPrincipalPermission(
-          companyId,
-          "agent",
-          agentId,
-          "tasks:assign",
-          true,
-          grantedByUserId,
-        );
-      }), 5);
+      await ensureNewAgentMembership(db, companyId, agentId, grantedByUserId);
     } catch (error) {
-      if (!isRetryableTransactionError(error)) throw error;
-      throw unprocessable("Agent hire grant setup hit database contention. Retry the same request.", {
-        code: "agent_hire_grant_contention",
-        retryable: true,
+      if (!isTransientLockContention(error)) throw error;
+      throw new AgentHireContentionError(error, 1);
+    }
+  }
+
+  async function ensureCompanyDefaultAgentGrantsAfterCreate(companyId: string) {
+    try {
+      await retryTransientLockContention(() => builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId), AGENT_HIRE_ATTEMPTS, {
+        jitterMs: 50,
+        onRetry: () => { transactionRetryStats.retried++; },
       });
+      return null;
+    } catch (error) {
+      if (!isTransientLockContention(error)) throw error;
+      logger.warn({ companyId, code: COMPANY_DEFAULT_GRANTS_DEFERRED, sqlState: postgresErrorCode(error) },
+        "Company default agent grants deferred after lock contention; the next create or startup reconciles them");
+      return { code: COMPANY_DEFAULT_GRANTS_DEFERRED, retryable: true,
+        message: "The agent was created. Company default grants for built-in agents hit lock contention and will be reconciled later." };
     }
   }
 
   // The lifecycle keeps upstream's AccountingContentionError for all other
   // callers. Only this hire CREATE boundary names the proven one-attempt
-  // rollback; the post-create GRANT boundary below is distinct (RFL 07:45Z).
+  // rollback (#20389, RFL 07:45Z). The GRANT step runs inside the same hire
+  // transaction (#20805 F2); its contention is retried by the hire's one
+  // wrapper (retryTransientLockContention, agent-lifecycle.ts) and, exhausted,
+  // answers the distinct agent_hire_grant_contention (AgentHireContentionError).
   function namedHireCreateContention(error: unknown): never {
     if (!(error instanceof AccountingContentionError) || error.attempts !== 1) throw error;
     const code = "agent_hire_create_contention";
     throw Object.assign(new HttpError(503, ACCOUNTING_WRITE_CONTENTION_MESSAGE, { code, retryable: true }), {
       code, retryable: true, attempts: 1, cause: error.cause,
     });
-  }
-
-  // #20805's grant retry above stays exactly as it is (five attempts; the grant
-  // runs after the create transaction committed). When a persistent 40P01/40001
-  // exhausts it, the caller gets upstream's named retryable error (HTTP 503,
-  // SQLSTATE in `code`), never a bare 500. The committed agent is unchanged.
-  function namedGrantContention(error: unknown): never {
-    throw isAccountingRetryable(error) && !isAccountingContentionError(error) ? new AccountingContentionError(error, 5) : error;
   }
 
   async function assertCanCreateAgentsForCompany(req: Request, companyId: string, options?: { hiring?: true }) {
@@ -4646,7 +4649,7 @@ export function agentRoutes(
             }, decisionNote: null, decidedByUserId: null, decidedAt: null, updatedAt: new Date(),
           });
         }
-        await applyDefaultAgentTaskAssignGrant(
+        await repairReplayedHireMembership(
           companyId,
           setupAgent.id,
           req.actor.type === "board" ? (req.actor.userId ?? null) : null,
@@ -4813,6 +4816,8 @@ export function agentRoutes(
         },
         {
           ...(setupAgentId ? { setupAgentId } : {}),
+          // #20805: membership + tasks:assign commit with the hire, not after it.
+          memberGrant: { grantedByUserId: getActorInfo(req).actorType === "user" ? getActorInfo(req).actorId : null },
           createdByUserId: req.actor.type === "board" ? req.actor.userId : null,
           createdByAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
           interactionTexts: [JSON.stringify(req.body)],
@@ -4938,12 +4943,6 @@ export function agentRoutes(
         trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
       }
 
-      await applyDefaultAgentTaskAssignGrant(
-        companyId,
-        agent.id,
-        actor.actorType === "user" ? actor.actorId : null,
-      ).catch(namedGrantContention);
-
       if (approval) {
         await logActivity(db, {
           companyId,
@@ -4959,7 +4958,11 @@ export function agentRoutes(
         });
       }
 
-      return { status: 201, body: { agent: { ...agent, ...(configurationWarnings.length ? { configurationWarnings } : {}) }, approval } };
+      // Same company-default reconciliation as the create route, outside the hire
+      // transaction; exhaustion is a named warning, the hire stands.
+      const defaultGrantsDeferred = await ensureCompanyDefaultAgentGrantsAfterCreate(companyId);
+      return { status: 201, body: { agent: { ...agent, ...(configurationWarnings.length ? { configurationWarnings } : {}) }, approval,
+        ...(defaultGrantsDeferred ? { warnings: [defaultGrantsDeferred] } : {}) } };
     };
 
     const outcome = runId
@@ -5108,7 +5111,7 @@ export function agentRoutes(
       if (match) {
         const existingAgent = await svc.getById(match.entityId);
         if (existingAgent && existingAgent.status !== "terminated") {
-          await applyDefaultAgentTaskAssignGrant(companyId, existingAgent.id, null);
+          await repairReplayedHireMembership(companyId, existingAgent.id, null);
           res.status(200).json({ ...redactAgentRowForResponse(existingAgent), idempotent: true });
           return;
         }
@@ -5126,7 +5129,8 @@ export function agentRoutes(
         lastHeartbeatAt: null,
       },
       {
-        ...(setupId ? { setupOnly: true } : {}),
+        // #20805: membership + tasks:assign commit with the create, not after it.
+        ...(setupId ? { setupOnly: true } : { memberGrant: { grantedByUserId: req.actor.type === "board" ? (req.actor.userId ?? null) : null } }),
         createdByUserId: req.actor.type === "board" ? req.actor.userId : null,
         createdByAgentId: req.actor.type === "agent" ? req.actor.agentId : null,
         interactionTexts: [JSON.stringify(req.body)],
@@ -5187,16 +5191,13 @@ export function agentRoutes(
       trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
     }
 
-    await applyDefaultAgentTaskAssignGrant(
-      companyId,
-      agent.id,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    ).catch(namedGrantContention);
     // Company-wide defaults (root CEO + built-in agents) stay on the create
-    // route, outside the retried per-agent grant transaction (review-fleet-2).
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+    // route, outside the hire transaction, with their own bounded retry. The
+    // agent is already complete; exhaustion is a named warning, not a failure.
+    const defaultGrantsDeferred = await ensureCompanyDefaultAgentGrantsAfterCreate(companyId);
 
-    res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}) });
+    res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}),
+      ...(defaultGrantsDeferred ? { warnings: [defaultGrantsDeferred] } : {}) });
   }));
 
   registerAgentProjectAccessRoutes(router, db);
