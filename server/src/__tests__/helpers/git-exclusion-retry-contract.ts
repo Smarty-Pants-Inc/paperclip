@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as execution from "@paperclipai/adapter-utils/execution-target";
 import * as ssh from "@paperclipai/adapter-utils/ssh";
-import { instructionGitExcludeProgram } from "../../services/agent-instruction-files.js";
 import { logger } from "../../middleware/logger.js";
 
 // Keep: the recorded sandbox-exec timeout incident and the unsafe-path trust
@@ -32,10 +31,10 @@ export function gitExclusionRetryContract(
       const shell = vi.spyOn(execution, "runAdapterExecutionTargetShellCommand").mockImplementation(async (_runId, _target, command) => {
         // Directory observation is a separate command after successful staging;
         // it is not a third exclusion attempt.
-        if (!command.includes(instructionGitExcludeProgram)) return success;
+        if (!command.includes("Unsafe runtime exclusion directory")) return success;
         return results[Math.min(calls++, results.length - 1)]!;
       });
-      return { shell, count: () => calls, exclusionCalls: () => shell.mock.calls.filter(([, , command]) => command.includes(instructionGitExcludeProgram)) };
+      return { shell, count: () => calls, exclusionCalls: () => shell.mock.calls.filter(([, , command]) => command.includes("Unsafe runtime exclusion directory")) };
     }
 
     it("retries one timeout after one second and prepares successfully", async () => {
