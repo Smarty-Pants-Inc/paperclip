@@ -1,5 +1,6 @@
 import { lstat, mkdir, readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { writePrivateFile } from "../private-file.js";
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -26,10 +27,6 @@ function explicitReserve(settings: Record<string, unknown>, model: string): unkn
   return override.reserveTokens ?? compaction.reserveTokens;
 }
 
-/** V2-R2 row 1: match v1's 100k headroom on large windows, without
- * exceeding a quarter of a small model's context. Leave Pi's other defaults alone.
- * Managed-home settings win; otherwise honor the original user's explicit reserve.
- */
 function packageNotInstalled(source: string): Error & { code: string } {
   return Object.assign(new Error(`Pi managed npm package ${JSON.stringify(source)} is not installed under the original agent home`), {
     code: "pi_managed_package_not_installed",
@@ -92,13 +89,23 @@ export async function configurePiManagedCompaction(input: {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
   });
-  const sameHome = resolve(input.originalAgentHome) === resolve(input.agentHome);
-  const original = sameHome ? settings : await readSettings(join(input.originalAgentHome, "settings.json"));
-  const base = !hasSettings && !sameHome ? original : settings;
+  // A no-env RUN already has the server's per-session PI_CODING_AGENT_DIR in
+  // process.env. Only for an empty session home, resolve Pi's image home at
+  // call time using homedir(), not the HOME projected into the child process.
+  const inheritImage = !hasSettings && resolve(input.originalAgentHome) === resolve(input.agentHome);
+  const originalAgentHome = inheritImage ? join(homedir(), ".pi", "agent") : input.originalAgentHome;
+  const sameHome = resolve(originalAgentHome) === resolve(input.agentHome);
+  const original = sameHome ? settings : await readSettings(join(originalAgentHome, "settings.json"));
+  // The image owns installed packages, not managed compaction or model routing.
+  // Existing session settings and explicitly selected original homes keep their
+  // existing behavior; never write back to the image home.
+  const base = !hasSettings && !sameHome
+    ? inheritImage ? (original.packages === undefined ? {} : { packages: original.packages }) : original
+    : settings;
   // Validate every package before creating or writing the managed home: Pi must
   // never fall back to installing a missing npm source during startup.
   const rewritten = sameHome ? { settings: base, changed: false }
-    : await rewriteManagedPackages(base, input.originalAgentHome);
+    : await rewriteManagedPackages(base, originalAgentHome);
   const hasExplicitReserve = explicitReserve(settings, input.model) !== undefined;
   if (hasExplicitReserve) {
     if (!rewritten.changed) return;
@@ -106,7 +113,7 @@ export async function configurePiManagedCompaction(input: {
     await writePrivateFile(path, `${JSON.stringify(rewritten.settings)}\n`);
     return;
   }
-  const reserveTokens = explicitReserve(original, input.model)
+  const reserveTokens = (inheritImage ? undefined : explicitReserve(original, input.model))
     ?? Math.min(100000, Math.floor(input.contextWindow * 0.25));
   const compaction = record(rewritten.settings.compaction) ? rewritten.settings.compaction : {};
   await mkdir(input.agentHome, { recursive: true, mode: 0o700 });
