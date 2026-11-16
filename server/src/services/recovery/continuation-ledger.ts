@@ -11,8 +11,10 @@ export async function freshContinuationTimes(db: Db, companyId: string, issueId:
     trigger: sql<string | null>`${issueRecoveryActions.evidence}#>>'{freshContinuation,trigger}'` }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
     sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}' > ${since.toISOString()}`)).limit(64);
+  // A person's Retry records its fresh provider thread too; it is not an automatic attempt.
   return rows.map(row => ({ at: new Date(row.recordedAt), trigger: row.trigger }))
-    .filter(record => Number.isFinite(record.at.getTime()) && record.at.getTime() > since.getTime());
+    .filter(record => record.trigger !== "person_retry"
+      && Number.isFinite(record.at.getTime()) && record.at.getTime() > since.getTime());
 }
 
 export async function sharedContinuationAttempts(db: Db, companyId: string, issueId: string, at: Date): Promise<Date[]> {

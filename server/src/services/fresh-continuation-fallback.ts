@@ -404,7 +404,8 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
     || reconciliation.actorId !== FRESH_CONTINUATION_ACTOR || reconciliation.runId !== source.id
     || !["remote_epoch", "writer_ended", "fresh_isolated_workspace"].includes(String(fresh.isolation))
     || settlement.isolation !== fresh.isolation
-    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id)
+    || (fresh.isolation === "fresh_isolated_workspace" && context.freshContinuationIsolation !== action.id
+      && !isRetryFreshProviderThread(action, source.id, run))
     || (fresh.isolation === "writer_ended" ? fresh.stopProof !== "writer_ended"
       : !["unproven_epoch_abandoned", "unproven_isolated"].includes(String(fresh.stopProof)))
     || typeof fresh.recordedAt !== "string" || source.resultJson?.[FRESH_CONTINUATION_SUPERSEDED_KEY] !== fresh.recordedAt
@@ -419,6 +420,65 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
   if (await hasAnswerSinceSettlement(db, source, issueId, fresh.recordedAt, run.id)) return null;
   return { recoveryActionId: action.id, sourceRunId: source.id, sourceSessionId: source.nativeSessionId,
     startedNote: await freshThreadStartedNote(db, source) };
+}
+
+/** The Retry's own record (recordRetryFreshProviderThread): bound at admission
+ * to exactly the successor run whose admitted readiness chose the new box. */
+function isRetryFreshProviderThread(action: typeof issueRecoveryActions.$inferSelect, sourceRunId: string,
+  run: typeof heartbeatRuns.$inferSelect) {
+  const readiness = object(object(object(run.contextSnapshot).explicitUserContinuation).readiness);
+  return object(action.evidence.freshContinuation).trigger === RETRY_FRESH_THREAD_TRIGGER
+    && action.evidence.continuationRunId === run.id && action.evidence.continuationDelivery === "delivered"
+    && readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId;
+}
+
+export const RETRY_FRESH_THREAD_TRIGGER = "person_retry" as const;
+
+/**
+ * A person's native Retry that admission routed to a fresh isolated workspace
+ * (the old box is not the task's own, or is remote) cannot continue the old
+ * provider thread there: the checkpoint matched by its session id belongs to
+ * the old box's scope, and the new scope root refuses it
+ * (prior_owner_scope_mismatch). Record, in the admitting transaction, the same
+ * fresh-thread decision the held_recovery follow-up records, delivered to the
+ * Retry's successor run. Its first run then selects a new provider thread
+ * (selectPiConversation / selectFreshContinuationThread) that starts with the
+ * saved-history handoff, and posts that path's one fresh-thread note. The
+ * conversation is not reset; only its provider thread is replaced, recorded.
+ * Caller holds the admission and has proven the source stopped. A person's
+ * Retry is not an automatic attempt (see freshContinuationTimes).
+ */
+export async function recordRetryFreshProviderThread(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; sourceRunId: string; successorRunId: string;
+}): Promise<string | null> {
+  const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
+  if (!source || source.runtimeMode !== "native" || source.nativeIssueId !== input.issueId || !source.nativeSessionId
+    || !UNFINISHED_STATUSES.includes(source.status) || !source.finishedAt) return null;
+  // The admitting transaction's clock: never later than its successor's created_at.
+  const [clock] = await db.execute<{ ms: string }>(sql`select (extract(epoch from date_trunc('milliseconds', now())) * 1000)::bigint::text as ms`);
+  const recordedAt = new Date(Number(clock!.ms)).toISOString();
+  const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
+  const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: RETRY_FRESH_THREAD_TRIGGER,
+    failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated" };
+  const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
+    workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
+    actorId: FRESH_CONTINUATION_ACTOR, recordedAt };
+  const settlement = { schema: FRESH_CONTINUATION_SCHEMA, actorType: "system", actorId: FRESH_CONTINUATION_ACTOR,
+    decision: "continue_in_fresh_run", replay: "none", sourceRunId: source.id, failureCode: source.errorCode ?? null,
+    reason: "retry_fresh_isolated_workspace", isolation, requestedBy: RETRY_FRESH_THREAD_TRIGGER, recordedAt };
+  const [created] = await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
+    kind: "active_run_watchdog", status: "resolved", outcome: "restored", ownerType: "system",
+    returnOwnerAgentId: input.agentId, cause: FRESH_CONTINUATION_CAUSE, fingerprint: `fresh-continuation:retry:${input.successorRunId}`,
+    nextAction: USER_TEXT, resolutionNote: "retry_fresh_provider_thread", resolvedAt: new Date(recordedAt), attemptCount: 1,
+    evidence: { runId: source.id, originalFailureCode: source.errorCode ?? null, executionReconciliation: reconciliation,
+      freshContinuationSettlement: settlement, freshContinuation, continuationDelivery: "delivered",
+      continuationRunId: input.successorRunId } }).returning({ id: issueRecoveryActions.id });
+  // As the follow-up does: the replaced run loses its write authority.
+  await db.update(heartbeatRuns).set({ resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb)
+    || ${JSON.stringify({ [FRESH_CONTINUATION_SUPERSEDED_KEY]: recordedAt })}::jsonb` }).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, source.id)));
+  return created!.id;
 }
 
 /**
