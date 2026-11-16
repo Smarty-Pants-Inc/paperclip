@@ -58,7 +58,7 @@ import * as activityLogModule from "../services/activity-log.js";
 import * as connectionCredentialBindings from "../services/connection-credential-bindings.js";
 import { chatSlackManagerGrants, chatSlackRegistrations, toolOauthStates } from "@paperclipai/db";
 import type { PaperclipCloudConnector, SealedConnectorCredentials } from "../services/paperclip-cloud-connector.js";
-import { buildSlackAppManifest, SLACK_MANAGER_SCOPES } from "@paperclipai/shared";
+import { buildSlackAppManifest, SLACK_MANAGER_SCOPES, issueCommentMetadataSchema } from "@paperclipai/shared";
 import { registerChatActionWork, dueChatAction } from "../services/chat-action-work.js";
 import { chatRunMilestoneWork } from "../services/chat-run-milestone-work.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -62112,6 +62112,67 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     }
     expect(comments.find(comment => comment.body.endsWith("was deleted."))?.sourceTrust ?? null).toBeNull();
     expect(wakeup).toHaveBeenCalledTimes(2);
+  });
+
+  it("stores a chat edit notice with an odd long handle and truncates its named sender", async () => {
+    // smarty-dev#20830: provider handles are data, even with markup and newlines.
+    const fixture = await seedCompany();
+    const { callbacks, endpoint, service } = await configuredSlackEndpoint(fixture);
+    const channel = makeThread({
+      channelId: "C-LIFECYCLE-ODD-SENDER",
+      id: "slack:C-LIFECYCLE-ODD-SENDER:7030.1",
+      name: "lifecycle-odd-sender",
+    });
+    const original = makeMessage({
+      id: "7030.1", text: "@maya original request", mentioned: true,
+    });
+    await deliverMessage({
+      callbacks, endpointId: endpoint.id, thread: channel.thread,
+      message: original, trigger: "mention",
+    });
+    await qualifySetupRoundTrip(service, endpoint.id);
+    await service.test(endpoint.id);
+    if (!callbacks.onMessageUpdated) throw new Error("Slack edit callback was not registered");
+
+    const handle = `雪☃\n**<outside-sender>**${"界".repeat(420)}`;
+    expect(handle.length).toBeGreaterThan(400);
+    await callbacks.onMessageUpdated({
+      endpointId: endpoint.id,
+      provider: "slack",
+      thread: channel.thread,
+      previousMessage: original,
+      message: {
+        ...makeMessage({ id: original.id, text: "@maya keep this correction", userName: handle }),
+        metadata: {
+          dateSent: new Date("2026-09-04T10:00:00.000Z"),
+          edited: true,
+          editedAt: new Date("2026-09-04T10:01:00.000Z"),
+        },
+      } as Message,
+    });
+
+    const [conversation] = await readChatConversationsByEndpointId(endpoint.id);
+    const comments = await readIssueCommentsByIssueId(conversation.issueId);
+    const edits = comments.filter(comment => comment.body.startsWith("An external message was edited:"));
+    expect(edits).toHaveLength(1);
+    expect(edits[0].body).toBe("An external message was edited:\n\n@maya keep this correction");
+    expect(edits[0].authorType).toBe("system");
+    expect(edits[0].sourceTrust).toMatchObject({
+      preset: "low_trust_review", disposition: "quarantined", sourceIssueId: conversation.issueId,
+    });
+    const metadata = issueCommentMetadataSchema.parse(edits[0].metadata);
+    const sender = handle.slice(0, 320);
+    expect(metadata.externalSource).toEqual({ channel: "slack", sender });
+    expect(metadata.externalSource?.sender).toHaveLength(320);
+    expect(metadata.sections).toEqual([{
+      title: "Outside sender",
+      rows: [
+        { type: "key_value", label: "Channel", value: "slack" },
+        { type: "key_value", label: "Sender", value: sender },
+      ],
+    }]);
+    expect((await readChatDeliveriesByEndpointId(endpoint.id))
+      .find(delivery => delivery.eventKind === "message_updated")).toMatchObject({ state: "processed" });
   });
 
   it("redacts lifecycle edits and ignores reactions after channel reach is revoked", async () => {

@@ -74,7 +74,7 @@ import {
 import { accessService } from "../services/access.js";
 import { emailConnectionService } from "../services/email-connections.js";
 import { toolAccessService } from "../services/tool-access.js";
-import { emailSendSchema } from "@paperclipai/shared";
+import { emailSendSchema, issueCommentMetadataSchema } from "@paperclipai/shared";
 import { chatChannelService } from "../services/chat-channels.js";
 
 const externalTestDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_EMAIL_TEST_DATABASE_URL");
@@ -678,6 +678,39 @@ describe("AgentMail durable email pipeline", () => {
     // smarty-dev#20830: inbound email is outside text, written low-trust with its source named.
     expect(comments[0].sourceTrust).toMatchObject({ preset: "low_trust_review", disposition: "quarantined", sourceIssueId: comments[0].issueId });
     expect(comments[0].metadata).toMatchObject({ externalSource: { channel: "email", sender: expect.stringContaining("sender@example.test") } });
+  });
+  it("stores an inbound email with a 1,000-character From and truncates its named sender", async () => {
+    // smarty-dev#20830: metadata validation must not silently drop outside text.
+    const f = await fixture();
+    const address = " <sender@example.test>";
+    const longFrom = `${"M".repeat(1000 - address.length)}${address}`;
+    expect(longFrom).toHaveLength(1000);
+    await f.receive(f.message("long-from", "long-from-thread", {
+      from: longFrom,
+      text: "Keep this email even when its sender exceeds the metadata limit",
+    }));
+
+    const comments = await db.select().from(issueComments)
+      .where(eq(issueComments.companyId, f.companyId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].body).toContain("Keep this email even when its sender exceeds the metadata limit");
+    expect(comments[0].authorType).toBe("system");
+    expect(comments[0].sourceTrust).toMatchObject({
+      preset: "low_trust_review", disposition: "quarantined", sourceIssueId: comments[0].issueId,
+    });
+    // externalSource.sender is limited to 320; key_value.value allows 2,000.
+    const metadata = issueCommentMetadataSchema.parse(comments[0].metadata);
+    const sender = longFrom.slice(0, 320);
+    expect(metadata.externalSource).toEqual({ channel: "email", sender });
+    expect(metadata.externalSource?.sender).toHaveLength(320);
+    expect(metadata.sections).toEqual([{
+      title: "Outside sender",
+      rows: [
+        { type: "key_value", label: "Channel", value: "email" },
+        { type: "key_value", label: "Sender", value: sender },
+      ],
+    }]);
+    expect(f.wakeup).toHaveBeenCalledTimes(1);
   });
   it("persists an email child and immutable intent before sending and deduplicates retries", async () => {
     const f = await fixture();
