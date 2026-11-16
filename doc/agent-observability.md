@@ -99,12 +99,18 @@ at the server's existing recursive native API/run-log redaction boundary, after
 API payload hashing and before native event persistence; it does not modify
 provider inputs or raw Pi session files. Secret-name matching bounds the runs on
 each side of the keyword to 64 characters to keep adversarial output scans
-bounded. PEM matching also recognizes an identity redactor's `***REDACTED***`
-marker adjacent to base64 material (at least one 32-character body run), including
-escaped-slash JSON and partially masked bodies. This keeps short rewrapped lines
-protected even when identity redaction has already erased BEGIN/END framing;
-standalone redaction marks are left unchanged. It does not reorder API hashing,
-identity delta processing, or native event replay.
+bounded. JWT starts use the entire base64url alphabet as their boundary, so a
+hyphen inside an unfinished segment cannot restart the scan. PEM matching also
+recognizes an identity redactor's `***REDACTED***` marker next to base64-only
+logical lines (up to 76 body characters per line, with at least one 32-character
+run), including escaped-slash JSON and partially masked bodies. A contiguous
+body immediately attached to a mark can be longer. Spaces/prose, pure hex hash
+lines and slash-only lowercase paths break this projected-PEM context; an
+unrelated SHA or image data URI later in the transcript is not evidence of PEM.
+The original identity marks are retained while adjacent material is hidden.
+This keeps short rewrapped lines protected even when identity redaction has
+already erased BEGIN/END framing. It does not reorder API hashing, identity
+delta processing, or native event replay.
 
 These are conservative output heuristics, not a guarantee against all secret
 encodings. Arbitrary base64 re-encoding without recognizable framing, secret
