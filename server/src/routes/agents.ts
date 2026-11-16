@@ -1433,6 +1433,7 @@ export function agentRoutes(
         true,
         grantedByUserId,
       );
+      await builtInAgentService(tx as unknown as Db).ensureCompanyDefaultAgentGrants(companyId);
     }), 5);
   }
 
@@ -5140,9 +5141,6 @@ export function agentRoutes(
       agent.id,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     ).catch(namedGrantContention);
-    // Company-wide defaults (root CEO + built-in agents) stay on the create
-    // route, outside the retried per-agent grant transaction (review-fleet-2).
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
 
     res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}) });
   });
