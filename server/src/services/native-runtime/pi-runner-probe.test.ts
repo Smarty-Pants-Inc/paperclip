@@ -7,7 +7,7 @@ import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 
 const mocks = vi.hoisted(() => ({ probe: vi.fn(), resolveBinary: vi.fn(), launch: vi.fn(),
-  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { regular: boolean; bytes: string }[] }));
+  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { regular: boolean; bytes: string }[], events: [] as string[] }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({
   ...await original<object>(), probeNativeRunnerEnvironment: mocks.probe,
 }));
@@ -30,10 +30,12 @@ vi.mock("./native-session-executor.js", async original => {
     prepareRemoteProviderPackOnTarget: async () => ({ root: "/selected/remote-pack" }),
     createRemoteRunnerProcessLauncher: mocks.launch,
     syncRemoteRunnerDirectoryOut: mocks.syncOut.mockImplementation(async (input: Parameters<typeof actual.syncRemoteRunnerDirectoryOut>[0]) => {
+      mocks.events.push("sync-out");
       try {
         await actual.syncRemoteRunnerDirectoryOut(input);
         const archived = join(input.targetPath, "bin", "paperclip-runnerd");
-        mocks.archives.push({ regular: (await lstat(archived)).isFile(), bytes: await readFile(archived, "utf8") });
+        const present = await lstat(archived).then(() => true, () => false);
+        mocks.archives.push({ regular: present && (await lstat(archived)).isFile(), bytes: present ? await readFile(archived, "utf8") : "" });
       } catch (error) { mocks.cleanupErrors.push(String(error)); throw error; }
     }),
   };
@@ -82,6 +84,18 @@ async function fixture(image: "matching" | "wrong-sha" | "missing", sync = true,
     ...(sync ? { syncIn } : {}),
     async execute(request) {
       requests.push(request);
+      if (request.command === "rm" && request.args?.includes("-rf")) mocks.events.push("rm");
+      if (request.args?.[2] === "paperclip-probe-static-manifest") {
+        mocks.events.push("manifest");
+        const root = request.args[3]!;
+        await mkdir(join(root, "bin"), { recursive: true });
+        await mkdir(join(root, "pi", "node-compile-cache", "nested"), { recursive: true });
+        await writeFile(join(root, "bin", "paperclip-runnerd"), "static runner binary");
+        await writeFile(join(root, "pi", "node-compile-cache", "nested", "cache.js"), "static cache");
+        await writeFile(join(root, "control-plane.json"), "control plane");
+        await writeFile(join(root, "diagnostics.log"), "diagnostics");
+        await writeFile(join(root, "runner-state.json"), "runner state");
+      }
       if (request.args?.[1]?.includes("cp --preserve=mode") && fault?.startsWith("copy-")) {
         if (fault === "copy-throw") throw new Error("copy unavailable");
         return { exitCode: 1, timedOut: fault === "copy-timeout", signal: null, pid: null, startedAt: new Date().toISOString(), stdout: "", stderr: "copy failed" };
@@ -132,6 +146,7 @@ afterEach(async () => {
   vi.clearAllMocks();
   mocks.cleanupErrors.length = 0;
   mocks.archives.length = 0;
+  mocks.events.length = 0;
   await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
 });
 
@@ -147,8 +162,51 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.requests.some(request => request.stdin !== undefined)).toBe(false);
     expect(await readFile(f.installed, "utf8")).toBe(script);
     expect(mocks.syncOut).toHaveBeenCalledTimes(2);
-    expect(mocks.archives).toEqual([0, 1].map(() => ({ regular: true, bytes: script })));
-    for (const [input] of mocks.syncOut.mock.calls) expect(input.excludeEntries).toBeUndefined();
+    expect(mocks.archives).toEqual([0, 1].map(() => ({ regular: false, bytes: "" })));
+    for (const [input] of mocks.syncOut.mock.calls) expect(input.excludeEntries).toEqual(["bin/paperclip-runnerd", "pi/node-compile-cache"]);
+  });
+
+  it("records static-file custody before syncing out and removing the remote root", async () => {
+    const f = await fixture("matching");
+    expect((await probeManagedNativePiRunner(f.context)).status).toBe("pass");
+    expect(mocks.syncOut).toHaveBeenCalledTimes(2);
+    for (const [input] of mocks.syncOut.mock.calls) {
+      expect(input.excludeEntries).toEqual(["bin/paperclip-runnerd", "pi/node-compile-cache"]);
+    }
+    expect(mocks.events).toEqual(["manifest", "sync-out", "rm", "manifest", "sync-out", "rm"]);
+    const walk = async (path: string): Promise<string[]> => {
+      const { readdir } = await import("node:fs/promises");
+      const entries = await readdir(path, { withFileTypes: true }).catch(() => []);
+      return (await Promise.all(entries.map(entry => entry.isDirectory() ? walk(join(path, entry.name)) : [join(path, entry.name)]))).flat();
+    };
+    const evidence = await walk(join(f.root, "state"));
+    const manifests = evidence.filter(path => path.endsWith(".excluded-static-files.txt"));
+    expect(manifests).toHaveLength(2);
+    for (const manifest of manifests) {
+      const text = await readFile(manifest, "utf8");
+      const lines = text.trimEnd().split("\n");
+      expect(lines.some(line => line.split(" ").length === 3 && line.endsWith(" bin/paperclip-runnerd"))).toBe(true);
+      expect(lines.some(line => line.split(" ").length === 3 && line.endsWith(" pi/node-compile-cache/nested/cache.js"))).toBe(true);
+      expect(evidence.some(path => path.endsWith("/remote-runtime/bin/paperclip-runnerd"))).toBe(false);
+      for (const name of ["control-plane.json", "diagnostics.log", "runner-state.json"])
+        expect(evidence.some(path => path.endsWith(`/remote-runtime/${name}`))).toBe(true);
+    }
+  });
+
+  it("does not sync out or remove the remote root when the custody manifest fails", async () => {
+    const f = await fixture("matching");
+    const execute = f.runner.execute.bind(f.runner);
+    vi.spyOn(f.runner, "execute").mockImplementation(async request => {
+      if (request.args?.[2] === "paperclip-probe-static-manifest") {
+        mocks.events.push("manifest");
+        return { exitCode: 1, timedOut: false, signal: null, pid: null, startedAt: new Date().toISOString(), stdout: "", stderr: "manifest failed" };
+      }
+      return execute(request);
+    });
+    expect((await probeManagedNativePiRunner(f.context)).status).toBe("fail");
+    expect(mocks.syncOut).not.toHaveBeenCalled();
+    expect(mocks.events).toEqual(["manifest"]);
+    expect(f.requests.some(request => request.command === "rm" && request.args?.includes("-rf"))).toBe(false);
   });
 
   it.each(["wrong-sha", "missing"] as const)("uploads and passes with a %s preinstalled runner", async image => {
