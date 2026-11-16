@@ -206,9 +206,9 @@ Runner callers can supply `PAPERCLIP_PI_ADMISSION_TIMEOUT_MS` in the transport's
 explicit `options.environment`. It crosses the existing Pi provider environment
 projection and runner-core's Pi-specific child allowlist; it is not inherited
 from ambient environment or supplied by task-configured environment projection.
-The proxy accepts only integer milliseconds from 1 through 29,999. Values at or
-above runner-core's 30,000 ms facade receive wait (and other invalid values) fail
-with `pi_admission_deadline_invalid` before opening Pi. Private-request expiry
+The proxy accepts only integer milliseconds from 1 through 24,999, below the
+25,000 ms thread/start deadline below. Other values fail with
+`pi_admission_deadline_invalid` before opening Pi. Private-request expiry
 reports `Pi private request timed out`; a lost receipt never triggers a retry or
 prompt. The deadline applies per exchange, not to a whole multi-exchange open.
 
@@ -217,6 +217,31 @@ through real private sockets: a 6-second inventory reply succeeds, a reply past
 the configured deadline fails after one exchange without prompting, and values
 at or beyond the facade wait are rejected. This is hermetic boundary proof,
 not deployed-provider or daily-work qualification.
+
+## Native thread/start deadline
+
+runner-core's facade waits 30,000 ms for the proxy's `thread/start` (or
+`thread/resume`) reply, then reports only a generic `response timed out`. The
+proxy therefore bounds the whole native open at 25,000 ms (`openDeadlineMs`)
+and passes the same value as the cold-process first `get_state` wait
+(`processStartupTimeoutMs`, standalone driver default 60,000 ms). That wait starts
+after the whole deadline, so the whole deadline fires first. The 5,000 ms margin
+covers the request's trip in, the reply's trip out and timer lateness on a loaded
+or freshly booted box.
+
+On expiry the open fails at once with `pi_startup_deadline` and its phase:
+`spawn` (preparing and spawning Pi), `first_get_state` (waiting for the new
+process's first answer) or `thread_start` (admission and private bind exchanges).
+The JSON-RPC error carries `data: { code: "pi_startup_deadline", phase }` and the
+facade surfaces it as `Codex thread/start failed: ...`. The abandoned open is
+aborted and cleans up in the background; a session that still opens late is
+closed. No prompt is sent.
+
+`pi-rpc-thread-start-deadline.test.ts` drives the production proxy config with
+real timers: a spawned stand-in Pi that never answers `get_state`, and admission
+exchanges that each answer inside their own bound but together outlast the
+window. Both answer with the named phase before 30,000 ms. This is hermetic
+boundary proof, not deployed-provider or daily-work qualification.
 
 ## Lost acknowledgments
 

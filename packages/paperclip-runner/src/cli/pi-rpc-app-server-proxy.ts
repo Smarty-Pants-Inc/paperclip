@@ -63,6 +63,8 @@ export interface PiRpcDriverLaunchConfig {
   environment: NodeJS.ProcessEnv;
   runnerInstanceId: string;
   startupTimeoutMs: number;
+  processStartupTimeoutMs: number;
+  openDeadlineMs: number;
   piRpcThinkingLevel?: PiThinkingLevel;
   deferInitialBinding?: boolean;
   systemInstructions: string;
@@ -198,14 +200,21 @@ function runtimeDirectory(environment: NodeJS.ProcessEnv): string {
   return resolve(configured);
 }
 
+// runner-core's CodexProvider::request_classified_until waits 30 s for the
+// thread/start (or thread/resume) reply. The proxy's whole open must answer
+// first with its own named, phased outcome. The 5 s margin covers the request's
+// trip in (stdin, the input queue), the reply's trip out (stdout, runner-core's
+// receive) and timer lateness on a loaded or freshly booted box.
+const PI_THREAD_START_DEADLINE_MS = 25_000;
+
 function piAdmissionTimeoutMs(environment: NodeJS.ProcessEnv): number {
-  // runner-core's CodexProvider::request receives for 30 s. Leave room for
-  // the native deadline to report its outcome before that facade wait expires.
+  // Each admission/bind exchange stays below the whole thread/start deadline,
+  // which itself stays below the facade's 30 s wait.
   // Match the driver's existing 10 s metadata budget, not its 5 s bind fallback.
   const configured = environment.PAPERCLIP_PI_ADMISSION_TIMEOUT_MS;
   const timeoutMs = configured === undefined ? 10_000 : Number(configured);
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs >= 30_000) {
-    throw new Error("pi_admission_deadline_invalid: PAPERCLIP_PI_ADMISSION_TIMEOUT_MS must be an integer from 1 through 29999 ms (below the facade's 30000 ms receive wait)");
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs >= PI_THREAD_START_DEADLINE_MS) {
+    throw new Error(`pi_admission_deadline_invalid: PAPERCLIP_PI_ADMISSION_TIMEOUT_MS must be an integer from 1 through ${PI_THREAD_START_DEADLINE_MS - 1} ms (below the ${PI_THREAD_START_DEADLINE_MS} ms thread/start deadline and the facade's 30000 ms receive wait)`);
   }
   return timeoutMs;
 }
@@ -566,6 +575,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
       environment: withoutAmbientPiCommand(environment),
       runnerInstanceId: environment.PAPERCLIP_RUNNER_INSTANCE_ID ?? "paperclip-runnerd-pi-rpc",
       startupTimeoutMs: piAdmissionTimeoutMs(environment),
+      // The cold-process get_state wait (driver default 60 s) starts after the
+      // whole open deadline, so with the same bound the named deadline fires first.
+      processStartupTimeoutMs: PI_THREAD_START_DEADLINE_MS,
+      openDeadlineMs: PI_THREAD_START_DEADLINE_MS,
       ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
       systemInstructions: text(params.baseInstructions, "Complete only the supplied task."),
       runtimeContext,
@@ -876,8 +889,10 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
     if (!missingResume && (message.method === "initialize" || message.method === "thread/start" || message.method === "thread/resume")) {
       bootstrapFailure ??= normalized;
     }
+    const phase = (normalized as Error & { phase?: unknown }).phase;
     send({ id: message.id, error: { code: -32000, message: normalized.message,
-      ...(code === "pi_session_file_missing" || code === "pi_session_file_invalid" ? { data: { code } } : {}) } });
+      ...(code === "pi_session_file_missing" || code === "pi_session_file_invalid" ? { data: { code } }
+        : code === "pi_startup_deadline" && typeof phase === "string" ? { data: { code, phase } } : {}) } });
   }
 
   function acceptLine(line: string): void {

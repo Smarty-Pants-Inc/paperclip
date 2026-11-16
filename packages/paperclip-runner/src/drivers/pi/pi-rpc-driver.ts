@@ -73,6 +73,12 @@ export interface PiRpcDriverOptions {
   startupTimeoutMs?: number;
   /** First RPC of a new Pi process (startup + extension load), default 60 s. */
   processStartupTimeoutMs?: number;
+  /**
+   * Whole open/recover budget (one thread/start or thread/resume). On expiry the
+   * open rejects at once with `pi_startup_deadline` naming its phase, and the
+   * abandoned open is aborted and cleans up in the background. Unset: no bound.
+   */
+  openDeadlineMs?: number;
   /** Dynamic tools have their own end-to-end deadline (protocol maximum: 60 s). */
   dynamicToolTimeoutMs?: number;
   /** Cold recovery must attach the current run before spending bootstrap authority. */
@@ -154,11 +160,21 @@ export class PiRpcDriver implements HarnessDriver {
 
   async #open(input: OpenHarnessSessionInput, recovery?: { snapshot: PersistedHarnessSession; sessionFile: string }): Promise<HarnessSession> {
     const spans: ProviderPerformanceSpan[] = [];
+    // Phase for a startup-deadline outcome: before the first get_state is sent
+    // (spawn), waiting for it (first_get_state), then admission/bind (thread_start).
+    let phase: PiStartupPhase = "spawn";
+    let step: PiOpenPhase | undefined;
     const measure: PiOpenMeasure = async (name, work) => {
       const startedAtMs = Date.now();
       let outcome: ProviderPerformanceSpan["outcome"] = "failed";
       let attributes: ProviderPerformanceSpan["attributes"];
-      try { const result = await work(); outcome = "ok"; return result; }
+      if (name !== "runner.pi.open.total") step = name;
+      if (name === "runner.pi.open.pi_spawn_to_get_state") phase = "first_get_state";
+      try {
+        const result = await work(); outcome = "ok";
+        if (name === "runner.pi.open.pi_spawn_to_get_state") phase = "thread_start";
+        return result;
+      }
       catch (error) { attributes = piBindTimeoutAttributes(error); throw error; }
       finally {
         const endedAtMs = Math.max(startedAtMs, Date.now());
@@ -169,10 +185,33 @@ export class PiRpcDriver implements HarnessDriver {
       }
     };
     let session: PiRpcHarnessSession | undefined;
+    const deadlineMs = this.#options.openDeadlineMs;
+    const abort = new AbortController();
+    const forwardAbort = () => abort.abort(input.signal?.reason);
+    if (input.signal?.aborted) forwardAbort(); else input.signal?.addEventListener("abort", forwardAbort, { once: true });
+    let deadlineTimer: NodeJS.Timeout | undefined;
     try {
-      session = await measure("runner.pi.open.total", () => this.#openMeasured(input, measure, recovery));
+      const opening = measure("runner.pi.open.total", () => this.#openMeasured({ ...input, signal: abort.signal }, measure, recovery));
+      if (deadlineMs === undefined) {
+        session = await opening;
+      } else {
+        let expired = false;
+        // A session that still opens after the deadline answered has no owner.
+        void opening.then(late => { if (expired) void late.close().catch(() => undefined); }, () => undefined);
+        session = await Promise.race([opening, new Promise<never>((_, reject) => {
+          deadlineTimer = setTimeout(() => {
+            expired = true;
+            const error = new PiStartupDeadlineError(deadlineMs, phase, step);
+            // Answer now; the abandoned open's own cleanup must not delay the reply.
+            abort.abort(error);
+            reject(error);
+          }, deadlineMs);
+        })]);
+      }
       return session;
     } finally {
+      if (deadlineTimer) clearTimeout(deadlineTimer);
+      input.signal?.removeEventListener("abort", forwardAbort);
       if (session) {
         try { session.recordOpenTimings(spans, input.runId); } catch { /* log-only */ }
       } else {
@@ -484,6 +523,18 @@ interface PiSessionState {
 }
 
 const PI_PROCESS_STARTUP_TIMEOUT_MS = 60_000;
+
+export type PiStartupPhase = "spawn" | "first_get_state" | "thread_start";
+
+/** The whole-open deadline, named with the phase it expired in. */
+export class PiStartupDeadlineError extends Error {
+  readonly code = "pi_startup_deadline";
+  constructor(readonly deadlineMs: number, readonly phase: PiStartupPhase, step?: string) {
+    super(`pi_startup_deadline: Pi startup exceeded its ${deadlineMs} ms deadline in phase ${phase}`
+      + (step ? ` (step ${step.slice("runner.pi.open.".length)})` : ""));
+    this.name = "PiStartupDeadlineError";
+  }
+}
 
 function piAdmissionPort(transport: PiRpcTransport, timeoutMs = 10_000,
   measure?: <T>(name: ProviderPerformancePhase, work: () => Promise<T>) => Promise<T>): PiRpcAdmissionPort {
