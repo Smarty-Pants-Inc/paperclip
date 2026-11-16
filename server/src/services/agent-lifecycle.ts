@@ -140,7 +140,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
       }, userId),
     recordCreation: (db, companyId, agentId) => recordResourceCreationEvent(db, companyId, "agent", agentId),
     recordStatus: recordAgentStatusEvent,
-    clearPrimary: clearPrimaryAgent,
+    clearPrimary: (db, companyId, agentId, publications) => clearPrimaryAgent(db, companyId, agentId, undefined, publications),
     lockConfigurationInteractions: lockAgentConfigurationInteractions,
     prepareConfiguration: prepareAgentConfiguration,
     completeConfiguration: completeAgentConfiguration,

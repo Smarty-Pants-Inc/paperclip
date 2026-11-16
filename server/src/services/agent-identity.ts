@@ -4,7 +4,7 @@ import { agentIdentityKeys, agents, type Db } from "@paperclipai/db";
 import type { AgentPublicIdentity } from "@paperclipai/shared";
 import { notFound } from "../errors.js";
 import { localEncryptedProvider } from "../secrets/local-encrypted-provider.js";
-import { persistActivity } from "./activity-log.js";
+import { persistActivity, type ActivityPublication } from "./activity-log.js";
 import { createAgentIdentityRedactor } from "./agent-identity-redaction.js";
 
 const publicColumns = {
@@ -40,7 +40,9 @@ export function agentIdentityService(db: Db) {
       return createAgentIdentityRedactor(row ? (await resolveIdentity(row)).privateKeyPem : undefined);
     },
 
-    async ensureAgentIdentity(companyId: string, agentId: string) {
+    /** `publications`: the caller's root post-commit buffer; without it the
+     * creation activity is persisted only (never published before commit). */
+    async ensureAgentIdentity(companyId: string, agentId: string, publications?: ActivityPublication[]) {
       return db.transaction(async (tx) => {
         // Lock the parent even when there is no identity row yet. This also
         // serializes deletion and works inside the agent-creation transaction.
@@ -58,11 +60,12 @@ export function agentIdentityService(db: Db) {
             companyId, agentId, algorithm: "Ed25519", keyId, publicKeyPem,
             privateKeyMaterial: encrypted.material,
           }).returning();
-          await persistActivity(tx as unknown as Db, {
+          const { publication } = await persistActivity(tx as unknown as Db, {
             companyId, actorType: "system", actorId: "system",
             action: "agent.identity.created", entityType: "agent", entityId: agentId,
             details: { algorithm: "Ed25519", keyId },
           });
+          publications?.push(publication);
         }
         // Fail closed on corruption or a wrong master key; never replace a key.
         return resolveIdentity(row);
