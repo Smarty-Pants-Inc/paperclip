@@ -3,7 +3,7 @@ import { connectionGrants, toolApplications, toolConnections, type Db } from "@p
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { DbTransaction } from "./tool-access/types.js";
 import { lockProjectConnectionLifecycle } from "./project-connection-retirement.js";
-import { isUnconsumedProjectAppApprovalSource, PROJECT_APP_APPROVAL_SOURCE } from "./project-app-custody.js";
+import { isConsumedProjectAppApprovalPredecessor, isUnconsumedProjectAppApprovalSource, PROJECT_APP_APPROVAL_SOURCE } from "./project-app-custody.js";
 
 /** Lane A. Provider verification belongs outside this transaction. */
 export type ProjectConnectionIdentity = Readonly<{
@@ -165,7 +165,7 @@ export async function assertProjectConnectionAvailability(
   let duplicate = false;
   let incompatible = false;
   for (const connection of live) {
-    if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId) continue;
+    if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId || isConsumedProjectAppApprovalPredecessor(connection)) continue;
     if (receiptCiting && isUnconsumedProjectAppApprovalSource(connection, identity)) continue;
     const ownedIdentity = projectConnectionIdentityForConnection(connection);
     const aliases = legacyAliases(connection);
@@ -214,7 +214,7 @@ export async function assertKnownProjectConnectionCreateAliases(
   // identity for the null row. This is denial-only, so no lock can turn it into
   // approval. B/C must still verify and lock any eventual successful attempt.
   if (input.exclusive && saved.some(connection => {
-    if (connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId) return false;
+    if (connection.id === input.excludeConnectionId || connection.id === input.consumedSourceConnectionId || isConsumedProjectAppApprovalPredecessor(connection)) return false;
     // The protected first-bind scope is server-prepared, never request metadata.
     // Raw spellings remain denial-only hints for every ordinary create.
     const receiptIdentity = input.consumedSourceConnectionId && input.projectId !== null
