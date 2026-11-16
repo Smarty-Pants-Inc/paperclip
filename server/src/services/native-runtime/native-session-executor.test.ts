@@ -14697,12 +14697,17 @@ describe("native warm session supervision", () => {
         // Each release represents one 6-second close completing. Four workers
         // drain twelve closes in three waves (18 seconds), inside the 20-second budget.
         for (let tick = 0; tick < 3; tick++) {
-          while (finishCloseDelays.length === 0) await flush();
+          await vi.waitFor(() => {
+            if (finishCloseDelays.length < 4) throw new Error("Waiting for the next four-session close wave");
+          }, { timeout: 5_000 });
           const pending = finishCloseDelays.splice(0);
           modeledElapsedMs += 6_000;
           pending.forEach(finish => finish());
           await flush();
         }
+        await vi.waitFor(() => {
+          if (completed === undefined) throw new Error("Warm session closes have not completed");
+        }, { timeout: 5_000 });
         expect(completed).toEqual({
           closed: 11, busy: 0, failed: 1,
           failures: [expect.objectContaining({ reason: expect.stringContaining("fixture close failure") })],
