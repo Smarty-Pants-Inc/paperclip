@@ -13,7 +13,7 @@ import { logger } from "../middleware/logger.js";
 import { agents, companies, issues, chatConversations, type Db } from "@paperclipai/db";
 import { and, eq, inArray, isNull, notExists } from "drizzle-orm";
 import { issueService } from "./issues.js";
-import { persistActivity, type ActivityPublication } from "./activity-log.js";
+import { logActivity, persistActivity, type ActivityPublication } from "./activity-log.js";
 import * as lifecycle from "../modules/agent-lifecycle/index.js";
 import { ACCOUNTING_TRANSACTION_ATTEMPTS, AccountingContentionError, accountingRetryDelayMs, isAccountingRetryable, withAccountingTransaction } from "./accounting-transaction.js";
 import { conflict } from "../errors.js";
@@ -120,7 +120,7 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
     beforeConnectionEligibilityRestore: async (tx, companyId, agentId) => {
       await notifyMuseContactVerification(tx, { companyId, agentId });
     },
-    async beforeStatusChange(tx, companyId, agentId, before, after) {
+    async beforeStatusChange(tx, companyId, agentId, before, after, publications) {
       await notifyAttentionRetentionWork(tx, { companyId });
       if (after === "terminated") {
         const companyAgents = await tx.select().from(agents).where(eq(agents.companyId, companyId));
@@ -145,10 +145,10 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
             await issueService(tx).update(issue.id, {
               companyGuard: companyId, assigneeAgentId: manager.id, assigneeUserId: null,
               ...(issue.status === "in_progress" ? { status: "todo" } : {}),
-            }, tx, [], []);
-            await persistActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
+            }, tx, publications ?? [], []);
+            await logActivity(tx, { companyId, actorType: "system", actorId: "agent_lifecycle",
               action: "issue.reassigned", entityType: "issue", entityId: issue.id,
-              details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } });
+              details: { reason: "agent_terminated", previousAssigneeAgentId: agentId, assigneeAgentId: manager.id } }, publications);
           }
         }
       }

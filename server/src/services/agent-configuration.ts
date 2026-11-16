@@ -189,6 +189,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
       updated, txDb,
       existing.adapterConfig,
       options?.recordRevision,
+      publications,
     );
   }
 

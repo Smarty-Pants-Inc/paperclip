@@ -134,7 +134,10 @@ checkout already owns a task lock, PostgreSQL rejects that lock attempt with
 rolls back and retries with the existing bounded accounting backoff. It also
 retries PostgreSQL-confirmed `40P01` and `40001` rollbacks. Each attempt reacquires
 the company mutex, rechecks authorization and creates a fresh activity-publication
-buffer. Nested lifecycle writes propagate contention to that root boundary;
+buffer. Configuration secret-binding activities and completion's task-access
+and reassignment activities use that buffer: live events publish only after the
+final commit, never from a rolled-back attempt.
+Nested lifecycle writes propagate contention to that root boundary;
 they do not retry inside an already-held outer transaction. Exhaustion leaves
 completion uncommitted and reports a retryable conflict. Assignment cancels only
 unfinished human-wake direction. Completed and failed wake receipts retain their
