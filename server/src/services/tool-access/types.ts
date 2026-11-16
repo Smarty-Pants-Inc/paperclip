@@ -3,6 +3,10 @@ import type { Db } from "@paperclipai/db";
 
 export type ActorInfo = {
   managementContext?: ConnectionManagementContext;
+  /** Original authenticated actor kind, never inferred from responsibleUserId. */
+  authenticatedActorType?: "board" | "agent";
+  /** Explicit scoped completion, never a generic force bypass. */
+  projectDoneConfirmation?: Readonly<{ projectId: string; connectionId: string }>;
   responsibleUserId?: string | null;
   actorType?: "agent" | "user" | "system" | "plugin";
   actorId?: string | null;

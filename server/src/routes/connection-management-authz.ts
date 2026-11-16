@@ -13,7 +13,7 @@ const contexts = new WeakMap<Request, ConnectionManagementContext>();
 export function connectionRequestContext(req: Request) { return contexts.get(req); }
 export function connectionRequestUserId(req: Request) { return responsibleConnectionUser(req.actor); }
 export function connectionRequestActor(req: Request) {
-  return { ...getActorInfo(req), ...contexts.get(req)?.audit, responsibleUserId: connectionRequestUserId(req), managementContext: contexts.get(req) };
+  return { ...getActorInfo(req), ...contexts.get(req)?.audit, authenticatedActorType: req.actor.type === "board" ? "board" as const : "agent" as const, responsibleUserId: connectionRequestUserId(req), managementContext: contexts.get(req) };
 }
 
 

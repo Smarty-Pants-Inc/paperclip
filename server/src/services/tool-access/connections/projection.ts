@@ -9,6 +9,7 @@ export function toConnection(row: typeof toolConnections.$inferSelect): ToolConn
   const retired = isRetiredComposioConnection(row);
   return {
     id: row.id,
+    projectId: row.projectId ?? null,
     companyId: row.companyId,
     applicationId: row.applicationId,
     name: row.name,
