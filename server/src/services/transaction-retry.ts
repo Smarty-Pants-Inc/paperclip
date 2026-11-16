@@ -54,13 +54,17 @@ export function retryUnlessTransactionBound<T>(db: object, run: (attempt: number
  * `db` is the handle `run` opens its transaction on. It must be the pool-level
  * db: the call throws before any attempt when it is a transaction handle.
  */
-export async function withTransactionRetry<T>(db: object, run: (attempt: number) => Promise<T>): Promise<T> {
+export async function withTransactionRetry<T>(
+  db: object,
+  run: (attempt: number) => Promise<T>,
+  maxAttempts = TRANSACTION_RETRY_ATTEMPTS,
+): Promise<T> {
   assertNotTransactionBound(db);
   for (let attempt = 1; ; attempt++) {
     try {
       return await run(attempt);
     } catch (error) {
-      if (attempt >= TRANSACTION_RETRY_ATTEMPTS || !isRetryableTransactionError(error)) throw error;
+      if (attempt >= maxAttempts || !isRetryableTransactionError(error)) throw error;
       transactionRetryStats.retried++;
       await new Promise(resolve => setTimeout(resolve, 25 * 2 ** attempt + Math.floor(Math.random() * 50)));
     }
