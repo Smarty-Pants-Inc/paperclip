@@ -306,7 +306,9 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
         // needs its handoff; SB needs the real Pi history. G asks a new question
         // and makes no claim to the earlier fact.
         const reply = (first || opening && toolResult) && containsFact ? `ACK_${fact}`
-          : governedWait && JSON.stringify(parsed.messages).includes(governedReply) ? governedReply
+          // SMA-60: the governed answer needs the remembered fact in THIS request
+          // (the fresh thread's saved-history handoff, or the thread's own history).
+          : governedWait && JSON.stringify(parsed.messages).includes(governedReply) && (!restoreRefused || containsFact) ? governedReply
           : handoffHasFact || sameBoxCold && containsFact ? `RECALLED_${fact}` : "HISTORY_LOST";
         // Only author the provider's tool_use. Pi executes the real Runner
         // callback and returns its tool_result before our final text turn.
@@ -932,6 +934,15 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       // thread of the same conversation; exactly ONE continuation note; no
       // failed run; the J3-17 lineage step recorded. Then the NEXT message
       // resumes that new thread.
+      // J3-22 handoff: the fresh thread's FIRST provider request carries the
+      // prior conversation (the '## Fresh session handoff' block with the fact
+      // remembered from the first exchange), and its answer uses it (the faux
+      // model answers the governed reply only with that fact in the request).
+      const firstFreshRequest = requests.find(request => request.runId === next.runId);
+      const firstFreshMessages = JSON.stringify(record(firstFreshRequest?.request).messages);
+      expect(firstFreshMessages, "the fresh thread's first request carries the saved-history handoff").toContain("## Fresh session handoff");
+      expect(firstFreshRequest, "the handoff carries the fact remembered from the first exchange")
+        .toMatchObject({ containsFact: true, handoffHasFact: true, reply: governedReply });
       expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
       expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
       expect(persisted?.error ?? null).toBeNull(); expect(persisted?.errorCode ?? null).toBeNull();
@@ -944,8 +955,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(freshProviderSessionId).toBeTruthy();
       expect(freshProviderSessionId, "fresh provider thread, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
       expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
-      // Evidence, not a target: on this RECOVER path the runtime treats the fresh
-      // thread as resumed, so no saved-history handoff is sent (NSR !recovered).
+      // Evidence: on this RECOVER path the fresh thread must get the saved-history
+      // handoff, as a fresh open does (asserted above).
       const freshRequest = requests.find(request => request.runId === next.runId)!;
       console.log(`E2E-PI-SMA60-HISTORY: ${JSON.stringify({ runId: next.runId, containsFact: freshRequest.containsFact,
         handoffHasFact: freshRequest.handoffHasFact, roles: (record(freshRequest.request).messages as Array<{ role: string }>).map(message => message.role) })}`);
@@ -953,6 +964,8 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(notes, "exactly ONE continuation note").toHaveLength(1);
       expect(notes[0]?.body).toMatch(/^Continuing in a fresh thread: the earlier provider thread could not be restored on this new sandbox/);
       expect(notes[0]?.body, "the note claims no history the fresh thread did not get").not.toContain("from its saved history");
+      expect(notes[0]?.body, "the handoff was sent, so the note says the fresh thread was given the saved history")
+        .toContain("was given the saved conversation history");
       expect(record(notes[0]?.metadata)).toMatchObject(continuationNote(next.runId));
       const [taskSessionAfter] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
         eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issueId)));

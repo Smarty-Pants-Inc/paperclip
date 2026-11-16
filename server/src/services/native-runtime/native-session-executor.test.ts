@@ -24621,12 +24621,18 @@ describe("runnerd provider runtime wiring", () => {
       expect(fixture.recoverSession).toHaveBeenCalledOnce();
       expect(fixture.openSession).toHaveBeenCalledOnce();
       expectRecordedFreshThread(fixture);
+      // J3-22 handoff: the fresh thread is marked so the runtime prompts it as
+      // a fresh open (saved-history handoff); this fixture has no handoff loader,
+      // so the note claims no history.
+      expect(recovered, "the recovered session is a FRESH thread").toMatchObject({ freshThread: true });
+      expect(restoreUnavailableNotice).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ historyHandedOff: false }));
     });
 
     it("guard: an AUTHORIZED restore still restores the same thread (no fresh thread, no note)", async () => {
       const fixture = await floorFixture("authorized", "destroyed");
       const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
       expect(recovered).toMatchObject({ recovered: true, session: fixture.restored });
+      expect(recovered, "a restored thread is not marked fresh").not.toHaveProperty("freshThread");
       expect(JSON.parse(await readFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), "utf8")).threadId)
         .toBe("retained-provider-thread");
       expect(fixture.openSession).not.toHaveBeenCalled();

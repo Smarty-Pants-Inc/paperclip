@@ -397,6 +397,68 @@ describe("executeNativeSession recovery", () => {
     expect(executionInput.workspace).toEqual(originalWorkspace);
   });
 
+  // J3-22 member (a): a backend that answers recovery by opening a FRESH
+  // provider thread (freshThread) gets the open path's prompt: the fresh
+  // envelope with the saved-history handoff prepended. A recovery without the
+  // marker keeps the resumed-session prompt and sends no handoff (guard).
+  it.each([
+    { freshThread: true, label: "handoff available", handoff: "## Fresh session handoff\nPRIOR_FACT_7f3" },
+    { freshThread: false, label: "handoff available", handoff: "## Fresh session handoff\nPRIOR_FACT_7f3" },
+    { freshThread: true, label: "no handoff", handoff: null },
+  ])("a recovered fresh thread is prompted like a fresh open (freshThread=$freshThread, $label)", async ({ freshThread, handoff }) => {
+    const executionInput = { ...preparedInput(), continuationPrompt: "RESUMED_CONTINUATION_PROMPT" } as NativeExecutionInputV5;
+    const capabilities = { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true };
+    const snapshot: PersistedNativeSession = {
+      backendKind: "mock", sessionId: "driver-recovery", identity, providerSessionId: "provider-recovery",
+      cursor: null, activeTurnId: null, semanticResult: null, terminal: null,
+      terminalTurns: [], pendingRuntimeRequests: [], lineage: [],
+    };
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "turn-recovery" }));
+    const session: NativeSession = {
+      identity: () => identity,
+      async capabilities() { return capabilities; },
+      async *events() {
+        yield runnerEvent(1, "run.result.proposed", result);
+        yield runnerEvent(2, "turn.completed");
+      },
+      startTurn,
+      async result() { return { result, terminal, turnId: "turn-recovery" }; },
+      async snapshot() { return structuredClone(snapshot); },
+      async close() {},
+    };
+    const backend = {
+      async descriptor() { return { kind: "mock", name: "fresh-thread-fixture", version: "1", capabilities,
+        runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" } }; },
+      async openSession() { return session; },
+      async recoverSession() { return { recovered: true, session, ...(freshThread ? { freshThread: true } : {}) }; },
+    } as NativeSessionBackend;
+    const port: ControlPlanePort = {
+      async openRun() {}, async checkpointSession() {},
+      async loadSessionCheckpoint() { return structuredClone(snapshot); },
+      async appendEvent(event: PrpEvent) { return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+      async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+      async completeRun() {},
+    };
+    const getFreshSessionHandoff = vi.fn(async () => handoff);
+    await executeNativeSession({ input: executionInput, backend, controlPlane: port, getFreshSessionHandoff,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" });
+    expect(startTurn).toHaveBeenCalledOnce();
+    const turn = startTurn.mock.calls[0]![0];
+    const envelope = JSON.parse(turn.message.text);
+    if (freshThread) {
+      expect(getFreshSessionHandoff).toHaveBeenCalledOnce();
+      expect(envelope.schema, "the fresh envelope, not the resumed-session continuation").not.toBe("paperclip.native-continuation.v1");
+      expect(turn).not.toHaveProperty("continuation");
+      if (handoff) expect(envelope.task.prompt.startsWith(`${handoff}\n\n`), "handoff prepended").toBe(true);
+      else expect(envelope.task.prompt).not.toContain("Fresh session handoff");
+    } else {
+      expect(getFreshSessionHandoff).not.toHaveBeenCalled();
+      expect(turn.message.text).not.toContain("Fresh session handoff");
+      expect(envelope).toMatchObject({ schema: "paperclip.native-continuation.v1" });
+      expect(turn.message.text).toContain("RESUMED_CONTINUATION_PROMPT");
+    }
+  });
+
   it.each([false, true])("settles a restart continuation that ended without a result through one disposition turn (Codex driver, native images=%s)", async nativeImages => {
     const lost = { code: "provider_turn_lost_on_restore", recoverable: true };
     const originalTransport = new FakeCodexTransport();
