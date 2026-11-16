@@ -310,8 +310,9 @@ API: `present` — representative operation IDs:
 - `POST /api/agents/{id}/lifecycle/retry`.
 - `GET /api/agents/{id}` returns the safe failed phase/step and action in `lifecycleError`.
 
-Agent access: `partial` — REST / native `call_api` resume under agent_config:update
-change-grant authorization; pause and termination remain board-only.
+Agent access: `partial` — REST / native `call_api` pause, resume and termination of a
+strict reporting descendant under agent_config:update change-grant authorization
+(fork deviation, Paul 11-13); termination hands work over through the recovery worker.
 
 Policy: Agent creation/configuration uses action grants, resource policies and change
 consent; some controls require a board actor.

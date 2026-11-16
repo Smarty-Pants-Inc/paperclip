@@ -161,7 +161,29 @@ settings, or host execution keys (`command`, `hermesCommand`, `args`, `extraArgs
 `cwd`, `filesystemSandboxCommand`). Existing narrow provider-credential paths
 remain unchanged. The Pi runner retains ownership of its `--session` and
 `--mode` arguments; `PAPERCLIP_PI_RUNTIME_DIR` is not an eligible configured env
-key. Retire a report through the existing pause, then terminate routes, not DELETE.
+key.
+
+Retire a report through the existing routes, not DELETE. This is a deliberate
+fork deviation from upstream's board-only termination: an agent caller may
+terminate a strict reporting descendant its direct `agents:configure` grant
+covers (Paul, 11-13). The full sequence:
+
+1. `POST /api/agents/{id}/pause` and wait for `lifecycleState` `paused`.
+2. `POST /api/agents/{id}/terminate` (or `PATCH` with `status: "terminated"`).
+   If the report has live reports of its own, the request is refused with
+   `409 agent_has_live_reports` when it has no manager, or when you could not
+   change those reports' manager yourself; nothing changes. Re-home them first.
+3. The lifecycle worker proves Stop and cleanup, then commits `terminated`
+   with the hand-over marker (`handover.code = "agent_handover_pending"` on
+   the agent) and one `agent.terminated` activity row naming you.
+4. The hand-over worker moves each open task to the nearest active manager
+   (`in_progress` becomes `todo`), re-points each live report's `reportsTo`
+   there (only that field changes), pauses the agent's routines, and closes an
+   open budget incident for it, with one activity row per item. The new
+   manager gets one `agent.reports_received` row.
+5. The marker clears when nothing is left. While it is set, `handover.blocked`
+   names any item that could not move and why (for example
+   `no_active_manager`); those need a person.
 
 ## Descendant budgets and instruction paths
 
