@@ -7,7 +7,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const FUNCTIONS = ["paperclip_record_agent_runtime", "paperclip_invalidate_connector_company"];
-// src8 (R2): the multi-agent fanouts 0489 also replaces, each with the migration
+// src8 (R2): the multi-agent fanouts 0491 also replaces, each with the migration
 // that last defined it, plus the new row-lock helper (dropped by the DOWN).
 const FANOUTS: Record<string, string> = {
   paperclip_invalidate_company_agent_runtimes: "./migrations/0354_agent_connection_assignment_hooks.sql",

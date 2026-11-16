@@ -5,7 +5,7 @@ import type { Db } from "@paperclipai/db";
 /**
  * #20805 R3 (RFL 06:42Z 11-16 + joint addendum 06:43Z): an in-flight per-agent
  * runtime writer as production now holds it: the agent row, then the SHARED
- * company connector-runtime hold (migration 0489, rows-then-lock; the same key as
+ * company connector-runtime hold (migration 0491, rows-then-lock; the same key as
  * server/src/services/agent-runtime-lock.ts). A company-wide fanout takes that
  * lock EXCLUSIVE, so it waits for this writer to commit.
  */
