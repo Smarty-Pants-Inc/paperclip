@@ -10,6 +10,13 @@ const API_TOOLS = new Set(["call_api", "save_api_response"]);
 const SCHEMA_DENIAL_STRINGS = ["provider", "operationId", "callId", "message", "inputSchemaGuidance"];
 const SCHEMA_DENIAL_FIELDS = new Set([...SCHEMA_DENIAL_STRINGS, "code", "paperclipExecuted"]);
 
+// Persistence must fail closed even if a scanner regression throws. Never
+// retry the same unsafe field from a JSON fallback's catch block.
+function redactOutputText(value: string): string {
+  try { return redactSecretShapes(value); }
+  catch { return "[REDACTED:unscannable]"; }
+}
+
 /** Only use after the PRP event's run and source bindings have been checked. */
 export function redactRunnerApiEvent<T extends { eventType: string; sourceKind: string; payload: unknown }>(event: T): T {
   const payload = event.payload && typeof event.payload === "object" ? event.payload as Record<string, unknown> : {};
@@ -21,7 +28,7 @@ export function redactRunnerApiEvent<T extends { eventType: string; sourceKind: 
     && SCHEMA_DENIAL_STRINGS.every(key => typeof payload[key] === "string"
       && payload[key].length > 0 && payload[key].length <= 512 && /^[\x20-\x7e]+$/.test(payload[key]))) {
     return { ...redactRunnerApiPayloads(event), payload: Object.fromEntries(Object.entries(payload)
-      .map(([key, value]) => [key, typeof value === "string" ? redactSecretShapes(value) : value])) };
+      .map(([key, value]) => [key, typeof value === "string" ? redactOutputText(value) : value])) };
   }
   return redactRunnerApiPayloads(event);
 }
@@ -43,15 +50,17 @@ function redactedPayload(value: unknown) {
 export function redactRunnerApiPayloads<T>(value: T): T {
   if (Array.isArray(value)) return value.map(redactRunnerApiPayloads) as T;
   if (typeof value === "string" && /^[\s]*[\[{]/.test(value)) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(value); }
+    catch { return redactOutputText(value) as T; }
     try {
-      const parsed = JSON.parse(value);
       const redacted = redactRunnerApiPayloads(parsed);
-      return (JSON.stringify(parsed) === JSON.stringify(redacted) ? redactSecretShapes(value) : JSON.stringify(redacted)) as T;
-    } catch { return redactSecretShapes(value) as T; }
+      return (JSON.stringify(parsed) === JSON.stringify(redacted) ? redactOutputText(value) : JSON.stringify(redacted)) as T;
+    } catch { return "[REDACTED:unscannable]" as T; }
   }
   // Keep API payload hashing above this pass: changing private material under
   // an existing source receipt must still conflict, even if both values redact.
-  if (typeof value === "string") return redactSecretShapes(value) as T;
+  if (typeof value === "string") return redactOutputText(value) as T;
   if (!value || typeof value !== "object") return value;
   const entry = value as Record<string, unknown>;
   const operation = entry.apiOperationId ?? entry.operationId;

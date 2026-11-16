@@ -15,11 +15,14 @@ const identityMark = String.raw`\*{3}REDACTED\*{3}`;
 // Identity material scanning can erase framing and long runs but leave short
 // lines or JSON-escaped slashes. Keep those lexical runs in one candidate.
 const projectedFirstBody = String.raw`(?:[A-Za-z0-9+/]|\\{1,2}/){32}={0,2}`;
-const projectedToken = new RegExp(String.raw`${identityMark}|(?:[A-Za-z0-9+/]|\\{1,2}/)+={0,2}`, "g");
+// Candidates are validated before replacement. A flat character class avoids
+// one regexp stack frame per escaped slash (or body byte) on multi-MiB lines.
+const projectedToken = new RegExp(String.raw`${identityMark}|[A-Za-z0-9+/\\]+={0,2}`, "g");
 const identityLineBreak = /(\\{1,2}[rn]|\r\n?|\n)/;
 const identityValue = "***REDACTED***";
-const attachedHex = new RegExp(String.raw`${identityMark}[a-f0-9]|[a-f0-9]${identityMark}`, "i");
-const onlyHashLines = (text: string) => !/[^a-f0-9\r\n]/i.test(text.replaceAll(identityValue, "")) && !attachedHex.test(text);
+// Reject ordinary PEM bytes before allocating a copy with every mark removed.
+const onlyHashLines = (text: string) => !/[^a-f0-9\r\n*rt]/i.test(text)
+  && !/[^a-f0-9\r\n]/i.test(text.replaceAll(identityValue, ""));
 
 // A projected PEM is a group of base64-only logical lines, not an arbitrary
 // span of words next to an identity mark. Bound line checks before normalizing;
@@ -27,7 +30,7 @@ const onlyHashLines = (text: string) => !/[^a-f0-9\r\n]/i.test(text.replaceAll(i
 function redactIdentityPem(candidate: string): string {
   if (!candidate.includes(identityValue)) return candidate;
   // Hash-only lines are not PEM evidence. Check them with simple native scans
-  // before allocating a split entry per line; attached bodies remain eligible.
+  // before allocating a split entry per line, including directly attached SHAs.
   if (onlyHashLines(candidate)) return candidate;
   const parts = candidate.split(identityLineBreak);
   let start = 0;
@@ -40,8 +43,17 @@ function redactIdentityPem(candidate: string): string {
   let previousLong = false;
   const flush = (end: number) => {
     if (hasMark && hasBody) {
-      for (let i = start; i < end; i += 2) parts[i] = parts[i]!.replace(projectedToken,
-        token => token === identityValue ? token : "[REDACTED:pem]");
+      let previous: string | undefined;
+      let replacement = "";
+      for (let i = start; i < end; i += 2) {
+        const line = parts[i]!;
+        if (line === identityValue) continue;
+        if (line !== previous) {
+          previous = line;
+          replacement = line.replace(projectedToken, token => token === identityValue ? token : "[REDACTED:pem]");
+        }
+        parts[i] = replacement;
+      }
     }
     start = end + 2;
     hasMark = hasBody = false;
@@ -64,10 +76,24 @@ function redactIdentityPem(candidate: string): string {
       // the n in \\n with the following body run. Strip only that suffix.
       const run = marked && j < runs.length - 1 ? runs[j]!.replace(/\\{1,2}$/, "") : runs[j]!;
       if (marked && !run) continue;
-      const normalized = run.includes("\\") ? run.replace(/\\{1,2}\//g, "/") : run;
-      const size = normalized.endsWith("==") ? normalized.length - 2 : normalized.endsWith("=") ? normalized.length - 1 : normalized.length;
-      if ((!marked && size > 76) || !/^[A-Za-z0-9+/]+={0,2}$/.test(normalized)
-        || (!marked && (/^[a-f0-9]{32,}$/i.test(normalized) || /^\/[a-z0-9/]+$/.test(normalized)))) {
+      let size = run.endsWith("==") ? run.length - 2 : run.endsWith("=") ? run.length - 1 : run.length;
+      if (!/^[A-Za-z0-9+/\\]+={0,2}$/.test(run)) { valid = false; break; }
+      // Count escaped slashes without allocating a replacement per slash or
+      // using an alternation repeated millions of times in a regexp.
+      const escaped = run.includes("\\");
+      if (escaped) {
+        for (let at = 0; at < run.length; at++) {
+          if (run.charCodeAt(at) !== 92) continue;
+          if (run.charCodeAt(at + 1) === 92) { at++; size--; }
+          if (run.charCodeAt(at + 1) !== 47) { valid = false; break; }
+          at++;
+          size--;
+        }
+      }
+      // Unmarked lines are already length-bounded. Normalize only those small
+      // path checks; attached pure hex is not additional PEM evidence either.
+      const path = !marked && /^\/[a-z0-9/]+$/.test(escaped ? run.replace(/\\{1,2}\//g, "/") : run);
+      if (!valid || (!marked && size > 76) || (!escaped && /^[a-f0-9]{32,}$/i.test(run)) || path) {
         valid = false;
         break;
       }
@@ -95,7 +121,7 @@ const patterns: ReadonlyArray<{ kind: string; pattern: RegExp; assignment?: "jso
   // Consume (and preserve) the line boundary instead of testing lookbehinds at
   // every byte. Body starts are only at logical lines or attached to a mark.
   // The callback checks bounded lines, never an unanchored body search.
-  { kind: "pem", identityPem: true, pattern: new RegExp(String.raw`(?:${identityMark}|(?:^|[\r\n]|\\{1,2}[rn])${projectedFirstBody})(?:[\r\n\\]+|${body}|${identityMark})*`, "g") },
+  { kind: "pem", identityPem: true, pattern: new RegExp(String.raw`(?:${identityMark}|(?:^|[\r\n]|\\{1,2}[rn])${projectedFirstBody})(?:[A-Za-z0-9+/=\r\n\\]+|${identityMark})*`, "g") },
   { kind: "assignment", assignment: "json", pattern: new RegExp(String.raw`("(?:${secretName})"\s*:\s*)("(?:\\[\s\S]|[^"\\])*")`, "gi") },
   { kind: "assignment", assignment: "shell", pattern: new RegExp(String.raw`((?<![A-Za-z0-9_.-])(?:${secretName})[ \t]*=[ \t]*)("(?:\\[\s\S]|[^"\\])*"|'[^']*'|[^\s"'\x60,;]+)`, "gi") },
   // Fixed minimum + a simple greedy tail avoids V8's per-character counter
@@ -115,6 +141,11 @@ const patterns: ReadonlyArray<{ kind: string; pattern: RegExp; assignment?: "jso
  * secrets from entropy. Orphan PEM needs a >=32-character adjacent body token
  * to avoid eating ordinary prose before an END marker. */
 export function redactSecretShapes(text: string): string {
+  try { return redactScannableText(text); }
+  catch { return "[REDACTED:unscannable]"; }
+}
+
+function redactScannableText(text: string): string {
   for (const { kind, pattern, assignment, needsEnd, bodyCandidate, identityPem, hint } of patterns) {
     if (hint && !(typeof hint === "string" ? text.includes(hint) : hint.test(text))) continue;
     if (kind === "pem" && !text.includes(identityPem ? identityValue : "PRIVATE KEY-----")) continue;

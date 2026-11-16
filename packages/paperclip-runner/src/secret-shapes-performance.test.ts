@@ -4,7 +4,8 @@ import { judgeSecretShapePerformanceInputsAt, secretShapePerformanceInputsAt } f
 
 // Keep reason: data safety / event-loop availability at the server output trust
 // boundary. Isolate RED so a quadratic regexp cannot hang the test coordinator.
-// The 100 ms budget covers this committed corpus, not every possible input.
+// The 100 ms budget covers the original corpus and explicit identity rows,
+// not every possible input. Judge-shaped assignment rows use 250 ms/MiB.
 // Use the median of three scans per input to tolerate one scheduler interruption.
 describe.each([1, 4])("secret-shape %i MiB adversarial budget", mib => {
   it.for([...secretShapePerformanceInputsAt(mib * 1024 * 1024).map(row => ({ ...row, budgetMs: 100 })),
@@ -21,7 +22,7 @@ describe.each([1, 4])("secret-shape %i MiB adversarial budget", mib => {
       }).sort((a, b) => a - b);
       console.log(samples[1]);
     `], { input: text, encoding: "utf8", timeout: 5_000 });
-    expect(probe.error, `${name}: isolated probe exceeded 2 seconds`).toBeUndefined();
+    expect(probe.error, `${name}: isolated probe exceeded 5 seconds`).toBeUndefined();
     expect(probe.status, probe.stderr).toBe(0);
     const elapsedMs = Number(probe.stdout.trim());
     expect(Number.isFinite(elapsedMs)).toBe(true);

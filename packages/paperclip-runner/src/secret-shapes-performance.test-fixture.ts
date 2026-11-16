@@ -64,6 +64,8 @@ export function judgeSecretShapePerformanceInputsAt(bytes: number) {
     { name: "judge: shell assignments with bounded overlapping KEY names", text: fill(`${"a".repeat(64)}KEY${"KEY".repeat(21)}='value'\n`), budgetMs: bytes / mb * 250 },
     { name: "judge: JSON assignments with bounded overlapping KEY names", text: fill(`"${"a".repeat(64)}KEY${"KEY".repeat(21)}": "value",\n`), budgetMs: bytes / mb * 250 },
     { name: "judge: repeated assignment-name near misses", text: fill(`${"KEY".repeat(43)}!\n`), budgetMs: bytes / mb * 250 },
+    { name: "judge: dense shell assignments", text: fill("KEY=x;"), budgetMs: bytes / mb * 250 },
+    { name: "judge: dense JSON assignments", text: fill('"KEY":"x",'), budgetMs: bytes / mb * 250 },
   ];
 }
 

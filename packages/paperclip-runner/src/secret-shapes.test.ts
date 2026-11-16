@@ -55,6 +55,14 @@ describe("redactSecretShapes", () => {
     expect(redactSecretShapes(text)).toBe(text);
     expect(redactSecretShapes(redactSecretShapes(text))).toBe(text);
   });
+  it.each(["/SomeMixedCase/Repository/SourceTree/Runtime", "CamelCaseIdentifierWithThirtyTwoCharactersAndMore"])(
+    "retains the documented conservative PEM interpretation of %s", ambiguous => {
+      const input = `***REDACTED***\n${ambiguous}\nls\nPASS\n`;
+      const output = "***REDACTED***\n[REDACTED:pem]\n[REDACTED:pem]\n[REDACTED:pem]\n";
+      expect(redactSecretShapes(input)).toBe(output);
+      expect(redactSecretShapes(output)).toBe(output);
+    },
+  );
   it("still hides a contiguous PEM body immediately following an identity mark", () => {
     const body = "AbCdEf01+/".repeat(16);
     const output = redactSecretShapes(`***REDACTED***${body}`);

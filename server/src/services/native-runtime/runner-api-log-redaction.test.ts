@@ -24,6 +24,16 @@ describe("composed identity/shape persistence", () => {
     expect(redactRunnerApiEvent(expected)).toEqual(expected);
     expect(input.payload.text).toContain(secret);
   });
+  it("keeps a SHA and mixed-case path after an actual configured key", () => {
+    const key = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    const suffix = "\n6e90f3f0ebcec3fcc70ffcf22056eac2c32ec699\n/SomeMixedCase/Repository/SourceTree/Runtime\nls\nPASS\n";
+    const identity = createAgentIdentityRedactor(key);
+    const input = { text: key.trim() + suffix };
+    // Exact-value identity redaction consumes the PEM's final newline too:
+    // the SHA is therefore directly attached to its mark in production order.
+    expect(redactRunnerApiPayloads(identity.redact(input))).toEqual({ text: "***REDACTED***" + suffix.slice(1) });
+    expect(input.text).toContain(key.trim());
+  });
   it.each([false, true])("hides all supported PEM vectors in both orders (configured=%s)", configured => {
     const key = configured ? generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString() : undefined;
     for (const { text, body, keyType, name } of secretShapePemVectors().filter(vector => vector.supported)) {

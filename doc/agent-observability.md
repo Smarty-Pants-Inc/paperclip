@@ -89,28 +89,58 @@ remain protected if a later turn echoes them. Redaction precedes field truncatio
 and covers captured prompts, answers, tool output (including errors) and projected
 command names. After exact-value redaction, the shared Pi/OpenCode exporter also
 replaces recognizable unknown secret shapes with `[REDACTED:<kind>]`: private-key
-PEM blocks (including escaped newlines, space-joined, rewrapped and orphan framing
-with adjacent base64), GitHub, OpenAI/Anthropic, Langfuse, Slack and AWS access-key
-shapes, JWTs, bearer credentials, and shell/JSON assignments whose names contain
+PEM blocks (including escaped newlines, space-joined and the supported wrapping
+and orphan-framing cases described below), GitHub, OpenAI/Anthropic, Langfuse,
+Slack and AWS access-key shapes, JWTs, bearer credentials, and shell/JSON
+assignments whose names contain
 KEY, TOKEN, SECRET, PASSWORD, PRIVATE or CREDENTIAL. Assignment names and existing
-redaction marks are retained. Ordinary prose, identifiers, UUIDs and bare git SHAs
-are not secret shapes. The same pure pass runs after registered-value redaction
-at the server's existing recursive native API/run-log redaction boundary, after
+redaction marks are retained. Ordinary prose, UUIDs and bare git SHAs are not
+secret shapes, but identifiers and paths can overlap projected PEM bodies next
+to an identity mark, as described below. The same pure pass runs after
+registered-value redaction at the server's existing recursive native API/run-log
+redaction boundary, after
 API payload hashing and before native event persistence; it does not modify
 provider inputs or raw Pi session files. Secret-name matching bounds the runs on
 each side of the keyword to 64 characters to keep adversarial output scans
 bounded. JWT starts use the entire base64url alphabet as their boundary, so a
-hyphen inside an unfinished segment cannot restart the scan. PEM matching also
-recognizes an identity redactor's `***REDACTED***` marker next to base64-only
+hyphen inside an unfinished segment cannot restart the scan. As a result, a JWT
+immediately after `-` is not recognized. JWTs immediately after literal escaped
+`\n`, `\t` or `\r` are also not recognized; these boundaries remain outside
+this pass's recall. PEM matching also recognizes an identity redactor's `***REDACTED***` marker next to base64-only
 logical lines (up to 76 body characters per line, with at least one 32-character
 run), including escaped-slash JSON and partially masked bodies. A contiguous
 body immediately attached to a mark can be longer. Spaces/prose, pure hex hash
-lines and slash-only lowercase paths break this projected-PEM context; an
-unrelated SHA or image data URI later in the transcript is not evidence of PEM.
-The original identity marks are retained while adjacent material is hidden.
-This keeps short rewrapped lines protected even when identity redaction has
-already erased BEGIN/END framing. It does not reorder API hashing, identity
-delta processing, or native event replay.
+lines (including a SHA directly attached to a mark) and slash-only lowercase
+paths break this projected-PEM context; an unrelated SHA or image data URI later
+in the transcript is not evidence of PEM. A SHA between a configured-key mark
+and a path also breaks the context. The original identity marks are retained
+while adjacent material is hidden.
+
+Some nonsecret output is indistinguishable from this projected body grammar.
+A dotless mixed-case slash path or a 32–76-character CamelCase identifier on the
+line after an identity mark can still be masked, together with short adjacent
+base64-only lines such as `ls` and `PASS`. These ambiguous cases remain masked
+to avoid exposing PEM fragments; they are not covered by an identifier/path
+precision guarantee.
+
+Rewrapped PEM coverage is limited. In the audited full-PEM `fold` vectors,
+shape-only redaction covers widths of at least 32 columns (31 for pkcs1).
+With the identity-material redactor first, widths of 31 or fewer columns leak
+the whole body, and widths 40–55 can leak 24-character pieces. A 32-character
+window check does not detect those shorter pieces. These wrapping gaps remain
+unfixed here; short rewrapped lines are not generally protected after identity
+redaction has erased BEGIN/END framing. This pass does not reorder API hashing,
+identity delta processing, or native event replay.
+
+Scanner exceptions, including a regexp stack overflow, mask the entire field as
+`[REDACTED:unscannable]` rather than returning raw text or failing persistence.
+The native API/log boundary does not retry a throwing scanner on the same field.
+Performance tests use a median of three scans per input: the 100 ms budget at
+1 and 4 MiB covers the original committed corpus and the explicit identity
+rows, not arbitrary output. Assignment-heavy judge-shaped rows have a separate
+250 ms/MiB budget. Assignment scanning remains linear with a potentially high
+constant cost (the judge measured up to 879 ms at 4 MiB); it is not covered by
+a general 100 ms guarantee.
 
 These are conservative output heuristics, not a guarantee against all secret
 encodings. Arbitrary base64 re-encoding without recognizable framing, secret
