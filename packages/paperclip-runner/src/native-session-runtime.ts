@@ -171,6 +171,47 @@ export function nativeSessionCleanupBlock(input: {
   }
   return block;
 }
+
+/** The exact owner behind one task's `operator_required` cleanup gate. */
+export interface NativeSessionCleanupGateOwner {
+  companyId: string;
+  runId: string;
+  issueId: string;
+  sessionId: string;
+  /** The trusted remote resource the owner's backend was bound to; null for a local backend. */
+  remoteCleanupScope: string | null;
+}
+
+/**
+ * Read-only snapshot of the exact owners that make a task's gate read
+ * `operator_required`: the run, session and remote resource each quarantined
+ * close was bound to. It grants no stop, retirement or execution authority;
+ * only the confirmed-stop boundaries above retire an owner.
+ */
+export function nativeSessionCleanupGateOwners(input: {
+  companyId: string;
+  issueId: string;
+}): NativeSessionCleanupGateOwner[] {
+  const issueResource = JSON.stringify(["issue", input.issueId]);
+  const owners: NativeSessionCleanupGateOwner[] = [];
+  for (const entry of quarantinedSessionCleanups) {
+    if (!entry.domain.resources.includes(issueResource) ||
+        cleanupDomainScope(entry.domain).companyId !== input.companyId) continue;
+    const exhausted = !entry.attempt && !entry.recovery && !entry.timer &&
+      entry.automaticAttempts >= MAX_QUARANTINED_SESSION_AUTOMATIC_CLOSE_ATTEMPTS;
+    if (!entry.operatorRecoveryRequired && !exhausted) continue;
+    let identity: ReturnType<NativeSession["identity"]>;
+    try {
+      identity = entry.session.identity();
+    } catch {
+      continue;
+    }
+    const [, , , remoteCleanupScope] = JSON.parse(entry.domain.key) as string[];
+    owners.push({ companyId: identity.companyId, runId: identity.runId, issueId: identity.issueId,
+      sessionId: identity.sessionId, remoteCleanupScope: remoteCleanupScope ?? null });
+  }
+  return owners;
+}
 const FAILED_SESSION_CLOSE_RETRY_MS = 1_000;
 const MAX_FAILED_SESSION_CLOSE_RETRIES = 3;
 const MAX_QUARANTINED_SESSION_CLOSE_RETRIES = 3;
@@ -199,6 +240,8 @@ interface QuarantinedSessionCleanup {
   recoveryMaxAttempts: number | null;
   timer: ReturnType<typeof setTimeout> | null;
   operatorRecoveryRequired: boolean;
+  /** The latest automatic close failure, named once the budget is spent. */
+  lastCloseError?: unknown;
 }
 
 const quarantinedSessionCleanups = new Set<QuarantinedSessionCleanup>();
@@ -977,6 +1020,7 @@ function startQuarantinedSessionCleanupRecovery(
         quarantinedSessionCleanups.delete(cleanup);
         announceCleanupSettled(cleanup.domain);
       } catch (error) {
+        cleanup.lastCloseError = error;
         if (error instanceof NativeSessionCloseUnrecoverableError) {
           if (!cleanup.operatorRecoveryRequired)
             announceCleanupQuarantine(cleanup.session, true, error);
@@ -1000,9 +1044,42 @@ function startQuarantinedSessionCleanupRecovery(
         cleanup.recoveryMaxAttempts = null;
       }
       scheduleQuarantinedSessionCleanup(cleanup);
+      escalateExhaustedQuarantinedSessionCleanup(cleanup);
     })
     .catch(() => undefined);
   return recovery;
+}
+
+/**
+ * The bounded automatic close budget is spent and nothing else is scheduled,
+ * so waiting can never settle this owner (#20806). Make that transition
+ * explicit and announce it once through the quarantine observer, so the host
+ * logs it and re-evaluates held work. It releases nothing: the owner stays a
+ * gate until a confirmed-stop boundary above retires it.
+ */
+function escalateExhaustedQuarantinedSessionCleanup(
+  cleanup: QuarantinedSessionCleanup,
+): void {
+  if (
+    !quarantinedSessionCleanups.has(cleanup) ||
+    cleanup.operatorRecoveryRequired ||
+    cleanup.attempt ||
+    cleanup.recovery ||
+    cleanup.timer ||
+    cleanup.automaticAttempts < MAX_QUARANTINED_SESSION_AUTOMATIC_CLOSE_ATTEMPTS
+  )
+    return;
+  cleanup.operatorRecoveryRequired = true;
+  const last = cleanup.lastCloseError;
+  const lastText = last instanceof Error ? `${last.name}: ${last.message}`
+    : last === undefined ? "unknown" : String(last);
+  announceCleanupQuarantine(
+    cleanup.session,
+    true,
+    new Error(
+      `native_session_cleanup_recovery_exhausted: ${cleanup.automaticAttempts} automatic close attempts failed; last: ${lastText}`,
+    ),
+  );
 }
 
 function scheduleQuarantinedSessionCleanup(
