@@ -14,11 +14,17 @@ import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./
 
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import { verifyRemoteProviderPack } from "./remote-provider-pack-verification.js";
 import type { prepareRemoteProviderPackOnTarget as PrepareRemoteProviderPackOnTarget } from "./native-session-executor.js";
 
 type NativePiProbePack = Awaited<ReturnType<typeof PrepareRemoteProviderPackOnTarget>>;
 
-/** The setup probe's factory preparation: the provider pack and the Runner daemon. */
+/** The setup probe's factory preparation, in the order task runs use (#17749).
+ * Ask the Runner daemon first: its build-metadata inventory reads only the
+ * protected manifest of each named root (paperclip-runnerd.rs: "Check only path
+ * metadata at startup; no directory walk"), so a sealed image pack is admitted
+ * with no pack walk, version command or upload (docker/daytona-runner/README.md:
+ * "It does not scan the pack"). Any other pack keeps the full selection path. */
 export async function prepareNativePiProbeRemote(input: {
   target: Parameters<typeof PrepareRemoteProviderPackOnTarget>[0]["target"];
   runner: CommandManagedRuntimeRunner;
@@ -29,13 +35,38 @@ export async function prepareNativePiProbeRemote(input: {
   requiredMode: "listen_ws" | "dial_wss";
 }): Promise<NativePiProbePack> {
   const { prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation } = await import("./native-session-executor.js");
-  const pack = await prepareRemoteProviderPackOnTarget({ target: input.target, runner: input.runner,
-    configuredProviderPackRoot: input.source.configuredRoot, manifest: input.source.manifest });
-  await createRemoteNativeArtifactPreparation({ target: input.target, runner: input.runner, remoteBinary: input.remoteBinary,
+  // The same roots as task runs (native-session-executor.ts providerPackRoots).
+  const stagedRoot = posix.join(input.target.remoteCwd, ".paperclip-runtime", "paperclip-runner", "provider-pack");
+  let inventoryInterrupted = false;
+  const runner: CommandManagedRuntimeRunner = { ...input.runner, execute: async request => {
+    const result = await input.runner.execute(request);
+    if (request.args?.[0] === "--build-metadata" && request.args.includes("--provider-pack-root")
+      && (result.timedOut || result.exitCode === null || result.signal)) inventoryInterrupted = true;
+    return result;
+  } };
+  const artifacts = createRemoteNativeArtifactPreparation({ target: input.target, runner, remoteBinary: input.remoteBinary,
     controllerRunnerBinary: input.controllerRunnerBinary, remoteRuntimeRoot: input.remoteRuntimeRoot,
     runnerRemoteBinaryPath: process.env.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH,
-    targetPlatformArtifactVerified: true }).prepare(input.requiredMode);
-  return pack;
+    targetPlatformArtifactVerified: true, providerPackRoots: [stagedRoot, "/opt/paperclip-runner/provider-pack"] });
+  try {
+    await artifacts.prepare(input.requiredMode);
+  } catch (error) {
+    // An interrupted probe proves no incompatibility (remote-provider-pack.ts).
+    if (inventoryInterrupted) throw new Error("runner_remote_provider_verification_unavailable: Runner daemon pack inventory was interrupted", { cause: error });
+    throw error;
+  }
+  for (const installation of artifacts.providerPackInventory()) {
+    try {
+      // Only an immutable root with the exact native Pi manifest is admitted here.
+      const manifest = await verifyRemoteProviderPack({ runner: input.runner, cwd: input.target.remoteCwd,
+        packRoot: installation.root, manifest: input.source.manifest, installation, provider: { kind: "pi_rpc" } });
+      return { root: installation.root, manifest, source: "preinstalled" };
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") throw error;
+    }
+  }
+  return prepareRemoteProviderPackOnTarget({ target: input.target, runner: input.runner,
+    configuredProviderPackRoot: input.source.configuredRoot, manifest: input.source.manifest });
 }
 
 /** Static launch files a setup probe never needs to copy out: the staged runner

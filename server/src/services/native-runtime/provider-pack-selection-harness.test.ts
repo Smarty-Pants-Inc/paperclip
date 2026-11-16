@@ -238,10 +238,12 @@ if (args[0] !== "--build-metadata") process.exit(17);
 const providerPacks = [];
 for (let index = 1; index < args.length; index += 2) {
   if (args[index] !== "--provider-pack-root") process.exit(2);
-  const pack = packs[args[index + 1]];
-  if (!pack) continue;
-  try { providerPacks.push({ root: args[index + 1], immutable: pack.immutable,
-    manifest: JSON.parse(fs.readFileSync(pack.directory + "/provider-pack.json", "utf8")) }); } catch {}
+  // Like provider_pack_inventory: every requested root is reported; only a
+  // sealed one carries its manifest.
+  const root = args[index + 1], pack = packs[root];
+  let manifest = null;
+  try { if (pack?.immutable) manifest = JSON.parse(fs.readFileSync(pack.directory + "/provider-pack.json", "utf8")); } catch {}
+  providerPacks.push(manifest ? { root, manifest, immutable: true } : { root, manifest: null, immutable: false });
 }
 process.stdout.write(JSON.stringify({ ...${JSON.stringify(metadata)}, ...(args.length > 1 ? { providerPacks } : {}) }));
 `, { mode: 0o755 });

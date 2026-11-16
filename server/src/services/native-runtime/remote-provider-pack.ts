@@ -60,11 +60,9 @@ export async function runRemoteProviderVerification(
   throw new Error(`runner_remote_provider_verification_unavailable: ${label} unavailable after 2 verification attempts (${diagnostic.slice(-1_536)})`);
 }
 
-/** Prefer a publisher-sealed exact installation, then a verified staged pack.
- * Without a seal or a scoped memo, reuse requires full byte verification. */
+/** Reuse only a pack that passes the same full verification as a new upload. */
 export async function prepareVerifiedRemoteProviderPack(input: {
   trace?: NativeRunTrace;
-  useSealedPreinstalled?: () => Promise<boolean>;
   verifyStaged: () => Promise<void>;
   usePreinstalled: (onRejected: (check: string) => void) => Promise<boolean>;
   stageAndVerify: () => Promise<void>;
@@ -73,12 +71,6 @@ export async function prepareVerifiedRemoteProviderPack(input: {
   let failed = false;
   let preinstalledCheck = "no_preinstalled_pack";
   const select = async () => {
-    try {
-      if (await input.useSealedPreinstalled?.()) return "preinstalled" as const;
-    } catch {
-      // An unavailable read-only optimization is not admission. The staged
-      // memo/full verifier below must still establish the pack's identity.
-    }
     try {
       await input.verifyStaged();
       return "staged" as const;
