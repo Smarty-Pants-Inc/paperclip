@@ -48,7 +48,10 @@ describe("project-owned tool connections on an image without the #20717 writer (
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("paperclip-projconn-reader-");
     db = createDb(database.connectionString);
-    for (const statement of MIGRATION_0493) await db.execute(sql.raw(statement));
+    // Harness only (merged #20717 tree): the schema already applies 0493, so
+    // replay it verbatim only where the column is still missing.
+    const [{ present }] = await db.execute(sql`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'tool_connections' AND column_name = 'project_id') AS present`) as unknown as Array<{ present: boolean }>;
+    if (!present) for (const statement of MIGRATION_0493) await db.execute(sql.raw(statement));
   }, 60_000);
   afterAll(async () => {
     await db?.$client.end({ timeout: 1 });
