@@ -3285,6 +3285,19 @@ describe("remote provider pack manifest", () => {
       session: { ...execution.session, normalizedSessionId: `bundled-${provider}-${randomUUID()}`, driverKind: nativePi ? "pi_rpc" : opencode ? "opencode_server" : "acpx_runtime" },
     } as unknown as NativeExecutionInputV1;
     const syncIn = vi.fn(async (_operations: { files: { kind: string }[] }[]) => undefined);
+    type StateFileOperation = Array<{ files: Array<{ sourcePath: string; targetPath: string; kind: string; mode?: number }> }>;
+    const copyStateFiles = async (operations: StateFileOperation, remoteFiles: Map<string, Buffer>) => {
+      for (const file of operations.flatMap(operation => operation.files)) {
+        const bytes = remoteFiles.get(file.sourcePath);
+        if (!bytes) throw Object.assign(new Error(`ENOENT: no such file or directory, syncOut source '${file.sourcePath}'`), { code: "ENOENT", path: file.sourcePath });
+        await mkdir(dirname(file.targetPath), { recursive: true });
+        await writeFile(file.targetPath, bytes, { mode: file.mode ?? 0o600 });
+      }
+    };
+    const syncOutFromRemoteFiles = (remoteFiles: Map<string, Buffer>) => vi.fn(async (operations: StateFileOperation) => {
+      await copyStateFiles(operations, remoteFiles);
+      return { operations: [] };
+    });
     const installed = structuredClone(manifest);
     if (opencode) {
       installed.payload.runnerSourceRevision = "c".repeat(40) + (provider === "opencode-dirty" ? "-dirty" : "");
@@ -3299,7 +3312,12 @@ describe("remote provider pack manifest", () => {
       providerSessionId: null, activeProviderTurnId: null, config: { provider: "opencode", driver: "opencode_server" } };
     const suspendedState = durableRunnerState({ runId: remoteExecution.binding.runId, runnerInstanceId: "bundled-image-runner",
       environmentLeaseId: "lease", normalizedSessionId: remoteExecution.session.normalizedSessionId }, "suspended");
-    const syncOut = vi.fn(async (operations: Array<{ files: Array<{ kind: string; targetPath: string }> }>) => {
+    const remoteStateFiles = new Map<string, Buffer>();
+    const syncOut = vi.fn(async (operations: StateFileOperation) => {
+      if (inspectionResets > 0 && inspectionReset && operations.some(operation => operation.files.some(file => file.sourcePath.endsWith(`/${inspectionReset}`)))) {
+        inspectionResets--;
+        throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+      }
       if (checkpointReadResets > 0 && operations.some(operation => operation.files.some(file => file.targetPath.includes("/.pending-")))) {
         checkpointReadResets--;
         throw Object.assign(new Error("write ECONNRESET"), { code: "ECONNRESET" });
@@ -3309,6 +3327,8 @@ describe("remote provider pack manifest", () => {
           await mkdir(file.targetPath, { recursive: true });
           await writeFile(join(file.targetPath, "runner-state.json"), JSON.stringify(suspendedState));
           await writeFile(join(file.targetPath, "codex-provider-state.json"), JSON.stringify(providerState));
+        } else if (file.sourcePath.endsWith("/runner-state.json") || file.sourcePath.endsWith("/codex-provider-state.json")) {
+          await copyStateFiles([{ files: [file] }], remoteStateFiles);
         } else { await mkdir(dirname(file.targetPath), { recursive: true }); await writeFile(file.targetPath, "qualified launch fixture"); }
       }
     });
@@ -3347,6 +3367,9 @@ describe("remote provider pack manifest", () => {
         inspectionResets--;
         throw Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
       }
+      const statePath = /^test -f '([^']+)'/.exec(script)?.[1];
+      if (statePath?.endsWith("/runner-state.json")) remoteStateFiles.set(statePath, Buffer.from(JSON.stringify(suspendedState)));
+      else if (statePath?.endsWith("/codex-provider-state.json")) remoteStateFiles.set(statePath, Buffer.from(JSON.stringify(providerState)));
       return {
       exitCode: 0, signal: null, timedOut: false, stderr: "",
       stdout: script.includes("paperclip_sizes=$(find ")
@@ -3619,7 +3642,12 @@ describe("remote provider pack manifest", () => {
         await writeFile(state.bundledPackManifestPath!, JSON.stringify(next));
         await writeFile(state.bundledRunnerBinary!, Buffer.concat([daemon, Buffer.from("new release")]));
         let recoveredRunnerStopped = false;
+        const recoveryState = { ...identity, lifecycle: "running" };
+        const recoveryStateFiles = new Map<string, Buffer>();
         const recoveryExecute = vi.fn(async (request: { args: string[] }) => {
+          const checkedStatePath = /^test -f '([^']+)'/.exec(request.args[1] ?? "")?.[1];
+          if (checkedStatePath?.endsWith("/runner-state.json")) recoveryStateFiles.set(checkedStatePath, Buffer.from(JSON.stringify(recoveryState)));
+          else if (checkedStatePath?.endsWith("/codex-provider-state.json")) recoveryStateFiles.set(checkedStatePath, Buffer.from(JSON.stringify(providerState)));
           if (request.args[2] === "paperclip-runner-recovery-check" && request.args[1]?.includes('kill -"$6"')) {
             const exitCode = recoveredRunnerStopped ? 45 : 0;
             recoveredRunnerStopped = true;
@@ -3636,7 +3664,7 @@ describe("remote provider pack manifest", () => {
           }) };
           if (request.args[0] === "-e" || request.args[0] === "--version") return { exitCode: 0, timedOut: false, stderr: "", stdout: request.args[0] === "--version" ? "1.18.34" : "" };
           const script = request.args[1];
-          const stdout = script.includes("base64") ? Buffer.from(JSON.stringify({ ...identity, lifecycle: "running" })).toString("base64")
+          const stdout = script.includes("base64") ? Buffer.from(JSON.stringify(recoveryState)).toString("base64")
             : script.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${identity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "";
           return { stdout, stderr: "", exitCode: 0, timedOut: false };
         });
@@ -3645,7 +3673,7 @@ describe("remote provider pack manifest", () => {
           ...(opencode ? { runnerEnvironment: configuredEnvironmentProjection({ PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS: "1" }) } : {}),
           runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
             environmentId: "environment", leaseId: "lease", providerKey: "daytona", effectiveCapabilities: { runnerWebSocketIngress: true },
-            runner: { execute: recoveryExecute, syncIn: vi.fn(async () => undefined), syncOut: vi.fn(async () => undefined) },
+            runner: { execute: recoveryExecute, syncIn: vi.fn(async () => undefined), syncOut: syncOutFromRemoteFiles(recoveryStateFiles) },
             sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: "sandbox" } } as never,
           restartRecovery: { kind: "reattach_remote_runner", runId: remoteExecution.binding.runId,
             leaseOwner: "controller", controllerGeneration: 2, providerAttempt: 1, restartKind: "graceful", recoveryRequestId: null,
@@ -3655,15 +3683,18 @@ describe("remote provider pack manifest", () => {
         // retry under a persisted runner artifact found the runner settled and
         // exited. Nothing is adopted, so the transport relaunches it from its
         // durable state and needs the admitted provider pack's launch inputs.
+        const settledState = { ...identity, lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null, warmTransition: null };
+        const settledStateFiles = new Map<string, Buffer>();
         const settledExecute = vi.fn(async (request: { args: string[] }) => {
+          const checkedStatePath = /^test -f '([^']+)'/.exec(request.args[1] ?? "")?.[1];
+          if (checkedStatePath?.endsWith("/runner-state.json")) settledStateFiles.set(checkedStatePath, Buffer.from(JSON.stringify(settledState)));
+          else if (checkedStatePath?.endsWith("/codex-provider-state.json")) settledStateFiles.set(checkedStatePath, Buffer.from(JSON.stringify(providerState)));
           if (request.args[2] === "paperclip-runner-recovery-check") return { exitCode: 45, timedOut: false, stderr: "", stdout: "" };
-          if (request.args[1]?.includes("base64")) return { exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify({
-            ...identity, lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null, warmTransition: null,
-          })).toString("base64") };
+          if (request.args[1]?.includes("base64")) return { exitCode: 0, timedOut: false, stderr: "", stdout: Buffer.from(JSON.stringify(settledState)).toString("base64") };
           return recoveryExecute(request);
         });
         const settledTarget = { ...(recoveryInput.runnerExecutionTarget as unknown as Record<string, unknown>),
-          runner: { execute: settledExecute, syncIn: vi.fn(async () => undefined), syncOut: vi.fn(async () => undefined) } };
+          runner: { execute: settledExecute, syncIn: vi.fn(async () => undefined), syncOut: syncOutFromRemoteFiles(settledStateFiles) } };
         await createRunnerdBackend({ ...recoveryInput, runnerExecutionTarget: settledTarget as never,
           controllerPersistence: { bootId: "replacement-controller", runnerArtifact: artifact } });
         state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
@@ -3691,7 +3722,7 @@ describe("remote provider pack manifest", () => {
             : settledExecute(request));
           await createRunnerdBackend({ ...recoveryInput,
             runnerExecutionTarget: { ...settledTarget, runner: { execute: artifactExecute,
-              syncIn: vi.fn(async () => undefined), syncOut: vi.fn(async () => undefined) } } as never,
+              syncIn: vi.fn(async () => undefined), syncOut: syncOutFromRemoteFiles(settledStateFiles) } } as never,
             controllerPersistence: { bootId: "replacement-controller", runnerArtifact: artifact },
             providerPackAdmissionSource: { runId: remoteExecution.binding.runId, receipt: null, state: null, artifacts: artifactReceipt } });
           state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
