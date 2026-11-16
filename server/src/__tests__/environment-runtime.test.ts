@@ -73,6 +73,7 @@ import { ROOT_CONTEXT, trace } from "@opentelemetry/api";
 import { buildNativeHarnessBackupManifest } from "../services/native-runtime/native-session-executor.ts";
 import { createNativeHarnessBackupStamp } from "../services/native-runtime/native-harness-backup-stamp.ts";
 import { retiredSourceAuthorizesNativeBackupRestore } from "../services/native-runtime/native-retired-backup-source.ts";
+import { retiredReusableLeasePredecessors } from "../services/environment-lease-handoff.ts";
 import { environmentRunOrchestrator } from "../services/environment-run-orchestrator.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
 import { NATIVE_PREPARATION_FENCING_VERSION } from "../services/native-runtime/native-active-runs.js";
@@ -5122,7 +5123,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // stamped L1. The recall's obsolete cleanup must read the newest stamp on the
   // lease CHAIN for that box (native-retired-backup-source's rule), and the
   // writer must stamp the chain tip. Keep: place-losing custody bug.
-  it.each(["kept", "writer stamps tip", "other box stamp", "other company stamp", "later provider work", "no stamp"] as const)(
+  it.each(["kept", "writer stamps tip", "other box stamp", "other company stamp", "later provider work", "no stamp", "irregular chain"] as const)(
     "stamp chain: obsolete cleanup reads the newest stamp across a resumed lease chain: %s", async scenario => {
     const pluginId = randomUUID();
     const providerConfig = { provider: "fake-plugin", from: "snapshot-a", cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
@@ -5224,6 +5225,18 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         createdAt: new Date(Date.parse(stamp.completedAt) + (scenario === "later provider work" ? 1000 : -1000)) });
       await runtimeWithPlugin.releaseRunLeases(refreshRunId);
       await settle(refreshRunId);
+      if (scenario === "irregular chain") {
+        const predecessor = (await environmentService(db).getLeaseById(admitted.lease.id))!;
+        const tip = (await environmentService(db).getLeaseById(resumed.lease.id))!;
+        expect(predecessor.metadata?.nativeHarnessBackup).toEqual(stamp);
+        expect(tip.metadata?.nativeHarnessBackup).toBeUndefined();
+        expect(retiredReusableLeasePredecessors(tip, [predecessor])).not.toBeNull();
+        // An older row on this same box has a failed cleanup: the handoff
+        // receipts still exist, but the restore proof must reject the chain.
+        const [failedPredecessor] = await db.update(environmentLeases).set({ cleanupStatus: "failed" })
+          .where(eq(environmentLeases.id, predecessor.id)).returning();
+        expect(retiredReusableLeasePredecessors(tip, [failedPredecessor!])).toBeNull();
+      }
 
       // The recall: a fingerprint-changing acquisition runs obsolete cleanup on L2.
       const changed = { ...environment, config: { ...providerConfig, region: "us" } };
@@ -5245,6 +5258,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
         expect(calls).not.toContain("environmentDestroyLease");
         expect(l2?.failureReason).not.toBe("lease_fingerprint_mismatch");
         expect(l2?.status).not.toBe("expired");
+        if (scenario === "irregular chain") {
+          // The safety floor is stop-and-keep, never destroyed-then-fresh.
+          await expect(retiredSourceAuthorizesNativeBackupRestore(db, { companyId, currentRunId: recallRunId, normalizedSessionId,
+            manifest: { sourceProviderLeaseId: providerLeaseId, runnerInstanceId, normalizedSessionId },
+            manifestSha256: stamp.manifestSha256, targetProviderLeaseId: recall.lease.providerLeaseId })).resolves.toBe(false);
+        }
       }
     } finally {
       if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
