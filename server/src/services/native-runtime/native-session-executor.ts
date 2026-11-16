@@ -9467,9 +9467,10 @@ export function nativeSessionFailureSourceCode(
       return "native_provider_model_rejected";
     // The event stream closed because the runner process itself exited. The
     // runner transport names that cause first in the closed-stream message; it
-    // is runner loss, not a provider verdict on its session.
+    // is runner loss, not a provider verdict on its session. A warm owner's
+    // runner that exits between two turns of one run is the same loss (#20825).
     if (error.providerCode === "notification_transport_failed"
-      && /^Notification transport failed closed: native_runner_process_exited: /.test(error.message))
+      && /^Notification transport failed closed: native_runner_(?:process|idle_warm_owner)_exited: /.test(error.message))
       return "native_runner_process_exited";
     return "native_provider_terminal_failed";
   }
@@ -9537,7 +9538,7 @@ export function nativeSessionFailureSourceCode(
     return "native_event_replay_conflict";
   }
   if (
-    /native_runner_process_exited|runnerd exited|runner process failed/i.test(
+    /native_runner_process_exited|native_runner_idle_warm_owner_exited|runnerd exited|runner process failed/i.test(
       message,
     )
   ) {
