@@ -17,7 +17,7 @@ import { mkdtemp, realpath, rm, access, readFile, writeFile, stat } from "node:f
 import os from "node:os";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
-import { createDb, type Db, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
+import { createDb, type Db, activityLog, companies, agents, agentTaskSessions, heartbeatRuns, companyMemberships, connectionGrants, toolApplications, connectionGrantDelegations, connectionGrantMembers, toolConnections, toolConnectionInstalls, aiConnectionDefaults, aiProviderDefaults, adapterAuthSessions, environments, plugins, issues, issueThreadInteractions, issueRecoveryActions, connectionIntentDeliveries, agentWakeupRequests, companySecrets, companySecretVersions, userSecretDefinitions, principalPermissionGrants } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "@paperclipai/db/test-embedded-postgres";
 import { fetchCompanyQuotaWindows } from "../services/quota-windows.js";
 import { quotaCredentialRecoveryPath, quotaCredentialRecovery, quotaCredentialHash } from "../services/quota-credential-recovery.js";
@@ -564,6 +564,47 @@ describe("managed AI connections", () => {
       expect(cleanup).toHaveBeenCalledOnce();
       await expect(service.runtimeCredential(row)).resolves.toBe(auth);
     } finally { retired.resolve(); await reconcileRetainedAiCleanup(scope).catch(() => {}); }
+  });
+
+  it("answers a successful probe while per-probe retirement finishes and records retained custody failures", async () => {
+    const owner = "pi-probe-retirement-answer";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await service.save(companyId, owner, { provider: "anthropic", method: "api_key", ownership: "personal", name: owner, apiKey: "fixture", loginSessionId: "fixture", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "messages", auth: "bearer", baseUrl: "https://gateway.example/v1", models: [] } }, "fixture-native-pi-key");
+    const probeInput = { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "anthropic", method: "api_key", mode: "delegated", ...account } as const, config: { provider: "pi_rpc", model: "paperclip/faux" } };
+    const retirement = Promise.withResolvers<void>();
+    void retirement.promise.catch(() => {});
+    const retried = vi.fn(async () => { throw new Error("fixture retirement remains unconfirmed"); });
+    let retainedHome: string | undefined;
+    const probe = vi.fn(async runtime => {
+      retainedHome = runtime.home;
+      await fs.mkdir(path.join(runtime.home!, "pi"), { mode: 0o700 });
+      await writeFile(path.join(runtime.home!, "pi", "history.jsonl"), "raw native Pi history\n", { mode: 0o600 });
+      await writeFile(path.join(runtime.home!, "pi", "provider-trace.jsonl"), "raw provider trace\n", { mode: 0o600 });
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")], retried);
+      Object.assign(error, { probeSuccessResult: "hello-verified" });
+      throw error;
+    });
+
+    try {
+      await expect(withManagedAiProbe(db, probeInput, probe)).resolves.toBe("hello-verified");
+      expect(await readFile(path.join(retainedHome!, "pi", "history.jsonl"), "utf8")).toBe("raw native Pi history\n");
+      expect(await readFile(path.join(retainedHome!, "pi", "provider-trace.jsonl"), "utf8")).toBe("raw provider trace\n");
+      await expect(withManagedAiProbe(db, probeInput, async () => "second-hire")).resolves.toBe("second-hire");
+      retirement.reject(new Error("fixture owner remains live"));
+      await vi.waitFor(async () => {
+        const record = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, agentId), eq(activityLog.action, "agent.native_probe_retirement")));
+        expect(record.some(row => (row.details as Record<string, unknown> | null)?.outcome === "retained")).toBe(true);
+      }, { timeout: 2_000 });
+      expect(retried).toHaveBeenCalled();
+      expect(await readFile(path.join(retainedHome!, "pi", "history.jsonl"), "utf8")).toBe("raw native Pi history\n");
+      expect(await readFile(path.join(retainedHome!, "pi", "provider-trace.jsonl"), "utf8")).toBe("raw provider trace\n");
+    } finally {
+      retirement.reject(new Error("fixture teardown"));
+      await reconcileRetainedAiCleanup({ companyId, accountKey: account.grantId }).catch(() => {});
+      if (retainedHome) await rm(retainedHome, { recursive: true, force: true });
+    }
   });
 
   it("allows the same account to run while retired Codex probe cleanup is pending or fails", async () => {
