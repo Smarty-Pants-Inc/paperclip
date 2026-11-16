@@ -87,6 +87,33 @@ describe("native session state syncOut", () => {
     expect(existsSync(dir)).toBe(false);
   });
 
+  it("preserves the configured missing-state exit when syncOut reports an absent source", async () => {
+    const execute = vi.fn(async ({ args }: { args?: string[] }) => args?.[1]?.includes("> /dev/null")
+      ? { exitCode: 66, timedOut: false, stdout: "", stderr: "" }
+      : { exitCode: 0, timedOut: false, stdout: "", stderr: "" });
+    const runner = { execute, syncOut: vi.fn(async () => { throw Object.assign(new Error("ENOENT: remote state file"), { code: "ENOENT" }); }) };
+    const failure = await readRemoteRunnerStateFile({ runner: runner as never, remotePath: "/private/runner-state.json" })
+      .then(() => null, error => error as Error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure?.message).toMatch(/^runner_remote_state_unavailable: exit=66 timedOut=false(?:\s|$)/);
+    expect(failure).toMatchObject({ exitCode: 66, timedOut: false });
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(execute.mock.calls[1]?.[0].args?.[1]).toContain("base64 < '/private/runner-state.json' > /dev/null");
+  });
+
+  it("preserves the unreadable-state exit and diagnostic after syncOut fails", async () => {
+    const execute = vi.fn(async ({ args }: { args?: string[] }) => args?.[1]?.includes("> /dev/null")
+      ? { exitCode: 1, timedOut: false, stdout: "", stderr: "base64: /private/runner-state.json: Permission denied" }
+      : { exitCode: 0, timedOut: false, stdout: "", stderr: "" });
+    const runner = { execute, syncOut: vi.fn(async () => { throw new Error("Kubernetes syncOut failed: source could not be read"); }) };
+    const failure = await readRemoteRunnerStateFile({ runner: runner as never, remotePath: "/private/runner-state.json" })
+      .then(() => null, error => error as Error);
+    expect(failure).toBeInstanceOf(Error);
+    expect(failure?.message).toMatch(/^runner_remote_state_unavailable: exit=1 timedOut=false base64: \/private\/runner-state\.json: Permission denied$/);
+    expect(failure).toMatchObject({ exitCode: 1, timedOut: false });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
   it("preserves provider-state transport failures from the active read transport", async () => {
     const failure = Object.assign(new Error("Daytona syncOut file download failed: socket hang up"), { code: "ECONNRESET" });
     const runner = {
