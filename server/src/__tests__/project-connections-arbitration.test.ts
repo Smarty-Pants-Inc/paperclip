@@ -31,7 +31,7 @@ describe("project connection PostgreSQL uniqueness and EXCLUSIVE (round-4 A)", (
     const f = await projectConnectionFixture(db);
     await f.seedConnection(f.a, { exclusive: true });
     const proposed = f.input(f.b);
-    proposed.config = { ...f.config(f.b), methodConfig: { ...f.config(f.b).methodConfig, appId: "Iv1ProjectClient1234" } };
+    proposed.config = { ...proposed.config, methodConfig: { ...f.config(f.b).methodConfig, appId: "Iv1ProjectClient1234" } };
     await expect(f.service.createConnection(f.companyId, proposed, f.actor()))
       .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
   });

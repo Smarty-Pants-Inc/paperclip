@@ -17,7 +17,7 @@ import { ensureHumanRoleDefaultGrants } from "../../services/principal-access-co
 
 // Type-only forward contract: BASE deliberately has no projectId in these types.
 // No missing runtime module, fake implementation, or test-only database DDL.
-export type OwnedConnectionInput = CreateToolConnection & { projectId: string | null };
+export type OwnedConnectionInput = CreateToolConnection & { projectId: string | null; exclusive?: boolean };
 export type OwnedConnectionRow = typeof toolConnections.$inferInsert & { projectId: string | null };
 export const INSTALLATION = "github.com/github-app-installation/456";
 export const CANARY = "synthetic-project-key-never-return-this";
@@ -65,13 +65,19 @@ export async function projectConnectionFixture(db: Db, sharedLead = false) {
     { type: "agent", companyId, agentId, source: "agent_key", onBehalfOfUserId: human },
     "connections:configure", { type: "connection_management", companyId, connectionId, operation: "PATCH /tool-connections/:connectionId" },
   );
-  const input = (project = a, overrides: Partial<OwnedConnectionInput> = {}): OwnedConnectionInput => ({
-    projectId: project.id, name: `Project ${project.name} ${randomUUID()}`, transport: "rest_api",
-    connectionPurpose: "tool", ownership: "customer", connectionKind: "managed", authKind: "none",
-    status: "draft", enabled: false, credentialPolicy: "shared", config: config(project),
-    credentialSecretRefs: [{ secretId: secret!.id, configPath: "credentials.privateKey", versionSelector: "latest", required: true }],
-    ...overrides,
-  });
+  const input = (project = a, overrides: Partial<OwnedConnectionInput> = {}): OwnedConnectionInput => {
+    const { projectScope, ...proposedConfig } = overrides.config ?? config(project);
+    // A create asks for a mode; it never submits the saved approval envelope.
+    // Only the seeded server-owned rows above/below carry projectScope.
+    const requestedExclusive = (projectScope as { exclusive?: boolean } | undefined)?.exclusive === true;
+    return {
+      projectId: project.id, name: `Project ${project.name} ${randomUUID()}`, transport: "rest_api",
+      connectionPurpose: "tool", ownership: "customer", connectionKind: "managed", authKind: "none",
+      status: "draft", enabled: false, credentialPolicy: "shared",
+      credentialSecretRefs: [{ secretId: secret!.id, configPath: "credentials.privateKey", versionSelector: "latest", required: true }],
+      ...overrides, config: proposedConfig, ...(requestedExclusive ? { exclusive: true } : {}),
+    };
+  };
   const seedConnection = async (project: typeof a | null = a, options: { exclusive?: boolean; status?: "draft" | "active" | "disabled" | "archived"; installed?: boolean; pending?: boolean; legacyId?: string; installationKey?: string } = {}) => {
     const [app] = await db.insert(toolApplications).values({ companyId, name: randomUUID(), type: "rest_api" }).returning();
     const c = config(project ?? a, options.exclusive);
