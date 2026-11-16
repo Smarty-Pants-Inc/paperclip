@@ -3499,6 +3499,7 @@ export function heartbeatService(
           issue: issueRef, target: executionTarget, workspaceId: persistedExecutionWorkspace?.id ?? null,
         });
         const githubEnvironment = await timePreparation("github_environment", () => prepareHeartbeatGitHubEnvironment({
+          runId: run.id,
           defer: !useAgentGitHubEnv && nativeRuntimeResolution.kind === "native" && nativeRuntimeResolution.profile.backend === "pi_rpc",
           target: executionTarget, cwd: executionWorkspace.cwd,
           env: Object.fromEntries(Object.entries(parseObject(runtimeConfig.env)).filter(
