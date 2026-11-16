@@ -4,7 +4,7 @@ import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { registerIdleLocalWorkProbe } from "./idle-local-work.js";
 import { RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
-import { summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
+import { boundDiagnosticFields, summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
 
 export type RetainedAiCleanupScope = { companyId: string; accountKey: string };
 export function retainedAiAccountKeyHash(accountKey: string): string {
@@ -91,8 +91,11 @@ export function retainAiCredentialCleanup(input: {
   }, (reason: unknown) => {
     entry.retired = "failed"; warn(entry, "retirement_rejected");
     // DIAGNOSTIC (log only): why retirement rejected, as a sanitized summary.
-    try { logger.info({ event: "native_retirement_rejected_detail", companyId: entry.scope.companyId, ...(entry.agentId ? { agentId: entry.agentId } : {}),
-      error: summarizeDiagnosticError(reason) }, "Retained AI credential retirement rejected"); } catch { /* log only */ }
+    try {
+      const message = "Retained AI credential retirement rejected";
+      logger.info(boundDiagnosticFields({ event: "native_retirement_rejected_detail", companyId: entry.scope.companyId, ...(entry.agentId ? { agentId: entry.agentId } : {}),
+        error: summarizeDiagnosticError(reason) }, message), message);
+    } catch { /* log only */ }
   });
 }
 

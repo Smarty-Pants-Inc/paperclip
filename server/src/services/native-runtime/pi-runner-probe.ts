@@ -8,7 +8,7 @@ import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileEr
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { cachedFileSha256 } from "./off-loop-file-work.js";
 import { logger } from "../../middleware/logger.js";
-import { summarizeDiagnosticError } from "./diagnostic-error-summary.js";
+import { boundDiagnosticFields, summarizeDiagnosticError } from "./diagnostic-error-summary.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 
@@ -24,6 +24,34 @@ const PROBE_STATIC_MANIFEST_SCRIPT = 'set -eu; root=$1; shift; cd -- "$root"; '
   + '{ for entry in "$@"; do if [ -e "$entry" ]; then find "$entry" -type f; fi; done; } | '
   + '{ n=0; while IFS= read -r f; do size=$(wc -c < "$f"); sha=$(sha256sum "$f"); '
   + 'printf "%s %s %s\\n" "$(echo $size)" "${sha%% *}" "$f"; n=$((n+1)); done; printf "count %s\\n" "$n"; }';
+
+/** The literal step names the native transport's probe cleanup passes to
+ * observeProbeCleanupStep (runnerd-codex-transport.ts). The cleanup-step log
+ * line carries only one of these, or "other"; never the forwarded text. */
+export type NativeProbeCleanupStep =
+  | "joining native Pi retirement"
+  | "confirming credential handoff"
+  | "joining original probe operations"
+  | "confirming physical retirement"
+  | "releasing original probe authority";
+const NATIVE_PROBE_CLEANUP_STEPS: ReadonlySet<string> = new Set<NativeProbeCleanupStep>([
+  "joining native Pi retirement", "confirming credential handoff", "joining original probe operations",
+  "confirming physical retirement", "releasing original probe authority",
+]);
+const CLEANUP_STEP_PREFIX = "Native probe cleanup step failed: ";
+const CLEANUP_STEP_LINE = /^Native probe cleanup step failed: ([A-Za-z ]{1,64}); elapsedMs=(\d{1,12}); pass=(teardown_pass|retained_retry)$/;
+
+/** DIAGNOSTIC (log only): reduce a transport diagnostic to the closed
+ * cleanup-step fields, or null when it is not a cleanup-step line. The text is
+ * matched against the fixed template; nothing from it is logged except a step
+ * name from the closed set, the pass and the elapsed milliseconds. */
+export function nativeProbeCleanupStepFields(message: unknown):
+  { step: NativeProbeCleanupStep | "other"; pass: "teardown_pass" | "retained_retry" | "other"; elapsedMs: number | null } | null {
+  if (typeof message !== "string" || !message.startsWith(CLEANUP_STEP_PREFIX)) return null;
+  const match = message.length <= 256 ? CLEANUP_STEP_LINE.exec(message) : null;
+  if (!match || !NATIVE_PROBE_CLEANUP_STEPS.has(match[1]!)) return { step: "other", pass: "other", elapsedMs: null };
+  return { step: match[1] as NativeProbeCleanupStep, pass: match[3] as "teardown_pass" | "retained_retry", elapsedMs: Number(match[2]) };
+}
 
 export type ProbeStaticManifest = { files: { size: number; sha256: string; path: string }[] };
 
@@ -171,7 +199,10 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
             throw error;
           } finally {
             timing.totalMs = Date.now() - started;
-            try { logger.info(timing, "Native setup probe cleanup timing"); } catch { /* Diagnostics must not change cleanup. */ }
+            try {
+              const message = "Native setup probe cleanup timing";
+              logger.info(boundDiagnosticFields(timing, message), message);
+            } catch { /* Diagnostics must not change cleanup. */ }
           }
         }
         await cleanupNativeSetupRuntime(runtimeDirectory, true);
@@ -196,10 +227,16 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           transportOptions: { ...executionDriver, runnerProcessLauncher, runnerBinary, runnerFilesystemRoot: remoteFilesystemRoot,
             ...nativePiRemoteLaunchOptions(pack.root, source.manifest, remoteRoot), piRpcThinkingLevel,
             externallySandboxed: target!.transport === "sandbox",
-            // DIAGNOSTIC (log only): forward only the fixed-format cleanup step lines.
+            // DIAGNOSTIC (log only): of the cleanup step lines, only the closed step
+            // name, the pass and the elapsed ms are logged; never the forwarded
+            // text (a transport diagnostic can carry step error text or stderr).
             onDiagnostic: (message: string) => {
-              if (!message.startsWith("Native probe cleanup step failed: ")) return;
-              try { logger.warn({ event: "native_probe_cleanup_step", runId: id, admissionOnly }, message); } catch { /* log only */ }
+              try {
+                const step = nativeProbeCleanupStepFields(message);
+                if (!step) return;
+                const line = "Native probe cleanup step failed";
+                logger.warn(boundDiagnosticFields({ event: "native_probe_cleanup_step", runId: id, admissionOnly, ...step }, line), line);
+              } catch { /* log only */ }
             },
             prpIdentity: { runnerInstanceId, runId: id, normalizedSessionId: id,
               environmentLeaseId: target!.transport === "sandbox" && target!.leaseId ? target!.leaseId : id, turnId: `turn-${id}`, itemId: `item-${id}` } },
