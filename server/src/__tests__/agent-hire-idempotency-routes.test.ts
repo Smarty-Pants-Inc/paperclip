@@ -235,4 +235,58 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
     expect(secondRunHire.body.idempotent).toBeUndefined();
     expect(secondRunHire.body.agent?.name).toBe("Sam 2");
   });
+
+  it("creates ten agents concurrently with membership and tasks:assign in five trials", async () => {
+    const trials: Array<{ statuses: number[]; errors: unknown[] }> = [];
+
+    for (let trial = 0; trial < 5; trial += 1) {
+      const { company, hiringAgent, run } = await seedHiringFixture(db);
+      await db.insert(companyMemberships).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: hiringAgent.id,
+        membershipRole: "member",
+        status: "active",
+      });
+      await db.insert(principalPermissionGrants).values({
+        companyId: company.id,
+        principalType: "agent",
+        principalId: hiringAgent.id,
+        permissionKey: "agents:create",
+      });
+      const app = createApp(db, agentActor(company.id, hiringAgent.id, run.id));
+      const responses = await Promise.all(Array.from({ length: 10 }, (_, index) =>
+        request(app).post(`/api/companies/${company.id}/agents`).send({
+          name: `Concurrent hire ${trial}-${index}`,
+          role: "engineer",
+          reportsTo: hiringAgent.id,
+          adapterType: "process",
+          adapterConfig: {},
+          runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
+        }).then(response => response, error => ({ status: 0, body: { error: String(error) } })),
+      ));
+      const statuses = responses.map(response => response.status);
+      const errors = responses.filter(response => response.status !== 201).map(response => response.body);
+      trials.push({ statuses, errors });
+      console.info(`[concurrent-agent-create] ${JSON.stringify({ trial: trial + 1, companyId: company.id, statuses, errors })}`);
+
+      expect(statuses, JSON.stringify({ trial: trial + 1, errors })).toEqual(Array(10).fill(201));
+      const created = responses.map(response => response.body.id as string);
+      for (const agentId of created) {
+        expect(await db.select().from(companyMemberships).where(and(
+          eq(companyMemberships.companyId, company.id),
+          eq(companyMemberships.principalType, "agent"),
+          eq(companyMemberships.principalId, agentId),
+        ))).toHaveLength(1);
+        expect(await db.select().from(principalPermissionGrants).where(and(
+          eq(principalPermissionGrants.companyId, company.id),
+          eq(principalPermissionGrants.principalType, "agent"),
+          eq(principalPermissionGrants.principalId, agentId),
+          eq(principalPermissionGrants.permissionKey, "tasks:assign"),
+        ))).toHaveLength(1);
+      }
+    }
+
+    expect(trials).toHaveLength(5);
+  });
 });
