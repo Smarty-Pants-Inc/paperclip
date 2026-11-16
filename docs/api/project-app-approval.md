@@ -30,6 +30,8 @@ Requirements:
 - A present trusted browser Origin. A foreign Origin is not rescued by Referer.
 - Company access and the current `companies.defaultResponsibleUserId` user,
   with an active owner/admin membership. Another administrator cannot approve.
+  H is **one human per company**, approving every project's App. A per-project
+  designee is a known future extension, not current behavior.
 - An active project and an unowned shared GitHub App source TOOL connection in
   that company, with its exact company-vault private-key reference and one active
   organization grant. Draft source connections are permitted.
@@ -80,8 +82,10 @@ creates the organization grant and ordinary take activity atomically. The
 approved lead finishes that saved candidate through the existing finish route.
 The gallery's raw-key form is not a reference-only project create surface.
 
-One internal fact-only reader checks the saved source at first bind, finish,
-management/re-scope admission and credential release. Changing H, revoking or
+Only project-owned connections (`projectId` non-null) require this receipt:
+one internal fact-only reader checks the saved source at first bind, finish,
+management/re-scope admission and credential release. Agent, personal, shared
+and delegated non-project connections do not require a project approval. Changing H, revoking or
 archiving the source, disabling its organization grant, changing the tuple or
 losing classification refuses the old receipt. A new H must approve again;
 old primary/lead scope is not silently rewritten. Board-human removal authority
@@ -102,6 +106,14 @@ and ordinary/non-project App connection creation. Native row-12 config
 replacement is session-only when it writes, preserves or removes `managerAppId`
 or the key anchor field; board keys cannot change or erase the classification.
 
+An instance/company with no C4 manager configuration and no retained W1 manager
+key/anchor has no manager App to exclude: ordinary non-project App setup and
+credential release retain their existing behavior. A configured but unreadable,
+malformed, disabled or incomplete manager classification fails closed on every
+path, including non-project paths. Removing C4 config while retaining W1 custody
+does not turn that state into “not configured.” Project approval/first binding
+still requires ready C4/W1 custody; absence never substitutes for a receipt.
+
 ## Named failures
 
 | Code | HTTP | Meaning |
@@ -112,7 +124,7 @@ or the key anchor field; board keys cannot change or erase the classification.
 | `project_app_receipt_protected` | 403 | Generic writer attempted a protected field write/erase |
 | `project_app_approval_required` | 403 | Missing/revoked/mismatched/old-H receipt |
 | `project_app_manager_forbidden` | 403 | Manager reference or canonical App identity |
-| `project_app_manager_classification_unavailable` | 403 | Trusted native classification missing/ineligible |
+| `project_app_manager_classification_unavailable` | 403 | Configured native classification unreadable/ineligible, or required project C4/W1 custody missing |
 | `project_app_manager_config_session_required` | 403 | Board-key manager config replacement |
 | `project_app_approval_state_changed` | 409 | Source/authority/key changed during verification or a wait |
 | `project_app_verification_unavailable` | 503 | Provider verification unavailable; no project credential released |

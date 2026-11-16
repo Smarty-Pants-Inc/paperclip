@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql, type SQLWrapper } from "drizzle-orm";
 import {
   companies, companyMemberships, companySecrets, connectionGrants, pluginCompanySettings, pluginConfig, plugins,
   projects, toolConnections, userCompanyPreferences, type Db,
@@ -35,15 +35,42 @@ const managerUnavailable = () => forbidden("The session-configured manager App c
 const managerForbidden = () => forbidden("The manager App and its private-key reference cannot serve a project or agent.", { code: "project_app_manager_forbidden" });
 const sorted = (ids: readonly number[]) => [...ids].sort((a, b) => a - b);
 
+/** A value-free presence fact selected with the current connection snapshot.
+ * Ordinary credential reads need no separate classifier query when this company
+ * has no C4/W1 state. Retained anchors/keys count even if config was removed. */
+export function projectAppManagerConfigured(companyId: string | SQLWrapper) {
+  return sql<boolean>`exists (
+    select 1 from ${plugins} where ${plugins.pluginKey} = ${ROW12_INSTALLER_PLUGIN_KEY}
+      and (exists (select 1 from ${pluginConfig} where ${pluginConfig.pluginId} = ${plugins.id} and ${pluginConfig.companyId} = ${companyId})
+        or exists (select 1 from ${companySecrets} where ${companySecrets.ownerPluginId} = ${plugins.id} and ${companySecrets.companyId} = ${companyId}
+          and ${companySecrets.scope} = 'instance' and ${companySecrets.key} = 'manager_private_key')
+        or exists (select 1 from ${projects} where ${projects.companyId} = ${companyId} and ${projects.name} = 'github-manager-key'))
+  )`;
+}
+
 /** Classification reads only existing native C4 config and W1 ownership metadata.
- * Missing config is not an empty deny-list. Never read the manager PEM. */
+ * Null means this company has never configured a manager, not an unreadable
+ * configured deny-list. Retained C4/W1 state always fails closed if incomplete.
+ * Never read the manager PEM. */
 export async function readProjectAppManager(db: Database, companyId: string) {
   const [plugin] = await db.select().from(plugins).where(eq(plugins.pluginKey, ROW12_INSTALLER_PLUGIN_KEY)).for("share");
-  const manifestKeys = z.object({ instanceSecretKeys: z.array(z.string()) }).safeParse(plugin?.manifestJson);
-  if (!plugin || plugin.status !== "ready" || !plugin.manifestJson.capabilities?.includes("projects.instance-secrets")
+  if (!plugin) return null;
+  const [config] = await db.select().from(pluginConfig).where(and(eq(pluginConfig.companyId, companyId), eq(pluginConfig.pluginId, plugin.id))).for("share");
+  if (!config) {
+    // A removed config must not turn an existing W1 manager into an ordinary
+    // App. Include inactive/deleted metadata: corruption is not deconfiguration.
+    const [key] = await db.select({ id: companySecrets.id }).from(companySecrets).where(and(
+      eq(companySecrets.companyId, companyId), eq(companySecrets.ownerPluginId, plugin.id),
+      eq(companySecrets.scope, "instance"), eq(companySecrets.key, "manager_private_key"),
+    ));
+    const [anchor] = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.companyId, companyId), eq(projects.name, "github-manager-key")));
+    if (key || anchor) throw managerUnavailable();
+    return null;
+  }
+  const manifestKeys = z.object({ instanceSecretKeys: z.array(z.string()) }).safeParse(plugin.manifestJson);
+  if (plugin.status !== "ready" || !plugin.manifestJson?.capabilities?.includes("projects.instance-secrets")
     || !manifestKeys.success || !manifestKeys.data.instanceSecretKeys.includes("manager_private_key")) throw managerUnavailable();
   const [settings] = await db.select().from(pluginCompanySettings).where(and(eq(pluginCompanySettings.companyId, companyId), eq(pluginCompanySettings.pluginId, plugin.id)));
-  const [config] = await db.select().from(pluginConfig).where(and(eq(pluginConfig.companyId, companyId), eq(pluginConfig.pluginId, plugin.id))).for("share");
   const id = positiveId.safeParse(config?.configJson.managerAppId);
   const anchorId = z.string().uuid().safeParse(config?.configJson.managerKeyAnchorProjectId);
   if (settings?.enabled === false || !id.success || !anchorId.success) throw managerUnavailable();
@@ -57,8 +84,12 @@ export async function readProjectAppManager(db: Database, companyId: string) {
   return { appId: id.data, secretId: keys[0]!.id, anchorProjectId: anchor.id, pluginId: plugin.id };
 }
 
-export async function assertNotManagerApp(db: Database, input: { companyId: string; refs?: readonly Ref[]; appId?: string; verifiedAppId?: string }) {
+export async function assertNotManagerApp(db: Database, input: { companyId: string; refs?: readonly Ref[]; appId?: string; verifiedAppId?: string; requireConfigured?: boolean }) {
   const manager = await readProjectAppManager(db, input.companyId);
+  if (!manager) {
+    if (input.requireConfigured) throw managerUnavailable();
+    return null;
+  }
   if (input.refs?.some(ref => ref.secretId === manager.secretId) || input.appId === manager.appId || input.verifiedAppId === manager.appId) throw managerForbidden();
   return manager;
 }
@@ -97,7 +128,7 @@ export async function readProjectAppCustody(db: Database, input: {
   registrationId?: string; repositoryIds: readonly number[];
 }): Promise<Readonly<{ sourceConnectionId: string; receipt: ProjectAppApproval }>> {
   const app = parseGitHubAppConfig(input.config.methodConfig);
-  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId, verifiedAppId: input.registrationId });
+  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId, verifiedAppId: input.registrationId, requireConfigured: true });
   const [company] = await db.select().from(companies).where(eq(companies.id, input.companyId)).for("share");
   const sourceId = input.config[PROJECT_APP_APPROVAL_SOURCE];
   if (sourceId !== undefined && !z.string().uuid().safeParse(sourceId).success) throw unavailable();
@@ -140,7 +171,7 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
   if (!source || source.projectId !== null || !isGitHubAppConnection(source) || ["archived", "disabled"].includes(source.status)
     || source.credentialPolicy !== "shared" || source.credentialSource !== "paperclip_vault" || source.credentialSecretRefs.length !== 1) throw notFound("Project App source connection not found");
   const config = parseGitHubAppConfig(source.config.methodConfig);
-  const manager = await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId });
+  const manager = await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, requireConfigured: true });
   const grants = await db.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.connectionId, source.id)));
   const grant = grants[0]; const ref = source.credentialSecretRefs[0]!;
   if (grants.length !== 1 || !grant || grant.kind !== "organization" || grant.status !== "active" || ref.configPath !== "credentials.privateKey"
@@ -157,7 +188,7 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
     return db.transaction(async tx => {
       await responsibleHuman(tx, input.companyId, input.userId, true);
       const [current] = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id))).for("update");
-      await assertNotManagerApp(tx, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, verifiedAppId: saved.data.appId });
+      await assertNotManagerApp(tx, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, verifiedAppId: saved.data.appId, requireConfigured: true });
       if (!current || current.status !== source.status || !isDeepStrictEqual(current.config, source.config) || !isDeepStrictEqual(current.credentialSecretRefs, source.credentialSecretRefs)) {
         throw conflict("The project App changed during replay", { code: "project_app_approval_state_changed" });
       }
@@ -170,7 +201,7 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
     let result;
     try { result = await approvalClient.acquire(`${input.companyId}:${source.id}:approval:${secret.latestVersion}`, config, secret.value, true); }
     catch { throw new HttpError(503, "GitHub could not verify the project App approval. Retry after provider recovery.", { code: "project_app_verification_unavailable" }); }
-    await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, verifiedAppId: result.verifiedRegistrationId });
+    await assertNotManagerApp(db, { companyId: input.companyId, refs: source.credentialSecretRefs, verifiedAppId: result.verifiedRegistrationId, requireConfigured: true });
     proposed = receiptSchema.parse({ version: 1, id: randomUUID(), companyId: input.companyId, humanUserId: input.userId, projectId: input.projectId,
       appId: result.verifiedRegistrationId, installationId: config.installationId, repositoryIds: sorted((result.github.repositories ?? []).map(repo => Number(repo.id))),
       secretRef: { secretId: ref.secretId, configPath: ref.configPath }, verifiedAt: new Date(Date.now()).toISOString(), revokedAt: null });
@@ -181,7 +212,7 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
     const [currentProject] = await tx.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId))).for("share");
     const [currentGrant] = await tx.select().from(connectionGrants).where(and(eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.id, grant.id))).for("share");
     const currentKey = await validateConnectionGrantSecretOwnership(tx, source, grant, ref);
-    const currentManager = await assertNotManagerApp(tx, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, verifiedAppId: proposed?.appId });
+    const currentManager = await assertNotManagerApp(tx, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, verifiedAppId: proposed?.appId, requireConfigured: true });
     if (!current || !currentProject || currentProject.archivedAt || !currentGrant || currentGrant.status !== "active"
       || !isDeepStrictEqual(currentGrant.credentialSecretRefs, grant.credentialSecretRefs)
       || !isDeepStrictEqual(currentManager, manager) || currentKey.latestVersion !== keyState.latestVersion || currentKey.status !== "active" || currentKey.deletedAt
@@ -221,13 +252,13 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
 /** Verify an exact vault reference even on the ordinary create path: a Client
  * ID alias must not reserve or export the numeric manager App. Values remain
  * internal to the existing App client; only normalized provider facts leave. */
-export async function verifyGitHubAppCandidate(db: Db, input: { companyId: string; config: Record<string, unknown>; refs: readonly Ref[]; namespace: string; actorId?: string }) {
+export async function verifyGitHubAppCandidate(db: Db, input: { companyId: string; config: Record<string, unknown>; refs: readonly Ref[]; namespace: string; actorId?: string; projectId?: string }) {
   const app = parseGitHubAppConfig(input.config.methodConfig);
-  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId });
+  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId, requireConfigured: input.projectId != null });
   const ref = input.refs[0];
   if (input.refs.length !== 1 || !ref || ref.configPath !== "credentials.privateKey") throw unavailable();
   const [secret] = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId)));
-  if (!secret || secret.scope !== "company" || secret.status !== "active" || secret.deletedAt) throw unavailable();
+  if (!secret || (input.projectId != null && secret.scope !== "company") || secret.status !== "active" || secret.deletedAt) throw unavailable();
   const version = ref.versionSelector ?? "latest";
   const privateKey = await secretService(db).resolveSecretValue(input.companyId, ref.secretId, version, {
     accessContext: { actorType: "system", actorId: input.actorId, consumerType: "system", consumerId: "project-app-reference-verification" },
@@ -238,7 +269,7 @@ export async function verifyGitHubAppCandidate(db: Db, input: { companyId: strin
   if (!registrationId.success || !ids.success || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== app.installationId) throw unavailable();
   const verified: VerifiedProjectConnectionProviderScope = { identity: { companyId: input.companyId, providerHost: "github.com", verifiedRegistrationId: registrationId.data,
     canonicalInstallationKey: `github.com/github-app-installation/${app.installationId}` }, repositoryIds: sorted(ids.data), secretVersion: typeof version === "number" ? version : secret.latestVersion };
-  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, verifiedAppId: verified.identity.verifiedRegistrationId });
+  await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, verifiedAppId: verified.identity.verifiedRegistrationId, requireConfigured: input.projectId != null });
   return { verified, providerTenant: { github: result.github }, secretVersion: secret.latestVersion };
 }
 
