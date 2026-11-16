@@ -101,6 +101,49 @@ export function redactRegisteredSecretValues<T>(input: T, values: string[], cred
   ) as T;
 }
 
+type LiveRunRedactor = { values: string[] };
+type LiveRunAttachment = { redactor: WeakRef<LiveRunRedactor>; identifiers: Array<string | null | undefined> };
+// In-process only: the run's live output redactors (the heartbeat's and the
+// native control-plane port's), keyed by company and run. Plaintext stays in
+// the redactors themselves; this map holds them weakly so a finished run's
+// redactor is never kept alive here.
+const liveRunRedactors = new Map<string, Set<LiveRunAttachment>>();
+const liveRunKey = (companyId: string, runId: string) => `${companyId}:${runId}`;
+
+function liveRunAttachments(key: string) {
+  const attachments = liveRunRedactors.get(key);
+  if (!attachments) return [];
+  for (const attachment of attachments) if (!attachment.redactor.deref()) attachments.delete(attachment);
+  if (attachments.size === 0) liveRunRedactors.delete(key);
+  return [...attachments];
+}
+
+/**
+ * Let a run's live output redactor gain secrets registered for the run after it
+ * was built (a value the agent fetches mid-run). `identifiers` are the run's own
+ * ids, applied exactly as at construction. Output committed earlier is never
+ * rewritten. Returns a detach function.
+ */
+export function attachLiveRunSecretRedactor(companyId: string, runId: string, redactor: LiveRunRedactor,
+  identifiers: Iterable<string | null | undefined> = []) {
+  for (const key of [...liveRunRedactors.keys()]) liveRunAttachments(key);
+  const key = liveRunKey(companyId, runId);
+  const attachment: LiveRunAttachment = { redactor: new WeakRef(redactor), identifiers: [...identifiers] };
+  liveRunRedactors.set(key, (liveRunRedactors.get(key) ?? new Set()).add(attachment));
+  return () => {
+    liveRunRedactors.get(key)?.delete(attachment);
+    liveRunAttachments(key);
+  };
+}
+
+/** Same rules as every other run-secret index: addRunSecretMaterial. */
+function addLiveRunSecretValue(companyId: string, runId: string, value: string) {
+  for (const attachment of liveRunAttachments(liveRunKey(companyId, runId))) {
+    const redactor = attachment.redactor.deref();
+    if (redactor) addRunSecretMaterial(redactor, [value], attachment.identifiers);
+  }
+}
+
 export function createRunSecretRedactionRegistry(db: Db) {
   const provider = getSecretProvider("local_encrypted");
 
@@ -145,6 +188,9 @@ export function createRunSecretRedactionRegistry(db: Db) {
       .select(registryColumns).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId))), [companyId, runId]),
     register: async (companyId: string, runId: string, value: string) => {
+      // The run's live output redactors mask the value from now on, before the
+      // caller can hand it to the agent.
+      addLiveRunSecretValue(companyId, runId, value);
       const fingerprintSha256 = createHash("sha256").update(value).digest("hex");
       await db.transaction(async (tx) => {
         const row = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot })

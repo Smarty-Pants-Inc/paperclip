@@ -2,6 +2,7 @@ import { notifyNativeResultCommit } from "../native-result-commit-notifications.
 import { measureNativeControllerStep } from "./native-controller-step-timing.js";
 import { notifyNativeWorkspaceFinalization } from "../native-workspace-finalization-notifications.js";
 import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { attachLiveRunSecretRedactor } from "../run-secret-redaction.js";
 import { and, asc, eq, gt, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -135,9 +136,12 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertRunAdmissionActive = options.assertRunAdmissionActive ?? options.assertControllerActive;
     this.#identityRedactor = createAgentIdentityRedactor(options.privateKeyPem);
     // The run's own ids are protocol metadata, never secret text.
-    addRunSecretMaterial(this.#identityRedactor, options.runSecretMaterial ?? [], [binding.companyId, binding.issueId,
-      binding.runId, binding.agentId, binding.sessionId, binding.completionContractId, binding.sourceInstanceId,
-      binding.controlPlaneSourceInstanceId]);
+    const runIdentifiers = [binding.companyId, binding.issueId, binding.runId, binding.agentId, binding.sessionId,
+      binding.completionContractId, binding.sourceInstanceId, binding.controlPlaneSourceInstanceId];
+    addRunSecretMaterial(this.#identityRedactor, options.runSecretMaterial ?? [], runIdentifiers);
+    // A secret registered for the run later (an agent's mid-run fetch) reaches
+    // this redactor too, under the same rules; earlier events stay as committed.
+    attachLiveRunSecretRedactor(binding.companyId, binding.runId, this.#identityRedactor, runIdentifiers);
     this.#binding = structuredClone(binding);
     this.#onCommittedEvent = options.onCommittedEvent;
     this.#onEventPersistence = options.onEventPersistence;

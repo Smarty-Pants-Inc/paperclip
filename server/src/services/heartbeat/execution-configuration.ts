@@ -13,6 +13,7 @@ import { parseObject } from "../../adapters/utils.js";
 import { logger } from "../../middleware/logger.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, extractWakeCommentIds, isNonAssigneeWorkspaceBusyRetry } from "../../modules/run-dispatch/index.js";
 import { addRunSecretMaterial, createAgentIdentityRedactor } from "../agent-identity-redaction.js";
+import { attachLiveRunSecretRedactor } from "../run-secret-redaction.js";
 import { agentIdentityService, supportsManagedAgentIdentity } from "../agent-identity.js";
 import { readAiConnectionConfigurationFailure, readAiCredentialAccessFailure } from "../ai-connection-configuration-failure.js";
 import { AI_AUTH_ENV_KEYS, isAiConnectionBusy, prepareManagedAiRuntime, stripAiAuthBindings } from "../ai-connection-runtime.js";
@@ -154,6 +155,9 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   const runIdentifiers = [run.id, agent.id, agent.companyId, issueId, selectedEnvironmentId, selectedEnvironmentForConfig?.id];
   // Observability header values follow the same rules as run secrets.
   addRunSecretMaterial(identityRedactor, observabilitySecretValues(earlyObservability), runIdentifiers);
+  // A secret the agent fetches mid-run (routes/secrets.ts) reaches this live
+  // redactor through the run-secret registry, under the same rules and ids.
+  attachLiveRunSecretRedactor(agent.companyId, run.id, identityRedactor, runIdentifiers);
   onIdentityRedactorPrepared(identityRedactor);
   // The executor keeps these values in its failure redactor before any later
   // preparation step can fail. Subsequent provider/identity values extend it.

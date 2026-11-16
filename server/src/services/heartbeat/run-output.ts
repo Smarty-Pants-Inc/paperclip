@@ -18,6 +18,14 @@ import {
 } from "./run-lifecycle.js";
 
 const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
+// Tool-output adapter events carry streamed text, like onLog chunks.
+const TOOL_OUTPUT_EVENT = /^tool[._]/;
+// The text fields the native delta path streams, plus the event's message.
+const STREAMED_EVENT_TEXT = /^(text|delta|output|patch)$/;
+const isStreamedEventText = (path: string[]) => path.length === 1 ? path[0] === "message"
+  : STREAMED_EVENT_TEXT.test(path[path.length - 1]!);
+const TOOL_CALL_KEYS = ["toolCallId", "callId", "toolUseId", "itemId", "executionId"];
+type AppendRunEventInput = Parameters<ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"]>[1];
 export const ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS = 60 * 1000;
 export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 
@@ -29,7 +37,8 @@ export interface HeartbeatRunOutputInput {
   runId: string;
   issueId: string | null;
   runLogStore: Pick<RunLogStore, "begin" | "append" | "enqueue" | "flush"> & Partial<Pick<RunLogStore, "read" | "recordVerifiedSourcePrefix">>;
-  identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "chunk" | "redact">;
+  identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "chunk" | "redact">
+    & Partial<Pick<ReturnType<typeof createAgentIdentityRedactor>, "holds" | "finish">>;
   secretKeys: Set<string>;
   appendRunEvent: ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
@@ -322,12 +331,79 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       });
     };
 
+    // A secret can be split across two tool-output events, as across two log
+    // chunks. Their text fields share onLog's per-stream hold (chunk/finish),
+    // keyed by event type, stream and tool call; every other field is redacted
+    // whole, as for any event. An event whose text ends in a held suffix is
+    // committed when the next event of its stream arrives, or at finish with the
+    // released tail: one adapter event stays one committed event.
+    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]> }>();
+    const holds = (id: string) => identityRedactor.holds?.(id) ?? false;
+    const appendToolOutputEvent = async (raw: AdapterRuntimeEvent, redacted: AdapterRuntimeEvent, eventType: string) => {
+      const rawPayload: Record<string, unknown> = raw.payload ?? {};
+      const call = TOOL_CALL_KEYS.map(key => rawPayload[key]).find(value => typeof value === "string") ?? null;
+      const key = JSON.stringify([eventType, raw.stream ?? null, call]);
+      const previous = toolOutputStreams.get(key);
+      toolOutputStreams.delete(key);
+      if (previous) await appendRunEvent(currentRun, previous.event);
+      const held = new Map([...previous?.held ?? []].filter(([id]) => holds(id)));
+      // Walk the raw event beside its whole-redacted copy: streamed text is
+      // chunked from the raw value, anything else keeps the redacted value.
+      const visit = (rawValue: unknown, redactedValue: unknown, path: string[]): unknown => {
+        if (typeof rawValue === "string" && isStreamedEventText(path)) {
+          const id = `${key}:${JSON.stringify(path)}`;
+          const output = identityRedactor.chunk(id, rawValue);
+          if (holds(id)) held.set(id, path);
+          else held.delete(id);
+          return output;
+        }
+        if (Array.isArray(rawValue) && Array.isArray(redactedValue))
+          return redactedValue.map((child, index) => visit(rawValue[index], child, [...path, String(index)]));
+        if (rawValue && redactedValue && typeof rawValue === "object" && typeof redactedValue === "object"
+          && !Array.isArray(rawValue) && !(rawValue instanceof Date)) {
+          return Object.fromEntries(Object.entries(redactedValue).map(([name, child]) =>
+            [name, visit((rawValue as Record<string, unknown>)[name], child, [...path, name])]));
+        }
+        return redactedValue;
+      };
+      const event: AppendRunEventInput = {
+        eventType: eventType.slice(0, 120),
+        stream: redacted.stream,
+        level: redacted.level,
+        color: redacted.color,
+        message: visit(raw.message, redacted.message, ["message"]) as string | undefined,
+        payload: visit(raw.payload, redacted.payload, ["payload"]) as Record<string, unknown> | undefined,
+      };
+      if (held.size) toolOutputStreams.set(key, { event, held });
+      else await appendRunEvent(currentRun, event);
+    };
+    const finishAdapterEvents = async () => {
+      const streams = [...toolOutputStreams.values()];
+      toolOutputStreams.clear();
+      for (const { event, held } of streams) {
+        for (const [id, path] of held) {
+          const tail = identityRedactor.finish?.(id) ?? "";
+          if (!tail) continue;
+          let target = event as unknown as Record<string, unknown>;
+          for (const name of path.slice(0, -1)) {
+            if (!target[name] || typeof target[name] !== "object") target[name] = {};
+            target = target[name] as Record<string, unknown>;
+          }
+          const field = path[path.length - 1]!;
+          target[field] = `${typeof target[field] === "string" ? target[field] : ""}${tail}`;
+        }
+        await appendRunEvent(currentRun, event);
+      }
+    };
+
     const onAdapterEvent = async (event: AdapterRuntimeEvent) => {
+      const raw = event;
       event = identityRedactor.redact(event);
       const eventType = event.eventType.trim();
       // This namespace attests host-owned handoff cleanup. Legacy adapters do
       // not carry nativeSource identities, so they must never author it.
       if (!eventType || eventType.startsWith("legacy.case_handoff_")) return;
+      if (TOOL_OUTPUT_EVENT.test(eventType)) return appendToolOutputEvent(raw, event, eventType);
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,
@@ -345,6 +421,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       onPersistedNativeLog,
       onAdapterMeta,
       onAdapterEvent,
+      finishAdapterEvents,
     };
   }
 
