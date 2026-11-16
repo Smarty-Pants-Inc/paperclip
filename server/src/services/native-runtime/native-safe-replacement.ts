@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-notifications.js";
@@ -662,6 +663,10 @@ export async function reconcileSafeNativeReplacements(
             ),
           )
           .for("update");
+        if (!task) return false;
+        const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+          companyId: run.companyId, agentId: run.agentId, issueId: task.id, contextSnapshot: { issueId: task.id },
+        });
         const [current] = await tx
           .select()
           .from(nativeRunFinalizations)
@@ -787,11 +792,14 @@ export async function reconcileSafeNativeReplacements(
           executionStatusDeliveryId: randomUUID(),
           wakeupRequestId: wake!.id,
           responsibleUserId: run.responsibleUserId,
-          contextSnapshot: context,
+          contextSnapshot: { ...context, projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext },
           retryOfRunId: run.id,
           scheduledRetryAt: dueAt,
           scheduledRetryAttempt: preClaim ? 1 : current.attempt,
           scheduledRetryReason: NATIVE_SAFE_REPLACEMENT_REASON,
+        });
+        await captureProjectConnectionRunContext(tx, {
+          companyId: run.companyId, agentId: run.agentId, heartbeatRunId: successorRunId,
         });
         options.failpoint?.("successor_inserted");
         await tx

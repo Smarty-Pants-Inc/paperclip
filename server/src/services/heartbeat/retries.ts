@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
@@ -902,6 +903,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
 
     const scheduleResult = await db.transaction(
       async (tx): Promise<ScheduledRetryTransactionResult> => {
+        const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+          companyId: run.companyId, agentId: run.agentId, issueId, contextSnapshot: retryContextSnapshot,
+        });
         // All automatic failure paths share the same predecessor claim. A
         // duplicate monitor, restart sweep or wake must reuse its successor.
         if (
@@ -1276,7 +1280,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             triggerDetail: "system",
             status: "scheduled_retry",
             wakeupRequestId: wakeupRequest.id,
-            contextSnapshot: retryContextSnapshot,
+            contextSnapshot: { ...retryContextSnapshot, projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext },
             ...(hasConversationContinuationPolicy(run.resultJson)
               ? { resultJson: { conversationContinuation: CONVERSATION_CONTINUATION_POLICY } } : {}),
             responsibleUserId,
@@ -1301,6 +1305,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
 
+        await captureProjectConnectionRunContext(tx, {
+          companyId: run.companyId, agentId: run.agentId, heartbeatRunId: scheduledRun.id,
+        });
         let detachWorkspaceFromIssue = false;
         if (issueId && shouldQuarantineWorkspaceForRetry) {
           const issueWorkspace = await tx

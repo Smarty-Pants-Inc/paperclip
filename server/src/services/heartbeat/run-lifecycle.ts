@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
@@ -2599,6 +2600,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     const now = new Date();
 
     const retryRun = await db.transaction(async (tx) => {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId: run.companyId, agentId: run.agentId, issueId, contextSnapshot: retryContextSnapshot,
+      });
       await tx.execute(
         sql`select id from issues where company_id = ${run.companyId} and execution_run_id = ${run.id} for update`,
       );
@@ -2651,7 +2655,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           triggerDetail: "system",
           status: "queued",
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: retryContextSnapshot,
+          contextSnapshot: { ...retryContextSnapshot, projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext },
           responsibleUserId,
           sessionIdBefore: sessionBefore,
           retryOfRunId: run.id,
@@ -2661,6 +2665,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         .returning()
         .then((rows) => rows[0]);
 
+      await captureProjectConnectionRunContext(tx, {
+        companyId: run.companyId, agentId: run.agentId, heartbeatRunId: queuedRun.id,
+      });
       await tx
         .update(agentWakeupRequests)
         .set({

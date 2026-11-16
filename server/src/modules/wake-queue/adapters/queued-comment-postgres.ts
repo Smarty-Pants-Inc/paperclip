@@ -1,3 +1,4 @@
+import { projectConnectionRunSnapshot } from "../../../services/project-connection-run-context.js";
 import { notifyStrandedAgentStatus } from "../../../services/live-run-recovery-notifications.js";
 import { assertAgentInteraction } from "../../../services/agent-interaction-policy.js";
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
@@ -100,7 +101,7 @@ function buildTransaction(tx: Db, companyId: string, issueId: string, deps: Queu
       await notifyChatRunMilestones(tx, { companyId, issueId });
       const row = await tx
         .update(heartbeatRuns)
-        .set({ contextSnapshot: withQueuedCommentIdsInRunContext(contextSnapshot, ids), updatedAt })
+        .set({ contextSnapshot: projectConnectionRunSnapshot(withQueuedCommentIdsInRunContext(contextSnapshot, ids)), updatedAt })
         .where(and(eq(heartbeatRuns.id, queueRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.status, "queued")))
         .returning()
         .then((rows) => rows[0] ?? null);

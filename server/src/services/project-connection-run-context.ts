@@ -107,13 +107,14 @@ async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission:
       projectId: await taskProject(db, input.companyId, issueId) };
   }
   if (!isUuidLike(input.heartbeatRunId)) throw invalid();
+  const allowedStatuses = atAdmission ? ["queued", "running", "scheduled_retry"] : ["queued", "running"];
   return db.transaction(async tx => {
     const readRun = () => tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
       nativeIssueId: heartbeatRuns.nativeIssueId, issueId: heartbeatRuns.issueId, contextSnapshot: heartbeatRuns.contextSnapshot,
     }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.heartbeatRunId!),
       eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId)));
     const [initial] = await readRun();
-    if (!initial || !["queued", "running"].includes(initial.status)) throw invalid();
+    if (!initial || !allowedStatuses.includes(initial.status)) throw invalid();
     assertBoundRunIssueId(initial);
     const issueId = boundRunIssueId(initial);
     if (input.issueId && input.issueId !== issueId) throw invalid();
@@ -127,7 +128,7 @@ async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission:
       // Fresh statements after a lifecycle wait: no stale run/task snapshot may
       // be promoted to a new admission or silently switched to another project.
       const [current] = await readRun();
-      if (!current || !["queued", "running"].includes(current.status)) throw invalid();
+      if (!current || !allowedStatuses.includes(current.status)) throw invalid();
       assertBoundRunIssueId(current);
       const currentSaved = savedBinding(current.contextSnapshot?.[SNAPSHOT_KEY]);
       if (boundRunIssueId(current) !== issueId || currentSaved.issueId !== saved.issueId
@@ -139,7 +140,7 @@ async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission:
     const projectId = await taskProject(tx, input.companyId, issueId, true);
     if (projectId) await lockProjectConnectionLifecycle(tx, { companyId: input.companyId, projectId });
     const [run] = await readRun().for("no key update");
-    if (!run || !["queued", "running"].includes(run.status)) throw invalid();
+    if (!run || !allowedStatuses.includes(run.status)) throw invalid();
     assertBoundRunIssueId(run);
     if (boundRunIssueId(run) !== issueId) throw invalid();
     const snapshot = run.contextSnapshot ?? {};

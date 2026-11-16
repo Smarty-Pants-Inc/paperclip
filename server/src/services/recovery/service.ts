@@ -1,3 +1,4 @@
+import { captureProjectConnectionRunContext, projectConnectionAdmissionSnapshot } from "../project-connection-run-context.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { wakeWaitersOfStalledIssues, type BlockerStallWakeup } from "./blocker-stall-wakeups.js";
 import { INTERACTION_DELIVERY_DENIED, isInteractionDeliveryDeniedRun } from "../agent-interaction-delivery.js";
@@ -2843,6 +2844,10 @@ export function recoveryService(
     const now = new Date();
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
     return database.transaction(async (tx) => {
+      const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+        companyId: input.issue.companyId, agentId: input.agentId, issueId: input.issue.id,
+        contextSnapshot: { issueId: input.issue.id },
+      });
       const commentInput = await readContinuationCommentInput(tx as unknown as Db, { companyId: input.issue.companyId, issueId: input.issue.id, runId: input.latestRun?.id });
       await notifyScheduledRetryDispatch(tx, { companyId: input.issue.companyId });
       const wakeup = await tx
@@ -2890,6 +2895,7 @@ export function recoveryService(
             {
               issueId: input.issue.id,
               taskId: input.issue.id,
+              projectConnectionRunContext: admissionSnapshot.projectConnectionRunContext,
               wakeReason: "provider_quota_recovery",
               ...commentInput,
               retryReason: "provider_quota_recovery",
@@ -2901,6 +2907,9 @@ export function recoveryService(
         })
         .returning()
         .then((rows) => rows[0]!);
+      await captureProjectConnectionRunContext(tx, {
+        companyId: input.issue.companyId, agentId: input.agentId, heartbeatRunId: scheduledRun.id,
+      });
       await tx
         .update(agentWakeupRequests)
         .set({ runId: scheduledRun.id, updatedAt: now })
@@ -3444,6 +3453,9 @@ export function recoveryService(
           created = Boolean(enqueuedRun);
         } else {
           scheduledRun = await db.transaction(async (tx) => {
+            const admissionSnapshot = await projectConnectionAdmissionSnapshot(tx, {
+              companyId: input.issue.companyId, agentId, issueId: input.issue.id, contextSnapshot: context,
+            });
             await notifyScheduledRetryDispatch(tx, { companyId: input.issue.companyId });
             const wakeup = await tx
               .insert(agentWakeupRequests)
@@ -3486,11 +3498,14 @@ export function recoveryService(
                 scheduledRetryAttempt: input.attempt,
                 scheduledRetryReason: ISSUE_DISPOSITION_REPAIR_RETRY_REASON,
                 responsibleUserId: sourceRun?.responsibleUserId ?? null,
-                contextSnapshot: context,
+                contextSnapshot: admissionSnapshot,
                 updatedAt: now,
               })
               .returning()
               .then((rows) => rows[0]!);
+            await captureProjectConnectionRunContext(tx, {
+              companyId: input.issue.companyId, agentId, heartbeatRunId: run.id,
+            });
             await tx
               .update(agentWakeupRequests)
               .set({ runId: run.id, updatedAt: now })
