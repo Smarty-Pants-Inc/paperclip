@@ -420,6 +420,10 @@ Stranded-task recovery uses the same Stop proof before clearing a task's checkou
 or execution owner. A paused or terminated assignee alone does not release those
 locks. Recovery checks both bound runs in the task's company under the task and
 run locks; unrelated runs of the same agent do not block a confirmed release.
+The stale-lock sweep uses this same proof before clearing either owner, even for
+terminal run records. It locks the task, then its bound runs in ID order, and
+rechecks Stop in the clear transaction. Missing or cross-company run evidence
+fails closed; no hold-release work is promoted when proof is incomplete.
 An accepted interaction keeps its existing retry or needs-attention disposition.
 Generic recovery does not create a replacement run while its executor cleans up.
 After cleanup, its saved needs-attention escalation repeats the Stop check.
