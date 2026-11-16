@@ -147,6 +147,7 @@ import {
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
+import { withTransactionRetry } from "../services/transaction-retry.js";
 import { agentBudgetPage, assertAuthenticated, assertBoard, assertCompanyAccess, COMPANY_BUDGETS_PAGE, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { runAdapterLoginStartSpine } from "./adapter-login-route-spine.js";
 import { isLoginCommandSupportedAdapterType } from "../services/login-command.js";
@@ -1420,15 +1421,19 @@ export function agentRoutes(
     agentId: string,
     grantedByUserId: string | null,
   ) {
-    await access.ensureMembership(companyId, "agent", agentId, "member", "active");
-    await access.setPrincipalPermission(
-      companyId,
-      "agent",
-      agentId,
-      "tasks:assign",
-      true,
-      grantedByUserId,
-    );
+    await withTransactionRetry(db, () => db.transaction(async (tx) => {
+      const txAccess = accessService(tx as unknown as Db);
+      await txAccess.ensureMembership(companyId, "agent", agentId, "member", "active");
+      await txAccess.setPrincipalPermission(
+        companyId,
+        "agent",
+        agentId,
+        "tasks:assign",
+        true,
+        grantedByUserId,
+      );
+      await builtInAgentService(tx as unknown as Db).ensureCompanyDefaultAgentGrants(companyId);
+    }), 5);
   }
 
   async function assertCanCreateAgentsForCompany(req: Request, companyId: string, options?: { hiring?: true }) {
@@ -5095,7 +5100,6 @@ export function agentRoutes(
       agent.id,
       req.actor.type === "board" ? (req.actor.userId ?? null) : null,
     );
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
 
     res.status(201).json({ ...redactAgentRowForResponse(agent), ...(configurationWarnings.length ? { configurationWarnings } : {}) });
   });
