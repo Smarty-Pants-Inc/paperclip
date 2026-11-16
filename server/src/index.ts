@@ -101,7 +101,7 @@ import { deliverBudgetResumeContinuations, type BudgetResumeDelivery } from "./s
 import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { acknowledgeNativeStartupCleanup } from "./services/native-runtime/native-startup-cleanup.js";
-import { sweepNativeStateStaging } from "./services/native-runtime/native-state-staging.js";
+import { fenceOrphanedNativeStateStaging, sweepNativeStateStaging } from "./services/native-runtime/native-state-staging.js";
 import { executionControlSchedule, registerExecutionControlWork } from "./services/execution-control-work.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
@@ -338,7 +338,9 @@ async function startServerWithDatabaseTeardown(
     initializeRuntimeConfigConsumers(startupConfig);
   }
   // A server that stopped mid-transfer never cleaned its native session state
-  // staging; remove what no plugin worker can still write into.
+  // staging. No transfer of this process is live yet, so every staging
+  // directory is fenced whatever its age; then aged entries are swept.
+  fenceOrphanedNativeStateStaging();
   sweepNativeStateStaging();
   
   type MigrationSummary =
