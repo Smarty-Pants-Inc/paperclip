@@ -32,10 +32,10 @@ export const ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS = 5 * 1000;
 type Run = typeof heartbeatRuns.$inferSelect;
 /** Server receipt of one adapter event: when it arrived and its per-run order. */
 type AdapterEventReceiptStamp = { receivedAt: string; adapterEventIndex: number };
-// Server-owned fields go on after redaction: they carry no adapter text, and
-// the adapter cannot set them.
+// Reserve the first payload keys so persistence bounding retains the stamp,
+// then restore its authoritative values after any adapter-owned fields.
 const withReceiptStamp = (payload: Record<string, unknown> | undefined, stamp: AdapterEventReceiptStamp) =>
-  ({ ...payload, ...stamp });
+  ({ ...stamp, ...payload, ...stamp });
 type CanonicalNativeLog = { kind: "canonical_native"; sourceCursor: number };
 
 export interface HeartbeatRunOutputInput {
@@ -343,7 +343,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     // whole, as for any event. An event whose text ends in a held suffix is
     // committed when the next event of its stream arrives, or at finish with the
     // released tail: one adapter event stays one committed event.
-    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]> }>();
+    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]>; stamp: AdapterEventReceiptStamp }>();
     const holds = (id: string) => identityRedactor.holds?.(id) ?? false;
     const appendToolOutputEvent = async (
       raw: AdapterRuntimeEvent,
@@ -385,13 +385,13 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         message: visit(raw.message, redacted.message, ["message"]) as string | undefined,
         payload: withReceiptStamp(visit(raw.payload, redacted.payload, ["payload"]) as Record<string, unknown> | undefined, stamp),
       };
-      if (held.size) toolOutputStreams.set(key, { event, held });
+      if (held.size) toolOutputStreams.set(key, { event, held, stamp });
       else await appendRunEvent(currentRun, event);
     };
     const finishAdapterEvents = async () => {
       const streams = [...toolOutputStreams.values()];
       toolOutputStreams.clear();
-      for (const { event, held } of streams) {
+      for (const { event, held, stamp } of streams) {
         for (const [id, path] of held) {
           const tail = identityRedactor.finish?.(id) ?? "";
           if (!tail) continue;
@@ -403,6 +403,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
           const field = path[path.length - 1]!;
           target[field] = `${typeof target[field] === "string" ? target[field] : ""}${tail}`;
         }
+        event.payload = withReceiptStamp(event.payload, stamp);
         await appendRunEvent(currentRun, event);
       }
     };
