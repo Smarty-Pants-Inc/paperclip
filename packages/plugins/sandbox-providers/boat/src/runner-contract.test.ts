@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin from "./plugin.js";
 import manifest from "./manifest.js";
-import { PluginEnvironmentRunnerIngressError } from "@paperclipai/plugin-sdk";
+import { PluginEnvironmentRunnerIngressError, environmentResumeErrorData, environmentRunnerIngressErrorData } from "@paperclipai/plugin-sdk";
 
 // Keep: provider/core trust boundary, retained workspace data safety, and
 // failures (foreign allocation, lost reply, secret-bearing errors) unsafe to seed live.
@@ -353,5 +353,34 @@ describe("Boat Runner contract", () => {
     vi.stubGlobal("fetch", network);
     await expect(plugin.definition.onEnvironmentInspectLease!({ ...scope, providerLeaseId })).rejects.toThrow("not a sandbox id");
     expect(network).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("frozen7 runner ingress and gone-box contract", () => {
+  // The SDK's providerErrorDiagnostic via its public envelope (environment-resume-error.ts:34-50).
+  const diagnostic = (error: unknown) => environmentResumeErrorData(error)?.diagnostic ?? null;
+  it("(f) runner-ingress acquire with HTTP 500 keeps status 500 reachable", async () => {
+    fixture(); vi.stubGlobal("fetch", vi.fn(async () => reply({ message: "do not leak private-token" }, 500)));
+    const error = await ingress().catch(e => e);
+    expect(error).toBeInstanceOf(PluginEnvironmentRunnerIngressError);
+    expect(environmentRunnerIngressErrorData(error)).toMatchObject({ failure: { phase: "sandbox_lookup", httpStatus: 500 } });
+    expect(error.status).toBe(500);
+    expect(diagnostic(error)).toEqual({ httpStatus: 500 });
+    expect(Object.hasOwn(error, "cause")).toBe(false);
+    expect(JSON.stringify(Object.getOwnPropertyDescriptors(error))).not.toContain("private-token");
+  });
+  it("(f) runner-ingress network failure keeps the closed errno reachable, not the raw cause", async () => {
+    fixture(); vi.stubGlobal("fetch", vi.fn(async () => { throw new TypeError("fetch failed", { cause: Object.assign(new Error("private-token"), { code: "ECONNRESET" }) }); }));
+    const error = await ingress().catch(e => e);
+    expect(error.message).toBe("Boat runner ingress failed during sandbox_lookup.");
+    expect(error.code).toBe("ECONNRESET");
+    expect(diagnostic(error)).toEqual({ errorCode: "ECONNRESET" });
+    expect(Object.hasOwn(error, "cause")).toBe(false);
+    expect(JSON.stringify(Object.getOwnPropertyDescriptors(error))).not.toContain("private-token");
+  });
+  it("(b) a 404 on resume of a proved lease is gone: expired, not transient, no throw", async () => {
+    const f = fixture(); const lease = await plugin.definition.onEnvironmentAcquireLease!(acquire);
+    f.network.mockImplementation(async () => reply(sandboxNotFound, 404));
+    expect(await plugin.definition.onEnvironmentResumeLease!({ ...scope, providerLeaseId: "bx_runner", leaseMetadata: lease.metadata })).toEqual({ providerLeaseId: null, metadata: { expired: true } });
   });
 });

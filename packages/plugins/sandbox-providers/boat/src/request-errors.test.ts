@@ -23,8 +23,8 @@ describe("central safe request errors", () => {
   it.each(["message", "nested", "statusText"])('drops provider %s and retains status', async source => {
     const error = await failure(async () => new Response(source === "statusText" ? null : JSON.stringify(source === "message" ? { message: canary } : { error: { message: canary } }), { status: 503, statusText: source === "statusText" ? canary : "fixture" }));
     assertSafe(error);
-    expect(error).toMatchObject({ httpStatus: 503, category: "http_error" });
-    expect(error.message).toBe(`Boat GET /sandboxes/${id} failed (503): http_error`);
+    expect(error).toMatchObject({ status: 503, httpStatus: 503, category: "http_error" });
+    expect(error.message).toBe(`Boat GET /sandboxes/${id} failed (503): http_error (service unavailable)`);
   });
   it("drops network message, nested causes and stack", async () => {
     const original = new Error(canary, { cause: new Error(canary) });
@@ -56,6 +56,7 @@ describe("central safe request errors", () => {
     const error = await failure(async () => new Response(null, { status: 403 }), "");
     expect(error.message).toBe(`Boat GET /sandboxes/${id} failed (403): http_error`);
     expect(error.httpStatus).toBe(403);
+    expect((error as any).status).toBe(403);
   });
   it("rejects required null JSON via the same boundary", async () => {
     const error = await failure(async () => new Response("null"));
