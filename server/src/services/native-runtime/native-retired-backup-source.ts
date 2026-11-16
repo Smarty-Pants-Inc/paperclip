@@ -268,8 +268,9 @@ async function idleWarmSourceRetiresBackup(db: Db, lease: typeof environmentLeas
   return !await nativeWorkspaceExportPendingForResource(db, lease, currentRunId);
 }
 
-/** A restore hold or a pending shutdown settlement still protects the files; reuse skips these too. */
-function sourceFilesHeld(lease: SourceLease): boolean {
+/** A restore hold or a pending shutdown settlement still protects the files; reuse skips these too.
+ * Also gates the recall's retirement of a previous boot's closed ACTIVE tip (J3-26). */
+export function sourceFilesHeld(lease: SourceLease): boolean {
   return Object.hasOwn(lease.metadata ?? {}, LEGACY_WORKSPACE_RECOVERY_KEY)
     || (lease.metadata?.legacyShutdownWorkspaceSettlement as { state?: unknown } | undefined)?.state === "pending";
 }

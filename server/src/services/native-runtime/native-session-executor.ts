@@ -45,6 +45,7 @@ import { notifyExternalAgentSettlement } from "../../modules/external-agents/ind
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { releaseRetainedNativeSessionCleanup } from "../retained-native-session-cleanup-notifications.js";
 import { registerIdleLocalWorkProbe, type IdleLocalWork } from "../idle-local-work.js";
+import { registerWarmOwnerLeaseHolderProbe } from "./warm-owner-lease-holders.js";
 import type { NativeCleanupOutcome } from "./retained-native-session-cleanup.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyNativeFinalizationWork } from "../native-finalization-notifications.js";
@@ -973,6 +974,13 @@ export function readNativeSessionIdleWork(): IdleLocalWork {
     ? "present" : "none";
 }
 registerIdleLocalWorkProbe(readNativeSessionIdleWork);
+// J3-26: the recall never treats a previous boot's ACTIVE tip as closed while
+// a warm owner in this process names its box or its run. Matching either is
+// enough, and company is not required to match, so a doubt keeps the lease.
+registerWarmOwnerLeaseHolderProbe(lease => [...warmNativeSessions.values()].some(entry =>
+  [entry.providerLeaseId, entry.sandboxProviderLeaseId, entry.pluginTaskId].includes(lease.providerLeaseId)
+  || (lease.heartbeatRunId !== null && [entry.runId, entry.instructionCopy?.runId, entry.preparingRunId,
+    entry.instructionPreparationRunId].includes(lease.heartbeatRunId))));
 
 /**
  * How long a new run's admission waits for the warm session to stop being busy.

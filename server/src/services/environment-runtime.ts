@@ -1,7 +1,7 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
-import { ENVIRONMENT_LEASE_CONTROLLER_KEY } from "./environment-lease-controller.js";
+import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, SandboxLeaseStartDeniedError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
@@ -36,17 +36,17 @@ import { beginIdleTrackedWork } from "./task-admission.js";
 import { historicalProviderCredentials } from "./historical-provider-credentials.js";
 import { ownedWorkspaceRecoveryLease, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
-import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
+import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareInspectedSourceSandboxStop, preparePreviousBootClosedTipStop, prepareSandboxStopAndRetain, prepareSupersededWarmSandboxStop, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
 import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
-import { currentControllerProcess } from "./controller-process-identity.js";
+import { currentControllerBootId, currentControllerProcess } from "./controller-process-identity.js";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns } from "@paperclipai/db";
+import { companySecrets, companySecretVersions, environments, environmentLeases, heartbeatRuns, nativeRunFinalizations } from "@paperclipai/db";
 import type {
   Environment,
   EnvironmentLease,
@@ -85,7 +85,8 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { hasSandboxSnapshotQualification, qualifiedSandboxSnapshotId, usesManagedCloudSandboxImage, type SandboxTemplateIdentity } from "./sandbox-snapshot-qualification.js";
 import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-harness-backup-storage.js";
 import { loadNativeHarnessBackupLeaseChain, nativeHarnessBackupHasLaterProviderWork,
-  newestNativeHarnessBackupStampOnChain } from "./native-runtime/native-retired-backup-source.js";
+  newestNativeHarnessBackupStampOnChain, sourceFilesHeld } from "./native-runtime/native-retired-backup-source.js";
+import { warmOwnerInThisProcessHoldsLease } from "./native-runtime/warm-owner-lease-holders.js";
 import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
 import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
@@ -1179,6 +1180,8 @@ function reusableLeaseCanBeResumed(input: {
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }
 
+const PREVIOUS_BOOT_TIP_TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
+
 function reusableLeaseCanBeCleanedUp(lease: Pick<EnvironmentLease, "status" | "metadata">): boolean {
   if (abandonedWorkspaceFilesParked(lease)) return false;
   return lease.status === "released" || lease.status === "retained";
@@ -1763,16 +1766,100 @@ function createSandboxEnvironmentDriver(
     return stamp;
   }
 
+  /**
+   * J3-26 (fresh 09:50Z, SMA-67/76). A previous boot's shutdown closed its warm
+   * owner: the checkpoint is stamped on the lease chain. But the owner's run had
+   * not settled its lease, so the chain tip is still `active`, and the recall's
+   * obsolete cleanup skipped it. That cleanup handles a retained tip as obsolete
+   * and, unlike upstream, never waits for the ownership settle (which stops an
+   * orphaned active lease only once its holder is proven gone). It handles an
+   * active tip the same way only when ALL of these hold:
+   * - (g1) the tip's run is terminal and ended;
+   * - (g2) the tip's holder stamp names a PREVIOUS boot, the run and its native
+   *   finalization were not driven by this boot, and no warm owner in this
+   *   process names the box or the run;
+   * - (g3) the newest verified stamp on the box's lease chain (the shared
+   *   selection restore and custody read) completed after the run ended, and no
+   *   provider work followed it: the close's checkpoint;
+   * - (g4) nothing holds the files and no native workspace export is pending
+   *   (the F9 helpers).
+   * Anything else stays as it is.
+   */
+  async function previousBootClosedActiveTip(lease: EnvironmentLease, currentRunId: string): Promise<boolean> {
+    if (lease.status !== "active" || lease.leasePolicy !== "reuse_by_environment" || !lease.heartbeatRunId
+      || lease.heartbeatRunId === currentRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
+      || abandonedWorkspaceFilesParked(lease) || reusableSandboxKeptAfterReplacement(lease)
+      || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
+      || Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor")) return false;
+    // (g2) The holder is a previous boot that nothing in this process still holds.
+    const bootId = currentControllerBootId();
+    const holder = readEnvironmentLeaseController(lease.metadata);
+    if (!holder || holder.bootId === bootId) return false;
+    if (warmOwnerInThisProcessHoldsLease({ companyId: lease.companyId, providerLeaseId: lease.providerLeaseId,
+      heartbeatRunId: lease.heartbeatRunId })) return false;
+    // (g1) The run is terminal and ended.
+    const [run] = await db.select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt,
+      controllerBootId: heartbeatRuns.controllerBootId }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
+    if (!run || !PREVIOUS_BOOT_TIP_TERMINAL_RUN_STATUSES.has(run.status) || !run.finishedAt
+      || run.controllerBootId === bootId) return false;
+    const [finalization] = await db.select({ controllerBootId: nativeRunFinalizations.controllerBootId })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, lease.companyId),
+        eq(nativeRunFinalizations.runId, lease.heartbeatRunId))).limit(1);
+    if (finalization?.controllerBootId === bootId) return false;
+    // (g4) No files held, no pending native workspace export.
+    if (sourceFilesHeld(lease) || await legacyShutdownWorkspaceResourceProtected(db, lease)
+      || await nativeWorkspaceExportPendingForLease(db, lease)
+      || await nativeWorkspaceExportPendingForResource(db, lease, currentRunId)) return false;
+    // (g3) The close's checkpoint: the chain's newest stamp, after the run ended.
+    const chain = await loadNativeHarnessBackupLeaseChain(db, { companyId: lease.companyId, providerLeaseId: lease.providerLeaseId });
+    if (!chain || chain.tip.id !== lease.id) return false;
+    const stamp = newestNativeHarnessBackupStampOnChain(chain);
+    if (!stamp || !(Date.parse(stamp.completedAt) > run.finishedAt.getTime())) return false;
+    return !await nativeHarnessBackupHasLaterProviderWork(db, { companyId: lease.companyId,
+      normalizedSessionId: stamp.normalizedSessionId, completedAt: stamp.completedAt });
+  }
+
+  /** The previous boot's closed ACTIVE tips in this acquisition's reuse scope
+   * whose boot source the environment no longer boots. Such a tip can never be
+   * resumed here, so it only ever enters obsolete cleanup, never reuse. */
+  async function previousBootClosedActiveSourceTips(input: {
+    companyId: string; environmentId: string; executionWorkspaceId: string | null; issueId: string | null;
+    agentId: string | null; heartbeatRunId: string | null; config: Record<string, unknown>; excludeIds: Set<string>;
+  }): Promise<EnvironmentLease[]> {
+    if (!input.heartbeatRunId || !input.agentId || (input.executionWorkspaceId === null && input.issueId === null)) return [];
+    const tips: EnvironmentLease[] = [];
+    for (const lease of await environmentsSvc.listLeases(input.environmentId)) {
+      if (input.excludeIds.has(lease.id) || lease.companyId !== input.companyId || lease.status !== "active"
+        || lease.environmentId !== input.environmentId || lease.executionWorkspaceId !== input.executionWorkspaceId
+        || (input.executionWorkspaceId === null && lease.issueId !== input.issueId)
+        || lease.metadata?.agentId !== input.agentId
+        || sandboxLeaseSourceMatches(input.config, lease.metadata ?? {})) continue;
+      if (await previousBootClosedActiveTip(lease, input.heartbeatRunId)) tips.push(lease);
+    }
+    return tips;
+  }
+
   async function cleanupObsoleteReusableSandboxLeases(input: {
     environment: Environment;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
     adapterType: string | null;
+    /** J3-26: previous boots' closed ACTIVE tips, admitted by `previousBootClosedActiveSourceTips`. */
+    closedActiveTips?: { leases: EnvironmentLease[]; heartbeatRunId: string };
   }) {
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
-    for (const lease of input.leases) {
+    const closedActiveTipIds = new Set(input.closedActiveTips?.leases.map(lease => lease.id) ?? []);
+    // Re-read and re-prove right before acting: the tip may have changed since it was admitted.
+    const closedActiveTipStill = async (id: string) => {
+      if (!input.closedActiveTips || !closedActiveTipIds.has(id)) return null;
+      const [current] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, id));
+      return current && await previousBootClosedActiveTip(current as EnvironmentLease, input.closedActiveTips.heartbeatRunId)
+        ? current : null;
+    };
+    for (const lease of [...input.leases, ...(input.closedActiveTips?.leases ?? [])]) {
       if (reusableIds.has(lease.id)) continue;
-      if (!reusableLeaseCanBeCleanedUp(lease)) continue;
+      if (!reusableLeaseCanBeCleanedUp(lease) && !closedActiveTipIds.has(lease.id)) continue;
       // Destroying an obsolete source deletes its box. A native session there
       // needs verified custody first: upstream's own resume-replacement guard
       // (verifyRecoverableNativeHarnessBackup). Without it nothing is
@@ -1781,7 +1868,8 @@ function createSandboxEnvironmentDriver(
       // mismatch already keeps it from serving the next run. Fails closed: only
       // a lease recorded with a KNOWN non-native adapter skips custody (RFL 06:33Z).
       const scope = lease.metadata?.reusableSandboxLease as { adapterType?: unknown } | undefined;
-      const knownNonNative = input.adapterType !== "paperclip_runner" && typeof scope?.adapterType === "string"
+      // A closed ACTIVE tip (J3-26) always needs verified custody before a destroy.
+      const knownNonNative = !closedActiveTipIds.has(lease.id) && input.adapterType !== "paperclip_runner" && typeof scope?.adapterType === "string"
         && scope.adapterType !== "paperclip_runner" && (AGENT_ADAPTER_TYPES as readonly string[]).includes(scope.adapterType);
       if (!knownNonNative
         && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
@@ -1790,6 +1878,11 @@ function createSandboxEnvironmentDriver(
           eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.id, lease.id),
         ));
         if (stale?.status === "retained") await prepareSupersededWarmSandboxStop(db, stale, { reason: "sandbox_source_changed" });
+        // J3-26: the previous boot's closed ACTIVE tip is stopped and kept as the retained tip is.
+        else if (stale?.status === "active") {
+          const tip = await closedActiveTipStill(stale.id);
+          if (tip) await preparePreviousBootClosedTipStop(db, tip, { reason: "sandbox_source_changed" });
+        }
         else if (stale && ["released", "expired"].includes(stale.status)
           && !hasBoundRemoteStopReceipt(stale) && !hasStopOnlyCleanup(stale)
           && stale.metadata?.pendingCleanupInFlight !== true) {
@@ -1801,9 +1894,12 @@ function createSandboxEnvironmentDriver(
         }
         continue;
       }
+      // J3-26: verified chain custody destroys a closed ACTIVE tip only if it still proves closed.
+      const destroyable = closedActiveTipIds.has(lease.id) ? await closedActiveTipStill(lease.id) : lease;
+      if (!destroyable) continue;
       await destroyReusableSandboxLease({
         environment: input.environment,
-        lease,
+        lease: destroyable as EnvironmentLease,
         failureReason: "lease_fingerprint_mismatch",
       });
     }
@@ -2030,12 +2126,21 @@ function createSandboxEnvironmentDriver(
           provider: parsed.config.provider, config: providerConfigForLease,
         });
         reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
-        if (reusableCandidateLeases.length > reusableExistingLeases.length) {
+        // J3-26: a previous boot's closed ACTIVE tip whose boot source changed.
+        const closedActiveTips = declaredReusableLeases && parsed.config.reuseLease
+          ? await previousBootClosedActiveSourceTips({ companyId: input.companyId, environmentId: input.environment.id,
+              executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, agentId: input.agentId,
+              heartbeatRunId: input.heartbeatRunId, config: providerConfigForLease as Record<string, unknown>,
+              excludeIds: new Set(reusableCandidateLeases.map(lease => lease.id)) })
+          : [];
+        if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
           await cleanupObsoleteReusableSandboxLeases({
             environment: input.environment,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
             adapterType: input.adapterType ?? null,
+            ...(closedActiveTips.length > 0 && input.heartbeatRunId
+              ? { closedActiveTips: { leases: closedActiveTips, heartbeatRunId: input.heartbeatRunId } } : {}),
           });
         }
         const reusableProviderLeaseId =
@@ -2460,12 +2565,21 @@ function createSandboxEnvironmentDriver(
         provider: parsed.config.provider, config: providerConfigForLease,
       });
       reusableExistingLeases.push(...compatible.compatibleLeases.filter(lease => compatible.pinnedConfigs.has(lease.id)));
-      if (reusableCandidateLeases.length > reusableExistingLeases.length) {
+      // J3-26: a previous boot's closed ACTIVE tip whose boot source changed.
+      const closedActiveTips = supportsReusableLeases && parsed.config.reuseLease
+        ? await previousBootClosedActiveSourceTips({ companyId: input.companyId, environmentId: input.environment.id,
+            executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, agentId: input.agentId,
+            heartbeatRunId: input.heartbeatRunId, config: providerConfigForLease as Record<string, unknown>,
+            excludeIds: new Set(reusableCandidateLeases.map(lease => lease.id)) })
+        : [];
+      if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
         await cleanupObsoleteReusableSandboxLeases({
           environment: input.environment,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
           adapterType: input.adapterType ?? null,
+          ...(closedActiveTips.length > 0 && input.heartbeatRunId
+            ? { closedActiveTips: { leases: closedActiveTips, heartbeatRunId: input.heartbeatRunId } } : {}),
         });
       }
       const reusableProviderLeaseId =
