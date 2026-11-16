@@ -49,6 +49,7 @@ import {
   PENDING_WAIT_BOUND_MS,
   settleUnansweredPersonMessage,
   unansweredMessageCode,
+  UNANSWERED_MESSAGE_TEXT,
 } from "../recovery/unanswered-person-message.js";
 
 /** The transport's own stall text (runnerd-codex-transport.ts describeRunnerCommandStall). */
@@ -174,7 +175,7 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
   });
 
   it.each([{ userComment: true }, { userComment: false }])(
-    "after exhaustion posts exactly one truthful note and no fresh-thread note (user comment: $userComment)",
+    "after exhaustion continues in a fresh run, with no executor note and no fresh-thread note (user comment: $userComment)",
     async ({ userComment }) => {
       const seeded = await seed({ userComment });
       await fail(seeded, new Error(PREPARE_NEVER_CONNECTED));
@@ -197,11 +198,18 @@ describe("a first start whose Runner never connected: what the person sees (rf4)
       state = await read(seeded);
 
       expect(state.notes.filter(note => note.body.includes(FRESH_THREAD_STARTED_NOTE))).toEqual([]);
-      // No fresh continuation that would start a "restored" thread.
-      expect(state.continued).toEqual([]);
-      expect(state.notes).toHaveLength(1);
-      expect(state.notes[0]!.body).toBe(truthful);
-      expect(state.issue.status).toBe("blocked");
+      // SUPERSEDED (r104c, RULED RFL + org 11-16 11:11-11:17Z): the task
+      // continues automatically in a fresh run, as before r104b; its one
+      // truthful note is owed at thread selection
+      // (native-startup-never-connected-fresh-run.integration.test.ts).
+      expect(state.continued).toHaveLength(1);
+      expect(state.continued[0]!.details).toMatchObject({ failureCode: "runner_ingress_startup_failed" });
+      // The executor posts no note of its own beside the continuation's.
+      expect(state.notes.filter(note => note.body === truthful)).toEqual([]);
+      // The continuation's run never started in this timeline, so the person's
+      // message gets the unanswered owner's bounded notice; nothing else.
+      expect(state.notes.map(note => note.body)).toEqual(userComment ? [UNANSWERED_MESSAGE_TEXT] : []);
+      expect(state.issue.status).not.toBe("blocked");
     },
   );
 
