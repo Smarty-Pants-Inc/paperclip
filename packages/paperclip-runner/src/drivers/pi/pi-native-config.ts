@@ -23,6 +23,16 @@ export class PiNativeAdmissionError extends Error {
   readonly code: string;
   constructor(code: string, message: string) { super(message); this.code = code; this.name = "PiNativeAdmissionError"; }
 }
+/** Shared proxy/in-process admission policy; cold process startup is separate. */
+export function piAdmissionTimeoutMs(environment: NodeJS.ProcessEnv, fallbackMs = 10_000): number {
+  const configured = environment.PAPERCLIP_PI_ADMISSION_TIMEOUT_MS;
+  const timeoutMs = configured === undefined ? fallbackMs : Number(configured);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs >= 30_000) {
+    throw new Error("pi_admission_deadline_invalid: PAPERCLIP_PI_ADMISSION_TIMEOUT_MS must be an integer from 1 through 29999 ms (below the facade's 30000 ms receive wait)");
+  }
+  return timeoutMs;
+}
+
 function record(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }
