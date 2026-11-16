@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, completionContracts, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issues,
-  nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { activityLog, agents, chatConversations, chatEndpoints, chatGitHubConfigurations, chatMessageLinks, companies, completionContracts, createDb,
+  heartbeatRunEvents, heartbeatRuns, issueComments, issues, nativeRunFinalizations, toolApplications, toolConnections, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { NativeRunCoordinatorStore } from "./native-run-coordinator-store.js";
@@ -59,13 +59,36 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
       payload: { prpEvent } });
     return { companyId, issueId, runId, agentId, contract, saveFinalReply };
   }
+  async function chatOrigin(f: Awaited<ReturnType<typeof fixture>>, provider: "github" | "slack") {
+    const applicationId = randomUUID(), connectionId = randomUUID(), endpointId = randomUUID();
+    const conversationId = randomUUID(), sourceCommentId = randomUUID();
+    await db.insert(toolApplications).values({ id: applicationId, companyId: f.companyId, name: `Chat channel ${endpointId}`, type: "chat" });
+    await db.insert(toolConnections).values({ id: connectionId, companyId: f.companyId, applicationId, name: `Chat connection ${endpointId}`,
+      uid: `chat-${endpointId}`, transport: "chat_sdk", connectionPurpose: "channel" });
+    await db.insert(chatEndpoints).values({ id: endpointId, companyId: f.companyId, connectionId, provider,
+      publicId: `chat-${endpointId}`, assignedAgentId: f.agentId, status: "active" });
+    await db.insert(chatConversations).values({ id: conversationId, companyId: f.companyId, endpointId, issueId: f.issueId,
+      externalConversationId: `external-${conversationId}`, externalLabel: "Review conversation" });
+    await db.insert(issueComments).values({ id: sourceCommentId, companyId: f.companyId, issueId: f.issueId,
+      authorUserId: "reviewer", body: "Please review this change." });
+    await db.insert(chatMessageLinks).values({ companyId: f.companyId, endpointId, conversationId,
+      providerMessageId: `message-${sourceCommentId}`, direction: "inbound", commentId: sourceCommentId });
+    if (provider === "github") await db.insert(chatGitHubConfigurations).values({ companyId: f.companyId, endpointId,
+      configuration: {} as never, updatedByUserId: "reviewer" });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, source: `chat:${provider}`,
+      chatConversationId: conversationId, endpointId, wakeCommentId: sourceCommentId, wakeCommentIds: [sourceCommentId] } })
+      .where(eq(heartbeatRuns.id, f.runId));
+  }
   const comments = (runId: string) => db.select().from(issueComments).where(eq(issueComments.createdByRunId, runId));
   const run = async (runId: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0];
   const receipt = async (runId: string) => ((await run(runId)).resultJson as Record<string, any> | null)?.responsePublication;
   // Advance the saved deadline instead of the clock so the database and the
   // worker agree on "due" without faking timers inside the driver.
-  const makeDue = (runId: string) => db.execute(sql`update heartbeat_runs set result_json = jsonb_set(result_json,
-    '{responsePublication,nextAttemptAt}', to_jsonb('2000-01-01T00:00:00.000Z'::text)) where id = ${runId}`);
+  const makeDue = async (runId: string) => {
+    await db.execute(sql`update heartbeat_runs set result_json = jsonb_set(result_json,
+      '{responsePublication,nextAttemptAt}', to_jsonb('2000-01-01T00:00:00.000Z'::text)) where id = ${runId}`);
+    await db.update(nativeRunFinalizations).set({ nextAttemptAt: new Date(0) }).where(eq(nativeRunFinalizations.runId, runId));
+  };
 
   it.each([false, true])("carry-comment: background publication publishes the result (commentOrigin=%s)", async commentOrigin => {
     const f = await fixture();
@@ -247,16 +270,47 @@ describe.skipIf(!support.supported)("native final reply publication retry", () =
     }
     expect(await comments(f.runId)).toEqual([]);
     const failed = await receipt(f.runId);
-    expect(failed).toMatchObject({ state: "failed", reasonCode: "native_response_publication_failed",
+    expect(failed).toMatchObject({ state: "failed", reasonCode: "native_response_publication_failed", lastRefusalReason: "no_final_agent_message",
       owner: { kind: "agent", agentId: f.agentId } });
     expect(failed.attempts).toBeGreaterThan(1);
     const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.runId),
       eq(heartbeatRunEvents.eventType, "run.response_publication.failed")));
-    expect(events).toEqual([expect.objectContaining({ level: "error" })]);
+    expect(events).toEqual([expect.objectContaining({ level: "error", payload: expect.objectContaining({ lastRefusalReason: "no_final_agent_message" }) })]);
     const activity = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
       eq(activityLog.action, "issue.response_publication_failed")));
-    expect(activity).toEqual([expect.objectContaining({ runId: f.runId, agentId: f.agentId })]);
+    expect(activity).toEqual([expect.objectContaining({ runId: f.runId, agentId: f.agentId,
+      details: expect.objectContaining({ lastRefusalReason: "no_final_agent_message" }) })]);
     // Bounded: the failed reply is no longer rescheduled.
     expect(await work.load({ companyId: f.companyId, issueId: f.issueId })).toEqual([]);
+  });
+
+  it("publishes a GitHub review run's selected final prose to its task exactly once", async () => {
+    const f = await fixture();
+    await chatOrigin(f, "github");
+    const work = nativeResponsePresentationWork(db);
+    const [entry] = await work.load({ companyId: f.companyId, issueId: f.issueId });
+    // The first attempt arrives before the final runner event and leaves a receipt to settle.
+    const retry = await work.check(entry);
+    expect(retry).not.toBeNull();
+    expect(await comments(f.runId)).toEqual([]);
+    await f.saveFinalReply();
+    await makeDue(f.runId);
+    await expect(work.check({ ...entry, dueAt: 0 })).resolves.toBeNull();
+    expect(await comments(f.runId)).toEqual([expect.objectContaining({ body: reply, authorAgentId: f.agentId })]);
+    expect(await receipt(f.runId)).toMatchObject({ state: "resolved", attempts: 1 });
+    expect(await work.load({ companyId: f.companyId, issueId: f.issueId })).toEqual([]);
+    expect((await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, f.runId),
+      inArray(heartbeatRunEvents.eventType, ["run.response_publication.failed", "run.response_publication.retrying"]))))
+      .some(event => event.eventType === "run.response_publication.failed")).toBe(false);
+  });
+
+  it("does not publish a non-GitHub external chat run locally", async () => {
+    const f = await fixture();
+    await chatOrigin(f, "slack");
+    await f.saveFinalReply();
+    const work = nativeResponsePresentationWork(db);
+    const [entry] = await work.load({ companyId: f.companyId, issueId: f.issueId });
+    await work.check(entry);
+    expect(await comments(f.runId)).toEqual([]);
   });
 });
