@@ -23,6 +23,7 @@ import { conversationTurnAnswered } from "../native-runtime/native-governance.js
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
+import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 
 /**
@@ -588,7 +589,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       const wait = await bounded(now.getTime() + 30_000);
       if (wait) return wait;
     }
-    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt })
+    const [coordinator] = await q.select({ phase: nativeRunFinalizations.phase, nextAttemptAt: nativeRunFinalizations.nextAttemptAt,
+      failureCode: nativeRunFinalizations.failureCode, failureDetail: nativeRunFinalizations.failureDetail })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id)));
     if (coordinator && !boardHold) {
       if (NATIVE_PENDING_PHASES.includes(coordinator.phase)) {
@@ -600,13 +602,23 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         // (at most 3 attempts, jittered ~30 s then ~60 s apart, plus each
         // attempt's own startup wait), which can outlast the 120 s bound. Its
         // scheduled retry is a real further attempt: wait for it; after
-        // exhaustion the executor's note explains the message (rf4).
+        // exhaustion the fresh continuation's note explains the message.
         if (run.errorCode === "runner_ingress_startup_failed" && coordinator.nextAttemptAt) {
           return { kind: "pending", recheckAt: Math.max(now.getTime() + 30_000, coordinator.nextAttemptAt.getTime()) };
         }
         const wait = await bounded(Math.max(now.getTime() + 30_000, (coordinator.nextAttemptAt?.getTime() ?? 0) + OVERDUE_NATIVE_RETRY_MS));
         if (wait) return wait;
       }
+    }
+    // A first start whose Runner never connected spent its same-run retries,
+    // but the task continues by itself in a fresh run whose one note explains
+    // the message (r104c). The board-owned hold here is that run's own
+    // exhaustion record, which the disposition worker settles into the
+    // continuation. That is a further attempt: wait for it, bounded like
+    // every other.
+    if (nativeStartupNeverConnectedExhausted(coordinator)) {
+      const wait = await bounded(now.getTime() + 30_000);
+      if (wait) return wait;
     }
     // A declared blocker or attention request answers the person only when its
     // words were PUBLISHED for this message (a reply attributed above, or the

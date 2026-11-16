@@ -76,8 +76,9 @@ export function isSystemOwnedFailureCode(code: string | null | undefined): boole
  * A first start whose Runner never connected (runner_ingress_startup_failed,
  * proven by the controller checkpoint before each same-run retry) used up its
  * bounded retries. No provider thread ever existed, so there is nothing to
- * restore and no saved work to continue from: the person retries the task.
- * Reads the coordinator's own durable record of that proof (R1-04, rf4).
+ * restore. The task still continues automatically in a fresh run (a new box
+ * usually answers); only its note differs (r104c). Reads the coordinator's
+ * own durable record of that proof (R1-04, rf4).
  */
 export function nativeStartupNeverConnectedExhausted(coordinator: {
   phase: string; failureCode: string | null; failureDetail: Record<string, unknown> | null;
@@ -86,6 +87,11 @@ export function nativeStartupNeverConnectedExhausted(coordinator: {
   return coordinator?.phase === "terminal_failure" && coordinator.failureCode === "native_session_retry_exhausted"
     && detail?.originalFailureCode === "runner_ingress_startup_failed" && detail.recoveryMode === "bootstrap_retry"
     && detail.providerSessionEstablished === false && detail.providerEventsExist === false && detail.checkpointExists === false;
+}
+
+/** The fresh continuation's note for that case: no "earlier thread" to restore. */
+export function nativeStartupNeverConnectedFreshRunNote(attempts: number): string {
+  return `Provider startup failed ${attempts} times before any work began; starting again in a fresh run.`;
 }
 
 export function continuationCauseIsSystemOwned(run: Pick<ClassifiedRun, "status" | "errorCode" | "error" | "runnerProfileJson">): boolean {

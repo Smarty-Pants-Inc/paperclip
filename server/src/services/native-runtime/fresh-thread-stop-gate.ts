@@ -1,5 +1,6 @@
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { nativeStartupNeverConnectedExhausted, nativeStartupNeverConnectedFreshRunNote } from "../continuation-cause.js";
 import { hasBoundRemoteStopReceipt, hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "../remote-execution-termination.js";
 import { hasConfirmedSandboxStopAndRetain, hasRestoredEndedLeaseStopReceipt, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES } from "../sandbox-stop-and-retain.js";
 import { noLocalRunnerProcessesForRuns, proveRunProcessGone } from "../run-process-owner.js";
@@ -22,7 +23,16 @@ export async function freshThreadStartedNote(db: Pick<Db, "select">, run: typeof
   // Generic prepare refusal and unrelated specific prepare refusals stay neutral.
   if (code !== "native_runner_refresh_required"
     || (refusal?.prepareRefusalCode != null
-      && !isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))) return FRESH_THREAD_STARTED_NOTE;
+      && !isInstructionRefreshPrepareCode(refusal.prepareRefusalCode))) {
+    // A first start whose Runner never connected had no provider thread: its
+    // continuation says so plainly instead of narrating a restore (r104c).
+    const [coordinator] = await db.select({ phase: nativeRunFinalizations.phase, attempt: nativeRunFinalizations.attempt,
+      failureCode: nativeRunFinalizations.failureCode, failureDetail: nativeRunFinalizations.failureDetail })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, run.companyId),
+        eq(nativeRunFinalizations.runId, run.id))).limit(1);
+    return nativeStartupNeverConnectedExhausted(coordinator)
+      ? nativeStartupNeverConnectedFreshRunNote(coordinator!.attempt) : FRESH_THREAD_STARTED_NOTE;
+  }
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(
     eq(agents.companyId, run.companyId), eq(agents.id, run.agentId))).limit(1);
   return `your skill change is in effect; ${agent?.name ?? "the agent"} restarted its working thread to pick it up. The fresh thread in this conversation reads its saved history. Earlier actions with unknown outcomes are not confirmed or replayed.`;
