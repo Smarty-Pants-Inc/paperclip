@@ -11,6 +11,47 @@ import { assertBoatActivityAdmission } from "./lease-gates.js";
 import type { PluginEnvironmentSyncInParams, PluginEnvironmentSyncResult, PluginSyncFileMapping, PluginEnvironmentExecuteResult } from "@paperclipai/plugin-sdk";
 
 const exec = promisify(execFile);
+/** Core never asks for more than 30 minutes per sync step (MAX_SANDBOX_SYNC_TIMEOUT_MS). */
+export const MAX_SYNC_STEP_TIMEOUT_MS = 30 * 60_000;
+/**
+ * The longest one mapping holds its paperclip-boat-sync-* temp: five bounded
+ * steps (archive, transfer URL, transfer body, install, remote cleanup), each
+ * at most MAX_SYNC_STEP_TIMEOUT_MS. Older than this, no live sync owns it.
+ */
+export const SYNC_TEMP_MAX_AGE_MS = 5 * MAX_SYNC_STEP_TIMEOUT_MS;
+const SYNC_TEMP_PREFIX = "paperclip-boat-sync-";
+/** Exactly what fs.mkdtemp(SYNC_TEMP_PREFIX) creates: the prefix plus six characters. */
+const SYNC_TEMP_NAME = /^paperclip-boat-sync-[A-Za-z0-9]{6}$/;
+
+/**
+ * Worker startup sweep (smarty-dev#20912). A worker killed mid-transfer never
+ * runs syncFiles' finally, so its temp keeps transfer.tar (the transferred
+ * bytes). Remove only this plugin's own sync temps: exact mkdtemp names in
+ * os.tmpdir(), real directories (never a symlink), owned by this user, whose
+ * newest entry is older than SYNC_TEMP_MAX_AGE_MS. Best effort; never throws.
+ */
+export async function sweepStaleSyncTemps(now = Date.now(), directory = os.tmpdir()): Promise<{ removed: number; kept: number }> {
+  let names: string[];
+  try { names = await fs.readdir(directory); } catch { return { removed: 0, kept: 0 }; }
+  const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+  let removed = 0, kept = 0;
+  for (const name of names) {
+    if (!SYNC_TEMP_NAME.test(name)) continue;
+    const dir = path.join(directory, name);
+    try {
+      const stat = await fs.lstat(dir);
+      if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid)) continue;
+      let newest = stat.mtimeMs;
+      for (const entry of await fs.readdir(dir)) {
+        try { newest = Math.max(newest, (await fs.lstat(path.join(dir, entry))).mtimeMs); } catch { /* Raced away. */ }
+      }
+      if (now - newest <= SYNC_TEMP_MAX_AGE_MS) { kept++; continue; }
+      await fs.rm(dir, { recursive: true, force: true });
+      removed++;
+    } catch { /* A sweep failure never blocks worker startup. */ }
+  }
+  return { removed, kept };
+}
 export interface SyncTransport {
   request(path: string, init?: RequestInit): Promise<any>;
   run(command: string, timeoutMs: number, cwd?: string): Promise<PluginEnvironmentExecuteResult>;
@@ -177,7 +218,7 @@ async function installHost(mapping: PluginSyncFileMapping, archive: string, time
 export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound: boolean, io: SyncTransport): Promise<PluginEnvironmentSyncResult> {
   const id = params.lease.providerLeaseId;
   if (!id) throw new Error("Boat sync requires a lease ID");
-  const timeout = Math.max(60_000, params.minimumTimeoutMs ?? 0), base = `/sandboxes/${encodeURIComponent(id)}`;
+  const timeout = Math.min(MAX_SYNC_STEP_TIMEOUT_MS, Math.max(60_000, params.minimumTimeoutMs ?? 0)), base = `/sandboxes/${encodeURIComponent(id)}`;
   // Validate before any side effect, including optional adapter-authored commands.
   for (const op of params.operations) {
     for (const mapping of op.files) {
@@ -198,7 +239,7 @@ export async function syncFiles(params: PluginEnvironmentSyncInParams, outbound:
   for (const op of params.operations) {
     let bytesTransferred = 0, filesTransferred = 0;
     for (const mapping of op.files) {
-      const temp = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-boat-sync-")), local = path.join(temp, "transfer.tar");
+      const temp = await fs.mkdtemp(path.join(os.tmpdir(), SYNC_TEMP_PREFIX)), local = path.join(temp, "transfer.tar");
       const remote = `/tmp/paperclip-boat-sync-${randomUUID()}.tar`;
       let remoteAttempted = false;
       try {

@@ -225,6 +225,16 @@ restores owner write on an existing target before removing it. The EXIT trap als
 restores owner write on extracted staging data before cleanup, including failure
 paths with read-only nested directories.
 
+Each file mapping stages its transfer in a private `os.tmpdir()/paperclip-boat-sync-XXXXXX`
+directory (`transfer.tar`) removed when the step ends. A worker killed
+mid-transfer cannot remove it, so at worker startup the plugin removes its own
+stale sync temps (smarty-dev#20912): exact `paperclip-boat-sync-` mkdtemp names,
+real directories (never symlinks) owned by the worker user, whose newest entry
+is older than the maximum step window, five sync steps of at most 30 minutes
+(Core's `MAX_SANDBOX_SYNC_TIMEOUT_MS`, which also clamps the step timeout here),
+i.e. 150 minutes. Other prefixes are never touched. A younger directory is left
+for a possibly live worker; the next startup after the window removes it.
+
 Resume verifies the recorded workspace sentinel at the allocation's original
 cwd, even when Core rewrites `remoteCwd` to a prepared shared workspace below it.
 The allocation receipt must name the same sandbox and original cwd; foreign or
