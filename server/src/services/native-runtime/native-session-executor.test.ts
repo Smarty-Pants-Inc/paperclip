@@ -138,6 +138,7 @@ import * as nativeCredentialStores from "./native-credential-store.js";
 import * as managedCredentialWriteback from "../managed-ai-credential-writeback.js";
 import { completeManagedNativeCredentialTurn } from "./managed-native-credentials.js";
 import * as nativeExecutionDriver from "./native-runner-execution-driver.js";
+import { stageRemoteLaunchAssets } from "./remote-launch-assets.js";
 import * as runnerPrpOutbound from "../../realtime/runner-prp-outbound.js";
 import { Readable } from "node:stream";
 import type { StorageProvider } from "../../storage/types.js";
@@ -4138,6 +4139,156 @@ describe("remote provider pack manifest", () => {
     );
     await rm(root, { recursive: true, force: true });
   });
+});
+
+describe("with-env Pi RPC remote checkpoint", () => {
+  it.each(["missing", "launch-materialized"] as const)(
+    "runs the actual checkpoint with pi-agent %s",
+    async mode => {
+      const root = await mkdtemp(join(tmpdir(), "paperclip-wenv-checkpoint-"));
+      const priorStateDirectory = process.env.PAPERCLIP_RUNNER_STATE_DIR;
+      const priorManifestPath = state.bundledPackManifestPath;
+      const priorRunnerBinary = state.bundledRunnerBinary;
+      const priorResolvedRunnerBinary = state.resolveRunnerBinary.getMockImplementation();
+      const priorResolvedRemoteRunnerBinary = state.resolveRemoteRunnerBinary.getMockImplementation();
+      const sessionId = `with-env-${randomUUID()}`;
+      const remoteCwd = join(root, "workspace");
+      const configuredPiAgentDir = join(root, "shared-configured-pi-home", "agent");
+      const executionInput = {
+        ...execution,
+        binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(), runId: randomUUID() },
+        workspace: { ...execution.workspace, cwd: remoteCwd },
+        provider: { kind: "pi_rpc", model: "paperclip/selected-model", profile: QUALIFIED_PI_RPC_PROFILE, piRpcThinkingLevel: "low" },
+        session: { ...execution.session, normalizedSessionId: sessionId, driverKind: "pi_rpc",
+          lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+      } as unknown as NativeExecutionInputV1;
+      const runnerInstanceId = `wenv-checkpoint-${mode}`;
+      const remoteRuntimeRoot = join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
+      const remoteSessionRoot = join(remoteRuntimeRoot, "sessions", createHash("sha256").update(sessionId).digest("hex"));
+      const remoteFilesystemRoot = join(remoteSessionRoot, "filesystem");
+      const target = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd,
+        environmentId: "wenv-checkpoint", leaseId: undefined, providerKey: "daytona",
+        effectiveCapabilities: { runnerWebSocketIngress: true } };
+      const { nativePiProviderPackFixture } = await import("./native-pi-provider-pack.test-fixture.js");
+      const { packRoot, manifest } = await nativePiProviderPackFixture(join(root, "provider-pack"));
+      const runnerBinary = join(root, "linux-paperclip-runnerd");
+      const elf = Buffer.alloc(64); elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]); elf.writeUInt16LE(62, 18);
+      await writeFile(runnerBinary, elf);
+      state.bundledPackManifestPath = join(packRoot, "provider-pack.json");
+      state.bundledRunnerBinary = runnerBinary;
+      state.resolveRunnerBinary.mockReturnValue(runnerBinary);
+      state.resolveRemoteRunnerBinary.mockResolvedValue(runnerBinary);
+      process.env.PAPERCLIP_RUNNER_STATE_DIR = join(root, "controller-state");
+      await mkdir(remoteCwd, { recursive: true });
+      await mkdir(configuredPiAgentDir, { recursive: true, mode: 0o700 });
+      await writeFile(join(configuredPiAgentDir, "models.json"), "SHARED_MODELS_SENTINEL", { mode: 0o600 });
+      await writeFile(join(configuredPiAgentDir, "auth.json"), "SHARED_AUTH_SENTINEL", { mode: 0o600 });
+
+      const remoteExecute = vi.fn(async (request: { command: string; args?: string[]; stdin?: string }) => {
+        const script = request.args?.[1] ?? "";
+        if (request.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
+          providerPacks: [{ root: "/opt/paperclip-runner/provider-pack", manifest, immutable: true }],
+        }) };
+        if (request.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "paperclip-runnerd fixture", stderr: "" };
+        if (script === "uname -s; uname -m") return { exitCode: 0, timedOut: false, stdout: "Linux\nx86_64\n", stderr: "" };
+        if (request.command === "sh" && script.includes(remoteSessionRoot)) {
+          try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", request.args, { encoding: "utf8", input: request.stdin }), stderr: "" }; }
+          catch (error) {
+            const failure = error as NodeJS.ErrnoException & { status?: number; stdout?: Buffer | string; stderr?: Buffer | string };
+            return { exitCode: failure.status ?? 1, timedOut: false, stdout: String(failure.stdout ?? ""), stderr: String(failure.stderr ?? "") };
+          }
+        }
+        return { exitCode: 0, signal: null, timedOut: false, stderr: "", stdout: "" };
+      });
+      const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string; kind: string }> }>) => {
+        for (const operation of operations) for (const file of operation.files) {
+          if (!file.targetPath.startsWith(`${remoteCwd}/`)) continue;
+          await mkdir(dirname(file.targetPath), { recursive: true, mode: 0o700 });
+          await cp(file.sourcePath, file.targetPath, { recursive: file.kind === "directory", force: true });
+        }
+      });
+      const syncOut = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+        for (const operation of operations) for (const file of operation.files) {
+          await mkdir(dirname(file.targetPath), { recursive: true, mode: 0o700 });
+          await cp(file.sourcePath, file.targetPath, { recursive: true });
+          await chmod(file.targetPath, 0o700);
+        }
+      });
+      const runner = { execute: remoteExecute, syncIn, syncOut };
+      const profile = resolveNativeHarnessPersistenceProfile(executionInput);
+      const persistenceDirectories = profile.directories.map(directory => ({
+        name: directory.name,
+        location: directory.location,
+        targetPath: directory.location === "runner" ? join(remoteSessionRoot, "runner")
+          : join(remoteFilesystemRoot, directory.name),
+      }));
+      const driver = vi.spyOn(nativeExecutionDriver, "createNativeRunnerExecutionDriver");
+      try {
+        await createRunnerdBackend({ db: leaseDb(executionInput), execution: executionInput, runnerInstanceId,
+          runnerIngressAuthorized: true, runnerEnvironment: { PI_CODING_AGENT_DIR: configuredPiAgentDir },
+          runnerRemoteProviderPackPath: packRoot,
+          runnerExecutionTarget: { ...target, runner } as never });
+        state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+        const transport = state.createTransport.mock.calls.at(-1)![0] as RunnerTransportOptions & { stateDirectory: string };
+        expect(transport.environment?.PI_CODING_AGENT_DIR).toBe(configuredPiAgentDir);
+        expect(transport.environment?.PI_CODING_AGENT_DIR).not.toContain(remoteFilesystemRoot);
+
+        if (mode === "launch-materialized") {
+          await stageRemoteLaunchAssets({ root: transport.stateDirectory, transport: "sandbox", runner: runner as never,
+            persistenceDirectories, runtimeContext: null, caBundleMapping: null,
+            stageFile: asset => stageRemoteRunnerFile({ target: target as never, runner: runner as never, ...asset }),
+            stageDirectory: asset => stageRemoteRunnerDirectory({ target: target as never, runner: runner as never, ...asset }),
+          });
+        } else {
+          await mkdir(join(remoteFilesystemRoot, "pi"), { recursive: true, mode: 0o700 });
+        }
+        const identity = { runnerInstanceId, environmentLeaseId: "wenv-checkpoint-lease", runId: executionInput.binding.runId,
+          normalizedSessionId: sessionId, turnId: "turn-wenv", itemId: "item-wenv" };
+        await mkdir(join(remoteSessionRoot, "runner"), { recursive: true, mode: 0o700 });
+        await writeFile(join(remoteSessionRoot, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")), { mode: 0o600 });
+        await writeFile(join(remoteSessionRoot, "runner", "codex-provider-state.json"), JSON.stringify({
+          schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "pi-provider-chat",
+          providerSessionId: null, activeProviderTurnId: null, config: { provider: "pi_rpc", driver: "pi_rpc" },
+        }), { mode: 0o600 });
+        await mkdir(join(remoteFilesystemRoot, "pi"), { recursive: true, mode: 0o700 });
+        await writeFile(join(remoteFilesystemRoot, "pi", `${sessionId}.jsonl`), '{"type":"session","id":"pi-provider-chat"}\n', { mode: 0o600 });
+
+        const checkpoint = driver.mock.calls.at(-1)![0].checkpoint!;
+        if (mode === "missing") {
+          await expect(checkpoint("settled")).rejects.toThrow(
+            "runner_remote_checkpoint_incomplete: exact suspended harness state unavailable (unavailable)");
+          expect(syncOut).not.toHaveBeenCalled();
+          expect(existsSync(join(transport.stateDirectory, "failover-backups", "current", "manifest.json"))).toBe(false);
+        } else {
+          expect(existsSync(join(remoteFilesystemRoot, "pi-agent"))).toBe(true);
+          await expect(checkpoint("settled")).resolves.toBeUndefined();
+          const backupRoot = join(transport.stateDirectory, "failover-backups", "current");
+          const manifestBytes = await readFile(join(backupRoot, "manifest.json"), "utf8");
+          const backupManifest = JSON.parse(manifestBytes) as { directories: Array<{ name: string }> };
+          expect(backupManifest.directories.map(directory => directory.name)).toEqual(["runner", "pi-agent", "pi"]);
+          expect(await readFile(join(backupRoot, "pi", `${sessionId}.jsonl`), "utf8"))
+            .toBe('{"type":"session","id":"pi-provider-chat"}\n');
+          await expect(access(join(backupRoot, "pi-agent", "auth.json"))).rejects.toMatchObject({ code: "ENOENT" });
+          await expect(access(join(backupRoot, "pi-agent", "models.json"))).rejects.toMatchObject({ code: "ENOENT" });
+          expect(await readFile(join(configuredPiAgentDir, "auth.json"), "utf8")).toBe("SHARED_AUTH_SENTINEL");
+          expect(await readFile(join(configuredPiAgentDir, "models.json"), "utf8")).toBe("SHARED_MODELS_SENTINEL");
+          expect(syncOut).toHaveBeenCalledTimes(3);
+        }
+      } finally {
+        driver.mockRestore();
+        if (priorStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
+        else process.env.PAPERCLIP_RUNNER_STATE_DIR = priorStateDirectory;
+        state.bundledPackManifestPath = priorManifestPath;
+        state.bundledRunnerBinary = priorRunnerBinary;
+        state.resolveRunnerBinary.mockReset().mockImplementation(priorResolvedRunnerBinary ?? (() => "/tmp/paperclip-runnerd"));
+        state.resolveRemoteRunnerBinary.mockReset().mockImplementation(priorResolvedRemoteRunnerBinary ?? (input => Promise.resolve(input.configuredPath || "/tmp/paperclip-runnerd")));
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("provider pack read diagnostics", () => {
