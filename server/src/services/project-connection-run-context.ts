@@ -48,8 +48,26 @@ async function taskProject(db: Executor, companyId: string, issueId: string | nu
   return issue.projectId;
 }
 
-/** Authenticate stored run/task binding and capture issues.projectId under admission locks. */
-export async function captureProjectConnectionRunContext(db: Executor, input: CaptureInput): Promise<ProjectConnectionRunContext> {
+/** Only queue admission may create the pair; credential consumers must only read it. */
+export function captureProjectConnectionRunContext(db: Executor, input: CaptureInput): Promise<ProjectConnectionRunContext> {
+  return resolveRunContext(db, input, true);
+}
+
+/** Read the admission pair without inventing one at first credential/cache use. */
+export function readProjectConnectionRunContext(db: Executor, input: CaptureInput): Promise<ProjectConnectionRunContext> {
+  return resolveRunContext(db, input, false);
+}
+
+/** Preserve the immutable DB pair through every later whole-snapshot replacement. */
+export function projectConnectionRunSnapshot(snapshot: Record<string, unknown>) {
+  const { [SNAPSHOT_KEY]: _untrusted, ...rest } = snapshot;
+  return sql<Record<string, unknown>>`${JSON.stringify(rest)}::jsonb || case
+    when ${heartbeatRuns.contextSnapshot} ? ${SNAPSHOT_KEY}
+    then jsonb_build_object(${SNAPSHOT_KEY}::text, ${heartbeatRuns.contextSnapshot}->${SNAPSHOT_KEY})
+    else '{}'::jsonb end`;
+}
+
+async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission: boolean): Promise<ProjectConnectionRunContext> {
   if (!input.heartbeatRunId) {
     // Only existing authorized server checkout callers use an issue without a run.
     const issueId = input.issueId ?? null;
@@ -74,6 +92,7 @@ export async function captureProjectConnectionRunContext(db: Executor, input: Ca
       if (saved.issueId !== issueId || saved.projectId !== await taskProject(tx, input.companyId, issueId)) throw invalid();
       return { companyId: input.companyId, agentId: input.agentId, heartbeatRunId: initial.id, ...saved };
     }
+    if (!atAdmission) throw invalid();
     // Existing task-before-run ordering, then the common start/retire project row.
     const projectId = await taskProject(tx, input.companyId, issueId, true);
     if (projectId) await lockProjectConnectionLifecycle(tx, { companyId: input.companyId, projectId });
@@ -97,7 +116,7 @@ export async function captureProjectConnectionRunContext(db: Executor, input: Ca
 
 /** Recheck the SAME binding after provider I/O/cache; never switch scope. */
 export async function revalidateProjectConnectionRunContext(db: Executor, context: ProjectConnectionRunContext): Promise<void> {
-  const current = await captureProjectConnectionRunContext(db, context);
+  const current = await readProjectConnectionRunContext(db, context);
   if (current.issueId !== context.issueId || current.projectId !== context.projectId) throw invalid();
 }
 

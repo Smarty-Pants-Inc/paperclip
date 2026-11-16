@@ -18,7 +18,7 @@ import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
 import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
-import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, type ProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, type ProjectConnectionRunContext } from "./project-connection-run-context.js";
 
 /**
  * Server-side git credentials for managed project checkouts and execution-workspace base
@@ -324,7 +324,20 @@ export function createGitRemoteAuthProvider(
   };
 
   return async (remoteUrl: string) => {
-    if (!isSupportedGitHubRemoteUrl(remoteUrl)) return null;
+    if (!isSupportedGitHubRemoteUrl(remoteUrl)) {
+      // Never let a protected GitHub checkout drop into inline credentials or an
+      // unsupported SSH/helper form. Local and genuinely non-GitHub remotes retain
+      // their upstream behavior.
+      let github = /^[^@\s]+@(?:www\.)?github\.com:/i.test(remoteUrl);
+      try { github ||= isGitHubDotCom(new URL(remoteUrl).hostname); } catch { /* local path */ }
+      if (github && db && (context?.heartbeatRunId || context?.issueId)) {
+        const selected = await resolveManagedGitHubIdentitySelection(db, companyId, context ?? {});
+        if (selected.connection?.projectId || selected.error?.startsWith("project_connection_")) {
+          throw new Error("project_connection_unavailable: Protected GitHub work requires managed authentication");
+        }
+      }
+      return null;
+    }
     if (db && context?.heartbeatRunId && context.agentId) {
       const [run] = await db.select({ contextId: heartbeatRuns.activeIdentityContextId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, context.heartbeatRunId), eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, context.agentId),
@@ -380,7 +393,7 @@ export async function resolveManagedGitHubIdentitySelection(
   let managedRequired = false;
   try {
     if (context.heartbeatRunId || context.issueId) {
-      runContext = await captureProjectConnectionRunContext(db, {
+      runContext = await readProjectConnectionRunContext(db, {
         companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
       });
       managedRequired = Boolean(runContext.projectId && await isProjectConnectionManagedRequired(db, {
@@ -628,7 +641,7 @@ export async function resolveManagedGitHubCredential(
 ): Promise<{ configured: boolean; identitySource?: "personal" | "dedicated"; credential?: GitCredential; error?: string }> {
   let captured: ProjectConnectionRunContext | undefined;
   try {
-    if (context.heartbeatRunId || context.issueId) captured = await captureProjectConnectionRunContext(db, {
+    if (context.heartbeatRunId || context.issueId) captured = await readProjectConnectionRunContext(db, {
       companyId, agentId: context.agentId ?? "", heartbeatRunId: context.heartbeatRunId, issueId: context.issueId,
     });
   } catch { return { configured: true, error: "project_connection_run_context_invalid" }; }
