@@ -126,7 +126,7 @@ export async function recoverSettledNativeRunLog(
       agentIdentityService(db).createExistingLogRedactor(companyId, binding[2]!),
       createRunSecretRedactionRegistry(db).redactionValuesForRun(companyId, runId),
     ]);
-    addRunSecretMaterial(identityRedactor, secrets);
+    addRunSecretMaterial(identityRedactor, secrets, [runId, companyId, binding[2]]);
     const handle = await store.begin({
       companyId,
       agentId: binding[2]!,

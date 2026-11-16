@@ -37,17 +37,46 @@ type MaterialStream = { context: boolean; token: string; suppressed: boolean; ma
 const newMaterialStream = (): MaterialStream => ({ context: false, token: "", suppressed: false, marker: "" });
 
 /**
- * Add a run's secret values to a redactor's exact values and key-body window
- * index. Live preparation and native log recovery both use this, so the two
- * paths cannot drift on how a run secret is matched.
+ * The shortest run-secret value matched in text, whole or derived: the floor
+ * the derived-line rule already used. A shorter value ("1", "v1") cannot be told
+ * apart from ordinary output, so indexing it only corrupts logs and events.
  */
-export function addRunSecretMaterial(redactor: { values: string[] }, secrets: Iterable<string>) {
+export const MIN_RUN_SECRET_LENGTH = 8;
+const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Lowercase DNS names ending in an alphabetic label; mixed-case tokens (JWTs,
+// API keys) and URLs with credentials never match.
+const HOST_NAME_VALUE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
+// Cloud region names only (us-east-1, europe-west4), not any dashed word list.
+const REGION_VALUE = /^(?:us|eu|ap|sa|ca|me|af|il|mx|cn|europe|asia|australia|northamerica|southamerica|africa)(?:-gov)?-(?:east|west|north|south|central|northeast|northwest|southeast|southwest)-?\d{1,2}[a-z]?$/;
+
+/**
+ * An identifier is public run metadata, not secret text: a UUID, a known
+ * agent/company/environment/connection/run id, a host name or a region. Masking
+ * it would rewrite event metadata and ordinary log text (a LANGFUSE_USER_ID env
+ * bound to the agent's own id).
+ */
+export function isRunSecretIdentifier(value: string, identifiers: ReadonlySet<string> = new Set()) {
+  const trimmed = value.trim();
+  return identifiers.has(value) || identifiers.has(trimmed) || UUID_VALUE.test(trimmed)
+    || HOST_NAME_VALUE.test(trimmed) || REGION_VALUE.test(trimmed);
+}
+
+/**
+ * Add a run's secret values to a redactor's exact values and key-body window
+ * index. Live preparation, observability values, the native control-plane port
+ * and native log recovery all use this, so the paths cannot drift on how a run
+ * secret is matched. `identifiers` are the run's own ids, never indexed.
+ */
+export function addRunSecretMaterial(redactor: { values: string[] }, secrets: Iterable<string>, identifiers: Iterable<string | null | undefined> = []) {
   const known = new Set(redactor.values);
+  const ids = new Set([...identifiers].filter((id): id is string => typeof id === "string" && id.length > 0));
   for (const secret of new Set(secrets)) {
+    if (typeof secret !== "string" || secret.length < MIN_RUN_SECRET_LENGTH || isRunSecretIdentifier(secret, ids)) continue;
     // Keep the whole secret; drop derived lines too short to mean anything
-    // (a JSON secret's "{" line would otherwise mask every brace).
+    // (a JSON secret's "{" line would otherwise mask every brace) or that are
+    // identifiers themselves.
     for (const value of createAgentIdentityRedactor(secret).values) {
-      if (known.has(value) || (value !== secret && value.length < 8)) continue;
+      if (known.has(value) || value.length < MIN_RUN_SECRET_LENGTH || isRunSecretIdentifier(value, ids)) continue;
       known.add(value);
       redactor.values.push(value);
     }

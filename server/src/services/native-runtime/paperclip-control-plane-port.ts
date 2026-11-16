@@ -134,7 +134,10 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     this.#assertControllerActive = options.assertControllerActive;
     this.#assertRunAdmissionActive = options.assertRunAdmissionActive ?? options.assertControllerActive;
     this.#identityRedactor = createAgentIdentityRedactor(options.privateKeyPem);
-    addRunSecretMaterial(this.#identityRedactor, options.runSecretMaterial ?? []);
+    // The run's own ids are protocol metadata, never secret text.
+    addRunSecretMaterial(this.#identityRedactor, options.runSecretMaterial ?? [], [binding.companyId, binding.issueId,
+      binding.runId, binding.agentId, binding.sessionId, binding.completionContractId, binding.sourceInstanceId,
+      binding.controlPlaneSourceInstanceId]);
     this.#binding = structuredClone(binding);
     this.#onCommittedEvent = options.onCommittedEvent;
     this.#onEventPersistence = options.onEventPersistence;
@@ -381,7 +384,11 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
     if (!isPrpEvent(value)) throw new Error("native_legacy_event_not_supported");
     const validated = validatePrpEvent(value);
     if (!validated.ok) throw new Error(`native_event_schema_invalid:${validated.issues[0]?.message ?? "unknown"}`);
-    let event = this.#identityRedactor.redact(validated.event);
+    // Binding checks read the validated event. Only content (payload, debug)
+    // is redacted; protocol metadata (schema, ids, sequence, cursor, binding)
+    // is committed byte-equal so a run secret can neither refuse nor rewrite it.
+    let event: PrpEvent = { ...validated.event, payload: this.#identityRedactor.redact(validated.event.payload),
+      ...(validated.event.debug === undefined ? {} : { debug: this.#identityRedactor.redact(validated.event.debug) }) };
     if (event.runId !== this.#binding.runId || (this.#sessionId && event.normalizedSessionId !== this.#sessionId)) {
       throw new Error("native_event_binding_mismatch");
     }
