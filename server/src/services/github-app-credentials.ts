@@ -3,7 +3,7 @@ import { connectionGrants, toolConnections, toolConnectionInstalls, projectWorks
 import { resolveConnectionGrantSecret, validateConnectionGrantSecretOwnership } from "./connection-credentials.js";
 import { HttpError, unprocessable } from "../errors.js";
 import { assertNotManagerApp, projectAppManagerConfigured, readProjectAppCustody } from "./project-app-custody.js";
-import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
+import { assertProjectConnectionAdmission, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
 import { createGitHubAppClient, GITHUB_APP_KEY_PATH, isGitHubAppConnection, parseGitHubAppConfig, githubAppFailure, rethrowGitHubAppFailure } from "./github-app-client.js";
 import { assertNotProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 
@@ -145,6 +145,17 @@ export async function resolveGitHubAppCredential(db: Db, connection: Connection,
 }
 
 export async function refreshGitHubAppAccess(db: Db, connection: Connection, force = false) {
+  if (connection.projectId) {
+    // Refresh has no credential recipient. Check the same DB off switch before
+    // any acquisition (or recipient-less use denial), never manufacture a
+    // recipient/management authority to make a refresh succeed.
+    const scope = readProjectConnectionScope(connection)!;
+    const app = parseGitHubAppConfig(connection.config.methodConfig);
+    await readProjectAppCustody(db, { companyId: connection.companyId, projectId: connection.projectId,
+      config: connection.config, refs: connection.credentialSecretRefs, connectionId: connection.id,
+      registrationId: scope.registrationId,
+      repositoryIds: await projectConnectionRepositoryIds(db, connection.companyId, connection.projectId, app.repositories) });
+  }
   const grant = await getGitHubAppGrant(db, connection);
   const result = await resolveGitHubAppCredential(db, connection, grant, connection.status === "draft", force);
   await db.update(connectionGrants).set({ providerTenant: { github: result.github } }).where(and(
