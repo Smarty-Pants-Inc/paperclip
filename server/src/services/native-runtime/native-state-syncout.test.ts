@@ -1,6 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { logger } from "../../middleware/logger.js";
 import { readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import {
@@ -147,5 +149,134 @@ describe("native session state syncOut", () => {
       expect(log.mock.calls.flat().join(" ")).not.toContain(stateBytes);
       expect(log.mock.calls.flat().join(" ")).not.toContain("https://");
     } finally { log.mockRestore(); }
+  });
+});
+
+describe("native session state syncOut under a recovery deadline", () => {
+  afterEach(() => { vi.useRealTimers(); });
+  const okProbe = () => vi.fn(async () => ({ exitCode: 0, timedOut: false, stdout: "", stderr: "" }));
+  const reset = () => Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" });
+  type Ops = Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>;
+  const writeState = (ops: Ops, bytes: string) => {
+    for (const file of ops.flatMap(op => op.files)) {
+      mkdirSync(dirname(file.targetPath), { recursive: true });
+      writeFileSync(file.targetPath, bytes, { mode: 0o600 });
+    }
+    return { operations: [] };
+  };
+  // Observes a read without awaiting it, so a read that never settles fails an
+  // assertion instead of hanging the test.
+  const observe = <T>(promise: Promise<T>) => {
+    let outcome: { value?: T; error?: unknown; at: number } | undefined;
+    promise.then(value => { outcome = { value, at: Date.now() }; }, error => { outcome = { error, at: Date.now() }; });
+    return () => outcome;
+  };
+
+  it("recovers a state read when one syncOut transfer resets and the next succeeds", async () => {
+    vi.useFakeTimers();
+    const syncOut = vi.fn()
+      .mockImplementationOnce(async () => { throw reset(); })
+      .mockImplementation(async (ops: Ops) => writeState(ops, stateBytes));
+    const read = observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never,
+      stateDirectory: "/private", recoveryDeadline: Date.now() + 30_000 }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(read()?.error).toBeUndefined();
+    expect(read()?.value).toEqual(JSON.parse(stateBytes));
+    expect(syncOut).toHaveBeenCalledTimes(2);
+  });
+
+  it("classes a syncOut transport failure on every attempt as probe_transport_failed", async () => {
+    vi.useFakeTimers();
+    const syncOut = vi.fn(async () => { throw reset(); });
+    const read = observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never,
+      stateDirectory: "/private", recoveryDeadline: Date.now() + 2_000 }));
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(read()).toBeDefined();
+    expect(readRemoteRunnerRecoveryError(read()?.error)).toEqual({ stage: "runner_state", reason: "probe_transport_failed" });
+    expect(read()?.error).toMatchObject({ code: "ECONNRESET" });
+    expect(syncOut.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("times a syncOut transfer that outlives the recovery deadline out at the deadline", async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const syncOut = vi.fn(async (ops: Ops) => { await released; return writeState(ops, stateBytes); });
+    const deadline = Date.now() + 5_000;
+    const read = observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never,
+      stateDirectory: "/private", recoveryDeadline: deadline }));
+    try {
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(read()).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(read()).toBeDefined();
+      expect(read()?.at).toBe(deadline);
+      expect(readRemoteRunnerRecoveryError(read()?.error)).toEqual({ stage: "runner_state", reason: "probe_timeout" });
+    } finally {
+      release();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+  });
+
+  it("parses only the bytes of the attempt that succeeded, never an earlier attempt's partial write", async () => {
+    vi.useFakeTimers();
+    const secondBytes = JSON.stringify({ principalSession: "attempt-2", n: 2 });
+    const partialBytes = '{"principalSession":"attempt-1-partial-bytes-left-behind-by-a-reset-transfer","n":';
+    const targets: string[] = [];
+    const syncOut = vi.fn()
+      .mockImplementationOnce(async (ops: Ops) => {
+        for (const file of ops.flatMap(op => op.files)) targets.push(file.targetPath);
+        writeState(ops, partialBytes);
+        throw reset();
+      })
+      .mockImplementation(async (ops: Ops) => {
+        // Writes from offset 0 without truncating, as a resumed stream would.
+        for (const file of ops.flatMap(op => op.files)) {
+          targets.push(file.targetPath);
+          mkdirSync(dirname(file.targetPath), { recursive: true });
+          const fd = openSync(file.targetPath, existsSync(file.targetPath) ? "r+" : "w", 0o600);
+          try { writeSync(fd, secondBytes, 0); } finally { closeSync(fd); }
+        }
+        return { operations: [] };
+      });
+    const read = observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never,
+      stateDirectory: "/private", recoveryDeadline: Date.now() + 30_000 }));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(read()?.error).toBeUndefined();
+    expect(read()?.value).toEqual(JSON.parse(secondBytes));
+    expect(targets).toHaveLength(2);
+    for (const target of targets) expect(existsSync(dirname(target))).toBe(false);
+  });
+
+  it("leaves no staged state bytes behind when a transfer abandoned at the deadline settles later", async () => {
+    vi.useFakeTimers();
+    const lateBytes = JSON.stringify({ principalSession: `late-transfer-${randomUUID()}` });
+    let release!: () => void;
+    const released = new Promise<void>(resolve => { release = resolve; });
+    const targets: string[] = [];
+    let transfer: Promise<unknown> | undefined;
+    const syncOut = vi.fn((ops: Ops) => {
+      for (const file of ops.flatMap(op => op.files)) targets.push(file.targetPath);
+      // File sync recreates the target's parent before it writes.
+      transfer = released.then(() => writeState(ops, lateBytes));
+      return transfer;
+    });
+    const deadline = Date.now() + 3_000;
+    const read = observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never,
+      stateDirectory: "/private", recoveryDeadline: deadline }));
+    try {
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(readRemoteRunnerRecoveryError(read()?.error)).toEqual({ stage: "runner_state", reason: "probe_timeout" });
+    } finally {
+      release();
+      await transfer;
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(targets.length).toBeGreaterThan(0);
+    for (const target of targets) expect(existsSync(dirname(target))).toBe(false);
+    const leftovers = readdirSync(tmpdir()).filter(name => name.startsWith("paperclip-native-state-"))
+      .flatMap(name => { try { return readdirSync(join(tmpdir(), name)).map(file => join(tmpdir(), name, file)); } catch { return []; } })
+      .filter(path => { try { return readFileSync(path, "utf8").includes(lateBytes); } catch { return false; } });
+    expect(leftovers).toEqual([]);
   });
 });
