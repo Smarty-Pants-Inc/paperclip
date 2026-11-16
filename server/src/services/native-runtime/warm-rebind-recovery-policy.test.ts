@@ -339,3 +339,104 @@ describe("D-B5 RFL refreshTools caller trace", () => {
     expect(withExecutorFlag).toMatchObject({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" });
   });
 });
+
+// Gate 6 (prp-resume-unavailable, fresh's image). F1: the warm controller's
+// same-run load (loadWarmNativeCheckpoint's sameRunRecovery branch) returned the
+// session snapshot as is, and a session snapshot never carries a policy. Fill an
+// absent one with the SAME nativeProviderRecoveryPolicy the rebind uses.
+// A replacement on a definite absence that actually changed the provider
+// session writes ONE person-visible line. Its durable identity record is
+// J3-17's (dl/identity-changed, provider-identity-lineage.ts); F7a writes none.
+describe("gate 6: same-run recovery policy and the person-visible replacement line", () => {
+  // Read per row so this file's other rows still load before the export exists.
+  const personLine = (reason: "resume_failed_on_new_box" | "runner_state_lost"): string =>
+    (nativeExecutor as unknown as { nativeProviderIdentityChangePersonLine?: (r: string) => string })
+      .nativeProviderIdentityChangePersonLine?.(reason) ?? `missing nativeProviderIdentityChangePersonLine(${reason})`;
+  const PERSON_LINE_PREFIX = "[paperclip] ";
+  const sameRunSnapshot = (f: ReturnType<typeof fixture>, extra: Partial<PersistedNativeSession> = {}): PersistedNativeSession => ({
+    ...f.snapshot("done"), identity: { ...f.snapshot("done").identity, runId: f.current.binding.runId },
+    semanticResult: null, cursor: "3", activeTurnId: "turn-inflight", ...extra,
+  });
+  async function warmSameRunLoad(f: ReturnType<typeof fixture>, checkpoint: PersistedNativeSession) {
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      await options.onCheckpoint?.(checkpoint);
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {} });
+    let warm: PersistedNativeSession | null | undefined;
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      warm = options.persistedSession;
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {} });
+    return warm;
+  }
+
+  it.each([
+    ["a first-turn fresh open", {}, "allow_replacement_after_resume_failure"],
+    ["an unfinished goal (guard: same_session_only never replaces)", { goal: { status: "active", objective: "Still unfinished" } as PersistedNativeSession["goal"] }, "same_session_only"],
+  ] as const)("fills an absent policy on a same-run warm checkpoint: %s", async (_label, extra, expected) => {
+    const f = fixture(home);
+    const checkpoint = sameRunSnapshot(f, extra);
+    expect(checkpoint).not.toHaveProperty("providerRecoveryPolicy");
+    const warm = await warmSameRunLoad(f, checkpoint);
+    // Same-run: the identity is NOT rebound and the turn state is kept.
+    expect(warm).toMatchObject({ identity: checkpoint.identity, activeTurnId: "turn-inflight", cursor: "3" });
+    expect(warm?.providerRecoveryPolicy).toBe(expected);
+    expect(warm?.providerRecoveryPolicy).toBe(nativeResume.nativeProviderRecoveryPolicy(checkpoint as unknown as Record<string, unknown>));
+  });
+
+  it("keeps a same-run warm checkpoint's own policy", async () => {
+    const f = fixture(home);
+    const warm = await warmSameRunLoad(f, sameRunSnapshot(f, { providerRecoveryPolicy: "allow_replacement_after_governed_wait" }));
+    expect(warm?.providerRecoveryPolicy).toBe("allow_replacement_after_governed_wait");
+  });
+
+  async function replacedRun(f: ReturnType<typeof fixture>, identityChangeReason: "resume_failed_on_new_box" | "runner_state_lost",
+    replacement = { driver: "db5-driver-replacement", provider: "db5-provider-replacement" },
+    previous = { driver: "db5-driver-session", provider: "db5-provider-session" }) {
+    const logs: string[] = [];
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      await options.onContinuityBreak?.({ reason: "NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
+        previousDriverSessionId: previous.driver, previousProviderSessionId: previous.provider,
+        replacementDriverSessionId: replacement.driver, replacementProviderSessionId: replacement.provider,
+        identityChangeReason } as Parameters<NonNullable<RuntimeOptions["onContinuityBreak"]>>[0]);
+      return completed(f.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: f.dbFor(f.current), execution: f.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {},
+      onLog: async (_stream: string, text: string) => { logs.push(text); } });
+    return logs;
+  }
+  it.each(["resume_failed_on_new_box", "runner_state_lost"] as const)("writes ONE person-visible line on a %s replacement that changed the provider session", async reason => {
+    const f = fixture(home);
+    const logs = await replacedRun(f, reason);
+    const lines = logs.filter(line => line.startsWith(PERSON_LINE_PREFIX));
+    expect(lines).toEqual([personLine(reason)]);
+    expect(lines[0]).toMatch(/new conversation/);
+    // A person reads it: no driver or session identifiers.
+    expect(lines[0]).not.toMatch(/driver|session=|db5-/);
+    // F7a writes no durable identity record of its own (J3-17 owns the one record type).
+    const root = nativeExecutor.scopedRunnerdStateRoot(f.current);
+    expect(await readdir(root).catch(() => [] as string[])).not.toContain("provider-identity-records.json");
+  });
+
+  it("writes no person line when the provider session did not change, or without a definite absence", async () => {
+    const unchanged = await replacedRun(fixture(home), "runner_state_lost",
+      { driver: "same", provider: "same" }, { driver: "same", provider: "same" });
+    expect(unchanged.filter(line => line.startsWith(PERSON_LINE_PREFIX))).toEqual([]);
+    const g = fixture(home);
+    const logs: string[] = [];
+    provider.execute.mockImplementationOnce(async (options: RuntimeOptions) => {
+      await options.onContinuityBreak?.({ reason: "provider session is no longer recoverable",
+        previousDriverSessionId: "a", previousProviderSessionId: "a", replacementDriverSessionId: "b", replacementProviderSessionId: "b" });
+      return completed(g.current);
+    });
+    await nativeExecutor.executePaperclipNativeSession({ db: g.dbFor(g.current), execution: g.current,
+      runnerInstanceId: "db5-runner", backend: unusedBackend, useRunnerd: false, onUsage: async () => {},
+      onLog: async (_stream: string, text: string) => { logs.push(text); } });
+    expect(logs.filter(line => line.startsWith(PERSON_LINE_PREFIX))).toEqual([]);
+  });
+});
