@@ -172,6 +172,7 @@ import { skillVersionSelectionMap } from "../services/runtime-skill-selections.j
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
 import { authorizationDeniedDetails, issueReadSqlCondition } from "../services/authorization.js";
 import { assertAgentLifecycleAuthority, assertCanManageSubordinateAgent, assertSubordinateBudgetChange, subordinatePermissionScope } from "../services/agent-subtree-management.js";
+import { assertAgentRetirementHandoverAllowed } from "../services/agent-handover-items.js";
 import { assertReportEnvSecretAccess, canConfigureReportRuntime, isReportRuntimeEnv } from "../services/agent-report-runtime.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import { AGENT_TERMINATED_STOP_REASON } from "../services/governance-pause-stop.js";
@@ -2638,9 +2639,18 @@ export function agentRoutes(
   function lifecycleForRequest(
     req: Request, target: { id: string; companyId: string }, command?: "pause" | "resume" | "terminate",
   ) {
-    if (req.actor.type !== "agent") return svcLifecycle;
+    if (req.actor.type !== "agent" && command !== "terminate") return svcLifecycle;
+    // A termination names its caller on the terminal audit row, and its
+    // hand-over refusals run at request time, under the company lock, before
+    // any write: a root with live reports, or a caller without authority over them.
+    const actor = getActorInfo(req);
     return createAgentLifecycle(db, { cancelWorkForScope: scope => heartbeat.cancelBudgetScopeWork(scope) },
-      tx => assertAgentLifecycleAuthority(tx, req.actor, target, command));
+      async tx => {
+        if (req.actor.type === "agent") await assertAgentLifecycleAuthority(tx, req.actor, target, command);
+        if (command === "terminate") await assertAgentRetirementHandoverAllowed(tx, req.actor, target);
+      },
+      command === "terminate" ? { actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId,
+        runId: actor.runId, agentApiKeyId: actor.agentApiKeyId } : undefined);
   }
 
   function assertNoAgentInstructionsConfigMutation(
@@ -6169,22 +6179,39 @@ export function agentRoutes(
       return;
     }
 
-    const companyAgentRows = await db
-      .select({
-        id: agentsTable.id,
-        companyId: agentsTable.companyId,
-        name: agentsTable.name,
-        reportsTo: agentsTable.reportsTo,
-        status: agentsTable.status,
-      })
-      .from(agentsTable)
-      .where(eq(agentsTable.companyId, agent.companyId));
-    const invalidOrgChainDescendantIds = listInvalidOrgChainDescendantIds(id, companyAgentRows);
-    const cancellation = await heartbeat.cancelInvocationsForAgents(
-      [id, ...invalidOrgChainDescendantIds],
-      AGENT_TERMINATED_STOP_REASON,
-    );
+    // The termination has committed. Stopping its work now is best-effort: the
+    // lifecycle worker keeps stopping it until Stop is proven, so a failed
+    // delivery here never turns a committed terminate into an error.
+    let cancellation: Awaited<ReturnType<typeof heartbeat.cancelInvocationsForAgents>> | null = null;
+    let invalidOrgChainDescendantIds: string[] = [];
+    try {
+      const companyAgentRows = await db
+        .select({
+          id: agentsTable.id,
+          companyId: agentsTable.companyId,
+          name: agentsTable.name,
+          reportsTo: agentsTable.reportsTo,
+          status: agentsTable.status,
+        })
+        .from(agentsTable)
+        .where(eq(agentsTable.companyId, agent.companyId));
+      invalidOrgChainDescendantIds = listInvalidOrgChainDescendantIds(id, companyAgentRows);
+      cancellation = await heartbeat.cancelInvocationsForAgents(
+        [id, ...invalidOrgChainDescendantIds],
+        AGENT_TERMINATED_STOP_REASON,
+      );
+    } catch (error) {
+      logger.warn({ err: error, agentId: id, companyId: agent.companyId },
+        "Post-commit stop delivery for a terminated agent failed; the lifecycle worker keeps stopping it");
+    }
 
+    // A lifecycle termination writes agent.terminated in its terminal
+    // transaction, for POST and PATCH alike. Only a rejected pending hire,
+    // which never enters that lifecycle, is recorded here.
+    if (existing.status !== "pending_approval") {
+      res.json(redactAgentRowForResponse(agent));
+      return;
+    }
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
@@ -6203,9 +6230,9 @@ export function agentRoutes(
           state: invalidOrgChainDescendantIds.length > 0 ? "descendants_invalid_under_terminated_manager" : "none",
         },
         cancellation: {
-          agentIds: cancellation.agentIds,
-          runsCancelled: cancellation.runsCancelled,
-          wakeupsCancelled: cancellation.wakeupsCancelled,
+          agentIds: cancellation?.agentIds ?? [],
+          runsCancelled: cancellation?.runsCancelled ?? 0,
+          wakeupsCancelled: cancellation?.wakeupsCancelled ?? 0,
         },
       },
     });
