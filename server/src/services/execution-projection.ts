@@ -23,6 +23,9 @@ import { hasPendingRunCleanup } from "./execution-blocker.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { NATIVE_RESPONSE_WAKE_WAITING_REASON } from "./native-runtime/status-arbiter.js";
 import { agentQueueLinesForRuns } from "./heartbeat/queued-run-line.js";
+import { NATIVE_CLEANUP_SETTLING_MESSAGE } from "./native-runtime/completed-turn-cleanup.js";
+import { NATIVE_CLEANUP_HOLD_CAUSE, NATIVE_CLEANUP_HOLD_NEXT_ACTION, nativeCleanupAdmissionBlock }
+  from "./native-runtime/native-cleanup-admission-hold.js";
 const MAX_PREDECESSOR_CLEANUP_CHECKS = 16;
 const text = (v: unknown) => (typeof v === "string" ? v : null);
 const executionRunColumns = {
@@ -201,7 +204,7 @@ export async function executionProjectionsForRuns(
   const setupAgentIds = [...new Set(queuedRuns.filter(run => !run.startedAt).map(run => run.agentId))];
   const setupAgents = setupAgentIds.length ? await read(async () => db
     .select({ id: agents.id, lifecycleState: agents.lifecycleState,
-      lifecycleHolds: agents.lifecycleHolds,
+      lifecycleHolds: agents.lifecycleHolds, adapterType: agents.adapterType,
       retryRequired: sql<boolean>`coalesce(${agents.lifecycleOperation}->>'retryRequired', 'false') = 'true'` })
     .from(agents).where(and(eq(agents.companyId, companyId), inArray(agents.id, setupAgentIds)))) : [];
   const setupByAgent = new Map(setupAgents.map(agent => [agent.id, agent]));
@@ -212,6 +215,17 @@ export async function executionProjectionsForRuns(
     : new Map<string, NonNullable<ExecutionProjection["agentQueue"]>>();
   const issueIdOf = (run: Run) => run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
   const queuedIssueIds = [...new Set(queuedRuns.map(issueIdOf).filter((id): id is string => !!id))];
+  // Admission keeps a never-started runner run queued while its task's
+  // previous native session cleanup is unsettled (#21031). Name that hold with
+  // admission's own predicate, read once per task from this process's gate.
+  const cleanupHeldRuns = new Set<string>();
+  const cleanupBlockByIssue = new Map<string, ReturnType<typeof nativeCleanupAdmissionBlock>>();
+  for (const run of queuedRuns) {
+    const issueId = issueIdOf(run);
+    if (run.startedAt || !issueId || setupByAgent.get(run.agentId)?.adapterType !== "paperclip_runner") continue;
+    if (!cleanupBlockByIssue.has(issueId)) cleanupBlockByIssue.set(issueId, nativeCleanupAdmissionBlock({ companyId, issueId }));
+    if (cleanupBlockByIssue.get(issueId)) cleanupHeldRuns.add(run.id);
+  }
   if (queuedIssueIds.length) {
     const issueKey = sql<string>`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId')`;
     // Two set-based reads for the whole batch, then one bounded, parallel
@@ -286,6 +300,7 @@ export async function executionProjectionsForRuns(
         setupByAgent.get(run.agentId),
         currentResponseWait(run),
         agentQueueByRun.get(run.id),
+        cleanupHeldRuns.has(run.id),
       ),
     );
   }
@@ -314,6 +329,8 @@ export function projectExecution(
   setupAgent?: { lifecycleState: string; lifecycleHolds: readonly string[]; retryRequired?: boolean },
   responseWaitCurrent = false,
   agentQueue?: ExecutionProjection["agentQueue"],
+  /** Admission holds this run while its task's previous native session cleanup is unsettled. */
+  nativeCleanupHold = false,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -556,6 +573,13 @@ export function projectExecution(
       ? "The server is restarting for an update. This turn starts automatically on the replacement server."
       : "The server restarted and is finishing recovery. This turn starts automatically when recovery completes.";
     return set("queued", "Waiting for server restart");
+  }
+  // Checked before the predecessor's lease cleanup: that can settle while the
+  // old session is still unproven, and this run would still wait.
+  if (run.status === "queued" && !run.startedAt && nativeCleanupHold) {
+    projection.cause = NATIVE_CLEANUP_HOLD_CAUSE;
+    projection.nextAction = NATIVE_CLEANUP_HOLD_NEXT_ACTION;
+    return set("queued", NATIVE_CLEANUP_SETTLING_MESSAGE);
   }
   if (run.status === "queued" && waitingForPredecessor) {
     projection.cause = "previous_run_settling";
