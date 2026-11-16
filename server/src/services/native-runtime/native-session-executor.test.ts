@@ -21383,7 +21383,7 @@ describe("runnerd provider runtime wiring", () => {
         backupRoot, execution: current, runnerInstanceId, sourceProviderLeaseId: "backup-box",
         providerSessionIdentity: identityOf(input.backupThread),
       })));
-      return { current, options, backend, remoteSession, syncIn, conversation };
+      return { current, options, backend, remoteSession, syncIn, conversation, db };
     }
 
     it("(a) resumes a recorded newer thread in place after a restart, with no provider_identity_changed", async () => {
@@ -21427,8 +21427,9 @@ describe("runnerd provider runtime wiring", () => {
       // restart-up's same-run replacement opened 01a1e2e9 (NSE onContinuityBreak notes it).
       // (At the RED commit the writer does not exist, so nothing is noted.)
       const lineage = await import("./provider-identity-lineage.js").catch(() => null);
-      lineage?.noteProviderIdentityBreak({ companyId: fixture.current.binding.companyId, agentId: fixture.current.binding.agentId,
-        taskKey: fixture.current.binding.issueId, normalizedSessionId: fixture.current.session.normalizedSessionId! },
+      await lineage?.noteProviderIdentityBreak(fixture.db, { companyId: fixture.current.binding.companyId,
+        agentId: fixture.current.binding.agentId, taskKey: fixture.current.binding.issueId,
+        normalizedSessionId: fixture.current.session.normalizedSessionId! },
       "resume_failed_on_new_box", fixture.current.binding.runId);
       // Idle close: the close checkpoint reads the suspended box and must not refuse the new thread.
       const controller = new DurablePrpControlPlane({ stateDirectory: join(fixture.options.stateDirectory!, "control-plane"),
@@ -21556,6 +21557,10 @@ describe("runnerd provider runtime wiring", () => {
         schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "01a1e2e9",
         providerSessionId: null, activeProviderTurnId: null, config: { provider: "pi_rpc", driver: "pi_rpc" },
       }));
+      // The run that started the thread noted it durably, beside the records.
+      const piConversation = () => conversation.sessionParamsJson.__paperclipPiConversation as Record<string, unknown>;
+      expect(piConversation().pendingProviderIdentityBreak).toEqual({ reason: "resume_failed_on_new_box",
+        runId: current.binding.runId, providerLeaseId: "bx_kuxnh4yq", notedAt: expect.any(String) });
       // Restart: the in-process notes are gone.
       const lineage = await import("./provider-identity-lineage.js");
       lineage.clearPendingProviderIdentityBreaksForTest();
@@ -21578,6 +21583,8 @@ describe("runnerd provider runtime wiring", () => {
         .providerIdentityResets as Array<Record<string, unknown>>;
       expect(stored).toEqual([expect.objectContaining({ generation: 1, reason: "resume_failed_on_new_box",
         runId: current.binding.runId, previousIdentity: identityOf("01a1e203"), identity: identityOf("01a1e2e9") })]);
+      // The read consumed the note in the same transaction as the record.
+      expect(piConversation().pendingProviderIdentityBreak).toBeUndefined();
     });
   });
 
