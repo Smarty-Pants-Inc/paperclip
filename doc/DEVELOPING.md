@@ -2657,6 +2657,15 @@ If a repository is detached or its source configuration changes, its previous ta
 
 Agent, project, environment, secret, skill, and workspace config edits are sampled at the next run boundary. A heartbeat that is already running finishes with the config it started with. Native runners project explicitly configured task environment variables into provider processes and tool commands, including custom `PAPERCLIP_*` names such as `PAPERCLIP_PAGE_BUCKET`. Adding, changing, or removing a projected variable replaces a retained provider process at the next run boundary. Unchanged variables permit process reuse. The projection contains names only; secret values stay in the child environment. Ambient host secrets are not projected. Native projections allow up to 128 variable names, 64 KiB per entry, and 256 KiB of values in total. These native launch limits do not apply to legacy adapter configuration. Runtime authority, provider login credentials, and process-loader settings use their existing restricted paths.
 
+After environment, agent, project, routine, and trusted runtime env overlays are
+resolved, runs with any `LANGFUSE_*` variable default `LANGFUSE_USER_ID` to the
+run's Paperclip agent id when that variable is unset. An explicitly configured
+user id is preserved; runs without Langfuse configuration get no added variable.
+This applies before local-adapter and native-sandbox dispatch. The default id is
+not a secret and is also valid for `low_trust_review`; credential bindings and
+inline-sensitive-value restrictions remain unchanged. This does not enable
+tracing when `LANGFUSE_TRACING_ENABLED=false` is configured.
+
 Native OpenCode applies that projection when starting `opencode serve`, so its
 shell tools receive both plain bindings and resolved company secrets from
 `adapterConfig.env`. Forwarded values participate in diagnostic and provider-trace
