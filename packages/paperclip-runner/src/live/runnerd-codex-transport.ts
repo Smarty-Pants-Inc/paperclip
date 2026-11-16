@@ -89,6 +89,7 @@ import {
   spawnRunner,
   waitForProcess,
   type RunnerProcessHandle,
+  type RunnerProcessResult,
   type RunnerProcessConnection,
   type DurablePrpControlPlaneOptions,
 } from "../control-plane/durable-prp-control-plane.js";
@@ -130,6 +131,24 @@ const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNER_RESTORE_STABLE_MS = 60_000;
 const MAX_UNSTABLE_RUNNER_RESTORES = 3;
+// A replacement that exits before it authenticates is retried once (#20825).
+const MAX_PRE_AUTHENTICATION_REPLACEMENT_EXITS = 2;
+// Durable runner lifecycles a runner writes only when it stopped on purpose.
+const GRACEFUL_RUNNER_LIFECYCLES = new Set(["suspended", "stopped"]);
+// A runner in this state needs a fresh bootstrap; a restart ticket can never satisfy it.
+const RUNNER_FRESH_BOOTSTRAP_REQUIRED = "lease_expired_requires_bootstrap";
+const RUNNERD_TURN_TERMINAL_EVENT_TYPES = new Set(["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"]);
+
+/** A runner-reported value as a bounded code, never free text. */
+function runnerLifecycleCode(value: string): string {
+  return /^[a-z]+(?:_[a-z]+){0,12}$/.test(value) ? value : "other";
+}
+
+function runnerLifecycleSummary(state: RunnerProcessResult["runnerLifecycle"]): string {
+  if (!state) return "lifecycle=unreported";
+  return `lifecycle=${runnerLifecycleCode(state.lifecycle)}${state.recoverableFailure === null ? ""
+    : ` recoverableFailure=${runnerLifecycleCode(state.recoverableFailure)}`}`;
+}
 // Bounds the one in-place restart after a runner settles an earlier attempt's suspend.
 const CARRIED_SUSPEND_RESTART_GRACE_MS = 30_000;
 const RUNNERD_MAX_OUTBOX_BYTES = 16 * 1024 * 1024;
@@ -4972,6 +4991,39 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#adoptedRunnerMonitor = null;
   }
 
+  /**
+   * Provider work this transport knows is in flight: a turn start awaiting its
+   * response (the #expectedProviderTurnId window), a durably active provider
+   * turn, a bridged runtime input, an unsettled semantic tool result, or a
+   * working goal. Release and runner-exit recovery share this one definition.
+   */
+  #providerWorkInFlight(core: DurablePrpControlPlane): boolean {
+    const events = core.store.state.committedEvents;
+    const goalEvent = events.findLast(event => event.eventType === "session.goal.updated" || event.eventType === "session.goal.cleared"
+      || event.eventType === "session.goal.snapshot");
+    const goalPayload = record(record(goalEvent?.envelope.payload).payload), goal = record(goalPayload.goal);
+    return this.#turnStartResponsePending || this.#bridgedRuntimeInputs.size > 0
+      || !core.semanticToolResultsSettled() || providerTurnIsActiveFromCommittedEvents(events)
+      || goalPayload.workingNow === true
+      || (goalEvent?.eventType !== "session.goal.cleared" && (goal.status === "active" || goal.workingNow === true));
+  }
+
+  /**
+   * A retained warm owner whose attached run already settled a provider turn
+   * and has no work in flight or pending. Its runner exit is not reconnected on
+   * the same path: the transport fails and the existing warm-close path
+   * retires the owner (#20825). A run that has not yet settled a turn (still
+   * starting, or between thread start and its first turn) keeps reconnecting.
+   */
+  #settledIdleWarmOwner(): boolean {
+    const core = this.#core;
+    if (!core || !this.#startupComplete || this.options.lifecyclePolicy?.mode !== "warm") return false;
+    if (this.#providerWorkInFlight(core) || core.store.state.commands.some(command => command.status === "pending")) return false;
+    const runId = core.store.state.identity.runId;
+    return core.store.state.committedEvents.some(event =>
+      RUNNERD_TURN_TERMINAL_EVENT_TYPES.has(event.eventType) && event.envelope.runId === runId);
+  }
+
   async #releaseSettledRunner(): Promise<DurableRecoveryIdentity | false> {
     const pair = this.options.releaseResume;
     const core = this.#core;
@@ -4981,16 +5033,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (!core || !this.#startupComplete) throw new Error("native_runner_release_unavailable");
     if (!this.#controlPlaneCheckpoint) return false;
     if (!this.#releaseEpisode) {
-      const knownBusy = () => {
-        const events = core.store.state.committedEvents;
-        const goalEvent = events.findLast(event => event.eventType === "session.goal.updated" || event.eventType === "session.goal.cleared"
-          || event.eventType === "session.goal.snapshot");
-        const goalPayload = record(record(goalEvent?.envelope.payload).payload), goal = record(goalPayload.goal);
-        return this.#turnStartResponsePending || this.#bridgedRuntimeInputs.size > 0
-          || !core.semanticToolResultsSettled() || providerTurnIsActiveFromCommittedEvents(events)
-          || goalPayload.workingNow === true
-          || (goalEvent?.eventType !== "session.goal.cleared" && (goal.status === "active" || goal.workingNow === true));
-      };
+      const knownBusy = () => this.#providerWorkInFlight(core);
       if (knownBusy() || !await this.#drainSettledProviderEventsBeforeSuspend() || knownBusy()) return false;
       if (core.store.state.commands.some(command => command.status === "pending")) return false;
       await core.flushCheckpoint();
@@ -9359,10 +9402,15 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         const detail = result.stderr.trim() || result.stdout.trim();
         if (detail) this.#diagnostic(detail.slice(-4_096));
         this.#publish();
+        // A remote launcher reports every exit with a null code; the runner's
+        // durable lifecycle then says whether it stopped on purpose.
+        const durableExit = result.runnerLifecycle;
+        const gracefulExitCode = result.code === 0 || (result.code === null && durableExit !== undefined
+          && GRACEFUL_RUNNER_LIFECYCLES.has(durableExit.lifecycle) && durableExit.recoverableFailure === null);
         // runnerd exited on its own while the session was still open, without
         // a clean suspend: it was lost (killed or crashed). Close may reap its
         // journalled lineage. An exit during close is never treated as loss.
-        if (!this.#closed && exitConfirmed && !(result.code === 0 &&
+        if (!this.#closed && exitConfirmed && !(gracefulExitCode &&
           this.#core?.store.state.committedEvents.some((event) => event.eventType === "runner.suspending")))
           this.#lostRunnerHandle = handle;
         if (this.#closed || this.#failure !== null || this.#handle !== handle || (this.#releaseEpisode && !this.#releaseEpisode.claimed))
@@ -9381,7 +9429,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         this.#pumpEventsSafely();
         const expectedPerTurnExit =
           exitConfirmed &&
-          result.code === 0 &&
+          gracefulExitCode &&
           (this.options.lifecyclePolicy?.mode ?? "per_turn") === "per_turn" &&
           (this.#core?.store.state.committedEvents.some(
             (event) => event.eventType === "runner.suspending",
@@ -9405,6 +9453,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.options.runnerReconnectGraceMs !== undefined &&
           handle.restart
         ) {
+          // A restart ticket can never satisfy a runner that needs a fresh
+          // bootstrap, and an idle settled owner has nothing to reconnect for.
+          // Neither relaunches on this path (#20825).
+          if (durableExit?.recoverableFailure === RUNNER_FRESH_BOOTSTRAP_REQUIRED) {
+            this.#failTransport(new Error(`native_runner_lease_expired_requires_bootstrap: ${runnerLifecycleSummary(durableExit)}`));
+            return;
+          }
+          if (this.#settledIdleWarmOwner()) {
+            this.#failTransport(new Error(`native_runner_idle_warm_owner_exited: ${runnerLifecycleSummary(durableExit)}`));
+            return;
+          }
           this.#recoverOrFailRunnerProcess(handle, detail);
           return;
         }
@@ -9423,6 +9482,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
           this.options.runnerReconnectGraceMs !== undefined &&
           handle.restart
         ) {
+          if (this.#settledIdleWarmOwner()) {
+            this.#failTransport(new Error("native_runner_idle_warm_owner_exited: lifecycle=unreported", { cause: error }));
+            return;
+          }
           this.#recoverOrFailRunnerProcess(
             handle,
             error instanceof Error ? error.message : String(error),
@@ -9513,6 +9576,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     let attempt = 0;
     let restart = failedHandle.restart;
     let lastDetail = initialDetail;
+    // Replacements that settled before they authenticated. A slow replacement
+    // that stays alive keeps the whole grace; one that dies first gets one retry.
+    let preAuthenticationExits = 0;
     this.#diagnostic(
       `runner process disconnected; recovery is allowed for ${graceMs}ms`,
     );
@@ -9553,9 +9619,11 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         let processSettled = false;
         let observationError: unknown;
         let observationDetail = "";
+        let replacementLifecycle: RunnerProcessResult["runnerLifecycle"];
         const completion = recoveredHandle.completion.then(
           (result) => {
             processSettled = true;
+            replacementLifecycle = result.runnerLifecycle;
             observationDetail = result.stderr.trim() || result.stdout.trim();
             lastDetail = observationDetail;
             return false;
@@ -9599,6 +9667,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             ),
           );
           return;
+        }
+        if (processSettled) {
+          if (replacementLifecycle?.recoverableFailure === RUNNER_FRESH_BOOTSTRAP_REQUIRED) {
+            this.#failTransport(new Error(
+              `native_runner_lease_expired_requires_bootstrap: ${runnerLifecycleSummary(replacementLifecycle)}`));
+            return;
+          }
+          preAuthenticationExits += 1;
+          if (preAuthenticationExits >= MAX_PRE_AUTHENTICATION_REPLACEMENT_EXITS) {
+            this.#failTransport(new Error(
+              `native_runner_replacement_exited_before_authentication: ${runnerLifecycleSummary(replacementLifecycle)}`,
+              { cause: observationError }));
+            return;
+          }
         }
         attempt += 1;
       }

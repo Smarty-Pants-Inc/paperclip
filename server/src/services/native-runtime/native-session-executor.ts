@@ -17065,12 +17065,17 @@ export function createRemoteRunnerProcessLauncher(input: {
               .map((value) => redactSensitiveText(value).slice(-1_000))
           : [];
         const stateSummary = `runner_remote_process_exited lifecycle=${lifecycle}${recoverableFailure ? ` recoverableFailure=${redactSensitiveText(recoverableFailure).slice(-1_000)}` : ""}${stateDiagnostics.length > 0 ? ` diagnostics=${JSON.stringify(stateDiagnostics)}` : ""}`;
+        // Bounded codes only: the transport decides from these whether the
+        // exit was graceful or needs a fresh bootstrap (#20825).
+        const lifecycleCode = (value: string) => /^[a-z]+(?:_[a-z]+){0,12}$/.test(value) ? value : "other";
         return {
           code: null,
           signal: null,
           stdout: "",
           // The durable state names a graceful exit; the files name a panic or what runnerd wrote to stderr.
           stderr: diagnosticTail ? `${stateSummary}\n${diagnosticTail}` : stateSummary,
+          runnerLifecycle: { lifecycle: lifecycleCode(lifecycle),
+            recoverableFailure: recoverableFailure === null ? null : lifecycleCode(recoverableFailure) },
         };
       }
     })().catch((error: unknown) => {
