@@ -7,6 +7,7 @@ import { PI_RPC_BUILTIN_THINKING_CATALOG, NativeEnvironmentProbeCleanupError, pr
 import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileError } from "./provider-profile.js";
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { cachedFileSha256 } from "./off-loop-file-work.js";
+import { logger } from "../../middleware/logger.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 
@@ -116,6 +117,13 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       };
       const cleanup = async () => {
         if (remoteCreated) {
+          // DIAGNOSTIC (log only): one line per cleanup with each step's ms,
+          // so the acceptance rows read retention seconds per check.
+          const timing: Record<string, unknown> = { event: "native_probe_cleanup_timing", runId: id, admissionOnly };
+          const started = Date.now();
+          let step = "static_manifest", stepStarted = started;
+          const done = (name: string) => { timing[`${step}Ms`] = Date.now() - stepStarted; step = name; stepStarted = Date.now(); };
+          try {
           // Reuse the retained-backup sync-out path. A failed/partial pull must
           // never authorize removal of the sole copy. The staged runner binary
           // and Node's compile cache are static, not records: record their
@@ -126,17 +134,34 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           // cachedFileSha256 returns "sha256:<hex>" (as matchesControllerRunnerArtifact strips it).
           const expectedRunnerSha256 = await cachedFileSha256(runnerBinary)
             .then(digest => /^sha256:[0-9a-f]{64}$/.test(digest) ? digest.slice("sha256:".length) : null, () => null);
-          const { excludeEntries, record } = probeStaticExclusions(
-            parseProbeStaticManifest(listed.stdout ?? "", PROBE_STATIC_SYNC_EXCLUSIONS), expectedRunnerSha256);
+          const manifest = parseProbeStaticManifest(listed.stdout ?? "", PROBE_STATIC_SYNC_EXCLUSIONS);
+          const { excludeEntries, record } = probeStaticExclusions(manifest, expectedRunnerSha256);
+          Object.assign(timing, { excluded: excludeEntries, staticFiles: manifest.files.length,
+            staticBytes: manifest.files.reduce((total, file) => total + file.size, 0),
+            runnerdMatch: /match yes$/m.test(record) });
+          done("sync_out");
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
             targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700, excludeEntries });
           await mkdir(join(runtimeDirectory, "remote-runtime"), { recursive: true, mode: 0o700 });
           await writeFile(join(runtimeDirectory, "remote-runtime", ".excluded-static-files.txt"), record, { mode: 0o600 });
+          done("evidence_commit");
           // Commit the pulled bytes to permanent evidence BEFORE remote rm.
           await cleanupNativeSetupRuntime(runtimeDirectory, true);
+          done("remote_rm");
           // The remote root can hold a full Pi session history; removal shares the 60 s probe retirement budget.
           requireSuccess(await runner!.execute({ command: "rm", args: ["-rf", "--", remoteRoot], bypassSession: true, timeoutMs: 60_000 }));
           remoteCreated = false;
+          done("done");
+          timing.outcome = "ok";
+          } catch (error) {
+            timing.outcome = "failed";
+            timing.failedStep = step;
+            timing[`${step}Ms`] = Date.now() - stepStarted;
+            throw error;
+          } finally {
+            timing.totalMs = Date.now() - started;
+            try { logger.info(timing, "Native setup probe cleanup timing"); } catch { /* Diagnostics must not change cleanup. */ }
+          }
         }
         await cleanupNativeSetupRuntime(runtimeDirectory, true);
       };
@@ -160,6 +185,11 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
           transportOptions: { ...executionDriver, runnerProcessLauncher, runnerBinary, runnerFilesystemRoot: remoteFilesystemRoot,
             ...nativePiRemoteLaunchOptions(pack.root, source.manifest, remoteRoot), piRpcThinkingLevel,
             externallySandboxed: target!.transport === "sandbox",
+            // DIAGNOSTIC (log only): forward only the fixed-format cleanup step lines.
+            onDiagnostic: (message: string) => {
+              if (!message.startsWith("Native probe cleanup step failed: ")) return;
+              try { logger.warn({ event: "native_probe_cleanup_step", runId: id, admissionOnly }, message); } catch { /* log only */ }
+            },
             prpIdentity: { runnerInstanceId, runId: id, normalizedSessionId: id,
               environmentLeaseId: target!.transport === "sandbox" && target!.leaseId ? target!.leaseId : id, turnId: `turn-${id}`, itemId: `item-${id}` } },
           onCleanupConfirmed: cleanup,
