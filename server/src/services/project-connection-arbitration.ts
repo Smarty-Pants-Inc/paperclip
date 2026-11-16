@@ -3,7 +3,7 @@ import { connectionGrants, toolApplications, toolConnections, type Db } from "@p
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { DbTransaction } from "./tool-access/types.js";
 import { lockProjectConnectionLifecycle } from "./project-connection-retirement.js";
-import { isUnconsumedProjectAppApprovalSource } from "./project-app-custody.js";
+import { isUnconsumedProjectAppApprovalSource, PROJECT_APP_APPROVAL_SOURCE } from "./project-app-custody.js";
 
 /** Lane A. Provider verification belongs outside this transaction. */
 export type ProjectConnectionIdentity = Readonly<{
@@ -108,6 +108,7 @@ export async function assertProjectConnectionAvailability(
     consumedSourceConnectionId?: string }>,
 ): Promise<void> {
   const { identity, projectId, exclusive, excludeConnectionId, consumedSourceConnectionId } = input;
+  let receiptCiting = projectId !== null && consumedSourceConnectionId !== undefined;
   assertIdentity(identity);
   if (exclusive && projectId === null) {
     throw unprocessable("Only a project connection can reserve an EXCLUSIVE App", { code: "project_connection_scope_invalid" });
@@ -127,6 +128,11 @@ export async function assertProjectConnectionAvailability(
     }
     if (saved.projectId !== null) {
       if (saved.status === "archived") throw conflict("This project's connection was retired. Create a new approved project connection.", { code: "project_connection_archived" });
+      // The winner's saved protected source pointer retains its receipt-citing
+      // identity at finish/install/profile writers. Otherwise a losing live S
+      // would let create win, then incorrectly block the winner from use. These
+      // callers still re-check custody/admission; this is not authorization.
+      receiptCiting ||= typeof saved.config[PROJECT_APP_APPROVAL_SOURCE] === "string";
       const savedIdentity = projectConnectionIdentityForConnection(saved)!;
       const savedExclusive = object(saved.config.projectScope)!.exclusive;
       if (exclusive && savedExclusive === false) {
@@ -160,7 +166,7 @@ export async function assertProjectConnectionAvailability(
   let incompatible = false;
   for (const connection of live) {
     if (connection.id === excludeConnectionId || connection.id === consumedSourceConnectionId) continue;
-    if (consumedSourceConnectionId && projectId !== null && isUnconsumedProjectAppApprovalSource(connection, identity)) continue;
+    if (receiptCiting && isUnconsumedProjectAppApprovalSource(connection, identity)) continue;
     const ownedIdentity = projectConnectionIdentityForConnection(connection);
     const aliases = legacyAliases(connection);
     const grantAliases = aliasesByConnection.get(connection.id);
