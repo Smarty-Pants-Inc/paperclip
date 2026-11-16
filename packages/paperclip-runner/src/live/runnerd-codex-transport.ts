@@ -9725,6 +9725,18 @@ async function awaitProbeCleanup<T>(pending: Promise<T>, deadline: number, detai
     })]);
   } finally { clearTimeout(timeout); }
 }
+
+export async function observeProbeCleanupStep<T>(
+  work: () => Promise<T>, detail: string, pass: "teardown_pass" | "retained_retry", onDiagnostic?: (message: string) => void,
+): Promise<T> {
+  const started = Date.now();
+  try { return await work(); }
+  catch (error) {
+    try { onDiagnostic?.(`Native probe cleanup step failed: ${detail}; elapsedMs=${Math.max(0, Date.now() - started)}; pass=${pass}`); }
+    catch { /* Diagnostics must not change cleanup behavior. */ }
+    throw error;
+  }
+}
 async function awaitProbeProof(proven: () => boolean, deadline: number, detail: string): Promise<void> {
   while (!proven()) {
     if (Date.now() >= deadline) throw new Error(`Native probe retirement remains unconfirmed while ${detail}; recovery state retained.`);
@@ -9992,8 +10004,9 @@ export async function probeNativeRunnerEnvironment(options: {
     } catch (error) { teardownErrors.push(error); }
     try { await awaitTeardown(operation.catch(() => undefined), "draining native setup"); }
     catch (error) { teardownErrors.push(error); }
-    if (failure instanceof PiEnvironmentProbeCleanupError) {
-      try { await awaitTeardown(failure.retired, "joining native Pi retirement"); }
+    const nativeCleanupFailure = failure instanceof PiEnvironmentProbeCleanupError ? failure : undefined;
+    if (nativeCleanupFailure) {
+      try { await observeProbeCleanupStep(() => awaitTeardown(nativeCleanupFailure.retired, "joining native Pi retirement"), "joining native Pi retirement", "teardown_pass", options.transportOptions?.onDiagnostic); }
       catch (error) { teardownErrors.push(error); }
     }
     if (registrationOperation) {
@@ -10017,23 +10030,28 @@ export async function probeNativeRunnerEnvironment(options: {
         .catch(error => { cleanupCallbackFailed = true; throw error; });
     };
     if (!teardownErrors.length && options.onCleanupConfirmed) {
-      try { await awaitTeardown(confirmCleanup(), "confirming credential handoff"); }
+      try { await observeProbeCleanupStep(() => awaitTeardown(confirmCleanup(), "confirming credential handoff"), "confirming credential handoff", "teardown_pass", options.transportOptions?.onDiagnostic); }
       catch (error) { teardownErrors.push(error); }
     }
     if (teardownErrors.length) {
       const retained = retainNativeProbeCleanup(async retry => {
         const deadline = Date.now() + cleanupBudget;
-        if (failure instanceof PiEnvironmentProbeCleanupError) await awaitProbeCleanup(failure.retryCleanup(), deadline, "joining native Pi retirement");
-        await awaitProbeCleanup(Promise.allSettled([operation, closingOperation, registrationOperation]), deadline, "joining original probe operations");
-        if (!bundle.retireProbeResources) throw new Error("Native probe physical retirement proof is unavailable");
-        await awaitProbeCleanup(bundle.retireProbeResources(Math.max(1, deadline - Date.now())), deadline, "confirming physical retirement");
+        if (nativeCleanupFailure) await observeProbeCleanupStep(() => awaitProbeCleanup(nativeCleanupFailure.retryCleanup(), deadline, "joining native Pi retirement"), "joining native Pi retirement", "retained_retry", options.transportOptions?.onDiagnostic);
+        await observeProbeCleanupStep(() => awaitProbeCleanup(Promise.allSettled([operation, closingOperation, registrationOperation]), deadline, "joining original probe operations"), "joining original probe operations", "retained_retry", options.transportOptions?.onDiagnostic);
+        await observeProbeCleanupStep(async () => {
+          if (!bundle.retireProbeResources) throw new Error("Native probe physical retirement proof is unavailable");
+          await awaitProbeCleanup(bundle.retireProbeResources(Math.max(1, deadline - Date.now())), deadline, "confirming physical retirement");
+        }, "confirming physical retirement", "retained_retry", options.transportOptions?.onDiagnostic);
         if (retry && registrationReleaseFailed) { registrationReleaseOperation = undefined; registrationReleaseFailed = false; }
-        if (!registrationCleanupConfirmed && releaseRegistration) await awaitProbeCleanup(releaseRegistration(), deadline, "releasing original probe authority");
+        if (!registrationCleanupConfirmed) await observeProbeCleanupStep(async () => {
+          if (!releaseRegistration) throw new Error("Native probe authority release remains unconfirmed");
+          await awaitProbeCleanup(releaseRegistration(), deadline, "releasing original probe authority");
+          if (!registrationCleanupConfirmed) throw new Error("Native probe authority release remains unconfirmed");
+        }, "releasing original probe authority", "retained_retry", options.transportOptions?.onDiagnostic);
         if (bundle.evidence().runnerPid !== null && options.provider === "codex" && options.onCodexCredentialRefresh) {
           await awaitProbeCleanup(preserveCredentialRefresh(retry), deadline, "preserving credential refresh");
         }
-        if (!registrationCleanupConfirmed) throw new Error("Native probe authority release remains unconfirmed");
-        await awaitProbeCleanup(confirmCleanup(retry), deadline, "confirming credential handoff");
+        await observeProbeCleanupStep(() => awaitProbeCleanup(confirmCleanup(retry), deadline, "confirming credential handoff"), "confirming credential handoff", "retained_retry", options.transportOptions?.onDiagnostic);
       });
       throw new NativeEnvironmentProbeCleanupError(retained.retired, failure, teardownErrors, retained.retryCleanup);
     }

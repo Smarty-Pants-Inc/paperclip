@@ -3,7 +3,28 @@ import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { expect, it, vi } from "vitest";
-import { NativeEnvironmentProbeCleanupError, probeNativeRunnerEnvironment } from "./runnerd-codex-transport.js";
+import { NativeEnvironmentProbeCleanupError, observeProbeCleanupStep, probeNativeRunnerEnvironment } from "./runnerd-codex-transport.js";
+
+it.each([
+  "joining native Pi retirement",
+  "joining original probe operations",
+  "confirming physical retirement",
+  "releasing original probe authority",
+  "confirming credential handoff",
+] as const)("logs one retained-retry diagnostic for %s and preserves the original outcome", async detail => {
+  const diagnostics: string[] = [];
+  const failure = Object.assign(new Error("same error"), { code: "FIXTURE_FAILURE" });
+  await expect(observeProbeCleanupStep(async () => { throw failure; }, detail, "retained_retry", message => diagnostics.push(message)))
+    .rejects.toBe(failure);
+  expect(diagnostics).toHaveLength(1);
+  expect(diagnostics[0]).toMatch(new RegExp(`^Native probe cleanup step failed: ${detail}; elapsedMs=\\d+; pass=retained_retry$`));
+  expect(failure.code).toBe("FIXTURE_FAILURE");
+  await expect(observeProbeCleanupStep(async () => { throw failure; }, detail, "teardown_pass", message => diagnostics.push(message)))
+    .rejects.toBe(failure);
+  expect(diagnostics[1]).toMatch(new RegExp(`^Native probe cleanup step failed: ${detail}; elapsedMs=\\d+; pass=teardown_pass$`));
+  await expect(observeProbeCleanupStep(async () => "unchanged result", detail, "teardown_pass", message => diagnostics.push(message))).resolves.toBe("unchanged result");
+  expect(diagnostics).toHaveLength(2);
+});
 
 it.each(["eventual-exit", "bounded-retry", "windows-unconfirmed"] as const)("retains a timed-out probe home until physical proof and runs cleanup once (%s)", async mode => {
   const root = await mkdtemp(join(tmpdir(), "native-probe-retained-"));

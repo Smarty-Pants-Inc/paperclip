@@ -27,7 +27,8 @@ import { NativeEnvironmentProbeCleanupError, sanitizeAntigravityCredential } fro
 import { readLocalAiCredentialFile } from "./local-ai-credential-file.js";
 import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigravity-runner-credentials.js";
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
-import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup } from "./retained-ai-credential-cleanup.js";
+import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup, retainedAiAccountKeyHash } from "./retained-ai-credential-cleanup.js";
+import { logger } from "../middleware/logger.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -650,7 +651,12 @@ export async function withManagedAiProbe<T>(
       retained = true;
       const retryCleanup = (error as { retryCleanup?: () => Promise<void> }).retryCleanup;
       retainAiCredentialCleanup({ scope: runtime.retainedCleanupScope!, home: runtime.home && path.join(runtime.home, "provider"), cleanup: runtime.cleanup, retired: error.retired,
+        agentId: input.agentId,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
+      try {
+        logger.warn({ code: "native_probe_cleanup_pending", accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey) },
+          "Native AI probe cleanup remains pending");
+      } catch { /* Diagnostics must not change the HTTP response. */ }
       throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
     }
     throw error;
