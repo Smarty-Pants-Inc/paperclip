@@ -58,9 +58,10 @@ describe("project connection task-derived selection and no legacy fallback (roun
     return { f, a, b, bound, context };
   }
 
-  it("RFL-C1/J12: agent_env launcher cannot export legacy/host tokens for a retired owned project", async () => {
+  it.each(["archived", "disabled", "revoked"] as const)("RFL-C1/J12: agent_env launcher cannot export legacy/host tokens for %s owned access", async state => {
     const f = await projectConnectionFixture(db);
-    await f.seedConnection(f.a, { status: "archived", installed: false });
+    const owned = await f.seedConnection(f.a, { status: state === "revoked" ? "active" : state, installed: state !== "archived" });
+    if (state === "revoked") await db.update(connectionGrants).set({ status: "revoked" }).where(eq(connectionGrants.id, owned.grant.id));
     const bound = await f.run();
     await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: bound.issue.id,
       projectConnectionRunContext: { version: 1, issueId: bound.issue.id, projectId: f.a.id } } }).where(eq(heartbeatRuns.id, bound.run.id));
