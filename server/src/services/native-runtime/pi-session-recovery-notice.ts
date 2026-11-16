@@ -232,8 +232,12 @@ export async function materializePiSessionRecoveryNotice(input: {
 /** J3-22 member (a): the person-visible line of a refused restore continued in a fresh thread. A
  * continuation, never a failure: the run goes on and answers. */
 export function restoreUnavailableContinuationNoticeBody(reason: string): string {
-  return "Continuing from saved history: the earlier provider thread could not be restored on this new sandbox, "
-    + "so this reply continues the same conversation in a fresh thread from its saved history. "
+  // Path-neutral and true on both opens: only a fresh OPEN sends the saved-
+  // history handoff (NSR session === null); a fresh thread taken while
+  // recovering the saved session gets this run's message only (the real-runner
+  // SMA-60 e2e row shows it). Never claim history the thread did not get.
+  return "Continuing in a fresh thread: the earlier provider thread could not be restored on this new sandbox, "
+    + "so this reply continues the same conversation in a fresh provider thread, which may not have the earlier thread's context. "
     + `Earlier actions with unknown outcomes are not confirmed or replayed. (${reason})`;
 }
 
