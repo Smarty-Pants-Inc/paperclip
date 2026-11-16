@@ -33,6 +33,32 @@ export function freshThreadRefusalCode(error: unknown, depth = 0): FreshThreadRe
   return freshThreadRefusalCode(value.cause, depth + 1);
 }
 
+/**
+ * J3-22 member (a) (RFL 09:55Z): SMA-60's refused restore on a NEW box. Host
+ * preparation on a created box refuses a current backup whose source is not
+ * provably retired with this exact code (NSE created branch). It stays a plain
+ * member of FRESH_THREAD_REFUSAL_CODES above; this is its OWN predicate, not a
+ * set. Its automatic retry already goes fresh for this exact code:
+ * fresh-continuation-fallback.ts BACKLOG_CONTINUATION_SOURCE_CODES /
+ * heldExecutionWhere select it, and selectPiConversation /
+ * selectFreshContinuationThread mint the fresh thread (pi-conversation-record.ts).
+ * Member (a) only moves that fresh thread into the run that met the refusal,
+ * at the managed backend's open (NSE openSession / recoverSession). A failed
+ * workspace restore after it (workspaceRestoreFailure='restore_failed') is that
+ * failed run's retained workspace, so (a) covers it.
+ */
+export const RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE: FreshThreadRefusalCode & "runner_harness_state_mismatch: backup_without_reusable_lease" =
+  "runner_harness_state_mismatch: backup_without_reusable_lease";
+/** The person-visible, named reason of member (a)'s continuation note. */
+export const RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON = "restore_unavailable_on_new_box" as const;
+
+/** Member (a)'s exact code, carried by a structured error or by a recovery
+ * result's exact refusal code. Prose never matches; no other code matches. */
+export function restoreUnavailableOnNewBoxCode(value: unknown): typeof RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE | null {
+  const code = typeof value === "string" ? (isCode(value) ? value : null) : freshThreadRefusalCode(value);
+  return code === RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE ? code : null;
+}
+
 export function isFreshThreadRefusal(run: { errorCode?: string | null; error?: string | null; resultJson?: Record<string, unknown> | null }): boolean {
   // Older controller rows saved the exact reserved code in `error` under the
   // generic reconciliation envelope. They need the SAME strict stop gate,

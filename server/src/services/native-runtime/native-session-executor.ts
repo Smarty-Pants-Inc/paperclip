@@ -1,4 +1,5 @@
-import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
+import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
+  RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE, RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON, restoreUnavailableOnNewBoxCode } from "./runner-reconciliation-refusal.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
@@ -355,7 +356,7 @@ import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+  readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -19595,6 +19596,82 @@ async function createRunnerdBackendWithinSessionClaim(
     expectedProviderPackManifest = providerPackAuthority?.manifest ?? null;
     providerPackVerified = false;
   };
+  // J3-22 member (a) (SMA-60, RFL 09:55Z). Host preparation on a created box
+  // refused a current backup with RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE: its
+  // source is not provably retired, so the backup must not be restored here.
+  // Today that run fails and only the automatic retry answers, on a fresh
+  // thread. Take that same fresh thread in THIS run: set the session's
+  // continuity state aside (archiveContinuityState, as the runtime's
+  // replacement does; the source box and its files are kept), note the break
+  // for this box, write one continuation note, and let the caller open a fresh
+  // provider session. After it opens, the step is recorded through J3-17's
+  // lineage append (reason resume_failed_on_new_box). At most once per backend.
+  // The fresh open carries no run authority of the old thread: a recovered
+  // checkpoint is taken only in the idle REBOUND shape (loadWarmNativeCheckpoint
+  // clears exactly these fields for a new run); any turn, terminal, result,
+  // runtime request, governed wait, disposition recovery or goal keeps the
+  // named refusal. A checkpoint the runtime itself may replace
+  // (allow_replacement_after_resume_failure) is left to the runtime.
+  let restoreUnavailableFreshThread: { previousIdentity: Record<string, unknown> | null } | null = null;
+  const takeRestoreUnavailableFreshThread = async (failure: unknown, previous?: PersistedNativeSession): Promise<boolean> => {
+    const code = restoreUnavailableOnNewBoxCode(failure);
+    if (code !== RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE || restoreUnavailableFreshThread || remoteTarget?.transport !== "sandbox"
+      || !remoteCommandRunner || sandboxLeaseAcquisition?.outcome !== "created" || !sandboxLeaseAcquisition.providerLeaseId) return false;
+    if (previous && (previous.activeTurnId != null || (previous.pendingRuntimeRequests?.length ?? 0) > 0
+      || previous.semanticResult != null || previous.terminal != null || (previous.terminalTurns?.length ?? 0) > 0
+      || previous.governedWait != null || previous.dispositionOnlyRecoveryConsumed === true
+      || previous.dispositionOnlyRecoveryTurnId != null
+      || (previous as { goal?: unknown }).goal != null)) return false;
+    // A checkpoint whose policy already lets the RUNTIME replace the session
+    // (NSR replacementAllowed) is left to that existing replacement: it
+    // archives the same state, reports the continuity break and hands the
+    // fresh session its saved-history handoff.
+    if (previous?.providerRecoveryPolicy === "allow_replacement_after_resume_failure"
+      && !("homeMode" in input.execution && input.execution.homeMode === "preconfigured")) return false;
+    const previousIdentity = compatibleNativeHarnessBackupManifests({ root, execution: input.execution,
+      runnerInstanceId: input.runnerInstanceId })[0]?.manifest.providerSessionIdentity ?? null;
+    await archiveContinuityState(previous);
+    restoreUnavailableFreshThread = { previousIdentity: previousIdentity ? record(previousIdentity) : null };
+    const scope = providerIdentityLineageScope(input.execution);
+    if (!(await noteProviderIdentityBreak(input.db, scope, "resume_failed_on_new_box", input.execution.binding.runId,
+      sandboxLeaseAcquisition.providerLeaseId))) {
+      await input.onLog?.("stderr", "[paperclip-runner] the fresh provider thread on this sandbox could not be noted durably; "
+        + "it is recorded once the thread opens.\n");
+    }
+    const atMs = Date.now();
+    await input.trace?.record({ name: "provider.session.restore_unavailable_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
+      attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
+        refusalCode: code, reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON } });
+    await input.onLog?.("stdout", `[paperclip-runner] continuing from saved history: the backup could not be restored on this `
+      + `new sandbox (${code}); this run continues the conversation in a fresh provider thread (${RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON}).\n`);
+    const { companyId, issueId, agentId, runId } = input.execution.binding;
+    await writeRestoreUnavailableContinuationNotice(input.db, { companyId, issueId, agentId, runId, code,
+      reason: RESTORE_UNAVAILABLE_ON_NEW_BOX_REASON }).catch(async (error: unknown) => {
+      await input.onLog?.("stderr", `[paperclip-runner] continuation note not written: ${
+        redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
+    });
+    return true;
+  };
+  /** The fresh session opened: append the old thread -> the box's new thread. */
+  const recordRestoreUnavailableFreshThread = async () => {
+    const taken = restoreUnavailableFreshThread;
+    if (!taken?.previousIdentity || !remoteCommandRunner || !remoteStateDirectory) return;
+    try {
+      const providerState = await readRemoteRunnerProviderState({ runner: remoteCommandRunner,
+        stateDirectory: remoteStateDirectory, execution: input.execution });
+      const identity = providerSessionIdentityFromDurableProviderState({ execution: input.execution, providerState });
+      // Not readable yet: the pending note stays, and J3-17's first suspended
+      // read of this box appends the same step.
+      if (!providerSessionIdentityIsPresent(identity)) return;
+      const recorded = await recordedProviderIdentityTransitionIsAllowed({ db: input.db,
+        scope: providerIdentityLineageScope(input.execution), previous: taken.previousIdentity, current: identity,
+        providerLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? null });
+      if (!recorded) await input.onLog?.("stderr", "[paperclip-runner] fresh provider thread not yet recorded on the conversation lineage\n");
+    } catch (error) {
+      await input.onLog?.("stderr", `[paperclip-runner] fresh provider thread not yet recorded on the conversation lineage: ${
+        redactSensitiveText(error instanceof Error ? error.message : String(error)).slice(0, 256)}\n`);
+    }
+  };
   const localRecoveryProcess =
     input.restartRecovery?.kind === "reattach_existing_runner"
       ? input.restartRecovery.process
@@ -20238,7 +20315,17 @@ async function createRunnerdBackendWithinSessionClaim(
     openSession: async (sessionInput) => {
       cursorCloudRuntime?.register();
       try {
-        const session = await backend.openSession(sessionInput);
+        let session: NativeSession;
+        try { session = await backend.openSession(sessionInput); }
+        catch (error) {
+          // J3-22 member (a): a refused restore continues in this run on a
+          // fresh thread. The runtime opens (not recovers) only when it loaded
+          // no checkpoint of this run (NSR session === null), so no turn,
+          // request or goal of the old thread can ride on this open.
+          if (!await takeRestoreUnavailableFreshThread(error)) throw error;
+          session = await backend.openSession(sessionInput);
+          await recordRestoreUnavailableFreshThread();
+        }
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, Boolean(adoptedProcess));
         return managed;
@@ -20269,6 +20356,19 @@ async function createRunnerdBackendWithinSessionClaim(
           ? { recovered: true, session: await backend.openSession({ identity: snapshot.identity,
               workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }) }
           : backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        // J3-22 member (a): host preparation refused the backup while
+        // recovering the saved session (SMA-60: session.checkpoint.restore
+        // tried and refused). Only an idle rebound checkpoint is taken (see
+        // takeRestoreUnavailableFreshThread); the run continues on a fresh
+        // provider thread of this conversation.
+        if (!result.recovered && !result.session
+          && await takeRestoreUnavailableFreshThread(result.recoveryRefusalCode, snapshot)) {
+          const fresh = wrapManagedSession(await backend.openSession({ identity: snapshot.identity,
+            workingDirectory: input.execution.workspace.cwd ?? undefined, signal: options.signal }));
+          await recordRestoreUnavailableFreshThread();
+          await recordAdmittedProviderPack(fresh, snapshot.identity, false);
+          return { recovered: true, session: fresh };
+        }
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();
