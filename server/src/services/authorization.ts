@@ -725,7 +725,13 @@ export async function canActorReadIssuePrivacy(db: Db | DbTransaction, actor: Au
 }
 
 /** Filter every externally reachable task query with the same privacy predicate. */
-export async function issueReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor): Promise<SQL<boolean>> {
+export async function issueReadSqlCondition(db: Db | DbTransaction, actor: AuthorizationActor, options?: { excludePrivate?: boolean }): Promise<SQL<boolean>> {
+  // Shared discovery is narrower than reading: even an owner/admin must not
+  // enumerate private conversations. Reuse the canonical privacy predicate
+  // with no principal (and therefore no implicit or explicit private grants),
+  // then intersect it with the caller's ordinary mode-aware read predicate.
+  if (options?.excludePrivate) return sql<boolean>`(${issuePrivacyCondition({ type: "none" })}
+    and ${await issueReadSqlCondition(db, actor)})`;
   if (actor.authorizingUserId) return issuePrivacyCondition(actor);
   if (issuePrivacyMode() !== "enforce") return sql<boolean>`true`;
   if (actor.source === "local_implicit" || actor.isInstanceAdmin) return sql<boolean>`true`;

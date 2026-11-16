@@ -19957,9 +19957,27 @@ export function issueRoutes(
 
   router.get("/companies/:companyId/chats", async (req, res) => {
     const companyId = req.params.companyId as string;
+    if (req.query.members === "all" && !actorCanAccessCompany(req, companyId)) throw notFound("Agent not found");
     assertCompanyAccess(req, companyId);
     if (req.actor.type !== "board" || !req.actor.userId) throw forbidden("Board user access required");
     if (!(await instanceSettings.getExperimental()).enableAgentChat) throw notFound("Agent Chat is disabled");
+    if (req.query.members === "all") {
+      const query = z.object({
+        members: z.literal("all"), agentId: z.string().uuid(),
+        limit: z.coerce.number().int().min(1).max(100).default(50),
+        offset: z.coerce.number().int().min(0).max(1_000_000).default(0),
+      }).strict().safeParse(req.query);
+      if (!query.success) throw badRequest("Invalid conversation filters");
+      const { agentId, limit, offset } = query.data;
+      const resolved = await agentsSvc.resolveByReference(companyId, agentId);
+      if (!resolved.agent || !(await access.decide({ actor: req.actor, action: "agent:read",
+        resource: { type: "agent", companyId, agentId },
+      })).allowed) throw notFound("Agent not found");
+      const conversations = await svc.listAgentConversations(companyId, agentId,
+        await issueReadSqlCondition(db, req.actor, { excludePrivate: true }), limit, offset);
+      res.json(await withConversationReadState(db, companyId, req.actor.userId, await filterIssuesForActor(req, conversations)));
+      return;
+    }
     const conversations = await svc.listConversations(companyId, req.actor.userId);
     res.json(await withConversationReadState(db, companyId, req.actor.userId, await filterIssuesForActor(req, conversations)));
   });

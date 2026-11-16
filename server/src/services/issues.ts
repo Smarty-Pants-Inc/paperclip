@@ -10544,6 +10544,10 @@ export function issueService(db: Db) {
       eq(issues.companyId, companyId), eq(issues.conversationUserId, userId), isNotNull(issues.conversationAgentId),
     )).orderBy(desc(issues.updatedAt), asc(issues.id)),
 
+    listAgentConversations: async (companyId: string, agentId: string, readCondition: SQL<boolean>, limit: number, offset: number) => db.select().from(issues).where(and(
+      eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId), isNotNull(issues.conversationUserId), readCondition,
+    )).orderBy(desc(issues.updatedAt), asc(issues.id)).limit(limit).offset(offset),
+
     getConversation: async (companyId: string, agentId: string, userId: string) => db.select().from(issues).where(and(
       eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId), eq(issues.conversationUserId, userId),
     )).then((rows) => rows[0] ?? null),
