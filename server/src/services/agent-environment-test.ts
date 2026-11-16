@@ -27,6 +27,10 @@ import { probeCopilotExecutionTarget } from "./copilot-connection-probe.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { pluginEnvironmentRequiresAgent } from "./plugin-environment-driver.js";
+
+// The setup check's sandbox lease must outlive box start, the probe (up to 45 s) and
+// its proven retirement (up to 60 s, plus one retained retry): 180 s could expire mid-retirement.
+const NATIVE_SETUP_TEST_LEASE_MS = 360_000;
 const asRecord = (value: unknown): Record<string, unknown> | null => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 async function probeManagedPiRunnerHello(context: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult> {
   const testedAt = new Date().toISOString();
@@ -304,7 +308,7 @@ export function agentEnvironmentTestService(db: Db, pluginWorkerManager?: Plugin
         agentId: input.agentId,
         adapterType: input.adapterType,
         ...(environment.driver === "plugin" && input.adapterType === "paperclip_runner"
-          ? { requestedExpiresAt: new Date(Date.now() + 180_000) } : {}),
+          ? { requestedExpiresAt: new Date(Date.now() + NATIVE_SETUP_TEST_LEASE_MS) } : {}),
         environment: testEnvironment,
         configuredEnvironment: environment,
         issueId: null,
