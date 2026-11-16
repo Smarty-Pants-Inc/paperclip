@@ -85,11 +85,21 @@ async function resolveRunContext(db: Executor, input: CaptureInput, atAdmission:
     assertBoundRunIssueId(initial);
     const issueId = boundRunIssueId(initial);
     if (input.issueId && input.issueId !== issueId) throw invalid();
-    // Credential/cache reads validate an already admitted pair without taking the
-    // admission lifecycle lock (or reinterpreting a later task move as admission).
+    // Credential/cache reads NEVER create a pair. Reuse the task -> project
+    // lifecycle ordering so a retirement/revocation already holding that lock
+    // completes before selection reads its fresh committed access state.
     if (Object.hasOwn(initial.contextSnapshot ?? {}, SNAPSHOT_KEY)) {
       const saved = savedBinding(initial.contextSnapshot![SNAPSHOT_KEY]);
-      if (saved.issueId !== issueId || saved.projectId !== await taskProject(tx, input.companyId, issueId)) throw invalid();
+      if (saved.issueId !== issueId || saved.projectId !== await taskProject(tx, input.companyId, issueId, true)) throw invalid();
+      if (saved.projectId) await lockProjectConnectionLifecycle(tx, { companyId: input.companyId, projectId: saved.projectId });
+      // Fresh statements after a lifecycle wait: no stale run/task snapshot may
+      // be promoted to a new admission or silently switched to another project.
+      const [current] = await readRun();
+      if (!current || !["queued", "running"].includes(current.status)) throw invalid();
+      assertBoundRunIssueId(current);
+      const currentSaved = savedBinding(current.contextSnapshot?.[SNAPSHOT_KEY]);
+      if (boundRunIssueId(current) !== issueId || currentSaved.issueId !== saved.issueId
+        || currentSaved.projectId !== saved.projectId || saved.projectId !== await taskProject(tx, input.companyId, issueId)) throw invalid();
       return { companyId: input.companyId, agentId: input.agentId, heartbeatRunId: initial.id, ...saved };
     }
     if (!atAdmission) throw invalid();
