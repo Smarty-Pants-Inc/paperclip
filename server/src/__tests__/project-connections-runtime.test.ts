@@ -22,7 +22,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   beforeAll(async () => { database = await startEmbeddedPostgresTestDatabase("paperclip-project-runtime-"); db = createDb(database.connectionString); }, 60_000);
-  beforeEach(() => provider.acquire.mockClear());
+  beforeEach(() => { provider.acquire.mockClear(); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); }, 60_000);
 
   async function shared() {
