@@ -114,6 +114,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
+import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -4289,6 +4290,19 @@ export function recoveryService(
         || current.executionAgentNameKey !== input.issue.executionAgentNameKey
         || current.updatedAt.getTime() !== input.issue.updatedAt.getTime()) {
         return null;
+      }
+
+      // A non-invokable assignee can still own a running provider. Escalation
+      // changes status and clears both task locks, so require the lifecycle's
+      // execution Stop proof under the same task/run locks as that write.
+      // Neither a cancellation request nor a terminal status alone proves Stop.
+      const ownerRunIds = [...new Set([current.checkoutRunId, current.executionRunId]
+        .filter((id): id is string => id !== null))];
+      if (ownerRunIds.length) {
+        await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, current.companyId), inArray(heartbeatRuns.id, ownerRunIds),
+        )).orderBy(asc(heartbeatRuns.id)).for("update");
+        if (!await runExecutionsHaveStopped(tx as unknown as Db, current.companyId, ownerRunIds)) return null;
       }
 
       // Acceptance holds the same issue lock before writing its successor.

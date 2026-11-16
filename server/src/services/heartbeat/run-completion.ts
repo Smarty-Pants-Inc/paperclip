@@ -982,6 +982,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
+      let interactionContinuationOwnsFailure = false;
       if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
         if (policy.enabled && policy.maxAttempts > 0) {
@@ -1013,10 +1014,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
       ) {
-        await scheduleInteractionContinuationInfrastructureRetryIfEligible(
-          livenessRun,
-          agent,
-        );
+        const retry = await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        interactionContinuationOwnsFailure = retry?.outcome === "scheduled" || retry?.outcome === "retry_exhausted";
       }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,
@@ -1025,7 +1024,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       );
       const conversationSettled = await settleConversationTurn(db, livenessRun);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: conversationSettled ||
+        // This interaction owns its retry or saved needs-attention escalation.
+        // Generic recovery must not dispatch before its final Stop settlement.
+        suppressImmediateRecovery: conversationSettled || interactionContinuationOwnsFailure ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||
@@ -1536,7 +1537,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // exhaustion. Once its durable coordinator has classified a
         // terminal failure, generic issue recovery must not create a
         // replacement retryOfRunId chain for the same provider work.
-        suppressImmediateRecovery: nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
+        suppressImmediateRecovery: (isResolvedInteractionContinuationWakeContext(livenessRun.contextSnapshot) &&
+          (fallbackRetry?.outcome === "scheduled" || fallbackRetry?.outcome === "retry_exhausted")) ||
+          nativeTerminalFailureCode !== null || storageWait?.outcome === "scheduled"
           || storageWait?.outcome === "retry_exhausted" || nativePreDispatchRetry?.outcome === "scheduled",
       });
       await handleIssueReviewPathDisposition(livenessRun);
@@ -1930,7 +1933,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       await settleStorageWaitMessage(livenessRun, storageWait, outerErr);
       await releaseIssueExecutionAndPromote(livenessRun, {
-        suppressImmediateRecovery: storageWaitScheduled || nativePreDispatchRetryScheduled ||
+        suppressImmediateRecovery: (isResolvedInteractionContinuationWakeContext(livenessRun.contextSnapshot) &&
+          (storageWait?.outcome === "scheduled" || storageWait?.outcome === "retry_exhausted")) ||
+          storageWaitScheduled || nativePreDispatchRetryScheduled ||
           readNonEmptyString(
             parseObject(livenessRun.contextSnapshot).goalControlRequestId,
           ) !== null ||

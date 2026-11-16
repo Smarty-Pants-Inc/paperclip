@@ -1938,22 +1938,20 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     if (!isRetryableInteractionContinuationInfrastructureFailure(run)) {
       const context = parseObject(run.contextSnapshot);
       const issueId = readNonEmptyString(context.issueId);
-      await escalatePlanApprovalResumeFailureNeedsAttention({
-        run,
-        issueId,
-        attempt: Math.min(
-          run.scheduledRetryAttempt ??
-            INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
-          INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
-        ),
-        maxAttempts: INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
+      const attempt = Math.min(run.scheduledRetryAttempt ?? INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
+        INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS);
+      const attention = await escalatePlanApprovalResumeFailureNeedsAttention({
+        run, issueId, attempt, maxAttempts: INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS,
       }).catch((error) => {
         logger.warn(
           { err: error, runId: run.id, issueId },
           "failed to escalate non-retryable plan-approval resume failure",
         );
       });
-      return null;
+      // The existing disposition owns this failure even when Stop proof defers
+      // its task escalation. Do not let generic recovery create a second run.
+      return attention ? { outcome: "retry_exhausted" as const, attempt,
+        maxAttempts: INTERACTION_CONTINUATION_INFRA_MAX_ATTEMPTS } : null;
     }
 
     return scheduleBoundedRetryForRun(run, agent, {
