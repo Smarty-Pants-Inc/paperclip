@@ -69,6 +69,9 @@ const companyState = vi.hoisted(() => ({
   setSelectedCompanyId: vi.fn(),
 }));
 
+// Exercise legacy creation/route races with the reversible policy disabled.
+// Hidden-policy direct opens and Add Agent are covered in OnboardingWizard.test.tsx.
+vi.mock("../lib/organization-creation", () => ({ ORGANIZATION_CREATION_HIDDEN: false }));
 vi.mock("../api/goals", () => ({ goalsApi: mockGoalsApi }));
 vi.mock("@/api/adapters", () => ({ adaptersApi: mockAdaptersApi }));
 vi.mock("../api/companies", () => ({ companiesApi: mockCompaniesApi }));

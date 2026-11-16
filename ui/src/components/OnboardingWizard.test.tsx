@@ -45,6 +45,12 @@ vi.mock("../api/auth", async (importOriginal) => {
   return { ...actual, authApi: { ...actual.authApi, getSession: mockAuthApi.getSession } };
 });
 
+// Keep the creation/restore regression suite exercising the reversible policy.
+const creationPolicy = vi.hoisted(() => ({ hidden: false }));
+vi.mock("../lib/organization-creation", () => ({
+  get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
+}));
+
 const mockDialog = vi.hoisted(() => ({
   onboardingOpen: true,
   onboardingOptions: {} as { initialStep?: number; companyId?: string },
@@ -357,6 +363,7 @@ function isArcPrimary(text: string): boolean {
 
 describe("OnboardingWizard restore-gate (stale localStorage across accounts)", () => {
   beforeEach(() => {
+    creationPolicy.hidden = false;
     managedApi.list.mockReset().mockResolvedValue({ currentUserId: "user-1", connections: [] });
     managedApi.create.mockReset().mockResolvedValue({ connectionId: "managed-connection", grantId: "managed-grant" });
     mockAdaptersApi.list.mockReset().mockResolvedValue([]);
@@ -450,6 +457,70 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
   afterEach(() => {
     document.body.innerHTML = "";
     vi.clearAllMocks();
+  });
+
+  describe("hidden organization creation", () => {
+    // Data safety: a direct wizard open or restored draft must not create an org.
+    it.each([false, true])("shows only a notice on step 1 (saved draft: %s)", async (savedDraft) => {
+      creationPolicy.hidden = true;
+      mockDialog.onboardingOptions = { initialStep: 1 };
+      if (savedDraft) {
+        localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify({ step: 1, companyName: "Initech" }));
+      }
+      const { root, queryClient } = render();
+      try {
+        await renderWizardView(root, queryClient);
+        await flushReact();
+        expect(document.body.textContent).toContain("Creating organizations isn't available here yet.");
+        expect(document.querySelector("#onboarding-company-name")).toBeNull();
+        expect([...document.querySelectorAll("button")].some((button) =>
+          /Continue|Create organization|Creating/.test(button.textContent ?? ""),
+        )).toBe(false);
+        expect(mockCompaniesApi.create).not.toHaveBeenCalled();
+      } finally { await act(async () => root.unmount()); queryClient.clear(); }
+    });
+
+    it.each(["ctrlKey", "metaKey"])("does not create from a saved name via %s+Enter", async (modifier) => {
+      creationPolicy.hidden = true;
+      localStorage.setItem(ONBOARDING_STORAGE_KEY, JSON.stringify({ step: 1, companyName: "Initech" }));
+      const { root, queryClient } = render();
+      try {
+        await renderWizardView(root, queryClient);
+        await flushReact();
+        const wizard = document.querySelector("[data-testid='onboarding-wizard']")!;
+        expect(wizard).not.toBeNull();
+        await act(async () => {
+          wizard.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", [modifier]: true, bubbles: true }));
+        });
+        await flushReact();
+        expect(mockCompaniesApi.create).not.toHaveBeenCalled();
+        expect(document.body.textContent).toContain("Creating organizations isn't available here yet.");
+      } finally { await act(async () => root.unmount()); queryClient.clear(); }
+    });
+
+    it("keeps Add Agent on the existing organization's agent step and advances", async () => {
+      creationPolicy.hidden = true;
+      mockCompany.companies = [{ id: "c1", name: "Acme", issuePrefix: "ACM" }];
+      mockCompaniesApi.list.mockResolvedValue(mockCompany.companies);
+      mockDialog.onboardingOptions = { companyId: "c1", initialStep: 3 };
+      const { root, queryClient } = render();
+      try {
+        await renderWizardView(root, queryClient);
+        await flushReact();
+        const field = document.querySelector<HTMLInputElement>("#onboarding-agent-name");
+        expect(field).not.toBeNull();
+        expect(document.querySelector("#onboarding-company-name")).toBeNull();
+        expect(document.body.textContent).not.toContain("Creating organizations isn't available here yet.");
+        await act(async () => setControlledValue(field!, "Ada"));
+        const next = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Next")!;
+        expect(next.disabled).toBe(false);
+        await act(async () => next.click());
+        await flushReact();
+        expect(document.body.textContent).toContain("Connect a model");
+        expect(mockAgentsApi.create).toHaveBeenCalledWith("c1", expect.objectContaining({ name: "Ada" }));
+        expect(mockCompaniesApi.create).not.toHaveBeenCalled();
+      } finally { await act(async () => root.unmount()); queryClient.clear(); }
+    });
   });
 
   describe("first-agent provider choices", () => {
