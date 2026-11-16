@@ -12,7 +12,7 @@ import { approvalService } from "../services/approvals.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { lockCompanyAgentRuntime } from "../services/agent-runtime-lock.js";
 
-// #20805 lock-order evidence for migration 0489's rule: existing agent rows
+// #20805 lock-order evidence for migration 0491's rule: existing agent rows
 // first, then the company runtime lock. Two sessions each, no timing races
 // decide the outcome: each step waits for the other session to be blocked.
 const support = await getEmbeddedPostgresTestSupport();
