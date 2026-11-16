@@ -237,6 +237,23 @@ describe("project connection make-before-break and local retirement (round-4 D)"
         .rejects.toMatchObject({ status: 409, details: { code: "installation_not_exclusive" } });
     });
 
+    it("N6(iii)(c) rollback: abort receipt failure cannot release S without retiring its pending consumer", async () => {
+      const p = await migration();
+      const candidate = await created(p);
+      const before = await storedConnection(db, p.legacy.connection.id);
+      await failReceipt(db, candidate.id);
+      try { await expect(p.f.service.archiveConnection(candidate.id, p.f.companyId, { ...p.f.actor(),
+        projectDoneConfirmation: { projectId: p.f.a.id, connectionId: candidate.id } })).rejects.toMatchObject({ cause: {
+          code: "P0001", message: "synthetic receipt persistence failure" } }); }
+      finally { await restoreReceipt(db); }
+      expect(await storedConnection(db, candidate.id)).toMatchObject({ status: "draft", enabled: false,
+        config: { projectScope: { migrationPending: true } } });
+      expect((await storedConnection(db, p.legacy.connection.id)).config).toEqual(before.config);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, p.legacy.connection.id),
+        eq(activityLog.action, "tool_connection.project_app_approval_released")))).toHaveLength(0);
+      await restartedPush(p, p.legacy.connection.id, p.bContext);
+    });
+
     it("N6(iii)(d): a completed transition rolled back by its receipt leaves S live while B still needs it", async () => {
       const p = await migration();
       const candidate = await created(p);
