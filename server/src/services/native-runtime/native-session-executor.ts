@@ -2,6 +2,7 @@ import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
+import { clearProviderIdentityBreak, noteProviderIdentityBreak, recordedProviderIdentityTransitionIsAllowed, type ProviderIdentityLineageScope } from "./provider-identity-lineage.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -275,6 +276,7 @@ import {
   issueThreadInteractions,
   issueRecoveryActions,
   issues,
+  nativeHarnessBackups,
   nativeRunFinalizations,
   nativeRunResults,
 } from "@paperclipai/db";
@@ -2360,6 +2362,16 @@ export function nativeSessionScopeDigestIsBusy(digest: string): boolean {
   return scopes.some(
     (scope) => createHash("sha256").update(scope).digest("hex") === digest,
   );
+}
+
+/** The piConversation lineage that holds this session's provider-identity steps. */
+export function providerIdentityLineageScope(execution: NativeExecutionInput): ProviderIdentityLineageScope {
+  return {
+    companyId: execution.binding.companyId,
+    agentId: execution.binding.agentId,
+    taskKey: execution.binding.issueId,
+    normalizedSessionId: nativeSessionKey(execution),
+  };
 }
 
 export function nativeSessionKey(execution: NativeExecutionInput): string {
@@ -13196,6 +13208,14 @@ async function executePaperclipNativeSessionAttempt(
               );
             },
             onContinuityBreak: async (continuity) => {
+              // restart-up's same-run replacement opened a NEW provider thread
+              // in this conversation. Record that step on the lineage at the
+              // first suspended read of the box, so a restart or idle close
+              // does not refuse the newer thread (#20787 J3-17).
+              if (input.execution.provider.kind === "pi_rpc") {
+                noteProviderIdentityBreak(providerIdentityLineageScope(input.execution),
+                  "resume_failed_on_new_box", input.execution.binding.runId);
+              }
               const atMs = Date.now();
               await trace.record({
                 name: "provider.session.continuity_break",
@@ -18493,7 +18513,16 @@ async function createRunnerdBackendWithinSessionClaim(
         execution: input.execution,
         previous: previousManifest.providerSessionIdentity,
         current: providerSessionIdentity,
-      })
+      }) &&
+      // A newer provider thread than the backup is this conversation's only
+      // when recorded steps chain the manifest's identity to it (#20787 J3-17).
+      !(await recordedProviderIdentityTransitionIsAllowed({
+        db: input.db,
+        scope: providerIdentityLineageScope(input.execution),
+        previous: previousManifest.providerSessionIdentity,
+        current: providerSessionIdentity,
+        providerLeaseId: sandboxLeaseAcquisition?.providerLeaseId ?? null,
+      }))
     ) {
       throw new Error("runner_harness_state_mismatch: provider_identity_changed");
     }
@@ -18612,6 +18641,23 @@ async function createRunnerdBackendWithinSessionClaim(
       timeoutMs: 30_000,
     });
     return moved.exitCode === 0 && !moved.timedOut;
+  };
+
+  // A new box that starts a fresh provider session while this conversation
+  // has a durable backup forks the lineage (the spare/new-box fallback). Note
+  // it for this box, so the first suspended read that meets the older backup
+  // records the step instead of refusing the newer thread (#20787 J3-17).
+  const noteFreshProviderSessionOnNewBox = async () => {
+    const providerLeaseId = sandboxLeaseAcquisition?.providerLeaseId;
+    if (input.execution.provider.kind !== "pi_rpc" || !providerLeaseId) return;
+    const [lineageBackup] = await input.db.select({ id: nativeHarnessBackups.id }).from(nativeHarnessBackups).where(and(
+      eq(nativeHarnessBackups.companyId, input.execution.binding.companyId),
+      eq(nativeHarnessBackups.scopeDigest, createHash("sha256").update(nativeSessionScopeKey(input.execution)).digest("hex")),
+      // An unreadable lineage leaves the fork unrecorded: the later read refuses, as before.
+      eq(nativeHarnessBackups.status, "current"))).limit(1).catch(() => []);
+    if (!lineageBackup) return;
+    noteProviderIdentityBreak(providerIdentityLineageScope(input.execution), "resume_failed_on_new_box",
+      input.execution.binding.runId, providerLeaseId);
   };
 
   const recordInPlaceHarnessReuse = async (
@@ -18918,6 +18964,8 @@ async function createRunnerdBackendWithinSessionClaim(
                           !(await claimUntouchedRemoteSession())) {
                         const code = `runner_harness_state_mismatch: resumed_${state.incompleteReason}`;
                         throw state.incompleteReason === "unavailable" ? nativeReconciliationError(code) : new Error(code);
+                      } else if (!provenRestart) {
+                        await noteFreshProviderSessionOnNewBox();
                       }
                     } else {
                       await recordInPlaceHarnessReuse(
@@ -18933,6 +18981,7 @@ async function createRunnerdBackendWithinSessionClaim(
                       "sandbox.lease.replacement",
                       async () => {
                         if (!freshReplacement) await restoreVerifiedHarnessBackup();
+                        else await noteFreshProviderSessionOnNewBox();
                       },
                       {
                         attributes: {
@@ -18986,6 +19035,9 @@ async function createRunnerdBackendWithinSessionClaim(
                         && await claimUntouchedRemoteSession())) {
                         throw new Error("runner_harness_state_mismatch: created_not_suspended");
                       }
+                    } else {
+                      // A created (e.g. spare) box with no state of this session starts fresh.
+                      await noteFreshProviderSessionOnNewBox();
                     }
                   }
                 } else if (remoteTarget && remoteCommandRunner) {
@@ -19260,6 +19312,8 @@ async function createRunnerdBackendWithinSessionClaim(
                 // save; its result is uncertain once it starts, so keep the
                 // resume path rather than discard a backup that may exist.
                 checkpointBackupStored = true;
+                // The new backup names the current thread itself.
+                clearProviderIdentityBreak(providerIdentityLineageScope(input.execution));
                 await publishNativeHarnessBackup({
                   db: input.db, companyId: input.execution.binding.companyId,
                   scopeDigest: createHash("sha256").update(sessionScopeId).digest("hex"), backupRoot, pendingRoot,
