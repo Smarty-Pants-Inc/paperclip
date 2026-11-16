@@ -202,7 +202,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   }).where(eq(agents.id, agent.id)).returning();
   if (next === "terminating" || next === "rejected") {
     await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.agentId, agent.id));
-    await effects.clearPrimary(tx, agent.companyId, agent.id);
+    await effects.clearPrimary(tx, agent.companyId, agent.id, publications);
   }
   if (command === "approve") await effects.recordCreation(tx, agent.companyId, agent.id);
   if (next === "pausing" || next === "resuming" || next === "terminating" || next === "rejected") {

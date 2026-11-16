@@ -162,7 +162,7 @@ export async function completeAgentConfiguration(txDb: Db, existing: AgentConfig
     ? buildConfigSnapshot(agentRecordQueries(txDb).normalizeAgentRow(existing))
     : null;
   if (updated.status === "terminated") {
-    await clearPrimaryAgent(txDb, updated.companyId, id);
+    await clearPrimaryAgent(txDb, updated.companyId, id, undefined, publications);
   }
 
   const priorAdapterConfig = isPlainRecord(existing.adapterConfig) ? existing.adapterConfig : {};
