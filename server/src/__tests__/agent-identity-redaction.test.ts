@@ -221,7 +221,7 @@ describe("run secret material: short values and identifiers keep ordinary text b
     const secret = randomBytes(30).toString("base64");
     const eight = "Zq8#rT2!";
     const redactor = createAgentIdentityRedactor();
-    addRunSecretMaterial(redactor, ["1", "v1", agentId, secret, eight]);
+    addRunSecretMaterial(redactor, ["1", "v1", agentId, secret, eight], [agentId]);
     const text = `${ordinary}token=${secret}\npass=${eight}\n`;
     for (const output of [stream(redactor, text), redactor.redact(text), JSON.stringify(redactor.redact({ text }))]) {
       expect(output).not.toContain(secret);
@@ -232,8 +232,9 @@ describe("run secret material: short values and identifiers keep ordinary text b
 
   it("(8) an identifier-valued secret (UUID, a known id, a host name, a region) is not indexed and stays visible", () => {
     const redactor = createAgentIdentityRedactor();
-    addRunSecretMaterial(redactor, [agentId, agentId.toUpperCase(), "api.internal.example.com", "us-east-1", "europe-west4", "env-prod-blue"],
-      ["env-prod-blue"]);
+    // redact-meta4: only values EQUAL to a known id are skipped; shape alone no longer is.
+    const known = [agentId, "api.internal.example.com", "us-east-1", "europe-west4", "env-prod-blue"];
+    addRunSecretMaterial(redactor, known, known);
     expect(redactor.values).toEqual([]);
     const text = `${ordinary}environment env-prod-blue\n`;
     expect(stream(redactor, text)).toBe(text);
