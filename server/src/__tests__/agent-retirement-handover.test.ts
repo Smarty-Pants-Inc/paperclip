@@ -686,6 +686,55 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     f.unsubscribe();
   }, 60_000);
 
+  it("JUDGE row 13: a failed per-item reassignment records its reason in a durable audit row", async () => {
+    const f = await seed();
+    const task = await f.task("Failed audited move", "todo");
+    await f.retire();
+    const before = new Set((await f.activity()).map(row => row.id));
+    await db.execute(sql`insert into b6_forced_failures values ('issue.reassigned', ${task.id})`);
+    await (await f.handover()).processAgent(f.workerId);
+    const newAudit = (await f.activity()).filter(row => !before.has(row.id) && row.entityId === task.id);
+    console.log("JUDGE_FAILURE_AUDIT_PROOF", JSON.stringify({ newAudit,
+      pending: marker(await f.current(f.workerId)), remainsAssigned: (await f.currentTask(task.id)).assigneeAgentId === f.workerId }));
+    f.unsubscribe();
+    expect(newAudit, "OLD-NEW-0505 row 13 requires the failed item's reason in its audit row").not.toHaveLength(0);
+  }, 60_000);
+
+  it("row 13 audit: retries, concurrent passes and a worker restart record one failure per item and reason", async () => {
+    const f = await seed();
+    const task = await f.task("Repeated failed move", "todo");
+    await f.retire();
+    await db.execute(sql`insert into b6_forced_failures values ('issue.reassigned', ${task.id})`);
+    let now = new Date();
+    const service = () => f.handover({ now: () => now });
+    await (await service()).processAgent(f.workerId);
+    const failures = async () => (await f.activity("issue.reassignment_failed")).filter(row => row.entityId === task.id);
+    expect(await failures()).toEqual([expect.objectContaining({ actorType: "system", entityType: "issue",
+      details: expect.objectContaining({ retiredAgentId: f.workerId, reason: expect.stringContaining("forced issue.reassigned failure") }) })]);
+    const first = (await failures())[0]!;
+    // A new service instance has no in-memory dedupe state; force a real retry, twice concurrently.
+    now = new Date(Date.parse(marker(await f.current(f.workerId)).blocked[0].retryAt) + 1);
+    await Promise.all([(await service()).processAgent(f.workerId), (await service()).processAgent(f.workerId)]);
+    expect(await failures()).toEqual([first]);
+    expect(await f.currentTask(task.id)).toMatchObject({ assigneeAgentId: f.workerId });
+    // A different reason deserves its own durable row, not another copy of the original.
+    await db.update(agents).set({ status: "terminated", lifecycleState: "terminated" }).where(inArray(agents.id, [f.leadId, f.rootId]));
+    now = new Date(Date.parse(marker(await f.current(f.workerId)).blocked[0].retryAt) + 1);
+    await (await service()).processAgent(f.workerId);
+    expect((await failures()).map(row => row.details?.reason).sort()).toEqual([first.details!.reason, "no_active_manager"].sort());
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready" }).where(inArray(agents.id, [f.leadId, f.rootId]));
+    await (await service()).processAgent(f.workerId);
+    expect(await failures()).toHaveLength(2); // Returning to the original reason still is not a new failure row.
+    now = new Date(Date.parse(marker(await f.current(f.workerId)).blocked[0].retryAt) + 1);
+    await db.execute(sql`delete from b6_forced_failures`);
+    await (await service()).processAgent(f.workerId);
+    expect(await f.currentTask(task.id)).toMatchObject({ assigneeAgentId: f.leadId });
+    expect(marker(await f.current(f.workerId))).toBeUndefined();
+    expect(await failures()).toHaveLength(2); // The audit survives successful recovery and marker removal.
+    expect(f.events.filter(event => event.action === "issue.reassignment_failed" && event.entityId === task.id)).toHaveLength(2);
+    f.unsubscribe();
+  }, 60_000);
+
   // ---- Condition 5 / W2: commit-bound wake drains a normal retire within 60 s (the gate row) ----
   it("gate row: a normal retire by the lead drains within 60 s through the commit-bound delivery queue", async () => {
     const f = await seed({ reports: 1 });
