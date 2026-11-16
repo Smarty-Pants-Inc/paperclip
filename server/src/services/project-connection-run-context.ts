@@ -162,6 +162,14 @@ export async function revalidateProjectConnectionRunContext(db: Executor, contex
   if (current.issueId !== context.issueId || current.projectId !== context.projectId) throw invalid();
 }
 
+/** Legacy-only companies retain their existing null-purpose runtime paths. */
+export async function hasProjectConnectionOwnership(db: Executor, companyId: string): Promise<boolean> {
+  const [row] = await db.select({ id: toolConnections.id }).from(toolConnections).where(and(
+    eq(toolConnections.companyId, companyId), sql`${toolConnections.projectId} is not null`,
+  )).limit(1);
+  return Boolean(row);
+}
+
 /** Retained ownership engages C2 before empty/legacy/ambient branches. */
 export async function isProjectConnectionManagedRequired(db: Executor, input: Readonly<{ companyId: string; projectId: string }>): Promise<boolean> {
   const rows = await db.select().from(toolConnections).where(and(

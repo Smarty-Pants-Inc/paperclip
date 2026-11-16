@@ -53,7 +53,7 @@ import { executeSpekoVoiceTool, spekoToolsForSession } from "./voice/speko-agent
 import { captureRunIdentity } from "./run-identity.js";
 import { emitConnectionInvoked } from "./connector-telemetry.js";
 import { resolveManagedGitHubIdentitySelection } from "./git-credentials.js";
-import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired } from "./project-connection-run-context.js";
+import { readProjectConnectionRunContext, revalidateProjectConnectionRunContext, isProjectConnectionManagedRequired, hasProjectConnectionOwnership } from "./project-connection-run-context.js";
 import { assertProjectConnectionAdmission } from "./project-connection-admission.js";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
 import { GITHUB_APP_MCP_URL } from "./github-app-client.js";
@@ -2036,6 +2036,36 @@ export function createToolGatewayService(
     }
 
     const snapshotIssueId = stringValue(run.issueId);
+    if (!await hasProjectConnectionOwnership(db, input.companyId)) {
+      // Preserve the documented null-purpose gateway contract when no retained
+      // project owner exists. Protected companies use only the immutable pair
+      // below, and credential acquisition rechecks ownership after async I/O.
+      const snapshotProjectId = stringValue(run.projectId);
+      if ((input.issueId && snapshotIssueId && input.issueId !== snapshotIssueId)
+        || (input.projectId && snapshotProjectId && input.projectId !== snapshotProjectId)) {
+        throw new ToolGatewayHttpError(403, "Supplied run context does not match stored heartbeat context", "run_context_mismatch");
+      }
+      const issueId = snapshotIssueId ?? input.issueId ?? null;
+      let projectId = snapshotProjectId ?? input.projectId ?? null;
+      if (issueId) {
+        const [issue] = await db.select({ companyId: issues.companyId, projectId: issues.projectId })
+          .from(issues).where(eq(issues.id, issueId)).limit(1);
+        if (!issue || issue.companyId !== input.companyId) {
+          throw new ToolGatewayHttpError(403, "Issue context is outside the run company", "run_context_mismatch");
+        }
+        if (projectId && issue.projectId && projectId !== issue.projectId) {
+          throw new ToolGatewayHttpError(403, "Project context does not match issue context", "run_context_mismatch");
+        }
+        projectId = projectId ?? issue.projectId;
+      }
+      if (projectId) {
+        const [project] = await db.select({ companyId: projects.companyId }).from(projects).where(eq(projects.id, projectId)).limit(1);
+        if (!project || project.companyId !== input.companyId) {
+          throw new ToolGatewayHttpError(403, "Project context is outside the run company", "run_context_mismatch");
+        }
+      }
+      return { issueId, projectId };
+    }
     if (input.issueId && input.issueId !== snapshotIssueId) {
       throw new ToolGatewayHttpError(
         403,
@@ -3144,7 +3174,7 @@ export function createToolGatewayService(
   }
 
   async function projectProtectedSession(session: ToolGatewaySession): Promise<boolean> {
-    if (!session.agentId) return false;
+    if (!session.agentId || !await hasProjectConnectionOwnership(db, session.companyId)) return false;
     if (session.runId) {
       const context = await readProjectConnectionRunContext(db, {
         companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId,
@@ -4382,7 +4412,7 @@ export function createToolGatewayService(
         "Project-owned provider is unsupported", "project_connection_provider_unsupported");
     }
     const github = connection.config.sourceTemplateKey === "github" || connection.transportConfig?.sourceTemplateKey === "github";
-    const runContext = github && session.agentId && session.runId
+    const runContext = github && session.agentId && session.runId && await hasProjectConnectionOwnership(db, session.companyId)
       ? await readProjectConnectionRunContext(db, { companyId: session.companyId, agentId: session.agentId, heartbeatRunId: session.runId }) : null;
     const assertProjectSelection = async () => {
       if (!github || !session.agentId) return;
