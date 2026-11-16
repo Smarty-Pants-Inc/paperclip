@@ -266,7 +266,9 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
         const processStarted = new Promise<void>(resolve => { spawned = resolve; });
         const runnerProcessLauncher = createRemoteRunnerProcessLauncher({ target: target!, runner: runner!, remoteBinary,
           processIdentityPath: posix.join(runnerStateDirectory, "runner-process.identity"), stateDirectory: runnerStateDirectory,
-          diagnosticsDirectory: posix.join(remoteRoot, "diagnostics"), runnerInstanceId, onRunnerProcessSpawned: spawned });
+          diagnosticsDirectory: posix.join(remoteRoot, "diagnostics"), runnerInstanceId, onRunnerProcessSpawned: spawned,
+          // A setup check stops a timed-out launch by its identity, then launches once more (smarty-dev#20916).
+          retryTimedOutLaunchOnce: true });
         const executionDriver = createNativeRunnerExecutionDriver({ ...connectivity, binding: { companyId: context.companyId, runId: id },
           prepareRemote, processStarted,
           mapCaBundle: async sourcePath => {

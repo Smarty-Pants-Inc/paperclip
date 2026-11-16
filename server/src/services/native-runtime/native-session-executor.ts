@@ -16999,6 +16999,12 @@ export function createRemoteRunnerProcessLauncher(input: {
   trace?: NativeRunTrace;
   onRunnerProcessSpawned?: () => void;
   sandboxRetention?: SandboxRunnerRetention;
+  /**
+   * A setup (harness) check only: when the launch RPC times out, stop the
+   * runnerd that attempt may have started (by its own identity marker), then
+   * launch once more. An unproven stop fails closed without retrying.
+   */
+  retryTimedOutLaunchOnce?: boolean;
   /** Test seam only; production uses the bounded safety-net cadence. */
   processPollMs?: number;
 }): (spec: RunnerProcessLaunchSpec) => RunnerProcessHandle {
@@ -17025,6 +17031,7 @@ export function createRemoteRunnerProcessLauncher(input: {
     // Set immediately before the launch RPC. Until then no sandbox command
     // could have started runnerd, so a staging failure proves no process.
     let launchDispatched = false;
+    let identityNonce = "";
     let pendingSignal: NodeJS.Signals | null = null;
     let launchedIdentity: {
       nonce: string;
@@ -17106,12 +17113,16 @@ export function createRemoteRunnerProcessLauncher(input: {
         }
       }
       if (pendingSignal) return cancelledBeforeDispatch();
+      const launchStartedAtMs = Date.now();
+      // Each timed-out attempt, kept as the failure's cause: attempt number and duration only.
+      const timedOutAttempts: { attempt: number; durationMs: number; outcome: "timed_out" }[] = [];
+      for (;;) {
       const bootstrapTicket = spec.refreshBootstrapTicket ? await spec.refreshBootstrapTicket() : null;
       if (pendingSignal) return cancelledBeforeDispatch();
       const launchEnvironment = bootstrapTicket
         ? { ...spec.environment, PAPERCLIP_RUNNER_BOOTSTRAP_TICKET: bootstrapTicket }
         : spec.environment;
-      const launchStartedAtMs = Date.now();
+      const attemptStartedAtMs = Date.now();
       await input.trace?.record({
         name: "runner.process.dispatch",
         parentName: "runner.session.startup",
@@ -17121,7 +17132,7 @@ export function createRemoteRunnerProcessLauncher(input: {
       });
       // Trace publication can yield after staging; recheck at dispatch.
       if (pendingSignal) return cancelledBeforeDispatch();
-      const identityNonce = randomUUID();
+      identityNonce = randomUUID();
       const remoteArgs = [...spec.args];
       const diagnosticsArgumentIndex = remoteArgs.indexOf(
         "--diagnostics-directory",
@@ -17167,12 +17178,46 @@ export function createRemoteRunnerProcessLauncher(input: {
         if (isPluginRpcTimeout(error)) return null;
         throw error;
       });
+      if (launchResult?.timedOut && input.retryTimedOutLaunchOnce) {
+        timedOutAttempts.push({ attempt: timedOutAttempts.length + 1, durationMs: Date.now() - attemptStartedAtMs, outcome: "timed_out" });
+        // The timed-out RPC may still have started runnerd. Stop it by this
+        // attempt's own marker and nonce (the identity-failure cleanup); only a
+        // proven stop permits another launch or confirms that no runnerd remains.
+        const cleanupStartedAtMs = Date.now();
+        const stopped = await cleanupRemoteRunnerAfterIdentityFailure({
+          runner,
+          identityPath: input.processIdentityPath,
+          nonce: identityNonce,
+          runnerInstanceId: input.runnerInstanceId,
+        });
+        await input.trace?.record({
+          name: "runner.process.launch_timeout_cleanup",
+          parentName: "runner.session.startup",
+          startedAtMs: cleanupStartedAtMs,
+          endedAtMs: Date.now(),
+          attributes: { attempt: timedOutAttempts.length, cleaned: stopped },
+        });
+        const timedOutFailure = (code: string) => Object.assign(new Error(`${code}: ${timedOutAttempts.length} attempt${
+          timedOutAttempts.length === 1 ? "" : "s"} (${timedOutAttempts.map(attempt => `${attempt.durationMs} ms`).join(", ")})`),
+        { code, attempts: timedOutAttempts.map(attempt => ({ ...attempt })) });
+        if (!stopped) throw timedOutFailure("runner_remote_process_launch_timed_out_cleanup_failed");
+        if (pendingSignal) return cancelledBeforeDispatch();
+        if (timedOutAttempts.length >= 2) {
+          exitConfirmed = true;
+          throw timedOutFailure("runner_remote_process_launch_timed_out");
+        }
+        await input.onLog?.("stderr", "[paperclip-runner] runner launch timed out; stopped that attempt, launching once more\n")
+          .catch(() => undefined);
+        continue;
+      }
       if (launchResult && (launchResult.exitCode !== 0 || launchResult.timedOut)) {
         throw new Error(
           launchResult.timedOut
             ? "runner_remote_process_launch_timed_out"
             : "runner_remote_process_launch_failed",
         );
+      }
+      break;
       }
       let identity: Awaited<ReturnType<typeof waitForRemoteRunnerProcessIdentity>>;
       try {
