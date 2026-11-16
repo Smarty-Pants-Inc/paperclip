@@ -14207,6 +14207,42 @@ describe("native warm session supervision", () => {
     } finally { finishClose(); await closeIdleWarmNativeSessionsForRestart(); }
   });
 
+  // #20825 loop fix B (RFL + review-fleet-2 08:31Z): the server's "owner released
+  // to idle" fact reaches the retained owner through its release(). A failed
+  // run's owner is closed, never released to idle.
+  it.each(["succeeded", "failed"] as const)("tells a retained warm owner it was released to idle only after a finished run: %s", async terminal => {
+    await closeIdleWarmNativeSessionsForRestart();
+    const close = vi.fn(async () => undefined);
+    let busyAtRelease: string | undefined;
+    const release = vi.fn(async () => {
+      busyAtRelease = readNativeSessionIdleWork();
+      return false as const;
+    });
+    const warmExecution = { ...execution, binding: { ...execution.binding,
+      runId: `run-released-to-idle-${terminal}`, executionWorkspaceId: `workspace-released-to-idle-${terminal}` },
+      session: { ...execution.session, normalizedSessionId: `session-released-to-idle-${terminal}`,
+        lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      await options.onSession?.({ close, release });
+      return { result: { summary: "Completed" }, terminal: { runTerminalState: terminal },
+        turnId: `turn-released-to-idle-${terminal}`, normalizedSessionId: warmExecution.session.normalizedSessionId,
+        providerSessionId: `provider-released-to-idle-${terminal}`, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    });
+    try {
+      await executePaperclipNativeSession({ db: leaseDb(warmExecution), execution: warmExecution, runnerInstanceId: "runner" })
+        .catch(() => undefined);
+      if (terminal === "succeeded") {
+        expect(release).toHaveBeenCalledOnce();
+        // Released while the entry is still busy: no admission attaches meanwhile.
+        expect(busyAtRelease).toBe("present");
+        expect(close).not.toHaveBeenCalled();
+      } else {
+        expect(release).not.toHaveBeenCalled();
+      }
+    } finally { await closeIdleWarmNativeSessionsForRestart(); }
+  });
+
   it.each(["controller restart", "idle timeout", "failed turn"])("retains a warm owner without an instruction working copy after rejected retirement: %s", async retirement => {
     await closeIdleWarmNativeSessionsForRestart();
     const failure = new Error("provider retirement unconfirmed");
