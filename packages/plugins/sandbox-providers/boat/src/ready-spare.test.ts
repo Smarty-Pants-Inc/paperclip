@@ -50,7 +50,7 @@ function fixture(initial: ReadySpare[] = [], warmExitCode = 0, warmTimedOut = fa
     }
     if (method === "POST" && route === "/sandboxes") {
       const id = body.labels.purpose === "spare" ? `bx_spare_${inventory.length}` : `bx_run_${inventory.length}`;
-      const sb = { id, state: "running", name: "", labels: body.labels, archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(), team: { id: "team-spare-test" } };
+      const sb = { id, state: "running", name: "", labels: body.labels, archiveAfter: new Date(Date.now() + body.ttlSeconds * 1000).toISOString(), createdAt: new Date(Date.now()).toISOString(), team: { id: "team-spare-test" } };
       inventory.push(sb);
       return response({ sandbox: sb }, 202);
     }
@@ -628,6 +628,60 @@ describe("Boat ready spare", () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     expect(db.query).not.toHaveBeenCalled();
     setInterval.mockRestore();
+  });
+
+  it("E2E wake race: event handlers protect and keep the new refill claimable while 15s maintenance is in flight", async () => {
+    const env = "environment-wake-race-e2e", company = "company-wake-race-e2e";
+    let now = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    let maintenanceTick: (() => void) | undefined;
+    vi.spyOn(globalThis, "setInterval").mockImplementation(((callback: TimerHandler, delay?: number) => {
+      if (delay === 15_000) maintenanceTick = callback as () => void;
+      return 1 as unknown as ReturnType<typeof globalThis.setInterval>;
+    }) as typeof globalThis.setInterval);
+    const db = fakeDatabase();
+    const f = fixture();
+    const logger = await setup(1, [env], 15, db, 1, 10, company);
+    await acquire("run-wake-race-seed", baseConfig, env, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true), { timeout: 2_000 });
+    const original = f.inventory.find(item => item.labels.purpose === "spare")!;
+    // Populate activity through the real event handlers before aging the company.
+    for (const event of ["issue.created", "agent.run.started", "issue.comment.created"]) await emitActivity(event, company);
+    original.state = "archived";
+    now += 16 * 60_000; // company is genuinely idle; maintenance snapshots this state
+
+    let releaseInventory!: () => void;
+    let inventoryEntered!: () => void;
+    const entered = new Promise<void>(resolve => { inventoryEntered = resolve; });
+    const gate = new Promise<void>(resolve => { releaseInventory = resolve; });
+    const realFetch = f.fetch;
+    let pauseOnce = true;
+    vi.stubGlobal("fetch", async (input: any, init: any = {}) => {
+      const url = new URL(String(input));
+      if (pauseOnce && (init.method ?? "GET") === "GET" && url.pathname === "/api/v1/sandboxes") {
+        pauseOnce = false;
+        inventoryEntered();
+        await gate;
+      }
+      return realFetch(input, init);
+    });
+    expect(maintenanceTick).toBeDefined();
+    maintenanceTick!();
+    await entered;
+    now += 1_000; // a real issue wake arrives while the timer is between snapshot and stop
+    for (const event of ["issue.created", "agent.run.started", "issue.comment.created"]) await emitActivity(event, company);
+    await vi.waitFor(() => expect(f.inventory.some(item => item.id !== original.id && item.labels.purpose === "spare" && item.name.startsWith("paperclip-spare:ready:"))).toBe(true), { timeout: 2_000 });
+    releaseInventory();
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    const refill = f.inventory.find(item => item.id !== original.id && item.labels.purpose === "spare")!;
+    expect(refill.state).not.toBe("archived");
+    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.warn.mock.calls.filter(([message]) => message === "Boat ready spare wake reconciliation failed")).toHaveLength(0);
+    await plugin.definition.onHealth!();
+    await acquire("run-wake-race-claim", baseConfig, env, company);
+    expect(f.calls.some(call => call.method === "PATCH" && call.url.pathname.endsWith(`/${refill.id}`)
+      && call.body?.name?.startsWith("paperclip-claim:"))).toBe(true);
   });
 
   it("does not query the claim store from the host-delivered company activity event", async () => {

@@ -28,6 +28,7 @@ export type ReadySpare = {
   warmed: boolean;
   expiresAt: string;
   ttlSeconds?: number;
+  createdAt?: string;
   name: string;
   labels: Record<string, string>;
   providerObservation?: Record<string, unknown>;
@@ -41,7 +42,7 @@ export type ReadySpareOperations = {
   warmUp?(spare: ReadySpare): Promise<"completed" | "missing_pack" | "failed" | "timeout">;
   claim(spare: ReadySpare, claimName: string, ttlSeconds: number): Promise<boolean>;
   refresh(spare: ReadySpare, ttlSeconds: number): Promise<ReadySpare>;
-  stop(spare: ReadySpare): Promise<void>;
+  stop(spare: ReadySpare): Promise<void | boolean>;
   /** Optional provider-side hourly cap check; fail closed on an unknown result. */
   allowCreate?(): Promise<boolean>;
 };
@@ -339,7 +340,8 @@ export class ReadySpareKeeper {
         || current.labels.configHash !== key.configHash
         || current.name !== `paperclip-spare:ready:${key.configHash}`
         || (current.state !== "ready" && current.state !== "idle") || this.claiming.has(surplus.id)) continue;
-      await operations.stop(current);
+      const stopped = await operations.stop(current);
+      if (stopped === false) selected.push(current);
     }
     if (selected.length) this.pools.set(poolId, selected);
     else this.pools.delete(poolId);
@@ -399,7 +401,8 @@ export class ReadySpareKeeper {
     }
     for (const stale of toStop) {
       if (this.stopping) return;
-      await operations.stop(stale);
+      const stopped = await operations.stop(stale);
+      if (stopped === false && readyAndHealthy(stale, key, this.now())) keep.push(stale);
     }
     if (this.stopping) return;
 
@@ -411,7 +414,11 @@ export class ReadySpareKeeper {
     }
     const selected = keep.slice(0, desired);
     for (const surplus of keep.slice(desired)) {
-      if (!strictBoatOnly) { await operations.stop(surplus); continue; }
+      if (!strictBoatOnly) {
+        const stopped = await operations.stop(surplus);
+        if (stopped === false) selected.push(surplus);
+        continue;
+      }
       if (this.stopping) return;
       let current: ReadySpare | undefined;
       try { current = await operations.get(surplus); } catch { continue; }
@@ -419,7 +426,8 @@ export class ReadySpareKeeper {
           && current.labels.environment === key.environmentId && current.labels.purpose === "spare"
           && current.labels.configHash === key.configHash && current.name === `paperclip-spare:ready:${key.configHash}`
           && (current.state === "ready" || current.state === "idle") && !this.claiming.has(surplus.id)) {
-        await operations.stop(current);
+        const stopped = await operations.stop(current);
+        if (stopped === false) selected.push(current);
       }
     }
     if (selected.length) this.pools.set(poolId, selected);

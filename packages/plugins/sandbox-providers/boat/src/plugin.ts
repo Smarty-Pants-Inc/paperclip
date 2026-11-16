@@ -709,6 +709,7 @@ function readySpareFromSandbox(sandbox: any, ttlSeconds: number): ReadySpare {
   return {
     id: sandbox.id, key, state: typeof sandbox.state === "string" ? sandbox.state : "unknown",
     warmed: name === `paperclip-spare:ready:${key.configHash}`, expiresAt, ttlSeconds, name, labels,
+    ...(typeof sandbox.createdAt === "string" ? { createdAt: sandbox.createdAt } : {}),
     providerObservation: sandbox as Record<string, unknown>,
   };
 }
@@ -737,7 +738,24 @@ async function createReadySpare(config: Config, key: ReadySpareKey, ttlSeconds: 
     const observation = { ...setup, ...warmedSandbox, id: sandbox.id, name };
     return readySpareFromSandbox({ ...observation, labels }, ttlSeconds);
   } catch (error) {
-    try { await stopSandbox(config, sandbox.id); } catch { /* Boat-side TTL remains the crash-safe stop. */ }
+    // A failed create may overlap a company wake. Never stop a creating box,
+    // or any allocation while its company is inside the activity window.
+    try {
+      const observed = await request(config, `/sandboxes/${encodeURIComponent(sandbox.id)}`, {
+        method: "GET", cache: "no-store", signal: AbortSignal.timeout(10_000),
+      }, false, { requireJson: true });
+      const current = observed?.sandbox ?? observed;
+      const activity = await loadCompanySpareActivity(key.companyId);
+      const latestActivity = Math.max(activity.lastActivityAt ?? Number.NEGATIVE_INFINITY,
+        activity.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY);
+      const active = Number.isFinite(latestActivity)
+        && Date.now() - latestActivity <= (knownSparePools.get(readySparePoolKey(key))?.idleMinutes ?? readySpareIdleMinutes(undefined)) * 60_000;
+      const createdAt = Date.parse(current?.createdAt ?? "");
+      if (current?.id === sandbox.id && ["ready", "idle", "running"].includes(current.state)
+          && !(active && Number.isFinite(createdAt) && createdAt >= latestActivity)) {
+        await stopSandbox(config, sandbox.id);
+      }
+    } catch { /* Boat-side TTL remains the crash-safe stop. */ }
     throw error;
   }
 }
@@ -821,7 +839,31 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
       return { ...spare, state: sandbox.state, expiresAt, ttlSeconds: refreshTtlSeconds,
         providerObservation: { ...(spare.providerObservation ?? {}), ...sandbox } };
     },
-    stop: async spare => { await stopSandbox(config, spare.id); },
+    stop: async spare => {
+      // This is the last gate for every keeper stop path (timer, adoption,
+      // reconcile, and create completion): refresh both Boat state and company
+      // activity immediately before issuing the stop.
+      let current: ReadySpare | undefined;
+      try { current = await createReadySpareOperations(config, key, ttlSeconds, from).get(spare); }
+      catch { return false; }
+      if (!current || current.id !== spare.id || current.labels.owner !== `paperclip:${key.companyId}`
+          || current.labels.environment !== key.environmentId || current.labels.purpose !== "spare"
+          || current.labels.configHash !== key.configHash
+          || current.name !== `paperclip-spare:ready:${key.configHash}`
+          || !["ready", "idle", "running"].includes(current.state)) return false;
+      const pool = knownSparePools.get(readySparePoolKey(key));
+      const activity = await loadCompanySpareActivity(key.companyId);
+      const latestActivity = Math.max(activity.lastActivityAt ?? Number.NEGATIVE_INFINITY,
+        activity.lastLeaseAcquiredAt ?? Number.NEGATIVE_INFINITY);
+      const active = Number.isFinite(latestActivity)
+        && Date.now() - latestActivity <= (pool?.idleMinutes ?? readySpareIdleMinutes(undefined)) * 60_000;
+      const createdAt = Date.parse(current.createdAt ?? "");
+      // Existing spare stock may still be retired while active. A box created
+      // at or after the fresh wake timestamp belongs to that wake and survives.
+      if (active && Number.isFinite(createdAt) && createdAt >= latestActivity) return false;
+      await stopSandbox(config, spare.id);
+      return true;
+    },
     async allowCreate() {
       const inventory = await listBoatSandboxes(config, [["owner", `paperclip:${key.companyId}`], ["purpose", "spare"]]);
       const cutoff = Date.now() - 60 * 60 * 1000;
