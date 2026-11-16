@@ -716,7 +716,7 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
       key: "CLAUDE_CODE_OAUTH_TOKEN",
       version: 3,
     });
-    // The response body carries the reference only, never a token value.
+    // The response body carries the reference only, never a token value. (superseded by replacement: #20816 F6, RFL record 19:12Z)
     expectNoTokenLeak(res.body, [FIXTURE_CLAUDE_OAUTH_TOKEN]);
 
     const declarations = await db
