@@ -279,3 +279,34 @@ BEGIN
   RETURN NULL;
 END;
 $$;
+--> statement-breakpoint
+-- #20805 R2 (src11, review-fleet-4 F1a/F1b): the agent file-event revision is a
+-- STATEMENT-level AFTER INSERT trigger on activity_log (as the connector trigger
+-- is). The row-level BEFORE trigger took the shared company hold for row 1 and
+-- then took agent rows after it: the activity row's own agent_id FK key share
+-- (the RI check runs after the BEFORE trigger) and a later row's target. Now
+-- every RI key share has run (AFTER ROW, before this trigger), then every file
+-- event's target agent row is locked in id order, then each revision is recorded
+-- (shared hold) and written into its activity row. Same events, same revision
+-- rows in row order, same details key.
+CREATE OR REPLACE FUNCTION paperclip_agent_runtime_files_changed() RETURNS trigger
+LANGUAGE plpgsql SET search_path = public, pg_temp AS $$
+DECLARE event record; revision bigint;
+BEGIN
+  PERFORM paperclip_lock_runtime_agents(ARRAY(SELECT n.entity_id::uuid FROM new_rows n
+    WHERE n.entity_type = 'agent' AND n.action IN ('agent.files_updated', 'agent.instructions_path_updated',
+      'agent.instructions_bundle_updated', 'agent.instructions_file_updated', 'agent.instructions_file_deleted', 'plugin.managed_agent.reset')));
+  FOR event IN SELECT n.id, n.company_id, n.entity_id::uuid AS agent_id FROM new_rows n
+    WHERE n.entity_type = 'agent' AND n.action IN ('agent.files_updated', 'agent.instructions_path_updated',
+      'agent.instructions_bundle_updated', 'agent.instructions_file_updated', 'agent.instructions_file_deleted', 'plugin.managed_agent.reset') LOOP
+    revision := paperclip_record_agent_runtime(event.company_id, event.agent_id);
+    UPDATE activity_log SET details = coalesce(details, '{}'::jsonb) || jsonb_build_object('agentRuntimeRevision', revision::text)
+      WHERE id = event.id;
+  END LOOP;
+  RETURN NULL;
+END;
+$$;
+--> statement-breakpoint
+DROP TRIGGER IF EXISTS paperclip_agent_runtime_files_changed ON activity_log;
+CREATE TRIGGER paperclip_agent_runtime_files_changed AFTER INSERT ON activity_log
+  REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION paperclip_agent_runtime_files_changed();
