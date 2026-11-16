@@ -14,7 +14,7 @@ import { initializeAgentHire, prepareAgentHire } from "../services/agent-hiring.
 import { lockAccountingCompany } from "../services/accounting-transaction.js";
 import { transactionRetryStats } from "../services/transaction-retry.js";
 
-// #20805 REDs: each fails at f6722df5 and passes with migration 0489 + the
+// #20805 REDs: each fails at f6722df5 and passes with migration 0491 + the
 // in-transaction membership grant. Evidence lines are printed as RED_* JSON.
 const support = await getEmbeddedPostgresTestSupport();
 const describePg = support.supported ? describe : describe.skip;
