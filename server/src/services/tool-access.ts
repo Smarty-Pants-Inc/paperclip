@@ -1,6 +1,6 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
-import { assertNotManagerApp, assertProjectAppReceiptInput, prepareProjectAppFirstBind, readProjectAppCustody } from "./project-app-custody.js";
-import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope, requireProjectConnectionHumanHandoff } from "./project-connection-admission.js";
+import { assertNotManagerApp, assertProjectAppReceiptInput, prepareProjectAppFirstBind, readProjectAppCustody, verifyGitHubAppCandidate } from "./project-app-custody.js";
+import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope } from "./project-connection-admission.js";
 import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { assertKnownProjectConnectionCreateAliases, assertProjectConnectionAvailability, lockProjectConnectionIdentities, mapProjectConnectionUniquenessError, projectConnectionIdentityForConnection } from "./project-connection-arbitration.js";
 import { verifyProjectConnectionGitHubScope, type VerifiedProjectConnectionProviderScope } from "./project-connection-provider-scope.js";
@@ -1625,12 +1625,13 @@ export function toolAccessService(
     input: ConnectToolApp,
     actor?: ActorInfo,
   ): Promise<ConnectToolAppResult> {
+    assertProjectAppReceiptInput({ config: input.configValues });
     await actor?.managementContext?.reauthorize();
     if (input.projectId != null) {
       if (input.galleryKey !== "github" || input.connectionMethodKey !== "app-installation") throw unprocessable("Project ownership supports only verified GitHub App TOOL connections", { code: "project_connection_provider_unsupported" });
       if (Object.values(input.credentialValues ?? {}).some(value => value.trim())) throw forbidden("Project setup accepts approved vault references, not raw credentials", { code: "project_connection_reference_not_approved" });
       await assertProjectConnectionAdmission(db, { companyId, projectId: input.projectId, operation: "create", actor });
-      requireProjectConnectionHumanHandoff();
+      throw unprocessable("Project setup requires approved vault references. After H's board-session approval, use the reference-only tool-connection create route.", { code: "project_connection_reference_only_required" });
     }
     if (input.exclusive) throw forbidden("EXCLUSIVE requires an approved project owner", { code: "project_connection_scope_protected" });
     const definition = input.galleryKey
@@ -1852,6 +1853,9 @@ export function toolAccessService(
     // A retired owned identity is history, never an implicit gallery recovery.
     if (recoveredConnection?.projectId) existingApplication = null;
     let retainedConnection = requestedResumeConnection ?? (recoveredConnection && (recoveredConnection.projectId || isGitHubAppConnection(recoveredConnection)) ? undefined : recoveredConnection);
+    // Gallery replacement reconstructs config; it must not erase a receipt on
+    // the approved source connection. Ordinary unrelated connections are unchanged.
+    if (retainedConnection) assertProjectAppReceiptInput({ config: {} }, retainedConnection);
     const transport = method?.transport ?? "mcp_remote";
     const applicationType = transport === "rest_api" ? "rest_api"
       : transport === "mcp_remote" ? "mcp_http"
@@ -2136,6 +2140,7 @@ export function toolAccessService(
         : normalizeConnectionMethodConfig(method, input.configValues ?? asRecord(asRecord(retainedConnection?.config).methodConfig));
     if (galleryEntry?.slug === "github" && method?.key === "app-installation") {
       const parsed = parseGitHubAppConfig(normalizedMethodConfig?.values);
+      await assertNotManagerApp(db, { companyId, refs: retainedConnection?.credentialSecretRefs, appId: parsed.appId });
       if (retainedConnection && isGitHubAppConnection(retainedConnection)
         && JSON.stringify(parsed) !== JSON.stringify(parseGitHubAppConfig(asRecord(retainedConnection.config).methodConfig))) {
         throw badRequest("Reconnect preserves the App, installation and access policy. Create a new connection to change them.");
@@ -4812,6 +4817,7 @@ export function toolAccessService(
       );
       assertProjectAppReceiptInput(input);
       let preparedProject: Awaited<ReturnType<typeof prepareProjectAppFirstBind>> | undefined;
+      let verifiedCandidate: Awaited<ReturnType<typeof verifyGitHubAppCandidate>> | undefined;
       if (isGitHubAppConnection({ config })) await assertNotManagerApp(db, { companyId, refs: input.credentialSecretRefs ?? [], appId: parseGitHubAppConfig(config.methodConfig).appId });
       // Check raw request authority before normalization or any application/key/provider write.
       if ([input.config, input.transportConfig].some(c => c && Object.hasOwn(c, "projectScope"))) throw forbidden("Project approval metadata is server-written", { code: "project_connection_scope_protected" });
@@ -4838,6 +4844,9 @@ export function toolAccessService(
         ...(input.credentialRefs ?? []),
         ...(input.credentialSecretRefs ?? []),
       ]);
+      if (!preparedProject && isGitHubAppConnection({ config })) verifiedCandidate = await verifyGitHubAppCandidate(db, {
+        companyId, config, refs: input.credentialSecretRefs ?? [], namespace: "connection-create", actorId: actor?.actorId ?? undefined,
+      });
       if (transport === "mcp_remote")
         await assertRemoteConnectionEndpointsAllowed(config);
       if (transport === "local_stdio") await stdioTemplateId(companyId, config);
@@ -4892,6 +4901,11 @@ export function toolAccessService(
           await assertProjectConnectionAvailability(tx, { identity, projectId,
             exclusive: asRecord(config.projectScope).exclusive === true });
         }
+        if (verifiedCandidate) {
+          await assertNotManagerApp(tx, { companyId, refs: input.credentialSecretRefs ?? [], verifiedAppId: verifiedCandidate.verified.identity.verifiedRegistrationId });
+          const [key] = await tx.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.id, input.credentialSecretRefs![0]!.secretId))).for("share");
+          if (!key || key.latestVersion !== verifiedCandidate.secretVersion || key.status !== "active" || key.deletedAt) throw conflict("The verified App key changed during creation", { code: "project_app_approval_state_changed" });
+        }
         let transactionApplicationId = applicationId;
         if (!transactionApplicationId) {
           const [app] = await tx.insert(toolApplications).values({
@@ -4943,7 +4957,10 @@ export function toolAccessService(
           await tx.insert(connectionGrants).values({ companyId, connectionId: row.id, kind: "organization", status: "active", isDefault: true,
             credentialSecretRefs: row.credentialSecretRefs, providerTenant: preparedProject.providerTenant });
           await assertProjectConnectionAdmission(tx, { companyId, projectId, connection: row, operation: "finish", actor });
-        } else await ensureDefaultOrganizationGrant(row, tx, undefined, undefined, actor);
+        } else {
+          const grant = await ensureDefaultOrganizationGrant(row, tx, undefined, undefined, actor);
+          if (verifiedCandidate) await tx.update(connectionGrants).set({ providerTenant: verifiedCandidate.providerTenant }).where(and(eq(connectionGrants.companyId, companyId), eq(connectionGrants.id, grant.id)));
+        }
         await syncCredentialBindings(row, [], tx);
         await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(row);
         if (projectId !== null) await writeProjectConnectionReceipt(tx, {
