@@ -107,44 +107,65 @@ The existing company approval rules still apply.
 They do not wait for external resource operations. A pause, including a budget
 pause, is not retirement. A termination request retains the target's execution
 holds, pause reason, task ownership and execution locks while Stop or cleanup
-is unconfirmed. Only the worker's durable host and required-plugin completion
-permits the final transition to `terminated` to release holds and task ownership.
-Budget policies, limits, spending and company holds remain unchanged.
+is unconfirmed. Budget policies, limits, spending and company holds remain
+unchanged, and holds stay frozen on the terminated row (the hold policy check
+excludes agents in termination or a final state).
 
-On completed termination, ordinary unfinished tasks assigned to the report return
-to its assignable immediate reporting manager in the worker's completion
-transaction. This uses normal task assignment validation and execution-lock
-fencing; an assignment failure rolls back completion rather than partially
-retiring the agent. The compatibility `status` already says `terminated` during
-Stop, so the status effect also runs at final lifecycle completion, even when
-that compatibility value does not change. An `in_progress` task
-returns as `todo`. Other statuses and real blockers are preserved: retirement is
-not task completion or proof that a blocker was resolved. Terminal tasks retain
-their historical assignee. Conversation and external-channel tasks retain their
-fixed identity. Root agents have no reporting manager to receive work; an
-unassignable manager (for example, already terminated during company teardown)
-also cannot receive tasks. Those tasks remain under the existing task/recovery
-workflow. Repeated termination does not
-repeat the transfer or its audit record. POST termination and PATCH terminal
-status use the same request and durable-completion path.
+A termination request is refused at request time, under the company lock and
+before any write, with `409 agent_has_live_reports` naming the reports when the
+target has live reports and either has no manager to hand them to (a root), or
+the caller could not change those reports' manager through the normal
+configuration route. The request records its caller on the lifecycle operation.
+POST termination and PATCH terminal status use the same request and
+durable-completion path.
 
-Retirement takes task locks without waiting while holding the agent lock. If a
-checkout already owns a task lock, PostgreSQL rejects that lock attempt with
-`55P03` instead of creating an agent/task deadlock. The root lifecycle transaction
-rolls back and retries with the existing bounded accounting backoff. It also
-retries PostgreSQL-confirmed `40P01` and `40001` rollbacks. Each attempt reacquires
-the company mutex, rechecks authorization and creates a fresh activity-publication
-buffer. Configuration secret-binding activities and completion's task-access
-and reassignment activities use that buffer: live events publish only after the
-final commit, never from a rolled-back attempt. So do hire and hire-decision
-activities (secret bindings, agent identity, primary-agent initialization and
-clearing), including writes from nested hire, approval, rejection and
-configure-then-transition savepoints, which join the root buffer.
-Nested lifecycle writes propagate contention to that root boundary;
-they do not retry inside an already-held outer transaction. Exhaustion leaves
-completion uncommitted and reports a retryable conflict. Assignment cancels only
-unfinished human-wake direction. Completed and failed wake receipts retain their
-original status, finish time and requester attribution.
+Retirement hands work over in two steps (#20389):
+
+1. The final transition (`cleaning_up` -> `terminated`) runs only after the
+   worker's durable host and required-plugin completion. In that one
+   transaction it writes the terminated state, ONE durable hand-over marker
+   (`lifecycleOperation.handover`, shown on agent reads as `handover` with the
+   code `agent_handover_pending`), and the `agent.terminated` activity row naming
+   the caller who asked, for POST and PATCH alike. It touches no task row and
+   takes no task lock, so it never meets a checkout's task-then-agent lock
+   order; it runs once, with no internal retry. A failure rolls all of it back
+   and the worker's next attempt completes it.
+2. The hand-over recovery worker (`services/agent-handover.ts`, delivery queue
+   `agent-handover`) is woken by that commit, and scans for marked retirements
+   on start. It moves each item in its own transaction that re-reads state:
+   an open task (lock the task, then the agents, as checkout does; ordinary
+   task assignment; `in_progress` returns as `todo`, other statuses and real
+   blockers are preserved; one `issue.reassigned` row), and a live report
+   (under the reporting-tree company lock; only `reportsTo` changes; one
+   `agent.reports_to_changed` row with the old and new manager). The target is
+   re-checked for every item: the nearest manager up the chain that is not
+   retired, retiring or pending. With none, or when the move would make a cycle,
+   the item stays where it is and is named in the marker. A failing item stays
+   assigned, is named in the marker with its attempts, and is retried with a
+   bounded backoff. The new manager receives one `agent.reports_received` row
+   per retirement. Active routines of the retired agent are paused with a
+   `routine.paused` row, not re-homed; the routine scheduler also skips a
+   retired default agent. An open budget incident for the agent is dismissed
+   and its pending override approval rejected, with one
+   `budget.incident_resolved` row. Each item's activity publishes after its
+   commit. The marker clears, with an `agent.handover_completed` row, only when
+   no open task and no live report remain. Re-running changes nothing.
+
+Terminal tasks retain their historical assignee. Conversation and
+external-channel tasks retain their fixed identity and stay named in the marker
+for a person to re-home. Agents retired before this worker existed carry no
+marker: the worker only logs a dry list (counts and ids) of them unless
+`PAPERCLIP_AGENT_HANDOVER_REPAIR_PRE_FIX=true`. The assigned-work sweep includes
+open tasks of retired assignees and hands them to the worker.
+
+Configuration secret-binding activities and hire and hire-decision activities
+(secret bindings, agent identity, primary-agent initialization and clearing)
+use the root transaction's activity-publication buffer, including writes from
+nested hire, approval, rejection and configure-then-transition savepoints,
+which join the root buffer: live events publish only after the commit, never
+from a rolled-back transaction. Reassignment cancels the task's human wake
+receipts, finished ones included: that is how a reassignment revokes the human
+direction (`human-directed-work.ts`).
 
 `retry` makes a failed step available for another attempt.
 `reconcilePolicyHolds` updates budget and company holds for the specified company.
