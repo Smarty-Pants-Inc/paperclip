@@ -236,6 +236,13 @@ export function restoreUnavailableContinuationNoticeBody(reason: string): string
   // history handoff (NSR session === null); a fresh thread taken while
   // recovering the saved session gets this run's message only (the real-runner
   // SMA-60 e2e row shows it). Never claim history the thread did not get.
+  // F20: a changed launch profile is taken on the OPEN path only, where the
+  // fresh session gets the saved-history handoff.
+  if (reason === "launch_profile_changed") {
+    return "Continuing in a fresh thread: the agent's runtime configuration changed, so the earlier provider thread "
+      + "could not be continued; this reply continues the same conversation in a fresh provider thread from its saved history. "
+      + `Earlier actions with unknown outcomes are not confirmed or replayed. (${reason})`;
+  }
   return "Continuing in a fresh thread: the earlier provider thread could not be restored on this new sandbox, "
     + "so this reply continues the same conversation in a fresh provider thread, which may not have the earlier thread's context. "
     + `Earlier actions with unknown outcomes are not confirmed or replayed. (${reason})`;
