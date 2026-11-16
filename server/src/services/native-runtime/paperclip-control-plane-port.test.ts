@@ -2,7 +2,9 @@ import { nativeResponsePresentationWork } from "./native-response-presentation-w
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import { plugins } from "@paperclipai/db";
 import { readTaskPanelActivations } from "../plugin-task-panels.js";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { assistant, createPiObservabilityTest, terminal, tool } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-observability.test-fixture.js";
+import { fakePemBody, shapeAssignments, shapePems, shapeTokens } from "../../../../packages/paperclip-runner/src/drivers/pi/pi-shape-redaction.test-fixture.js";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { createHash, generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -1076,6 +1078,44 @@ describe("PaperclipControlPlanePort conformance", () => {
       expect(deltas.map(delta => delta.text).join("")).toBe("***REDACTED***");
       expect(deltas.map(delta => (delta.update as { delta: string }).delta).join("")).toBe("***REDACTED***");
     }
+  });
+
+  it("SHAPE: unknown Pi tokens and transformed PEM stay out of persisted events for that run", async () => {
+    const capture = createPiObservabilityTest();
+    vi.stubGlobal("fetch", capture.transport);
+    try {
+      const pi = await capture.openPi();
+      const values = [...shapeTokens, ...shapeAssignments, ...shapePems];
+      for (const [index, { value: text }] of values.entries()) {
+        await pi.start();
+        const args = { command: `safe command ${text}` };
+        pi.peer.send(...assistant(`shape-persist-${index}`, { tool: "bash", args, text }), ...tool(`shape-persist-${index}`, "bash", text, args), ...terminal);
+        await pi.settled(index + 1);
+      }
+      await pi.close();
+      expect(capture.bodies).toHaveLength(values.length);
+      // The same real-driver receipts go through the production persistence
+      // port, with only the fixture's textual binding ids mapped to DB UUIDs.
+      const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+      const runnerId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+        status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+        runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha });
+      const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+        completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `shape-${identity.runId}` });
+      for (const [index, event] of pi.events.entries()) await port.appendEvent({ ...event, runId: identity.runId,
+        normalizedSessionId: identity.sessionId, sourceInstanceId: runnerId, sourceSeq: index + 1,
+        sourceEventId: `${runnerId}:${index + 1}` });
+      const saved = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId));
+      expect(saved).toHaveLength(pi.events.length);
+      const wire = JSON.stringify(saved);
+      if (process.env.TASK_OUT) await import("node:fs/promises").then(fs => fs.writeFile(join(process.env.TASK_OUT!, `shape-${process.env.SHAPE_EVIDENCE_LABEL ?? "candidate"}-persisted-events.json`), JSON.stringify(saved, null, 2)));
+      for (const { value, kind } of shapeTokens) expect(wire, kind).not.toContain(value);
+      for (const { secret } of shapeAssignments) expect(wire).not.toContain(secret);
+      expect(wire).not.toMatch(/-----BEGIN .*PRIVATE KEY-----|-----END .*PRIVATE KEY-----/);
+      for (let offset = 0; offset + 64 <= fakePemBody.length; offset++) expect(wire).not.toContain(fakePemBody.slice(offset, offset + 64));
+      expect(wire).toContain("[REDACTED:pem]");
+    } finally { await capture.close(); vi.unstubAllGlobals(); }
   });
 
   it("runs the unchanged package conformance suite against Paperclip persistence", async () => {
