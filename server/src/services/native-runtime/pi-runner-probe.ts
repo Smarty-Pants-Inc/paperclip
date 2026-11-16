@@ -1,3 +1,4 @@
+import { mkdir, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join, posix } from "node:path";
 import { cleanupNativeSetupRuntime, createNativeSetupRuntime } from "./native-setup-evidence.js";
@@ -7,7 +8,15 @@ import { resolvePaperclipRunnerProviderProfile, PaperclipRunnerProviderProfileEr
 import { resolveRemotePaperclipRunnerBinary } from "./native-codex-runner.js";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
+
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
+
+/** Static launch files a setup probe never needs to copy out: the staged runner
+ * binary and Node's compile cache. Their custody is a size + sha256 manifest. */
+const PROBE_STATIC_SYNC_EXCLUSIONS = ["bin/paperclip-runnerd", "pi/node-compile-cache"] as const;
+const PROBE_STATIC_MANIFEST_SCRIPT = 'set -eu; root=$1; shift; cd -- "$root"; for entry in "$@"; do '
+  + '[ -e "$entry" ] || continue; find "$entry" -type f ! -type l -exec sh -c \'for f; do '
+  + 'printf "%s %s %s\\n" "$(wc -c < "$f" | tr -d " ")" "$(sha256sum "$f" | cut -d " " -f1)" "$f"; done\' _ {} +; done';
 
 const SAFE_FAILURES: Record<string, string> = {
   pi_prompt_rejected: "Pi handled or rejected hello without starting a model turn.",
@@ -74,10 +83,18 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       };
       const cleanup = async () => {
         if (remoteCreated) {
-          // Reuse the retained-backup sync-out path, without exclusions. A
-          // failed/partial pull must never authorize removal of the sole copy.
+          // Reuse the retained-backup sync-out path. A failed/partial pull must
+          // never authorize removal of the sole copy. The staged runner binary
+          // and Node's compile cache are static, not records: record their
+          // path, size and sha256 instead of copying ~33 MB per launch.
+          const excludeEntries = PROBE_STATIC_SYNC_EXCLUSIONS;
+          const listed = await runner!.execute({ command: "sh", args: ["-c", PROBE_STATIC_MANIFEST_SCRIPT,
+            "paperclip-probe-static-manifest", remoteRoot, ...excludeEntries], bypassSession: true, timeoutMs: 60_000 });
+          requireSuccess(listed);
           await syncRemoteRunnerDirectoryOut({ runner: runner!, sourcePath: remoteRoot,
-            targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700 });
+            targetPath: join(runtimeDirectory, "remote-runtime"), mode: 0o700, excludeEntries });
+          await mkdir(join(runtimeDirectory, "remote-runtime"), { recursive: true, mode: 0o700 });
+          await writeFile(join(runtimeDirectory, "remote-runtime", ".excluded-static-files.txt"), listed.stdout, { mode: 0o600 });
           // Commit the pulled bytes to permanent evidence BEFORE remote rm.
           await cleanupNativeSetupRuntime(runtimeDirectory, true);
           // The remote root can hold a full Pi session history; removal shares the 60 s probe retirement budget.
