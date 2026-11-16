@@ -223,7 +223,8 @@ function estimateLostReceipt(usage: Record<string, unknown>) {
 
 /** The run's persisted usage is a durable receipt. Ledger, reservation handoff
  * and acknowledgement commit together, including after a restart or failed run. */
-export async function accountRunCost(db: Db, runId: string, hooks: BudgetServiceHooks = {}, receiptIndex?: UsageReceiptIndex) {
+export async function accountRunCost(db: Db, runId: string, hooks: BudgetServiceHooks = {}, receiptIndex?: UsageReceiptIndex,
+  progress?: { changed: boolean }) {
   const [identity] = await db.select({ companyId: heartbeatRuns.companyId, status: heartbeatRuns.status,
     pending: heartbeatRuns.costAccountingPending, accountedAt: heartbeatRuns.costAccountedAt,
     issueId: sql<string | null>`${heartbeatRuns.usageJson}->'ledgerScope'->>'issueId'`,
@@ -240,10 +241,12 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
   const pendingReceipts = !identity.accountedAt
     ? await readPendingRunUsageReceipts({ companyId: identity.companyId, runId }, undefined, index) : [];
   let recoveredFiles: string[] = [];
+  let changed = false;
   const accounted = await withBudgetSpan("budget.accounting.settlement", () => withOperationAccountingTransaction(db, identity.companyId, async (tx, publications) => {
     // The operation wrapper can retry a transaction PostgreSQL rolled back.
     // Never delete files imported only by an earlier, unsuccessful attempt.
     recoveredFiles = [];
+    changed = false;
     // Native recovery owns the issue before updating its run. Acquire the
     // charge's issue FK lock first so inserting it cannot reverse that order.
     const issueId = text(identity.issueId);
@@ -255,14 +258,19 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
     // Tool-side image spend is separate from the provider receipt; settle any
     // paid image whose own accounting write did not complete.
     for (const projectId of new Set(await settleChargedImageReceiptsInTransaction(tx, run, publications))) {
+      changed = true;
       await queueBudgetEvaluation(tx, { companyId: run.companyId, agentId: run.agentId, projectId });
     }
     if (run.costAccountedAt) {
       if (object(run.usageJson).accountingLateReceiptPending === true) {
+        // A late-receipt attempt persists its attempted identity even when it
+        // cannot post a charge; a missing identity is a no-op, not progress.
+        changed ||= typeof object(run.usageJson).accountingLateReceiptId === "string";
         // Clearing late debt can release an admission hold too.
         await notifyAccountingHoldRelease(tx, run.companyId);
         return reconcileLateRunUsageReceiptInTransaction(tx, run, publications);
       }
+      changed = true;
       await notifyStrandedAgentStatus(tx, { companyId: run.companyId, agentId: run.agentId });
       await notifyAccountingHoldRelease(tx, run.companyId);
       await tx.update(heartbeatRuns).set({ costAccountingPending: false }).where(eq(heartbeatRuns.id, run.id));
@@ -274,6 +282,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
       throw conflict("Run accounting closure changed during receipt recovery. Retry accounting.");
     for (const item of pendingReceipts) await persistUsageReceiptInTransaction(tx, item.envelope);
     recoveredFiles = pendingReceipts.map(item => item.file);
+    changed ||= recoveredFiles.length > 0;
     [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     if (text(object(object(run.usageJson).ledgerScope).issueId) !== issueId) {
       throw conflict("Run cost attribution changed. Retry accounting.");
@@ -306,6 +315,7 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
       : receiptUnavailable ? await readNativeReceiptClosure(tx, run.id) : null;
     if (receiptUnavailable && !receiptClosure) return false;
     const closureTimedOut = receiptClosure === "timed_out";
+    changed = true;
     if (!preProviderFailure) await ensureRuntimeAccountingBaseline(tx, run.companyId, run.agentId);
     // Acknowledgement is part of the same transaction. Budget checks inside
     // this transaction must not mistake this receipt for missing accounting.
@@ -434,6 +444,8 @@ export async function accountRunCost(db: Db, runId: string, hooks: BudgetService
         timeoutMinutes: ACCOUNTING_CLOSURE_TIMEOUT_MS / 60_000 } }, publications);
     return true;
   }), { "budget.accounting.owner": "run" });
+  // Count committed work only, never writes from a rolled-back retry.
+  if (progress) progress.changed ||= changed;
   // Only a closed account reaches this gap; an open one returned false above.
   if (accounted) crashPoint("accounting.closure.after_commit_before_spool_unlink");
   for (const file of recoveredFiles) {
@@ -508,35 +520,42 @@ export async function readCostAccountingWork(db: Db, now = Date.now(), receiptDi
 export async function reconcileRunCosts(db: Db, hooks: BudgetServiceHooks = {}) {
   const pending = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(actionableRunAccounting())
     .orderBy(asc(heartbeatRuns.updatedAt), asc(heartbeatRuns.id)).limit(100);
-  let accounted = 0;
+  let accounted = 0, changed = 0, failed = 0;
   const receiptIndex = pending.length > 0 ? await indexPendingUsageReceipts() : undefined;
   for (const run of pending) {
-    try { if (await accountRunCost(db, run.id, hooks, receiptIndex)) accounted++; }
+    try {
+      const progress = { changed: false };
+      if (await accountRunCost(db, run.id, hooks, receiptIndex, progress)) accounted++;
+      if (progress.changed) changed++;
+    }
     catch (error) {
+      failed++;
       // Move failed attempts behind other pending work so a poisoned receipt
       // cannot monopolize the bounded batch on every recovery tick.
       await db.update(heartbeatRuns).set({ updatedAt: new Date(), accountingLastAttemptAt: new Date(), accountingAttemptCount: sql`${heartbeatRuns.accountingAttemptCount} + 1`, accountingLastError: error instanceof Error ? error.message.slice(0, 1000) : "Accounting failed" }).where(eq(heartbeatRuns.id, run.id));
       logger.error({ err: error, runId: run.id }, "Run accounting remains pending for retry");
     }
   }
-  return { scanned: pending.length, accounted };
+  return { scanned: pending.length, accounted, changed, failed };
 }
 
 /** Share recovery across overlapping signals. The owning delivery worker
  * schedules retries only while a durable receipt or actionable debt remains. */
-export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks = {}, recoverServices?: () => Promise<void>) {
+export function createCostAccountingReconciler(db: Db, hooks: BudgetServiceHooks = {}, recoverServices?: () => Promise<number | void>) {
   let inFlight: Promise<Awaited<ReturnType<typeof reconcileRunCosts>>> | undefined;
   return () => {
     if (!inFlight) {
       inFlight = (async () => {
         try {
           let serviceRecoveryFailure: { error: unknown } | undefined;
-          try { await recoverServices?.(); }
+          let servicesRecovered = 0;
+          try { servicesRecovered = (await recoverServices?.()) ?? 0; }
           catch (error) { serviceRecoveryFailure = { error }; }
-          await replayUsageReceipts(db);
+          const receipts = await replayUsageReceipts(db);
           const result = await reconcileRunCosts(db, hooks);
           if (serviceRecoveryFailure) throw serviceRecoveryFailure.error;
-          return result;
+          return { ...result, changed: result.changed + servicesRecovered + receipts.replayed,
+            failed: result.failed + receipts.failed };
         } finally {
           inFlight = undefined;
         }
