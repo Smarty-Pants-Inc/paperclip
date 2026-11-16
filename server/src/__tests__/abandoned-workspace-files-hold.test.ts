@@ -198,6 +198,7 @@ describe.skipIf(!support.supported)("sandbox that holds files from an abandoned 
     return runId;
   }
 
+  // SUPERSEDED BY REPLACEMENT (RFL + review-fleet-5, #20878): 54b53598 adds exact predecessor lineage to resume_failed replacements for cold-restore fencing.
   it("gives the next run a new sandbox at once and parks the held one, which cleanup and later runs leave alone", async () => {
     const seeded = await seed();
     await abandon(seeded);
@@ -206,7 +207,8 @@ describe.skipIf(!support.supported)("sandbox that holds files from an abandoned 
     const acquired = await acquire(seeded, runtime);
 
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
-    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed" });
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
+      previousProviderLeaseId: seeded.providerLeaseId });
     const parked = await leaseRow(seeded);
     expect(parked).toMatchObject({ status: "retained", failureReason: ABANDONED_WORKSPACE_FILES_PARKED_REASON });
     expect(parked.metadata).toHaveProperty(ABANDONED_WORKSPACE_FILES_PARKED_KEY);

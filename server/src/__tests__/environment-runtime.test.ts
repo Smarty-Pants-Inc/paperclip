@@ -5047,9 +5047,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // Rung-6 incident 6c0d4025: a new run resumed a two-snapshots-old box.
   // Keep: recorded real catch + provider-state data safety. Exercise the real
   // DB-backed admission path, including pre-upgrade scope fingerprints.
+  // SUPERSEDED BY REPLACEMENT (RFL + review-fleet-5, #20878): 0c1a5535 + 7ae41e06 require exact running inspection before an ended source gains stop authority; no inspection preserves its evidence.
   it.each(["from", "snapshot", "image", "rootfs"].flatMap(key =>
-    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "stale lifecycle"].map(change => ({ key, change }))))(
+    ["same", "changed", "legacy changed", "old identity changed", "unset", "released", "released inspected running", "stale lifecycle"].map(change => ({ key, change }))))(
     "never reuses a retained allocation across a boot source change: $key / $change", async ({ key, change }) => {
+    const inspectedRunning = change === "released inspected running";
+    const released = change === "released" || inspectedRunning;
     const pluginId = randomUUID();
     const providerConfig = { provider: "fake-plugin", [key]: "snap-A", reuseLease: true, timeoutMs: 1234 };
     const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
@@ -5062,8 +5065,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     let acquisitions = 0;
     const workerManager = {
       isRunning: () => true,
-      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute"] }),
+      getWorker: () => ({ supportedMethods: ["environmentResumeLease", "environmentReleaseLease", "environmentDestroyLease", "environmentExecute",
+        ...(inspectedRunning ? ["environmentInspectLease"] : [])] }),
       call: vi.fn(async (_pluginId: string, method: string, params: any) => {
+        if (method === "environmentInspectLease" && inspectedRunning) return { providerLeaseId: params.providerLeaseId, state: "running" };
         if (method === "environmentAcquireLease") return {
           providerLeaseId: `source-${++acquisitions}`, metadata: { ...params.config, remoteCwd: "/workspace" },
         };
@@ -5087,13 +5092,14 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       else scope.leaseIdentityFingerprint = { ...(scope.leaseIdentityFingerprint as object), fingerprint: "0".repeat(64) };
       await environmentService(db).updateLeaseMetadata(first.lease.id, { ...first.lease.metadata, reusableSandboxLease: scope });
     }
-    await db.update(environmentLeases).set({ status: change === "released" ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
+    await db.update(environmentLeases).set({ status: released ? "released" : "retained" }).where(eq(environmentLeases.id, first.lease.id));
     if (change === "stale lifecycle") vi.spyOn(workerManager, "getWorker").mockReturnValue({ supportedMethods: ["environmentResumeLease", "environmentExecute"] } as never);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
     const nextRunId = randomUUID();
     await insertRunningManualRun(nextRunId, companyId, agentId);
     const config = { ...providerConfig, [key]: change === "same" ? "snap-A" : change === "unset" ? null : "snap-B" };
     await environmentService(db).update(environment.id, { config });
+    const endedBefore = released ? (await environmentService(db).getLeaseById(first.lease.id))! : null;
     vi.mocked(workerManager.call).mockClear();
     const next = await acquire({ ...environment, config }, nextRunId);
     expect(next.lease.metadata?.[key]).toBe(config[key]);
@@ -5104,12 +5110,32 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(next.lease.providerLeaseId).not.toBe(first.lease.providerLeaseId);
       expect(acquisitions).toBe(2);
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentResumeLease", expect.anything(), expect.anything());
-      await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
-        status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
-        metadata: { [key]: "snap-A", sandboxStopAndRetain: {
-          schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
-        } },
-      });
+      if (change === "released") {
+        const endedAfter = (await environmentService(db).getLeaseById(first.lease.id))!;
+        expect(endedBefore).toMatchObject({ status: "released", cleanupStatus: null, failureReason: null });
+        expect(endedAfter).toEqual(endedBefore);
+        expect(endedAfter.metadata).not.toHaveProperty("sandboxStopAndRetain");
+        for (const method of ["environmentInspectLease", "environmentStopLease", "environmentReleaseLease"]) {
+          expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, method, expect.anything(), expect.anything());
+        }
+      } else {
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+          status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending",
+          metadata: { [key]: "snap-A", sandboxStopAndRetain: {
+            schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId: first.lease.providerLeaseId, pluginId,
+          } },
+        });
+        if (inspectedRunning) {
+          expect(vi.mocked(workerManager.call).mock.calls.filter(([, method]) => method === "environmentInspectLease")).toEqual([
+            [pluginId, "environmentInspectLease", expect.objectContaining({ providerLeaseId: first.lease.providerLeaseId }), expect.any(Number)],
+          ]);
+          const sourceRows = await db.select().from(environmentLeases).where(eq(environmentLeases.providerLeaseId, first.lease.providerLeaseId!));
+          expect(sourceRows).toHaveLength(1);
+          expect(sourceRows[0]).toMatchObject({ id: endedBefore!.id, status: "pending_cleanup", cleanupStatus: "failed", failureReason: "sandbox_stop_pending" });
+          // Acquisition persists the one intent; dispatch belongs to the existing cleanup owner.
+          expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentStopLease", expect.anything(), expect.anything());
+        }
+      }
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
     }
     await expect(service.execute({ environment: { ...environment, config }, lease: next.lease, command: "verify source" }))
