@@ -1,4 +1,5 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
+import { assertNotManagerApp, assertProjectAppReceiptInput, prepareProjectAppFirstBind, readProjectAppCustody } from "./project-app-custody.js";
 import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope, requireProjectConnectionHumanHandoff } from "./project-connection-admission.js";
 import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { assertKnownProjectConnectionCreateAliases, assertProjectConnectionAvailability, lockProjectConnectionIdentities, mapProjectConnectionUniquenessError, projectConnectionIdentityForConnection } from "./project-connection-arbitration.js";
@@ -3291,6 +3292,7 @@ export function toolAccessService(
         verifiedProject = await verifyProjectConnectionGitHubScope({ companyId, namespace: `${companyId}:${connection.id}:${grant.id}`, config: parseGitHubAppConfig(connection.config.methodConfig), privateKey: secret.value,
           secretVersion: typeof ref.versionSelector === "number" ? ref.versionSelector : secret.latestVersion });
         const scope = readProjectConnectionScope(connection)!;
+        await assertNotManagerApp(db, { companyId, refs: connection.credentialSecretRefs, verifiedAppId: verifiedProject.identity.verifiedRegistrationId });
         if (verifiedProject.identity.companyId !== companyId || verifiedProject.identity.providerHost !== "github.com"
           || verifiedProject.identity.verifiedRegistrationId !== scope.registrationId || verifiedProject.identity.canonicalInstallationKey !== scope.installationKey) {
           throw conflict("The provider identity differs from this project's approved App", { code: "project_connection_state_changed" });
@@ -3848,6 +3850,7 @@ export function toolAccessService(
     let appGrant: typeof connectionGrants.$inferSelect | undefined;
     let appProviderTenant: (typeof connectionGrants.$inferSelect)["providerTenant"] = null;
     if (isGitHubAppConnection(connection)) {
+      await assertNotManagerApp(db, { companyId, refs: connection.credentialSecretRefs, appId: parseGitHubAppConfig(connection.config.methodConfig).appId });
       appGrant = await getGitHubAppGrant(db, connection, { forReconnect: true });
       await assertManagedGrantReactivationAccess(db, connection, appGrant, actor);
       const key = input.credentialValues[GITHUB_APP_KEY_PATH]?.trim();
@@ -3856,6 +3859,7 @@ export function toolAccessService(
         `${companyId}:${connection.id}:${appGrant.id}:replacement`,
         parseGitHubAppConfig(connection.config.methodConfig), key, true,
       );
+      await assertNotManagerApp(db, { companyId, refs: connection.credentialSecretRefs, verifiedAppId: verified.verifiedRegistrationId });
       appProviderTenant = { github: verified.github };
     }
     const personalIdentity = await fixedPersonalIdentityForReconnect(
@@ -4803,9 +4807,12 @@ export function toolAccessService(
         throw unprocessable("Only tool connections can be created here");
       if (transport === "chat_sdk" || transport === "voice")
         throw unprocessable("Chat and voice connections cannot be created here");
-      const config = normalizeGoogleSheetsConnectionConfig(
+      let config = normalizeGoogleSheetsConnectionConfig(
         input.config ?? input.transportConfig ?? {},
       );
+      assertProjectAppReceiptInput(input);
+      let preparedProject: Awaited<ReturnType<typeof prepareProjectAppFirstBind>> | undefined;
+      if (isGitHubAppConnection({ config })) await assertNotManagerApp(db, { companyId, refs: input.credentialSecretRefs ?? [], appId: parseGitHubAppConfig(config.methodConfig).appId });
       // Check raw request authority before normalization or any application/key/provider write.
       if ([input.config, input.transportConfig].some(c => c && Object.hasOwn(c, "projectScope"))) throw forbidden("Project approval metadata is server-written", { code: "project_connection_scope_protected" });
       if (input.projectId != null) {
@@ -4816,11 +4823,13 @@ export function toolAccessService(
         await assertProjectConnectionAdmission(db, { companyId, projectId: input.projectId, operation: "create", actor,
           proposedSecretRefs: input.credentialSecretRefs ?? [],
           proposedRepositoryIds: await projectConnectionRepositoryIds(db, companyId, input.projectId, parseGitHubAppConfig(config.methodConfig).repositories) });
-        // Provider identity is not proof of the human's GitHub clicks. Do not
-        // create an unverified reservation while the trusted custody reader is absent.
-        requireProjectConnectionHumanHandoff();
+        const actorId = actor?.managementContext?.actor.type === "agent" ? actor.managementContext.actor.agentId : actor?.actorId;
+        preparedProject = await prepareProjectAppFirstBind(db, { companyId, projectId: input.projectId, config,
+          refs: input.credentialSecretRefs ?? [], exclusive: input.exclusive === true, actorId: actorId ?? "",
+          repositoryIds: await projectConnectionRepositoryIds(db, companyId, input.projectId, parseGitHubAppConfig(config.methodConfig).repositories) });
+        config = preparedProject.config;
       }
-      if (input.exclusive) throw forbidden("EXCLUSIVE requires an approved project owner", { code: "project_connection_scope_protected" });
+      if (input.exclusive && !preparedProject) throw forbidden("EXCLUSIVE requires an approved project owner", { code: "project_connection_scope_protected" });
       await assertConnectorConnectionSetupEnabled({ config, applicationId, companyId });
       // Validate company-scoped references before touching a caller-supplied
       // network endpoint. Besides failing fast, this keeps cross-company
@@ -4876,6 +4885,10 @@ export function toolAccessService(
           await actor?.managementContext?.reauthorize();
           await assertProjectConnectionAdmission(tx, { companyId, projectId, operation: "create", actor,
             proposedSecretRefs: input.credentialSecretRefs ?? [] });
+          const custody = await readProjectAppCustody(tx, { companyId, projectId, config, refs: input.credentialSecretRefs ?? [],
+            registrationId: preparedProject!.verified.identity.verifiedRegistrationId, repositoryIds: preparedProject!.verified.repositoryIds });
+          const [key] = await tx.select().from(companySecrets).where(and(eq(companySecrets.companyId, companyId), eq(companySecrets.id, custody.receipt.secretRef.secretId))).for("share");
+          if (custody.receipt.id !== preparedProject!.custody.receipt.id || !key || key.latestVersion !== preparedProject!.secretVersion) throw conflict("The approved project App changed during first binding", { code: "project_app_approval_state_changed" });
           await assertProjectConnectionAvailability(tx, { identity, projectId,
             exclusive: asRecord(config.projectScope).exclusive === true });
         }
@@ -4913,7 +4926,7 @@ export function toolAccessService(
               typeof config.sourceTemplateKey === "string" ? getConnectableAppDefinition(config.sourceTemplateKey)?.agentInstructions : null,
             ),
             config,
-            transportConfig: isGoogleSheetsConnectionConfig(config)
+            transportConfig: projectId !== null || isGoogleSheetsConnectionConfig(config)
               ? config
               : (input.transportConfig ?? config),
             credentialRefs: canonicalConnectionCredentialRefs(input.credentialRefs ?? [], input.credentialSecretRefs ?? []),
@@ -4923,7 +4936,14 @@ export function toolAccessService(
             createdByUserId: connectionActorUserId(actor),
           })
           .returning();
-        await ensureDefaultOrganizationGrant(row, tx, undefined, undefined, actor);
+        if (preparedProject) {
+          // The first owned grant and the connection are one transaction. The
+          // ordinary grant synchronizer expects an already-existing owned grant
+          // at admission, so it cannot bootstrap this first binding.
+          await tx.insert(connectionGrants).values({ companyId, connectionId: row.id, kind: "organization", status: "active", isDefault: true,
+            credentialSecretRefs: row.credentialSecretRefs, providerTenant: preparedProject.providerTenant });
+          await assertProjectConnectionAdmission(tx, { companyId, projectId, connection: row, operation: "finish", actor });
+        } else await ensureDefaultOrganizationGrant(row, tx, undefined, undefined, actor);
         await syncCredentialBindings(row, [], tx);
         await createToolRuntimeSlots(tx, runtimeSupervisor).ensureRuntimeSlot(row);
         if (projectId !== null) await writeProjectConnectionReceipt(tx, {

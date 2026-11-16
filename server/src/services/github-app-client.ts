@@ -8,6 +8,13 @@ export const GITHUB_APP_MCP_URL = "https://api.githubcopilot.com/mcp/";
 export const GITHUB_APP_KEY_PATH = "credentials.privateKey";
 const FRESH_MS = 5 * 60_000;
 const MAX_CACHE = 128;
+// Shared invalidation generation reaches all client instances, including the
+// separate <=60s project verifier and ordinary token clients. Signed installation
+// webhooks and local receipt revocation invalidate without retaining tokens.
+let installationGeneration = 0;
+export function invalidateGitHubAppInstallation(_installationId: string) {
+  installationGeneration += 1;
+}
 type Metadata = NonNullable<ConnectionGrant["providerTenant"]>["github"];
 export type GitHubAppConfig = {
   version: 1;
@@ -109,7 +116,8 @@ const repositoriesSchema = z.object({ repositories: z.array(z.object({
   id: providerId, full_name: z.string(), private: z.boolean().optional(),
 })) });
 
-export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Date.now) {
+export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Date.now, cacheMs = FRESH_MS) {
+  if (!Number.isFinite(cacheMs) || cacheMs < 0 || cacheMs > FRESH_MS) throw new Error("Invalid GitHub App cache bound");
   const cache = new Map<string, { until: number; settled: boolean; promise: Promise<AppCredential> }>();
   async function request<T>(path: string, token: string, reason: FailureReason, schema: z.ZodType<T>, body?: unknown): Promise<T> {
     let response: Response;
@@ -171,7 +179,8 @@ export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Dat
   return {
     async acquire(namespace: string, config: GitHubAppConfig, key: string, force = false) {
       const hash = createHash("sha256").update(JSON.stringify(config)).update(key).digest("hex");
-      const cacheKey = `${namespace}:${hash}`;
+      const generation = installationGeneration;
+      const cacheKey = `${namespace}:${generation}:${hash}`;
       const current = cache.get(cacheKey);
       if (current && !current.settled) return current.promise;
       if (!force && current && current.until > clock()) return current.promise;
@@ -181,10 +190,16 @@ export function createGitHubAppClient(fetcher: typeof fetch = fetch, clock = Dat
         if (!oldest) githubAppFailure();
         cache.delete(oldest[0]);
       }
-      const entry = { until: clock() + FRESH_MS, settled: false, promise: acquire(config, key).catch(rethrowGitHubAppFailure) };
+      const entry = { until: clock() + cacheMs, settled: false, promise: acquire(config, key).then(result => {
+        // All joiners await this promise too: an invalidation during provider
+        // I/O must refuse them, not merely the caller that populated the cache.
+        if (generation !== installationGeneration) githubAppFailure("installation");
+        return result;
+      }).catch(rethrowGitHubAppFailure) };
       cache.set(cacheKey, entry);
       try {
         const result = await entry.promise;
+        if (generation !== installationGeneration) githubAppFailure("installation");
         entry.until = Math.min(entry.until, result.expiresAt - 60_000);
         entry.settled = true;
         return result;

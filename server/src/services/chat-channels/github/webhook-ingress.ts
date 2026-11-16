@@ -22,6 +22,7 @@ import {
 } from "../../chat-github-events.js";
 
 import { githubAppJwt } from "../../chat-github-client.js";
+import { invalidateGitHubAppInstallation } from "../../github-app-client.js";
 
 import {
   createHash,
@@ -324,6 +325,11 @@ export function createGitHubWebhookIngress(db: Db, options: GitHubWebhookIngress
         return { kind: "ignored" };
       }
 
+      // Only provider-authenticated lifecycle traffic can invalidate custody
+      // verdicts. Do this at ingress, not after deferred worker processing.
+      if (["installation", "installation_repositories"].includes(eventType)) {
+        invalidateGitHubAppInstallation(String(incomingInstallationId ?? credentials.installationId));
+      }
       const bodySha256 = createHash("sha256").update(body).digest("hex");
       const staged = await db.transaction(async (tx) => {
         const currentEndpoint = await tx
