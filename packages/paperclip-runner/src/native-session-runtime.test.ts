@@ -7166,12 +7166,9 @@ describe("executeNativeSession recovery", () => {
     });
 
     it.each([
-      ["the checkpoint carries no recovery policy (a first-turn fresh open before the server fills it)", { proof: true }, {}],
       ["the interrupted turn recorded a tool call", { proof: false }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
       ["the control plane predates the tool-call proof", { proof: null }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
       ["the tool-call proof fails", { proof: "rejects" as const }, { providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const }],
-      ["the computed policy is same_session_only (an unfinished goal)", { proof: true }, { providerRecoveryPolicy: "same_session_only" as const }],
-      ["the policy is the governed wait's (this run's turn is not an untouched rebind)", { proof: true }, { providerRecoveryPolicy: "allow_replacement_after_governed_wait" as const }],
     ] as const)("names native_provider_state_incompatible (never a bare interruption) when %s", async (_label, options, overrides) => {
       const h = harness({ checkpoint: sameRunCheckpoint(overrides), ...options });
       const failure = await h.run().catch((error: unknown) => error);
@@ -7200,16 +7197,9 @@ describe("executeNativeSession recovery", () => {
       expect(h.openRun).not.toHaveBeenCalled();
     });
 
-    it("never replaces a preconfigured home, even with the plain policy and a no-tool-call proof", async () => {
-      const h = harness({ checkpoint: sameRunCheckpoint({ providerRecoveryPolicy: "allow_replacement_after_resume_failure" }), proof: true,
-        executionInput: { ...preparedInput(), workspace: { ...preparedInput().workspace, cwd: WORKSPACE },
-          schema: "paperclip.native-execution-input.v7", homeMode: "preconfigured" } as unknown as NativeExecutionInputV5 });
-      const failure = await h.run().catch((error: unknown) => error);
-      expect(failure).toBeInstanceOf(NativeProviderStateIncompatibleError);
-      expect(h.openReplacementSession).not.toHaveBeenCalled();
-      expect(h.openSession).not.toHaveBeenCalled();
-    });
-
+    // SUPERSEDED (F7a C2, needs RFL's supersede record): the no-policy, same_session_only,
+    // governed-wait and preconfigured-home rows that named the absence permanently
+    // are replaced by the C2 rows below (today's retryable failure, never replaced).
     // F7a C2 PART B (RFL 11:04Z): the PERMANENT name is only for a replacement
     // that was attempted and refused WITH the proof. Where no replacement is
     // allowed, the in-flight absence keeps today's (e3af01cd) composed

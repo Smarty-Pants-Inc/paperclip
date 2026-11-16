@@ -16493,28 +16493,8 @@ describe("native session bounded recovery", () => {
     expect(nativeSessionFailureSourceCode(new Error(failure.message))).toBe("native_session_interrupted");
   });
 
-  // Gate 6 (prp-resume-unavailable): the Runner's definite absence of saved
-  // state used to reach here as a bare retryable interruption, retry with the
-  // same empty state until retry_exhausted, and never answer. Retry starts fresh.
-  it("names the Runner's definite absence of resume state instead of a bare retryable interruption", () => {
-    const runtimeComposed = new Error(
-      "native_session_recovery_failed: NativeRunnerResumeStateUnavailableError: PRP provider resume state is unavailable",
-    );
-    // Route B: the typed class itself, thrown outside recoverSession.
-    const typed = Object.assign(new NativeRunnerResumeStateUnavailableError(),
-      { cause: new Error("runner_remote_state_unavailable: exit=66 timedOut=false") });
-    for (const failure of [runtimeComposed, typed, new Error("runner reattach failed", { cause: typed })]) {
-      const code = nativeSessionFailureSourceCode(failure);
-      expect(code, failure.message).toBe("native_provider_state_incompatible");
-      // The retry loop stops at the first definite absence.
-      expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({
-        phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
-    }
-    // Prose that only resembles the class stays generic.
-    expect(nativeSessionFailureSourceCode(new Error("native_session_recovery_failed: Error: PRP provider resume state is unavailable")))
-      .toBe("native_session_interrupted");
-  });
-
+  // SUPERSEDED (F7a C2, needs RFL's supersede record): the gate-6 row that named the
+  // typed absence and its composed recovery text permanently is replaced by the C2 row below.
   // F7a C2 PART B (RFL 11:04Z): TL08 4e25ee88 failed with the Runner's bare
   // typed absence, thrown by the fresh open (seq 63 runner.control_plane.open
   // mode=bootstrap failed, seq 67 error "PRP provider resume state is
