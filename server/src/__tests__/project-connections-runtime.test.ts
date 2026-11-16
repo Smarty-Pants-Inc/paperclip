@@ -198,7 +198,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const bound = await f.run(null);
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.leadA.id, status: "running" }).returning();
     await expect(captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id,
-      heartbeatRunId: run!.id, issueId: bound.issue.id })).rejects.toMatchObject({ status: 403 });
+      heartbeatRunId: run!.id, issueId: bound.issue.id })).rejects.toMatchObject({ status: 403, details: { code: "project_connection_run_context_invalid" } });
   });
 
   it("A05: conflicting stored task bindings refuse before provider use", async () => {
@@ -219,7 +219,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const bound = await f.run(null);
     const captured = await captureProjectConnectionRunContext(db, { companyId: f.companyId, agentId: f.leadA.id, heartbeatRunId: bound.run.id });
     await db.delete(issues).where(eq(issues.id, bound.issue.id));
-    await expect(revalidateProjectConnectionRunContext(db, captured)).rejects.toMatchObject({ status: 403 });
+    await expect(revalidateProjectConnectionRunContext(db, captured)).rejects.toMatchObject({ status: 403, details: { code: "project_connection_run_context_invalid" } });
   });
 
   it.each(["archived", "disabled", "draft"] as const)("M03/J12: retained %s ownership with no runtime installs engages C2", async status => {
@@ -261,7 +261,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, { agentId: f.leadA.id, responsibleUserId: f.human, heartbeatRunId: bound.run.id, issueId: bound.issue.id });
     expect(selected.credential).toBeUndefined();
     expect(selected.configured).toBe(true);
-    expect(selected.error).toBeTruthy();
+    expect(selected.error).toContain("project_connection_use_denied");
     expect(provider.acquire).not.toHaveBeenCalled();
   });
 
@@ -307,8 +307,11 @@ describe("project connection task-derived selection and no legacy fallback (roun
         ? { protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "synthetic-project-mcp", version: "1" } }
         : { content: [{ type: "text", text: "synthetic project read" }] } });
     });
+    await db.insert(toolPolicies).values({ companyId: f.companyId, name: "Allow project fixture read", policyType: "allow", selectors: { riskLevel: "read" } });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, bound.issue.id));
     const gateway = createToolGatewayService(db, { remoteHttpRequest: dispatch });
     const boundB = await f.run(f.b);
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, boundB.issue.id));
     const bSession = await gateway.createSession({ companyId: f.companyId, agentId: f.leadA.id, runId: boundB.run.id });
     const bDescriptor = (await gateway.listToolsForSession(bSession.token)).find(tool => tool.connectionId === b.connection.id);
     expect(bDescriptor).toBeDefined();
@@ -371,6 +374,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
       const result = await waiting;
       expect(result.configured).toBe(true);
       expect(result.credential).toBeUndefined();
+      expect(result.error).toContain("project_connection_unavailable");
       expect(provider.acquire).not.toHaveBeenCalled();
     } finally {
       release?.();
@@ -502,6 +506,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     expect(selected.connection?.id).not.toBe(b.connection.id);
     expect(selected.grant).toBeUndefined();
     expect(selected.configured).toBe(true);
+    expect(selected.error).toContain("project_connection_unavailable");
   });
 
   it("A05: project movement during provider acquisition discards the stale token", async () => {
@@ -525,6 +530,7 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const denied = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
     expect(denied.grant).toBeUndefined();
     expect(denied.configured).toBe(true);
+    expect(denied.error).toContain("project_connection_unavailable");
     const boundB = await f.run(f.b);
     const bContext = { ...context, heartbeatRunId: boundB.run.id, issueId: boundB.issue.id };
     const allowed = await resolveManagedGitHubCredential(db, detectableFallback(), f.companyId, bContext);
