@@ -193,6 +193,31 @@ runnerd recovery integration separately covers real SIGKILL recovery with an
 intact file on local and split-filesystem layouts. These credential-free local
 checks are not separate-host, deployed, or daily-work qualification.
 
+## Native admission deadline
+
+The native Pi proxy passes an explicit `startupTimeoutMs` to `PiRpcDriver` for
+model/thinking admission and each private bind exchange, including
+`tool_inventory`. The proxy default is 10,000 ms, matching the driver's existing
+metadata-discovery budget and allowing inventory replies beyond the standalone
+driver's 5,000 ms fallback. This does not change the separate cold-process
+`processStartupTimeoutMs` budget.
+
+Runner callers can supply `PAPERCLIP_PI_ADMISSION_TIMEOUT_MS` in the transport's
+explicit `options.environment`. It crosses the existing Pi provider environment
+projection and runner-core's Pi-specific child allowlist; it is not inherited
+from ambient environment or supplied by task-configured environment projection.
+The proxy accepts only integer milliseconds from 1 through 29,999. Values at or
+above runner-core's 30,000 ms facade receive wait (and other invalid values) fail
+with `pi_admission_deadline_invalid` before opening Pi. Private-request expiry
+reports `Pi private request timed out`; a lost receipt never triggers a retry or
+prompt. The deadline applies per exchange, not to a whole multi-exchange open.
+
+`pi-rpc-admission-deadline.test.ts` drives the production-shaped proxy config
+through real private sockets: a 6-second inventory reply succeeds, a reply past
+the configured deadline fails after one exchange without prompting, and values
+at or beyond the facade wait are rejected. This is hermetic boundary proof,
+not deployed-provider or daily-work qualification.
+
 ## Lost acknowledgments
 
 `PiRpcTransport` gives commands a 30-second client response deadline. Set
@@ -215,8 +240,8 @@ that already settled also needs no second run. Otherwise that turn fails with
 retired using normal bounded cleanup. The next turn must use a fresh session.
 An idle snapshot does not prove rejection or authorize replay.
 
-The inspection budget is the lesser of the startup budget (default five seconds)
-and the prompt acceptance budget. Cleanup has its own bounded shutdown escalation;
+The inspection budget is the lesser of the startup budget (standalone driver
+default five seconds; native proxy default ten seconds) and the prompt acceptance budget. Cleanup has its own bounded shutdown escalation;
 these budgets are not additional permission to wait for an unanswered prompt.
 
 Regression proof lives in `pi-rpc-prompt.test.ts` and `pi-rpc-transport.test.ts`:

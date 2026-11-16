@@ -4006,6 +4006,9 @@ function createCapabilityRunnerdProviderEnvironmentBase(input: {
       PAPERCLIP_PI_RPC_CREDENTIAL_MODE: input.options.environment?.PAPERCLIP_PI_RPC_CREDENTIAL_MODE ?? "broker",
       // Server-selected registered instruction-copy executionRoot; Pi only.
       ...(input.options.environment?.AGENT_HOME ? { AGENT_HOME: input.options.environment.AGENT_HOME } : {}),
+      ...(input.options.environment?.PAPERCLIP_PI_ADMISSION_TIMEOUT_MS === undefined ? {} : {
+        PAPERCLIP_PI_ADMISSION_TIMEOUT_MS: input.options.environment.PAPERCLIP_PI_ADMISSION_TIMEOUT_MS,
+      }),
       PAPERCLIP_PI_RUNTIME_DIR: input.options.piRuntimeDirectory ?? resolve(input.options.stateDirectory ?? tmpdir(), "pi"),
       PAPERCLIP_PI_THINKING_LEVEL: resolveDefaultPiRpcThinkingLevel(input.options.piRpcThinkingLevel ?? input.options.environment?.PAPERCLIP_PI_THINKING_LEVEL, input.model, undefined, PI_RPC_BUILTIN_THINKING_CATALOG), ...commonIdentity };
   }

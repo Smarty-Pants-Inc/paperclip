@@ -62,6 +62,7 @@ export interface PiRpcDriverLaunchConfig {
   runtimeDirectory: string;
   environment: NodeJS.ProcessEnv;
   runnerInstanceId: string;
+  startupTimeoutMs: number;
   piRpcThinkingLevel?: PiThinkingLevel;
   deferInitialBinding?: boolean;
   systemInstructions: string;
@@ -195,6 +196,18 @@ function runtimeDirectory(environment: NodeJS.ProcessEnv): string {
   const configured = environment.PAPERCLIP_PI_RUNTIME_DIR?.trim();
   if (!configured) throw new Error("PAPERCLIP_PI_RUNTIME_DIR is required");
   return resolve(configured);
+}
+
+function piAdmissionTimeoutMs(environment: NodeJS.ProcessEnv): number {
+  // runner-core's CodexProvider::request receives for 30 s. Leave room for
+  // the native deadline to report its outcome before that facade wait expires.
+  // Match the driver's existing 10 s metadata budget, not its 5 s bind fallback.
+  const configured = environment.PAPERCLIP_PI_ADMISSION_TIMEOUT_MS;
+  const timeoutMs = configured === undefined ? 10_000 : Number(configured);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs >= 30_000) {
+    throw new Error("pi_admission_deadline_invalid: PAPERCLIP_PI_ADMISSION_TIMEOUT_MS must be an integer from 1 through 29999 ms (below the facade's 30000 ms receive wait)");
+  }
+  return timeoutMs;
 }
 
 /** A process-independent facade implementation, with the native driver behind HarnessDriver. */
@@ -552,6 +565,7 @@ export function createPiRpcAppServerProxy(options: PiRpcAppServerProxyOptions) {
         : runtimeDirectory(environment),
       environment: withoutAmbientPiCommand(environment),
       runnerInstanceId: environment.PAPERCLIP_RUNNER_INSTANCE_ID ?? "paperclip-runnerd-pi-rpc",
+      startupTimeoutMs: piAdmissionTimeoutMs(environment),
       ...(piRpcThinkingLevel === undefined ? {} : { piRpcThinkingLevel }),
       systemInstructions: text(params.baseInstructions, "Complete only the supplied task."),
       runtimeContext,
