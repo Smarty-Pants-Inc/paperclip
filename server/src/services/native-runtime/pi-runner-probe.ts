@@ -13,6 +13,30 @@ import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { createNativeRunnerExecutionDriver, prepareNativeRemoteRunner } from "./native-runner-execution-driver.js";
 
 import { nativePiRemoteLaunchOptions } from "./native-pi-launch.js";
+import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
+import type { prepareRemoteProviderPackOnTarget as PrepareRemoteProviderPackOnTarget } from "./native-session-executor.js";
+
+type NativePiProbePack = Awaited<ReturnType<typeof PrepareRemoteProviderPackOnTarget>>;
+
+/** The setup probe's factory preparation: the provider pack and the Runner daemon. */
+export async function prepareNativePiProbeRemote(input: {
+  target: Parameters<typeof PrepareRemoteProviderPackOnTarget>[0]["target"];
+  runner: CommandManagedRuntimeRunner;
+  remoteBinary: string;
+  controllerRunnerBinary: string;
+  remoteRuntimeRoot: string;
+  source: { configuredRoot: string | null; manifest: NativePiProbePack["manifest"] };
+  requiredMode: "listen_ws" | "dial_wss";
+}): Promise<NativePiProbePack> {
+  const { prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation } = await import("./native-session-executor.js");
+  const pack = await prepareRemoteProviderPackOnTarget({ target: input.target, runner: input.runner,
+    configuredProviderPackRoot: input.source.configuredRoot, manifest: input.source.manifest });
+  await createRemoteNativeArtifactPreparation({ target: input.target, runner: input.runner, remoteBinary: input.remoteBinary,
+    controllerRunnerBinary: input.controllerRunnerBinary, remoteRuntimeRoot: input.remoteRuntimeRoot,
+    runnerRemoteBinaryPath: process.env.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH,
+    targetPlatformArtifactVerified: true }).prepare(input.requiredMode);
+  return pack;
+}
 
 /** Static launch files a setup probe never needs to copy out: the staged runner
  * binary (only when its sha256 matches the shipped one) and Node's compile
@@ -113,7 +137,7 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
     if (target?.kind !== "remote" || target.transport === "sandbox" && target.runnerTask) throw new Error("Native Pi setup requires a remote command factory");
     const runner = target.transport === "ssh" ? createNativeSshCommandRunner({ spec: target.spec, defaultCwd: target.remoteCwd }) : target.runner;
     if (!runner) throw new Error("The selected factory has no process runner");
-    const { resolveRemoteProviderPackSource, prepareRemoteProviderPackOnTarget, createRemoteNativeArtifactPreparation, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
+    const { resolveRemoteProviderPackSource, stageRemoteRunnerFile, createRemoteRunnerProcessLauncher, readRemoteRunnerState, syncRemoteRunnerDirectoryOut } = await import("./native-session-executor.js");
     const source = resolveRemoteProviderPackSource(process.env.PAPERCLIP_RUNNER_REMOTE_PROVIDER_PACK_PATH);
     // Validate native entries before staging or acquiring an inference authority.
     nativePiRemoteLaunchOptions("/unused", source.manifest, "/unused");
@@ -140,17 +164,14 @@ export async function probeManagedNativePiRunner(context: AdapterEnvironmentTest
       const privateAgentDir = environment.PI_CODING_AGENT_DIR ? null : posix.join(target!.remoteCwd, ".paperclip-runtime", `${id}-pi-agent`);
       const probeEnvironment = privateAgentDir ? { ...environment, PI_CODING_AGENT_DIR: privateAgentDir } : environment;
       let cleanupTransferred = false, remoteCreated = false, prepared = false;
-      let pack: Awaited<ReturnType<typeof prepareRemoteProviderPackOnTarget>> | undefined;
+      let pack: NativePiProbePack | undefined;
       const prepareRemote = async (requiredMode: "listen_ws" | "dial_wss") => {
         if (prepared) return;
         requireSuccess(await runner!.execute({ command: "mkdir", args: ["-p", "-m", "700", "--", remoteRoot, remoteFilesystemRoot,
           ...(privateAgentDir ? [privateAgentDir] : [])], bypassSession: true, timeoutMs: 10_000 }));
         remoteCreated = true;
-        pack = await prepareRemoteProviderPackOnTarget({ target: target!, runner: runner!, configuredProviderPackRoot: source.configuredRoot, manifest: source.manifest });
-        await createRemoteNativeArtifactPreparation({ target: target!, runner: runner!, remoteBinary,
-          controllerRunnerBinary: runnerBinary, remoteRuntimeRoot: remoteRoot,
-          runnerRemoteBinaryPath: process.env.PAPERCLIP_RUNNER_REMOTE_BINARY_PATH,
-          targetPlatformArtifactVerified: true }).prepare(requiredMode);
+        pack = await prepareNativePiProbeRemote({ target: target!, runner: runner!, remoteBinary,
+          controllerRunnerBinary: runnerBinary, remoteRuntimeRoot: remoteRoot, source, requiredMode });
         prepared = true;
       };
       const cleanup = async () => {
