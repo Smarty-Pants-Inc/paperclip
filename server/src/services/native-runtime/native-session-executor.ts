@@ -322,6 +322,7 @@ import {
   describeExitedRemoteRunner, describeExitedRemoteRunnerReason, describeExitedRemoteRunnerRunLog, exitedRunnerRequestedFreshBootstrap, readRemoteRunnerRecoveryError,
   remoteRecoveryProbeReason, runnerStateRequestsFreshBootstrap,
 } from "./remote-runner-recovery-diagnostics.js";
+import { createNativeStateStaging, fenceNativeStateStagingQuietly, removeNativeStateStaging, sweepNativeStateStaging } from "./native-state-staging.js";
 import { isPluginRpcTimeout, readRemoteRunnerRecoveryProbe, retryRemoteRunnerRecoveryAttempt, REMOTE_RUNNER_PLUGIN_STALL_BUDGET_MS, REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS, remoteRunnerPluginStall, type RemoteRunnerPluginStall } from "./remote-runner-recovery-probe.js";
 import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettledRemoteWarmControlState, summarizePostTerminalEvents, type RemoteWarmSessionRecovery, unsettledControllerCommands, waitForLiveWarmSessionOwner } from "./remote-warm-session-recovery.js";
 import { assertNativeWarmIngressRetirement, nativeWarmIngressAllocation, nativeWarmIngressIdentity, type NativeWarmIngressClaim, type NativeWarmIngressOwner } from "./native-warm-ingress-ownership.js";
@@ -16220,17 +16221,28 @@ export async function readRemoteRunnerStateFile(input: {
     const checked = await runReadProbe(request);
     if (checked.exitCode !== 0 || checked.timedOut) throw unavailable(checked);
     const syncOut = runner.syncOut;
+    sweepNativeStateStaging();
     // Each attempt transfers into its own private staging directory, so a retry
-    // never parses bytes an earlier failed attempt left behind. A transfer cannot
-    // be cancelled: when the attempt's time runs out it is abandoned, and its
-    // staging directory is removed again once that transfer settles.
+    // never parses bytes an earlier failed attempt left behind. The plugin RPC
+    // has no cancel: a failed or abandoned transfer's worker may still write
+    // after the host's call settled, so its staging path is fenced, not only
+    // removed (native-state-staging.ts). An abandoned transfer keeps its private
+    // directory until the transfer settles.
     const transferAttempt = async (timeoutMs?: number) => {
-      const staging = mkdtempSync(join(tmpdir(), "paperclip-native-state-"));
-      const removeStaging = () => rmSync(staging, { recursive: true, force: true });
+      const { staging, targetPath } = createNativeStateStaging();
+      let transfer: ReturnType<typeof syncOut>;
       try {
-        chmodSync(staging, 0o700);
-        const localPath = join(staging, "state.json");
-        const transfer = syncOut.call(runner, [{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
+        transfer = syncOut.call(runner, [{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath, kind: "file", mode: 0o600 }] }]);
+      } catch (transferError) {
+        fenceNativeStateStagingQuietly(staging);
+        throw transferError;
+      }
+      const settleLate = () => {
+        void transfer.then(() => {
+          try { removeNativeStateStaging(staging); } catch { fenceNativeStateStagingQuietly(staging); }
+        }, () => fenceNativeStateStagingQuietly(staging));
+      };
+      try {
         if (timeoutMs === undefined) await transfer;
         else {
           let timer: ReturnType<typeof setTimeout> | undefined;
@@ -16238,17 +16250,19 @@ export async function readRemoteRunnerStateFile(input: {
             new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(true), timeoutMs); })])
             .finally(() => clearTimeout(timer));
           if (abandoned) {
-            const removeLate = () => {
-              try { removeStaging(); } catch (error) { logger.warn({ err: error }, "native session state staging cleanup failed"); }
-            };
-            void transfer.then(removeLate, removeLate);
+            settleLate();
             return { timedOut: true, bytes: "" };
           }
         }
-        chmodSync(localPath, 0o600);
-        return { timedOut: false, bytes: readFileSync(localPath, "utf8") };
+      } catch (transferError) {
+        fenceNativeStateStagingQuietly(staging);
+        throw transferError;
+      }
+      try {
+        chmodSync(targetPath, 0o600);
+        return { timedOut: false, bytes: readFileSync(targetPath, "utf8") };
       } finally {
-        removeStaging();
+        removeNativeStateStaging(staging);
       }
     };
     let bytes: string;
