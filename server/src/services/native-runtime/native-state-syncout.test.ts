@@ -479,9 +479,9 @@ describe("native session state staging left by a crashed server", () => {
   });
 });
 
-// RFL judge7 probes J2/J4/J5 (#20762 re-judge of 185cffec), kept as
-// permanent rows. J2 is the strict form of P1/P1b. J4 and J5 measured the
-// defects F2 and F3; here each measurement asserts the fixed outcome.
+// RFL judge7 probes J2/J4/J5/J6 (#20762 re-judge of 185cffec), kept as
+// permanent rows. J2 is the strict form of P1/P1b. J4, J5 and J6 measured the
+// defects F2, F3 and F6; here each measurement asserts the fixed outcome.
 describe("native session state staging fences against late plugin workers (RFL judge7)", () => {
   afterEach(() => { vi.useRealTimers(); });
   isolateStagingTmpdir();
@@ -618,4 +618,33 @@ describe("native session state staging fences against late plugin workers (RFL j
     sweep(mtLonger + 60 * hour + 1, { streamDeadlineMs: 30 * hour });
     expect(existsSync(longer)).toBe(false);
   });
+
+  for (const writeAtMs of [40_000, 5_000]) {
+    it(`J6 abandoned live transfer (worker writes at ${writeAtMs / 1000}s): its staging is fenced at abandon time, so no state survives the next state read or the RPC settling`, async () => {
+      vi.useFakeTimers();
+      const late = `j6-${randomUUID()}`;
+      let calls = 0;
+      const targets: string[] = []; const outcomes: LateWriteOutcome[] = [];
+      const syncOut = vi.fn((ops: Ops) => {
+        const target = ops[0]!.files[0]!.targetPath; calls++; targets.push(target);
+        return new Promise(resolve => setTimeout(() => {
+          recordWorkerWrite(outcomes, target, JSON.stringify({ principalSession: late }));
+          setTimeout(() => resolve({}), 100_000);
+        }, writeAtMs));
+      });
+      observe(readRemoteRunnerState({ runner: { execute: okProbe(), syncOut } as never, stateDirectory: "/private", recoveryDeadline: Date.now() + 30_000 }));
+      await vi.advanceTimersByTimeAsync(60_000);
+      await readRemoteRunnerState({ runner: okRunner() as never, stateDirectory: "/private" });
+      const afterNextRead = stagingFilesHolding(late).length;
+      await vi.advanceTimersByTimeAsync(200_000);
+      const afterSettle = stagingFilesHolding(late).length;
+      console.log(`J6 write_at_ms=${writeAtMs} abandoned_transfers=${calls} outcomes=${JSON.stringify(outcomes.map(o => o.error ? o.error.code : "LANDED"))} state_files_after_next_read=${afterNextRead} after_rpc_settled=${afterSettle}`);
+      expect(calls).toBeGreaterThan(0);
+      expect(afterNextRead).toBe(0);
+      expect(afterSettle).toBe(0);
+      if (writeAtMs > 10_000) expectOneFenceRefusalPerTransfer(targets, outcomes);
+      for (const target of targets) expectStagingFence(dirname(dirname(target)));
+      expectNoStateAtAnyDepth(late);
+    });
+  }
 });
