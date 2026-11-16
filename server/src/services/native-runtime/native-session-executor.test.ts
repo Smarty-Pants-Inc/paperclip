@@ -15525,11 +15525,17 @@ describe("native warm session supervision", () => {
     { name: "network access change", firstEnvironment: { PAPERCLIP_RUNNER_NETWORK_ACCESS: "disabled" }, secondEnvironment: { PAPERCLIP_RUNNER_NETWORK_ACCESS: "enabled" }, reuse: false },
     { name: "run-scoped environment broker", firstEnvironment: { PAPERCLIP_GITHUB_BROKER_TOKEN: "first-run-capability" }, secondEnvironment: { PAPERCLIP_GITHUB_BROKER_TOKEN: "second-run-capability" }, reuse: false },
     { name: "Core-hosted GitHub access", managedGitHub: true, reuse: true, adoptionReuse: false },
+    // #20797: a same-run restart reattach adopts the Runner the previous server
+    // launched with that server's in-memory GitHub access. The broker's
+    // authority is not persisted for adoption, so that warm session retires.
+    { name: "restart reattach without core GitHub access", restartReattach: true, reuse: true },
+    { name: "Core-hosted GitHub access after a restart reattach", managedGitHub: true, restartReattach: true, reuse: false, adoptionReuse: false },
   ] as Array<{ name: string; firstEnvironment?: Record<string, string>; secondEnvironment?: Record<string, string>;
-    refreshTools?: boolean; unsupportedRefresh?: boolean; managedGitHub?: boolean; reuse: boolean; adoptionReuse?: boolean }>)(
+    refreshTools?: boolean; unsupportedRefresh?: boolean; managedGitHub?: boolean; restartReattach?: boolean; reuse: boolean; adoptionReuse?: boolean }>)(
     "decides warm and adopted process reuse from one key: $name",
     async ({ name, firstEnvironment = {}, secondEnvironment = {}, refreshTools, unsupportedRefresh = false,
-      managedGitHub = false, reuse, adoptionReuse = reuse }) => {
+      managedGitHub = false, restartReattach = false, reuse, adoptionReuse = reuse }) => {
+      const restartRetirementLine = "[paperclip] GitHub access for this turn is unavailable after a server restart; the session retires at run end (github_access_restart_reattach).\n";
       const decisions: Record<string, boolean> = {};
       for (const path of ["warm", "adoption", ...(refreshTools ? ["portable", "portable-bootstrap", "legacy-plugin"] as const : [])] as const) {
         const portable = path === "portable" || path === "portable-bootstrap";
@@ -15559,8 +15565,17 @@ describe("native warm session supervision", () => {
           second.runtimeContext.mcp.digest = "1".repeat(64);
           second.runtimeContext.aggregateDigest = canonicalNativeRuntimeContextDigest(second.runtimeContext);
         }
+        const restartIdentity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId,
+          runnerInstanceId: "runner-reuse-key", environmentLeaseId: first.binding.executionWorkspaceId,
+          turnId: "restart-turn", itemId: "restart-item" };
+        // A live Runner the previous server launched for this same run.
+        const restartRunner = vi.fn(async (request: { args?: string[] }) => ({ exitCode: 0, timedOut: false, stderr: "",
+          stdout: request.args?.[1]?.includes("base64") ? Buffer.from(JSON.stringify({ ...restartIdentity, lifecycle: "running" })).toString("base64")
+            : request.args?.[1]?.includes("cat --") ? `nonce\n123\n2026-09-19T10:00:00.000Z\n${restartIdentity.runnerInstanceId}\nlinux:abcd-1234:100\n` : "" }));
         const target = { kind: "remote" as const, transport: "sandbox" as const, environmentId: "environment-reuse-key",
-          remoteCwd: "/home/daytona/paperclip-workspace", runner: { execute: vi.fn() } };
+          remoteCwd: "/home/daytona/paperclip-workspace", runner: { execute: restartReattach ? restartRunner : vi.fn() },
+          ...(restartReattach ? { sandboxLeaseAcquisition: { outcome: "created" as const, providerLeaseId: "sandbox-reuse-key" } } : {}) };
+        const runLogs: string[] = [];
         const firstSession = { close: vi.fn(async () => undefined) };
         const recoveredSession = { close: vi.fn(async () => undefined), snapshot: vi.fn() };
         const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
@@ -15615,10 +15630,35 @@ describe("native warm session supervision", () => {
         const issueProjection = path === "legacy-plugin" ? vi.spyOn(issueServiceModule, "issueService")
           .mockReturnValue({ update: vi.fn(async () => null) } as never) : undefined;
         try {
-          await executePaperclipNativeSession({ db: leaseDb(first), execution: first, runnerInstanceId: "runner-reuse-key",
+          const restartOwner = "restart-reuse-key-owner";
+          if (restartReattach) {
+            state.createBackend.mockClear(); state.createTransport.mockClear();
+            await createRunnerdBackend({ db: leaseDb(first), execution: first, runnerInstanceId: restartIdentity.runnerInstanceId });
+            state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+            const restartRoot = state.createTransport.mock.calls.at(-1)![0].stateDirectory!;
+            await mkdir(join(restartRoot, "control-plane"), { recursive: true });
+            await writeFile(join(restartRoot, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(restartIdentity)));
+            state.createBackend.mockClear(); state.createTransport.mockClear();
+          }
+          await executePaperclipNativeSession({
+            db: restartReattach ? leaseDb(first, await currentRecoveryCoordinator(restartOwner)) : leaseDb(first),
+            execution: first, runnerInstanceId: "runner-reuse-key",
             useRunnerd: true, managedGitHub, runnerExecutionTarget: target as never,
+            onLog: async (_stream, chunk) => { runLogs.push(chunk); },
+            ...(restartReattach ? { leaseOwner: restartOwner, runnerIngressAuthorized: true,
+              restartRecovery: { kind: "reattach_remote_runner" as const, runId: first.binding.runId, leaseOwner: restartOwner,
+                controllerGeneration: 2, providerAttempt: 1, restartKind: "hard" as const, recoveryRequestId: null,
+                remote: { providerLeaseId: "sandbox-reuse-key", remoteCwd: target.remoteCwd } } } : {}),
             ...(portable ? { managedAiAccountIdentity: "fixture-account", managedAiCredentialIdentity: "old-revision" } : {}),
             runnerEnvironment: { PAPERCLIP_GITHUB_AUTH_MODE: "managed", ...firstEnvironment } });
+          if (restartReattach) {
+            // The restart claim adopted the live Runner rather than launching one.
+            state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+            expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ adoptExistingRunner: { pid: 123 } });
+            // Retired at this run's end, before any next turn: not left reusable.
+            expect(firstSession.close).toHaveBeenCalledTimes(managedGitHub ? 1 : 0);
+            expect(runLogs.filter(line => line === restartRetirementLine)).toHaveLength(managedGitHub ? 1 : 0);
+          }
           const durableRoot = (await readdir(stateBase, { withFileTypes: true }))
             .filter(entry => entry.isDirectory() && /^[a-f0-9]{64}$/.test(entry.name)).map(entry => join(stateBase, entry.name))[0]!;
           const durableIdentity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId,
@@ -15628,7 +15668,8 @@ describe("native warm session supervision", () => {
           await writeFile(join(durableRoot, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(durableIdentity)));
           await mkdir(join(durableRoot, "runner"), { recursive: true });
           await writeFile(join(durableRoot, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(durableIdentity, "ready")));
-          if (path !== "warm") expect(await closeIdleWarmNativeSessionsForRestart()).toEqual({ closed: 1, busy: 0, failed: 0, failures: [] });
+          if (path !== "warm") expect(await closeIdleWarmNativeSessionsForRestart())
+            .toEqual({ closed: restartReattach && managedGitHub ? 0 : 1, busy: 0, failed: 0, failures: [] });
           if (portable) {
             const directory = join(resolvePaperclipInstanceRoot(), "runtime/paperclip-runner/sessions");
             const path = join(directory, (await readdir(directory))[0]!);
@@ -15697,8 +15738,11 @@ describe("native warm session supervision", () => {
             expect(portableTarget.runnerTask).toHaveBeenCalledOnce();
             continue;
           }
-          if (path === "adoption") await expect(continuation).rejects.toThrow("fixture adoption decision recorded");
-          else await continuation;
+          // A retired restart session leaves no warm owner: the next turn reaches
+          // idle adoption, which refuses this process (fresh Runner, fresh access).
+          if (path === "adoption" || path === "warm" && restartReattach && !reuse) {
+            await expect(continuation).rejects.toThrow("fixture adoption decision recorded");
+          } else await continuation;
           expect(decisions[path]).toBe(portable ? true : path === "adoption" ? adoptionReuse : reuse);
           if (portable) {
             expect(portableTarget.runnerTask).not.toHaveBeenCalled();
@@ -19816,6 +19860,80 @@ describe("runnerd provider runtime wiring", () => {
     await expect(options.prepareExternalRunnerState()).resolves.toBeUndefined();
     expect(execute.mock.calls.some(([request]) => request.args.includes("paperclip-runner-launch")
       || request.args.includes("paperclip-runner-claim-unstarted-session"))).toBe(false);
+  });
+
+  it("retires a local warm session whose same-run restart reattach adopted the live Runner with core GitHub access (#20797)", async () => {
+    const base = scopedNativeExecution("restart-reattach-local-github");
+    const first = { ...base, workspace: { ...base.workspace, cwd: "/tmp/runnerd-restart-reattach-local" },
+      session: { ...base.session, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    const second = { ...first, binding: { ...first.binding, runId: `${first.binding.runId}-next` } };
+    const identity = { runId: first.binding.runId, normalizedSessionId: first.session.normalizedSessionId!,
+      runnerInstanceId: "local-restart-runner", environmentLeaseId: first.binding.executionWorkspaceId,
+      turnId: `turn_attachment_${randomUUID()}`, itemId: `item_attachment_${randomUUID()}` };
+    const root = await initializeScopedRunnerRoot(first, identity.runnerInstanceId);
+    await mkdir(join(root, "control-plane"), { recursive: true });
+    await writeFile(join(root, "control-plane", "control-plane-state.json"), JSON.stringify(durableControlPlaneState(identity)));
+    await mkdir(join(root, "runner"), { recursive: true });
+    await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "ready")));
+    // The live local Runner the previous server launched for this run.
+    const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", "--run-id", first.binding.runId], { stdio: "ignore" });
+    onTestFinished(() => { live.kill("SIGKILL"); });
+    await once(live, "spawn");
+    const { readProcessStartedAt } = await import("../hot-restart.js");
+    const startedAt = (await readProcessStartedAt(live.pid!))!;
+    const restartLine = "[paperclip] GitHub access for this turn is unavailable after a server restart; the session retires at run end (github_access_restart_reattach).\n";
+    githubAccess.create.mockReset().mockImplementation(async () => ({ env: {}, ready: true, duplexRequested: false,
+      activate: githubAccess.activate.mockReset().mockImplementation(() => vi.fn()), stop: githubAccess.stop.mockReset().mockResolvedValue(undefined) }));
+    const firstSession = { close: vi.fn(async () => undefined) };
+    const result = { result: { summary: "completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+      normalizedSessionId: first.session.normalizedSessionId, providerSessionId: "provider-restart-local", driverKind: "test",
+      driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+    let nextExistingSession: unknown = "unset";
+    state.execute.mockReset()
+      .mockImplementationOnce(async options => { options.onSession?.(firstSession); return result; })
+      .mockImplementationOnce(async options => { nextExistingSession = options.existingSession; return result; });
+    const logs: string[] = [];
+    const owner = "restart-local-owner";
+    try {
+      state.createBackend.mockClear(); state.createTransport.mockClear();
+      await executePaperclipNativeSession({ db: leaseDb(first, await currentRecoveryCoordinator(owner)), execution: first,
+        runnerInstanceId: identity.runnerInstanceId, useRunnerd: true, managedGitHub: true, leaseOwner: owner,
+        restartRecovery: { kind: "reattach_existing_runner", runId: first.binding.runId, leaseOwner: owner,
+          controllerGeneration: 2, providerAttempt: 1, restartKind: "hard", recoveryRequestId: null,
+          process: { pid: live.pid!, processGroupId: null, startedAt } },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        runnerEnvironment: { PAPERCLIP_GITHUB_AUTH_MODE: "managed" } });
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      expect(state.createTransport.mock.calls.at(-1)![0]).toMatchObject({ adoptExistingRunner: { pid: live.pid } });
+      // Retired at this run's end through the existing release path.
+      expect(firstSession.close).toHaveBeenCalledOnce();
+      expect(logs.filter(line => line === restartLine)).toHaveLength(1);
+      // The retired Runner suspends its durable state and exits.
+      await writeFile(join(root, "runner", "runner-state.json"), JSON.stringify(durableRunnerState(identity, "suspended")));
+      const exited = once(live, "exit");
+      live.kill("SIGKILL");
+      await exited;
+      state.createBackend.mockClear(); state.createTransport.mockClear();
+      const nextDb = leaseDb(second);
+      const select = nextDb.select.bind(nextDb);
+      nextDb.select = ((fields?: Record<string, unknown>) => {
+        if (fields?.status === heartbeatRuns.status && fields?.runnerProfileJson === heartbeatRuns.runnerProfileJson) {
+          return { from: () => ({ where: () => ({ limit: async () =>
+            [{ status: "succeeded", runnerProfileJson: { nativeExecutionInput: first } }] }) }) };
+        }
+        return select(fields as never);
+      }) as Db["select"];
+      await executePaperclipNativeSession({ db: nextDb, execution: second, runnerInstanceId: identity.runnerInstanceId,
+        useRunnerd: true, managedGitHub: true, runnerEnvironment: { PAPERCLIP_GITHUB_AUTH_MODE: "managed" } });
+      // The next turn launches a fresh Runner with fresh GitHub access.
+      expect(nextExistingSession).toBeUndefined();
+      expect(githubAccess.create).toHaveBeenCalledTimes(2);
+      state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+      expect(state.createTransport.mock.calls.at(-1)![0].adoptExistingRunner).toBeUndefined();
+    } finally {
+      state.execute.mockReset();
+      await closeIdleWarmNativeSessionsForRestart();
+    }
   });
 
   it.each([
