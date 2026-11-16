@@ -768,11 +768,10 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .resolves.toEqual([{ checkoutRunId: runningRunId, executionRunId: runningRunId }]);
   });
 
-  it("terminalizes a running run whose issue is terminal, even while the process stays alive (reuse-lease path)", async () => {
-    // Reuse Lease ON stops the sandbox but keeps the server process alive, so
-    // the in-memory handle and the recorded pid can both persist. The
-    // process-death authority misses this case. The issue-terminal authority
-    // catches it: the issue reached "done" while the run row stayed "running".
+  it("terminalizes a running run whose issue is terminal but retains claims while the process stays alive (reuse-lease path)", async () => {
+    // Terminal task authority still settles the run's status, but cannot prove
+    // execution Stop while its recorded PID is alive. Keep both claims until
+    // the execution evidence is released, even when the task is already done.
     const { companyId, agentId, runningRunId } = await seed();
     // process.pid is the live test process, so isPidAlive returns true.
     await db
@@ -796,7 +795,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     const result = await heartbeat.sweepStaleIssueLocks();
 
     expect(result.terminalizedRunIds).toEqual([runningRunId]);
-    expect(result.cleared).toBe(1);
+    expect(result.cleared).toBe(0);
 
     const run = await db
       .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
@@ -813,7 +812,7 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
-    expect(lock).toEqual({ checkoutRunId: null, executionRunId: null });
+    expect(lock).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
 
     const event = await db
       .select({ message: heartbeatRunEvents.message })
@@ -831,6 +830,12 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       "agent.task_run",
       expect.objectContaining({ agent_id: agentId, state: "succeeded" }),
     );
+
+    await db.update(heartbeatRuns).set({ processPid: null }).where(eq(heartbeatRuns.id, runningRunId));
+    expect((await heartbeat.sweepStaleIssueLocks()).cleared).toBe(1);
+    await expect(db.select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues).where(eq(issues.id, issueId)))
+      .resolves.toEqual([{ checkoutRunId: null, executionRunId: null }]);
   });
 
   it("terminalizes a running run to cancelled when its issue is cancelled (reuse-lease path)", async () => {
