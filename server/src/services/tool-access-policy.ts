@@ -54,6 +54,7 @@ import {
   profileIdsInBindingOrder,
 } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { isProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 import { canonicalToolArguments, readSignedToolArgumentsPayload, toolRequestIdentityHash } from "./tool-content-guards.js";
 
 class RejectedInvocationAdmission extends Error {
@@ -1146,6 +1147,8 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
             enabled: toolConnections.enabled,
             status: toolConnections.status,
             transport: toolConnections.transport,
+            config: toolConnections.config,
+            transportConfig: toolConnections.transportConfig,
           })
           .from(toolConnections)
           .where(eq(toolConnections.id, contextConnectionId)));
@@ -1154,6 +1157,11 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       }
       if (!connection.enabled || connection.status === "disabled" || connection.status === "archived") {
         return { ok: false, redaction, decision: decision("deny", "deny_disabled_connection", "Connection is disabled.", [], [], { redactionPlan: redaction.redactionPlan }) };
+      }
+      // RFL C3: this image cannot apply a project owner's admission rules, so
+      // no actor, policy, profile or grant can reach a project-owned row here.
+      if (isProjectOwnedToolConnection(connection)) {
+        return { ok: false, redaction, decision: decision("deny", "deny_project_owned_connection", "Connection belongs to a project and cannot be used by this server version.", [], [], { redactionPlan: redaction.redactionPlan }) };
       }
       applicationId = connection.applicationId;
       connectionTransport = connection.transport;

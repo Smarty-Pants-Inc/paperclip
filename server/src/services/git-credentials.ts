@@ -13,6 +13,7 @@ import {
 } from "@paperclipai/db";
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { isGitHubAppConnection, resolveGitHubAppCredential } from "./github-app-credentials.js";
+import { isProjectOwnedToolConnection } from "./project-owned-connection-guard.js";
 import { isGitHubDotCom } from "./github-fetch.js";
 import { secretService } from "./secrets.js";
 import { toolAccessService } from "./tool-access.js";
@@ -376,6 +377,8 @@ export async function resolveManagedGitHubIdentitySelection(
     ),
   ));
   const githubConnections = connections.filter((connection) => {
+    // RFL C3: a project-owned connection is never a run's company identity.
+    if (isProjectOwnedToolConnection(connection)) return false;
     const config = connection.config && typeof connection.config === "object" ? connection.config as Record<string, unknown> : {};
     const transportConfig = connection.transportConfig && typeof connection.transportConfig === "object"
       ? connection.transportConfig as Record<string, unknown>

@@ -6,8 +6,9 @@ import { notifyAttentionRetentionWork } from "./retention-work-notifications.js"
 import { notifySkillVersionRetention, notifySkillVersionPinChange } from "./skill-version-retention-notifications.js";
 import { agentAppearanceSchema, randomAgentAppearance } from "@paperclipai/shared";
 import { normalizePaperclipRunnerAdapterConfig } from "@paperclipai/adapter-utils/server-utils";
-import { agents, companyMemberships, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
-import { eq, sql } from "drizzle-orm";
+import { agents, companyMemberships, toolConnections, toolConnectionInstalls, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { isProjectOwnedToolConnection, projectOwnedConnectionError } from "./project-owned-connection-guard.js";
 import { lockCompanyAgentRuntime } from "./agent-runtime-lock.js";
 import { isTransientLockContention } from "./transient-lock-contention.js";
 import { notifyMuseContactVerification } from "../modules/external-agents/index.js";
@@ -122,6 +123,11 @@ export async function initializeAgentHire(txDb: Db, created: AgentHireRecord, op
   if (options?.aiConnectionInstall) {
     const install = options.aiConnectionInstall;
     const connectionIds = [...new Set([install.connectionId, ...(install.memberConnectionIds ?? [])])];
+    // RFL C3: a hire never installs a project-owned connection on this image.
+    const owned = (await tx.select({ id: toolConnections.id, config: toolConnections.config, transportConfig: toolConnections.transportConfig })
+      .from(toolConnections).where(and(eq(toolConnections.companyId, companyId), inArray(toolConnections.id, connectionIds))))
+      .find(isProjectOwnedToolConnection);
+    if (owned) throw projectOwnedConnectionError(owned.id);
     await tx.insert(toolConnectionInstalls).values(connectionIds.map(connectionId => ({
       companyId, connectionId,
       targetType: "agent" as const, targetId: created.id,

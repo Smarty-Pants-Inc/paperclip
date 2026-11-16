@@ -33,6 +33,7 @@ import { toolAccessPolicyService } from "../services/tool-access-policy.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { createToolGatewayService } from "../services/tool-gateway.js";
 import { initializeAgentHire } from "../services/agent-hiring.js";
+import { isProjectOwnedToolConnection } from "../services/project-owned-connection-guard.js";
 
 const OWNED_CODE = "project_connection_not_supported_by_this_server";
 // 0493_furry_the_watchers.sql (fl/projconn-next 916712112bc7), verbatim.
@@ -180,5 +181,13 @@ describe("project-owned tool connections on an image without the #20717 writer (
       .rejects.toMatchObject({ details: { code: OWNED_CODE } });
     const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, owned.connection.id));
     expect(installs.map(install => install.targetType)).toEqual(["company"]);
+  });
+
+  it("detects ownership from the envelope alone, in either config, whatever its value (no schema read)", () => {
+    expect(isProjectOwnedToolConnection({ config: { projectScope: { version: 1 } }, transportConfig: {} })).toBe(true);
+    expect(isProjectOwnedToolConnection({ config: {}, transportConfig: { projectScope: { version: 1 } } })).toBe(true);
+    expect(isProjectOwnedToolConnection({ config: { projectScope: null }, transportConfig: {} })).toBe(true);
+    expect(isProjectOwnedToolConnection({ config: { sourceTemplateKey: "github" }, transportConfig: { sourceTemplateKey: "github" } })).toBe(false);
+    expect(isProjectOwnedToolConnection(null)).toBe(false);
   });
 });
