@@ -48,12 +48,31 @@ export interface NativeRunnerExecutionDriverInput {
   onIngressUnreachable?: (error: Error) => void;
 }
 
-/** An idle owner has no command in flight to its runner (a turn, an identity
- * check, a lifecycle command). Its route may outlive the recovery budget. */
+/** No command is pending to the runner (an identity check, a lifecycle
+ * command). Only an additional busy signal: runnerd completes turn.start when
+ * it ACCEPTS a turn, so this alone calls a running turn idle (#20825). */
 function controlPlaneIdle(authority: unknown): boolean {
   const commands = (authority as { store?: { state?: { commands?: unknown } } }).store?.state?.commands;
   return Array.isArray(commands)
     && !commands.some(command => (command as { status?: unknown })?.status === "pending");
+}
+
+/** An authenticated route exhausted its recovery budget while its owner was
+ * busy: the runner stayed unreachable mid-turn (#20825). */
+export const NATIVE_RUNNER_INGRESS_RECOVERY_EXHAUSTED = "native_runner_ingress_recovery_exhausted";
+
+/** The run-facing failure for an authenticated route's give-up. An idle
+ * retire and a lease expiry keep their own codes; an exhausted recovery is
+ * named, carrying only bounded codes (never transport prose). */
+function authenticatedRouteFailure(error: unknown): unknown {
+  const value = (typeof error === "object" && error !== null ? error : {}) as
+    { code?: unknown; causeSummary?: { failure?: unknown } };
+  const ingressCode = value.code;
+  if (ingressCode !== "runner_ingress_unavailable" && ingressCode !== "runner_ingress_auth_failed") return error;
+  const failure = typeof value.causeSummary?.failure === "string" && /^[A-Za-z0-9_]{1,64}$/.test(value.causeSummary.failure)
+    ? value.causeSummary.failure : "unknown";
+  return Object.assign(new Error(`${NATIVE_RUNNER_INGRESS_RECOVERY_EXHAUSTED}: the runner stayed unreachable for the whole recovery budget (ingress=${ingressCode} failure=${failure})`,
+    { cause: error }), { code: NATIVE_RUNNER_INGRESS_RECOVERY_EXHAUSTED, ingressCode, causeSummary: value.causeSummary });
 }
 
 async function measureNativeRunnerSpan<T>(
@@ -319,13 +338,17 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
           const routeFailure = new Promise<never>((_resolve, reject) => { rejectRouteFailure = reject; });
           void routeFailure.catch(() => undefined);
           let reportedUnreachable = false;
+          // The owner's idleness, bound by the transport (its settled idle
+          // warm owner predicate). Unbound means busy.
+          let ownerIdle: (() => boolean) | null = null;
           const openRoute = (startupDeadlineMs?: number) => {
             const route = connectRunnerPrpIngress({
               authority, endpoint: ingress, startupDeadlineMs,
               // #20825: an idle warm route redials past the recovery budget
-              // until the control plane's lease expiry minus a margin.
+              // until the control plane's lease expiry minus a margin. Idle is
+              // the OWNER's idleness; a pending CP command is an extra busy signal.
               idleWarm: {
-                isIdle: () => controlPlaneIdle(authority),
+                isIdle: () => ownerIdle !== null && ownerIdle() === true && controlPlaneIdle(authority),
                 leaseExpiresAtUnixMs: () => controlPlaneLeaseExpiresAtUnixMs(authority),
               },
               onStateChange: (state, failureCode) => {
@@ -337,7 +360,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
             void route.ready?.then(() => { authenticated = true; }, () => undefined);
             void route.failure?.catch((error: unknown) => {
               if (!authenticated || released || outbound !== route) return;
-              rejectRouteFailure(error);
+              rejectRouteFailure(authenticatedRouteFailure(error));
               const code = (error as { code?: unknown })?.code;
               if (code === "native_runner_ingress_unreachable" && !reportedUnreachable) {
                 reportedUnreachable = true;
@@ -462,6 +485,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
             get failure() {
               return routeFailure;
             },
+            bindOwnerIdle: (isIdle: () => boolean) => { ownerIdle = isIdle; },
             startupFailureCode: "runner_ingress_unavailable" as const,
             checkpoint,
             quiesce: () => { outbound?.quiesce(); },

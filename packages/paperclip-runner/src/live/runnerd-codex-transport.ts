@@ -130,6 +130,7 @@ const RUNNER_CLIENT_VERSION = "0.3.0";
 const RUNNER_BOOTSTRAP_TICKET_TTL_MS = 60_000;
 const RUNNER_RESTORE_STABLE_MS = 60_000;
 const MAX_UNSTABLE_RUNNER_RESTORES = 3;
+const RUNNERD_TURN_TERMINAL_EVENT_TYPES = new Set(["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"]);
 // Bounds the one in-place restart after a runner settles an earlier attempt's suspend.
 const CARRIED_SUSPEND_RESTART_GRACE_MS = 30_000;
 const RUNNERD_MAX_OUTBOX_BYTES = 16 * 1024 * 1024;
@@ -4935,6 +4936,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     identity?: DurableRecoveryIdentity,
   ): Promise<ControlPlaneRegistration> {
     const registration = await this.options.controlPlaneRegistration!(core, identity);
+    // A Core-dialed route reads this owner's idleness from the transport's own
+    // definition, never from the control plane's command list alone: runnerd
+    // completes turn.start when it accepts a turn (#20825).
+    registration.bindOwnerIdle?.(() => this.#settledIdleWarmOwner());
     const quiesce = registration.quiesce;
     if (!quiesce) return registration;
     this.#controlPlaneQuiesces.add(quiesce);
@@ -4972,6 +4977,39 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#adoptedRunnerMonitor = null;
   }
 
+  /**
+   * Provider work this transport knows is in flight: a turn start awaiting its
+   * response (the #expectedProviderTurnId window), a durably active provider
+   * turn, a bridged runtime input, an unsettled semantic tool result, or a
+   * working goal. Release and runner-exit recovery share this one definition.
+   */
+  #providerWorkInFlight(core: DurablePrpControlPlane): boolean {
+    const events = core.store.state.committedEvents;
+    const goalEvent = events.findLast(event => event.eventType === "session.goal.updated" || event.eventType === "session.goal.cleared"
+      || event.eventType === "session.goal.snapshot");
+    const goalPayload = record(record(goalEvent?.envelope.payload).payload), goal = record(goalPayload.goal);
+    return this.#turnStartResponsePending || this.#bridgedRuntimeInputs.size > 0
+      || !core.semanticToolResultsSettled() || providerTurnIsActiveFromCommittedEvents(events)
+      || goalPayload.workingNow === true
+      || (goalEvent?.eventType !== "session.goal.cleared" && (goal.status === "active" || goal.workingNow === true));
+  }
+
+  /**
+   * A retained warm owner whose attached run already settled a provider turn
+   * and has no work in flight or pending. Its runner exit is not reconnected on
+   * the same path: the transport fails and the existing warm-close path
+   * retires the owner (#20825). A run that has not yet settled a turn (still
+   * starting, or between thread start and its first turn) keeps reconnecting.
+   */
+  #settledIdleWarmOwner(): boolean {
+    const core = this.#core;
+    if (!core || !this.#startupComplete || this.options.lifecyclePolicy?.mode !== "warm") return false;
+    if (this.#providerWorkInFlight(core) || core.store.state.commands.some(command => command.status === "pending")) return false;
+    const runId = core.store.state.identity.runId;
+    return core.store.state.committedEvents.some(event =>
+      RUNNERD_TURN_TERMINAL_EVENT_TYPES.has(event.eventType) && event.envelope.runId === runId);
+  }
+
   async #releaseSettledRunner(): Promise<DurableRecoveryIdentity | false> {
     const pair = this.options.releaseResume;
     const core = this.#core;
@@ -4981,16 +5019,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     if (!core || !this.#startupComplete) throw new Error("native_runner_release_unavailable");
     if (!this.#controlPlaneCheckpoint) return false;
     if (!this.#releaseEpisode) {
-      const knownBusy = () => {
-        const events = core.store.state.committedEvents;
-        const goalEvent = events.findLast(event => event.eventType === "session.goal.updated" || event.eventType === "session.goal.cleared"
-          || event.eventType === "session.goal.snapshot");
-        const goalPayload = record(record(goalEvent?.envelope.payload).payload), goal = record(goalPayload.goal);
-        return this.#turnStartResponsePending || this.#bridgedRuntimeInputs.size > 0
-          || !core.semanticToolResultsSettled() || providerTurnIsActiveFromCommittedEvents(events)
-          || goalPayload.workingNow === true
-          || (goalEvent?.eventType !== "session.goal.cleared" && (goal.status === "active" || goal.workingNow === true));
-      };
+      const knownBusy = () => this.#providerWorkInFlight(core);
       if (knownBusy() || !await this.#drainSettledProviderEventsBeforeSuspend() || knownBusy()) return false;
       if (core.store.state.commands.some(command => command.status === "pending")) return false;
       await core.flushCheckpoint();

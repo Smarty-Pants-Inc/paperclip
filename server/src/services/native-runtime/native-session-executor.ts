@@ -9466,9 +9466,15 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
   | "native_session_interrupted"
+  | NativeRunnerIngressFailureCode
   | FreshThreadRefusalCode {
   const freshRefusal = freshThreadRefusalCode(error);
   if (freshRefusal) return freshRefusal;
+  // A runner ingress failure after authentication names itself, raw or as
+  // relayed by the codex notification stream: it is neither a startup failure
+  // nor a provider verdict on its session (#20825).
+  const ingressFailure = nativeRunnerIngressFailureCode(error);
+  if (ingressFailure) return ingressFailure;
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
   if (findNativePredecessorRetirementUnproven(error)) return NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE;
   if (findNativeFailedBeforeProviderTurn(error)) return NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE;
@@ -9606,6 +9612,27 @@ export function nativeSessionFailureSourceCode(
   }
   if (runnerIngressConnectionFailure(error)) return "runner_ingress_startup_failed";
   return "native_session_interrupted";
+}
+
+/** Post-authentication runner ingress failures that reach a run (#20825):
+ * an idle warm owner retired as unreachable, and a busy owner's exhausted
+ * recovery budget. Both stay ordinary retryable resumes. */
+export const NATIVE_RUNNER_INGRESS_FAILURE_CODES = [
+  "native_runner_ingress_unreachable",
+  "native_runner_ingress_recovery_exhausted",
+] as const;
+export type NativeRunnerIngressFailureCode = typeof NATIVE_RUNNER_INGRESS_FAILURE_CODES[number];
+
+function nativeRunnerIngressFailureCode(error: unknown, depth = 0): NativeRunnerIngressFailureCode | null {
+  if (!error || typeof error !== "object" || depth > 5) return null;
+  const value = error as Record<string, unknown>;
+  const code = NATIVE_RUNNER_INGRESS_FAILURE_CODES.find(candidate => candidate === value.code);
+  if (code) return code;
+  if (typeof value.message === "string") {
+    const named = /(?:^|: )(native_runner_ingress_unreachable|native_runner_ingress_recovery_exhausted): /.exec(value.message)?.[1];
+    if (named) return named as NativeRunnerIngressFailureCode;
+  }
+  return nativeRunnerIngressFailureCode(value.cause, depth + 1);
 }
 
 function runnerIngressConnectionFailure(error: unknown, depth = 0): boolean {
@@ -13919,6 +13946,7 @@ async function executePaperclipNativeSessionAttempt(
               ...(error instanceof NativeRunnerIngressAcquisitionError ? { runnerIngressFailure: error.failure } : {}),
               originalFailureCode:
                 error instanceof NativeProviderTerminalFailure
+                  && !(NATIVE_RUNNER_INGRESS_FAILURE_CODES as readonly string[]).includes(sourceFailureCode)
                   ? error.providerCode
                   : sourceFailureCode,
               recoverable:
