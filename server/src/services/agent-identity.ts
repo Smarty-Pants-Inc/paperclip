@@ -12,13 +12,22 @@ const publicColumns = {
   keyId: agentIdentityKeys.keyId,
   publicKeyPem: agentIdentityKeys.publicKeyPem,
   createdAt: agentIdentityKeys.createdAt,
+  revokedAt: agentIdentityKeys.revokedAt,
 };
+
+export class AgentIdentityRevokedError extends Error {
+  constructor() {
+    super("Agent identity key is revoked");
+    this.name = "AgentIdentityRevokedError";
+  }
+}
 
 export function agentIdentityService(db: Db) {
   const ownership = (companyId: string, agentId: string) => and(
     eq(agentIdentityKeys.companyId, companyId), eq(agentIdentityKeys.agentId, agentId),
   );
   async function resolveIdentity(row: typeof agentIdentityKeys.$inferSelect) {
+    if (row.revokedAt) throw new AgentIdentityRevokedError();
     const privateKeyPem = await localEncryptedProvider.resolveVersion({ material: row.privateKeyMaterial, externalRef: null });
     const privateKey = createPrivateKey(privateKeyPem);
     const derived = createPublicKey(privateKey).export({ type: "spki", format: "der" });
@@ -33,7 +42,10 @@ export function agentIdentityService(db: Db) {
     // Reading an identity must never provision it or decrypt private material.
     async getPublicIdentity(companyId: string, agentId: string): Promise<AgentPublicIdentity | null> {
       const [row] = await db.select(publicColumns).from(agentIdentityKeys).where(ownership(companyId, agentId));
-      return row ? { ...row, createdAt: row.createdAt.toISOString() } : null;
+      if (!row) return null;
+      const { revokedAt, ...identity } = row;
+      return { ...identity, createdAt: row.createdAt.toISOString(),
+        ...(revokedAt ? { revokedAt: revokedAt.toISOString() } : {}) };
     },
     async createExistingLogRedactor(companyId: string, agentId: string) {
       const [row] = await db.select().from(agentIdentityKeys).where(ownership(companyId, agentId));
@@ -44,9 +56,11 @@ export function agentIdentityService(db: Db) {
       return db.transaction(async (tx) => {
         // Lock the parent even when there is no identity row yet. This also
         // serializes deletion and works inside the agent-creation transaction.
-        const [owner] = await tx.select({ id: agents.id }).from(agents)
+        const [owner] = await tx.select({ id: agents.id, status: agents.status }).from(agents)
           .where(and(eq(agents.companyId, companyId), eq(agents.id, agentId))).for("update");
         if (!owner) throw notFound("Agent not found");
+        // Do not mint a first key for a terminated, previously unprovisioned agent.
+        if (owner.status === "terminated") throw new AgentIdentityRevokedError();
         let [row] = await tx.select().from(agentIdentityKeys).where(ownership(companyId, agentId));
         if (!row) {
           const keys = generateKeyPairSync("ed25519");

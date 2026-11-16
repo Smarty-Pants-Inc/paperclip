@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
-import { agents, agentApiKeys, companies, budgetPolicies, type Db } from "@paperclipai/db";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
+import { agents, agentApiKeys, agentIdentityKeys, companies, budgetPolicies, type Db } from "@paperclipai/db";
+import { persistActivity } from "../../../services/activity-log.js";
 import type { AgentLifecycleOperation } from "@paperclipai/shared";
 import { AgentLifecycleConflict, canConfigureAgentConnection, compatibilityStatus, isLifecycleWorkPending, transition, type LifecycleCommand } from "../domain/policy.js";
 import type { LifecycleEffects } from "./effects.js";
@@ -199,6 +200,16 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   }).where(eq(agents.id, agent.id)).returning();
   if (next === "terminating" || next === "rejected") {
     await tx.update(agentApiKeys).set({ revokedAt: new Date() }).where(eq(agentApiKeys.agentId, agent.id));
+    const revokedKeys = await tx.update(agentIdentityKeys).set({ revokedAt: sql`now()` })
+      .where(and(eq(agentIdentityKeys.companyId, agent.companyId), eq(agentIdentityKeys.agentId, agent.id),
+        isNull(agentIdentityKeys.revokedAt))).returning({ keyId: agentIdentityKeys.keyId });
+    for (const { keyId } of revokedKeys) {
+      await persistActivity(tx, {
+        companyId: agent.companyId, actorType: "system", actorId: "system",
+        action: "agent.identity.revoked", entityType: "agent", entityId: agent.id,
+        details: { keyId },
+      });
+    }
     await effects.clearPrimary(tx, agent.companyId, agent.id);
   }
   if (command === "approve") await effects.recordCreation(tx, agent.companyId, agent.id);
