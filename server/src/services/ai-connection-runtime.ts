@@ -29,6 +29,7 @@ import { prepareAntigravityCredentialWriteback } from "./native-runtime/antigrav
 import { quotaCredentialHash, quotaCredentialRecovery, RetiredCredentialRecoveryError } from "./quota-credential-recovery.js";
 import { bindRetainedAiCredentialHome, reconcileRetainedAiCleanup, retainAiCredentialCleanup, retainedAiAccountKeyHash } from "./retained-ai-credential-cleanup.js";
 import { logger } from "../middleware/logger.js";
+import { summarizeDiagnosticError } from "./native-runtime/diagnostic-error-summary.js";
 
 export function isAiConnectionBusy(error: unknown): error is HttpError {
   return error instanceof HttpError && error.status === 422 &&
@@ -654,17 +655,10 @@ export async function withManagedAiProbe<T>(
         agentId: input.agentId,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
       try {
-        // DIAGNOSTIC (log only): name the failing teardown steps. Only our own
-        // fixed-template messages ("Native ...", "Pi ...", native_/runner_ codes) are
-        // logged; anything else is reduced to its error class.
-        const describe = (failure: unknown) => {
-          const message = failure instanceof Error ? failure.message : "";
-          return /^(?:Native |Pi |native_|runner_)[A-Za-z0-9 _,.;:'()-]{1,200}$/.test(message) ? message
-            : `other:${failure instanceof Error ? failure.name : typeof failure}`;
-        };
+        // DIAGNOSTIC (log only): name each teardown error (sanitized summary).
         logger.warn({ code: "native_probe_cleanup_pending", accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
-          agentId: input.agentId, cleanupSteps: error.cleanupErrors.map(describe),
-          operationError: error.operationError === undefined ? null : describe(error.operationError) },
+          agentId: input.agentId, cleanupErrors: error.cleanupErrors.slice(0, 8).map(failure => summarizeDiagnosticError(failure)),
+          operationError: error.operationError === undefined ? null : summarizeDiagnosticError(error.operationError) },
           "Native AI probe cleanup remains pending");
       } catch { /* Diagnostics must not change the HTTP response. */ }
       throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
