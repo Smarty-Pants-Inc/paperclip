@@ -38,6 +38,10 @@ const transports = new Map<string, PreparedAdapterExecutionTargetRuntime>();
 // the whole operation (including queued locks and receipt/cleanup writes), not
 // the native run: a detached provider may keep running on the next controller.
 const pendingAgentFileCheckpoints = new Set<Promise<void>>();
+export function pendingAgentFileCheckpointCount(): number {
+  return pendingAgentFileCheckpoints.size;
+}
+
 export function trackAgentFileCheckpoint<T>(operation: Promise<T>): Promise<T> {
   const settled = operation.then(() => undefined, () => undefined);
   pendingAgentFileCheckpoints.add(settled);
