@@ -211,6 +211,29 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(persisted?.processPid).toBe(process.pid);
   });
 
+  // #20825: a finished run's retained warm owner relaunched its runner; each
+  // relaunch overwrote the terminal run's process identity and bumped updated_at.
+  it.each(["succeeded", "failed", "cancelled", "timed_out"] as const)(
+    "never changes a %s run's process identity or updated_at from a later relaunch", async status => {
+      const { run } = await fixture();
+      const launchedAt = "2026-11-16T04:00:00.000Z";
+      await persistHeartbeatRunProcessMetadata(db, run.id, { pid: 4100, processGroupId: null, startedAt: launchedAt, targetKind: "remote" });
+      await db.update(heartbeatRuns).set({ status, finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      const events = async () => (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, run.id))).length;
+      const eventsBefore = await events();
+      await new Promise(resolve => setTimeout(resolve, 20));
+      // The warm owner's relaunch reports a new sandbox process for the finished run.
+      await persistHeartbeatRunProcessMetadata(db, run.id, {
+        pid: 4200, processGroupId: null, startedAt: "2026-11-16T04:11:00.000Z", targetKind: "remote" });
+      const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(after.processPid).toBe(4100);
+      expect(after.processStartedAt?.toISOString()).toBe(launchedAt);
+      expect(after.updatedAt.toISOString()).toBe(finished.updatedAt.toISOString());
+      expect(after.status).toBe(status);
+      expect(await events()).toBe(eventsBefore);
+    });
+
   it("keeps one terminal outcome and reports only the winner of competing writes", async () => {
     const { run } = await fixture();
     const deps = callbacks(db);
