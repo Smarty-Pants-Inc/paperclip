@@ -154,9 +154,6 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     if (company.status === "archived") holds.push("company_archived");
     if (company.status === "paused") holds.push("company_paused");
   }
-  // Holds control resumable work, not retirement. Keep policy/accounting rows;
-  // only the terminal agent's obsolete execution holds are released.
-  if (command === "terminate") holds = [];
   if (command === "pause") holds = [...new Set([...holds, reason])];
   if (command === "resume") holds = holds.filter(hold => reason === "user" ? ["budget", "company_archived", "company_paused"].includes(hold) : hold !== reason);
   const blockingHolds = holds.filter(hold => hold !== "setup" || !["preparing", "verifying"].includes(agent.lifecycleState));
@@ -170,6 +167,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
+  if (next === "terminated") holds = [];
   if (next === agent.lifecycleState) {
     if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
       const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, agent.id)).returning();
@@ -192,7 +190,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   }
   const status = compatibilityStatus(next, agent.status);
   if(!canConfigureAgentConnection(agent)&&canConfigureAgentConnection({lifecycleState:next,status}))await effects.beforeConnectionEligibilityRestore?.(tx,agent.companyId,agent.id);
-  if (status !== agent.status) await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status);
+  if (status !== agent.status || next === "terminated") await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status);
   if (isLifecycleWorkPending(next)) await effects.notifyWork(tx);
   const [updated] = await tx.update(agents).set({
     lifecycleHolds: holds, lifecycleState: next, lifecycleVersion: agent.lifecycleVersion + 1, lifecycleError: null,
