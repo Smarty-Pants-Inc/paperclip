@@ -1,4 +1,5 @@
-import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
+import { nativeReconciliationError, freshThreadRefusalCode, isFreshThreadRefusal, type FreshThreadRefusalCode,
+  freshThreadRefusal, PRIOR_OWNER_LIFECYCLE_UNSETTLED, type SameRunFreshThreadRefusalCode } from "./runner-reconciliation-refusal.js";
 import { currentControllerProcess } from "../controller-process-identity.js";
 import { probePiSessionResumeFile, restorePiSessionResumeFile } from "./pi-session-file-repair.js";
 import { readRemoteCheckpointManifest, verifyLocalCheckpointManifest } from "./remote-checkpoint-manifest.js";
@@ -353,7 +354,7 @@ import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
-  readUnsupersededHeldConversationNotice } from "./pi-session-recovery-notice.js";
+  readUnsupersededHeldConversationNotice, supersedeHeldConversationNotice, writePiSessionHistoryLossNotice } from "./pi-session-recovery-notice.js";
 import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
@@ -6106,6 +6107,9 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   projectedControlBytes?: string;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /** Floor member (b) only: prove everything except lifecycle commands, which
+   * the same filter as a restarted box then treats as settled. Never retires. */
+  lifecycleCommandsUndeliverable?: boolean;
 }): Promise<{ finished: true; run: typeof heartbeatRuns.$inferSelect; recheck: () => Promise<string | null> }
   | { finished: false; refused: string; generationLost: boolean }> {
   const target = input.runnerExecutionTarget;
@@ -6146,7 +6150,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
-  const remoteRunnerStopped = !localRunner && resumedSandboxRunner(target);
+  const remoteRunnerStopped = !localRunner && (resumedSandboxRunner(target) || input.lifecycleCommandsUndeliverable === true);
   const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteSandboxLeasesEnded(input.db, {
     companyId: binding.companyId, runId: identity.runId,
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
@@ -6295,6 +6299,76 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   } catch {
     return false;
   }
+}
+
+/** Floor member (b): every recorded lease of the prior run is on ANOTHER box
+ * and none is still active. Unrecorded leases prove nothing, so they hold. */
+async function priorRemoteSandboxLeasesInactiveElsewhere(db: Db, input: {
+  companyId: string; runId: string; currentProviderLeaseId?: string;
+}): Promise<boolean> {
+  try {
+    const leases = await db.select({ status: environmentLeases.status, providerLeaseId: environmentLeases.providerLeaseId })
+      .from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, input.runId)));
+    return leases.length > 0 && leases.every(lease => lease.status !== "active"
+      && lease.providerLeaseId !== null && lease.providerLeaseId !== input.currentProviderLeaseId);
+  } catch {
+    return false;
+  }
+}
+
+export type SameRunFreshThreadProof = {
+  code: SameRunFreshThreadRefusalCode;
+  priorRunId: string;
+  previousProviderSessionId: string | null;
+  refusal: string;
+  /** Pi only: today's retry keeps conversation C (heartbeat/runtime-selection.ts:543-544)
+   * and finds this root quarantined, so the same run is exactly that retry. Other
+   * providers' retry mints a new normalized session, which an admitted run
+   * cannot take (pi-conversation-record.ts:200-201); they keep the typed refusal. */
+  sameRun: boolean;
+};
+
+/** Floor member (b), SMA-66: the prior per-turn owner of a created/replacement
+ * sandbox is proven finished (committed result, released owner lease, stopped
+ * controller, settled terminal, deliveries and tool answers settled, the same
+ * quarantine copies) except for lifecycle commands its Runner never
+ * acknowledged, while its box is not active and may still exist. Upstream holds
+ * this owner ("a Runner whose sandbox may still exist keeps the owner held");
+ * that hold is kept for its thread: it is never resumed or retired here. */
+async function priorOwnerFinishedExceptLifecycleCommands(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0],
+  refused: string): Promise<SameRunFreshThreadProof | null> {
+  const target = input.runnerExecutionTarget;
+  if (!refused.startsWith("journal_commands_unsettled(") || target?.kind !== "remote" || target.transport !== "sandbox"
+    || !target.runner || target.runnerTask || resumedSandboxRunner(target)
+    || !["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) return null;
+  const runId = input.identity.runId;
+  if (typeof runId !== "string" || !await priorRemoteSandboxLeasesInactiveElsewhere(input.db, {
+    companyId: input.execution.binding.companyId, runId, currentProviderLeaseId: target.sandboxLeaseAcquisition?.providerLeaseId,
+  })) return null;
+  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, lifecycleCommandsUndeliverable: true });
+  if (!proof.finished || await proof.recheck() !== null) return null;
+  const providerSessionId = record(record(proof.run.runnerProfileJson).sessionCheckpoint).providerSessionId;
+  return { code: PRIOR_OWNER_LIFECYCLE_UNSETTLED, priorRunId: runId,
+    previousProviderSessionId: typeof providerSessionId === "string" ? providerSessionId : null,
+    refusal: `runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${refused}`,
+    sameRun: input.execution.provider.kind === "pi_rpc" };
+}
+
+/** The continuation note for a same-run fresh thread: one per set-aside owner,
+ * through the typed history-loss notice helper, superseding the conversation's
+ * held notice. Replays add none. */
+async function writeSameRunFreshThreadNotice(input: { db: Db; execution: NativeExecutionInput }, proof: SameRunFreshThreadProof) {
+  const { companyId, issueId, agentId, runId } = input.execution.binding;
+  const authorizationReason = `fresh_provider_thread:prior_owner_lifecycle_unsettled:${proof.priorRunId}`;
+  await input.db.transaction(async tx => {
+    const [issue] = await tx.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, companyId))).for("no key update");
+    if (!issue) return;
+    await writePiSessionHistoryLossNotice(input.db, tx, { companyId, issueId, runId, agentId, authorizationReason,
+      body: "A restart cut off my previous run before its runner confirmed it had stopped, so I set that conversation thread aside. "
+        + "I'm continuing from the saved work in a fresh thread." });
+    await supersedeHeldConversationNotice(tx, { companyId, issueId, heldSessionId: nativeSessionKey(input.execution), reason: authorizationReason });
+  });
 }
 
 function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined): boolean {
@@ -6531,6 +6605,8 @@ async function migrateRunnerdStateRootForExecution(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   bootstrapRetryLeaseOwner?: string;
   managedAiAccountIdentity?: string; managedAiCredentialIdentity?: string;
+  /** The executor's own admission: take the same-run fresh-thread floor. */
+  onSameRunFreshThread?: (proof: SameRunFreshThreadProof) => Promise<void>;
 }): Promise<VerifiedWarmTransitionBinding | undefined> {
   const scoped = scopedRunnerdStateRoot(input.execution);
   await restoreWarmRunnerdController(input);
@@ -6697,6 +6773,7 @@ async function migrateRunnerdStateRootForExecution(input: {
       // Name the failed retirement proof: the shared error otherwise hides
       // which of several independent fences held the follow-up.
       let retirementRefusal = "";
+      let freshThread: SameRunFreshThreadProof | null = null;
       if (verification === "terminal_state_indeterminate" && !input.retainedWarmOwnerRunId
         && (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete")) {
         if (resumedSandboxRunner(input.runnerExecutionTarget)) {
@@ -6708,6 +6785,7 @@ async function migrateRunnerdStateRootForExecution(input: {
           const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
           if (retirement.retired) return;
           if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
+          freshThread = await priorOwnerFinishedExceptLifecycleCommands({ ...input, root: scoped, identity }, retirement.refused);
         }
       }
       if (
@@ -6722,8 +6800,28 @@ async function migrateRunnerdStateRootForExecution(input: {
               : "identity_indeterminate",
           );
         }
+        // Floor member (b), SMA-66 (J3-23): the quarantine above set the old
+        // thread aside exactly as today's automatic retry finds it. Continue
+        // THIS run in a fresh thread instead of failing it: no Runner, provider
+        // or tool of the old owner is resumed, so this deviates from upstream's
+        // pinned hold only in WHEN the fresh thread starts (Boat stops and keeps
+        // the old box where upstream destroys it, as in ad011851).
+        if (freshThread?.sameRun && !existsSync(scoped) && input.onSameRunFreshThread) {
+          // TODO(J3-17): append this fresh thread through provider-identity-lineage.ts
+          // (fork dl/identity-changed a78c402c) once it is on this base; until then
+          // the existing continuity-break event is the record (no second shape).
+          await input.onLog?.("stderr", `[paperclip-runner] provider session continuity break: prior owner ${freshThread.priorRunId} `
+            + `set aside (${freshThread.refusal}); old provider session=${freshThread.previousProviderSessionId ?? "unavailable"}, `
+            + "continuing this run in a fresh thread\n");
+          await input.onSameRunFreshThread(freshThread);
+          await writeSameRunFreshThreadNotice(input, freshThread);
+          return;
+        }
         await recordPriorOwnerFenceRefusal(input, `prior_owner_${verification}`);
-        const refusal = new Error(`runner_state_identity_mismatch: prior_owner_${verification}${retirementRefusal}`);
+        const refusalText = `runner_state_identity_mismatch: prior_owner_${verification}${retirementRefusal}`;
+        // Elsewhere the member keeps upstream's exact text and joins the closed
+        // fresh-thread set, so its failed run takes the existing continuation.
+        const refusal = freshThread ? freshThreadRefusal(freshThread.code, refusalText) : new Error(refusalText);
         // A terminal owner on this reused sandbox can be retired only from a
         // different sandbox, where its Runner cannot be. Send the next attempt there.
         const target = input.runnerExecutionTarget;
@@ -11553,6 +11651,18 @@ async function executePaperclipNativeSessionAttempt(
       predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
       bootstrapRetryLeaseOwner: input.leaseOwner,
       managedAiAccountIdentity: input.managedAiAccountIdentity, managedAiCredentialIdentity: input.managedAiCredentialIdentity,
+      // The floor: this run's admission continues in a recorded fresh thread
+      // (FRESH_THREAD_REFUSAL_CODES member b) instead of failing the run.
+      onSameRunFreshThread: async proof => {
+        const atMs = Date.now();
+        await trace.record({
+          name: "provider.session.continuity_break", parentName: "native.session.execute",
+          startedAtMs: atMs, endedAtMs: atMs, outcome: "failed",
+          attributes: { reason: proof.code, previousDriverSessionId: nativeSessionKey(input.execution),
+            previousProviderSessionId: proof.previousProviderSessionId ?? "unavailable",
+            replacementDriverSessionId: nativeSessionKey(input.execution), replacementProviderSessionId: "unavailable" },
+        });
+      },
     }));
   }
   const durableRunnerBinding = input.useRunnerd
@@ -17132,6 +17242,8 @@ export async function createRunnerdBackend(input: {
   restartRecovery?: NativeRestartRecoveryClaim;
   recoveryPurpose?: "execution" | "stop_cleanup";
   durableEnvironmentLeaseId?: string;
+  /** Same-run fresh-thread floor for this construction's own root admission. */
+  onSameRunFreshThread?: (proof: SameRunFreshThreadProof) => Promise<void>;
   remoteWarmRecovery?: Omit<RemoteWarmSessionRecovery, "revalidate"> & { revalidate: () => Promise<void> };
   retainedPluginTaskOwner?: ReturnType<typeof createPluginRunnerTaskOwner>;
   retainedSandboxOwner?: SandboxRunnerRetention;
@@ -17226,6 +17338,7 @@ export async function createRunnerdBackend(input: {
         restartRecovery: input.restartRecovery,
         runnerExecutionTarget: input.runnerExecutionTarget,
         predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
+        ...(input.onSameRunFreshThread ? { onSameRunFreshThread: input.onSameRunFreshThread } : {}),
       });
     }
     input.executionContext?.signal.throwIfAborted();
