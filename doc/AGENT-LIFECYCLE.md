@@ -148,13 +148,16 @@ Retirement hands work over in two steps (#20389):
    retired default agent. An open budget incident for the agent is dismissed
    and its pending override approval rejected, with one
    `budget.incident_resolved` row. Each item's activity publishes after its
-   commit. The marker clears, with an `agent.handover_completed` row, only when
-   no open task and no live report remain. Re-running changes nothing.
+   commit. The marker clears, with one `agent.handover_completed` row, when
+   no re-homable open task and no live report remain. That final row records
+   `conversationBoundCount` and `conversationBoundTaskIds` for the bound
+   conversations left with the retired agent. Re-running changes nothing.
 
 Terminal tasks retain their historical assignee. Conversation and
-external-channel tasks retain their fixed identity and stay named in the marker
-for a person to re-home. Agents retired before this worker existed carry no
-marker: the worker only logs a dry list (counts and ids) of them unless
+external-channel tasks retain their fixed identity for a person to re-home;
+these intentionally retained tasks do not keep the hand-over marker pending
+or produce reassignment-failure activities. Agents retired before this worker
+existed carry no marker: the worker only logs a dry list (counts and ids) of them unless
 `PAPERCLIP_AGENT_HANDOVER_REPAIR_PRE_FIX=true`. The assigned-work sweep includes
 open tasks of retired assignees and hands them to the worker.
 
@@ -175,6 +178,12 @@ Pending hires and agents in termination or a final state are excluded.
 An explicit company or budget change still updates all affected agents immediately.
 `updateAndTransition` applies a configuration change and a lifecycle command
 in one transaction. A failed command does not save the configuration change.
+
+On the hire HTTP routes, a proven create-transaction rollback returns HTTP 503
+with code `agent_hire_create_contention` and retryable details. Create runs
+once; the database error remains only in the error's cause. Other lifecycle
+callers retain upstream's `AccountingContentionError` unchanged. The separate
+post-create grant step retains its existing five-attempt retry and error mapping.
 
 The onboarding and invitation services own their feature workflows.
 They commit the hire through `requestHire` before they save the other records.
