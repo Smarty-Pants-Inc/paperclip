@@ -167,10 +167,16 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
   // Only the persisted agent setting selects this mode, never a task override.
   const agentAdapterConfig = parseObject(agent.adapterConfig);
   const requestedAgentGitHubEnv = agentAdapterConfig.githubAuthenticationMode === "agent_env";
-  const runProject = await readProjectConnectionRunContext(db, { companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id });
-  const managedRequired = Boolean(runProject.projectId && await isProjectConnectionManagedRequired(db, {
-    companyId: agent.companyId, projectId: runProject.projectId,
+  // taskProjectContext is the existing server-loaded task project, not a wake
+  // or workspace hint. Legacy taskless preparation must not start consulting
+  // the managed resolver before resolving an explicitly selected agent token.
+  const managedRequired = Boolean(taskProjectContext && await isProjectConnectionManagedRequired(db, {
+    companyId: agent.companyId, projectId: taskProjectContext.id,
   }));
+  const admittedScope = Object.hasOwn(run.contextSnapshot ?? {}, "projectConnectionRunContext");
+  if (managedRequired) await readProjectConnectionRunContext(db, {
+    companyId: agent.companyId, agentId: agent.id, heartbeatRunId: run.id,
+  });
   const [mentionedSkills, githubIdentity] = await Promise.allSettled([
     preconfiguredHome || pinnedSkillTest ? Promise.resolve([]) : time("configuration_mentions", () => resolveRunScopedMentionedSkillKeys({
       db,
@@ -179,9 +185,12 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       commentIds: extractWakeCommentIds(context),
       actor: skillActor,
     })),
-    time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
-      agentId: agent.id, responsibleUserId, allowStandingDelegation: false, heartbeatRunId: run.id,
-    })),
+    requestedAgentGitHubEnv && !managedRequired && !admittedScope
+      ? Promise.resolve<Awaited<ReturnType<typeof resolveManagedGitHubIdentitySelection>>>({ configured: false })
+      : time("configuration_github_identity", () => resolveManagedGitHubIdentitySelection(db, agent.companyId, {
+          agentId: agent.id, responsibleUserId, allowStandingDelegation: false, heartbeatRunId: run.id,
+        })),
+
   ]);
   if (mentionedSkills.status === "rejected") throw mentionedSkills.reason;
   if (githubIdentity.status === "rejected") throw githubIdentity.reason;
