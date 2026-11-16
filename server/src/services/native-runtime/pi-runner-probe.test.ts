@@ -3,13 +3,13 @@ import { promisify } from "node:util";
 import { runInNewContext } from "node:vm";
 import { chmod, copyFile, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AdapterEnvironmentTestContext } from "@paperclipai/adapter-utils";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 
 const mocks = vi.hoisted(() => ({ probe: vi.fn(), resolveBinary: vi.fn(), launch: vi.fn(),
-  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { binaryArchived: boolean; binaryBytes: string | null; source: string[]; missing: string[]; copied: string[] }[] }));
+  syncOut: vi.fn(), cleanupErrors: [] as string[], archives: [] as { binaryArchived: boolean; binaryBytes: string | null; source: string[]; missing: string[]; copied: string[]; symlinks: string[] }[] }));
 vi.mock("../../vendor/paperclip-runner/index.js", async original => ({
   ...await original<object>(), probeNativeRunnerEnvironment: mocks.probe,
 }));
@@ -41,9 +41,11 @@ vi.mock("./native-session-executor.js", async original => {
         const source = (await readdir(input.sourcePath, { recursive: true })).filter(entry =>
           !excluded.some(prefix => entry === prefix || entry.startsWith(`${prefix}/`))).sort();
         const target = new Set(await readdir(input.targetPath, { recursive: true }));
+        const symlinks: string[] = [];
+        for (const entry of target) if (await lstat(join(input.targetPath, entry)).then(stat => stat.isSymbolicLink(), () => false)) symlinks.push(entry);
         const binaryArchived = await lstat(archived).then(stat => stat.isFile(), () => false);
         mocks.archives.push({ binaryArchived, binaryBytes: binaryArchived ? await readFile(archived, "utf8") : null,
-          source, missing: source.filter(entry => !target.has(entry)), copied: [...target].sort() });
+          source, missing: source.filter(entry => !target.has(entry)), copied: [...target].sort(), symlinks });
       } catch (error) { mocks.cleanupErrors.push(String(error)); throw error; }
     }),
   };
@@ -135,6 +137,28 @@ async function fixture(image: "matching" | "wrong-sha" | "missing", sync = true,
         concurrentSyncOperations: false, duplexCommandStream: false, runnerWebSocketIngress: true } },
   };
   return { root, runner, source, installed, observed, requests, syncIn, context };
+}
+
+function mockPiAgentDriver(f: Awaited<ReturnType<typeof fixture>>, hooks: {
+  beforeHome?: (input: { agentHome: string; remoteRoot: string; launch: number }) => Promise<void> | void;
+  afterHome?: (input: { agentHome: string; remoteRoot: string; launch: number }) => Promise<void> | void;
+} = {}) {
+  let launch = 0;
+  mocks.probe.mockReset().mockImplementation(async options => {
+    const index = launch++;
+    const remoteRoot = f.requests.find(request => request.command === "mkdir" && request.args?.[4]?.includes("/.paperclip-runtime/"))?.args?.[4];
+    if (!remoteRoot) throw new Error("fixture_remote_root_missing");
+    const agentHome = options.environment.PI_CODING_AGENT_DIR ?? join(remoteRoot, "pi", "agent");
+    // Pi rejects relative agent homes. This models the driver's launch gate so
+    // the setup probe must reject a relative default before touching the target.
+    if (!isAbsolute(agentHome)) throw new Error("native_probe_agent_dir_not_absolute");
+    await hooks.beforeHome?.({ agentHome, remoteRoot, launch: index });
+    await mkdir(agentHome, { recursive: true });
+    await hooks.afterHome?.({ agentHome, remoteRoot, launch: index });
+    await options.onCleanupConfirmed();
+    return { providerDriver: "pi_rpc", effectiveModel: model, helloProbePassed: !options.admissionOnly,
+      sessionAdmissionPassed: true, piMetadata: { version: "1.5.2" } };
+  });
 }
 
 afterEach(async () => {
@@ -397,6 +421,94 @@ describe("native Pi probe runner artifact preparation", () => {
     expect(f.syncIn).not.toHaveBeenCalled();
     expect(mocks.probe).not.toHaveBeenCalled();
     expect(f.requests).toEqual([]);
+  });
+
+  it("removes the private Pi agent home without following its absolute npm link", async () => {
+    const f = await fixture("matching");
+    const npmTarget = await mkdtemp(join(tmpdir(), "pi-probe-npm-target-"));
+    roots.push(npmTarget);
+    const pkg = join(npmTarget, "pkg.txt");
+    await writeFile(pkg, "package bytes remain untouched\n");
+    let agentHome = "";
+    let targetBefore: Awaited<ReturnType<typeof lstat>> | undefined;
+    let fileBefore: Awaited<ReturnType<typeof lstat>> | undefined;
+    mockPiAgentDriver(f, { afterHome: async input => {
+      agentHome = input.agentHome;
+      await symlink(npmTarget, join(agentHome, "npm"));
+      targetBefore = await lstat(npmTarget);
+      fileBefore = await lstat(pkg);
+      expect(await readlink(join(agentHome, "npm"))).toBe(npmTarget);
+    } });
+
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("pass");
+    expect(mocks.probe).toHaveBeenCalledTimes(2);
+    expect(await lstat(npmTarget)).toMatchObject({ dev: targetBefore?.dev, ino: targetBefore?.ino,
+      mode: targetBefore?.mode, mtimeMs: targetBefore?.mtimeMs });
+    expect(await lstat(pkg)).toMatchObject({ dev: fileBefore?.dev, ino: fileBefore?.ino,
+      size: fileBefore?.size, mode: fileBefore?.mode, mtimeMs: fileBefore?.mtimeMs });
+    expect(await readFile(pkg, "utf8")).toBe("package bytes remain untouched\n");
+    await expect(lstat(agentHome)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("gives admission and hello distinct private agent homes, recreating hello after admission cleanup", async () => {
+    const f = await fixture("matching");
+    const homes: string[] = [];
+    mockPiAgentDriver(f, { beforeHome: async ({ agentHome, launch }) => {
+      homes.push(agentHome);
+      expect(isAbsolute(agentHome)).toBe(true);
+      if (launch === 1) await expect(lstat(homes[0])).rejects.toMatchObject({ code: "ENOENT" });
+    } });
+
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("pass");
+    expect(homes).toHaveLength(2);
+    expect(new Set(homes).size).toBe(2);
+    for (const home of homes) await expect(lstat(home)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("rejects a relative default agent home before any remote mkdir or rm", async () => {
+    const f = await fixture("matching");
+    const target = f.context.executionTarget;
+    if (target?.kind !== "remote") throw new Error("fixture_remote_target_missing");
+    target.remoteCwd = "relative-cwd";
+    mockPiAgentDriver(f);
+
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("fail");
+    expect(result.checks.map(check => check.code)).toContain("pi_rpc_metadata_failed");
+    // The product intentionally drops the raw internal Error message at its
+    // result boundary; it is represented by the fixed metadata failure code.
+    expect(result.checks.map(check => check.message).join(" ")).not.toContain("native_probe_agent_dir_not_absolute");
+    expect(f.requests.some(request => request.command === "mkdir")).toBe(false);
+    expect(f.requests.some(request => request.command === "rm" && request.args?.[0] === "-rf")).toBe(false);
+  });
+
+  it("passes with an assigned company-skill bundle link outside the synced copy", async () => {
+    const f = await fixture("matching");
+    const skillTarget = await mkdtemp(join(tmpdir(), "pi-probe-company-skill-"));
+    roots.push(skillTarget);
+    await writeFile(join(skillTarget, "SKILL.md"), "fixture company skill\n");
+    const bundle = `bundle-${"a".repeat(64)}`;
+    const links: string[] = [];
+    mockPiAgentDriver(f, { afterHome: async ({ agentHome }) => {
+      const skillLink = join(agentHome, "skills", "paperclip-company-skills", bundle);
+      await mkdir(dirname(skillLink), { recursive: true });
+      await symlink(skillTarget, skillLink);
+      expect(await readlink(skillLink)).toBe(skillTarget);
+      links.push(skillLink);
+    } });
+
+    const result = await probeManagedNativePiRunner(f.context);
+    expect(result.status).toBe("pass");
+    expect(links).toHaveLength(2);
+    expect(mocks.archives).toHaveLength(2);
+    for (const archive of mocks.archives) {
+      expect(archive.source.some(entry => entry.includes("paperclip-company-skills"))).toBe(false);
+      expect(archive.copied.some(entry => entry.includes("paperclip-company-skills"))).toBe(false);
+      expect(archive.symlinks).toEqual([]);
+    }
+    for (const link of links) await expect(lstat(link)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });
 
