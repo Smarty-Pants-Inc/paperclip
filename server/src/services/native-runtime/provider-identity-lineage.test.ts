@@ -6,6 +6,8 @@ import {
   recordedProviderIdentityTransitionIsAllowed,
   noteProviderIdentityBreak,
   clearPendingProviderIdentityBreaksForTest,
+  clearProviderIdentityBreak,
+  readPendingProviderIdentityBreak,
 } from "./provider-identity-lineage.js";
 
 // #20787 J3-17: the reset-record contract. Identities are the objects NSE
@@ -128,7 +130,7 @@ describe("recordedProviderIdentityTransitionIsAllowed", () => {
     await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope,
       previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(false);
     expect(fixture.stored()).toEqual([]);
-    noteProviderIdentityBreak(scope, "resume_failed_on_new_box", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope,
       previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(true);
     expect(fixture.stored()).toEqual([expect.objectContaining({ generation: 1, previousIdentity: identity("01a1e203"),
@@ -146,7 +148,7 @@ describe("recordedProviderIdentityTransitionIsAllowed", () => {
     clearPendingProviderIdentityBreaksForTest();
     const fixture = conversationDb([]);
     // SMA-67 05:51Z: a spare box bx_kuxnh4yq started 01a1e2e9 while the backup named 01a1e203.
-    noteProviderIdentityBreak(scope, "resume_failed_on_new_box", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "bx_kuxnh4yq");
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "bx_kuxnh4yq");
     await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_other",
       previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(false);
     expect(fixture.stored()).toEqual([]);
@@ -159,5 +161,77 @@ describe("recordedProviderIdentityTransitionIsAllowed", () => {
     clearPendingProviderIdentityBreaksForTest();
     await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_kuxnh4yq",
       previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(true);
+  });
+
+  // review-fleet-3 F1 (#20787 J3-21): the note is durable in the run that
+  // starts the thread, so a restart BEFORE any suspended read keeps it.
+  const conversationOf = (fixture: ReturnType<typeof conversationDb>) =>
+    (fixture.row.sessionParamsJson as Record<string, any>).__paperclipPiConversation as Record<string, unknown>;
+
+  it("stores the note durably beside the records, under the issue then task lock", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([record(1, "01a1e203", "01a1e2e9")]);
+    await expect(noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      "bx_kuxnh4yq", new Date("2026-11-16T05:51:00Z"))).resolves.toBe(true);
+    expect(fixture.locks).toEqual(["issue:no key update", "task:update"]);
+    expect(conversationOf(fixture).pendingProviderIdentityBreak).toEqual({ reason: "resume_failed_on_new_box",
+      runId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", providerLeaseId: "bx_kuxnh4yq", notedAt: "2026-11-16T05:51:00.000Z" });
+    // The conversation record and its existing steps are kept as they were.
+    expect(conversationOf(fixture)).toMatchObject({ id: scope.normalizedSessionId, generation: 1, reason: "first_message" });
+    expect(fixture.stored().map(entry => entry.generation)).toEqual([1]);
+  });
+
+  it("a restart before any suspended read keeps the note: the first read records the step and consumes it", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "dddddddd-dddd-4ddd-8ddd-dddddddddddd", "bx_kuxnh4yq");
+    clearPendingProviderIdentityBreaksForTest(); // restart
+    // Another box's state is still not recorded after the restart.
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_other",
+      previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(false);
+    expect(fixture.stored()).toEqual([]);
+    expect(await readPendingProviderIdentityBreak(fixture.db, scope)).not.toBeNull();
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_kuxnh4yq",
+      previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(true);
+    expect(fixture.stored()).toEqual([expect.objectContaining({ generation: 1, previousIdentity: identity("01a1e203"),
+      identity: identity("01a1e2e9"), reason: "resume_failed_on_new_box", runId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd" })]);
+    expect(conversationOf(fixture).pendingProviderIdentityBreak).toBeUndefined();
+    // Consumed once: a later unrecorded change on the same box refuses.
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_kuxnh4yq",
+      previous: identity("01a1e203"), current: identity("foreign-thread") })).resolves.toBe(false);
+  });
+
+  it("publishing a backup clears the durable note, so a later restart refuses an unrecorded change", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    await noteProviderIdentityBreak(fixture.db, scope, "resume_failed_on_new_box", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee", "bx_kuxnh4yq");
+    fixture.locks.length = 0;
+    await clearProviderIdentityBreak(fixture.db, scope);
+    expect(fixture.locks).toEqual(["issue:no key update", "task:update"]);
+    expect(conversationOf(fixture).pendingProviderIdentityBreak).toBeUndefined();
+    clearPendingProviderIdentityBreaksForTest();
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope, providerLeaseId: "bx_kuxnh4yq",
+      previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(false);
+    // Nothing to clear takes no lock.
+    fixture.locks.length = 0;
+    await clearProviderIdentityBreak(fixture.db, scope);
+    expect(fixture.locks).toEqual([]);
+  });
+
+  it("never writes a note onto a rotated conversation; only this process's copy remains (fail closed after a restart)", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const rotated = conversationDb([], "99999999-9999-4999-8999-999999999999");
+    await expect(noteProviderIdentityBreak(rotated.db, scope, "resume_failed_on_new_box", "ffffffff-ffff-4fff-8fff-ffffffffffff"))
+      .resolves.toBe(false);
+    expect(conversationOf(rotated).pendingProviderIdentityBreak).toBeUndefined();
+  });
+
+  it("ignores a malformed durable note", async () => {
+    clearPendingProviderIdentityBreaksForTest();
+    const fixture = conversationDb([]);
+    conversationOf(fixture).pendingProviderIdentityBreak = { reason: "anything", runId: "x", providerLeaseId: null, notedAt: "now" };
+    await expect(recordedProviderIdentityTransitionIsAllowed({ db: fixture.db, scope,
+      previous: identity("01a1e203"), current: identity("01a1e2e9") })).resolves.toBe(false);
+    expect(fixture.stored()).toEqual([]);
   });
 });

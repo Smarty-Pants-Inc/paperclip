@@ -13214,12 +13214,14 @@ async function executePaperclipNativeSessionAttempt(
             },
             onContinuityBreak: async (continuity) => {
               // restart-up's same-run replacement opened a NEW provider thread
-              // in this conversation. Record that step on the lineage at the
-              // first suspended read of the box, so a restart or idle close
-              // does not refuse the newer thread (#20787 J3-17).
-              if (input.execution.provider.kind === "pi_rpc") {
-                noteProviderIdentityBreak(providerIdentityLineageScope(input.execution),
-                  "resume_failed_on_new_box", input.execution.binding.runId);
+              // in this conversation. Note it durably now (#20787 J3-21 F1);
+              // the first suspended read of the box, before or after a
+              // restart, records the step, so a restart or idle close does
+              // not refuse the newer thread (#20787 J3-17).
+              if (input.execution.provider.kind === "pi_rpc" && !(await noteProviderIdentityBreak(input.db,
+                providerIdentityLineageScope(input.execution), "resume_failed_on_new_box", input.execution.binding.runId))) {
+                await input.onLog?.("stderr", "[paperclip-runner] the new provider thread could not be noted durably; "
+                  + "a restart before its first checkpoint will refuse it as provider_identity_changed.\n");
               }
               const atMs = Date.now();
               await trace.record({
@@ -18643,7 +18645,8 @@ async function createRunnerdBackendWithinSessionClaim(
 
   // A new box that starts a fresh provider session while this conversation
   // has a durable backup forks the lineage (the spare/new-box fallback). Note
-  // it for this box, so the first suspended read that meets the older backup
+  // it for this box, durably and in this run (#20787 J3-21 F1), so the first
+  // suspended read that meets the older backup, before or after a restart,
   // records the step instead of refusing the newer thread (#20787 J3-17).
   const noteFreshProviderSessionOnNewBox = async () => {
     const providerLeaseId = sandboxLeaseAcquisition?.providerLeaseId;
@@ -18654,8 +18657,11 @@ async function createRunnerdBackendWithinSessionClaim(
       // An unreadable lineage leaves the fork unrecorded: the later read refuses, as before.
       eq(nativeHarnessBackups.status, "current"))).limit(1).catch(() => []);
     if (!lineageBackup) return;
-    noteProviderIdentityBreak(providerIdentityLineageScope(input.execution), "resume_failed_on_new_box",
-      input.execution.binding.runId, providerLeaseId);
+    if (!(await noteProviderIdentityBreak(input.db, providerIdentityLineageScope(input.execution), "resume_failed_on_new_box",
+      input.execution.binding.runId, providerLeaseId))) {
+      await input.onLog?.("stderr", "[paperclip-runner] the fresh provider session on this sandbox could not be noted durably; "
+        + "a restart before its first checkpoint will refuse it as provider_identity_changed.\n");
+    }
   };
 
   const recordInPlaceHarnessReuse = async (
@@ -19314,8 +19320,11 @@ async function createRunnerdBackendWithinSessionClaim(
                 // save; its result is uncertain once it starts, so keep the
                 // resume path rather than discard a backup that may exist.
                 checkpointBackupStored = true;
-                // The new backup names the current thread itself.
-                clearProviderIdentityBreak(providerIdentityLineageScope(input.execution));
+                // The new backup names the current thread itself. A note that
+                // cannot be cleared here stays until a suspended read consumes it.
+                await clearProviderIdentityBreak(input.db, providerIdentityLineageScope(input.execution)).catch(async () => {
+                  await input.onLog?.("stderr", "[paperclip-runner] the pending provider-thread note could not be cleared after the backup.\n");
+                });
                 await publishNativeHarnessBackup({
                   db: input.db, companyId: input.execution.binding.companyId,
                   scopeDigest: createHash("sha256").update(sessionScopeId).digest("hex"), backupRoot, pendingRoot,
