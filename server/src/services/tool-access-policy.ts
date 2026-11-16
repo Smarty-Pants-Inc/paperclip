@@ -2,7 +2,14 @@ import type { ConnectionManagementContext } from "./connection-management.js";
 import { createHash } from "node:crypto";
 import { boundRunIssueIdSql } from "./run-task-binding.js";
 import type { ToolApprovalClaim } from "./tool-approval-execution.js";
-import { and, asc, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, ne, sql } from "drizzle-orm";
+import { assertProjectConnectionAdmission, readProjectConnectionScope } from "./project-connection-admission.js";
+import { lockProjectConnectionRows } from "./project-connection-arbitration.js";
+import { assertProjectConnectionNotInUse } from "./project-connection-retirement.js";
+import { captureProjectConnectionRunContext, revalidateProjectConnectionRunContext } from "./project-connection-run-context.js";
+import { profileManagementActor } from "./tool-access/profiles/connection-configuration.js";
+import { isGitHubAppConnection } from "./github-app-client.js";
+import type { DbTransaction } from "./tool-access/types.js";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -812,6 +819,64 @@ function scopeAllowsTool(scope: Record<string, unknown> | null, ctx: ToolAccessC
 }
 
 export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "update" | "delete" | "transaction">, options: { toolActionSigningSecret?: string } = {}) {
+  // Policy edits may remove effective reach just as profile edits do. Resolve
+  // indirect application/catalog/action selectors before acquiring subordinate
+  // policy rows. A policy never supplies an implicit install or task authority.
+  async function guardProjectPolicyMutation(
+    tx: DbTransaction,
+    companyId: string,
+    selectors: readonly (ToolAccessSelector | Record<string, unknown> | null)[],
+    managementContext?: ConnectionManagementContext,
+  ) {
+    if (selectors.length === 0) return;
+    const candidates = await tx.select().from(toolConnections).where(and(
+      eq(toolConnections.companyId, companyId), isNotNull(toolConnections.projectId), ne(toolConnections.status, "archived"),
+    ));
+    if (candidates.length === 0) return;
+    const catalog = await tx.select().from(toolCatalogEntries).where(eq(toolCatalogEntries.companyId, companyId));
+    const applications = await tx.select().from(toolApplications).where(eq(toolApplications.companyId, companyId));
+    const matches = (selector: Record<string, unknown>, key: string, actual: string | null) => {
+      const one = selector[key];
+      const many = listValues(selector[`${key}s`]);
+      return (typeof one !== "string" || one === actual) && (many.length === 0 || Boolean(actual && many.includes(actual)));
+    };
+    const matchingSelectors = (connection: typeof toolConnections.$inferSelect) => selectors.filter(raw => {
+      const selector = (raw ?? {}) as Record<string, unknown>;
+      const application = applications.find(app => app.id === connection.applicationId);
+      if (!matches(selector, "connectionId", connection.id) || !matches(selector, "applicationId", connection.applicationId)
+        || !matches(selector, "projectId", connection.projectId)
+        || !matches(selector, "applicationKey", application?.applicationKey ?? null)
+        || !matches(selector, "providerType", connection.transport === "rest_api" && !isGitHubAppConnection(connection)
+          ? "provider_rest" : connection.transport === "local_stdio" ? "mcp_local_stdio" : "mcp_remote_http")) return false;
+      const hasAction = ["catalogEntryId", "catalogEntryIds", "toolName", "toolNames", "riskLevel", "riskLevels"]
+        .some(key => selector[key] !== undefined);
+      // Tool names may be gateway-remapped descriptors, not catalog names.
+      // Do not let that spelling hide a destructive policy writer. Precise
+      // connection/application/project/catalog selectors still narrow the gate.
+      return !hasAction || catalog.some(entry => entry.connectionId === connection.id
+        && matches(selector, "catalogEntryId", entry.id) && matches(selector, "riskLevel", entry.riskLevel));
+    });
+    const affected = candidates.filter(connection => matchingSelectors(connection).length > 0);
+    if (affected.length === 0) return;
+    const connections = await lockProjectConnectionRows(tx, affected);
+    const installs = await tx.select().from(toolConnectionInstalls).where(and(
+      eq(toolConnectionInstalls.companyId, companyId), inArray(toolConnectionInstalls.connectionId, connections.map(connection => connection.id)),
+    ));
+    const actor = profileManagementActor(managementContext);
+    await managementContext?.reauthorize();
+    for (const connection of connections) {
+      const targets = installs.filter(install => install.connectionId === connection.id && install.targetType === "agent"
+        && matchingSelectors(connection).some(raw => matches((raw ?? {}) as Record<string, unknown>, "agentId", install.targetId)))
+        .map(install => install.targetId);
+      await assertProjectConnectionAdmission(tx, {
+        companyId, projectId: connection.projectId, operation: "update", connection, actor, targetAgentIds: targets,
+      });
+      if (targets.length > 0) await assertProjectConnectionNotInUse(tx, {
+        companyId, projectId: connection.projectId!, connectionId: connection.id, actor,
+      });
+    }
+  }
+
   // Policy administration includes authorized self-targeted changes. It cannot
   // resolve governed action requests or modify principal permission grants.
   async function listPolicies(companyId: string) {
@@ -830,6 +895,10 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
 
     await managementContext?.reauthorize();
     return db.transaction(async (tx) => {
+      const before = await tx.select().from(toolPolicies).where(and(
+        eq(toolPolicies.companyId, companyId), ne(toolPolicies.policyType, "trust_rule"),
+      )).orderBy(toolPolicies.id);
+      await guardProjectPolicyMutation(tx, companyId, before.filter(row => row.enabled).map(row => row.selectors), managementContext);
       const rows = await tx
         .select()
         .from(toolPolicies)
@@ -839,6 +908,9 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
         ))
         .orderBy(toolPolicies.id)
         .for("no key update");
+      if (JSON.stringify(before) !== JSON.stringify(rows)) throw conflict("Policies changed while waiting. Retry with current state.", {
+        code: "project_connection_policy_changed", retryable: true,
+      });
       const byId = new Map(rows.map((row) => [row.id, row]));
       const missingIds = uniquePolicyIds.filter((id) => !byId.has(id));
       if (missingIds.length > 0) {
@@ -851,6 +923,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
         });
       }
 
+      await managementContext?.reauthorize();
       const now = new Date();
       await tx.execute(sql`UPDATE tool_policies
         SET priority = (requested.ordinality * 100)::integer, updated_at = ${now.toISOString()}
@@ -916,9 +989,11 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     managementContext?: ConnectionManagementContext,
   ) {
     assertSupportedGenericPolicyShape(body.policyType, body.conditions ?? null, body.config ?? null);
+    return db.transaction(async (tx) => {
+    await guardProjectPolicyMutation(tx, companyId, body.enabled === false ? [] : [body.selectors ?? {}], managementContext);
     await managementContext?.reauthorize();
     const now = new Date();
-    const [policy] = await db
+    const [policy] = await tx
       .insert(toolPolicies)
       .values({
         companyId,
@@ -937,6 +1012,7 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       })
       .returning();
     return policy;
+    });
   }
 
   async function updatePolicy(input: {
@@ -945,14 +1021,23 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     body: UpdateToolPolicy;
     managementContext?: ConnectionManagementContext;
   }) {
-    const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
+    return db.transaction(async (tx) => {
+    const existing = await getGenericPolicyRow(tx, input.companyId, input.policyId);
+    const affectsReach = ["policyType", "priority", "enabled", "selectors", "conditions", "config"]
+      .some(key => Object.prototype.hasOwnProperty.call(input.body, key));
+    if (affectsReach && (existing.enabled || input.body.enabled === true)) await guardProjectPolicyMutation(tx, input.companyId,
+      [existing.selectors, input.body.selectors ?? existing.selectors], input.managementContext);
+    const [current] = await tx.select().from(toolPolicies).where(eq(toolPolicies.id, existing.id)).for("no key update");
+    if (JSON.stringify(existing) !== JSON.stringify(current)) throw conflict("Policy changed while waiting. Retry with current state.", {
+      code: "project_connection_policy_changed", retryable: true,
+    });
     const nextPolicyType = input.body.policyType ?? existing.policyType;
     const nextConditions = input.body.conditions !== undefined ? input.body.conditions ?? null : existing.conditions ?? null;
     const nextConfig = input.body.config !== undefined ? input.body.config ?? null : existing.config ?? null;
     assertSupportedGenericPolicyShape(nextPolicyType, nextConditions, nextConfig);
     await input.managementContext?.reauthorize();
     const now = new Date();
-    const [policy] = await db
+    const [policy] = await tx
       .update(toolPolicies)
       .set({
         ...(input.body.name !== undefined ? { name: input.body.name } : {}),
@@ -968,16 +1053,24 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
       .where(eq(toolPolicies.id, existing.id))
       .returning();
     return policy;
+    });
   }
 
   async function deletePolicy(input: { companyId: string; policyId: string; managementContext?: ConnectionManagementContext }) {
-    const existing = await getGenericPolicyRow(db, input.companyId, input.policyId);
+    return db.transaction(async (tx) => {
+    const existing = await getGenericPolicyRow(tx, input.companyId, input.policyId);
+    if (existing.enabled) await guardProjectPolicyMutation(tx, input.companyId, [existing.selectors], input.managementContext);
+    const [current] = await tx.select().from(toolPolicies).where(eq(toolPolicies.id, existing.id)).for("no key update");
+    if (JSON.stringify(existing) !== JSON.stringify(current)) throw conflict("Policy changed while waiting. Retry with current state.", {
+      code: "project_connection_policy_changed", retryable: true,
+    });
     await input.managementContext?.reauthorize();
-    const [deleted] = await db
+    const [deleted] = await tx
       .delete(toolPolicies)
       .where(eq(toolPolicies.id, existing.id))
       .returning();
     return deleted;
+    });
   }
 
   async function loadCatalogEntry(companyId: string, catalogEntryId: string, cache?: ToolAccessDecisionCache) {
@@ -1533,6 +1626,53 @@ export function toolAccessPolicyService(db: Pick<Db, "select" | "insert" | "upda
     const loaded = await loadContext(input, cache);
     if (!loaded.ok) return loaded.decision;
     const { ctx, redaction } = loaded;
+    // Owned rows are never authorized by a cached listing, a policy selector,
+    // caller projectId, or a run's descriptive snapshot. C resolves only the
+    // durable task binding; B rechecks the current common admission boundary.
+    if (ctx.connectionId) {
+      const [hint] = await db.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, ctx.companyId), eq(toolConnections.id, ctx.connectionId),
+      ));
+      if (hint?.projectId !== null && hint?.projectId !== undefined) {
+        const ownedDecision = await db.transaction(async tx => {
+        const [connection] = await tx.select().from(toolConnections).where(and(
+          eq(toolConnections.companyId, ctx.companyId), eq(toolConnections.id, hint.id),
+        ));
+        if (!connection || connection.projectId !== hint.projectId) {
+          return decision("deny", "deny_run_context_mismatch", "Project connection changed during authorization.", [], []);
+        }
+        const scope = readProjectConnectionScope(connection);
+        if (!scope || scope.migrationPending || connection.status !== "active" || !connection.enabled
+          || ctx.actorType !== "agent" || !ctx.agentId) {
+          return decision("deny", "deny_policy_block", "Project connection is not available to this actor.", [], [], { redactionPlan: redaction.redactionPlan });
+        }
+        const run = await captureProjectConnectionRunContext(tx, {
+          companyId: ctx.companyId, agentId: ctx.agentId, heartbeatRunId: ctx.heartbeatRunId,
+        });
+        if (run.projectId && run.projectId !== connection.projectId) {
+          return decision("deny", "deny_run_context_mismatch", "Connection does not belong to the bound task project.", [], [], { redactionPlan: redaction.redactionPlan });
+        }
+        const installs = await tx.select({ targetId: toolConnectionInstalls.targetId }).from(toolConnectionInstalls).where(and(
+          eq(toolConnectionInstalls.companyId, ctx.companyId), eq(toolConnectionInstalls.connectionId, connection.id),
+          eq(toolConnectionInstalls.targetType, "agent"), eq(toolConnectionInstalls.targetId, ctx.agentId),
+        ));
+        if (installs.length === 0) {
+          return decision("deny", "deny_not_installed_for_agent", "Project connection requires an explicit agent install.", [], [], { redactionPlan: redaction.redactionPlan });
+        }
+        await assertProjectConnectionAdmission(tx, {
+          companyId: ctx.companyId, projectId: connection.projectId, operation: "use", connection,
+          actor: { actorType: "agent", actorId: ctx.agentId }, targetAgentIds: [ctx.agentId],
+        });
+        await revalidateProjectConnectionRunContext(tx, run);
+        // Policy project selectors see the same authoritative binding. Taskless
+        // use stays taskless; connection ownership does not invent a task.
+        ctx.projectId = run.projectId;
+        ctx.issueId = run.issueId;
+        return undefined;
+        });
+        if (ownedDecision) return ownedDecision;
+      }
+    }
     // Installs are an agent audience boundary, independent of action grants,
     // profiles and policies. Keep context valid so denied calls can be audited.
     // Legacy zero-install connections and board/user actors are unchanged.

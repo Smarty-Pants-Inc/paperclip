@@ -9,7 +9,10 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { toolAccessAuditEvents, toolConnectionInstalls, toolConnections, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import type { ToolConnection, ToolConnectionInstall, ToolConnectionInstallSnapshot, PutToolConnectionInstalls } from "@paperclipai/shared";
-import { unprocessable } from "../../../errors.js";
+import { forbidden, notFound, unprocessable } from "../../../errors.js";
+import { lockProjectConnectionRows } from "../../project-connection-arbitration.js";
+import { assertProjectConnectionAdmission } from "../../project-connection-admission.js";
+import { assertProjectConnectionNotInUse } from "../../project-connection-retirement.js";
 import { logActivity } from "../../activity-log.js";
 
 type InstallDependencies = {
@@ -185,7 +188,12 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           // Same mutex/order as reportsTo writers; also protects indirect paths.
           await lockAccountingCompany(tx as unknown as Db, connection.companyId);
         }
+        await lockProjectConnectionRows(tx, [connection]);
         await lockToolConnectionRuntimeInputs(tx, connection.companyId, connection.id);
+        const [currentConnection] = await tx.select().from(toolConnections).where(and(
+          eq(toolConnections.companyId, connection.companyId), eq(toolConnections.id, connection.id),
+        ));
+        if (!currentConnection) throw notFound("Tool connection not found");
         // A concurrent replace-set writer may have changed the delta since the
         // HTTP guard. Check its latest committed set after the connection lock.
         await actor?.managementContext?.reauthorize();
@@ -233,6 +241,23 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
           (install) =>
             !requested.has(`${install.targetType}:${install.targetId}`),
         );
+        if (currentConnection.projectId !== null) {
+          // Check the COMPLETE replace-set after all waits, not just additions
+          // authorized by the route. Company reach never implicitly enrolls a
+          // project's future hires or unrelated agents.
+          if ([...requested.values()].some(install => install.targetType !== "agent")) {
+            throw forbidden("Project connections require explicit project agent installs", { code: "project_connection_target_outside_project" });
+          }
+          await assertProjectConnectionAdmission(tx, {
+            companyId: currentConnection.companyId, projectId: currentConnection.projectId,
+            operation: "install", actor, connection: currentConnection,
+            targetAgentIds: [...requested.values()].map(install => install.targetId),
+          });
+          if (removals.length > 0) await assertProjectConnectionNotInUse(tx, {
+            companyId: currentConnection.companyId, projectId: currentConnection.projectId,
+            connectionId: currentConnection.id, actor,
+          });
+        }
         const removeIds = removals.map((install) => install.id);
         if (removeIds.length > 0) {
           await tx
@@ -296,7 +321,7 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         if (requested.size > 0 && connection.connectionPurpose !== "ai") {
           const cleanupLegacyInclude = actor?.managementContext?.actor.type !== "agent"
             && actor?.actorType !== "agent";
-          const profile = await appProfileForConnection(tx, connection, cleanupLegacyInclude);
+          const profile = await appProfileForConnection(tx, currentConnection, cleanupLegacyInclude);
           for (const install of additions) {
             const [binding] = await tx
               .insert(toolProfileBindings)
