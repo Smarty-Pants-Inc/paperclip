@@ -87,7 +87,7 @@ export async function readProjectAppManager(db: Database, companyId: string) {
   return { appId: id.data, secretId: keys[0]!.id, anchorProjectId: anchor.id, pluginId: plugin.id };
 }
 
-export async function assertNotManagerApp(db: Database, input: { companyId: string; refs?: readonly Ref[]; appId?: string; verifiedAppId?: string; requireConfigured?: boolean }) {
+export async function assertNotManagerApp(db: Database, input: { companyId: string; refs?: readonly Readonly<{ secretId: string; configPath?: string }>[]; appId?: string; verifiedAppId?: string; requireConfigured?: boolean }) {
   const manager = await readProjectAppManager(db, input.companyId);
   if (!manager) {
     if (input.requireConfigured) throw managerUnavailable();
