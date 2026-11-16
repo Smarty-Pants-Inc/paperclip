@@ -5,7 +5,7 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@
 import { SANDBOX_BACKUP_SOURCE_SUPERSEDED_KEY } from "../../agent-run-cancellation.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
-import { hasConfirmedSandboxStopAndRetain } from "../sandbox-stop-and-retain.js";
+import { hasConfirmedSandboxStopAndRetain, SANDBOX_STOP_AND_RETAIN_KEY } from "../sandbox-stop-and-retain.js";
 import { LEGACY_WORKSPACE_RECOVERY_KEY, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../workspace-restore-recovery-state.js";
 import { readNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
 import { nativeWorkspaceExportPendingForLease, nativeWorkspaceExportPendingForResource } from "./native-workspace-finalization-state.js";
@@ -83,7 +83,8 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
     || stamp.normalizedSessionId !== input.normalizedSessionId
     || stamp.runnerInstanceId !== input.manifest.runnerInstanceId) return false;
   // A released lease can still be selected for resume; only a retired one is final.
-  const idleSource = !destroyed && !await settledRestoreHoldRetiresSource(db, lease);
+  const idleSource = !destroyed && !await sourceChangeStopRetiresSource(db, lease)
+    && !await settledRestoreHoldRetiresSource(db, lease);
   if (idleSource && !await idleWarmSourceRetiresBackup(db, lease, input.currentRunId)) return false;
   // Provider work recorded after the checkpoint means the destroyed sandbox
   // held newer state than this backup. Restoring would silently rewind it.
@@ -174,6 +175,20 @@ async function idleWarmSourceRetiresBackup(db: Db, lease: typeof environmentLeas
     eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
   if (!run || !TERMINAL_SOURCE_RUN_STATUSES.has(run.sourceRunStatus)) return false;
   return !await nativeWorkspaceExportPendingForResource(db, lease, currentRunId);
+}
+
+/**
+ * An image (boot-source) change made Paperclip supersede this reusable source
+ * and stop it under the stop-only contract (`sandbox_source_changed`). Reuse
+ * never selects a source-mismatched lease again and the stop permits no provider
+ * work, so the source is retired as soon as the stop is requested; the caller's
+ * stamp and later-work proofs still decide. A pending export keeps it ambiguous.
+ */
+async function sourceChangeStopRetiresSource(db: Db, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
+  const stop = lease.metadata?.[SANDBOX_STOP_AND_RETAIN_KEY] as { reason?: unknown; leaseId?: unknown; providerLeaseId?: unknown } | undefined;
+  return lease.leasePolicy === "reuse_by_environment" && stop?.reason === "sandbox_source_changed"
+    && stop.leaseId === lease.id && stop.providerLeaseId === lease.providerLeaseId
+    && !await nativeWorkspaceExportPendingForLease(db, lease);
 }
 
 /**

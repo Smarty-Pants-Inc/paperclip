@@ -23347,9 +23347,16 @@ describe("runnerd provider runtime wiring", () => {
     // run left without any harness state. It takes the backup under the same proof.
     ["a resumed lease never held the session and the warm source is idle", "none", "matching", false, true, "resumed_idle_warm"],
     ["a resumed lease lost the state the backup came from", "none", "matching", false, false, "resumed_own_source"],
-  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source") => {
+    // SMA-67 (fresh 05:51Z): an image swap made the retained warm source obsolete;
+    // acquisition stopped and kept it (`sandbox_source_changed`) and a spare was
+    // claimed as a created lease. The same thread must continue from the backup.
+    ["an image swap stopped the retained source and the next run claimed a spare", "none", "matching", false, true, "source_changed_stop"],
+    ["an image swap stopped the source but provider work followed the backup", "none", "matching", true, false, "source_changed_stop"],
+    ["an image swap stopped the source whose stamp names another backup", "none", "foreign", false, false, "source_changed_stop"],
+  ] as const)("restores a warm backup into a created lease only when %s", async (_label, terminationState, stampKind, laterProviderWork, restores, hold?: "settled_hold" | "unconfirmed_hold" | "idle_warm" | "idle_warm_export_pending" | "idle_warm_run_active" | "idle_warm_claim_lost" | "resumed_idle_warm" | "resumed_own_source" | "source_changed_stop") => {
+    const sourceChangedStop = hold === "source_changed_stop";
     const restoreHold = hold === "settled_hold" || hold === "unconfirmed_hold";
-    const idleWarm = !!hold && !restoreHold;
+    const idleWarm = !!hold && !restoreHold && !sourceChangedStop;
     const resumed = hold === "resumed_idle_warm" || hold === "resumed_own_source";
     const targetProviderLeaseId = hold === "resumed_own_source" ? "prior-sandbox" : "sandbox-created";
     // Regression: a legacy follow-up retired the warm sandbox as an obsolete lease, so the
@@ -23366,7 +23373,8 @@ describe("runnerd provider runtime wiring", () => {
     const confirmedAt = new Date().toISOString();
     const sourceLease = (manifestSha256: string) => ({
       id: "source-lease", companyId: current.binding.companyId, heartbeatRunId: "source-run", provider: "daytona",
-      providerLeaseId: "prior-sandbox", status: idleWarm ? "retained" : restoreHold ? "released" : "expired", cleanupStatus: "success",
+      providerLeaseId: "prior-sandbox", status: sourceChangedStop ? "pending_cleanup" : idleWarm ? "retained" : restoreHold ? "released" : "expired",
+      cleanupStatus: sourceChangedStop ? "failed" : "success",
       leasePolicy: restoreHold ? "retain_on_failure" : "reuse_by_environment",
       acquiredAt: new Date(Date.now() - 60_000), releasedAt: idleWarm ? null : new Date(Date.now() + 1_000), expiresAt: null,
       metadata: {
@@ -23382,6 +23390,11 @@ describe("runnerd provider runtime wiring", () => {
         // The exact row the hold left: marker, stop-and-retain receipt, no reuse.
         ...(restoreHold ? { pluginId: "daytona-plugin",
           workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", runId: "source-run" } } : {}),
+        // The exact row cleanupObsoleteReusableSandboxLeases' stop-and-keep leaves.
+        ...(sourceChangedStop ? { pendingCleanupInFlight: false, sandboxStopAndRetain: {
+          schema: "paperclip.sandbox-stop-and-retain.v1", requestId: "stop-request", companyId: current.binding.companyId,
+          runId: "source-run", leaseId: "source-lease", provider: "daytona", providerLeaseId: "prior-sandbox",
+          pluginId: "daytona-plugin", reason: "sandbox_source_changed" } } : {}),
         ...(hold === "settled_hold" ? { sandboxStopAndRetainReceipt: { schema: "paperclip.sandbox-stop-and-retain-receipt.v1",
           requestId: "stop-request", companyId: current.binding.companyId, runId: "source-run", leaseId: "source-lease",
           provider: "daytona", providerLeaseId: "prior-sandbox", pluginId: "daytona-plugin", method: "environmentStopLease",
@@ -23416,6 +23429,8 @@ describe("runnerd provider runtime wiring", () => {
         expect(table).toBe(environmentLeases);
         return [];
       } }) }) })) as unknown as Db["update"];
+      // The claim now runs in a transaction; route it through the losing update.
+      db.transaction = (async (operation: (transaction: Db) => Promise<unknown>) => operation(db)) as unknown as Db["transaction"];
     }
     const remoteExecute = vi.fn(async (command: { command: string; args?: string[] }) => {
       if (command.args?.[0] === "--build-metadata") return { exitCode: 0, timedOut: false, stderr: "", stdout: JSON.stringify({
@@ -23468,7 +23483,11 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([
+      // The stamp is merged in SQL (`coalesce(metadata) || <json>`); read its JSON operand.
+      const sqlJson = (value: unknown) => (value as { queryChunks?: unknown[] } | null)?.queryChunks
+        ?.find((chunk): chunk is string => typeof chunk === "string" && chunk.startsWith("{"));
+      expect(updates.filter(update => update.table === environmentLeases).map(update => ({ ...update, values: { ...update.values,
+        metadata: sqlJson(update.values.metadata) ? JSON.parse(sqlJson(update.values.metadata)!) : update.values.metadata } }))).toEqual([
         // The idle source is claimed first: its reuse scope moves into a superseded
         // receipt, so it is never resumed with the older state again.
         ...(idleWarm ? [expect.objectContaining({ values: expect.objectContaining({
