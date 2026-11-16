@@ -321,7 +321,8 @@ export async function nativeRunnerNeverAuthenticated(
     const rows = await db.select().from(nativeRunnerCheckpoints).where(and(
       eq(nativeRunnerCheckpoints.companyId, binding.companyId), eq(nativeRunnerCheckpoints.issueId, binding.issueId),
       eq(nativeRunnerCheckpoints.runId, binding.runId))).limit(MAX_BOOTSTRAP_CHECKPOINT_COMMANDS + 3);
-    if (rows.length < 4 || rows.length > MAX_BOOTSTRAP_CHECKPOINT_COMMANDS + 2
+    // header + cursor + command:1 (run.prepare) is the smallest bootstrap.
+    if (rows.length < 3 || rows.length > MAX_BOOTSTRAP_CHECKPOINT_COMMANDS + 2
       || rows.reduce((bytes, row) => bytes + Buffer.byteLength(JSON.stringify(row.material)), 0)
         > 2 * NATIVE_CHECKPOINT_INSPECTION_TOTAL_MAX_BYTES) return false;
     const cipher = createLocalEncryptedCipher("read");

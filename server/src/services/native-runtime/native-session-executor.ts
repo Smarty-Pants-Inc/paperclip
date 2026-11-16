@@ -9589,6 +9589,10 @@ function runnerIngressConnectionFailure(error: unknown, depth = 0): boolean {
   if (value.code === "runner_connection_lease_expired") return false;
   if (typeof value.message === "string"
     && /^runner_ingress_(?:auth_failed|unavailable): (?:Runner ingress did not complete PRP authentication before the deadline|Runner ingress connection failed)\.$/.test(value.message)) return true;
+  // The transport's own stall text: run.prepare, the first startup command, got
+  // no answer and no Runner ever connected. The controller checkpoint still
+  // proves it (nativeRunnerNeverAuthenticated) before any retry (R1-04).
+  if (value.message === "runner_ingress_unavailable: PRP command run.prepare timed out (runner never connected; pending ahead 0; last runner event none)") return true;
   return runnerIngressConnectionFailure(value.cause, depth + 1);
 }
 
