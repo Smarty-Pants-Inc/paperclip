@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, principalPermissionGrants, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, principalPermissionGrants, toolApplications, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { lockCompanyAgentRuntime } from "../services/agent-runtime-lock.js";
 
@@ -91,5 +91,48 @@ describePg("#20805 company runtime lock order", () => {
     await refresh;
     evidence(`LOCK_ORDER_REFRESH ${JSON.stringify({ codes })}`);
     expect(codes).toEqual([null, null]);
+  }, 30_000);
+
+  // ---- src8 R2 (RFL 06:42Z 11-16): no path takes the company lock and THEN an
+  // agent row lock other than its own. Each RED below is a path that did.
+
+  /** Session A holds `rowId` (the hire's placement: row first) and, once session B
+   * is blocked on that row, takes the company lock. B is `work`. */
+  async function rowHolderThenLockVersus(f: { companyId: string }, rowId: string, work: (client: Db) => Promise<unknown>,
+    options: { lockMode?: "no key update" | "update" } = {}) {
+    const codes: Array<string | null> = [null, null];
+    let b: Promise<void> | undefined;
+    await db.transaction(async tx => {
+      await tx.execute(sql.raw("SET LOCAL deadlock_timeout = '50ms'"));
+      const pid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`))[0]!.pid);
+      await tx.execute(sql.raw(`SELECT id FROM agents WHERE id = '${rowId}' FOR ${options.lockMode === "update" ? "UPDATE" : "NO KEY UPDATE"}`));
+      b = Promise.resolve().then(() => work(db)).then(() => undefined, error => { codes[1] = pgCode(error); });
+      expect(await waitUntilBlocked(pid)).toBe(true);
+      await lockCompanyAgentRuntime(tx as unknown as Db, f.companyId);
+    }).catch(error => { codes[0] = pgCode(error); });
+    await b;
+    return codes;
+  }
+
+  it("R2 RED fanout loop: the startup refresh locks every agent row before its first shared hold (hirer beyond the first cursor batch)", async () => {
+    const f = await company(20);
+    const codes = await rowHolderThenLockVersus(f, f.hirer.id,
+      client => client.execute(sql`SELECT paperclip_invalidate_company_agent_runtimes(${f.companyId}::uuid)`));
+    evidence(`R2_FANOUT_LOOP ${JSON.stringify({ codes })}`);
+    expect(codes).toEqual([null, null]);
+  }, 30_000);
+
+  it("R2 RED connector statement: a multi-agent install statement locks its agent rows before its first shared hold", async () => {
+    const f = await company(3);
+    const [application] = await db.insert(toolApplications).values({ companyId: f.companyId, name: "Order MCP", type: "mcp_http" }).returning();
+    const [connection] = await db.insert(toolConnections).values({ companyId: f.companyId, applicationId: application!.id, name: "Order connection",
+      uid: randomUUID(), transport: "mcp_remote", authKind: "none", enabled: true, status: "active" }).returning();
+    const targets = [f.peers[0]!.id, f.hirer.id];
+    const codes = await rowHolderThenLockVersus(f, f.hirer.id, client => client.insert(toolConnectionInstalls).values(targets.map(targetId => ({
+      companyId: f.companyId, connectionId: connection!.id, targetType: "agent" as const, targetId }))));
+    const installs = await db.select().from(toolConnectionInstalls).where(sql`${toolConnectionInstalls.connectionId} = ${connection!.id}`);
+    evidence(`R2_CONNECTOR_STATEMENT ${JSON.stringify({ codes, installs: installs.length })}`);
+    expect(codes).toEqual([null, null]);
+    expect(installs).toHaveLength(2);
   }, 30_000);
 });
