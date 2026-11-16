@@ -118,6 +118,17 @@ describe("project connection stable-ID envelope at credential release", () => {
     }
   });
 
+  it("INT-R2/R06: retain the exact malformed-envelope typed refusal alongside the frozen assertion", async () => {
+    const f = await projectConnectionFixture(db);
+    const { connection, grant } = await f.seedConnection();
+    expect((await resolveGitHubAppCredential(db, connection, grant, false, false, f.leadA.id)).token).toBe("synthetic-restricted-token");
+    provider.secret.mockClear(); provider.acquire.mockClear();
+    const [malformed] = await db.update(toolConnections).set({ config: { ...connection.config, projectScope: { version: 1 } } }).where(eq(toolConnections.id, connection.id)).returning();
+    await expect(resolveGitHubAppCredential(db, malformed!, grant, false, false, f.leadA.id)).rejects.toMatchObject({ details: { code: "github_app_access_unavailable" } });
+    expect(provider.secret).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
   it("A12: a malformed owned approval envelope fails closed before the private-key read", async () => {
     const f = await projectConnectionFixture(db);
     const { connection, grant } = await f.seedConnection();
