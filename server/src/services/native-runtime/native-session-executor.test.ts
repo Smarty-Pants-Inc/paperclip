@@ -25104,7 +25104,8 @@ describe("runnerd provider runtime wiring", () => {
     const identityOf = (threadId: string) =>
       ({ providerSessionId: threadId, providerBackendSessionId: null, providerSessionIdentity: null });
 
-    async function floorFixture(label: string, proof: "none" | "destroyed" = "none") {
+    async function floorFixture(label: string, proof: "none" | "destroyed" = "none",
+      leaseOutcome: "created" | "resumed" = "created") {
       const remoteCwd = join(isolatedStateDirectory, `remote-j322-${label}`);
       const current: NativeExecutionInputV1 = { ...execution,
         binding: { ...execution.binding, companyId: randomUUID(), agentId: randomUUID(), issueId: randomUUID(),
@@ -25177,7 +25178,7 @@ describe("runnerd provider runtime wiring", () => {
           durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"],
         }) };
         if (command.args?.[0] === "--version") return { exitCode: 0, timedOut: false, stdout: "codex-cli 0.160.0", stderr: "" };
-        if (command.args?.[1]?.includes("base64")) {
+        if (command.args?.[1]?.includes("base64") || command.args?.[1]?.includes(".continuity-break-")) {
           try { return { exitCode: 0, timedOut: false, stdout: execFileSync("sh", command.args, { encoding: "utf8" }), stderr: "" }; }
           catch { return { exitCode: 1, timedOut: false, stdout: "", stderr: "" }; }
         }
@@ -25225,7 +25226,7 @@ describe("runnerd provider runtime wiring", () => {
         runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd, environmentId: "environment",
           leaseId: "lease-created", providerKey: "daytona", reusableLeaseConfigured: true,
           effectiveCapabilities: { runnerWebSocketIngress: true },
-          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: "sandbox-created" },
+          sandboxLeaseAcquisition: { outcome: leaseOutcome, providerLeaseId: "sandbox-created" },
           runner: { execute: remoteExecute, syncIn },
         } as never,
       });
@@ -25357,6 +25358,170 @@ describe("runnerd provider runtime wiring", () => {
       expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: "runner_remote_state_unavailable" });
       expect(fixture.openSession).not.toHaveBeenCalled();
       expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+    });
+
+    // F20 (gate-6 dress, OPEN path). Chats prepared on an older image; the
+    // window changed runtime skills / adapter config, so the server's warm
+    // checkpoint digest differs (no checkpoint -> the runtime OPENS, and on an
+    // open NSR sends the saved-history handoff). The runner's run.prepare then
+    // refuses the box's legacy state (no pi_release_digest):
+    // provider_launch_profile_mismatch -> native_runner_launch_profile_mismatch.
+    // Today that run FAILS and the scheduler answers minutes later. The open
+    // wrapper sets the refused state aside and opens ONE more time in the SAME
+    // run, records the lineage step (config_changed) and writes ONE truthful note.
+    describe("F20: a launch-profile refusal on the OPEN path answers in the first run", () => {
+      const LAUNCH_CODE = "native_runner_launch_profile_mismatch";
+      const launchProfileRefusal = () => Object.assign(new Error("run.prepare failed: Pi runner launch profile changed"), {
+        runnerCommandResult: { commandType: "run.prepare", status: "failed",
+          result: { code: "command_execution_failed", refusalCode: "provider_launch_profile_mismatch" } } });
+      async function dressFixture(label: string, box: Record<string, unknown> = {}, leaseOutcome: "created" | "resumed" = "resumed") {
+        const fixture = await floorFixture(`f20-${label}`, "none", leaseOutcome);
+        // The box's legacy runner state (settled unless the row says otherwise).
+        await mkdir(join(fixture.remoteSession, "runner"), { recursive: true });
+        await writeFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+          schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "retained-provider-thread",
+          providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" }, ...box }));
+        // The runner refuses the first run.prepare of this open (as runnerd does).
+        fixture.openSession.mockImplementationOnce(async () => {
+          const error = launchProfileRefusal(); fixture.refusals.push(error); throw error;
+        });
+        return fixture;
+      }
+      const open = (fixture: Awaited<ReturnType<typeof floorFixture>>) => fixture.backend.openSession({
+        identity: { runId: fixture.current.binding.runId, sessionId: fixture.current.session.normalizedSessionId },
+        workingDirectory: fixture.current.workspace.cwd } as never);
+
+      it.each(["created"] as const)("(dress, %s lease) the refused open is answered in the FIRST run on a recorded fresh thread, one note; a second message resumes it", async (leaseOutcome) => {
+        const fixture = await dressFixture(`dress-${leaseOutcome}`, {}, leaseOutcome);
+        await expect(open(fixture)).resolves.toBe(fixture.fresh);
+        expect(fixture.openSession).toHaveBeenCalledTimes(2);
+        expect(fixture.refusals).toHaveLength(1);
+        // The refused remote state is set aside (never deleted) and the box kept.
+        expect(await readdir(join(fixture.root, "continuity-breaks"))).toHaveLength(1);
+        expect((await readdir(dirname(fixture.remoteSession))).some(name => name.includes(".continuity-break-"))).toBe(true);
+        // The lineage step: old thread -> the box's new thread, named for the config change.
+        expect(fixture.resets()).toEqual([expect.objectContaining({ schema: "paperclip.provider-identity-reset.v1",
+          generation: 1, reason: "config_changed", previousIdentity: identityOf("retained-provider-thread"),
+          identity: identityOf("fresh-provider-thread"), runId: fixture.current.binding.runId })]);
+        // ONE truthful note: the launch profile changed (not "a new sandbox").
+        expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+        expect(restoreUnavailableNotice).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+          runId: fixture.current.binding.runId, code: LAUNCH_CODE, reason: "launch_profile_changed" }));
+        expect(fixture.onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("new sandbox"));
+        // A SECOND message resumes the new thread: no refusal, no second fresh thread, no second note.
+        const second = await fixture.backend.recoverSession!(fixture.snapshot({ sessionId: "fresh-provider-thread",
+          providerSessionId: "fresh-provider-thread" }), { signal: new AbortController().signal });
+        expect(second).toMatchObject({ recovered: true });
+        expect(fixture.refusals).toHaveLength(1);
+        expect(fixture.openSession).toHaveBeenCalledTimes(2);
+        expect(fixture.resets()).toHaveLength(1);
+        expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+      });
+
+      it("(dress, through the runtime) the FIRST run answers and its submitted prompt carries the saved-history handoff", async () => {
+        const fixture = await dressFixture("runtime", {}, "created");
+        const ident = { runId: fixture.current.binding.runId, sessionId: fixture.current.session.normalizedSessionId! };
+        const startTurn = vi.fn(async (_turn: { message: { text: string } }) => ({ turnId: "turn-fresh" }));
+        // The fresh provider session the wrapper's second open returns.
+        Object.assign(fixture.fresh, {
+          identity: () => ident,
+          capabilities: async () => ({ resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }),
+          async *events() {
+            yield { schema: "paperclip.prp.event.v1", sourceEventId: `f20:${ident.runId}:1`, sourceSeq: 1, sourceInstanceId: "f20",
+              sourceKind: "runner", runId: ident.runId, normalizedSessionId: ident.sessionId, turnId: "turn-fresh",
+              eventType: "turn.completed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} };
+          },
+          startTurn,
+          result: async () => ({ turnId: "turn-fresh",
+            result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Answered in the first run.",
+              completionClaim: { contractRevision: "1", objectiveSatisfied: true,
+                criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [] }], remainingWork: [] },
+              evidence: [], verification: [{ commandOrCheck: "f20", status: "passed" }], attentionRequests: [], artifacts: [] },
+            terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed", runTerminalState: "succeeded",
+              reportedWorkDisposition: "done" } }),
+          snapshot: async () => ({ backendKind: "runner", driverKind: "codex_app_server", sessionId: "fresh-provider-thread",
+            providerSessionId: "fresh-provider-thread", identity: ident, workingDirectory: fixture.current.workspace.cwd, cursor: "0",
+            activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+        });
+        // The fake inner backend (createNativeSessionBackend) names itself.
+        Object.assign(state.createBackend.mock.results.at(-1)!.value as object, {
+          descriptor: async () => ({ kind: "test", name: "f20 dress", version: "1",
+            capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }) });
+        const events: unknown[] = [];
+        const controlPlane = {
+          openRun: async () => undefined, completeRun: async () => {}, checkpointSession: async () => {},
+          // The dress: the warm checkpoint's config digest differs -> no checkpoint -> the runtime OPENS.
+          loadSessionCheckpoint: async () => null,
+          appendEvent: async (event: unknown) => { events.push(event);
+            return { cursor: events.length, highestContiguousSourceSeq: events.length, disposition: "committed" }; },
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+        };
+        const getFreshSessionHandoff = vi.fn(async () => "## Fresh session handoff\n\nThe saved conversation so far.");
+        const outcome = await executeNativeSession({ input: fixture.current, backend: fixture.backend, controlPlane,
+          getFreshSessionHandoff, runnerInstanceId: "f20-runner", controlPlaneInstanceId: "f20-control" } as never)
+          .catch((error: unknown) => error);
+        expect(outcome).not.toBeInstanceOf(Error);
+        expect(fixture.refusals).toHaveLength(1);
+        expect(fixture.openSession).toHaveBeenCalledTimes(2);
+        expect(startTurn).toHaveBeenCalledOnce();
+        const envelope = JSON.parse(startTurn.mock.calls[0]![0].message.text) as { task: { prompt: string } };
+        expect(envelope.task.prompt.startsWith("## Fresh session handoff")).toBe(true);
+        expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+        expect(fixture.resets()).toEqual([expect.objectContaining({ reason: "config_changed",
+          identity: identityOf("fresh-provider-thread") })]);
+      });
+
+      it("the person-visible note for a changed launch profile names the change, never a new sandbox", async () => {
+        const { restoreUnavailableContinuationNoticeBody } = await vi.importActual<typeof import("./pi-session-recovery-notice.js")>(
+          "./pi-session-recovery-notice.js");
+        const body = restoreUnavailableContinuationNoticeBody("launch_profile_changed");
+        expect(body).toMatch(/^Continuing in a fresh thread: /);
+        expect(body).toContain("configuration changed");
+        expect(body).not.toContain("new sandbox");
+      });
+
+      it.each([
+        ["a turn in flight", { activeProviderTurnId: "turn-in-flight" }],
+        ["an active goal", { goal: { status: "active", workingNow: false } }],
+        ["a goal working now", { goal: { status: "paused", workingNow: true } }],
+        ["a deferred Pi terminal", { piDeferredTerminal: { turnId: "turn-1" } }],
+        ["an ambiguous turn start", { ambiguousTurnStartPending: true }],
+      ])("guard: a box with %s keeps the launch-profile refusal (nothing set aside)", async (_name, box) => {
+        const fixture = await dressFixture(`guard-${Object.keys(box)[0]}`, box);
+        await expect(open(fixture)).rejects.toMatchObject({ runnerCommandResult: expect.objectContaining({ commandType: "run.prepare" }) });
+        expect(fixture.openSession).toHaveBeenCalledOnce();
+        expect(fixture.resets()).toEqual([]);
+        expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+        await expect(readdir(join(fixture.root, "continuity-breaks"))).rejects.toThrow();
+      });
+
+      it("guard: the RECOVER path keeps the launch-profile refusal (NSR's in-run replacement owns it)", async () => {
+        const fixture = await floorFixture("f20-recover");
+        fixture.recoverSession.mockResolvedValueOnce({ recovered: false, reason: "launch profile changed",
+          recoveryRefusalCode: LAUNCH_CODE } as never);
+        const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
+        expect(recovered).toMatchObject({ recovered: false, recoveryRefusalCode: LAUNCH_CODE });
+        expect(fixture.openSession).not.toHaveBeenCalled();
+        expect(fixture.resets()).toEqual([]);
+        expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+      });
+
+      it("guard: a same-runner restart (no mismatch) opens once, as today", async () => {
+        const fixture = await floorFixture("f20-same-runner", "none", "resumed");
+        fixture.openSession.mockImplementationOnce(async () => fixture.fresh as never);
+        await expect(open(fixture)).resolves.toBe(fixture.fresh);
+        expect(fixture.openSession).toHaveBeenCalledOnce();
+        expect(fixture.resets()).toEqual([]);
+        expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+      });
+
+      it("guard: a second launch-profile refusal in the same run is not taken again (once only)", async () => {
+        const fixture = await dressFixture("twice");
+        fixture.openSession.mockImplementationOnce(async () => { throw launchProfileRefusal(); });
+        await expect(open(fixture)).rejects.toMatchObject({ runnerCommandResult: expect.anything() });
+        expect(fixture.openSession).toHaveBeenCalledTimes(2);
+        expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+      });
     });
   });
 
