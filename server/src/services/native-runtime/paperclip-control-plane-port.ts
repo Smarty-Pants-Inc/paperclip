@@ -251,7 +251,7 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
   async checkpointSession(snapshot: PersistedNativeSession, options?: { signal: AbortSignal }): Promise<void> {
     this.#assertActive(options);
     if (this.#deferredEventObservers.size > 0 || this.#deferredObserverFailure) await this.#settleDeferredObservers(options);
-    snapshot = redactRunnerApiPayloads(this.#identityRedactor.redact(snapshot));
+    // Binding checks read the snapshot as sent; redaction cannot refuse it.
     const identity = snapshot.identity;
     if (
       identity.companyId !== this.#binding.companyId
@@ -260,6 +260,12 @@ export class PaperclipControlPlanePort implements ControlPlanePort {
       || identity.agentId !== this.#binding.agentId
       || this.#sessionId !== identity.sessionId
     ) throw new Error("native_session_checkpoint_binding_mismatch");
+    // Session protocol fields stay byte-equal; the rest is content and redacted.
+    const { backendKind, driverKind, sessionId, providerSessionId, cursor, activeTurnId } = snapshot;
+    snapshot = { ...redactRunnerApiPayloads(this.#identityRedactor.redact(snapshot)), backendKind, sessionId,
+      identity: structuredClone(identity),
+      ...(driverKind === undefined ? {} : { driverKind }), ...(providerSessionId === undefined ? {} : { providerSessionId }),
+      ...(cursor === undefined ? {} : { cursor }), ...(activeTurnId === undefined ? {} : { activeTurnId }) };
     const piConversation = this.#taskSessionPublication?.providerKind === "pi_rpc" && !!snapshot.providerSessionId;
     const publication = this.#taskSessionPublication && (piConversation || eligibleNativeTaskSessionPublication(snapshot))
       ? this.#taskSessionPublication : null;

@@ -49,9 +49,16 @@ function registryEntries(contextSnapshot: unknown): RegistryEntry[] {
   });
 }
 
+/** An all-digit secret: masked only where it is a whole number. */
+export const isDigitValue = (value: string) => /^[0-9]+$/.test(value);
+
 function redactText(input: string, values: string[]) {
   return values.reduce(
-    (result, value) => value.length > 0 ? result.split(value).join(REDACTED_EVENT_VALUE) : result,
+    (result, value) => value.length === 0 ? result
+      // A numeric secret must not mask every longer number that contains it
+      // (timestamps, ids); it is masked where no digit touches it on either side.
+      : isDigitValue(value) ? result.replace(new RegExp(`(?<![0-9])${value}(?![0-9])`, "g"), REDACTED_EVENT_VALUE)
+      : result.split(value).join(REDACTED_EVENT_VALUE),
     input,
   );
 }

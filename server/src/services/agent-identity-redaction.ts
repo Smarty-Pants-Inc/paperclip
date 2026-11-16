@@ -1,5 +1,5 @@
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
-import { redactRegisteredSecretValues } from "./run-secret-redaction.js";
+import { isDigitValue, redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
 const MATERIAL_WINDOW = 32;
 const PEM_RUN_MIN = 40;
@@ -42,30 +42,26 @@ const newMaterialStream = (): MaterialStream => ({ context: false, token: "", su
  * apart from ordinary output, so indexing it only corrupts logs and events.
  */
 export const MIN_RUN_SECRET_LENGTH = 8;
-const UUID_VALUE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-// Lowercase DNS names ending in an alphabetic label; mixed-case tokens (JWTs,
-// API keys) and URLs with credentials never match.
-const HOST_NAME_VALUE = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
-// Cloud region names only (us-east-1, europe-west4), not any dashed word list.
-const REGION_VALUE = /^(?:us|eu|ap|sa|ca|me|af|il|mx|cn|europe|asia|australia|northamerica|southamerica|africa)(?:-gov)?-(?:east|west|north|south|central|northeast|northwest|southeast|southwest)-?\d{1,2}[a-z]?$/;
 
 /**
- * An identifier is public run metadata, not secret text: a UUID, a known
- * agent/company/environment/connection/run id, a host name or a region. Masking
- * it would rewrite event metadata and ordinary log text (a LANGFUSE_USER_ID env
- * bound to the agent's own id).
+ * A value is skipped only when it EQUALS one of the run's own ids (run, agent,
+ * company, issue, environment, connection ids passed as `identifiers`). A
+ * value merely shaped like an id (a UUID, a host name, a region) is NOT
+ * skipped: many API keys are bare UUIDs, and a guard must never let a real
+ * credential print unmasked. Masking is applied to content only (payload,
+ * debug, log text), so an indexed value cannot rewrite protocol metadata.
  */
 export function isRunSecretIdentifier(value: string, identifiers: ReadonlySet<string> = new Set()) {
-  const trimmed = value.trim();
-  return identifiers.has(value) || identifiers.has(trimmed) || UUID_VALUE.test(trimmed)
-    || HOST_NAME_VALUE.test(trimmed) || REGION_VALUE.test(trimmed);
+  return identifiers.has(value) || identifiers.has(value.trim());
 }
 
 /**
  * Add a run's secret values to a redactor's exact values and key-body window
  * index. Live preparation, observability values, the native control-plane port
  * and native log recovery all use this, so the paths cannot drift on how a run
- * secret is matched. `identifiers` are the run's own ids, never indexed.
+ * secret is matched. `identifiers` are the run's own ids: a value equal to one
+ * is never indexed. An all-digit value is indexed but masks only where it stands
+ * as a whole number (see redactRegisteredSecretValues), so ordinary numbers stay.
  */
 export function addRunSecretMaterial(redactor: { values: string[] }, secrets: Iterable<string>, identifiers: Iterable<string | null | undefined> = []) {
   const known = new Set(redactor.values);
@@ -233,7 +229,10 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
         }
       }
       // A complete exact match must not be mistaken for its own suffix prefix.
-      if (values.some(value => value.length >= held && text.endsWith(value))) held = 0;
+      if (values.some(value => !isDigitValue(value) && value.length >= held && text.endsWith(value))) held = 0;
+      // An all-digit value masks only as a whole number: hold a complete one at
+      // the end until the next character shows whether the number continues.
+      else for (const value of values) if (isDigitValue(value) && text.endsWith(value)) held = Math.max(held, value.length);
       if (held) pending.set(stream, text.slice(-held));
       else pending.delete(stream);
       const state = materialStreams.get(stream) ?? newMaterialStream();
