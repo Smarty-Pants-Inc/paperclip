@@ -105,6 +105,8 @@ export interface CreateAgentOptions {
   aiConnectionInstall?: { connectionId: string; memberConnectionIds?: string[]; createdByUserId: string | null };
   allowBuiltInAgentMetadata?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  /** Create and hire routes: the new agent's active membership and tasks:assign, inside the hire transaction. */
+  memberGrant?: { grantedByUserId: string | null };
 }
 
 type AgentEligibilityRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "name" | "status" | "reportsTo">;
