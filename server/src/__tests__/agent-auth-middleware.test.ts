@@ -12,7 +12,7 @@ import {
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { assertCompanyAccess } from "../routes/authz.js";
+import { assertAuthenticated, assertCompanyAccess } from "../routes/authz.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -162,6 +162,27 @@ function craftAgentJwtWithoutResponsibleClaim(input: {
 }
 
 describe("agent auth middleware", () => {
+  it.each(["none", "authorization", "capability-header"] as const)(
+    "does not authenticate a runner ingress capability on a general /api route (%s)", async header => {
+      const { db } = createDbState({ agent: { id: randomUUID(), companyId: randomUUID() } });
+      const app = createApp(db);
+      let resolvedActor: unknown;
+      app.get("/api/general-probe", (req, res) => {
+        resolvedActor = req.actor;
+        assertAuthenticated(req);
+        res.json({ ok: true });
+      });
+      const capability = "runner-ingress-capability-probe";
+      const req = request(app).get("/api/general-probe");
+      if (header === "authorization") req.set("Authorization", `Bearer ${capability}`);
+      else if (header === "capability-header") req.set("x-paperclip-github-capability", capability);
+
+      const res = await req;
+      expect(res.status).toBe(401);
+      if (header === "authorization") expect(resolvedActor).toBeUndefined();
+      else expect(resolvedActor).toMatchObject({ type: "none", source: "none" });
+    },
+  );
   const originalSecret = process.env.PAPERCLIP_AGENT_JWT_SECRET;
   const originalTtl = process.env.PAPERCLIP_AGENT_JWT_TTL_SECONDS;
   const originalInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
