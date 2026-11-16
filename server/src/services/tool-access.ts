@@ -4819,7 +4819,12 @@ export function toolAccessService(
       let preparedProject: Awaited<ReturnType<typeof prepareProjectAppFirstBind>> | undefined;
       let verifiedCandidate: Awaited<ReturnType<typeof verifyGitHubAppCandidate>> | undefined;
       const manager = isGitHubAppConnection({ config }) ? await assertNotManagerApp(db, {
-        companyId, refs: [...(input.credentialRefs ?? []), ...(input.credentialSecretRefs ?? [])],
+        companyId, refs: [
+          // Classification compares secret IDs only; retain MCP placement as a
+          // value-free path instead of passing its different ref shape as Ref.
+          ...(input.credentialRefs ?? []).map(ref => ({ secretId: ref.secretId, configPath: `${ref.placement}.${ref.key}` })),
+          ...(input.credentialSecretRefs ?? []),
+        ],
         appId: parseGitHubAppConfig(config.methodConfig).appId, requireConfigured: input.projectId != null,
       }) : null;
       // Check raw request authority before normalization or any application/key/provider write.
