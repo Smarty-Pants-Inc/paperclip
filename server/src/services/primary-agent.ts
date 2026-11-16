@@ -2,7 +2,7 @@ import { and, eq } from "drizzle-orm";
 import { agents, userCompanyPreferences, type Db } from "@paperclipai/db";
 import type { PrimaryAgentPreference } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
-import { persistActivity, publishActivity } from "./activity-log.js";
+import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { resourceMembershipService } from "./resource-memberships.js";
 
 const preferenceWhere = (companyId: string, userId: string) => and(
@@ -10,8 +10,11 @@ const preferenceWhere = (companyId: string, userId: string) => and(
 );
 
 /** Call inside the transaction that creates the human's agent. The unique key
- * arbitrates concurrent first creations; an explicit or cleared choice wins. */
-export async function initializePrimaryAgent(db: Db, companyId: string, userId: string, agentId: string) {
+ * arbitrates concurrent first creations; an explicit or cleared choice wins.
+ * Pass the root transaction's post-commit `publications` so the entry reaches
+ * live subscribers once, after commit; without them it is persisted only. */
+export async function initializePrimaryAgent(db: Db, companyId: string, userId: string, agentId: string,
+  publications?: ActivityPublication[]) {
   const [row] = await db.insert(userCompanyPreferences).values({
     companyId, userId, primaryAgentId: agentId, primaryAgentInitialized: true,
   }).onConflictDoUpdate({
@@ -19,24 +22,32 @@ export async function initializePrimaryAgent(db: Db, companyId: string, userId: 
     set: { primaryAgentId: agentId, primaryAgentInitialized: true, updatedAt: new Date() },
     setWhere: eq(userCompanyPreferences.primaryAgentInitialized, false),
   }).returning();
-  if (row) await persistActivity(db, {
-    companyId, actorType: "user", actorId: userId, action: "primary_agent.initialized",
-    entityType: "user_preference", entityId: userId,
-  });
+  if (row) {
+    const { publication } = await persistActivity(db, {
+      companyId, actorType: "user", actorId: userId, action: "primary_agent.initialized",
+      entityType: "user_preference", entityId: userId,
+    });
+    publications?.push(publication);
+  }
 }
 
-/** Keep initialization sticky when the primary leaves or is terminated. */
-export async function clearPrimaryAgent(db: Db, companyId: string, agentId: string, userId?: string) {
+/** Keep initialization sticky when the primary leaves or is terminated.
+ * `publications`: the root transaction's post-commit buffer (see above). */
+export async function clearPrimaryAgent(db: Db, companyId: string, agentId: string, userId?: string,
+  publications?: ActivityPublication[]) {
   const rows = await db.update(userCompanyPreferences).set({
     primaryAgentId: null, updatedAt: new Date(),
   }).where(and(
     eq(userCompanyPreferences.companyId, companyId), eq(userCompanyPreferences.primaryAgentId, agentId),
     userId ? eq(userCompanyPreferences.userId, userId) : undefined,
   )).returning();
-  for (const row of rows) await persistActivity(db, {
-    companyId, actorType: "system", actorId: "primary-agent-lifecycle", action: "primary_agent.cleared",
-    entityType: "user_preference", entityId: row.userId,
-  });
+  for (const row of rows) {
+    const { publication } = await persistActivity(db, {
+      companyId, actorType: "system", actorId: "primary-agent-lifecycle", action: "primary_agent.cleared",
+      entityType: "user_preference", entityId: row.userId,
+    });
+    publications?.push(publication);
+  }
 }
 
 export function primaryAgentService(db: Db) {

@@ -24,9 +24,26 @@ export interface LifecycleEffects {
   setAgentBudget(db: Db, publications: ActivityPublication[], companyId: string, agentId: string, amount: number, userId: string | null, isActive?: boolean): Promise<unknown>;
   recordCreation(db: Db, companyId: string, agentId: string): Promise<void>;
   recordStatus(db: Db, companyId: string, agentId: string, before: string, after: string): Promise<void>;
-  clearPrimary(db: Db, companyId: string, agentId: string): Promise<unknown>;
+  clearPrimary(db: Db, companyId: string, agentId: string, publications?: ActivityPublication[]): Promise<unknown>;
   prepareHire(db: Db, companyId: string, data: CreateAgentData, options?: CreateAgentOptions): Promise<CreateAgentData>;
-  initializeHire(db: Db, agent: AgentHireRecord, options?: CreateAgentOptions): Promise<void>;
+  initializeHire(db: Db, agent: AgentHireRecord, options?: CreateAgentOptions, publications?: ActivityPublication[]): Promise<void>;
   prepareHireApproval(db: Db, agent: AgentHireRecord, payload?: Record<string, unknown> | null): Promise<AgentConfigurationPatch>;
-  completeHireApproval(db: Db, agent: AgentHireRecord, previous: AgentHireRecord): Promise<void>;
+  completeHireApproval(db: Db, agent: AgentHireRecord, previous: AgentHireRecord, publications?: ActivityPublication[]): Promise<void>;
+}
+
+/** Run a nested lifecycle transaction (a savepoint inside the caller's root
+ * transaction) against the caller's root post-commit `publications`. The
+ * nested work stages its activities and hands them to the root buffer only
+ * when it completes, so they publish once, after the root commit, and never
+ * from a rolled-back attempt or savepoint. */
+export function joinLifecycleTransaction(effects: LifecycleEffects, publications: ActivityPublication[]): LifecycleEffects {
+  return {
+    ...effects,
+    transaction: (db, companyId, work) => effects.transaction(db, companyId, async tx => {
+      const staged: ActivityPublication[] = [];
+      const result = await work(tx, staged);
+      publications.push(...staged);
+      return result;
+    }),
+  };
 }

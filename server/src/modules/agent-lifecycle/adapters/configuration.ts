@@ -40,7 +40,7 @@ export async function updateAgentConfiguration(tx: Db, effects: LifecycleEffects
         adapterConfig: Object.prototype.hasOwnProperty.call(patch, "adapterConfig") ? patch.adapterConfig : current.adapterConfig });
   const invalidate = changed && (["preparing", "verifying", "resuming"].includes(current.lifecycleState) || prepareSetup || pauseForEnvironment);
   if(prepareSetup&&!canConfigureAgentConnection(current))await effects.beforeConnectionEligibilityRestore?.(tx,current.companyId,current.id);
-  if (pauseForEnvironment) await effects.beforeStatusChange(tx, current.companyId, id, current.status, "paused");
+  if (pauseForEnvironment) await effects.beforeStatusChange(tx, current.companyId, id, current.status, "paused", publications);
   if (invalidate) await effects.notifyWork(tx);
   const [updated] = await tx.update(agents).set({ ...patch, updatedAt: new Date(), ...(invalidate ? {
     lifecycleVersion: current.lifecycleVersion + 1, lifecycleError: null,
