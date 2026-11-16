@@ -23307,12 +23307,26 @@ describe("runnerd provider runtime wiring", () => {
         createHash("sha256").update(current.session.normalizedSessionId!).digest("hex"));
       expect(JSON.parse(await readFile(join(remoteSession, "runner/runner-state.json"), "utf8"))).toEqual(runnerState);
       expect(await readFile(join(remoteSession, "filesystem/codex-home/sentinel.txt"), "utf8")).toBe("retained provider home");
-      expect(updates.filter(update => update.table === environmentLeases)).toEqual([expect.objectContaining({
-        values: expect.objectContaining({ metadata: { nativeHarnessBackup: expect.objectContaining({
-          normalizedSessionId: current.session.normalizedSessionId, runnerInstanceId,
-          sourceProviderLeaseId: "prior-sandbox", authorizedProviderLeaseId: "sandbox-created",
-        }) } }),
-      })]);
+      // SUPERSEDED BY REPLACEMENT (RFL 09:33Z 11-16): 23784adc moved the stamp merge into SQL; the restore assertions above are unchanged.
+      const stampWrites = updates.filter(update => update.table === environmentLeases);
+      expect(stampWrites).toHaveLength(1);
+      const stampValues = stampWrites[0]!.values;
+      expect(Object.keys(stampValues).sort()).toEqual(["metadata", "updatedAt"]);
+      expect(stampValues.updatedAt).toBeInstanceOf(Date);
+      const stampQuery = new PgDialect().sqlToQuery(stampValues.metadata as SQL);
+      expect(stampQuery.sql).toBe('coalesce("environment_leases"."metadata", \'{}\'::jsonb) || $1::jsonb');
+      expect(stampQuery.params).toHaveLength(1);
+      const manifestBytes = await readFile(join(backupRoot, "manifest.json"));
+      expect(JSON.parse(stampQuery.params[0] as string)).toEqual({ nativeHarnessBackup: {
+        schema: "paperclip.native-harness-backup-stamp.v2",
+        normalizedSessionId: current.session.normalizedSessionId,
+        runnerInstanceId,
+        sessionScopeSha256: basename(options.stateDirectory!),
+        sourceProviderLeaseId: "prior-sandbox",
+        authorizedProviderLeaseId: "sandbox-created",
+        manifestSha256: `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`,
+        completedAt: JSON.parse(manifestBytes.toString("utf8")).completedAt,
+      } });
     } else {
       await expect(options.prepareExternalRunnerState()).rejects.toThrow("backup_without_reusable_lease");
       expect(syncIn).not.toHaveBeenCalled();
