@@ -15,7 +15,8 @@ import { agentRoutes } from "../routes/agents.js";
 import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffects } from "../services/agent-lifecycle.js";
 import { createAgentLifecycle as lifecycleWithEffects } from "../modules/agent-lifecycle/index.js";
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
-import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
+import { agentHandoverService } from "../services/agent-handover.js";
+import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { issueService } from "../services/issues.js";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -63,7 +64,9 @@ describe("#20389 RFL retirement regressions", () => {
 
   async function seed() {
     for (const worker of workers) await worker.stop();
-    const companyId = randomUUID(), userId = randomUUID(), managerId = randomUUID(), workerId = randomUUID();
+    const companyId = randomUUID(), userId = randomUUID();
+    // The production race parks checkout on the manager before the retiring row (checkout locks agents in id order).
+    const [managerId, workerId] = [randomUUID(), randomUUID()].sort() as [string, string];
     await db.insert(companies).values({ id: companyId, name: "Retirement regression", issuePrefix: `R${companyId.slice(0, 7)}`, requireBoardApprovalForNewAgents: false });
     await db.insert(authUsers).values({ id: userId, name: "Owner", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(agents).values({ id: managerId, companyId, name: "Manager", adapterType: "process", status: "idle", lifecycleState: "ready", runtimeConfig: { heartbeat: { enabled: false } } });
@@ -214,7 +217,9 @@ describe("#20389 RFL retirement regressions", () => {
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toEqual(run);
   }, 60_000);
 
-  it("retirement retains holds and task ownership until durable Stop and cleanup completion", async () => {
+  // superseded by replacement: RFL FINAL S2/S3 + CTL6-RF2-0505 W1/W5/W6 (holds-cleared dropped).
+  // Original intent: ownership/execution exclusion survive Stop and cleanup; completed retirement returns the task exactly once.
+  it("retirement retains holds and task ownership until durable Stop and cleanup completion (current contract: frozen holds until and after handover)", async () => {
     const f = await seed(), runId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.workerId, status: "running", startedAt: new Date() });
     await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, f.task.id));
@@ -240,65 +245,108 @@ describe("#20389 RFL retirement regressions", () => {
     await worker.process(f.workerId);
     expect(await f.currentAgent()).toMatchObject({ lifecycleState: "cleaning_up", lifecycleHolds: ["budget"], pauseReason: "budget" });
     expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId });
+    const taskBeforeCompletion = await f.currentTask();
     cleanupConfirmed = true;
     await createAgentLifecycle(db).retry(f.workerId);
     await worker.process(f.workerId);
-    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated", lifecycleHolds: [], pauseReason: null });
+    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated", lifecycleHolds: ["budget"], pauseReason: "budget",
+      lifecycleOperation: { handover: { code: "agent_handover_pending" } } });
+    expect(await f.currentTask()).toEqual(taskBeforeCompletion);
+    const recovery = agentHandoverService(db);
+    expect(await recovery.processAgent(f.workerId)).toMatchObject({ tasks: [f.task.id], cleared: true, blocked: [] });
+    expect(await f.currentAgent()).toMatchObject({ lifecycleState: "terminated", lifecycleHolds: ["budget"], pauseReason: "budget" });
+    expect((await f.currentAgent()).lifecycleOperation?.handover).toBeUndefined();
     expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId, status: "todo", checkoutRunId: null, executionRunId: null });
+    const completedTask = await f.currentTask();
+    await recovery.processAgent(f.workerId);
+    await worker.process(f.workerId);
+    expect(await f.currentTask()).toEqual(completedTask);
+    for (const [action, entityId] of [["agent.terminated", f.workerId], ["issue.reassigned", f.task.id], ["agent.handover_completed", f.workerId]]) {
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, entityId!), eq(activityLog.action, action!)))).toHaveLength(1);
+    }
     const managerRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: managerRunId, companyId: f.companyId, agentId: f.managerId, status: "running" });
     await expect(issueService(db).checkout(f.task.id, f.managerId, ["todo"], managerRunId)).resolves.toMatchObject({ executionRunId: managerRunId });
   }, 60_000);
 
-  it("durable termination completion retries the real checkout lock cycle and commits one transfer", async () => {
-    const f = await seed();
-    const owner = randomUUID();
-    await db.update(agents).set({ status: "terminated", lifecycleState: "cleaning_up", lifecycleRequiredPluginIds: [],
-      lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 1, leaseOwner: owner,
-        leaseUntil: new Date(Date.now() + 120_000).toISOString() } }).where(eq(agents.id, f.workerId));
-    const taskLocked = barrier(), agentLocked = barrier(), runCheckout = barrier(), runTermination = barrier();
-    const effects = createAgentLifecycleEffects(), transaction = effects.transaction;
-    let attempts = 0;
-    effects.transaction = (database, companyId, work) => transaction(database, companyId, async (tx, publications) => {
-      const attempt = ++attempts;
-      if (attempt > 1) await checkout;
-      await tx.execute(sql`set local deadlock_timeout = '100ms'`);
-      await tx.execute(sql`set local statement_timeout = '15s'`);
-      await tx.select().from(agents).where(eq(agents.id, f.workerId)).for("update");
-      if (attempt === 1) { agentLocked.release(); await runTermination.promise; }
-      return work(tx, publications);
-    });
-    const settle = (promise: Promise<unknown>) => promise.then(value => ({ value }), error => ({ error }));
-    const checkout = settle(db.transaction(async transaction => {
-      const tx = transaction as unknown as Db;
-      await tx.execute(sql`set local deadlock_timeout = '10s'`);
-      await tx.execute(sql`set local statement_timeout = '15s'`);
-      await tx.select().from(issues).where(eq(issues.id, f.task.id)).for("update");
-      taskLocked.release(); await runCheckout.promise;
-      await assertAgentInteraction(tx, { companyId: f.companyId, actorAgentId: f.managerId,
-        targetAgentId: f.managerId, issueId: f.task.id, operation: "assign", lock: true });
-      return true;
-    }));
-    await taskLocked.promise;
-    const completion = settle(createLifecycleStore(db, effects).change(f.workerId, "complete", { version: (await f.currentAgent()).lifecycleVersion, owner }));
-    await agentLocked.promise;
-    try {
-      runCheckout.release();
-      await vi.waitFor(async () => {
-        const waiting = await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
-          and wait_event_type = 'Lock' and query like '%from "agents"%'`);
-        expect(waiting.length).toBeGreaterThan(0);
-      }, { timeout: 5_000, interval: 10 });
-    } finally { runCheckout.release(); runTermination.release(); }
-    expect(await completion).toMatchObject({ value: { lifecycleState: "terminated" } });
-    expect(await checkout).toEqual({ value: true });
-    expect(attempts).toBe(2);
-    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId, status: "todo" });
-    const moves = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.task.id), eq(activityLog.action, "issue.reassigned")));
-    expect(moves).toHaveLength(1);
+  // superseded by replacement: RFL :281 supersede + RFL FINAL S2/S3 + CTL6-RF2-0505 W3.
+  // Original intent: a real checkout race finishes retirement with exactly one transfer and no duplicated effects.
+  it("durable termination completion retries the real checkout lock cycle and commits one transfer (current contract: production races commit in one attempt)", async () => {
+    // Mirrors BOTH production race schedules in agent-retirement-handover, not
+    // the old harness that itself injected an inverse agent/task lock order.
+    for (const order of ["task-first", "agent-first"] as const) {
+      const f = await seed(), owner = randomUUID(), managerRunId = randomUUID();
+      await db.update(agents).set({ status: "terminated", lifecycleState: "cleaning_up", lifecycleRequiredPluginIds: [],
+        lifecycleHolds: ["budget"], pauseReason: "budget",
+        lifecycleOperation: { id: randomUUID(), hostComplete: true, completedPluginIds: [], attempts: 1, leaseOwner: owner,
+          leaseUntil: new Date(Date.now() + 120_000).toISOString() } }).where(eq(agents.id, f.workerId));
+      await db.insert(heartbeatRuns).values({ id: managerRunId, companyId: f.companyId, agentId: f.managerId, status: "running" });
+      const deadlocks = async () => Number((await db.execute(sql`select deadlocks from pg_stat_database where datname = current_database()`))[0]!.deadlocks);
+      const beforeDeadlocks = await deadlocks();
+      const held = barrier(), release = barrier();
+      const blocker = db.transaction(async tx => {
+        // Park a production query, not a replacement for checkout/termination.
+        await tx.select({ id: agents.id }).from(agents).where(eq(agents.id, order === "task-first" ? f.managerId : f.workerId)).for("update");
+        held.release(); await release.promise;
+      });
+      const effects = createAgentLifecycleEffects(), transaction = effects.transaction;
+      let attempts = 0;
+      effects.transaction = (database, companyId, work) => transaction(database, companyId, (tx, publications) => {
+        attempts++;
+        return work(tx, publications);
+      });
+      const settle = (promise: Promise<unknown>) => promise.then(value => ({ value, error: undefined }), error => ({ value: undefined, error }));
+      let completion: ReturnType<typeof settle> | undefined, checkout: ReturnType<typeof settle> | undefined;
+      const waits = async () => (await db.execute(sql`select 1 from pg_stat_activity where datname = current_database()
+        and wait_event_type = 'Lock' and query like '%from "agents"%'`)).length;
+      await held.promise;
+      try {
+        const complete = async () => createLifecycleStore(db, effects).change(f.workerId, "complete", { owner, version: (await f.currentAgent()).lifecycleVersion });
+        const checkOut = () => issueService(db).checkout(f.task.id, f.managerId, ["todo", "in_progress"], managerRunId);
+        if (order === "task-first") {
+          checkout = settle(checkOut());
+          await vi.waitFor(async () => expect(await waits()).toBeGreaterThan(0), { timeout: 5_000, interval: 10 });
+          completion = settle(complete());
+          // The terminal step has no task lock: it must finish even while checkout is parked.
+          expect(await Promise.race([completion, new Promise(resolve => setTimeout(resolve, 5_000))]))
+            .toMatchObject({ value: { lifecycleState: "terminated" }, error: undefined });
+        } else {
+          completion = settle(complete());
+          await vi.waitFor(async () => expect(await waits()).toBeGreaterThan(0), { timeout: 5_000, interval: 10 });
+          checkout = settle(checkOut());
+          await vi.waitFor(async () => expect(await waits()).toBeGreaterThanOrEqual(2), { timeout: 5_000, interval: 10 });
+        }
+      } finally {
+        release.release(); await blocker;
+        // Drain both production operations even if a scheduling assertion fails.
+        await Promise.all([completion, checkout]);
+      }
+      expect(await completion).toMatchObject({ value: { lifecycleState: "terminated" }, error: undefined });
+      expect(attempts, order).toBe(1);
+      const checkedOut = await checkout;
+      // The task is still owned by the retiring agent: a named 409 is allowed,
+      // but 40P01 (or any other unclassified error) is not.
+      if (checkedOut?.error) expect(checkedOut.error).toMatchObject({ status: 409 });
+      expect(await f.currentAgent()).toMatchObject({ status: "terminated", lifecycleState: "terminated", lifecycleHolds: ["budget"],
+        lifecycleOperation: { handover: { code: "agent_handover_pending" } } });
+      const recovery = agentHandoverService(db);
+      await recovery.processAgent(f.workerId);
+      expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.managerId, status: "todo" });
+      expect(await deadlocks()).toBe(beforeDeadlocks);
+      const after = await f.currentTask();
+      await recovery.processAgent(f.workerId);
+      expect(await f.currentTask()).toEqual(after);
+      expect((await f.currentAgent()).lifecycleOperation?.handover).toBeUndefined();
+      expect((await f.currentAgent()).lifecycleHolds).toEqual(["budget"]);
+      for (const [action, entityId] of [["agent.terminated", f.workerId], ["issue.reassigned", f.task.id], ["agent.handover_completed", f.workerId]]) {
+        expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, entityId!), eq(activityLog.action, action!)))).toHaveLength(1);
+      }
+    }
   }, 60_000);
 
-  it("a rolled-back lifecycle transaction rechecks authorization before retrying PATCH", async () => {
+  // superseded by replacement: RFL F4 supersede + RFL FINAL S2/S3 (explicit retry rechecks authority).
+  // Original intent: revoked authority after rollback cannot mutate the agent or its tasks or publish anything.
+  it("a rolled-back lifecycle transaction rechecks authorization before retrying PATCH (current contract: a separate explicit request)", async () => {
     const f = await seed();
     let transactions = 0, authorizations = 0;
     let rootTransaction: unknown;
@@ -311,16 +359,32 @@ describe("#20389 RFL retirement regressions", () => {
       }, options)) as Db["transaction"];
       return Reflect.get(target, key, receiver);
     } });
-    const before = await f.currentAgent();
+    const before = await f.currentAgent(), beforeTask = await f.currentTask();
+    const beforeActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id);
+    const events: unknown[] = [];
+    const unsubscribe = subscribeCompanyLiveEvents(f.companyId, event => { if (event.type === "activity.logged") events.push(event); });
     const lifecycle = createAgentLifecycle(wrappedDb, {}, async tx => {
       if (tx !== rootTransaction) return;
       if (++authorizations > 1) throw new Error("scope revoked before retry");
     });
-    await expect(lifecycle.updateAndTransition(f.workerId, "terminate", { title: "Must roll back" })).rejects.toThrow("scope revoked before retry");
-    expect(authorizations).toBe(2);
-    expect(transactions).toBe(1);
-    expect(await f.currentAgent()).toEqual(before);
-    expect(await f.currentTask()).toMatchObject({ assigneeAgentId: f.workerId });
+    try {
+      await expect(lifecycle.updateAndTransition(f.workerId, "terminate", { title: "Must roll back" }))
+        .rejects.toMatchObject({ status: 503, code: "40P01", attempts: 1 });
+      expect({ authorizations, transactions }).toEqual({ authorizations: 1, transactions: 1 });
+      expect(await f.currentAgent()).toEqual(before);
+      expect(await f.currentTask()).toEqual(beforeTask);
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id)).toEqual(beforeActivity);
+      expect(events).toEqual([]);
+      // The caller retries explicitly after the first 503; authority is re-read
+      // in that request's own transaction, and denial leaves exact rows intact.
+      await expect(lifecycle.updateAndTransition(f.workerId, "terminate", { title: "Denied" })).rejects.toThrow("scope revoked before retry");
+      expect(authorizations).toBe(2);
+      expect(transactions).toBe(1);
+      expect(await f.currentAgent()).toEqual(before);
+      expect(await f.currentTask()).toEqual(beforeTask);
+      expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id)).toEqual(beforeActivity);
+      expect(events).toEqual([]);
+    } finally { unsubscribe(); }
   }, 60_000);
 
   // F3 withdrawn by RFL 05:43Z: ordinary reassignment revokes the human direction, finished receipts included.
