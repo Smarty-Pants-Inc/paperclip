@@ -1,8 +1,8 @@
 import { notifyGitHubCredentialChange } from "./github-connection-notifications.js";
-import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, readProjectConnectionScope, requireProjectConnectionHumanHandoff } from "./project-connection-admission.js";
+import { assertProjectConnectionAdmission, assertProjectConnectionPatch, assertProjectConnectionSupported, projectConnectionActor, projectConnectionRepositoryIds, readProjectConnectionScope, requireProjectConnectionHumanHandoff } from "./project-connection-admission.js";
 import { lockProjectConnectionLifecycle, assertProjectConnectionNotInUse, activateProjectConnectionMigration, writeProjectConnectionReceipt } from "./project-connection-retirement.js";
 import { lockProjectConnectionIdentities, assertProjectConnectionAvailability } from "./project-connection-arbitration.js";
-import { verifyProjectConnectionGitHubScope } from "./project-connection-provider-scope.js";
+import { verifyProjectConnectionGitHubScope, type VerifiedProjectConnectionProviderScope } from "./project-connection-provider-scope.js";
 import { resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { RepositoryCatalogUnavailableError, findRepositoryCatalogUnavailableError } from "./repository-catalog-unavailable-error.js";
 import { notifyVoiceChange } from "./voice/voice-recovery-notifications.js";
@@ -115,7 +115,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { and, asc, desc, eq, inArray, max, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, connectionGrantMembers, connectionGrants, companyMemberships, principalPermissionGrants, userSecretDefinitions, plugins, toolAccessAuditEvents, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolStdioCommandTemplates, toolCallEvents, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
+import { agents, connectionGrantMembers, connectionGrants, companySecrets, companyMemberships, principalPermissionGrants, userSecretDefinitions, plugins, toolAccessAuditEvents, toolApplications, toolCatalogEntries, toolConnectionInstalls, toolConnections, toolStdioCommandTemplates, toolCallEvents, toolPolicies, toolProfileBindings, toolProfileEntries, toolProfiles } from "@paperclipai/db";
 import type { AppDefinition, ConnectionGrantKind, CreateToolApplication, CreateToolConnection, ConnectToolApp, ConnectToolAppResult, CreateToolStdioCommandTemplate, FinishToolApp, FinishToolAppResult, CreateToolProfileBindingForProfile, CreateToolProfileEntryForProfile, DeploymentExposure, DeploymentMode, ImportMcpJson, McpConnectionCredentialRef, McpJsonImportPreview, ToolApplication, ToolCatalogEntry, ToolCatalogRefreshResult, ToolConnection, ToolConnectionInstall, ToolConnectionHealthCheckResult, ToolConnectionAuthKind, ToolConnectionCredentialPolicy, ToolConnectionCredentialSource, ToolConnectionTransport, ToolAppMetadataPreflightResult, ToolExampleInstallResult, ToolExampleSmokeCheck, ToolExampleSmokeResult, ToolExampleSummary, ToolProfileBinding, ToolProfileEntry, ToolPolicyDecision, ToolStdioCommandTemplate, UpdateToolApplication, UpdateToolConnection, VercelConnectCredentialReference } from "@paperclipai/shared";
 import { getAppDefinitionForUrl, getAvailableConnectionMethods, getConnectableAppDefinition, recommendedDefaultsForApp } from "@paperclipai/shared";
 import {
@@ -3268,6 +3268,8 @@ export function toolAccessService(
     await assertConnectorConnectionSetupEnabled(connection);
     if (connection.status === "archived")
       throw conflict("Archived app connections cannot be finished");
+    let verifiedProject: VerifiedProjectConnectionProviderScope | undefined;
+    let verifiedGrant: typeof connectionGrants.$inferSelect | undefined;
     if (isGitHubAppConnection(connection)) {
       const grant = await getGitHubAppGrant(db, connection);
       if ((grant.kind === "agent" && (input.access === "all_agents" || input.access.agentIds.length !== 1
@@ -3275,8 +3277,31 @@ export function toolAccessService(
         ) {
         throw badRequest("Dedicated GitHub App identities require their assigned agent.");
       }
-      await refreshGitHubAppAccess(db, connection);
+      if (connection.projectId) {
+        // Exact ref authorization precedes key resolution; HTTP never runs under
+        // project/identity locks. Never treat a stored health label as proof.
+        const ref = grant.credentialSecretRefs.find(ref => ref.configPath === GITHUB_APP_KEY_PATH);
+        if (!ref) throw forbidden("The approved project key reference is unavailable", { code: "project_connection_reference_not_approved" });
+        const secret = await resolveConnectionGrantSecret(db, connection, grant, ref, {
+          actorType: actor?.actorType ?? "system", actorId: actor?.actorId ?? undefined,
+          consumerType: "tool_connection", consumerId: connection.id, configPath: ref.configPath,
+          responsibleUserId: actor?.responsibleUserId ?? actor?.managementContext?.responsibleUserId,
+        });
+        verifiedGrant = grant;
+        verifiedProject = await verifyProjectConnectionGitHubScope({ companyId, namespace: `${companyId}:${connection.id}:${grant.id}`, config: parseGitHubAppConfig(connection.config.methodConfig), privateKey: secret.value,
+          secretVersion: typeof ref.versionSelector === "number" ? ref.versionSelector : secret.latestVersion });
+        const scope = readProjectConnectionScope(connection)!;
+        if (verifiedProject.identity.companyId !== companyId || verifiedProject.identity.providerHost !== "github.com"
+          || verifiedProject.identity.verifiedRegistrationId !== scope.registrationId || verifiedProject.identity.canonicalInstallationKey !== scope.installationKey) {
+          throw conflict("The provider identity differs from this project's approved App", { code: "project_connection_state_changed" });
+        }
+        await assertProjectConnectionAdmission(db, { companyId, projectId: connection.projectId, connection, operation: "finish", actor,
+          targetAgentIds: input.access === "all_agents" ? [companyId] : input.access.agentIds, proposedRepositoryIds: verifiedProject.repositoryIds });
+      } else await refreshGitHubAppAccess(db, connection);
     }
+    // Project identity replacement is reference-only and uses the ordinary
+    // guarded finish path, not the legacy access-preservation shortcut.
+    if (connection.projectId && connection.config.mcpPreserveAccess === true) throw conflict("Finish this project connection using explicit current recipients", { code: "project_connection_scope_protected" });
 
     if (connection.config.mcpPreserveAccess === true && (isRemoteMcpConnectorMethod(connection.config.sourceTemplateKey, connection.config.connectionMethodKey) || isGitHubAppConnection(connection))) {
       const [profile] = await db.select().from(toolProfiles).where(and(
@@ -3383,11 +3408,18 @@ export function toolAccessService(
           }));
     await actor?.managementContext?.reauthorize();
     const transactionResult = await db.transaction(async (tx) => {
+      if (connection.projectId) {
+        if (!verifiedProject) throw conflict("A fresh project App verification is required", { code: "project_connection_verification_required" });
+        await lockProjectConnectionLifecycle(tx, { companyId, projectId: connection.projectId });
+        await lockProjectConnectionIdentities(tx, [verifiedProject.identity]);
+        await assertProjectConnectionAvailability(tx, { identity: verifiedProject.identity, projectId: connection.projectId,
+          exclusive: readProjectConnectionScope(connection)!.exclusive, excludeConnectionId: connection.id });
+      }
       await tx.select({ id: toolApplications.id }).from(toolApplications)
         .where(and(eq(toolApplications.id, connection.applicationId), eq(toolApplications.companyId, companyId)))
         .for("update");
       const [lockedConnection] = await tx
-        .select({ id: toolConnections.id, status: toolConnections.status, enabled: toolConnections.enabled })
+        .select()
         .from(toolConnections)
         .where(
           and(
@@ -3397,6 +3429,21 @@ export function toolAccessService(
         )
         .for("update");
       if (!lockedConnection) throw notFound("Tool connection not found");
+      const recheckProjectFinish = async (targets: readonly string[]) => {
+        if (!connection.projectId || !verifiedProject || !verifiedGrant) return;
+        if (connectionSetupMutationFingerprint(lockedConnection) !== connectionSetupMutationFingerprint(connection)) throw conflict("The project connection changed during verification. Retry with current state.", { code: "project_connection_state_changed" });
+        await assertProjectConnectionAdmission(tx, { companyId, projectId: connection.projectId, connection: lockedConnection, operation: "finish", actor,
+          targetAgentIds: targets, proposedRepositoryIds: verifiedProject.repositoryIds });
+        const [grant] = await tx.select().from(connectionGrants).where(and(eq(connectionGrants.id, verifiedGrant.id), eq(connectionGrants.companyId, companyId))).for("update");
+        if (!grant || grant.status !== "active" || stableHash(grant.credentialSecretRefs) !== stableHash(verifiedGrant.credentialSecretRefs)
+          || grant.updatedAt.getTime() !== verifiedGrant.updatedAt.getTime()) throw conflict("The project authorization changed during verification", { code: "project_connection_state_changed" });
+        const ref = grant.credentialSecretRefs[0]!;
+        const [secret] = await tx.select().from(companySecrets).where(and(eq(companySecrets.id, ref.secretId), eq(companySecrets.companyId, companyId))).for("share");
+        const currentVersion = typeof ref.versionSelector === "number" ? ref.versionSelector : secret?.latestVersion;
+        if (!secret || secret.status !== "active" || secret.deletedAt || currentVersion !== verifiedProject.secretVersion) throw conflict("The project key changed during verification. Verify its current version again.", { code: "project_connection_state_changed" });
+      };
+      await recheckProjectFinish(bindingInputs.map(target => target.targetId));
+      let projectFinalTargetIds = bindingInputs.map(target => target.targetId);
       const [existingProfile] = await tx
         .select()
         .from(toolProfiles)
@@ -3425,6 +3472,16 @@ export function toolAccessService(
         if (!input.preserveExistingAccess) changedAgentTargets.push(...[...existingAgentTargets].filter(id => !requestedAgentTargets.has(id)));
       }
       await assertAgentToolAssignmentInteractions(tx as unknown as Db, sourceAgentId, companyId, changedAgentTargets, false);
+      if (connection.projectId) {
+        const finalTargets = input.preserveExistingAccess ? [...bindingInputs, ...existingBindings, ...existingInstalls] : bindingInputs;
+        if (finalTargets.some(target => target.targetType !== "agent")) throw forbidden("Project access requires explicit agent recipients", { code: "project_connection_target_outside_project" });
+        // Fresh authority and final union AFTER assignment-lock waits too.
+        projectFinalTargetIds = [...new Set(finalTargets.map(target => target.targetId))];
+        await recheckProjectFinish(projectFinalTargetIds);
+        if (!input.preserveExistingAccess && [...existingBindings, ...existingInstalls].some(target => !requestedAgentTargets.has(target.targetId))) {
+          await assertProjectConnectionNotInUse(tx, { companyId, projectId: connection.projectId, connectionId: connection.id, actor, projectDoneConfirmation: actor?.projectDoneConfirmation });
+        }
+      }
       // A renamed connection can leave its old profile name in use. Resolve
       // names against profiles too, including when finalizing an installed draft.
       const otherProfiles = await tx
@@ -3651,6 +3708,10 @@ export function toolAccessService(
         },
         tx,
       );
+      if (connection.projectId && verifiedProject && readProjectConnectionScope(lockedConnection)!.migrationPending) {
+        await activateProjectConnectionMigration(tx, { connection: lockedConnection, actor,
+          targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds, verifiedSecretVersion: verifiedProject.secretVersion });
+      }
       await notifyGitHubCredentialChange(tx, connection);
       await notifyToolConnectionHealth(tx, connection);
       const [updatedConnection] = await tx
@@ -3671,6 +3732,8 @@ export function toolAccessService(
         .set({ status: "active", updatedAt: new Date() })
         .where(eq(toolApplications.id, connection.applicationId));
 
+      if (connection.projectId && verifiedProject) await writeProjectConnectionReceipt(tx, { connection: updatedConnection, actor,
+        action: "tool_connection.updated", reason: "project_connection_verified_finish", targetAgentIds: projectFinalTargetIds, verifiedRepositoryIds: verifiedProject.repositoryIds });
       return { profileId, profileBindings, policies, updatedConnection };
     });
     emitConnectionUpdated(
@@ -4748,7 +4811,8 @@ export function toolAccessService(
           credentialRefs: input.credentialRefs ?? [], credentialSecretRefs: input.credentialSecretRefs ?? [] });
         if (input.transportConfig && stableHash(input.transportConfig) !== stableHash(config)) throw forbidden("Alternate project credential projections are not supported", { code: "project_connection_scope_protected" });
         await assertProjectConnectionAdmission(db, { companyId, projectId: input.projectId, operation: "create", actor,
-          proposedSecretRefs: input.credentialSecretRefs ?? [] });
+          proposedSecretRefs: input.credentialSecretRefs ?? [],
+          proposedRepositoryIds: await projectConnectionRepositoryIds(db, companyId, input.projectId, parseGitHubAppConfig(config.methodConfig).repositories) });
         // Provider identity is not proof of the human's GitHub clicks. Do not
         // create an unverified reservation while the trusted custody reader is absent.
         requireProjectConnectionHumanHandoff();
