@@ -13,7 +13,7 @@ import * as credentials from "../services/connection-credentials.js";
 import { createToolConnectionSchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
-import { projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
+import { configureProjectFixture, projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 describe("project connection writer admission (round-4 B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -106,18 +106,23 @@ describe("project connection writer admission (round-4 B)", () => {
 
   it("J19: missing trusted handoff refuses even H's real primary; installer labels are not proof", async () => {
     const f = await projectConnectionFixture(db);
+    await configureProjectFixture(db, f); // manager only: NO source, NO approval
+    const setupActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(setupActivity.map(row => row.action)).toEqual(["plugin.config.updated"]);
     const resolve = vi.spyOn(credentials, "resolveConnectionGrantSecret");
     const verify = vi.spyOn(providerScope, "verifyProjectConnectionGitHubScope");
     for (const installedBy of [undefined, f.human, `different-human-${randomUUID()}`]) {
       const input = f.input();
       input.config = { ...input.config, ...(installedBy ? { installedBy, createdBy: f.human } : {}) };
       await expect(f.service.createConnection(f.companyId, input, f.actor()))
-        .rejects.toMatchObject({ status: 403, details: { code: "project_connection_human_handoff_required" } });
+        .rejects.toMatchObject({ status: 403, details: { code: "project_app_approval_required" } });
     }
     expect(resolve).not.toHaveBeenCalled();
     expect(verify).not.toHaveBeenCalled();
     expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
-    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
+    const afterActivity = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    expect(afterActivity.filter(row => !setupActivity.some(setup => setup.id === row.id))).toHaveLength(0);
+    expect(afterActivity).toEqual(setupActivity);
   });
 
   it("A01: worker cannot self-ratify first bind; actorless service calls cannot bypass it", async () => {
