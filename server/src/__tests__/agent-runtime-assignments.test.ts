@@ -7,6 +7,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, heartbeatRuns, issues, companies, companyMemberships, applyPendingMigrations, closeFileStorageDb, createDb, instanceSettings, pluginConfig, plugins, projects, toolApplications, toolConnections, toolConnectionInstalls, toolProfiles, toolMcpGateways, toolProfileBindings, resourceLifecycleEvents, type Db } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectWaitsOnCompanyRuntimeHold, holdAgentRowThenCompanyRuntimeShared } from "./helpers/agent-runtime-hold.js";
 import { pluginAgentRuntimeState } from "../services/plugin-agent-runtime-state.js";
 import { pluginLifecycleInbox } from "../services/plugin-lifecycle-inbox.js";
 import { registerPluginLifecycleDelivery } from "../services/plugin-lifecycle-delivery.js";
@@ -64,14 +65,19 @@ describeDatabase("connection assignment synchronization", () => {
   });
   const events = () => db.select().from(resourceLifecycleEvents).where(and(eq(resourceLifecycleEvents.companyId, companyId), eq(resourceLifecycleEvents.resourceType, "agent_runtime"))).orderBy(resourceLifecycleEvents.id);
 
-  it("journals gateway definitions while preserving ordered agent locks", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): journals gateway definitions while preserving ordered agent locks
+  it("journals gateway definitions while preserving ordered agent locks behind an in-flight writer's shared company hold", async () => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
+
     const [profile] = await db.insert(toolProfiles).values({ companyId, profileKey: "gateway-fixture", name: "Gateway fixture" }).returning();
     const [lower, higher] = [agentId, peerId].sort();
     let locked!: () => void; let release!: () => void;
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, lower)).for("no key update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, lower);
       locked(); await resume;
     });
     await held;
@@ -84,6 +90,7 @@ describeDatabase("connection assignment synchronization", () => {
       return createToolGatewayService(tx as unknown as Db).createNamedGateway({ companyId, body: { name: `Gateway ${index}`, profileId: profile.id, agentId: target } });
     }));
     const completed = Promise.allSettled(saves);
+    let savesSettled = false; void completed.then(() => { savesSettled = true; });
     try {
       await vi.waitFor(async () => {
         expect(pids).toHaveLength(2);
@@ -91,7 +98,10 @@ describeDatabase("connection assignment synchronization", () => {
           const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pid}`);
           expect(row.wait_event_type).toBe("Lock");
         }
+        const advisory = await db.execute(sql`SELECT pid FROM pg_locks WHERE pid IN (${pids[0]}, ${pids[1]}) AND NOT granted AND locktype = 'advisory'`);
+        expect(advisory.length).toBeGreaterThan(0);
       }, { timeout: 5000 });
+      expect(savesSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     const results = await completed;
     for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -297,7 +307,7 @@ describeDatabase("connection assignment synchronization", () => {
     if (source) expect(await db.select().from(toolProfiles).where(eq(toolProfiles.id, source.id))).toEqual([]);
   }, 15000);
 
-  it.each(["connection settings", "profile binding"] as const)("orders AI adoption with concurrent %s using foreign-key-compatible locks", async change => {
+  const adoptionScenario = async (change: "connection settings" | "profile binding", hold: "agent row" | "runtime writer") => {
     const home = await realpath(await mkdtemp(join(tmpdir(), "paperclip-adoption-fixture-")));
     vi.stubEnv("PAPERCLIP_HOME", home);
     vi.stubEnv("PAPERCLIP_INSTANCE_ID", "adoption-fixture");
@@ -323,7 +333,8 @@ describeDatabase("connection assignment synchronization", () => {
       const held = new Promise<void>(resolve => { locked = resolve; });
       const resume = new Promise<void>(resolve => { release = resolve; });
       const blocker = db.transaction(async tx => {
-        await tx.select().from(agents).where(eq(agents.id, lower)).for("no key update");
+        if (hold === "runtime writer") await holdAgentRowThenCompanyRuntimeShared(tx, companyId, lower);
+        else await tx.select().from(agents).where(eq(agents.id, lower)).for("no key update");
         locked(); await resume;
       });
       await held;
@@ -338,15 +349,18 @@ describeDatabase("connection assignment synchronization", () => {
         expect(pids.length).toBeGreaterThan(index);
         const [activity] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
         expect(activity.wait_event_type).toBe("Lock");
+        if (hold === "runtime writer" && index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
       }, { timeout: 5000 });
       const adopt = (client: Db) => connectionIntentService(client).complete(card!.interactionId!, account.connectionId, userId, { validatedAdoption: { agentUpdatedAt: agent.updatedAt, binding: setup.aiConnection! } });
       const first = run(change === "connection settings" ? client => toolAccessService(client, { remoteHttpEndpointLookup: async () => [{ address: "8.8.8.8", family: 4 }] }).updateConnection(connectionId, { name: "Concurrent settings" }) : adopt);
       let second: Promise<PromiseSettledResult<unknown>[]> | undefined;
       const firstResult = Promise.allSettled([first]);
+      let firstSettled = false; void firstResult.then(() => { firstSettled = true; });
       try {
         await waitForLock(0);
         second = Promise.allSettled([run(change === "connection settings" ? adopt : client => toolAccessService(client).bindProfile(bindingProfile!.id, { targetType: "agent", targetId: lower, priority: 100 }, { actorType: "agent", actorId: higher }))]);
         await waitForLock(1);
+        if (hold === "runtime writer") expect(firstSettled).toBe(false); // still waiting when the writer commits
       } finally { release(); await blocker; }
       for (const result of [...await firstResult, ...await second!]) if (result.status === "rejected") throw result.reason;
       expect((await db.select().from(agents).where(eq(agents.id, higher)))[0].runtimeConfig.aiConnection).toEqual(setup.aiConnection);
@@ -355,9 +369,27 @@ describeDatabase("connection assignment synchronization", () => {
       expect(await toolAccessService(db).listConnectionInstalls(account.connectionId, companyId)).toEqual(expect.arrayContaining([expect.objectContaining({ targetType: "agent", targetId: higher })]));
       expect((await intents.setupOptions(card!.interactionId!)).interaction.status).toBe("accepted");
     } finally { release?.(); await rm(home, { recursive: true, force: true }); }
+  };
+  it.each(["profile binding"] as const)("orders AI adoption with concurrent %s using foreign-key-compatible locks", change => adoptionScenario(change, "agent row"), 20000);
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders AI adoption with concurrent connection settings using foreign-key-compatible locks
+  it.each(["connection settings"] as const)("orders AI adoption with concurrent %s behind an in-flight writer's shared company hold", change => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
+    return adoptionScenario(change, "runtime writer");
   }, 20000);
 
-  it.each(["installs", "finish", "activate", "enable", "revive", "reassign"] as const)("orders %s replacement before scoped and company runtime locks", async change => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders installs replacement before scoped and company runtime locks
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders finish replacement before scoped and company runtime locks
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders activate replacement before scoped and company runtime locks
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders enable replacement before scoped and company runtime locks
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders revive replacement before scoped and company runtime locks
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): orders reassign replacement before scoped and company runtime locks
+  it.each(["installs", "finish", "activate", "enable", "revive", "reassign"] as const)("orders %s replacement before scoped and company runtime locks behind an in-flight writer's shared company hold", async change => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
+
     const [lower, higher] = [agentId, peerId].sort();
     await db.update(toolConnections).set({ config: { url: "https://mcp.example.test/mcp" } }).where(eq(toolConnections.id, connectionId));
     const [app] = await db.insert(toolApplications).values({ companyId, name: "Replacement app", type: "mcp_http" }).returning();
@@ -372,7 +404,7 @@ describeDatabase("connection assignment synchronization", () => {
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, lower)).for("no key update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, lower);
       locked(); await resume;
     });
     await held;
@@ -387,8 +419,10 @@ describeDatabase("connection assignment synchronization", () => {
       expect(pids.length).toBeGreaterThan(index);
       const [activity] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
       expect(activity.wait_event_type).toBe("Lock");
+      if (index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
     }, { timeout: 5000 });
     const settings = Promise.allSettled([run(service => service.updateConnection(connectionId, { name: "Ordered replacement settings" }))]);
+    let settingsSettled = false; void settings.then(() => { settingsSettled = true; });
     let replacement: Promise<PromiseSettledResult<unknown>[]> | undefined;
     try {
       await waitForLock(0);
@@ -397,6 +431,7 @@ describeDatabase("connection assignment synchronization", () => {
         : change === "reassign" ? service.deleteProfile(source.id, { force: false, reassignToProfileId: target.id })
           : service.finishGalleryAppConnection(companyId, connection.id, { enabledCatalogEntryIds: [], askFirstCatalogEntryIds: [], access: { agentIds: [change === "finish" ? lower : higher] } }))]);
       await waitForLock(1);
+      expect(settingsSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     for (const result of [...await settings, ...await replacement!]) if (result.status === "rejected") throw result.reason;
     if (change === "installs") expect(await toolAccessService(db).listConnectionInstalls(connection.id, companyId)).toEqual([expect.objectContaining({ targetType: "agent", targetId: lower })]);

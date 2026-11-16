@@ -3,6 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, chatEndpoints, authUsers, heartbeatRuns, issues, companies, companyMemberships, principalPermissionGrants, companySecrets, companySecretBindings, companySecretProviderConfigs, connectionGrants, connectionGrantMembers, connectionGrantDelegations, userSecretDefinitions, createDb, plugins, toolApplications, toolConnections, toolCatalogEntries, toolConnectionInstalls, toolProfiles, toolProfileBindings, resourceLifecycleEvents, type Db } from "@paperclipai/db";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { expectWaitsOnCompanyRuntimeHold, holdAgentRowThenCompanyRuntimeShared } from "./helpers/agent-runtime-hold.js";
 import { toolAccessService } from "../services/tool-access.js";
 import { updateAgentConfigurationInTransaction } from "../services/agent-configuration-transaction.js";
 import { connectionIntentService } from "../services/connection-intents.js";
@@ -66,7 +67,7 @@ describeDatabase("connector access runtime synchronization", () => {
     await service.replaceConnectionGrantMembers(connectionId, grant.id, []);
     expect(await events()).toHaveLength(before + 4);
   });
-  it.each(["uninstall", "uninstall last", "permission save"] as const)("serializes %s with finalization or role changes before runtime locks", async change => {
+  const serializesScenario = async (change: "uninstall" | "uninstall last" | "permission save", hold: "agent row" | "runtime writer") => {
     let first: (client: Db) => Promise<unknown>;
     let second: (client: Db) => Promise<unknown>;
     let memberId: string | undefined;
@@ -87,7 +88,8 @@ describeDatabase("connector access runtime synchronization", () => {
     const held = new Promise<void>(resolve => { locked = resolve; });
     const resume = new Promise<void>(resolve => { release = resolve; });
     const blocker = db.transaction(async tx => {
-      await tx.select().from(agents).where(eq(agents.id, agentId)).for("no key update");
+      if (hold === "runtime writer") await holdAgentRowThenCompanyRuntimeShared(tx, companyId, agentId);
+      else await tx.select().from(agents).where(eq(agents.id, agentId)).for("no key update");
       locked(); await resume;
     });
     await held;
@@ -102,13 +104,16 @@ describeDatabase("connector access runtime synchronization", () => {
       expect(pids.length).toBeGreaterThan(index);
       const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pids[index]}`);
       expect(row.wait_event_type).toBe("Lock");
+      if (hold === "runtime writer" && index === 0) await expectWaitsOnCompanyRuntimeHold(db, pids[index]);
     }, { timeout: 5000 });
     const initial = run(first);
+    let initialSettled = false; void initial.then(() => { initialSettled = true; }, () => { initialSettled = true; });
     let concurrent: Promise<unknown> | undefined;
     try {
       await waitForLock(0);
       concurrent = run(second);
       await waitForLock(1);
+      if (hold === "runtime writer") expect(initialSettled).toBe(false); // still waiting when the writer commits
     } finally { release(); await blocker; }
     const results = await Promise.allSettled([initial, concurrent]);
     for (const result of results) if (result.status === "rejected") throw result.reason;
@@ -125,7 +130,16 @@ describeDatabase("connector access runtime synchronization", () => {
       expect(await accessService(db).getMemberById(companyId, memberId!)).toMatchObject({ membershipRole: "admin" });
       expect(await db.select().from(principalPermissionGrants).where(eq(principalPermissionGrants.companyId, companyId))).toEqual([expect.objectContaining({ permissionKey: "tasks:assign" })]);
     }
+  };
+  it.each(["uninstall", "uninstall last"] as const)("serializes %s with finalization or role changes before runtime locks", change => serializesScenario(change, "agent row"), 15000);
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): serializes permission save with finalization or role changes before runtime locks
+  it.each(["permission save"] as const)("serializes %s with finalization or role changes behind an in-flight writer's shared company hold", change => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
+    return serializesScenario(change, "runtime writer");
   }, 15000);
+
   it.each(["email allowAgent", "connection intent"] as const)("orders outer %s with direct install saves", async caller => {
     let outer: (client: Db) => Promise<unknown>;
     if (caller === "email allowAgent") {
@@ -605,7 +619,12 @@ describeDatabase("connector access runtime synchronization", () => {
     await db.delete(companySecretBindings).where(eq(companySecretBindings.id, binding.id));
     expect((await events()).slice(before).map(event => event.resourceId)).toEqual([agentId, agentId, agentId]);
   });
-  it("allows an agent configuration save to finish while a connector refresh waits on that agent", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL 06:42Z 11-16, #20805): allows an agent configuration save to finish while a connector refresh waits on that agent
+  it("allows an agent configuration save to finish while a connector refresh waits on that agent's in-flight shared company hold", async () => {
+    // Re-targeted (joint addendum 06:43Z): the in-flight per-agent writer holds its agent row and then the
+    // SHARED company runtime hold; the fanout's EXCLUSIVE lock waits on that advisory lock (equally strict),
+    // and it is still waiting when the writer commits (commit order).
+
     const higher = [agentId, peerId].sort().at(-1)!;
     const [secret] = await db.insert(companySecrets).values({ companyId, key: "concurrent", name: "Concurrent fixture" }).returning();
     await db.insert(companySecretBindings).values({ companyId, secretId: secret.id, targetType: "agent", targetId: higher, configPath: "env.FIXTURE" });
@@ -616,6 +635,7 @@ describeDatabase("connector access runtime synchronization", () => {
     const save = db.transaction(async tx => {
       await tx.execute(sql`SET LOCAL lock_timeout = '8s'`);
       await tx.select().from(agents).where(eq(agents.id, higher)).for("update");
+      await holdAgentRowThenCompanyRuntimeShared(tx, companyId, higher);
       locked(); await maySave;
       await updateAgentConfigurationInTransaction(tx as unknown as Db, higher, { adapterConfig: { env: {} } });
     });
@@ -626,12 +646,15 @@ describeDatabase("connector access runtime synchronization", () => {
       started(Number(row.pid));
       await tx.update(toolConnections).set({ enabled: false }).where(eq(toolConnections.id, connectionId));
     });
+    let connectorSettled = false; void connector.then(() => { connectorSettled = true; }, () => { connectorSettled = true; });
     try {
       const pid = await connectorStarted;
       await vi.waitFor(async () => {
         const [row] = await db.execute(sql`SELECT wait_event_type FROM pg_stat_activity WHERE pid = ${pid}`);
         expect(row.wait_event_type).toBe("Lock");
+        await expectWaitsOnCompanyRuntimeHold(db, pid);
       }, { timeout: 5000 });
+      expect(connectorSettled).toBe(false); // still waiting when the writer commits
     } finally { resume(); await Promise.all([save, connector]); }
     expect(await db.select().from(companySecretBindings).where(eq(companySecretBindings.targetId, higher))).toEqual([]);
     expect((await db.select().from(toolConnections).where(eq(toolConnections.id, connectionId)))[0].enabled).toBe(false);
