@@ -17,7 +17,7 @@ import type { VerifiedProjectConnectionProviderScope } from "./project-connectio
 
 type Database = Db | DbTransaction;
 type Connection = typeof toolConnections.$inferSelect;
-type Ref = Readonly<{ secretId: string; configPath: string }>;
+type Ref = Readonly<{ secretId: string; configPath: string; versionSelector?: "latest" | number }>;
 export const PROJECT_APP_APPROVAL_FIELD = "projectAppApproval";
 export const PROJECT_APP_APPROVAL_SOURCE = "projectAppApprovalSourceId";
 export const ROW12_INSTALLER_PLUGIN_KEY = "paperclipai.plugin-row12-installer";
@@ -147,6 +147,23 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
     || !isDeepStrictEqual(grant.credentialSecretRefs, source.credentialSecretRefs)) throw unavailable();
   const keyState = await validateConnectionGrantSecretOwnership(db, source, grant, ref);
   if (keyState.status !== "active" || keyState.deletedAt) throw unavailable();
+  const saved = receiptSchema.safeParse(source.config[PROJECT_APP_APPROVAL_FIELD]);
+  if (input.action === "approve" && saved.success && !saved.data.revokedAt && saved.data.companyId === input.companyId
+    && saved.data.projectId === input.projectId && saved.data.humanUserId === input.userId && saved.data.installationId === config.installationId
+    && (!/^[1-9]\d*$/.test(config.appId) || saved.data.appId === config.appId)
+    && saved.data.secretRef.secretId === ref.secretId && saved.data.secretRef.configPath === ref.configPath) {
+    // A replay has no provider work/token mint and no second durable event.
+    // It still rechecks the current H, classifier and exact source under locks.
+    return db.transaction(async tx => {
+      await responsibleHuman(tx, input.companyId, input.userId, true);
+      const [current] = await tx.select().from(toolConnections).where(and(eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, source.id))).for("update");
+      await assertNotManagerApp(tx, { companyId: input.companyId, refs: source.credentialSecretRefs, appId: config.appId, verifiedAppId: saved.data.appId });
+      if (!current || current.status !== source.status || !isDeepStrictEqual(current.config, source.config) || !isDeepStrictEqual(current.credentialSecretRefs, source.credentialSecretRefs)) {
+        throw conflict("The project App changed during replay", { code: "project_app_approval_state_changed" });
+      }
+      return saved.data;
+    });
+  }
   let proposed: ProjectAppApproval | undefined;
   if (input.action === "approve") {
     const secret = await resolveConnectionGrantSecret(db, source, grant, ref, { actorType: "user", actorId: input.userId, consumerType: "tool_connection", consumerId: source.id });
@@ -201,25 +218,35 @@ export async function writeProjectAppApproval(db: Db, input: { companyId: string
   return result.receipt;
 }
 
-/** Reference-only first-bind preflight. Nothing is written/reserved until H's
- * receipt AND provider facts agree. Repeated DB reader checks fence lock waits. */
-export async function prepareProjectAppFirstBind(db: Db, input: { companyId: string; projectId: string; config: Record<string, unknown>; refs: readonly Ref[]; exclusive: boolean; actorId: string; repositoryIds: readonly number[] }) {
+/** Verify an exact vault reference even on the ordinary create path: a Client
+ * ID alias must not reserve or export the numeric manager App. Values remain
+ * internal to the existing App client; only normalized provider facts leave. */
+export async function verifyGitHubAppCandidate(db: Db, input: { companyId: string; config: Record<string, unknown>; refs: readonly Ref[]; namespace: string; actorId?: string }) {
   const app = parseGitHubAppConfig(input.config.methodConfig);
   await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, appId: app.appId });
   const ref = input.refs[0];
   if (input.refs.length !== 1 || !ref || ref.configPath !== "credentials.privateKey") throw unavailable();
   const [secret] = await db.select().from(companySecrets).where(and(eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId)));
   if (!secret || secret.scope !== "company" || secret.status !== "active" || secret.deletedAt) throw unavailable();
-  const privateKey = await secretService(db).resolveSecretValue(input.companyId, ref.secretId, "latest", {
-    accessContext: { actorType: "agent", actorId: input.actorId, consumerType: "system", consumerId: "project-app-first-bind" },
+  const version = ref.versionSelector ?? "latest";
+  const privateKey = await secretService(db).resolveSecretValue(input.companyId, ref.secretId, version, {
+    accessContext: { actorType: "system", actorId: input.actorId, consumerType: "system", consumerId: "project-app-reference-verification" },
   });
-  const result = await approvalClient.acquire(`${input.companyId}:custody-first-bind:${input.projectId}:${ref.secretId}:${secret.latestVersion}`, app, privateKey, true);
+  const result = await approvalClient.acquire(`${input.companyId}:${input.namespace}:${ref.secretId}:${secret.latestVersion}:${version}`, app, privateKey, true);
   const registrationId = positiveId.safeParse(result.verifiedRegistrationId);
   const ids = repoIds.safeParse((result.github.repositories ?? []).map(repo => Number(repo.id)));
   if (!registrationId.success || !ids.success || result.github.installationIds?.length !== 1 || result.github.installationIds[0] !== app.installationId) throw unavailable();
   const verified: VerifiedProjectConnectionProviderScope = { identity: { companyId: input.companyId, providerHost: "github.com", verifiedRegistrationId: registrationId.data,
-    canonicalInstallationKey: `github.com/github-app-installation/${app.installationId}` }, repositoryIds: sorted(ids.data), secretVersion: secret.latestVersion };
+    canonicalInstallationKey: `github.com/github-app-installation/${app.installationId}` }, repositoryIds: sorted(ids.data), secretVersion: typeof version === "number" ? version : secret.latestVersion };
   await assertNotManagerApp(db, { companyId: input.companyId, refs: input.refs, verifiedAppId: verified.identity.verifiedRegistrationId });
+  return { verified, providerTenant: { github: result.github }, secretVersion: secret.latestVersion };
+}
+
+/** Reference-only first-bind preflight. Nothing is written/reserved until H's
+ * receipt AND provider facts agree. Repeated DB reader checks fence lock waits. */
+export async function prepareProjectAppFirstBind(db: Db, input: { companyId: string; projectId: string; config: Record<string, unknown>; refs: readonly Ref[]; exclusive: boolean; actorId: string; repositoryIds: readonly number[] }) {
+  const { verified, providerTenant, secretVersion } = await verifyGitHubAppCandidate(db, { ...input, namespace: `custody-first-bind:${input.projectId}` });
+  const ref = input.refs[0]!;
   if (!isDeepStrictEqual(sorted(input.repositoryIds), sorted(verified.repositoryIds))) throw unavailable();
   const custody = await readProjectAppCustody(db, { ...input, registrationId: verified.identity.verifiedRegistrationId, repositoryIds: verified.repositoryIds });
   const [project] = await db.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId)));
@@ -228,5 +255,5 @@ export async function prepareProjectAppFirstBind(db: Db, input: { companyId: str
   const scope: ProjectConnectionScope = { version: 1, installationKey: verified.identity.canonicalInstallationKey, registrationId: verified.identity.verifiedRegistrationId,
     exclusive: input.exclusive, approvedLeadAgentId: project.leadAgentId, approvedByAgentId: input.actorId, responsibleUserId: custody.receipt.humanUserId,
     approvedRepositoryIds: [...verified.repositoryIds], approvedSecretRefs: [{ secretId: ref.secretId, configPath: ref.configPath }] };
-  return { custody, verified, providerTenant: { github: result.github }, config: { ...input.config, projectScope: scope, [PROJECT_APP_APPROVAL_SOURCE]: custody.sourceConnectionId }, secretVersion: secret.latestVersion };
+  return { custody, verified, providerTenant, config: { ...input.config, projectScope: scope, [PROJECT_APP_APPROVAL_SOURCE]: custody.sourceConnectionId }, secretVersion };
 }
