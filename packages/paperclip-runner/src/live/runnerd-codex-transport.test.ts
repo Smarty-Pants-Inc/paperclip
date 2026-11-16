@@ -7443,12 +7443,16 @@ describe("runner exits that must not relaunch on the same path (#20825)", () => 
     return { directory, bundle, launch, children, exits, notifications, drain, failure: () => failure, diagnostics, cleanup };
   }
 
-  it("does not relaunch an idle warm owner's runner after its run settled", async () => {
+  // Superseded setup (#20825 loopfix3, RFL + review-fleet-2 08:31Z): B is gated
+  // on the server's "owner released to idle" fact, so this RED's finished run is
+  // now released to idle first, as the server's warm release does.
+  it("does not relaunch an idle warm owner's runner after its run settled and the server released it to idle", async () => {
     const owner = await startOwner({ mode: "warm",
       replacement: () => preAuthExit({ lifecycle: "recoverable_failure", recoverableFailure: "connection_refused" }) });
     try {
       await owner.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Finish, then stay warm." }] });
       for (;;) if ((await owner.notifications.next()).value?.method === "turn/completed") break;
+      await owner.bundle.transport.release!();
       owner.drain();
       fakeClock();
       owner.children[0]!.kill("SIGKILL");
@@ -7620,13 +7624,46 @@ describe("a runnerd death between two turns of the same run (#20825 B)", () => {
     }
   }, 60_000);
 
-  it("fails by name, never relaunches, when runnerd dies before turn 2 is sent, and a same-run resume keeps the session", async () => {
+  // #20825 loopfix3: the "released to idle" fact ends when the owner takes a
+  // turn again. A runner death after that turn reconnects; it is never stood down.
+  it("reconnects a released owner that took another turn, and accepts the next turn", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "runnerd-between-turns-rereleased-"));
+    const run = await startRun(directory);
+    try {
+      await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 1." }] });
+      await run.turnCompleted();
+      await run.bundle.transport.release!();
+      await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 2 after the release." }] });
+      await run.turnCompleted();
+      run.children[0]!.kill("SIGKILL");
+      await run.exits[0];
+      await vi.waitFor(() => expect(run.bundle.evidence().diagnostics
+        .some(line => /restored its durable PRP session/.test(line))).toBe(true), { timeout: 30_000, interval: 50 });
+      await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 3." }] });
+      await run.turnCompleted();
+      expect(run.launch).toHaveBeenCalledTimes(2);
+      expect(run.bundle.evidence().diagnostics.some(line => line.startsWith("native_runner_idle_warm_owner_exited"))).toBe(false);
+      const calls = (await readFile(join(directory, "calls.log"), "utf8")).trim().split(/\r?\n/);
+      expect(calls.filter(call => call === "thread/start")).toHaveLength(1);
+      expect(calls.filter(call => call === "turn/start")).toHaveLength(3);
+    } finally {
+      await run.cleanup();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  // Superseded (#20825 loopfix3, RFL + review-fleet-2 08:31Z): a live run between
+  // two turns now reconnects (the RFL judge probe "B edge" in
+  // runnerd-codex-transport-judge-20825.test.ts). B's named stand-down needs the
+  // server's "owner released to idle" fact, so this test releases the owner first.
+  it("fails by name, never relaunches, when runnerd dies after the server released the owner to idle, and a resume keeps the session", async () => {
     const directory = await mkdtemp(join(tmpdir(), "runnerd-between-turns-idle-"));
     const run = await startRun(directory);
     let resumed: ReturnType<typeof createCapabilityRunnerdCodexTransport> | undefined;
     try {
       await run.bundle.transport.request("turn/start", { input: [{ type: "text", text: "Turn 1." }] });
       await run.turnCompleted();
+      await run.bundle.transport.release!();
       run.children[0]!.kill("SIGKILL");
       await run.exits[0];
       // The provider-facing stream closes with the named cause (never silent).
