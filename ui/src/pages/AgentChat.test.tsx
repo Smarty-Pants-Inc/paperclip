@@ -45,7 +45,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   api.enabled = true;
   api.listChats.mockResolvedValue([{ id: "member-chat", companyId: "company-a", conversationAgentId: agentId, conversationUserId: "member-b", title: "Launch plan", updatedAt: "2026-11-15T12:00:00Z" }]);
-  api.directory.mockResolvedValue({ users: [{ id: "member-b", name: "Member B" }] });
+  api.directory.mockResolvedValue({ users: [{ principalId: "member-b", status: "active", user: { id: "member-b", name: "Member B" } }] });
   client = new QueryClient({ defaultOptions: { queries: { retry: false, retryOnMount: false, staleTime: Infinity, gcTime: Infinity } } });
   client.setQueryData(queryKeys.auth.session, { user: { id: "viewer-a" } });
   api.session.mockResolvedValue({ user: { id: "viewer-a" } });

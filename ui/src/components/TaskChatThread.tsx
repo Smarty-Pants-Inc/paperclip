@@ -450,6 +450,7 @@ function resolvedWithoutUserFacingResponse(value: unknown): boolean {
 
 export type TaskChatThreadProps = ComponentProps<typeof IssueChatThread> & {
   conversationMode?: boolean;
+  conversationOwnerId?: string | null;
   creationActivity?: ActivityEvent[];
   createdTasks?: Issue[];
   compactHistory?: boolean;
@@ -525,7 +526,25 @@ function durableInputLabel(
  * to the tool history. Turns without a reply bubble keep the standalone
  * folded row. flag-OFF remains byte-for-byte IssueChatThread.
  */
-export function TaskChatThread(props: TaskChatThreadProps) {
+export function TaskChatThread(inputProps: TaskChatThreadProps) {
+  const readOnlyConversation = Boolean(inputProps.conversationMode && inputProps.conversationOwnerId
+    && inputProps.conversationOwnerId !== "draft" && inputProps.conversationOwnerId !== (inputProps.currentUserId ?? "local-board"));
+  const readOnlyReason = `Only ${inputProps.userLabelMap?.get(inputProps.conversationOwnerId ?? "") ?? "the owner"} can send in this conversation.`;
+  const props: TaskChatThreadProps = readOnlyConversation ? {
+    ...inputProps, showComposer: false, composerDisabledReason: readOnlyReason,
+    onAdd: async () => { throw new Error(readOnlyReason); },
+    onVote: undefined, onDeleteComment: undefined, onCancelRun: undefined, onStopRun: undefined,
+    onWorkModeChange: undefined, onAttachImage: undefined, imageUploadHandler: undefined,
+    onAcceptInteraction: undefined, onRejectInteraction: undefined, onSubmitInteractionAnswers: undefined,
+    onCancelInteraction: undefined, onSkipInteraction: undefined, onSubmitInteractionVerdicts: undefined,
+    onDismissInteraction: undefined, onRetryFailedRun: undefined, onTryAgainNoLiveExecutionPath: undefined,
+    onResumeAssignee: undefined, onResumeFromBacklog: undefined, onInterruptQueued: undefined,
+    onCancelQueued: undefined, onEditQueuedComment: undefined, onReorderQueuedComments: undefined,
+    onSteerQueuedComment: undefined, onDiscardQueuedComment: undefined, runFinalizationActions: undefined,
+    onResolveRecoveryAction: undefined, onReissueIsolatedRecoveryAction: undefined,
+    onReconcileForwardRecoveryAction: undefined, onBreakGlassOverrideRecoveryAction: undefined,
+    onQuarantineRestoreRecoveryAction: undefined,
+  } : inputProps;
   const coordinatorEnabled = useCoordinatorPresentation();
   // Each run's reasoning display is its adapter's declared default
   // (reasoning-display.ts). No per-chat switch and no per-browser choice.
@@ -659,9 +678,10 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       : onRetryFailedRun;
   const canRetryFailedRun = Boolean(retryFailedRunHandler);
   const queryClient = useQueryClient();
-  const decisionReceipts = useCoordinatorChatDecisionReceipts(issueId, conversationMode);
-  const pendingQuestions = useCoordinatorChatPendingQuestions(issueId, conversationMode);
-  const taskHandoffs = useCoordinatorChatTaskHandoffs(issueId, conversationMode === true);
+  const ownConversation = conversationMode === true && !readOnlyConversation;
+  const decisionReceipts = useCoordinatorChatDecisionReceipts(issueId, ownConversation);
+  const pendingQuestions = useCoordinatorChatPendingQuestions(issueId, ownConversation);
+  const taskHandoffs = useCoordinatorChatTaskHandoffs(issueId, ownConversation);
   const scrollingHistory: ScrollingHistory | undefined = props.scrollingHistory ? {
     hasMore: props.scrollingHistory.hasMore || !!decisionReceipts.hasNextPage || !!taskHandoffs.hasNextPage,
     loading: props.scrollingHistory.loading || decisionReceipts.isFetchingNextPage || taskHandoffs.isFetchingNextPage,
@@ -3039,7 +3059,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
     (item: TaskChatInteractionItem) => (
       <TaskChatInteractionCard
         item={item}
-        onReviewRequest={reopenToolReview}
+        onReviewRequest={readOnlyConversation ? undefined : reopenToolReview}
         showUnansweredQuestion
         showPendingRequest
         planDocument={planDocument}
@@ -3082,6 +3102,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       settledRunIds,
       tailRunId,
       reopenToolReview,
+      readOnlyConversation,
     ],
   );
 
@@ -3589,9 +3610,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                                         paperclipRunnerTail &&
                                         tailTimelineAnchors.length > 0
                                       }
-                                      onRuntimeRequestDecision={
-                                        handleRuntimeRequestDecision
-                                      }
+                                      onRuntimeRequestDecision={readOnlyConversation ? undefined : handleRuntimeRequestDecision}
                                     />
                                   ) : (
                                     <TaskChatShimmerScope items={tailItems}>
@@ -3669,6 +3688,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
                 />
               </div>
             ) : null}
+            {readOnlyConversation && <p role="note" className="mx-auto w-full max-w-(--tc-shell-max-w) px-4 py-4 text-sm text-muted-foreground">{readOnlyReason}</p>}
             {showComposer ? (
               <TaskChatComposerDock mobile={isMobile} streamlined={streamlinedUiEnabled} concealed={!historyRevealed}>
                 {prepareInitialContent ? (

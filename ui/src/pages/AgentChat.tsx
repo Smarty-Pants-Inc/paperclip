@@ -1,8 +1,12 @@
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { agentChatsApi } from "@/api/agentChats";
 import { agentsApi } from "@/api/agents";
 import { authApi } from "@/api/auth";
+import { accessApi } from "@/api/access";
+import { Button } from "@/components/ui/button";
+import { CoordinatorRelativeTime } from "@/components/coordinator/CoordinatorRelativeTime";
+import { buildCompanyUserLabelMap } from "@/lib/company-members";
 import { QueryErrorState, useQueryView } from "@/components/QueryView";
 import { useCompany } from "@/context/CompanyContext";
 import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
@@ -54,6 +58,22 @@ export function AgentChat() {
     },
     enabled: enabled && !!agent && session.isFetched,
   });
+  const [memberScope, setMemberScope] = useState<"mine" | "all">("mine");
+  const [offset, setOffset] = useState(0);
+  useEffect(() => { setMemberScope("mine"); setOffset(0); }, [selectedCompanyId, userId, agent?.id]);
+  const allChats = useQuery({
+    queryKey: [...queryKeys.agentChats.list(selectedCompanyId, userId), "all", agent?.id, offset],
+    queryFn: () => agentChatsApi.list(selectedCompanyId!, { agentId: agent!.id, members: "all", limit: 50, offset }),
+    enabled: enabled && !!agent && session.isSuccess && memberScope === "all",
+  });
+  const directory = useQuery({
+    queryKey: queryKeys.access.companyUserDirectory(selectedCompanyId!),
+    queryFn: () => accessApi.listUserDirectory(selectedCompanyId!),
+    enabled: !!selectedCompanyId && memberScope === "all",
+  });
+  const ownerNames = useMemo(() => buildCompanyUserLabelMap(directory.data?.users), [directory.data?.users]);
+  const allChatsView = useQueryView(allChats);
+  const directoryView = useQueryView(directory);
   const sessionView = useQueryView(session);
   const historyView = useQueryView(historyAgent);
   const chatView = useQueryView(chat);
@@ -117,9 +137,34 @@ export function AgentChat() {
       <p className="text-sm text-muted-foreground">Loading conversation…</p>
     );
   return (
-    <TaskDetailSurface
-      key={`${agent.id}:${userId}`}
-      conversation={{ agent, issue: chat.data ?? null, ensureIssue }}
-    />
+    <div className="flex h-full min-h-0 flex-col">
+      <div role="group" aria-label="Conversation members" className="flex shrink-0 gap-1 px-4 py-2">
+        <Button size="sm" variant={memberScope === "mine" ? "secondary" : "ghost"} aria-pressed={memberScope === "mine"} onClick={() => setMemberScope("mine")}>Mine</Button>
+        <Button size="sm" variant={memberScope === "all" ? "secondary" : "ghost"} aria-pressed={memberScope === "all"} onClick={() => setMemberScope("all")}>All members</Button>
+      </div>
+      {memberScope === "mine" ? <div className="flex min-h-0 flex-1 flex-col">
+        <TaskDetailSurface key={`${agent.id}:${userId}`} conversation={{ agent, issue: chat.data ?? null, ensureIssue }} />
+      </div> : <section aria-label={`Conversations with ${agent.name}`} className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-4 py-4">
+        <h1 className="text-lg font-semibold">Conversations with {agent.name}</h1>
+        {allChatsView.kind === "error" ? <QueryErrorState error={allChats.error} action="load conversations" onRetry={allChatsView.retry} />
+          : directoryView.kind === "error" ? <QueryErrorState error={directory.error} action="load member names" onRetry={directoryView.retry} />
+          : allChats.isPending || directory.isPending ? <p role="status" className="text-sm text-muted-foreground">Loading conversations…</p>
+          : <>
+            <ul className="flex flex-col gap-2">
+              {allChats.data?.map(item => <li key={item.id}>
+                <Link to={`/issues/${item.identifier ?? item.id}`} className="flex flex-wrap items-center justify-between gap-2 rounded-lg p-3 hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  <span className="flex min-w-0 flex-col gap-1"><span className="break-words text-sm font-medium">{item.title}</span><span className="text-sm text-muted-foreground">{ownerNames.get(item.conversationUserId ?? "") ?? "Company member"}</span></span>
+                  <CoordinatorRelativeTime value={item.updatedAt} className="shrink-0 text-xs text-muted-foreground" />
+                </Link>
+              </li>)}
+            </ul>
+            {!allChats.data?.length && <p className="text-sm text-muted-foreground">No shared conversations on this page.</p>}
+            <div className="flex gap-2">
+              {offset > 0 && <Button variant="ghost" size="sm" onClick={() => setOffset(value => Math.max(0, value - 50))}>Previous</Button>}
+              {allChats.data?.length === 50 && <Button variant="ghost" size="sm" onClick={() => setOffset(value => value + 50)}>Next</Button>}
+            </div>
+          </>}
+      </section>}
+    </div>
   );
 }
