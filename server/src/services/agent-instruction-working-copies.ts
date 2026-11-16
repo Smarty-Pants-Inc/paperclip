@@ -5,7 +5,7 @@ import { notifyInstructionCommit, type InstructionCommitScope } from "./instruct
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import type { createDeliveryWorkCoordinator } from "./delivery-work-coordinator.js";
 import { registerScopedDeadlineWork } from "./scoped-deadline-work.js";
-import { AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService, isAgentDirectoryCopy } from "./agent-directory-working-copies.js";
+import { AgentDirectoryOperationBusyError, agentDirectoryWorkingCopyService, isAgentDirectoryCopy, trackAgentFileCheckpoint } from "./agent-directory-working-copies.js";
 import { createHash } from "node:crypto";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -295,9 +295,12 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
       return true;
     } catch { return true; }
   }
-  async function checkpointWarm(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null }) {
-    const row = await get(input.companyId, input.runId);
-    return row && isAgentDirectoryCopy(row) ? directories.checkpointWarm(row, input.target) : row;
+  function checkpointWarm(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null }) {
+    // Register before the first DB read, not only once directory capture starts.
+    return trackAgentFileCheckpoint((async () => {
+      const row = await get(input.companyId, input.runId);
+      return row && isAgentDirectoryCopy(row) ? directories.checkpointWarm(row, input.target) : row;
+    })());
   }
 
   async function acknowledgeExplicitSave(input: { companyId: string; agentId: string; runId: string; entryFile: string; revisionId: string; contentHash: string }) {
@@ -335,7 +338,7 @@ export function agentInstructionWorkingCopyService(db: Db, options: { environmen
 
   /** Caller must have joined the owned provider process before granting this proof. */
   function collectStopped(input: { companyId: string; runId: string; target?: AdapterExecutionTarget | null }): Promise<Copy | null> {
-    return serializeCopySave(db, input.companyId, input.runId, () => collectStoppedOnce(input));
+    return trackAgentFileCheckpoint(serializeCopySave(db, input.companyId, input.runId, () => collectStoppedOnce(input)));
   }
   async function collectStoppedOnce(input: Parameters<typeof collectStopped>[0]) {
     let row = await get(input.companyId, input.runId);

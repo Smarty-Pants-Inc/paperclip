@@ -27,6 +27,11 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { gzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import fs from "node:fs/promises";
+import * as checkpointFiles from "../services/agent-file-checkpoints.js";
+import * as agentFiles from "../services/agent-file-store.js";
+import { agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
+import { directorySnapshotSha256, serializeDirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 
 const cloudRuntimeStartupMocks = vi.hoisted(() => ({
   initialize: vi.fn(async () => null),
@@ -1790,6 +1795,113 @@ describe("startServer feedback export wiring", () => {
       await vi.waitFor(() => expect(issueThreadInteractionServiceMock.mergedPullRequestConfirmationPage).toHaveBeenCalled());
       await settleStartupHousekeeping(); expect(started).toBe(true); expect(getStartupRecoveryState().phase).toBe("ready");
     } finally { release(); await starting; timer.mockRestore(); }
+  });
+
+  // Keep: data safety regression for CONNECTION_ENDED after successful native
+  // detach. Capture and directory collection are real; store/pool boundaries are
+  // doubles here. The PostgreSQL checkpoint suite covers durable receipt writes.
+  it.each(["warm turn", "session close", "deadline"] as const)("joins a held agent-file checkpoint before pool.end on hot restart (%s)", async source => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ heartbeatSchedulerEnabled: true }));
+    const events: string[] = [];
+    let poolEnded = false;
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const capturing = new Promise<void>(resolve => { entered = resolve; });
+    let releaseExecution!: () => void;
+    const execution = new Promise<undefined>(resolve => { releaseExecution = () => resolve(undefined); });
+    const drainRuns = vi.fn(async () => undefined);
+    const drainExecutions = vi.fn(() => execution);
+    const heartbeat = { ...heartbeatServiceMock,
+      drainActiveRunExecutions: drainExecutions,
+      drainRunningRunsForShutdown: drainRuns,
+      prepareHotRestartShutdown: vi.fn(async () => ({ skipDrain: true, detachedRunIds: ["checkpoint-run"] })),
+    };
+    heartbeatServiceFactoryMock.mockReturnValueOnce(heartbeat);
+    const interval = vi.spyOn(globalThis, "setInterval").mockImplementation(() => 1 as unknown as ReturnType<typeof setInterval>);
+    const home = await fs.mkdtemp(path.join(tmpdir(), "shutdown-agent-files-"));
+    const localRoot = path.join(home, "file-sync", "runs", "checkpoint-run", "live");
+    const canonical = path.join(home, "canonical");
+    await fs.mkdir(localRoot, { recursive: true });
+    await fs.mkdir(canonical);
+    await fs.writeFile(path.join(canonical, "AGENTS.md"), "before");
+    const { snapshot } = await agentFiles.inspectAgentDirectory(canonical);
+    await fs.writeFile(path.join(localRoot, "AGENTS.md"), "saved before pool close");
+    await fs.writeFile(path.join(path.dirname(localRoot), "owner.json"), JSON.stringify({ runId: "checkpoint-run" }));
+    type Copy = Parameters<ReturnType<typeof agentDirectoryWorkingCopyService>["checkpointWarm"]>[0];
+    let row: Copy = { companyId: "checkpoint-company", agentId: "checkpoint-agent", runId: "checkpoint-run", localRoot,
+      responsibleUserId: "checkpoint-editor", baseRevisionId: null, candidateBase64: null, candidateHash: null,
+      attempts: 0, nextAttemptAt: null, errorCode: null, errorMessage: null, createdAt: new Date(), updatedAt: new Date(),
+      executionRoot: localRoot, location: "local", state: "prepared", entryFile: "AGENTS.md", baseHash: directorySnapshotSha256(snapshot),
+      receipt: { schema: "paperclip.agent-files.v1", warm: true, baseline: serializeDirectorySnapshot(snapshot) },
+      processStoppedAt: null };
+    const patch = async (_row: Copy, values: Partial<Copy>) => {
+      if (poolEnded) throw new Error("CONNECTION_ENDED");
+      row = { ...row, ...values };
+      if (values.candidateHash) events.push("checkpoint_receipt");
+      return row;
+    };
+    const store = vi.spyOn(agentFiles, "agentFileStore").mockReturnValue({
+      apply: async (input: { sourceDir: string }) => {
+        if (poolEnded) throw new Error("CONNECTION_ENDED");
+        await fs.copyFile(path.join(input.sourceDir, "AGENTS.md"), path.join(canonical, "AGENTS.md"));
+        events.push("checkpoint_saved");
+        return { storageWarning: null };
+      },
+    } as unknown as ReturnType<typeof agentFiles.agentFileStore>);
+    const capture = checkpointFiles.captureAgentFileCheckpoint;
+    const hold = vi.spyOn(checkpointFiles, "captureAgentFileCheckpoint").mockImplementation(async input => {
+      const captured = await capture(input);
+      events.push("checkpoint_held");
+      entered();
+      await held;
+      return captured;
+    });
+    const directories = agentDirectoryWorkingCopyService({} as Db, async () => row, patch);
+    let checkpoint: Promise<Copy> | undefined;
+    let stopping: Promise<void> | undefined;
+    try {
+      const server = await startServer();
+      await settleStartupHousekeeping();
+      const end = vi.fn(async () => { poolEnded = true; events.push("pool_end"); });
+      for (const result of createDbMock.mock.results) Object.assign(result.value, { $client: { end } });
+      checkpoint = source === "session close" ? directories.collectStopped(row) : directories.checkpointWarm(row);
+      void checkpoint.catch(() => {}); // The RED/timeout path rejects after pool.end.
+      await capturing;
+      if (source === "deadline") vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+      stopping = server.shutdown();
+      await settleStartupHousekeeping();
+      expect(drainRuns).not.toHaveBeenCalled();
+      expect(drainExecutions).not.toHaveBeenCalled();
+      expect(end, events.join(" -> ")).not.toHaveBeenCalled();
+      if (source === "deadline") {
+        await vi.advanceTimersByTimeAsync(29_999);
+        expect(end).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(1);
+        await stopping;
+        expect(end).toHaveBeenCalled();
+        expect(logger.info).toHaveBeenCalledWith(
+          { signal: "SIGTERM", timeoutMs: 30_000 }, "bounded heartbeat execution finalizer drain timed out",
+        );
+        return; // The retained bound intentionally permits teardown at 30 s.
+      }
+      release();
+      await checkpoint;
+      await stopping;
+      expect(await fs.readFile(path.join(canonical, "AGENTS.md"), "utf8")).toBe("saved before pool close");
+      expect(events.indexOf("checkpoint_saved")).toBeLessThan(events.indexOf("checkpoint_receipt"));
+      expect(events.indexOf("checkpoint_receipt")).toBeLessThan(events.indexOf("pool_end"));
+      expect(end).toHaveBeenCalled();
+    } finally {
+      release();
+      releaseExecution();
+      await Promise.allSettled([checkpoint, stopping]);
+      vi.useRealTimers();
+      hold.mockRestore();
+      store.mockRestore();
+      interval.mockRestore();
+      await fs.rm(home, { recursive: true, force: true });
+    }
   });
 
   it.each([false, true])("joins timed-out workspace repairs before teardown with hot-restart skipDrain=%s", async skipDrain => {
