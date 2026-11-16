@@ -6366,6 +6366,24 @@ async function priorOwnerFinishedExceptLifecycleCommands(input: Parameters<typeo
     sameRun: input.execution.provider.kind === "pi_rpc" };
 }
 
+/** The lineage record of a same-run fresh thread (J3-17, no second shape): the
+ * run that starts the thread notes it durably for THIS box, exactly as
+ * restart-up's replacement and a new-box fresh start do; the box's first
+ * suspended read (idle close, checkpoint or host preparation, before or after
+ * a restart) appends the step { the old backup's identity -> the new thread }
+ * through appendProviderIdentityReset in the module's lock order. */
+async function noteSameRunFreshThread(input: { db: Db; execution: NativeExecutionInput;
+  runnerExecutionTarget?: AdapterExecutionTarget | null; onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void> }): Promise<void> {
+  const target = input.runnerExecutionTarget;
+  const providerLeaseId = target?.kind === "remote" && target.transport === "sandbox"
+    ? target.sandboxLeaseAcquisition?.providerLeaseId ?? null : null;
+  if (!(await noteProviderIdentityBreak(input.db, providerIdentityLineageScope(input.execution), "forced_fresh_session",
+    input.execution.binding.runId, providerLeaseId))) {
+    await input.onLog?.("stderr", "[paperclip-runner] the fresh provider thread could not be noted durably; "
+      + "a restart before its first checkpoint will refuse it as provider_identity_changed.\n");
+  }
+}
+
 /** The continuation note for a same-run fresh thread: one per set-aside owner,
  * through the typed history-loss notice helper, superseding the conversation's
  * held notice. Replays add none. */
@@ -6819,9 +6837,7 @@ async function migrateRunnerdStateRootForExecution(input: {
         // pinned hold only in WHEN the fresh thread starts (Boat stops and keeps
         // the old box where upstream destroys it, as in ad011851).
         if (freshThread?.sameRun && !existsSync(scoped) && input.onSameRunFreshThread) {
-          // TODO(J3-17): append this fresh thread through provider-identity-lineage.ts
-          // (fork dl/identity-changed a78c402c) once it is on this base; until then
-          // the existing continuity-break event is the record (no second shape).
+          await noteSameRunFreshThread(input);
           await input.onLog?.("stderr", `[paperclip-runner] provider session continuity break: prior owner ${freshThread.priorRunId} `
             + `set aside (${freshThread.refusal}); old provider session=${freshThread.previousProviderSessionId ?? "unavailable"}, `
             + "continuing this run in a fresh thread\n");
