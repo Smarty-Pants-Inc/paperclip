@@ -675,6 +675,9 @@ describe("AgentMail durable email pipeline", () => {
       .where(eq(issueComments.companyId, f.companyId));
     expect(comments).toHaveLength(1);
     expect(comments[0].body).toContain("\\!\\[tracker\\]");
+    // smarty-dev#20830: inbound email is outside text, written low-trust with its source named.
+    expect(comments[0].sourceTrust).toMatchObject({ preset: "low_trust_review", disposition: "quarantined", sourceIssueId: comments[0].issueId });
+    expect(comments[0].metadata).toMatchObject({ externalSource: { channel: "email", sender: expect.stringContaining("sender@example.test") } });
   });
   it("persists an email child and immutable intent before sending and deduplicates retries", async () => {
     const f = await fixture();
