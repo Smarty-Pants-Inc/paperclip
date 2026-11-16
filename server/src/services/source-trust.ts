@@ -71,6 +71,27 @@ export function buildLowTrustSourceTrust(input: {
   };
 }
 
+/**
+ * Comment metadata naming the outside source of a system comment that quotes
+ * outside text (inbound email, chat edit notice). Description only, never
+ * authorization; pair it with buildLowTrustSourceTrust (smarty-dev#20830).
+ */
+export function externalSourceCommentMetadata(input: { channel: string; sender: string | null | undefined }) {
+  const channel = input.channel.trim().slice(0, 40) || "unknown";
+  const sender = input.sender?.trim().slice(0, 320) || null;
+  return {
+    version: 1 as const,
+    externalSource: { channel, sender },
+    sections: [{
+      title: "Outside sender",
+      rows: [
+        { type: "key_value" as const, label: "Channel", value: channel },
+        ...(sender ? [{ type: "key_value" as const, label: "Sender", value: sender }] : []),
+      ],
+    }],
+  };
+}
+
 export function buildPromotedSourceTrust(input: {
   sourceIssueId: string;
   sourceArtifactKind: "comment" | "document" | "work_product" | "issue";

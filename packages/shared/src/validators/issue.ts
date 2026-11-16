@@ -1178,6 +1178,12 @@ export const issueCommentMetadataSchema = z
     // points the previous one at it instead of rewriting conversation history.
     supersededByCommentId: z.uuid().optional(),
     sourceChannel: z.enum(CHAT_PROVIDERS).optional(),
+    // Names the outside source of quoted outside text (inbound email, chat edit);
+    // description only, never authorization (smarty-dev#20830).
+    externalSource: z.object({
+      channel: z.string().trim().min(1).max(40),
+      sender: z.string().max(320).nullable(),
+    }).strict().optional(),
     sourceRunId: z.string().guid().nullable().optional(),
     authorizationReason: z
       .string()

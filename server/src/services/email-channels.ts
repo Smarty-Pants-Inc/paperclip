@@ -51,6 +51,7 @@ import { secretService } from "./secrets.js";
 import { authorizationService } from "./authorization.js";
 import { assertChatTaskCreationAccess, resolveChatExecutionDefaults } from "./chat-execution-defaults.js";
 import { issueService } from "./issues.js";
+import { buildLowTrustSourceTrust, externalSourceCommentMetadata } from "./source-trust.js";
 import { logActivity } from "./activity-log.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { toolAccessPolicyService } from "./tool-access-policy.js";
@@ -1146,7 +1147,15 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
       conversation.issueId,
       `**${direction === "inbound" ? "Email from" : "Email sent by"} ${plainEmailMarkdown(message.from)}**\n\n${plainEmailMarkdown(emailText(message)) || "(No text body)"}`,
       {},
-      { authorType: "system" },
+      // smarty-dev#20830: inbound email is outside text. Mark it low-trust with its
+      // source named, so history shows it as external_message, never the person.
+      direction === "inbound"
+        ? {
+            authorType: "system",
+            sourceTrust: buildLowTrustSourceTrust({ issueId: conversation.issueId }),
+            metadata: externalSourceCommentMetadata({ channel: "email", sender: message.from }),
+          }
+        : { authorType: "system" },
       tx,
     );
     const attachments = await importAttachments(
