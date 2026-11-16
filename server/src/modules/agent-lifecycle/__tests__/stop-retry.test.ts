@@ -140,9 +140,8 @@ describe("bounded lifecycle Stop recovery", () => {
       for (let attempt = 0; attempt < 11; attempt++) { await due(agent.id); await worker.process(agent.id); }
       const row = await current(agent.id);
       expect(row.lifecycleState).toBe("pausing");
-      expect(row.lifecycleOperation).toMatchObject({ pendingPasses: 11 });
+      expect(row.lifecycleOperation).toMatchObject({ pendingPasses: 11, pendingReason: "legacy_stop_unproven" });
       expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
-      expect(row.lifecycleOperation?.pendingReason).toBe("legacy_stop_unproven");
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("cancelled");
       expect(await store.pending(100, new Date(Date.now() + 86_400_000))).toContain(agent.id);
       // Confirmed stop completes automatically, without an operator Retry.
