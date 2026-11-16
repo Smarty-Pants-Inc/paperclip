@@ -654,7 +654,17 @@ export async function withManagedAiProbe<T>(
         agentId: input.agentId,
         ...(typeof retryCleanup === "function" ? { retryRetirement: () => retryCleanup.call(error) } : {}) });
       try {
-        logger.warn({ code: "native_probe_cleanup_pending", accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey) },
+        // DIAGNOSTIC (log only): name the failing teardown steps. Only our own
+        // fixed-template messages ("Native ...", "Pi ...", native_/runner_ codes) are
+        // logged; anything else is reduced to its error class.
+        const describe = (failure: unknown) => {
+          const message = failure instanceof Error ? failure.message : "";
+          return /^(?:Native |Pi |native_|runner_)[A-Za-z0-9 _,.;:'()-]{1,200}$/.test(message) ? message
+            : `other:${failure instanceof Error ? failure.name : typeof failure}`;
+        };
+        logger.warn({ code: "native_probe_cleanup_pending", accountKeyHash: retainedAiAccountKeyHash(runtime.retainedCleanupScope!.accountKey),
+          agentId: input.agentId, cleanupSteps: error.cleanupErrors.map(describe),
+          operationError: error.operationError === undefined ? null : describe(error.operationError) },
           "Native AI probe cleanup remains pending");
       } catch { /* Diagnostics must not change the HTTP response. */ }
       throw unprocessable("The native account test is still cleaning up. Retry after runtime cleanup completes.", { code: "native_probe_cleanup_pending" });
