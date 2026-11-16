@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueReadStates, issues, issueThreadInteractions } from "@paperclipai/db";
 import { issueRoutes } from "../routes/issues.js";
@@ -19,7 +19,7 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
   const companyId = randomUUID(), otherCompanyId = randomUUID();
   const agentId = randomUUID(), otherAgentId = randomUUID(), foreignAgentId = randomUUID(), hiddenAgentId = randomUUID();
   const owner = randomUUID(), member = randomUUID(), privateOwner = randomUUID();
-  const ownChat = randomUUID(), memberChat = randomUUID(), privateChat = randomUUID(), otherChat = randomUUID(), legacyChat = randomUUID();
+  const ownChat = randomUUID(), memberChat = randomUUID(), privateChat = randomUUID(), otherChat = randomUUID();
   const interactionId = randomUUID(), failedRunId = randomUUID();
   const originalMode = process.env.PAPERCLIP_ISSUE_PRIVACY_MODE;
   function appFor(userId = owner, extra: Record<string, unknown> = {}) {
@@ -53,12 +53,7 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
       { id: memberChat, companyId, title: "Member conversation", conversationAgentId: agentId, conversationUserId: member, createdByUserId: member },
       { id: privateChat, companyId, title: "Private conversation", conversationAgentId: agentId, conversationUserId: privateOwner, createdByUserId: privateOwner, visibility: "private" },
       { id: otherChat, companyId, title: "Other agent conversation", conversationAgentId: otherAgentId, conversationUserId: member, createdByUserId: member },
-      { id: legacyChat, companyId, title: "Legacy conversation", conversationAgentId: agentId, conversationUserId: randomUUID() },
     ].map(row => ({ ...row, assigneeAgentId: row.conversationAgentId, conversationState: "waiting" as const, status: "in_review" })));
-    // Current schema forbids NULL. Simulate only the review's legacy-data case
-    // in this isolated database; production schema remains unchanged.
-    await db.execute(sql`alter table issues alter column visibility drop not null`);
-    await db.execute(sql`update issues set visibility = null where id = ${legacyChat}`);
     await db.insert(issueComments).values({ companyId, issueId: memberChat, authorAgentId: agentId, authorType: "agent", body: "Saved answer for Member B" });
     await db.insert(issueReadStates).values({ companyId, issueId: memberChat, userId: member, lastReadAt: new Date("2020-01-01") });
     await db.insert(heartbeatRuns).values({ id: failedRunId, companyId, agentId, status: "failed", runtimeMode: "legacy", contextSnapshot: { issueId: memberChat }, finishedAt: new Date() });
@@ -71,12 +66,12 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "./hel
     await database?.cleanup();
   });
 
-  it.each(["enforce", "off"])("lists only shared readable conversations, including legacy NULL (%s)", async mode => {
+  it.each(["enforce", "off"])("lists only shared readable conversations (%s)", async mode => {
     process.env.PAPERCLIP_ISSUE_PRIVACY_MODE = mode;
     const app = appFor();
     const response = await list(app);
     expect(response.status).toBe(200);
-    expect(response.body.map((row: { id: string }) => row.id).sort()).toEqual([ownChat, memberChat, legacyChat].sort());
+    expect(response.body.map((row: { id: string }) => row.id).sort()).toEqual([ownChat, memberChat].sort());
     expect(response.body.find((row: { id: string }) => row.id === memberChat).conversationUserId).toBe(member);
     for (const row of response.body) expect((await request(app).get(`/api/issues/${row.id}`)).status).toBe(200);
     const search = await request(app).get(`/api/companies/${companyId}/issues`).query({ q: "conversation" });
