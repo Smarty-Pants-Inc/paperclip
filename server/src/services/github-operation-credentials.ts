@@ -18,6 +18,7 @@ import {
 import { secretService } from "./secrets.js";
 import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 import { isLowTrustQuarantined } from "./source-trust.js";
+import { assertBoundRunIssueId, boundRunIssueId } from "./run-task-binding.js";
 
 export type GitHubCredentialSummary = {
   status: "available" | "absent" | "unavailable";
@@ -34,10 +35,8 @@ async function allowsGitHubCredentialExport(
   db: Db,
   run: typeof heartbeatRuns.$inferSelect,
 ) {
-  const issueId =
-    run.contextSnapshot?.issueId ??
-    run.contextSnapshot?.taskId ??
-    run.nativeIssueId;
+  assertBoundRunIssueId(run);
+  const issueId = boundRunIssueId(run);
   if (
     issueId !== undefined &&
     issueId !== null &&
@@ -67,7 +66,7 @@ async function allowsGitHubCredentialExport(
       : [];
   if (issueId !== undefined && issueId !== null && !issue) return false;
   if (isLowTrustQuarantined(issue?.sourceTrust)) return false;
-  const projectId = issue?.projectId ?? run.contextSnapshot?.projectId;
+  const projectId = issue?.projectId ?? null;
   if (
     projectId !== undefined &&
     projectId !== null &&
@@ -160,10 +159,8 @@ export async function resolveGitHubOperationCredentials(
           context?.cause === "company_default"
             ? null
             : (context?.responsibleUserId ?? null),
-        issueId:
-          typeof run.contextSnapshot?.issueId === "string"
-            ? run.contextSnapshot.issueId
-            : null,
+        // An issue hint can never override the authenticated run's stored binding.
+        issueId: boundRunIssueId(run),
       },
     );
     if (resolved.credential) {
