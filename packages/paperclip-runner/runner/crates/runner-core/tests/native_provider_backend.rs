@@ -2832,7 +2832,11 @@ fn rebuild_pi_proxy(directory: &Path, config: &DurableRunnerConfig) -> DurableRu
 fn leave_unclosed_settled_pi_session(directory: &Path, config: &DurableRunnerConfig) {
     let mut first = NativeProviderCommandExecutor::with_runner_config(directory, config);
     first
-        .execute(&command(1, "run.prepare", pi_rpc_prepare_payload(directory)))
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(directory),
+        ))
         .unwrap();
     first
         .execute(&command(2, "session.open", json!({})))
@@ -2873,10 +2877,16 @@ fn settled_pi_session_continues_after_a_controller_proxy_rebuild() {
         "no fresh Pi thread is started",
     );
     recovered
-        .execute(&command(4, "turn.start", json!({"text": "Continue the task."})))
+        .execute(&command(
+            4,
+            "turn.start",
+            json!({"text": "Continue the task."}),
+        ))
         .unwrap();
     let observed = poll_opencode_until(&mut recovered, "turn.completed");
-    assert!(observed.iter().any(|event| event.event_type == "turn.completed"));
+    assert!(observed
+        .iter()
+        .any(|event| event.event_type == "turn.completed"));
     recovered.shutdown().unwrap();
     drop(recovered);
 
@@ -2943,7 +2953,11 @@ fn pi_proxy_rebuild_refuses_an_active_turn() {
     config.pi_launch_profile.as_mut().unwrap().proxy_script = qualified_artifact(proxy_script);
     let mut first = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
     first
-        .execute(&command(1, "run.prepare", pi_rpc_prepare_payload(&directory)))
+        .execute(&command(
+            1,
+            "run.prepare",
+            pi_rpc_prepare_payload(&directory),
+        ))
         .unwrap();
     first
         .execute(&command(2, "session.open", json!({})))
@@ -2955,7 +2969,10 @@ fn pi_proxy_rebuild_refuses_an_active_turn() {
     let state_path = directory.join("codex-provider-state.json");
     let saved_state = fs::read(&state_path).unwrap();
     let saved: Value = serde_json::from_slice(&saved_state).unwrap();
-    assert!(saved["activeProviderTurnId"].is_string(), "the turn is in flight");
+    assert!(
+        saved["activeProviderTurnId"].is_string(),
+        "the turn is in flight"
+    );
 
     let rebuilt = rebuild_pi_proxy(&directory, &config);
     let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &rebuilt);
