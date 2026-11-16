@@ -169,7 +169,6 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
-  if (next === "terminated") holds = [];
   if (next === agent.lifecycleState) {
     if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
       const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, agent.id)).returning();
@@ -177,8 +176,14 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     }
     return agent;
   }
+  // Holds pass through unchanged, terminated rows included (doc/AGENT-LIFECYCLE.md hold policy).
+  const requestedBy = next === "terminating" ? effects.requestActor ?? agent.lifecycleOperation?.requestedBy
+    : agent.lifecycleOperation?.requestedBy;
   const operation: AgentLifecycleOperation = {
     responsibleUserId: agent.lifecycleOperation?.responsibleUserId,
+    ...(requestedBy ? { requestedBy } : {}),
+    // The durable hand-over marker commits with the terminal state, never apart from it.
+    ...(next === "terminated" ? { handover: { code: "agent_handover_pending" as const, since: new Date().toISOString() } } : {}),
     id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0,
     resumeState: next === "pausing"
       ? agent.lifecycleState === "preparing" || agent.lifecycleState === "verifying" ? agent.lifecycleState : agent.lifecycleOperation?.resumeState ?? "ready"
@@ -192,7 +197,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   }
   const status = compatibilityStatus(next, agent.status);
   if(!canConfigureAgentConnection(agent)&&canConfigureAgentConnection({lifecycleState:next,status}))await effects.beforeConnectionEligibilityRestore?.(tx,agent.companyId,agent.id);
-  if (status !== agent.status || next === "terminated") await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status, publications);
+  if (status !== agent.status) await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status, publications);
   if (isLifecycleWorkPending(next)) await effects.notifyWork(tx);
   const [updated] = await tx.update(agents).set({
     lifecycleHolds: holds, lifecycleState: next, lifecycleVersion: agent.lifecycleVersion + 1, lifecycleError: null,
@@ -215,6 +220,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
     }
     await effects.clearPrimary(tx, agent.companyId, agent.id, publications);
   }
+  if (next === "terminated") await effects.completeTermination?.(tx, updated, publications);
   if (command === "approve") await effects.recordCreation(tx, agent.companyId, agent.id);
   if (next === "pausing" || next === "resuming" || next === "terminating" || next === "rejected") {
     await effects.recordStatus(tx, agent.companyId, agent.id,

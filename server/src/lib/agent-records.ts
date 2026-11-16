@@ -345,6 +345,8 @@ export function agentRecordQueries(db: Db) {
     const { lifecycleOperation, lifecycleRequiredPluginIds, harnessVerifiedDigest, harnessVerifiedAt, ...publicRow } = row;
     return withUrlKey({
       ...publicRow,
+      // A retired agent shows its named pending code until its work and reports are handed over.
+      ...(lifecycleOperation?.handover ? { handover: lifecycleOperation.handover } : {}),
       permissions: normalizeAgentPermissions(row.permissions, { role: row.role }),
     });
   }

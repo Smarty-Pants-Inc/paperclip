@@ -1,6 +1,7 @@
 import type { LifecycleFailure } from "../application/ports.js";
 import type { Db } from "@paperclipai/db";
-import type { budgetPolicies } from "@paperclipai/db";
+import type { agents, budgetPolicies } from "@paperclipai/db";
+import type { AgentLifecycleRequester } from "@paperclipai/shared";
 import type { CreateAgentData, CreateAgentOptions, AgentConfigurationPatch, AgentConfigurationRecord, AgentHireRecord, UpdateAgentOptions } from "../../../lib/agent-records.js";
 import type { ActivityPublication } from "../../../types/activity-publication.js";
 
@@ -14,6 +15,10 @@ export interface LifecycleEffects {
   leaseHolder?(): Record<string, unknown> | null;
   beforeStatusChange(db: Db, companyId: string, agentId: string, before: string, after: string, publications?: ActivityPublication[]): Promise<void>;
   beforeConnectionEligibilityRestore?(db: Db, companyId: string, agentId: string): Promise<void>;
+  /** Who asks for a termination through this lifecycle instance; saved on the operation. */
+  requestActor?: AgentLifecycleRequester;
+  /** Runs in the terminal (complete -> terminated) transaction, after the row carries its hand-over marker. */
+  completeTermination?(db: Db, agent: typeof agents.$inferSelect, publications?: ActivityPublication[]): Promise<void>;
   reportFailure(context: LifecycleFailure, error: unknown): void;
   deleteDependencies(db: Db, companyId: string, agentId: string): Promise<void>;
   lockConfigurationInteractions(db: Db, id: string, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<UpdateAgentOptions | undefined>;
