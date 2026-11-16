@@ -51,7 +51,8 @@ mod unix_socket {
     const HTTP_RESPONSE_TIMEOUT_SLICE: Duration = Duration::from_millis(100);
     const CONNECTION_QUEUE_CAPACITY: usize = 32;
     const HTTP_WORKER_COUNT: usize = 4;
-    const ERROR_BODY_CAPABILITY_PENDING: &[u8] = br#"{"error":"native_github_access_capability_pending"}"#;
+    const ERROR_BODY_CAPABILITY_PENDING: &[u8] =
+        br#"{"error":"native_github_access_capability_pending"}"#;
     const ERROR_BODY_METHOD_NOT_ALLOWED: &[u8] = br#"{"error":"Method not allowed"}"#;
     const GITHUB_CREDENTIALS_PATH: &str = "/runtime-tools/github/credentials";
 
