@@ -8197,12 +8197,23 @@ function definiteAbsenceIdentityChange(continuity: DefiniteAbsenceContinuity): N
 }
 
 /**
- * HOOK (F7b): J3-17's provider-identity lineage append goes HERE
- * (dl/identity-changed, provider-identity-lineage.ts owns the ONE record type
- * and its chain validator). F7a deliberately writes no record of its own.
+ * HOOK (F7b): the replacement after the Runner's definite absence writes
+ * through J3-17's provider-identity lineage (provider-identity-lineage.ts owns
+ * the ONE record type and its chain validator). The new thread's identity
+ * object exists only in the box's durable provider state, so the step is
+ * noted here and appended (appendProviderIdentityReset) at the first
+ * suspended read that meets the older backup, under the issue -> task-session
+ * lock; the backup gate (NSE provider_identity_changed) then accepts the
+ * recorded chain. No second record store.
  */
-async function recordDefiniteAbsenceProviderIdentityChange(_execution: NativeExecutionInput,
-  _continuity: DefiniteAbsenceContinuity, _reason: NativeProviderIdentityChangeReason): Promise<void> {}
+async function recordDefiniteAbsenceProviderIdentityChange(execution: NativeExecutionInput,
+  _continuity: DefiniteAbsenceContinuity, reason: NativeProviderIdentityChangeReason): Promise<void> {
+  // J3-17's record type has no runner_state_lost reason: that replacement
+  // notes no step of its own here (a pi_rpc one is still noted by J3-17's own
+  // continuity-break writer, as resume_failed_on_new_box).
+  if (reason !== "resume_failed_on_new_box") return;
+  noteProviderIdentityBreak(providerIdentityLineageScope(execution), reason, execution.binding.runId);
+}
 
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
