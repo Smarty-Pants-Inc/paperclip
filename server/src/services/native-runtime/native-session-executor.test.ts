@@ -25294,13 +25294,29 @@ describe("runnerd provider runtime wiring", () => {
       expect(await readdir(join(fixture.root, "continuity-breaks"))).toHaveLength(1);
     });
 
-    it("(SMA-60) checkpoint.restore tried and refused while recovering the saved session -> the same run answers on a recorded fresh thread", async () => {
+    // Superseded (RFL 14:49Z; review-fleet-3 J3-22 verdict 6914443167; org
+    // 10:54Z): the RECOVER path no longer takes a fresh thread. The refused
+    // restore while recovering the saved session is returned as the NAMED
+    // refusal; nothing of a fresh thread happens in this run.
+    it("(SMA-60) checkpoint.restore tried and refused while recovering the saved session -> the same run answers on a recorded fresh thread (superseded by replacement: rf3 J3-22 verdict 6914443167; org 10:54Z)", async () => {
       const fixture = await floorFixture("sma60");
       const recovered = await fixture.backend.recoverSession!(fixture.snapshot(), { signal: new AbortController().signal });
-      expect(recovered).toMatchObject({ recovered: true, session: fixture.fresh });
+      expect(recovered).toMatchObject({ recovered: false });
+      expect(recovered.recoveryRefusalCode).toBe("runner_harness_state_mismatch: backup_without_reusable_lease");
+      expect(recovered.session).toBeUndefined();
       expect(fixture.recoverSession).toHaveBeenCalledOnce();
-      expect(fixture.openSession).toHaveBeenCalledOnce();
-      expectRecordedFreshThread(fixture);
+      // NO fresh provider session opened in this run.
+      expect(fixture.openSession).not.toHaveBeenCalled();
+      expect(fixture.syncIn).not.toHaveBeenCalled();
+      expect(fixture.refusals).toEqual([expect.objectContaining({ code: FLOOR_CODE })]);
+      // No lineage step, no continuation note, no log claiming a fresh thread.
+      expect(fixture.resets()).toEqual([]);
+      expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+      expect(fixture.onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("fresh provider thread"));
+      // The backup is NOT archived: nothing set aside, the backup kept in place.
+      const breaks = join(fixture.root, "continuity-breaks");
+      expect(existsSync(breaks) ? await readdir(breaks) : []).toEqual([]);
+      expect(existsSync(join(fixture.root, "failover-backups/current/manifest.json"))).toBe(true);
     });
 
     it("guard: an AUTHORIZED restore still restores the same thread (no fresh thread, no note)", async () => {
