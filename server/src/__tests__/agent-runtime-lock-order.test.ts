@@ -2,7 +2,13 @@ import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, principalPermissionGrants, toolApplications, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
+import express from "express";
+import request from "supertest";
+import { agents, companies, companyMemberships, createDb, principalPermissionGrants, toolApplications, toolConnectionInstalls, toolConnections, type Db } from "@paperclipai/db";
+import { errorHandler } from "../middleware/index.js";
+import { agentRoutes } from "../routes/agents.js";
+import { agentService } from "../services/agents.js";
+import { approvalService } from "../services/approvals.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { lockCompanyAgentRuntime } from "../services/agent-runtime-lock.js";
 
@@ -134,5 +140,62 @@ describePg("#20805 company runtime lock order", () => {
     evidence(`R2_CONNECTOR_STATEMENT ${JSON.stringify({ codes, installs: installs.length })}`);
     expect(codes).toEqual([null, null]);
     expect(installs).toHaveLength(2);
+  }, 30_000);
+
+  function routeApp(actor: Express.Request["actor"]) {
+    const a = express();
+    a.use(express.json());
+    a.use((req, _res, next) => { req.actor = actor; next(); });
+    a.use("/api", agentRoutes(db));
+    a.use(errorHandler);
+    return a;
+  }
+
+  it("R2 RED hire manager key: the hire takes its reportsTo key share before the exclusive lock (vs a row-then-shared writer of the manager)", async () => {
+    const f = await company(3);
+    const manager = f.peers[1]!;
+    await db.update(agents).set({ permissions: { canCreateAgents: true } }).where(sql`${agents.id} = ${f.hirer.id}`);
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "agent", principalId: f.hirer.id, status: "active", membershipRole: "member" });
+    await db.insert(principalPermissionGrants).values({ companyId: f.companyId, principalType: "agent", principalId: f.hirer.id, permissionKey: "agents:create" });
+    const app = routeApp({ type: "agent", agentId: f.hirer.id, companyId: f.companyId, source: "agent_key" } as Express.Request["actor"]);
+    // Session A is a writer that holds the manager row (FOR UPDATE, the native
+    // committer's actor lock) and then takes the SHARED hold (rows first).
+    const codes: Array<string | null> = [null];
+    let hire: Promise<request.Response> | undefined;
+    await db.transaction(async tx => {
+      await tx.execute(sql.raw("SET LOCAL deadlock_timeout = '50ms'"));
+      const pid = Number((await tx.execute<{ pid: number }>(sql`SELECT pg_backend_pid() AS pid`))[0]!.pid);
+      await tx.execute(sql`SELECT id FROM agents WHERE id = ${manager.id} FOR UPDATE`);
+      hire = request(app).post(`/api/companies/${f.companyId}/agents`).send({ name: "Keyed hire", role: "engineer", reportsTo: manager.id,
+        adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }).then(r => r);
+      expect(await waitUntilBlocked(pid)).toBe(true);
+      await tx.execute(sql`SELECT pg_advisory_xact_lock_shared(hashtextextended('paperclip.connector_runtime:' || ${f.companyId}::uuid::text, 0))`);
+    }).catch(error => { codes[0] = pgCode(error); });
+    const response = await hire!;
+    evidence(`R2_HIRE_MANAGER_KEY ${JSON.stringify({ codes, hire: response.status })}`);
+    expect(codes).toEqual([null]);
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+  }, 30_000);
+
+  it("R2 RED approval rows-first: approving a pending hire locks the agent row before the exclusive lock (two sessions: [null,null])", async () => {
+    const f = await company(2);
+    const [pending] = await db.insert(agents).values({ companyId: f.companyId, name: "Pending", role: "engineer", adapterType: "process",
+      status: "pending_approval", lifecycleState: "pending_approval" }).returning();
+    const codes = await rowHolderThenLockVersus(f, pending!.id, client => approvalService(client).approveHire(pending!.id, "board-user"));
+    const [after] = await db.select({ status: agents.status }).from(agents).where(sql`${agents.id} = ${pending!.id}`);
+    evidence(`R2_APPROVAL_ROWS_FIRST ${JSON.stringify({ codes, status: after!.status })}`);
+    expect(codes).toEqual([null, null]);
+    expect(after!.status).not.toBe("pending_approval");
+  }, 30_000);
+
+  it("R2 RED PATCH permissions rows-first: the permission save locks the agent row before the exclusive lock (two sessions: [null,null])", async () => {
+    const f = await company(2);
+    const target = f.peers[0]!;
+    const codes = await rowHolderThenLockVersus(f, target.id,
+      client => agentService(client).updatePermissions(target.id, { canCreateAgents: true }));
+    const [after] = await db.select({ permissions: agents.permissions }).from(agents).where(sql`${agents.id} = ${target.id}`);
+    evidence(`R2_PATCH_PERMISSIONS_ROWS_FIRST ${JSON.stringify({ codes, canCreateAgents: (after!.permissions as any)?.canCreateAgents })}`);
+    expect(codes).toEqual([null, null]);
+    expect((after!.permissions as any)?.canCreateAgents).toBe(true);
   }, 30_000);
 });
