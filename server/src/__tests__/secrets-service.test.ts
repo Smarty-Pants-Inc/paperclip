@@ -2653,6 +2653,7 @@ describeEmbeddedPostgres("secretService", () => {
     expect(versions).toHaveLength(1);
     expect(versions[0]?.providerVersionRef).toBe("version-1");
     expect(JSON.stringify(versions[0])).not.toContain("runtime-secret");
+    expect(JSON.stringify(versions[0])).not.toContain("sk-");
     expectNoTokenLeak(versions[0], ["runtime-secret"]);
 
     await expect(
@@ -3811,6 +3812,7 @@ describeEmbeddedPostgres("secretService", () => {
       .where(eq(companySecretVersions.secretId, imported!.id));
     expect(versions).toHaveLength(1);
     expect(JSON.stringify(versions[0])).not.toContain("runtime-secret");
+    expect(JSON.stringify(versions[0])).not.toContain("sk-");
     expectNoTokenLeak(versions[0], ["runtime-secret"]);
   });
 
