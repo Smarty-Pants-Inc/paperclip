@@ -101,14 +101,18 @@ describe("Pi private bind exchange performance", () => {
     expect(JSON.stringify(spans)).not.toMatch(/socket|instructions|nonce|apiKey/);
   });
 
-  it("records settle, park_ready and stop_children exchanges through the same reader", async () => {
+  it("records settle and park_ready through the same reader but excludes cleanup stop_children", async () => {
     const f = await fixture(); const session = await f.open();
     await session.releaseInitialBindingForRecovery(); await session.parkReady(); await session.close(); await tick();
-    for (const kind of ["settle", "park_ready", "stop_children"]) {
+    for (const kind of ["settle", "park_ready"]) {
       const spans = f.spans().filter(span => span.name === `runner.pi.${kind}`);
       expect(spans, kind).toHaveLength(1);
       expect(spans[0], kind).toMatchObject({ name: `runner.pi.${kind}`, outcome: "ok" });
       expect(spans[0]!.endedAtMs - spans[0]!.startedAtMs).toBeGreaterThanOrEqual(0);
     }
+    expect(f.commands.filter(command => command.type === "stop_children")).toHaveLength(1);
+    expect(f.events.flatMap(event => event.payload.code === "provider_performance_spans"
+      ? event.payload.spans as Array<{ name: string }> : [])
+      .filter(span => span.name === "runner.pi.stop_children")).toEqual([]);
   });
 });
