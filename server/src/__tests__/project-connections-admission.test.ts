@@ -70,7 +70,8 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J19: another member's private primary and a mismatched responsible human cannot first-bind", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve();
     const member = `member-${randomUUID()}`;
     await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: member, membershipRole: "member", status: "active" });
     await db.insert(userCompanyPreferences).values({ companyId: f.companyId, userId: member, primaryAgentId: f.outsider.id });
@@ -283,14 +284,14 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it.each(["primary", "lead", "recipient", "key", "returned-repository", "identity"] as const)("A05/M02: %s changes during provider verification refuse before reach", async variant => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
     harness.verify.mockImplementation(async () => {
       if (variant === "primary") await db.update(userCompanyPreferences).set({ primaryAgentId: f.outsider.id }).where(and(eq(userCompanyPreferences.companyId, f.companyId), eq(userCompanyPreferences.userId, f.human)));
       if (variant === "lead") await db.update(projects).set({ leadAgentId: f.leadB.id }).where(eq(projects.id, f.a.id));
       if (variant === "recipient") await db.update(agents).set({ reportsTo: f.leadB.id }).where(eq(agents.id, f.worker.id));
-      if (variant === "key") await db.update(companySecrets).set({ latestVersion: 2 }).where(eq(companySecrets.id, f.secret.id));
+      if (variant === "key") await db.update(companySecrets).set({ latestVersion: APPROVED_KEY_VERSION + 1 }).where(eq(companySecrets.id, f.secret.id));
       return { ...harness.verified,
         ...(variant === "returned-repository" ? { repositoryIds: [999] } : {}),
         ...(variant === "identity" ? { identity: { ...harness.verified.identity, verifiedRegistrationId: "987" } } : {}),
@@ -306,10 +307,10 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J02/A05: preserveExistingAccess checks the final recipient union, not only the new worker", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(toolConnectionInstalls).values({ companyId: f.companyId, connectionId: connection.id, targetType: "agent", targetId: f.outsider.id });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
     await expect(f.service.finishGalleryAppConnection(f.companyId, connection.id, { ...finishInput(f.worker.id), preserveExistingAccess: true }, f.actor()))
       .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id)))
@@ -388,7 +389,7 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J11/B-RF2-0036-integration: real running-work gate rolls back lead and every retained approval", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
     const live = await f.seedConnection(f.a, { status: "draft", installed: false });
     await f.run(f.a, f.worker.id);
