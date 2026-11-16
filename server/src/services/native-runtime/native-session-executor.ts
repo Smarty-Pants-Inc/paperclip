@@ -15949,20 +15949,35 @@ export async function readRemoteRunnerStateFile(input: {
     timeoutMs: 10_000,
   };
   if (runner.syncOut) {
-    const checked = input.recoveryDeadline === undefined
-      ? await runner.execute(request)
-      : await readRemoteRunnerRecoveryProbe({ runner, request, stage: "runner_state",
+    const runReadProbe = (probeRequest: typeof request) => input.recoveryDeadline === undefined
+      ? runner.execute(probeRequest)
+      : readRemoteRunnerRecoveryProbe({ runner, request: probeRequest, stage: "runner_state",
           deadline: input.recoveryDeadline, readOnly: true, stall: input.stall });
-    if (checked.exitCode !== 0 || checked.timedOut) {
-      const error = new Error(`runner_remote_state_unavailable: exit=${checked.exitCode} timedOut=${checked.timedOut}${checked.stderr.trim() ? ` ${redactSensitiveText(checked.stderr).trim().slice(-512)}` : ""}`);
-      Object.assign(error, { exitCode: checked.exitCode, timedOut: checked.timedOut });
-      throw error;
-    }
+    const unavailable = (result: Awaited<ReturnType<typeof runner.execute>>) => {
+      const error = new Error(`runner_remote_state_unavailable: exit=${result.exitCode} timedOut=${result.timedOut}${result.stderr.trim() ? ` ${redactSensitiveText(result.stderr).trim().slice(-512)}` : ""}`);
+      Object.assign(error, { exitCode: result.exitCode, timedOut: result.timedOut });
+      return error;
+    };
+    const checked = await runReadProbe(request);
+    if (checked.exitCode !== 0 || checked.timedOut) throw unavailable(checked);
     const staging = mkdtempSync(join(tmpdir(), "paperclip-native-state-"));
     try {
       chmodSync(staging, 0o700);
       const localPath = join(staging, "state.json");
-      await runner.syncOut([{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
+      try {
+        await runner.syncOut([{ operationId: "native-session-state-read", files: [{ sourcePath: remotePath, targetPath: localPath, kind: "file", mode: 0o600 }] }]);
+      } catch (transferError) {
+        // A native transfer keeps state bytes off command output. If it fails,
+        // run the same read solely as an error/absence probe with stdout sent to
+        // /dev/null; this retains the command path's exit/stderr distinction
+        // without ever returning state bytes through the runner result.
+        const diagnosticRequest = { ...request,
+          args: ["-c", `test -f '${escapedPath}' || exit ${input.missingExitCode ?? 66}; base64 < '${escapedPath}' > /dev/null`] };
+        let diagnostic: Awaited<ReturnType<typeof runner.execute>>;
+        try { diagnostic = await runReadProbe(diagnosticRequest); } catch { throw transferError; }
+        if (diagnostic.exitCode !== 0 || diagnostic.timedOut) throw unavailable(diagnostic);
+        throw transferError;
+      }
       chmodSync(localPath, 0o600);
       return record(JSON.parse(readFileSync(localPath, "utf8")));
     } finally {
@@ -16019,8 +16034,11 @@ export async function readRemoteRunnerProviderState(input: {
   if (input.runner.syncOut) {
     try {
       return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath, missingExitCode: 1 });
-    } catch {
-      throw new Error("runner_remote_provider_state_unavailable");
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("runner_remote_state_unavailable:")) {
+        throw new Error("runner_remote_provider_state_unavailable");
+      }
+      throw error;
     }
   }
   logger.warn("session state read via command; output retained by provider");
@@ -18444,8 +18462,17 @@ async function createRunnerdBackendWithinSessionClaim(
       runnerState = remoteCommandRunner.syncOut
         ? await readRemoteRunnerStateFile({ runner: remoteCommandRunner, remotePath: runnerStatePath })
         : record(JSON.parse(Buffer.from(inspected.stdout.replace(/\s+/g, ""), "base64").toString("utf8")));
-    } catch {
-      throw new Error("runner_harness_state_mismatch: runner_state_invalid_json");
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error("runner_harness_state_mismatch: runner_state_invalid_json");
+      if (error instanceof Error && error.message.startsWith("runner_remote_state_unavailable:")) {
+        const unpreparedBootstrapRunId = source === "host_preparation" ? await inspectOwnUnpreparedBootstrap() : null;
+        if (unpreparedBootstrapRunId) {
+          return { complete: false, runnerState: null, providerSessionIdentity: null,
+            incompleteReason: "not_suspended", notSuspendedRunId: unpreparedBootstrapRunId };
+        }
+        return { complete: false, runnerState: null, providerSessionIdentity: null, incompleteReason: "unavailable" };
+      }
+      throw error;
     }
     if (
       runnerState.runnerInstanceId !== input.runnerInstanceId ||
