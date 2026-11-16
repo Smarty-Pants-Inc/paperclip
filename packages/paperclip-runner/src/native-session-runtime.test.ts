@@ -6791,6 +6791,80 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
+  // B3 (#20736/#20787): a server restart left a Pi chat unclosed, and the new
+  // Runner refuses its saved state because the launch-profile digest changed
+  // (PB load_state_without_provider). The follow-up's checkpoint allows
+  // replacement, so, as upstream does for PROVIDER_STATE_INCOMPATIBLE, the
+  // user's first message is answered in this ONE run on a replacement session
+  // carrying the stored handoff, with one continuity note; it does not fail
+  // and leave a second run to start the fresh thread.
+  it("answers an unclosed chat's first message in one run when the Runner refuses its changed launch profile", async () => {
+    const checkpoint: PersistedNativeSession = {
+      backendKind: "mock", driverKind: "pi_rpc", sessionId: "driver-unclosed", identity,
+      providerSessionId: "provider-unclosed", providerRecoveryPolicy: "allow_replacement_after_resume_failure",
+      cursor: "0", activeTurnId: null, terminalTurns: [], pendingRuntimeRequests: [], lineage: [],
+    };
+    const startTurn = vi.fn<NativeSession["startTurn"]>(async () => ({ turnId: "turn-replacement" }));
+    const replacementSession: NativeSession = {
+      identity: () => identity,
+      capabilities: async () => ({ resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }),
+      async *events() { yield runnerEvent(1, "turn.completed"); },
+      startTurn,
+      result: async () => ({ result, terminal, turnId: "turn-replacement" }),
+      snapshot: async () => ({ ...structuredClone(checkpoint), sessionId: "driver-replacement",
+        providerSessionId: "provider-replacement" }),
+      close: async () => {},
+    };
+    const refusal: NativeSessionRecoveryResult = {
+      recovered: false, failureClass: PROVIDER_LAUNCH_PROFILE_MISMATCH,
+      prepareRefusalCode: "provider_launch_profile_mismatch",
+      reason: "Error: Pi runner launch profile changed across durable recovery",
+    };
+    const recoverSession = vi.fn(async () => refusal);
+    const openReplacementSession = vi.fn(async () => replacementSession);
+    const openSession = vi.fn(async () => { throw new Error("the replacement seam must be used"); });
+    const backend: NativeSessionBackend = {
+      descriptor: async () => ({ kind: "mock", name: "pi-launch-refusal", version: "1",
+        capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }),
+      openSession, openReplacementSession, recoverSession,
+    };
+    const events: PrpEvent[] = [];
+    const openRun = vi.fn(async () => undefined);
+    const completeRun = vi.fn(async () => {});
+    const controlPlane: ControlPlanePort = {
+      openRun, completeRun, checkpointSession: async () => {},
+      loadSessionCheckpoint: async () => structuredClone(checkpoint),
+      async appendEvent(event) {
+        events.push(structuredClone(event as PrpEvent));
+        return { cursor: events.length, highestContiguousSourceSeq: highestContiguous(events), disposition: "committed" };
+      },
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+    };
+    const onContinuityBreak = vi.fn(async () => undefined);
+    const getFreshSessionHandoff = vi.fn(async () => "FRESH_HANDOFF: prior Pi conversation");
+
+    const outcome = await executeNativeSession({
+      input, backend, controlPlane, getFreshSessionHandoff, onContinuityBreak,
+      runnerInstanceId: "runner-restarted", controlPlaneInstanceId: "control-restarted",
+    }).catch((error: unknown) => error);
+
+    expect(outcome).not.toBeInstanceOf(Error);
+    expect(outcome).toMatchObject({ providerSessionId: "provider-replacement" });
+    expect(recoverSession).toHaveBeenCalledOnce();
+    expect(openReplacementSession).toHaveBeenCalledOnce();
+    expect((openReplacementSession.mock.calls[0] as unknown[])[1]).toMatchObject({ sessionId: "driver-unclosed" });
+    expect(openSession).not.toHaveBeenCalled();
+    expect(openRun).toHaveBeenCalledOnce();
+    expect(startTurn).toHaveBeenCalledOnce();
+    const envelope = JSON.parse(startTurn.mock.calls[0]![0].message.text) as { task: { prompt: string } };
+    expect(envelope.task.prompt.startsWith("FRESH_HANDOFF: prior Pi conversation")).toBe(true);
+    expect(onContinuityBreak).toHaveBeenCalledOnce();
+    expect(onContinuityBreak).toHaveBeenCalledWith(expect.objectContaining({
+      reason: refusal.reason, previousDriverSessionId: "driver-unclosed",
+      previousProviderSessionId: "provider-unclosed", replacementProviderSessionId: "provider-replacement",
+    }));
+  });
+
   it.each([false, true])("preserves refresh turn waiting without runtime-owned replacement (waitForTurn=%s)", async waitForTurn => {
     for (const providerRecoveryPolicy of ["same_session_only", "allow_replacement_after_resume_failure", "allow_replacement_after_governed_wait"] as const) {
       const checkpoint: PersistedNativeSession = { backendKind: "mock", sessionId: "earlier-driver", identity,
