@@ -12,6 +12,7 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
 import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
 import { createLocalEncryptedCipher } from "../secrets/local-encrypted-provider.js";
 import { connectionManagementService } from "../services/connection-management.js";
+import { githubAppFailure } from "../services/github-app-client.js";
 
 const provider = vi.hoisted(() => ({ verify: vi.fn(async () => ({ token: "synthetic-verified-project-token", expiresAt: Date.now() + 3600000,
   github: { userId: "123", login: "project-fixture[bot]", installationCount: 1, repositoryCount: 1, repositorySelection: "selected", installationIds: ["456"], installationOwnerLogins: ["owner"], repositories: [{ id: "101", fullName: "owner/A", installationId: "456", private: true }] },
@@ -177,6 +178,20 @@ describe("project connection make-before-break and local retirement (round-4 D)"
       await restartedPush(p, p.legacy.connection.id);
     });
 
+    it("INT-R5/:143 companion: create fails on the injected receipt P0001, not the custody prerequisite", async () => {
+      const control = await migration(); await created(control);
+      const p = await migration();
+      const beforeApplications = await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId));
+      await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${p.f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'synthetic create receipt failure'; END IF; RETURN NEW; END $$`));
+      await db.execute(sql.raw("CREATE TRIGGER project_red_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_red_receipt_failure()"));
+      try { await expect(p.create()).rejects.toMatchObject({ cause: { code: "P0001", message: "synthetic create receipt failure" } }); }
+      finally { await restoreReceipt(db); }
+      expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, p.f.companyId))).toEqual(beforeApplications);
+      expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, p.f.companyId))).toEqual([p.legacy.connection]);
+      expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, p.f.companyId))).toEqual([p.legacy.grant]);
+      await restartedPush(p, p.legacy.connection.id);
+    });
+
     it.each(["mint", "wrong-repository-id", "stale-approval", "stale-key", "stale-recipient", "finish-install", "receipt"] as const)(
       "RFL/M02 second operation: %s failure preserves pending/non-serving candidate and usable legacy across a new service", async boundary => {
         const p = await migration(); const candidate = await created(p);
@@ -284,6 +299,33 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.connection.id))).toEqual(installs);
     const selected = await resolveManagedGitHubCredential(db, { getByName: vi.fn(async () => null), resolveSecretValue: vi.fn(async () => "") }, f.companyId, context);
     expect(selected.credential?.connectionId).toBe(legacy.connection.id);
+  });
+
+  it("INT-R5/:249 companion: pending finish reaches the exact injected receipt P0001 after a successful finish control", async () => {
+    const control = await pending(); await control.finish();
+    expect((await storedConnection(db, control.candidate.connection.id)).config.projectScope).toMatchObject({ migrationPending: false });
+    const { f, legacy, candidate, context, finish } = await pending();
+    const installs = await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.connection.id));
+    await failReceipt(db, candidate.connection.id);
+    try { await expect(finish()).rejects.toMatchObject({ cause: { code: "P0001", message: "synthetic receipt persistence failure" } }); }
+    finally { await restoreReceipt(db); }
+    expect(await storedConnection(db, candidate.connection.id)).toEqual(candidate.connection);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, candidate.connection.id))).toHaveLength(0);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, legacy.connection.id))).toEqual(installs);
+    expect((await resolveManagedGitHubIdentitySelection(db, f.companyId, context)).connection?.id).toBe(legacy.connection.id);
+  });
+
+  it("INT-R5/:263 companion: mint fault is the token-specific provider refusal, not version_missing", async () => {
+    const control = await pending(); await control.finish();
+    expect((await storedConnection(db, control.candidate.connection.id)).config.projectScope).toMatchObject({ migrationPending: false });
+    const { f, legacy, candidate, context, finish } = await pending();
+    let injected = false;
+    provider.verify.mockImplementationOnce(async () => { injected = true; githubAppFailure("token"); });
+    await expect(finish()).rejects.toMatchObject({ status: 422, details: { code: "github_app_access_unavailable", reason: "token" } });
+    expect(injected).toBe(true);
+    expect(await storedConnection(db, candidate.connection.id)).toEqual(candidate.connection);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, candidate.connection.id))).toHaveLength(0);
+    expect((await resolveManagedGitHubIdentitySelection(db, f.companyId, context)).connection?.id).toBe(legacy.connection.id);
   });
 
   it("M02: failed token mint is not a health-only activation, and legacy remains usable after retry/restart", async () => {
@@ -400,6 +442,22 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     finally { await restoreReceipt(db); }
     expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it("INT-R5/:366 companion: take fails on the injected receipt P0001 after the same create succeeds", async () => {
+    const control = await projectConnectionFixture(db); await versionOne(control);
+    const created = await control.service.createConnection(control.companyId, control.input(), control.actor());
+    expect(created.projectId).toBe(control.a.id);
+    const f = await projectConnectionFixture(db); await versionOne(f);
+    await db.execute(sql.raw(`CREATE OR REPLACE FUNCTION project_red_receipt_failure() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.company_id = '${f.companyId}' AND NEW.action = 'tool_connection.project_taken' THEN RAISE EXCEPTION 'synthetic take receipt persistence failure'; END IF; RETURN NEW; END $$`));
+    await db.execute(sql.raw("CREATE TRIGGER project_red_receipt_failure BEFORE INSERT ON activity_log FOR EACH ROW EXECUTE FUNCTION project_red_receipt_failure()"));
+    try { await expect(f.service.createConnection(f.companyId, f.input(), f.actor())).rejects.toMatchObject({ cause: { code: "P0001", message: "synthetic take receipt persistence failure" } }); }
+    finally { await restoreReceipt(db); }
+    expect(await db.select().from(toolApplications).where(eq(toolApplications.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(toolConnections).where(eq(toolConnections.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(connectionGrants).where(eq(connectionGrants.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.companyId, f.companyId))).toHaveLength(0);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toHaveLength(0);
   });
 
   it("A03/W2: explicit finish of archived owner returns terminal typed conflict, never revival", async () => {
