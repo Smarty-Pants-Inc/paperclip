@@ -1,12 +1,12 @@
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { configurePiManagedCompaction } from "./pi-managed-settings.js";
 
 const roots: string[] = [];
 async function root() { const path = await mkdtemp(join(tmpdir(), "pi-managed-settings-")); roots.push(path); return path; }
-afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
+afterEach(async () => { vi.unstubAllEnvs(); await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
 
 it("copies complete original settings only for a fresh managed home, then adds the reserve", async () => {
   const original = await root(), managed = await root();
@@ -30,6 +30,20 @@ it("keeps existing managed settings behaviour and original-home behaviour", asyn
   expect(JSON.parse(await readFile(join(managed, "settings.json"), "utf8"))).toEqual({ retry: { enabled: false }, compaction: { reserveTokens: 11 } });
   await configurePiManagedCompaction({ agentHome: original, originalAgentHome: original, model: "vendor/model", contextWindow: 2000 });
   expect(JSON.parse(await readFile(join(original, "settings.json"), "utf8"))).toEqual(originalSettings);
+});
+
+it.each(["missing-package", "invalid-settings"])("fails closed on the runtime image's %s before writing session settings", async failure => {
+  const home = await root(), managed = await root();
+  const imageHome = join(home, ".pi", "agent");
+  await mkdir(imageHome, { recursive: true });
+  const bytes = failure === "missing-package" ? JSON.stringify({ packages: ["npm:missing"] }) : "{invalid";
+  await writeFile(join(imageHome, "settings.json"), bytes);
+  vi.stubEnv("HOME", home);
+  const configure = configurePiManagedCompaction({ agentHome: managed, originalAgentHome: managed, model: "paperclip/m", contextWindow: 400 });
+  if (failure === "missing-package") await expect(configure).rejects.toMatchObject({ code: "pi_managed_package_not_installed" });
+  else await expect(configure).rejects.toThrow("refusing to overwrite");
+  await expect(readFile(join(managed, "settings.json"))).rejects.toMatchObject({ code: "ENOENT" });
+  expect(await readFile(join(imageHome, "settings.json"), "utf8")).toBe(bytes);
 });
 
 it("keeps session settings and models separate", async () => {
