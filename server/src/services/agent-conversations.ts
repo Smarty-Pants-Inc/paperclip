@@ -3,7 +3,7 @@ import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
-import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody } from "@paperclipai/shared";
+import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody, issueCommentHistoryAuthor } from "@paperclipai/shared";
 import {
   persistActivity,
   publishActivity,
@@ -562,7 +562,7 @@ export async function conversationReplay(
     .reverse()
     .map((row) =>
       JSON.stringify({
-        author: row.origin === "fast_response" ? "paperclip_receipt" : row.authorAgentId ? "agent" : "user",
+        author: issueCommentHistoryAuthor(row),
         body: fastResponseHistoryBody(sanitizeQuarantinedCommentForHigherTrust(row)).slice(0, 8000),
       }),
     )
