@@ -607,6 +607,33 @@ describe("managed AI connections", () => {
     }
   });
 
+  it("fences later checks while verified subscription cleanup still touches shared account state", async () => {
+    const owner = "pi-probe-shared-retirement";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const auth = JSON.stringify({ tokens: { account_id: owner, id_token: "identity", access_token: "access", refresh_token: "refresh" }, last_refresh: "2026-09-10T10:00:00Z" });
+    const account = await service.save(companyId, owner, { provider: "openai", method: "subscription", ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, auth);
+    const input = { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "openai", method: "subscription", mode: "responsible_user" } as const, config: { provider: "codex", model: "gpt-5.6-sol" } };
+    const retirement = Promise.withResolvers<void>();
+    const probe = vi.fn(async () => {
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")]);
+      Object.assign(error, { probeSuccessResult: "hello-verified", retirementOnly: true });
+      throw error;
+    });
+    try {
+      await expect(withManagedAiProbe(db, input, probe)).resolves.toBe("hello-verified");
+      await expect(withManagedAiProbe(db, input, async () => "must-not-run")).rejects.toMatchObject({ details: { code: "ai_credential_cleanup_pending" } });
+      expect(probe).toHaveBeenCalledOnce();
+      retirement.resolve();
+      await vi.waitFor(async () => {
+        await expect(withManagedAiProbe(db, input, async () => "after-retirement")).resolves.toBe("after-retirement");
+      }, { timeout: 2_000 });
+    } finally {
+      retirement.resolve();
+      await reconcileRetainedAiCleanup({ companyId, accountKey: account.grantId }).catch(() => {});
+    }
+  });
+
   it("records a delayed successful native probe retirement after answering", async () => {
     const owner = "pi-probe-retirement-completed";
     await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
@@ -628,6 +655,32 @@ describe("managed AI connections", () => {
         expect(record.some(row => (row.details as Record<string, unknown> | null)?.outcome === "retired")).toBe(true);
       }, { timeout: 2_000 });
     } finally { retirement.resolve(); }
+  });
+
+  it("records a verified retirement completed by the retained owner's retry", async () => {
+    const owner = "pi-probe-retirement-retried";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const account = await service.save(companyId, owner, { provider: "anthropic", method: "api_key", ownership: "personal", name: owner, apiKey: "fixture", loginSessionId: "fixture", agentIds: [], allAgents: true,
+      routing: { kind: "gateway", protocol: "messages", auth: "bearer", baseUrl: "https://gateway.example/v1", models: [] } }, "fixture-native-pi-key");
+    const input = { companyId, agentId, responsibleUserId: owner, adapterType: "paperclip_runner",
+      binding: { provider: "anthropic", method: "api_key", mode: "delegated", ...account } as const, config: { provider: "pi_rpc", model: "paperclip/faux" } };
+    const retirement = Promise.withResolvers<void>();
+    void retirement.promise.catch(() => {});
+    const retry = vi.fn(async () => {});
+    const probe = async () => {
+      const error = new runnerProbe.NativeEnvironmentProbeCleanupError(retirement.promise, undefined, [new Error("fixture retirement pending")], retry);
+      Object.assign(error, { probeSuccessResult: "hello-verified", retirementOnly: true });
+      throw error;
+    };
+    try {
+      await expect(withManagedAiProbe(db, input, probe)).resolves.toBe("hello-verified");
+      retirement.reject(new Error("fixture first retirement attempt failed"));
+      await vi.waitFor(async () => {
+        const record = await db.select().from(activityLog).where(and(eq(activityLog.companyId, companyId), eq(activityLog.entityId, agentId), eq(activityLog.action, "agent.native_probe_retirement")));
+        expect(record.some(row => (row.details as Record<string, unknown> | null)?.outcome === "retried")).toBe(true);
+      }, { timeout: 2_000 });
+      expect(retry).toHaveBeenCalledOnce();
+    } finally { retirement.reject(new Error("fixture teardown")); await reconcileRetainedAiCleanup({ companyId, accountKey: account.grantId }).catch(() => {}); }
   });
 
   it("allows the same account to run while retired Codex probe cleanup is pending or fails", async () => {
