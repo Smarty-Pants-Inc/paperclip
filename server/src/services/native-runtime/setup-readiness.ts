@@ -173,6 +173,8 @@ async function probeRemoteNativeRuntime(options: {
             readRunnerState: () => readRemoteRunnerState({ runner, stateDirectory: remoteStateDirectory }),
             runnerProcessLauncher: createRemoteRunnerProcessLauncher({ target, runner, remoteBinary, stateDirectory: remoteStateDirectory,
               onRunnerProcessSpawned: signalSpawned, processIdentityPath: posix.join(remoteStateDirectory, "runner-process.identity"), diagnosticsDirectory: posix.join(remoteRoot, "diagnostics"), runnerInstanceId,
+              // A setup check stops a timed-out launch by its identity, then launches once more (smarty-dev#20916).
+              retryTimedOutLaunchOnce: true,
               ensureArtifact: async () => {
                 for (const name of ["auth.json", "config.toml"] as const) {
                   const sourcePath = join(runtimeDirectory, "codex-home", name);

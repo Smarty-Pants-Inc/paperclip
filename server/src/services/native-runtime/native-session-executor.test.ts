@@ -2020,7 +2020,7 @@ describe("remote runner process supervision", () => {
         onRunnerProcessSpawned,
         retryTimedOutLaunchOnce: true,
         processPollMs: 1,
-      } as Parameters<typeof createRemoteRunnerProcessLauncher>[0])({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
+      })({ command: "/controller/runnerd", args: [], cwd: "/controller", environment: {} });
       return { handle, launches, stops, onRunnerProcessSpawned, releaseMonitor };
     }
 
