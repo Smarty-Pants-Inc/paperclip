@@ -5,6 +5,7 @@ import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { EmptyState } from "../components/EmptyState";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 
 const DASHBOARD_LIVE_RUN_LIMIT = 50;
 
@@ -23,7 +24,7 @@ export function DashboardLive() {
     return (
       <EmptyState
         icon={RadioTower}
-        message={companies.length === 0 ? "Create an organization to view live runs." : "Select an organization to view live runs."}
+        message={!ORGANIZATION_CREATION_HIDDEN && companies.length === 0 ? "Create an organization to view live runs." : "Select an organization to view live runs."}
       />
     );
   }

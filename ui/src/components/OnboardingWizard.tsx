@@ -88,6 +88,7 @@ import {
   resolveManagedSandboxEnvironmentId,
 } from "../lib/adapter-test-environment";
 import { queryKeys } from "../lib/queryKeys";
+import { ORGANIZATION_CREATION_HIDDEN } from "../lib/organization-creation";
 import { Dialog, DialogPortal } from "@/components/ui/dialog";
 import {
   Popover,
@@ -2353,6 +2354,8 @@ function OnboardingWizardInner({
       setStep(3);
       return;
     }
+    // All entry points (button, field Enter, and Cmd/Ctrl+Enter) share this guard.
+    if (ORGANIZATION_CREATION_HIDDEN) return;
     if (creatingCompanyRef.current) return;
     creatingCompanyRef.current = true;
     setLoading(true);
@@ -2870,6 +2873,13 @@ function OnboardingWizardInner({
                   : "w-full max-w-md px-8 py-12",
               )}
             >
+              {ORGANIZATION_CREATION_HIDDEN && step === 1 && !createdCompanyId ? (
+                <div className="flex flex-col gap-4">
+                  <p>Creating organizations isn't available here yet.</p>
+                  <Button variant="ghost" onClick={handleClose}>Close</Button>
+                </div>
+              ) : (
+                <>
               {/* Full-length progress bar (brand .wsteps/.wstep) — segment N
                   filled once step ≥ N. Completed segments jump back.
                   Hidden for a run that entered on the agent arc: the arc strip
@@ -3595,6 +3605,8 @@ function OnboardingWizardInner({
                     else handleLaunchToDashboard();
                   }}
                 />
+              )}
+                </>
               )}
             </div>
           </div>
