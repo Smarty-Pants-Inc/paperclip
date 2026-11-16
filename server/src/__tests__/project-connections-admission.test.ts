@@ -1,3 +1,4 @@
+import "./helpers/project-connections-approval-http.js";
 import { randomUUID } from "node:crypto";
 import request from "supertest";
 import { assertProjectConnectionAdmission } from "../services/project-connection-admission.js";
@@ -12,6 +13,7 @@ import * as credentials from "../services/connection-credentials.js";
 import { createToolConnectionSchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { CANARY, projectConnectionFixture, storedConnection } from "./helpers/project-connections-fixture.js";
+import { projectConnectionFixture as approvedProjectConnectionFixture } from "./helpers/project-connections-approved-fixture.js";
 
 describe("project connection writer admission (round-4 B)", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
@@ -23,11 +25,14 @@ describe("project connection writer admission (round-4 B)", () => {
   // B-only composition harness: A/C/D remain unimplemented on this lane.
   // Replace just those exported boundaries and synthetic vault acquisition;
   // all B writer, authority and transaction SQL below is production code.
-  function composeFinish(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
-    vi.spyOn(credentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: CANARY, latestVersion: 1 });
+  // Genuine approval rotates the fixture key to a real PEM once (vault version 2);
+  // the synthetic vault read must report the version the vault actually holds.
+  const APPROVED_KEY_VERSION = 2;
+  function composeFinish(f: Awaited<ReturnType<typeof projectConnectionFixture>>, secretVersion = 1) {
+    vi.spyOn(credentials, "resolveConnectionGrantSecret").mockResolvedValue({ value: CANARY, latestVersion: secretVersion });
     const verified = { identity: { companyId: f.companyId, providerHost: "github.com" as const,
       verifiedRegistrationId: "123", canonicalInstallationKey: "github.com/github-app-installation/456" },
-      repositoryIds: [101], secretVersion: 1 };
+      repositoryIds: [101], secretVersion };
     const verify = vi.spyOn(providerScope, "verifyProjectConnectionGitHubScope").mockResolvedValue(verified);
     vi.spyOn(retirement, "lockProjectConnectionLifecycle").mockImplementation(async (tx, input) => {
       await tx.select().from(projects).where(and(eq(projects.companyId, input.companyId), eq(projects.id, input.projectId))).for("update");
@@ -101,7 +106,7 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J01: B's ordinarily permitted lead cannot disable A through the common writer", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection();
     // The saved actor, not a route-only check, is needed by the writer.
     await expect(f.management(connection.id, f.leadB.id).then(context => f.service.updateConnection(connection.id, { enabled: false }, context)))
@@ -110,14 +115,15 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J02: wrong-project recipient cannot be installed by an otherwise permitted manager", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
     await expect(f.service.putConnectionInstalls(connection.id, { installs: [{ targetType: "agent", targetId: f.outsider.id }] }, f.actor()))
       .rejects.toMatchObject({ status: 403, details: { code: "project_connection_target_outside_project" } });
   });
 
   it("J03/J16: native create parsing preserves the nullable owner without removing baseline grants", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
+    await f.approve(); // genuine C4 session write + H-session receipt before first bind
     const parsed = createToolConnectionSchema.parse(f.input());
     expect(parsed).toHaveProperty("projectId", f.a.id);
     const before = await db.select().from(companyMemberships).where(eq(companyMemberships.companyId, f.companyId));
@@ -245,9 +251,9 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J02/J03: approved lead finishes an explicit worker with fresh verification and a transactional receipt", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
-    const harness = composeFinish(f);
+    const harness = composeFinish(f, APPROVED_KEY_VERSION);
     const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor(f.leadA.id));
     expect(result.connection).toMatchObject({ id: connection.id, projectId: f.a.id, status: "active", enabled: true });
     expect(harness.verify).toHaveBeenCalledTimes(1);
@@ -312,7 +318,7 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("A08/W7: actorless project lead changes cannot rewrite the approved team", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection();
     const { projectService } = await import("../services/projects.js");
     await expect(projectService(db).update(f.a.id, { leadAgentId: f.leadB.id }))
@@ -342,10 +348,10 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J03/A08/W7: an authorized drained lead change synchronizes live and retained approvals atomically", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
     const live = await f.seedConnection(f.a, { status: "draft", installed: false });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
     expect(response.status).toBe(200);
     expect(response.body.leadAgentId).toBe(f.worker.id);
@@ -356,9 +362,9 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J11/A08/W7: running-work refusal rolls back project lead and all approval envelopes", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { installed: false });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
     vi.mocked(retirement.assertProjectConnectionNotInUse).mockRejectedValue(conflict("synthetic running work", { code: "project_connection_in_use" }));
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
     expect(response.status).toBe(409);
@@ -369,7 +375,7 @@ describe("project connection writer admission (round-4 B)", () => {
   // These release REDs deliberately use D's REAL exports. On lane B's
   // isolated Stage-0 checkout they remain blocked on D, not mocked green.
   it("J03/B-RF2-0036-integration: real lifecycle/gate permits a drained lead change atomically", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const archived = await f.seedConnection(f.a, { status: "archived", installed: false });
     const live = await f.seedConnection(f.a, { status: "draft", installed: false });
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
@@ -397,7 +403,7 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J03/B-RF2-0036-archived-only: changing the lead preserves the sole connection's terminal archive", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "archived", installed: false });
     const response = await request(f.route(f.primary.id)).patch(`/api/projects/${f.a.id}`).send({ leadAgentId: f.worker.id });
     expect(response.status).toBe(200);
@@ -437,10 +443,10 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("M01/A08/W3: an explicit install cannot expose a still-pending migration candidate", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const legacy = await f.seedConnection(null);
     const { connection } = await f.seedConnection(f.a, { status: "draft", pending: true, legacyId: legacy.connection.id, installed: false });
-    composeFinish(f);
+    composeFinish(f, APPROVED_KEY_VERSION);
     await expect(f.service.putConnectionInstalls(connection.id, { installs: [{ targetType: "agent", targetId: f.worker.id }] }, f.actor()))
       .rejects.toMatchObject({ status: 409, details: { code: "project_connection_migration_pending" } });
     expect(await db.select().from(toolConnectionInstalls).where(eq(toolConnectionInstalls.connectionId, connection.id))).toHaveLength(0);
@@ -464,12 +470,12 @@ describe("project connection writer admission (round-4 B)", () => {
   });
 
   it("J05-positive: finish permits a requested shard inside a larger primary approval", async () => {
-    const f = await projectConnectionFixture(db);
+    const f = await approvedProjectConnectionFixture(db);
     const { connection } = await f.seedConnection(f.a, { status: "draft", installed: false });
     await db.insert(projectWorkspaces).values({ companyId: f.companyId, projectId: f.a.id, name: "Second approved repository", repoUrl: "https://github.com/owner/A2.git", metadata: { githubRepositoryId: 102 } });
     const config = { ...connection.config, projectScope: { ...f.scope(), approvedRepositoryIds: [101, 102] } };
     await db.update(toolConnections).set({ config, transportConfig: config }).where(eq(toolConnections.id, connection.id));
-    composeFinish(f); // This connection requests and verifies only A (101).
+    composeFinish(f, APPROVED_KEY_VERSION); // This connection requests and verifies only A (101).
     const result = await f.service.finishGalleryAppConnection(f.companyId, connection.id, finishInput(f.worker.id), f.actor());
     expect(result.connection).toMatchObject({ status: "active", enabled: true });
     expect(result.connection).toMatchObject({ config: { projectScope: { approvedRepositoryIds: [101, 102] } } });
