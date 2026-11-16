@@ -4954,6 +4954,10 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     identity?: DurableRecoveryIdentity,
   ): Promise<ControlPlaneRegistration> {
     const registration = await this.options.controlPlaneRegistration!(core, identity);
+    // A Core-dialed route reads this owner's idleness from the transport's own
+    // definition, never from the control plane's command list alone: runnerd
+    // completes turn.start when it accepts a turn (#20825).
+    registration.bindOwnerIdle?.(() => this.#settledIdleWarmOwner());
     const quiesce = registration.quiesce;
     if (!quiesce) return registration;
     this.#controlPlaneQuiesces.add(quiesce);

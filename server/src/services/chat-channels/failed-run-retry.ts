@@ -577,6 +577,10 @@ export function createChatFailedRunRetry(db: Db, options: ChatFailedRunRetryOpti
       "provider_session_open_timeout",
       "local_runtime_api_listener_unavailable",
       "runner_ingress_startup_failed",
+      // A runner unreachable after authentication (#20825); before, the same
+      // mid-turn loss was classed runner_ingress_startup_failed.
+      "native_runner_ingress_unreachable",
+      "native_runner_ingress_recovery_exhausted",
     ];
     if (
       !coordinator ||

@@ -56,6 +56,12 @@ export interface RunnerExecutionDriver {
      * treating a dropped connection as transport loss, so a Core-dialed route
      * neither redials nor fails; keep the established receive/ACK path. */
     quiesce?: () => void;
+    /** The transport binds its own owner idleness here, once, before
+     * activate(): true only for a settled idle warm owner (no provider work in
+     * flight, no pending command, its attached run settled a turn). A
+     * Core-dialed route may outlive its recovery budget only while this
+     * returns true; an unbound owner is busy (#20825). */
+    bindOwnerIdle?: (isIdle: () => boolean) => void;
     release: (reason?: "detach") => Promise<void> | void;
   }>;
   /** Register source and target checkpoint ownership before staging changes the stored run. */
