@@ -1407,6 +1407,26 @@ must therefore be listed in `MIGRATIONS_WITH_TOP_LEVEL_STATEMENTS` in
 because a failed run starts again from the first statement. The pull-request
 guard fails a new `CONCURRENTLY` migration that is not in that list.
 
+For a short transactional DDL change on a busy table, put `SET LOCAL
+lock_timeout = '500ms';` before the DDL (with a statement breakpoint). It bounds
+each lock acquisition, not statement execution or index-build duration, and
+resets on commit or rollback. Migration `0493_furry_the_watchers.sql` uses 500 ms
+to let reads queued behind its ALTER resume within a one-second budget. Its
+non-concurrent index still requires the documented controlled staging window.
+
+The ordinary per-file transactional executor retries only PostgreSQL SQLSTATE
+`55P03` (lock not available), after rolling back the entire file and its history
+entry. It makes at most three attempts, backing off 250 ms then 500 ms outside
+the transaction. Other errors fail immediately; top-level/nontransactional
+migrations and the special paired project-environment repair are not retried
+by this path. Exhaustion fails startup or `pnpm db:migrate` with
+`MigrationLockTimeoutError` (`code: migration_lock_timeout`), naming the file
+and attempts and retaining the PostgreSQL error as its cause. Identify and
+finish or roll back the blocking transaction, then rerun the same migration
+command. Do not mark the file applied manually: failed attempts leave no DDL
+or history entry from that file. Earlier successfully committed files remain
+applied. This is bounded contention recovery, not an online-compatibility waiver.
+
 **The rule for a new migration.** A pull request fails when a migration it adds
 is `unknown`. Rewrite the migration, split it into expand and contract
 migrations, or, when you have verified the migration yourself, state the class
