@@ -1264,6 +1264,12 @@ export interface IssueCommentMetadata {
   supersededByCommentId?: string;
   /** Inbound channel attribution; never an authorization input. */
   sourceChannel?: ChatProvider;
+  /**
+   * Names the outside source of a system comment that quotes outside text
+   * (inbound email, chat edit notice). Description only; the comment's
+   * sourceTrust marks it untrusted. Never an authorization input.
+   */
+  externalSource?: { channel: string; sender: string | null };
   sourceRunId?: string | null;
   sourceIdentityContextId?: string | null;
   authorizationReason?: string | null;

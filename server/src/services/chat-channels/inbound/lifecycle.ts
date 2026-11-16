@@ -66,6 +66,7 @@ import type {
   MessageDeletedEvent,
 } from "chat";
 import { normalizedDeliveryThreadId, lifecycleRuntimeFence } from "./delivery-ledger.js";
+import { buildLowTrustSourceTrust, externalSourceCommentMetadata } from "../../source-trust.js";
 type DeliveryRow = typeof chatDeliveries.$inferSelect;
 type MessageLifecycleOptions = {
   DELIVERY_PROCESSING_STALE_MS: number;
@@ -961,7 +962,19 @@ export function createChatMessageLifecycle(db: Db, options: MessageLifecycleOpti
           linkedTarget.issueId,
           lifecycle.text,
           {},
-          { authorType: "system" },
+          // smarty-dev#20830: an edit or restore notice quotes the outside message,
+          // so it is marked low-trust with its source named; a delete notice is
+          // fixed platform text and stays a plain notice.
+          activeDelivery.eventKind === "message_deleted"
+            ? { authorType: "system" }
+            : {
+                authorType: "system",
+                sourceTrust: buildLowTrustSourceTrust({ issueId: linkedTarget.issueId }),
+                metadata: externalSourceCommentMetadata({
+                  channel: currentEndpoint.provider,
+                  sender: lifecycle.actor?.handle || lifecycle.actor?.displayName || null,
+                }),
+              },
           tx,
         );
         await notifyChatDeliveryWork(tx);

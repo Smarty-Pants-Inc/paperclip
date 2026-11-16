@@ -3,7 +3,7 @@ import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
-import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody, issueCommentHistoryAuthor } from "@paperclipai/shared";
+import { FAST_RESPONSE_AGENT_GUIDANCE, fastResponseHistoryBody, issueCommentExternalSource, issueCommentHistoryAuthor } from "@paperclipai/shared";
 import {
   persistActivity,
   publishActivity,
@@ -560,12 +560,14 @@ export async function conversationReplay(
     .limit(40);
   return FAST_RESPONSE_AGENT_GUIDANCE + "\n" + rows
     .reverse()
-    .map((row) =>
-      JSON.stringify({
-        author: issueCommentHistoryAuthor(row),
+    .map((row) => {
+      const author = issueCommentHistoryAuthor(row);
+      return JSON.stringify({
+        author,
+        ...(author === "external_message" ? { source: issueCommentExternalSource(row) } : {}),
         body: fastResponseHistoryBody(sanitizeQuarantinedCommentForHigherTrust(row)).slice(0, 8000),
-      }),
-    )
+      });
+    })
     .join("\n");
 }
 
