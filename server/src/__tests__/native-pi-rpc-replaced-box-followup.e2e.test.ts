@@ -10,9 +10,10 @@
 // SMA-60 (J3-22 member (a)): governed wait + a CURRENT failover backup (the
 // controller drains gracefully, as a deploy does) + image swap: host
 // preparation refuses that backup on the NEW box (backup_without_reusable_lease,
-// no retired-source proof). The ORIGINAL run must answer on a fresh thread
-// with exactly one continuation note, no failed run, the J3-17 lineage step
-// recorded; the NEXT message must resume that new thread.
+// no retired-source proof). Superseded (RFL 14:49Z; review-fleet-3 J3-22
+// verdict 6914443167; org 10:54Z): on this RECOVER path the ORIGINAL run fails
+// with that named refusal; no second provider thread starts in it, no
+// continuation note, no lineage step, the backup is not set aside.
 // Real: DB resume admission, two OS controller processes with different bootIds,
 // surviving controller state, default sandbox driver/commands, runnerd, TLS PRP
 // preview, qualified Pi 1.5.2 and its JSONL, native history handoff and events.
@@ -222,9 +223,9 @@ const recoveryCases: RecoveryCase[] = [{ name: "deployed: warm envelope + DB che
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "absent", control: "none", expected: "record", box: "replaced", responseWait: "github-review-shape" },
 { name: "SB-cold: warm envelope + DB checkpoint, done, same box with cold runner",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "done", failoverBackups: "absent", control: "none", expected: "answers-with-history", box: "same-box-cold" },
-{ name: "SMA-60: governed wait, CURRENT backup, image swap -> restore refused on the new box, the original run answers on a fresh thread",
+{ name: "SMA-60: governed wait, CURRENT backup, image swap -> restore refused on the new box, the original run answers on a fresh thread (superseded by replacement: rf3 J3-22 verdict 6914443167; org 10:54Z)",
   localEnvelope: "present", dbCheckpoint: "present", priorRun: "yielded-response-wake", failoverBackups: "present", control: "none",
-  expected: "answers-no-history", box: "replaced", responseWait: "board", piConversationFile: "present", restoreRefused: true }];
+  expected: "refused-once", box: "replaced", responseWait: "board", piConversationFile: "present", restoreRefused: true }];
 const runRecoveryCase = async (scenario: RecoveryCase) => {
   const governedWait = scenario.priorRun === "yielded-response-wake";
   const reviewerShape = scenario.responseWait === "github-review-shape";
@@ -878,7 +879,7 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       }, {});
       console.log(`E2E-PI-SB-COUNT: ${JSON.stringify({ runId: next.runId, eventCountByType, localWarmCursor: localSnapshot.cursor ?? null })}`);
     }
-    if (governedWait && (outcome.error != null || persisted?.error != null
+    if (governedWait && !restoreRefused && (outcome.error != null || persisted?.error != null
       || record(outcome.result).exitCode !== 0 || record(outcome.result).summary !== governedReply)) {
       // Capture the FIRST failure before a second person message. Do not repair,
       // bypass, or overwrite the failed predecessor: use the same admission.
@@ -928,70 +929,35 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
 
     let nextWorkspaceRestored = false;
     if (restoreRefused) {
-      // SMA-60 TARGET (J3-22 member (a)): the ORIGINAL run answers on a fresh
-      // thread of the same conversation; exactly ONE continuation note; no
-      // failed run; the J3-17 lineage step recorded. Then the NEXT message
-      // resumes that new thread.
-      expect(outcome.error, JSON.stringify(outcome)).toBeUndefined();
-      expect(outcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
-      expect(persisted?.error ?? null).toBeNull(); expect(persisted?.errorCode ?? null).toBeNull();
+      // SMA-60, superseded by replacement (RFL 14:49Z; rf3 J3-22 verdict
+      // 6914443167; org 10:54Z): the refused restore while RECOVERING the saved
+      // session is the NAMED refusal. The ORIGINAL run fails with that code; no
+      // second provider thread starts in it; no continuation note claims a fresh
+      // thread; no lineage step; the refused backup is NOT set aside.
+      const refusalCode = "runner_harness_state_mismatch: backup_without_reusable_lease";
+      expect(outcome.error != null || persisted?.error != null || record(outcome.result).exitCode !== 0,
+        `the original run fails: ${JSON.stringify(outcome)}`).toBe(true);
+      expect(record(outcome.result).summary, "the original run does not answer").not.toBe(governedReply);
+      expect(JSON.stringify({ outcome, error: persisted?.error ?? null, errorCode: persisted?.errorCode ?? null,
+        resultJson: persisted?.resultJson ?? null, events }), "the run fails with the exact named refusal").toContain(refusalCode);
+      expect(requests.filter(request => request.runId === next.runId), "no provider thread answered in this run").toHaveLength(0);
       const logs = stages.map(record).filter(entry => entry.kind === "log" && entry.runId === next.runId).map(entry => String(entry.text));
-      expect(logs.some(text => text.includes("continuing in a fresh provider thread") && text.includes("backup_without_reusable_lease")),
-        "the refused restore (backup_without_reusable_lease) was met and continued in this run").toBe(true);
-      expect(readdirSync(join(stateRoot, "continuity-breaks")), "the refused backup set aside once, never deleted").toHaveLength(1);
+      expect(logs.filter(text => text.includes("fresh provider thread")), "no log claims a fresh thread").toEqual([]);
+      expect(notes.filter(note => note.body.startsWith("Continuing in a fresh thread")
+        || String(record(note.metadata).authorizationReason ?? "").startsWith("restore_unavailable_fresh_thread:")),
+        "no continuation note claiming a fresh thread").toEqual([]);
+      const breaks = join(stateRoot, "continuity-breaks");
+      expect(existsSync(breaks) ? readdirSync(breaks) : [], "the refused backup is NOT set aside").toEqual([]);
+      expect(backupInventory().some(entry => entry.endsWith("manifest.json")), "the CURRENT backup is kept in place").toBe(true);
       const finalCheckpoint = record(record(persisted?.runnerProfileJson).sessionCheckpoint);
-      const freshProviderSessionId = finalCheckpoint.providerSessionId;
-      expect(freshProviderSessionId).toBeTruthy();
-      expect(freshProviderSessionId, "fresh provider thread, same normalized conversation").not.toBe(admission.checkpoint!.providerSessionId);
-      expect(requests.filter(request => request.runId === next.runId)).toHaveLength(1);
-      // Evidence, not a target: on this RECOVER path the runtime treats the fresh
-      // thread as resumed, so no saved-history handoff is sent (NSR !recovered).
-      const freshRequest = requests.find(request => request.runId === next.runId)!;
-      console.log(`E2E-PI-SMA60-HISTORY: ${JSON.stringify({ runId: next.runId, containsFact: freshRequest.containsFact,
-        handoffHasFact: freshRequest.handoffHasFact, roles: (record(freshRequest.request).messages as Array<{ role: string }>).map(message => message.role) })}`);
-      const continuationNote = (runId: string) => ({ authorizationReason: `restore_unavailable_fresh_thread:restore_unavailable_on_new_box:${runId}` });
-      expect(notes, "exactly ONE continuation note").toHaveLength(1);
-      expect(notes[0]?.body).toMatch(/^Continuing in a fresh thread: the earlier provider thread could not be restored on this new sandbox/);
-      expect(notes[0]?.body, "the note claims no history the fresh thread did not get").not.toContain("from its saved history");
-      expect(record(notes[0]?.metadata)).toMatchObject(continuationNote(next.runId));
+      if (finalCheckpoint.providerSessionId != null) expect(finalCheckpoint.providerSessionId, "no second provider thread recorded")
+        .toBe(admission.checkpoint!.providerSessionId);
       const [taskSessionAfter] = await db.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, companyId),
         eq(agentTaskSessions.agentId, agentId), eq(agentTaskSessions.adapterType, "paperclip_runner"), eq(agentTaskSessions.taskKey, issueId)));
       const lineage = record(readPiConversation(taskSessionAfter?.sessionParamsJson)).providerIdentityResets as Array<Record<string, unknown>> | undefined;
-      console.log(`E2E-PI-SMA60-LINEAGE: ${JSON.stringify({ runId: next.runId, freshProviderSessionId, lineage })}`);
-      expect(lineage, "J3-17 lineage record written").toEqual([expect.objectContaining({ reason: "resume_failed_on_new_box", runId: next.runId })]);
-      expect(JSON.stringify(lineage![0]!.identity)).toContain(String(freshProviderSessionId));
-      // The run completed: finalize it as the heartbeat does, then the NEXT message.
-      await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, next.runId));
-      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, next.runId));
-      await nextOptions.sync.restoreWorkspace(); nextWorkspaceRestored = true;
-      await heartbeat.releaseEnvironmentLeasesForRun({ runId: next.runId, companyId, agentId, status: "succeeded", providerResourceDisposition: "keep_running" });
-      const [secondComment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "local-board",
-        body: `Second message. ${followupPrompt}` }).returning();
-      const second = await seed(secondComment!.body, B.identity, first.native.normalizedSessionId, secondComment!.id);
-      activeRunId = second.runId; followupRunId = second.runId;
-      const secondAdmission = await admitFollowup(second);
-      expect(secondAdmission.selected.id, "the next message resumes from the answered run").toBe(next.runId);
-      expect(secondAdmission.admission.checkpoint?.providerSessionId, "admitted on the NEW thread").toBe(freshProviderSessionId);
-      const secondOptions = await executionOptions(second);
-      const secondOutcome = await B.call("execute", secondOptions.input);
-      const [secondPersisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, second.runId));
-      const secondEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, second.runId));
-      const secondNotes = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).filter(row => row.authorType === "system");
-      const secondCheckpoint = record(record(secondPersisted?.runnerProfileJson).sessionCheckpoint);
-      console.log(`E2E-PI-SMA60-SECOND: ${JSON.stringify({ runId: second.runId, outcome: secondOutcome, error: secondPersisted?.error ?? null,
-        errorCode: secondPersisted?.errorCode ?? null, providerSessionId: secondCheckpoint.providerSessionId ?? null, freshProviderSessionId,
-        notes: secondNotes.map(note => note.body), acquisition: secondOptions.target.sandboxLeaseAcquisition })}`);
-      await writeFile(join(root, "second-message-outcome.json"), JSON.stringify({ secondOutcome, secondPersisted, secondEvents, secondNotes }, null, 2));
-      expect(secondOutcome.error, JSON.stringify(secondOutcome)).toBeUndefined();
-      expect(secondOutcome.result).toMatchObject({ exitCode: 0, sessionId: first.native.normalizedSessionId, summary: governedReply });
-      expect(secondPersisted?.error ?? null).toBeNull(); expect(secondPersisted?.errorCode ?? null).toBeNull();
-      expect(secondCheckpoint.providerSessionId, "the next message RESUMES the same new thread").toBe(freshProviderSessionId);
-      expect(JSON.stringify({ secondOutcome, secondPersisted, secondEvents }), "no provider_identity_changed refusal")
-        .not.toContain("provider_identity_changed");
-      expect(secondNotes.map(note => note.id), "no second note").toEqual(notes.map(note => note.id));
-      const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
-      expect(allRuns.filter(run => run.status === "failed" || run.error != null), "0 failed runs").toEqual([]);
-      await secondOptions.sync.restoreWorkspace();
+      console.log(`E2E-PI-SMA60-REFUSED: ${JSON.stringify({ runId: next.runId, error: persisted?.error ?? outcome.error ?? null,
+        errorCode: persisted?.errorCode ?? null, lineage, notes: notes.map(note => note.body) })}`);
+      expect(lineage ?? [], "no J3-17 lineage step for a fresh thread").toEqual([]);
     } else if (governedWait) {
       // G TARGETS: both answer, never a fresh-thread refusal. G1 resumes the
       // surviving Pi history; G2 starts without history and explains it once.
@@ -1082,7 +1048,7 @@ const runRecoveryCase = async (scenario: RecoveryCase) => {
       expect(new Set(destroyRefusals), "only the old image-A box was asked for").toEqual(new Set([allocationIds[0]]));
     } else expect(providerCalls.some(call => call.method === "environmentDestroyLease"), "never destroy either box").toBe(false);
     if (!nextWorkspaceRestored) await nextOptions.sync.restoreWorkspace();
-    stage(restoreRefused ? "GREEN: SMA-60 refused restore answered in the original run; next message resumed the new thread"
+    stage(restoreRefused ? "GREEN: SMA-60 refused restore failed the original run with the named refusal; no fresh thread in it"
       : governedWait ? "GREEN: governed-wait replaced-box follow-up answered"
       : sameBoxCold ? "GREEN: same-box cold-runner follow-up answered without replay or history re-send"
       : "GREEN: replaced-box follow-up answered from real history handoff", { runId: next.runId, failedStateReads });
