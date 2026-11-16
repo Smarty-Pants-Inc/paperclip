@@ -5019,9 +5019,7 @@ export function secretService(db: Db | DbTransaction) {
      * written, and the delete + insert run on one executor, so an invalid
      * ref (deleted, unknown, or outside the target's scope) fails the whole
      * call without leaving the target half-bound. Environments always require
-     * company scope. A private instance secret requires an exact agent/project
-     * owner and installed-plugin match, supplied by trusted lifecycle code;
-     * ordinary config callers must not derive this context from user input.
+     * company scope.
      */
     replaceSecretRefsForInstanceTarget: async (
       target: { targetType: SecretBindingTargetType; targetId: string },
@@ -5034,7 +5032,7 @@ export function secretService(db: Db | DbTransaction) {
         projectionClass?: SecretProjectionClass;
         projectionAllowlistKey?: string | null;
       }>,
-      options?: { db?: SecretBindingDb; instanceOwner?: InstanceSecretOwner },
+      options?: { db?: SecretBindingDb },
     ) => {
       const normalizedRefs: Array<{
         companyId: string;
@@ -5055,14 +5053,7 @@ export function secretService(db: Db | DbTransaction) {
             { code: "secret_missing", configPath: ref.configPath },
           );
         }
-        const instanceOwner = options?.instanceOwner;
-        const instanceOwned = secret.scope === "instance" && instanceOwner &&
-          ((target.targetType === "agent" && target.targetId === instanceOwner.agentId) ||
-            (target.targetType === "project" && target.targetId === instanceOwner.projectId)) &&
-          secret.ownerAgentId === (instanceOwner.agentId ?? null) &&
-          secret.ownerProjectId === (instanceOwner.projectId ?? null) &&
-          secret.ownerPluginId === instanceOwner.pluginId;
-        if (secret.scope !== "company" && !instanceOwned) {
+        if (secret.scope !== "company") {
           throw unprocessable("Secret references require company-scoped secrets");
         }
         assertSecretBindingConfigPath({ targetType: target.targetType, configPath: ref.configPath });

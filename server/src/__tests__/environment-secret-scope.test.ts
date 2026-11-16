@@ -183,20 +183,29 @@ if (!support.supported) console.warn(`Skipping environment secret scope tests: $
     }
   }
 
-  it.each(["agent", "project"] as const)("allows an instance secret bound to its exact %s and plugin owner", async (targetType) => {
-    const svc = secretService(db);
-    const target = { targetType, targetId: targetType === "agent" ? ownerAgentId : ownerProjectId };
-    const secretId = targetType === "agent" ? agentSecretId : instanceSecretId;
-    for (const callerTransaction of [false, true]) {
-      const options = { instanceOwner: owner(targetType) };
-      const refs = [{ secretId, configPath: "privateApiKey" }];
-      const result = callerTransaction
-        ? await db.transaction((tx) => svc.replaceSecretRefsForInstanceTarget(target, refs, { ...options, db: tx }))
-        : await svc.replaceSecretRefsForInstanceTarget(target, refs, options);
-      expect(result).toMatchObject([{ companyId, secretId }]);
-      const rows = await bindings(target.targetId, targetType);
-      expect(rows).toHaveLength(1);
-      expect(rows[0]).toMatchObject({ ...target, companyId, secretId, configPath: "privateApiKey" });
+  // RFL 00:05Z: the instanceOwner exception is deleted (rules 12/13): no production caller supplies it.
+  // RED on 05c963f7, which allowed this exact owner. A caller that still passes an instanceOwner-shaped
+  // option (cast through unknown, as the deleted type allowed) for an instance secret on its exact
+  // agent/project and plugin owner is refused like every other non-company secret, with no row written.
+  it("refuses an instance secret even with an instanceOwner-like option for its exact agent/project and plugin owner", async () => {
+    for (const targetType of ["agent", "project"] as const) {
+      const svc = secretService(db);
+      const target = { targetType, targetId: targetType === "agent" ? ownerAgentId : ownerProjectId };
+      const secretId = targetType === "agent" ? agentSecretId : instanceSecretId;
+      for (const callerTransaction of [false, true]) {
+        await svc.replaceSecretRefsForInstanceTarget(target, [{ secretId: companySecretId, configPath: "existingKey" }]);
+        const before = await bindings(target.targetId, targetType);
+        const refs = [{ secretId, configPath: "privateApiKey" }];
+        const attempt = async (executor?: { db: unknown }) => {
+          const options = { ...executor, instanceOwner: owner(targetType) } as unknown as Parameters<typeof svc.replaceSecretRefsForInstanceTarget>[2];
+          return svc.replaceSecretRefsForInstanceTarget(target, refs, options).then(() => null, (failure: unknown) => failure);
+        };
+        const error = callerTransaction ? await db.transaction((tx) => attempt({ db: tx })) : await attempt();
+        expect.soft(error, `${targetType}, callerTransaction=${callerTransaction}: refused`)
+          .toMatchObject({ status: 422, message: "Secret references require company-scoped secrets" });
+        expect.soft(await bindings(target.targetId, targetType), `${targetType}, callerTransaction=${callerTransaction}: no row written`)
+          .toEqual(before);
+      }
     }
   });
 
