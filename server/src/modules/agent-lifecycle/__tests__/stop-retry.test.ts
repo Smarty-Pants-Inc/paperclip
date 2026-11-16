@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
@@ -8,6 +8,7 @@ import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.
 import { createLifecycleStore, surfaceAgentLifecycleStopParkInTransaction } from "../adapters/postgres.js";
 import { createLifecycleWorker } from "../application/worker.js";
 import { startAgentLifecycle } from "../index.js";
+import { recoveryService } from "../../../services/recovery/service.js";
 
 // Keep reason: the reported production pausing row kept being claimed even
 // after an operator set retryRequired. Exercise the saved journal and worker.
@@ -74,6 +75,7 @@ describe("bounded lifecycle Stop recovery", () => {
       expect(parked.lifecycleError).toContain("Automatic stop work is paused");
       expect(parked.lifecycleError).toContain(parked.lifecycleOperation!.id);
       expect(parked.lifecycleError).toContain("Retry");
+      expect(parked.lifecycleError).toContain("lifecycle_stop_retry_required");
       await worker.stop();
       const restarted = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true);
       try {
@@ -155,6 +157,7 @@ describe("bounded lifecycle Stop recovery", () => {
         expect(row.lifecycleError).toContain(`Automatic stop work is paused in ${agent.lifecycleState}`);
         expect(row.lifecycleError).toContain(agent.lifecycleOperation!.id);
         expect(row.lifecycleError).toContain("use Retry");
+        expect(row.lifecycleError).toContain("lifecycle_stop_retry_required");
       }
       expect(driver.runHost).not.toHaveBeenCalled();
       driver.runHost.mockResolvedValue("complete");
@@ -231,6 +234,48 @@ describe("bounded lifecycle Stop recovery", () => {
       expect((await current(agent.id)).lifecycleState).toBe("paused");
     } finally { await worker.stop(); }
   });
+  // Keep reason: #20807 (c), failure path spanning the real Stop worker,
+  // durable task ownership, the public lifecycle read/Retry and Resume commands.
+  it("makes exhausted unconfirmed Stop actionable without releasing its task until proof arrives", async () => {
+    const agent = await fixture("pausing");
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "dispatching",
+      startedAt: new Date("2000-01-01T00:00:00Z"), finishedAt: new Date(),
+      runnerProfileJson: { adapterDispatch: { adapterType: "http" } }, resultJson: {} }).returning();
+    const [task] = await db.insert(issues).values({ companyId, title: "Waiting for confirmed Stop", status: "in_progress",
+      assigneeAgentId: agent.id, checkoutRunId: run.id, executionRunId: run.id }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: task.id } }).where(eq(heartbeatRuns.id, run.id));
+    const commands = createAgentLifecycle(db);
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    const worker = createLifecycleWorker(store, createLifecycleDriver(db, {} as never), () => {});
+    const recovery = recoveryService(db, { enqueueWakeup: vi.fn() });
+    const currentTask = async () => (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
+    try {
+      for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
+      // This is the public lifecycle read used by the existing Retry surface,
+      // not just an internal log or worker counter.
+      expect((await commands.get(agent.id))?.lifecycleError).toContain("lifecycle_stop_retry_required");
+      expect((await commands.get(agent.id))?.lifecycleError).toContain(`invocation ${run.id}`);
+      expect((await current(agent.id)).lifecycleOperation?.retryRequired).toBe(true);
+      expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
+      expect(await currentTask()).toEqual(task);
+      // Retry is not permission to invent Stop proof, or remove a manual hold.
+      await commands.retry(agent.id); await worker.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("pausing");
+      expect((await current(agent.id)).lifecycleHolds).toEqual(["manual"]);
+      expect(await currentTask()).toEqual(task);
+      await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, run.id));
+      await due(agent.id); await worker.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("paused");
+      expect((await current(agent.id)).lifecycleError).toBeNull();
+      expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(1);
+      expect(await currentTask()).toMatchObject({ status: "blocked", checkoutRunId: null, executionRunId: null });
+      await commands.resumeAgent(agent.id); await worker.process(agent.id);
+      expect((await current(agent.id)).lifecycleState).toBe("ready");
+      expect((await current(agent.id)).lifecycleHolds).toEqual([]);
+    } finally { await worker.stop(); }
+  });
+
   it.each(["pausing", "terminating", "cleaning_up"] as const)("also bounds thrown %s Stop failures with secret-safe errors", async phase => {
     const agent = await fixture(phase);
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
