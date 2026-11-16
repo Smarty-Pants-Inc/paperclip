@@ -1,5 +1,5 @@
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
-import { drainAgentFileCheckpoints } from "./services/agent-directory-working-copies.js";
+import { drainAgentFileCheckpoints, pendingAgentFileCheckpointCount } from "./services/agent-directory-working-copies.js";
 import { closeProcessRunAdmission, isProcessRunAdmissionClosed } from "./services/heartbeat/run-admission.js";
 import { registerReattachPhaseWork } from "./services/heartbeat/reattach-phase.js";
 import { createRunStartHandover, registerRunStartHandover } from "./services/run-start-handover.js";
@@ -2337,12 +2337,28 @@ async function startServerWithDatabaseTeardown(
     // Hot restart leaves detached native executions running for reattach. Join
     // only their already-started file saves, not the execution promises, before
     // the DB pools close. Ordinary shutdown retains its full execution join.
-    await drainRunExecutionFinalizersForShutdown({
-      signal,
-      drain: skipHeartbeatDrain ? drainAgentFileCheckpoints : drainHeartbeatExecutionFinalizers,
-      timeoutMs: 30_000,
-      log: logger,
-    });
+    if (skipHeartbeatDrain) {
+      const pendingSaves = pendingAgentFileCheckpointCount();
+      const joinStartedAt = Date.now();
+      const result = await drainRunExecutionFinalizersForShutdown({
+        signal,
+        drain: drainAgentFileCheckpoints,
+        timeoutMs: 20_000,
+        log: logger,
+      });
+      logger.info({
+        outcome: pendingSaves === 0 ? "none_pending" : result === "timed_out" ? "timed_out" : "settled",
+        durationMs: Date.now() - joinStartedAt,
+        pendingSaves,
+      }, "hot-restart agent-file checkpoint join complete");
+    } else {
+      await drainRunExecutionFinalizersForShutdown({
+        signal,
+        drain: drainHeartbeatExecutionFinalizers,
+        timeoutMs: 30_000,
+        log: logger,
+      });
+    }
 
     await workspaceRecoveryStop;
 
