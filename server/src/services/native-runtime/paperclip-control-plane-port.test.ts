@@ -1078,6 +1078,84 @@ describe("PaperclipControlPlanePort conformance", () => {
     }
   });
 
+  it("rf4 independent judge: secret_ref PEM reaches the real native event persistence path", async () => {
+    const { secretService } = await import("../secrets.js");
+    const { syncAgentAdapterEnvBindings } = await import("../agent-secret-bindings.js");
+    const { resolveExecutionRunAdapterConfig } = await import("../heartbeat/run-preparation.js");
+    const { addRunSecretMaterial, createAgentIdentityRedactor } = await import("../agent-identity-redaction.js");
+    const { writeFileSync } = await import("node:fs");
+    const { pemTransformForms, pemBodyWindows } = await import("../../__tests__/fixtures/agent-identity-redaction-vectors.js");
+    const identity = { ...CONTROL_PLANE_CONFORMANCE_OPEN.identity, runId: randomUUID(), sessionId: randomUUID() };
+    const runnerId = randomUUID();
+    const privateKeyPem = generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    const fakePem = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+    await db.insert(heartbeatRuns).values({ id: identity.runId, companyId: identity.companyId, agentId: identity.agentId,
+      status: "running", runtimeMode: "native", nativeIssueId: identity.issueId, nativeSessionId: identity.sessionId,
+      runnerInstanceId: runnerId, completionContractId: contractId, completionContractSha256: contractSha,
+      contextSnapshot: { issueId: identity.issueId } });
+    const secretsSvc = secretService(db);
+    const secret = await secretsSvc.create(identity.companyId, { name: `rf4-fake-${identity.runId}`, provider: "local_encrypted", value: fakePem });
+    const adapterConfig = { env: { RF4_TEST_PEM: { type: "secret_ref", secretId: secret.id, version: "latest" } } };
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, identity.agentId));
+    await syncAgentAdapterEnvBindings({ secretsSvc, companyId: identity.companyId, agentId: identity.agentId, adapterConfig });
+    const config = await resolveExecutionRunAdapterConfig({ managedAiCredentials: true, managedGitHubCredentials: true,
+      companyId: identity.companyId, agentId: identity.agentId, adapterType: "codex_local", issueId: identity.issueId,
+      heartbeatRunId: identity.runId, executionRunConfig: adapterConfig, agentAdapterConfig: adapterConfig,
+      projectEnv: null, secretsSvc });
+    const resolved = (config.resolvedConfig.env as Record<string,string>).RF4_TEST_PEM;
+    expect(resolved === fakePem).toBe(true); expect(config.secretKeys.has("RF4_TEST_PEM")).toBe(true);
+    const liveRedactor = createAgentIdentityRedactor(privateKeyPem);
+    addRunSecretMaterial(liveRedactor, [resolved]);
+    const { createRunSecretRedactionRegistry } = await import("../run-secret-redaction.js");
+    const registry = createRunSecretRedactionRegistry(db);
+    const valuesBeforeRead = await registry.redactionValuesForRun(identity.companyId, identity.runId);
+    const midrunToken = (randomUUID() + randomUUID()).replace(/-/g, "").slice(0, 40);
+    // routes/secrets.ts calls this same registration API after a mid-run read.
+    await registry.register(identity.companyId, identity.runId, midrunToken);
+    const valuesAfterRead = await registry.redactionValuesForRun(identity.companyId, identity.runId);
+    const midrunOutput = liveRedactor.redact(midrunToken);
+    const midrunWindows = Array.from({ length: midrunToken.length - 31 }, (_, i) => midrunToken.slice(i, i + 32));
+    const openProbes = { registryValuesAfterEnvResolution: valuesBeforeRead.length,
+      envSecretInRegistryBeforeRead: valuesBeforeRead.includes(fakePem), registryValuesAfterMidrunRead: valuesAfterRead.length,
+      envSecretInRegistryAfterRead: valuesAfterRead.includes(fakePem), midrunSecretInRegistry: valuesAfterRead.includes(midrunToken),
+      midrunSecretTotalWindows: midrunWindows.length, midrunSecretLiveWindows: midrunWindows.filter(w => midrunOutput.includes(w)).length,
+      midrunSecretLiveOutputUnchanged: midrunOutput === midrunToken };
+    if (process.env.RF4_OUT) writeFileSync(process.env.RF4_OUT + "/open-probes.json", JSON.stringify(openProbes, null, 2) + "\n");
+    console.log("RF4_OPEN_PROBES", JSON.stringify(openProbes));
+    const observed: PrpEvent[] = [];
+    const port = new PaperclipControlPlanePort(db, { ...identity, completionContractId: contractId,
+      completionContractSha256: contractSha, sourceInstanceId: runnerId, controlPlaneSourceInstanceId: `rf4-${identity.runId}` },
+      // The native executor passes the heartbeat redactor's live material, as runtime-execution does.
+      { privateKeyPem, runSecretMaterial: liveRedactor.values, onCommittedEvent: async event => { observed.push(event); } });
+    await port.openRun({ identity, backendKind: "mock", sourceInstanceId: runnerId });
+    const probes: Array<{key:string,pem:string,form:string,itemId:string,liveWindows:number}> = [];
+    let seq = 0;
+    for (const [key, pem] of [["secret_ref PEM", fakePem], ["agent identity", privateKeyPem]]) {
+      for (const form of pemTransformForms(pem)) {
+        const itemId = `rf4-item-${seq}`;
+        probes.push({key,pem,form:form.name,itemId,liveWindows:pemBodyWindows(pem).filter(w => liveRedactor.redact(form.text).replace(/\s/g, "").includes(w)).length});
+        await port.appendEvent({schema:"paperclip.prp.event.v1",schemaVersion:1,sourceEventId:`${runnerId}:${++seq}`,sourceSeq:seq,
+          sourceInstanceId:runnerId,sourceKind:"runner",runId:identity.runId,normalizedSessionId:identity.sessionId,turnId:"rf4-turn",itemId,
+          eventType:"item.delta",priority:1,emittedAt:new Date().toISOString(),payload:{itemId,kind:"commandExecution",text:form.text}});
+        await port.appendEvent({schema:"paperclip.prp.event.v1",schemaVersion:1,sourceEventId:`${runnerId}:${++seq}`,sourceSeq:seq,
+          sourceInstanceId:runnerId,sourceKind:"runner",runId:identity.runId,normalizedSessionId:identity.sessionId,turnId:"rf4-turn",itemId,
+          eventType:"item.completed",priority:0,emittedAt:new Date().toISOString(),payload:{itemId}});
+      }
+    }
+    const persisted = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, identity.runId)).orderBy(asc(heartbeatRunEvents.seq));
+    const rows = probes.map(probe => {
+      const text = persisted.map(row => (row.payload as any)?.prpEvent).filter(event => event?.itemId === probe.itemId)
+        .map(event => (event.payload.text ?? "") + ((event.payload.outputTails ?? []) as any[]).map(t => t.payload.text ?? "").join("")).join("");
+      const wins = pemBodyWindows(probe.pem); const compact = text.replace(/\s/g, "");
+      return {key:probe.key,form:probe.form,total:wins.length,nativeStoredWindows:wins.filter(w=>compact.includes(w)).length,
+        liveRedactorWindows:probe.liveWindows,markers:(compact.match(/(?:BEGIN|END)(?:RSA|EC|DSA|OPENSSH|ENCRYPTED)?PRIVATEKEY/g)||[]).length};
+    });
+    if (process.env.RF4_OUT) writeFileSync(process.env.RF4_OUT + "/native-port-results.json", JSON.stringify(rows,null,2)+"\n");
+    console.log("RF4_NATIVE_PORT", JSON.stringify(rows));
+    await secretsSvc.remove(secret.id);
+    expect(rows.every(row=>row.nativeStoredWindows===0 && row.markers===0), "native DB event leaks; see count-only report").toBe(true);
+  }, 60_000);
+
   it("runs the unchanged package conformance suite against Paperclip persistence", async () => {
     const identity = CONTROL_PLANE_CONFORMANCE_OPEN.identity;
     const committedEventIds: string[] = [];
