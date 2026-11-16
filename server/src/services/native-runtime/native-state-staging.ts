@@ -20,11 +20,32 @@ export const NATIVE_STATE_STAGING_PREFIX = "paperclip-native-state-";
  * The longest a plugin worker can still write into a staging entry after the
  * transfer started: the kubernetes provider streams a syncOut for at most
  * `podActivityDeadlineSec` (default 3600 s), then only extracts and renames.
- * Ten minutes covers that reassembly. Age rule: an entry whose own mtime is
- * older than this is swept. Every entry's mtime is no earlier than the start
- * of the transfer that made it, so such an entry has no live writer.
+ * Ten minutes covers that reassembly. Age rule for a staging directory: one
+ * whose own mtime is older than this is swept. Every entry's mtime is no
+ * earlier than the start of the transfer that made it, so such an entry has no
+ * live writer.
  */
-export const NATIVE_STATE_STAGING_MAX_AGE_MS = 3_600_000 + 600_000;
+export const NATIVE_STATE_STREAM_DEADLINE_DEFAULT_MS = 3_600_000;
+export const NATIVE_STATE_STAGING_MAX_AGE_MS = NATIVE_STATE_STREAM_DEADLINE_DEFAULT_MS + 600_000;
+
+/**
+ * A fence is an empty file, so it is kept far longer than any worker can run:
+ * at least 48 hours, and at least twice the stream deadline.
+ */
+export const NATIVE_STATE_FENCE_MIN_LIFE_MS = 48 * 3_600_000;
+
+export interface NativeStateStagingSweepOptions {
+  /** The provider's stream deadline; defaults to the kubernetes default of 3600 s. */
+  streamDeadlineMs?: number;
+}
+
+export function nativeStateFenceLifeMs(streamDeadlineMs = NATIVE_STATE_STREAM_DEADLINE_DEFAULT_MS): number {
+  return Math.max(NATIVE_STATE_FENCE_MIN_LIFE_MS, 2 * streamDeadlineMs);
+}
+
+function nativeStateStagingMaxAgeMs(streamDeadlineMs = NATIVE_STATE_STREAM_DEADLINE_DEFAULT_MS): number {
+  return Math.max(NATIVE_STATE_STAGING_MAX_AGE_MS, streamDeadlineMs + 600_000);
+}
 
 export function createNativeStateStaging(): { staging: string; targetPath: string } {
   const staging = mkdtempSync(join(tmpdir(), NATIVE_STATE_STAGING_PREFIX));
@@ -52,7 +73,8 @@ export function removeNativeStateStaging(staging: string): void {
  * an empty file at its path, so a worker still running cannot recreate the
  * directory and land state bytes. A worker that recreates it between the
  * removal and the fence is removed again. The startup and read sweeps remove
- * the empty fence once it is older than the age rule.
+ * the empty fence only once it is older than its fence life
+ * ({@link nativeStateFenceLifeMs}).
  */
 export function fenceNativeStateStaging(staging: string): void {
   let lastError: unknown;
@@ -74,25 +96,55 @@ export function fenceNativeStateStagingQuietly(staging: string): void {
   }
 }
 
-/**
- * Sweeps staging entries a crashed server left behind: every
- * `paperclip-native-state-*` entry in the temp directory whose mtime is older
- * than {@link NATIVE_STATE_STAGING_MAX_AGE_MS}. Runs at server startup and on
- * each native state read.
- */
-export function sweepNativeStateStaging(now = Date.now()): number {
-  let removed = 0;
-  let names: string[];
-  try { names = readdirSync(tmpdir()); } catch (error) {
-    logger.warn({ err: error }, "native session state staging sweep could not list the temp directory");
-    return removed;
+function listNativeStateStaging(): string[] {
+  try {
+    return readdirSync(tmpdir()).filter(name => name.startsWith(NATIVE_STATE_STAGING_PREFIX)).map(name => join(tmpdir(), name));
+  } catch (error) {
+    logger.warn({ err: error }, "native session state staging could not list the temp directory");
+    return [];
   }
-  for (const name of names) {
-    if (!name.startsWith(NATIVE_STATE_STAGING_PREFIX)) continue;
-    const entry = join(tmpdir(), name);
+}
+
+/**
+ * Fences every `paperclip-native-state-*` directory in the temp directory,
+ * whatever its age. Runs at server startup, before any transfer of this
+ * process exists: every staging directory then belongs to a server that
+ * stopped mid-transfer, and its worker may still be running or may already
+ * have landed state bytes. Never follows a symlink.
+ */
+export function fenceOrphanedNativeStateStaging(): number {
+  let fenced = 0;
+  for (const entry of listNativeStateStaging()) {
+    let stat: ReturnType<typeof lstatSync>;
+    try { stat = lstatSync(entry, { throwIfNoEntry: false }); } catch (error) {
+      logger.warn({ err: error }, "native session state staging fence could not inspect an entry");
+      continue;
+    }
+    if (!stat?.isDirectory()) continue;
+    fenceNativeStateStagingQuietly(entry);
+    fenced += 1;
+  }
+  return fenced;
+}
+
+/**
+ * Sweeps staging entries in the temp directory, by age, never following a
+ * symlink. An empty file is a fence: it is removed only once it is older than
+ * its fence life. Any other entry is removed once it is older than the
+ * directory age rule ({@link NATIVE_STATE_STAGING_MAX_AGE_MS}, or the stream
+ * deadline plus ten minutes when that is longer). Runs at server startup,
+ * after {@link fenceOrphanedNativeStateStaging}, and on each native state read.
+ */
+export function sweepNativeStateStaging(now = Date.now(), options: NativeStateStagingSweepOptions = {}): number {
+  let removed = 0;
+  const fenceLifeMs = nativeStateFenceLifeMs(options.streamDeadlineMs);
+  const maxAgeMs = nativeStateStagingMaxAgeMs(options.streamDeadlineMs);
+  for (const entry of listNativeStateStaging()) {
     try {
       const stat = lstatSync(entry, { throwIfNoEntry: false });
-      if (!stat || now - stat.mtimeMs <= NATIVE_STATE_STAGING_MAX_AGE_MS) continue;
+      if (!stat) continue;
+      const fence = stat.isFile() && stat.size === 0;
+      if (now - stat.mtimeMs <= (fence ? fenceLifeMs : maxAgeMs)) continue;
       rmSync(entry, { recursive: true, force: true });
       removed += 1;
     } catch (error) {
