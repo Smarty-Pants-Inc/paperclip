@@ -6,11 +6,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent, AttentionFeed, AttentionItem } from "@paperclipai/shared";
 import { buildPinnedNavigationItems, CoordinatorSidebar } from "./CoordinatorSidebar";
 import { TooltipProvider } from "./ui/tooltip";
-import { coordinatorAttentionQueryKey, coordinatorAttentionSummaryQueryKey } from "@/lib/coordinator-attention";
+import { coordinatorAttentionQueryKey, coordinatorAttentionSummaryQueryKey, coordinatorAttentionTasksQueryKey } from "@/lib/coordinator-attention";
 import { queryKeys } from "@/lib/queryKeys";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
+const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", search: "", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
   recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, enableGoalsSidebarLink: undefined as boolean | undefined, agents: [] as Agent[] }));
 vi.mock("@/hooks/useAgentChatNavigation", () => ({ useAgentChatNavigation: () => ({
   companyId: "company", userId: fixture.userId, agents: { data: fixture.agents }, chats: { data: fixture.chats }, session: { isSuccess: true },
@@ -29,7 +29,7 @@ vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimenta
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => fixture.projects } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
-  useLocation: () => ({ pathname: fixture.pathname, search: "" }),
+  useLocation: () => ({ pathname: fixture.pathname, search: fixture.search }),
   Link: ({ to, children, ...props }: { to: string; children: ReactNode }) => <a href={to} {...props}>{children}</a>,
   NavLink: ({ to, children, className, state: _state, end: _end, ...props }: {
     to: string; children: ReactNode; className?: string | ((state: { isActive: boolean }) => string); state?: unknown; end?: boolean;
@@ -39,7 +39,9 @@ vi.mock("@/lib/router", () => ({
 const pending = (id: string) => ({ id, sourceKind: "issue_thread_interaction", subject: { id, kind: "interaction", status: "pending" },
   createdAt: "2026-10-20T12:00:00Z", activityAt: "2026-10-20T12:00:00Z" }) as AttentionItem;
 function feed(items: AttentionItem[]): AttentionFeed {
-  return { companyId: "company", generatedAt: "2026-10-27T12:00:00Z", totalCount: items.length, deskBadgeCount: 0,
+  // Every fixture card is addressed to the viewer, so the For you count
+  // (deskBadgeCount = viewCounts.mine) equals the total, as on the server.
+  return { companyId: "company", generatedAt: "2026-10-27T12:00:00Z", totalCount: items.length, deskBadgeCount: items.length,
     viewCounts: { mine: items.length, unassigned: 0, company: 0, archived: 0, all: items.length }, nextCursor: null, countsBySourceKind: {} as AttentionFeed["countsBySourceKind"], items };
 }
 
@@ -50,7 +52,7 @@ function summary(items: AttentionItem[]) {
 
 let root: Root, container: HTMLDivElement, client: QueryClient;
 beforeEach(() => {
-  vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues";
+  vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues"; fixture.search = "";
   fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.enableGoalsSidebarLink = undefined; fixture.agents = [];
   fixture.summary.mockResolvedValue(summary([pending("question"), pending("review")]));
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
@@ -328,6 +330,49 @@ describe("Coordinator Inbox badge", () => {
   });
 });
 
+// #20846: the Inbox opens on For you ("Assigned to you"), so its badge is the
+// For you count (deskBadgeCount), never every visible card (totalCount).
+describe("Coordinator Inbox badge counts only the default For you list (#20846)", () => {
+  const counts = (totalCount: number, mine: number) => ({
+    ...summary([]), totalCount, deskBadgeCount: mine,
+    viewCounts: { mine, unassigned: 0, company: 0, archived: 0, all: totalCount },
+  });
+  const projections = [
+    { name: "summary", pathname: "/COO/issues", search: "", seed: (data: ReturnType<typeof counts>) => fixture.summary.mockResolvedValue(data) },
+    { name: "Inbox list", pathname: "/COO/decisions", search: "",
+      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionQueryKey("company"), { ...data, nextCursor: null, items: [] }) },
+    { name: "task index", pathname: "/COO/issues", search: "?view=needs_attention",
+      seed: (data: ReturnType<typeof counts>) => client.setQueryData(coordinatorAttentionTasksQueryKey("company"), { ...data, taskIds: [] }) },
+  ];
+  const badge = () => decisionLink().querySelector('[data-slot="badge"]')?.textContent ?? null;
+
+  it.each(projections)("shows no badge for someone else's card, matching the empty default list ($name)", async ({ pathname, search, seed }) => {
+    fixture.pathname = pathname; fixture.search = search;
+    // A card addressed to another owner: visible (totalCount 1), not For you.
+    seed(counts(1, 0));
+    // The default Inbox list is the For you feed; for this viewer it is empty.
+    const forYou = { ...counts(1, 0), nextCursor: null, items: [] as AttentionItem[] };
+    client.setQueryData(coordinatorAttentionQueryKey("company", "reviewer", "mine"), forYou);
+    await renderSidebar();
+    expect(badge()).toBeNull();
+    expect(Number(badge() ?? 0)).toBe(forYou.items.length);
+    expect(decisionLink().textContent).toBe("Inbox");
+  });
+
+  it.each(projections)("counts only the For you cards when others are visible too ($name)", async ({ pathname, search, seed }) => {
+    fixture.pathname = pathname; fixture.search = search;
+    seed(counts(5, 2));
+    await renderSidebar();
+    expect(badge()).toBe("2");
+  });
+
+  it("falls back to the total for an older server without deskBadgeCount", async () => {
+    const { deskBadgeCount: _mine, ...older } = counts(3, 0);
+    fixture.summary.mockResolvedValue(older);
+    await renderSidebar();
+    expect(badge()).toBe("3");
+  });
+});
 
 describe("Coordinator collection reads", () => {
   it("does not replace a resolved count with an older summary that arrives later", async () => {
