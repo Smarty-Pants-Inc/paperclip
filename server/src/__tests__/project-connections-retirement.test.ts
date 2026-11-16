@@ -86,6 +86,13 @@ describe("project connection make-before-break and local retirement (round-4 D)"
     return { f, legacy, candidate, bound, context, finish };
   }
 
+  async function removalCustody(f: Awaited<ReturnType<typeof projectConnectionFixture>>) {
+    await versionOne(f);
+    const source = await f.seedConnection(null, { installed: false });
+    await approveFixtureCustodySource(db, f, source);
+    provider.verify.mockClear();
+  }
+
   // RFL F2/F3: these tests intentionally use the REAL create/finish/install-set
   // writers and Git auth factory. Candidate rows are NEVER seeded here. The
   // only simulated dependency is the external provider; all writes/faults are PG.
@@ -389,6 +396,7 @@ describe("project connection make-before-break and local retirement (round-4 D)"
 
   it("A06b: B lead acting for the same human gets readable 403, not board removal authority", async () => {
     const f = await projectConnectionFixture(db);
+    await removalCustody(f);
     const { connection } = await f.seedConnection();
     const result = await request(f.route(f.leadB.id)).delete(`/api/tool-connections/${connection.id}`);
     expect(result.status).toBe(403);
@@ -500,7 +508,8 @@ describe("project connection make-before-break and local retirement (round-4 D)"
   });
 
   it("D-RF2-0011/A06b: B's agent for the same human cannot confirm A done or retire it while A work is queued", async () => {
-    const f = await projectConnectionFixture(db); const { connection, grant } = await f.seedConnection();
+    const f = await projectConnectionFixture(db);
+    await removalCustody(f); const { connection, grant } = await f.seedConnection();
     const work = await f.run();
     await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, work.run.id));
     const result = await request(f.route(f.leadB.id)).delete(`/api/tool-connections/${connection.id}`)
