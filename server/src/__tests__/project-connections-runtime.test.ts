@@ -450,6 +450,25 @@ describe("project connection task-derived selection and no legacy fallback (roun
     const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
     expect(selected.configured).toBe(true);
     expect(selected.grant).toBeUndefined();
+    // A new factory models a process restart: no process-local ownership memory.
+    for (let restart = 0; restart < 2; restart++) {
+      const git = createGitRemoteAuthProvider(db, f.companyId, context, { secrets, env: { GITHUB_TOKEN: "synthetic-env-token" } });
+      await expect(git("https://github.com/owner/A.git")).rejects.toThrow();
+    }
+    expect(secrets.getByName).not.toHaveBeenCalled();
+    expect(secrets.resolveSecretValue).not.toHaveBeenCalled();
+    expect(provider.acquire).not.toHaveBeenCalled();
+  });
+
+  it("RFL-C5/J12 companion: retained archived ownership returns the intended managed refusal", async () => {
+    const f = await projectConnectionFixture(db);
+    await f.seedConnection(f.a, { status: "archived", installed: false });
+    const bound = await f.run();
+    const secrets = detectableFallback();
+    const context = { agentId: f.leadA.id, responsibleUserId: f.human, issueId: bound.issue.id, heartbeatRunId: bound.run.id };
+    const selected = await resolveManagedGitHubIdentitySelection(db, f.companyId, context);
+    expect(selected.configured).toBe(true);
+    expect(selected.grant).toBeUndefined();
     expect(selected.error).toContain("project_connection_unavailable");
     const git = createGitRemoteAuthProvider(db, f.companyId, context, { secrets, env: { GITHUB_TOKEN: "synthetic-env-token" } });
     await expect(git("https://github.com/owner/A.git")).rejects.toThrow("project_connection_unavailable");
