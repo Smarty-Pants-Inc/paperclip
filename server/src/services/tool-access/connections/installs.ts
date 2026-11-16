@@ -11,6 +11,7 @@ import { toolAccessAuditEvents, toolConnectionInstalls, toolConnections, toolPro
 import type { ToolConnection, ToolConnectionInstall, ToolConnectionInstallSnapshot, PutToolConnectionInstalls } from "@paperclipai/shared";
 import { unprocessable } from "../../../errors.js";
 import { logActivity } from "../../activity-log.js";
+import { assertNotProjectOwnedToolConnection, notProjectOwnedToolConnectionSql } from "../../project-owned-connection-guard.js";
 
 type InstallDependencies = {
   now: () => Date;
@@ -133,6 +134,8 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
         and(
           eq(toolConnections.companyId, companyId),
           inArray(toolConnections.id, connectionIds),
+          // RFL C3: never part of an agent's effective connections here.
+          notProjectOwnedToolConnectionSql(),
         ),
       )
       .orderBy(asc(toolConnections.name));
@@ -153,6 +156,8 @@ export function createConnectionInstalls(db: Db, { now, getConnectionRow, assert
     ): Promise<ToolConnectionInstallSnapshot> => {
       await actor?.managementContext?.reauthorize();
       const connection = await getConnectionRow(connectionId);
+      // RFL C3: this image cannot apply a project owner's recipient rules.
+      assertNotProjectOwnedToolConnection(connection);
       const requested = new Map(
         input.installs.map((install) => [
           `${install.targetType}:${install.targetId}`,

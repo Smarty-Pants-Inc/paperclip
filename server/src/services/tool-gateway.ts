@@ -269,6 +269,7 @@ import {
   verifyToolArgumentsSignature,
 } from "./tool-content-guards.js";
 import { extendApprovedExecutionWaitDeadline } from "./approved-execution-wait.js";
+import { notProjectOwnedToolConnectionSql } from "./project-owned-connection-guard.js";
 
 const DEFAULT_SESSION_TTL_MS = 15 * 60 * 1000;
 const MAX_SESSION_TTL_MS = 60 * 60 * 1000;
@@ -1642,6 +1643,8 @@ export function createToolGatewayService(
       inArray(toolConnections.transport, ["mcp_remote", "local_stdio", "rest_api"]),
       eq(toolConnections.status, "active"),
       eq(toolConnections.enabled, true),
+      // RFL C3: project-owned connections are never discovered on this image.
+      notProjectOwnedToolConnectionSql(),
       // A personal connection has no company-level credential to probe. A
       // credential-less health sweep can therefore mark it as errored even
       // while the responsible user's grant is valid. Keep its cached active
