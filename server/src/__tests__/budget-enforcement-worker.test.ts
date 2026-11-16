@@ -23,11 +23,16 @@ vi.mock("../services/budget-resume-continuation.js", () => ({ hasDeliverableBudg
   hasPendingBudgetResumeForRun: resumeWork.pendingForRun, nextBudgetResumeClaimExpiryAt: resumeWork.expiry }));
 vi.mock("../services/run-cost-accounting.js", () => ({ readCostAccountingWork: work.accounting }));
 
+const tracing = vi.hoisted(() => ({ start: vi.fn() }));
+vi.mock("@opentelemetry/api", () => ({ trace: { getTracer: () => ({ startActiveSpan: tracing.start }) } }));
+
 const coordinators: ReturnType<typeof createDeliveryWorkCoordinator>[] = [];
 const subscriptions: (() => void)[] = [];
 beforeEach(() => {
   vi.useFakeTimers();
   vi.resetAllMocks();
+  vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector.test");
+  tracing.start.mockImplementation((_name, _options, callback) => callback({ end: vi.fn(), setStatus: vi.fn() }));
   work.deliver.mockResolvedValue(undefined);
   work.pending.mockResolvedValue(false);
   work.next.mockResolvedValue(null);
@@ -40,6 +45,7 @@ afterEach(async () => {
   for (const stop of subscriptions.splice(0)) stop();
   for (const c of coordinators.splice(0)) await c.stop();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 function setup() {
   const execute = vi.fn(async () => [{ xid: "42", status: "committed" }]);
@@ -171,6 +177,82 @@ describe("budget accounting delivery", () => {
     await s.owner.transaction(tx => notifyDeliveryWork(tx as object, DELIVERY_QUEUES.budgetEnforcement));
     await vi.advanceTimersByTimeAsync(1000);
     expect(work.reconcile).toHaveBeenLastCalledWith(s.db, { startup: true, cursor: "company:agent:scope" });
+    expect(s.coordinator.nextWakeAt()).toBeNull();
+  });
+
+  // Recorded catch: the accounting recovery meter charged idle delivery passes.
+  it("emits no recovery spans for 100 idle passes with nothing pending", async () => {
+    const s = setup();
+    const recover = vi.fn(async () => ({ scanned: 0, accounted: 0, changed: 0, failed: 0 }));
+    const worker = registerCostAccountingWork(s.db, s.coordinator, recover);
+    subscriptions.push(worker.stop);
+    await worker.ready;
+    for (let pass = 1; pass < 100; pass++) {
+      worker.wake();
+      await vi.advanceTimersByTimeAsync(1);
+    }
+    expect(recover).toHaveBeenCalledTimes(100);
+    expect(tracing.start).not.toHaveBeenCalled();
+    expect(s.coordinator.nextWakeAt()).toBeNull();
+  });
+
+  it("keeps an unchanged held partial quiet until its deadline, but a new receipt wakes settlement immediately", async () => {
+    const s = setup();
+    const due = Date.now() + 60_000;
+    work.accounting.mockResolvedValue({ pending: false, nextRunAt: due });
+    const recover = vi.fn(async () => ({ scanned: 0, accounted: 0, changed: 0, failed: 0 }));
+    const worker = registerCostAccountingWork(s.db, s.coordinator, recover);
+    subscriptions.push(worker.stop);
+    await worker.ready;
+    await vi.advanceTimersByTimeAsync(59_999);
+    expect(recover).toHaveBeenCalledOnce();
+    expect(work.accounting).toHaveBeenCalledOnce();
+    expect(tracing.start).not.toHaveBeenCalled();
+    expect(s.coordinator.nextWakeAt()).toBe(due);
+    recover.mockResolvedValue({ scanned: 1, accounted: 1, changed: 1, failed: 0 });
+    work.accounting.mockResolvedValue({ pending: false, nextRunAt: null });
+    await s.owner.transaction(tx => notifyDeliveryWork(tx as object, DELIVERY_QUEUES.accounting));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(recover).toHaveBeenCalledTimes(2);
+    expect(tracing.start).toHaveBeenCalledTimes(1);
+    expect(tracing.start.mock.calls[0][0]).toBe("budget.accounting.recover");
+    expect(s.coordinator.nextWakeAt()).toBeNull();
+  });
+
+  it.each([
+    { scanned: 1, accounted: 0, changed: 0, failed: 0 },
+    { scanned: 0, accounted: 0, changed: 0, failed: 0 },
+  ])("does not trace a no-op reconciliation even after candidate selection: %j", async result => {
+    const s = setup();
+    const worker = registerCostAccountingWork(s.db, s.coordinator, async () => result);
+    subscriptions.push(worker.stop);
+    await worker.ready;
+    expect(tracing.start).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { scanned: 0, accounted: 0, changed: 1, failed: 0 }, // spool/service/marker repair
+    { scanned: 1, accounted: 0, changed: 0, failed: 1 }, // contained per-item failure
+  ])("traces accounting progress or a contained failure: %j", async result => {
+    const s = setup();
+    const worker = registerCostAccountingWork(s.db, s.coordinator, async () => result);
+    subscriptions.push(worker.stop);
+    await worker.ready;
+    expect(tracing.start).toHaveBeenCalledTimes(1);
+  });
+
+  it("traces thrown recovery failures and still schedules their retry", async () => {
+    const s = setup();
+    const error = new Error("recovery unavailable");
+    const recover = vi.fn().mockRejectedValueOnce(error).mockResolvedValue({ changed: 0, failed: 0 });
+    const worker = registerCostAccountingWork(s.db, s.coordinator, recover);
+    subscriptions.push(worker.stop);
+    await worker.ready;
+    expect(s.onError).toHaveBeenCalledWith(error, DELIVERY_QUEUES.accounting);
+    expect(tracing.start).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(recover).toHaveBeenCalledTimes(2);
+    expect(tracing.start).toHaveBeenCalledTimes(1);
     expect(s.coordinator.nextWakeAt()).toBeNull();
   });
 
