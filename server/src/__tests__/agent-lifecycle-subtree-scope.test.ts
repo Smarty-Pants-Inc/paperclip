@@ -229,7 +229,9 @@ describe("subtree-scoped agent lifecycle", () => {
       expect(visible.status, visible.text).toBe(200);
       expect(visible.body.handover).toMatchObject({ code: "agent_handover_pending" });
       const recovery = agentHandoverService(db);
-      expect(await recovery.processAgent(workerId)).toMatchObject({ tasks: expect.arrayContaining([task.id, active.id]), cleared: true, blocked: [] });
+      const recovered = await recovery.processAgent(workerId);
+      expect(recovered).toMatchObject({ cleared: true, blocked: [] });
+      expect(recovered.tasks.sort()).toEqual([task.id, active.id].sort());
       expect((await f.current(workerId)).lifecycleOperation?.handover).toBeUndefined();
       const current = (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
       expect.soft(current).toMatchObject({ assigneeAgentId: f.ids.lead });
