@@ -338,14 +338,14 @@ describe("subtree-scoped agent lifecycle", () => {
     expect(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual(before);
     expect((await f.current(workerId)).status).toBe("pending_approval");
     const pending = await f.current(workerId);
-    const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId));
+    const events = await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id);
     const patch = await request(f.api).patch(`/api/agents/${workerId}`).set("Authorization", `Bearer ${f.token}`)
       .send({ status: "terminated" });
     expect.soft(patch.status, patch.text).toBe(403);
     expect.soft(patch.body.error).toContain("board user");
     expect.soft(await f.current(workerId)).toEqual(pending);
     expect.soft(await db.select().from(approvals).where(eq(approvals.companyId, f.companyId))).toEqual(before);
-    expect.soft(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId))).toEqual(events);
+    expect.soft(await db.select().from(activityLog).where(eq(activityLog.companyId, f.companyId)).orderBy(activityLog.id)).toEqual(events);
     const allowed = await request(f.board).post(`/api/agents/${workerId}/terminate`).send({});
     expect(allowed.status, allowed.text).toBe(200);
     const [decided] = await db.select().from(approvals).where(eq(approvals.companyId, f.companyId));
