@@ -268,6 +268,14 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     },
     /** True while `chunk` still holds text of this stream for its next piece. */
     holds(stream: string): boolean { return hasPending(stream); },
+    // Release only the key-material hold, as finish does (interrupted key
+    // material is never flushed). A held exact-value prefix stays held for the
+    // stream's next piece; it follows the released text in stream order.
+    settle(stream: string): string {
+      const state = materialStreams.get(stream);
+      materialStreams.delete(stream);
+      return state ? scanMaterial("", state, true) : "";
+    },
     // An interrupted partial secret must not be flushed as plaintext.
     finish(stream: string): string {
       const held = pending.get(stream);

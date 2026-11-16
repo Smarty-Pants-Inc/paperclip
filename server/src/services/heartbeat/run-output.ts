@@ -38,7 +38,7 @@ export interface HeartbeatRunOutputInput {
   issueId: string | null;
   runLogStore: Pick<RunLogStore, "begin" | "append" | "enqueue" | "flush"> & Partial<Pick<RunLogStore, "read" | "recordVerifiedSourcePrefix">>;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "chunk" | "redact">
-    & Partial<Pick<ReturnType<typeof createAgentIdentityRedactor>, "holds" | "finish">>;
+    & Partial<Pick<ReturnType<typeof createAgentIdentityRedactor>, "holds" | "finish" | "settle">>;
   secretKeys: Set<string>;
   appendRunEvent: ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
@@ -334,18 +334,52 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
     // A secret can be split across two tool-output events, as across two log
     // chunks. Their text fields share onLog's per-stream hold (chunk/finish),
     // keyed by event type, stream and tool call; every other field is redacted
-    // whole, as for any event. An event whose text ends in a held suffix is
-    // committed when the next event of its stream arrives, or at finish with the
-    // released tail: one adapter event stays one committed event.
-    const toolOutputStreams = new Map<string, { event: AppendRunEventInput; held: Map<string, string[]> }>();
+    // whole, as for any event. An event whose text ends in a held suffix waits
+    // only until the next adapter event of the run (or finish): one adapter
+    // event stays one committed event, and events commit in adapter order.
+    // An event committed by a later event of another call or stream first
+    // takes its released key-material hold (settle: as at finish, interrupted
+    // key material is never flushed); a held exact-value prefix stays with its
+    // stream, so it lands in that stream's next event and a value split across
+    // the stream's events is still matched whole. If that stream never sends
+    // again, the prefix (an interrupted value) is never committed: no row is
+    // added after the event's place.
+    const toolOutputStreams = new Map<string, { event?: AppendRunEventInput; held: Map<string, string[]> }>();
     const holds = (id: string) => identityRedactor.holds?.(id) ?? false;
+    const appendTail = (event: AppendRunEventInput, path: string[], tail: string) => {
+      let target = event as unknown as Record<string, unknown>;
+      for (const name of path.slice(0, -1)) {
+        if (!target[name] || typeof target[name] !== "object") target[name] = {};
+        target = target[name] as Record<string, unknown>;
+      }
+      const field = path[path.length - 1]!;
+      target[field] = `${typeof target[field] === "string" ? target[field] : ""}${tail}`;
+    };
+    // Before any later event of the run is committed, commit the waiting event.
+    // `key` is the stream of that later event (null: not a tool-output event).
+    const commitHeldEvent = async (key: string | null) => {
+      for (const [heldKey, entry] of [...toolOutputStreams]) {
+        const event = entry.event;
+        if (!event) continue;
+        entry.event = undefined;
+        if (heldKey !== key) {
+          for (const [id, path] of entry.held) {
+            const tail = identityRedactor.settle?.(id) ?? "";
+            if (tail) appendTail(event, path, tail);
+            if (!holds(id)) entry.held.delete(id);
+          }
+          if (!entry.held.size) toolOutputStreams.delete(heldKey);
+        }
+        await appendRunEvent(currentRun, event);
+      }
+    };
     const appendToolOutputEvent = async (raw: AdapterRuntimeEvent, redacted: AdapterRuntimeEvent, eventType: string) => {
       const rawPayload: Record<string, unknown> = raw.payload ?? {};
       const call = TOOL_CALL_KEYS.map(key => rawPayload[key]).find(value => typeof value === "string") ?? null;
       const key = JSON.stringify([eventType, raw.stream ?? null, call]);
+      await commitHeldEvent(key);
       const previous = toolOutputStreams.get(key);
       toolOutputStreams.delete(key);
-      if (previous) await appendRunEvent(currentRun, previous.event);
       const held = new Map([...previous?.held ?? []].filter(([id]) => holds(id)));
       // Walk the raw event beside its whole-redacted copy: streamed text is
       // chunked from the raw value, anything else keeps the redacted value.
@@ -383,16 +417,10 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       for (const { event, held } of streams) {
         for (const [id, path] of held) {
           const tail = identityRedactor.finish?.(id) ?? "";
-          if (!tail) continue;
-          let target = event as unknown as Record<string, unknown>;
-          for (const name of path.slice(0, -1)) {
-            if (!target[name] || typeof target[name] !== "object") target[name] = {};
-            target = target[name] as Record<string, unknown>;
-          }
-          const field = path[path.length - 1]!;
-          target[field] = `${typeof target[field] === "string" ? target[field] : ""}${tail}`;
+          // An event already committed in order takes no tail and no new row.
+          if (tail && event) appendTail(event, path, tail);
         }
-        await appendRunEvent(currentRun, event);
+        if (event) await appendRunEvent(currentRun, event);
       }
     };
 
@@ -404,6 +432,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       // not carry nativeSource identities, so they must never author it.
       if (!eventType || eventType.startsWith("legacy.case_handoff_")) return;
       if (TOOL_OUTPUT_EVENT.test(eventType)) return appendToolOutputEvent(raw, event, eventType);
+      await commitHeldEvent(null);
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,
