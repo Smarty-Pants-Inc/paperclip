@@ -357,7 +357,7 @@ describeEmbeddedPostgres("agent hire idempotency within a run", () => {
       adapterConfig: {},
       runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } },
     });
-    expect(response.status, JSON.stringify(response.body)).toBe(503);
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
     expect(response.body.code).toBe("agent_hire_grant_contention");
     expect(response.body.details).toMatchObject({ retryable: true });
     expect(transactionRetryStats.retried - retryCountBefore).toBe(4);
