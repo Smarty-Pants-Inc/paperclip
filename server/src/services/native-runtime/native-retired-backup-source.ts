@@ -66,7 +66,7 @@ export async function retiredSourceAuthorizesNativeBackupRestore(db: Db, input: 
   if (!chain) return false;
   const lease = chain.tip;
   // Retirement and the supersession claim belong exclusively to the tip.
-  const stamp = newestNativeHarnessBackupStampOnChain(chain);
+  const stamp = newestNativeHarnessBackupStampOnChain(chain, input.normalizedSessionId);
   if (!stamp) return false;
   if (stamp.manifestSha256 !== input.manifestSha256
     || stamp.normalizedSessionId !== input.normalizedSessionId
@@ -93,12 +93,7 @@ export async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
   companyId: string; providerLeaseId: string;
 }): Promise<NativeHarnessBackupLeaseChain | null> {
   if (!input.providerLeaseId) return null;
-  const leases = await db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, input.companyId),
-    eq(environmentLeases.providerLeaseId, input.providerLeaseId),
-  ));
-  const source = leases.filter(lease => lease.companyId === input.companyId
-    && lease.providerLeaseId === input.providerLeaseId);
+  const source = await loadNativeHarnessBackupLeaseRows(db, input);
   const tips = source.filter(lease => !Object.hasOwn(lease.metadata ?? {}, "reusableLeaseSuccessor"));
   if (tips.length !== 1) return null;
   const tip = tips[0]!;
@@ -106,15 +101,45 @@ export async function loadNativeHarnessBackupLeaseChain(db: Db, input: {
   return predecessors ? { tip, predecessors } : null;
 }
 
+/** Every lease row of one allocation in one company (the chain's own query). */
+export async function loadNativeHarnessBackupLeaseRows(db: Db, input: {
+  companyId: string; providerLeaseId: string;
+}): Promise<SourceLease[]> {
+  if (!input.providerLeaseId) return [];
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId),
+    eq(environmentLeases.providerLeaseId, input.providerLeaseId),
+  ));
+  return leases.filter(lease => lease.companyId === input.companyId
+    && lease.providerLeaseId === input.providerLeaseId);
+}
+
+/**
+ * The native session a lease row's own run served: the run's
+ * `native_session_id`, else its `nativeExecutionInput` session. The reuse
+ * scope has no session, so one allocation can serve several sessions in turn.
+ */
+export async function nativeSessionOfLeaseRun(db: Db, lease: Pick<SourceLease, "companyId" | "heartbeatRunId">): Promise<string | null> {
+  if (!lease.heartbeatRunId) return null;
+  const [run] = await db.select({ nativeSessionId: heartbeatRuns.nativeSessionId, profile: heartbeatRuns.runnerProfileJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, lease.companyId), eq(heartbeatRuns.id, lease.heartbeatRunId))).limit(1);
+  const planned = (run?.profile as { nativeExecutionInput?: { session?: { normalizedSessionId?: unknown } } } | null | undefined)
+    ?.nativeExecutionInput?.session?.normalizedSessionId;
+  return run?.nativeSessionId || (typeof planned === "string" && planned ? planned : null);
+}
+
 /**
  * Warm handoffs leave stamps on their original owner rows, but owner order
- * does not establish checkpoint chronology. The newest stamp for the chain's
- * allocation by completion time; conflicting latest-time stamps are ambiguous.
+ * does not establish checkpoint chronology. The newest stamp for ONE native
+ * session on the chain's allocation by completion time; another session's stamp
+ * never stands in for it. Conflicting latest-time stamps are ambiguous.
  */
-export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain) {
+export function newestNativeHarnessBackupStampOnChain(chain: NativeHarnessBackupLeaseChain, normalizedSessionId: string | null) {
+  if (!normalizedSessionId) return null;
   const stamps = [chain.tip, ...chain.predecessors]
     .map(row => readNativeHarnessBackupStamp(row.metadata?.nativeHarnessBackup, chain.tip.providerLeaseId!))
-    .filter(candidate => candidate !== null)
+    .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null
+      && candidate.normalizedSessionId === normalizedSessionId)
     .sort((left, right) => Date.parse(right.completedAt) - Date.parse(left.completedAt));
   const stamp = stamps[0];
   if (!stamp || stamps.some(candidate => Date.parse(candidate.completedAt) === Date.parse(stamp.completedAt)
@@ -163,7 +188,9 @@ function destroyedSource(lease: SourceLease): boolean {
  * the tip": a concurrent handoff either commits first (the write misses and the
  * next attempt re-reads the new tip) or reads the stamped row and carries the
  * stamp forward. Bounded retries end on the named row, which chain readers
- * still find, so a stamp is never dropped.
+ * still find, so a stamp is never dropped. The tip is stamped only when its own
+ * run served the stamp's session; a tip resumed for another session keeps no
+ * custody of this one, and the stamp stays on the named row.
  */
 export async function recordNativeHarnessBackupStampOnLeaseChain(db: Db, input: {
   leaseId: string; companyId: string; providerLeaseId: string; runId?: string | null; stamp: unknown;
@@ -179,9 +206,11 @@ export async function recordNativeHarnessBackupStampOnLeaseChain(db: Db, input: 
       sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? 'reusableLeaseSuccessor')`) : eq(environmentLeases.id, leaseId))
     .returning({ id: environmentLeases.id })
     .then(rows => rows.length > 0), { companyId: input.companyId, runId: runId ?? undefined, leaseId });
+  const stampSessionId = readNativeHarnessBackupStamp(input.stamp, input.providerLeaseId)?.normalizedSessionId ?? null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const chain = await loadNativeHarnessBackupLeaseChain(db, input);
     if (!chain || chain.tip.id === input.leaseId || !chain.predecessors.some(row => row.id === input.leaseId)) break;
+    if (!stampSessionId || await nativeSessionOfLeaseRun(db, chain.tip) !== stampSessionId) break;
     if (await write(chain.tip.id, chain.tip.heartbeatRunId, true)) return true;
   }
   return write(input.leaseId, input.runId, false);
