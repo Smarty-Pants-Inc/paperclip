@@ -270,7 +270,8 @@ describe("native session state syncOut under a recovery deadline", () => {
       expect(readRemoteRunnerRecoveryError(read()?.error)).toEqual({ stage: "runner_state", reason: "probe_timeout" });
     } finally {
       release();
-      await transfer;
+      // The abandoned transfer's staging is fenced, so its late write is refused.
+      await transfer?.catch(() => undefined);
       await vi.advanceTimersByTimeAsync(0);
     }
     expect(targets.length).toBeGreaterThan(0);
