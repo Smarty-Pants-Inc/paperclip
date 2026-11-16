@@ -302,6 +302,48 @@ describe("#20389 B6 retire the Paperclip way: marker + per-item recovery worker"
     }, 60_000);
   }
 
+  // Replacement for agent-lifecycle-subtree-scope.test.ts "#20389 gate row: retire via POST|PATCH" (holds-cleared and the
+  // in-transaction return are superseded by the ruling): every other assertion of that test, with the recovery worker.
+  for (const via of ["POST", "PATCH"] as const) {
+    it(`gate row replacement ${via}: retire returns open tasks to the lead through the worker, never another subtree; holds stay frozen`, async () => {
+      const f = await seed();
+      const otherId = randomUUID();
+      await db.insert(agents).values({ id: otherId, companyId: f.companyId, name: "Unrelated", reportsTo: f.rootId, adapterType: "process",
+        status: "idle", lifecycleState: "ready", runtimeConfig: { heartbeat: { enabled: false } } });
+      await db.update(agents).set({ status: "paused", lifecycleState: "paused", lifecycleHolds: ["budget"], pauseReason: "budget" })
+        .where(eq(agents.id, f.workerId));
+      const blocked = await f.task("Unfinished worker task", "blocked");
+      const done = await f.task("Completed worker task", "done");
+      const active = await f.task("Active worker task", "in_progress");
+      const other = await f.task("Other subtree task", "blocked", otherId);
+      const otherBefore = await f.currentTask(other.id);
+      const [policy] = await db.insert(budgetPolicies).values({ companyId: f.companyId, scopeType: "agent", scopeId: f.workerId,
+        windowKind: "calendar_month_utc", amount: 100 }).returning();
+      const company = (await db.select().from(companies).where(eq(companies.id, f.companyId)))[0];
+      const unrelated = await f.current(otherId);
+      const denied = await f.terminate("POST", otherId);
+      expect(denied.status, denied.text).toBe(403);
+      expect(await f.current(otherId)).toEqual(unrelated);
+      await f.retire(via);
+      await (await f.handover()).processAgent(f.workerId);
+      expect(await f.current(f.workerId)).toMatchObject({ status: "terminated", lifecycleState: "terminated", lifecycleHolds: ["budget"], pauseReason: "budget" });
+      expect(await f.currentTask(blocked.id)).toMatchObject({ assigneeAgentId: f.leadId, status: "blocked" });
+      expect(await f.currentTask(active.id)).toMatchObject({ assigneeAgentId: f.leadId, status: "todo", executionRunId: null, checkoutRunId: null });
+      expect(await f.currentTask(done.id)).toMatchObject({ assigneeAgentId: f.workerId, status: "done" });
+      expect(await f.currentTask(other.id)).toEqual(otherBefore);
+      expect((await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy!.id)))[0]).toEqual(policy);
+      expect((await db.select().from(companies).where(eq(companies.id, f.companyId)))[0]).toEqual(company);
+      expect(await f.current(otherId)).toEqual(unrelated);
+      const repeated = await f.terminate("POST");
+      expect(repeated.status, repeated.text).toBe(200);
+      await f.worker.process(f.workerId);
+      await (await f.handover()).processAgent(f.workerId);
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, blocked.id), eq(activityLog.action, "issue.reassigned")))).toHaveLength(1);
+      expect(await f.activity("agent.terminated")).toHaveLength(1);
+      f.unsubscribe();
+    }, 60_000);
+  }
+
   it("W1: a failure in the terminal step commits neither terminated nor the marker nor the audit row; the worker's next attempt completes once", async () => {
     const f = await seed();
     const { owner, version } = await cleaningUp(f.workerId);
