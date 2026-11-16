@@ -37,6 +37,7 @@ type GithubAccessHandler = {
   setRunnerIngressCapabilityRefresher?: (refresher: ((capability: string) => Promise<void>) | null) => () => void;
   onCapabilityRefreshSuccess?: () => void;
   onCapabilityRefreshFailure?: () => void;
+  recordRequest?: (input: { frame: unknown; response: GithubAccessReply; durationMs: number }) => Promise<void>;
 };
 const HANDSHAKE_TIMEOUT_MS = 15_000;
 const MIN_CONNECT_ATTEMPTS = 3;
@@ -434,18 +435,25 @@ function normalizeGithubAccessReply(value: unknown, requestId: string): GithubAc
 function githubAccessRequestDispatcher(handler: GithubAccessHandler) {
   const inFlight = new Set<symbol>();
   return async (value: unknown, identity: DurableRecoveryIdentity): Promise<GithubAccessReply> => {
+    const startedAt = performance.now();
     const requestId = githubAccessFrameRequestId(value);
-    if (requestId === null) return githubAccessResponse("invalid-request", 403, { error: "GitHub ingress request refused" });
+    const refusal = async (id: string, status: number, message: string) => {
+      const response = githubAccessResponse(id, status, { error: message });
+      await Promise.resolve(handler.recordRequest?.({ frame: value, response,
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)) })).catch(() => undefined);
+      return response;
+    };
+    if (requestId === null) return refusal("invalid-request", 403, "GitHub ingress request refused");
     if (inFlight.size >= DEFAULT_SANDBOX_CALLBACK_BRIDGE_MAX_IN_FLIGHT) {
-      return githubAccessResponse(requestId, 503, { error: "GitHub ingress request capacity unavailable" });
+      return refusal(requestId, 503, "GitHub ingress request capacity unavailable");
     }
-    if (!validGithubAccessFrame(value)) return githubAccessResponse(requestId, 403, { error: "GitHub ingress request refused" });
-    if (!decodeGithubAccessBody(value.bodyBase64)) return githubAccessResponse(requestId, 413, { error: "GitHub request body exceeds the configured size limit" });
+    if (!validGithubAccessFrame(value)) return refusal(requestId, 403, "GitHub ingress request refused");
+    if (!decodeGithubAccessBody(value.bodyBase64)) return refusal(requestId, 413, "GitHub request body exceeds the configured size limit");
     if (value.method !== "POST" || value.path !== GITHUB_ACCESS_CREDENTIALS_PATH) {
-      return githubAccessResponse(requestId, 404, { error: "Unknown GitHub session operation" });
+      return refusal(requestId, 404, "Unknown GitHub session operation");
     }
     const binding = handler.getSessionBinding(identity);
-    if (!binding) return githubAccessResponse(requestId, 403, { error: "No active GitHub run" });
+    if (!binding) return refusal(requestId, 403, "No active GitHub run");
     const inFlightRequest = Symbol(requestId);
     inFlight.add(inFlightRequest);
     let timer: ReturnType<typeof setTimeout> | undefined;

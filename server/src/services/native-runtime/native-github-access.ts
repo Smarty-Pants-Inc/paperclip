@@ -133,6 +133,7 @@ export async function createNativeGitHubAccess(input: {
   const location = { runId: `native-session-${randomUUID()}`, target: input.target };
   let active: Binding | null = null;
   let activeGeneration: string | null = null;
+  let activeOnLog = input.onLog;
   let stopped = false;
   let ready = true;
   let staleRunnerCapability = false;
@@ -172,6 +173,8 @@ export async function createNativeGitHubAccess(input: {
   };
 
   const httpHandler = transport === "callback_bridge" ? async (req: import("node:http").IncomingMessage, res: import("node:http").ServerResponse) => {
+    const startedAt = performance.now();
+    const requestOnLog = activeOnLog;
     res.setHeader("Cache-Control", "no-store");
     res.setHeader("Content-Type", "application/json");
     const bodyComplete = new Promise<void>(resolve => req.once("end", resolve));
@@ -186,10 +189,11 @@ export async function createNativeGitHubAccess(input: {
       const record = {
         method: redactLogValue(req.method ?? ""), path: redactLogValue(req.url ?? ""), status: response.status,
         responseSize: response.body.byteLength, requestId: randomUUID(), transport: "bridge",
+        durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
         ...(input.fallbackReason ? { fallbackReason: input.fallbackReason } : {}),
       };
       const line = `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`;
-      await Promise.resolve(input.onLog?.("stderr", line)).catch(() => undefined);
+      await Promise.resolve(requestOnLog?.("stderr", line)).catch(() => undefined);
     };
     const reply = async (response: HttpReply) => {
       await recordRequest(response);
@@ -323,6 +327,8 @@ export async function createNativeGitHubAccess(input: {
       markRunnerIngressStale() { if (transport === "runner_ingress") staleRunnerCapability = true; },
       duplexRequested,
       async handleRunnerIngressHttpRequest(frame: unknown, sessionBinding: Binding): Promise<NativeGitHubAccessHttpReply> {
+        const startedAt = performance.now();
+        const requestOnLog = activeOnLog;
         const parsed = parseIngressRequest(frame);
         const requestId = typeof frame === "object" && frame !== null && typeof (frame as { requestId?: unknown }).requestId === "string"
           ? (frame as { requestId: string }).requestId : "invalid-request";
@@ -330,9 +336,9 @@ export async function createNativeGitHubAccess(input: {
           const record = {
             method: redactLogValue(parsed?.method ?? ""), path: redactLogValue(parsed?.path ?? ""), status: response.status,
             responseSize: response.body.byteLength, requestId: redactLogValue(parsed?.requestId ?? requestId),
-            transport: "prp",
+            transport: "prp", durationMs: Math.max(0, Math.round(performance.now() - startedAt)),
           };
-          await Promise.resolve(input.onLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
+          await Promise.resolve(requestOnLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
           return responseFrame(requestId, response);
         };
         if (!parsed) return respond(jsonReply(403, { error: "GitHub ingress request refused" }));
@@ -361,6 +367,18 @@ export async function createNativeGitHubAccess(input: {
         }
         return respond(await acquireCredentials(binding, generation!));
       },
+      async recordRunnerIngressRequest(frame: unknown, response: NativeGitHubAccessHttpReply, durationMs: number) {
+        const parsed = parseIngressRequest(frame);
+        const requestId = typeof frame === "object" && frame !== null && typeof (frame as { requestId?: unknown }).requestId === "string"
+          ? (frame as { requestId: string }).requestId : "invalid-request";
+        const record = {
+          method: redactLogValue(parsed?.method ?? ""), path: redactLogValue(parsed?.path ?? ""), status: response.status,
+          responseSize: Buffer.from(response.bodyBase64, "base64").byteLength,
+          requestId: redactLogValue(parsed?.requestId ?? requestId), transport: "prp",
+          durationMs: Math.max(0, Math.round(durationMs)),
+        };
+        await Promise.resolve(activeOnLog?.("stderr", `[paperclip-runner] github_access.request ${JSON.stringify(record)}\n`)).catch(() => undefined);
+      },
       getSessionBinding(sessionBinding: Binding): Binding | null {
         const binding = active;
         if (!binding || stopped || binding.companyId !== sessionBinding.companyId ||
@@ -368,7 +386,7 @@ export async function createNativeGitHubAccess(input: {
             binding.runId !== sessionBinding.runId) return null;
         return { ...binding };
       },
-      async activate(binding: Binding) {
+      async activate(binding: Binding, onLog?: typeof input.onLog) {
         if (stopped || active) throw new Error("GitHub session is closed or busy");
         if (binding.companyId !== input.scope.companyId || binding.agentId !== input.scope.agentId ||
             binding.issueId !== input.scope.issueId) throw new Error("GitHub session scope mismatch");
@@ -376,6 +394,7 @@ export async function createNativeGitHubAccess(input: {
         if (transport === "runner_ingress") token = randomBytes(32).toString("hex");
         if (transport === "callback_bridge") await bridge?.resume?.(generation);
         const owner = { ...binding };
+        activeOnLog = onLog ?? input.onLog;
         active = owner;
         activeGeneration = generation;
         try {
@@ -387,6 +406,7 @@ export async function createNativeGitHubAccess(input: {
           if (active === owner) {
             active = null;
             activeGeneration = null;
+            activeOnLog = input.onLog;
           }
           staleRunnerCapability = true;
           throw error;
@@ -395,6 +415,7 @@ export async function createNativeGitHubAccess(input: {
           if (active === owner) {
             active = null;
             activeGeneration = null;
+            activeOnLog = input.onLog;
             if (transport === "callback_bridge") await bridge?.pause?.();
           }
         };

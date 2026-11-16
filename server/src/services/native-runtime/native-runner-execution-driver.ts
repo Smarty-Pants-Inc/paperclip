@@ -312,6 +312,7 @@ export function createNativeRunnerExecutionDriver(input: NativeRunnerExecutionDr
                     return githubAccess.getSessionBinding({ companyId, agentId, issueId, runId });
                   },
                   handleRequest: (frame, binding) => githubAccess.handleRunnerIngressHttpRequest(frame, binding),
+                  recordRequest: ({ frame, response, durationMs }) => githubAccess.recordRunnerIngressRequest(frame, response, durationMs),
                   getCapability: () => githubAccess.getRunnerIngressCapability(),
                   setRunnerIngressCapabilityRefresher: refresher => githubAccess.setRunnerIngressCapabilityRefresher(refresher),
                   onCapabilityRefreshSuccess: () => githubAccess.markRunnerIngressReady(),

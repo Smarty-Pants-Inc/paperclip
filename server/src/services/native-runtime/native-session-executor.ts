@@ -12848,7 +12848,7 @@ async function executePaperclipNativeSessionAttempt(
         const fallbackReason = nativeGitHubAccessFallbackReason(input, githubAccess.transport);
         await input.onLog?.("stderr", `[paperclip-runner] github_access transport=${githubTransport}${fallbackReason ? ` fallback_reason=${fallbackReason}` : ""}\n`).catch(() => undefined);
         executionContext?.assertOpen();
-        releaseGitHubRun = await githubAccess.activate(input.execution.binding);
+        releaseGitHubRun = await githubAccess.activate(input.execution.binding, input.onLog);
         input = { ...input, runnerEnvironment: { ...input.runnerEnvironment, ...githubAccess.env } };
       }
       if (runnerIngressGitHubAccessIsSelected && input.runnerEnvironment) {

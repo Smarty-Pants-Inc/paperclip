@@ -1044,7 +1044,9 @@ describe("runner provider-ingress WebSocket wire", () => {
       expect(reply.status).toBe(404);
       expect(handleRequest).not.toHaveBeenCalled();
       expect(recordRequest).toHaveBeenCalledOnce();
-      expect(recordRequest).toHaveBeenCalledWith(expect.objectContaining({ status: 404, durationMs: expect.any(Number) }));
+      expect(recordRequest).toHaveBeenCalledWith(expect.objectContaining({
+        response: expect.objectContaining({ status: 404 }), durationMs: expect.any(Number),
+      }));
       expect(recordRequest.mock.calls[0]![0].durationMs).toBeGreaterThanOrEqual(0);
     } finally { await harness.handle.close(); harness.restore(); }
   });
