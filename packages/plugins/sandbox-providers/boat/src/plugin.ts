@@ -3,9 +3,9 @@ import { posix } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { syncFiles } from "./file-sync.js";
 import { parseHttpDate } from "./http-date.js";
-import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
+import { createReadySpareClaimStore, ReadySpareKeeper, READY_SPARE_TTL_SECONDS, readyCreateCeilingPerHour, readySpareConfigHash, readySpareCount, readySpareDemandWindowMinutes,
   readySpareEnvironmentIds, readySpareIdleMinutes, readySpareMax, readySparePoolKey,
-  type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
+  type CreateCapRefusal, type ReadySpare, type ReadySpareClaimStore, type ReadySpareKey, type ReadySpareOperations } from "./ready-spares.js";
 import { stageGuardian, type GuardianPreflight } from "./guardian-stage.js";
 import { BoatIdleActivity, trackBoatHooks } from "./idle-activity.js";
 import { assertBoatActivityAdmission, gateBoatHooks, withBoatLeaseActivity } from "./lease-gates.js";
@@ -35,7 +35,7 @@ const readySpares = new ReadySpareKeeper();
 type KnownSparePool = { key: ReadySpareKey; ttlSeconds: number; desired: number; baseDesired: number; spareMax: number; demandWindowMinutes: number;
   idleMinutes: number; operations: ReadySpareOperations; idleStopped: boolean };
 type CompanySpareActivity = { lastActivityAt?: number; lastLeaseAcquiredAt?: number };
-type AcquireOutcomeReason = "no_ready_spare" | "refill_in_flight" | "env_not_listed" | "config_mismatch" | "claim_conflict" | "spares_disabled" | "idle";
+type AcquireOutcomeReason = "no_ready_spare" | "create_capped" | "refill_in_flight" | "env_not_listed" | "config_mismatch" | "claim_conflict" | "spares_disabled" | "idle";
 type AcquireOutcomeCounts = { spare: number; cold: number; reasons: Partial<Record<AcquireOutcomeReason, number>> };
 type CompanyAcquireOutcomes = Map<string, AcquireOutcomeCounts>;
 const knownSparePools = new Map<string, KnownSparePool>();
@@ -133,7 +133,7 @@ async function loadCompanyAcquireOutcomes(companyId: string): Promise<CompanyAcq
           if (typeof value.environmentId !== "string" || !value.environmentId) continue;
           const reasons: AcquireOutcomeCounts["reasons"] = {};
           if (value.reasons && typeof value.reasons === "object" && !Array.isArray(value.reasons)) {
-            for (const reason of ["no_ready_spare", "refill_in_flight", "env_not_listed", "config_mismatch", "claim_conflict", "spares_disabled", "idle"] as const) {
+            for (const reason of ["no_ready_spare", "create_capped", "refill_in_flight", "env_not_listed", "config_mismatch", "claim_conflict", "spares_disabled", "idle"] as const) {
               const count = (value.reasons as Record<string, unknown>)[reason];
               if (Number.isInteger(count) && Number(count) >= 0) reasons[reason] = Number(count);
             }
@@ -175,6 +175,54 @@ async function recordAcquireOutcome(companyId: string, environmentId: string, ou
   await persistCompanyAcquireOutcomes(companyId, outcomes);
   const message = `[boat] acquire outcome=${outcome}${reason ? ` reason=${reason}` : ""} env=${encodeURIComponent(environmentId)}`;
   try { duplexLogger?.debug(message, { companyId, environmentId, outcome, ...(reason ? { reason } : {}) }); } catch { /* Logging never changes allocation outcome. */ }
+}
+/**
+ * Claimed spares whose run acquire returned this box, until the run proves use
+ * or the lease is released. Proof of use (#20869) is the run reaching a step on
+ * the bound box: Core calls environmentExecute, the Runner ingress endpoint or a
+ * duplex channel open for this exact providerLeaseId. A release, stop or
+ * destroy first ends the binding, so an instant release is never use.
+ */
+const claimedSpareLeases = new Map<string, { companyId: string; environmentId: string; claimedAt: number }>();
+const CLAIMED_SPARE_BINDING_MAX_MS = 24 * 60 * 60 * 1000;
+function bindClaimedSpare(companyId: string, environmentId: string, providerLeaseId: string): void {
+  for (const [id, binding] of claimedSpareLeases) if (Date.now() - binding.claimedAt > CLAIMED_SPARE_BINDING_MAX_MS) claimedSpareLeases.delete(id);
+  claimedSpareLeases.set(providerLeaseId, { companyId, environmentId, claimedAt: Date.now() });
+}
+function unbindClaimedSpare(providerLeaseId: string | null | undefined): void {
+  if (providerLeaseId) claimedSpareLeases.delete(providerLeaseId);
+}
+function recordSpareUse(companyId: string, providerLeaseId: string | null | undefined, step: "execute" | "runner_ingress" | "duplex_open"): void {
+  if (!providerLeaseId) return;
+  const binding = claimedSpareLeases.get(providerLeaseId);
+  if (!binding || binding.companyId !== companyId) return;
+  claimedSpareLeases.delete(providerLeaseId);
+  if (!readySpares.markUsed(companyId, providerLeaseId)) return;
+  try {
+    duplexLogger?.debug(`[boat] spare used step=${step} env=${encodeURIComponent(binding.environmentId)}`,
+      { companyId, environmentId: binding.environmentId, providerLeaseId, step, claimToUseMs: Date.now() - binding.claimedAt });
+  } catch { /* Logging never changes admission. */ }
+  // A pool held by the churn cap may now admit the replacement it was refused.
+  for (const key of readySpares.churnCappedPools(companyId)) {
+    const pool = knownSparePools.get(readySparePoolKey(key));
+    if (!pool || pool.desired <= 0 || pool.idleStopped || shuttingDown) continue;
+    void readySpares.reconcile(pool.key, pool.desired, pool.operations).catch(() => undefined);
+  }
+}
+function reportCreateCapRefusal(refusal: CreateCapRefusal): void {
+  const message = `[boat] create_capped reason=${refusal.reason} kind=${refusal.kind} source=${refusal.source} env=${encodeURIComponent(refusal.environmentId)}`
+    + ` churn=${refusal.churnCreates}/${refusal.churnCap} all=${refusal.allCreates}/${refusal.ceiling}`;
+  try { duplexLogger?.info(message, { ...refusal, refusals: { ...refusal.refusals } }); } catch { /* Logging never changes admission. */ }
+}
+function createCapHealth(): { message: string; details: Record<string, unknown>; ceilingHeld: boolean } {
+  const refusals = readySpares.refusalTotals();
+  const active = readySpares.activeCaps();
+  let message = `; create refusals churn_cap=${refusals.churn_cap} ceiling=${refusals.ceiling}`;
+  if (active.length) {
+    message += `; create_capped ${active.map(cap => `reason=${cap.reason} kind=${cap.kind} company=${cap.companyId} env=${encodeURIComponent(cap.environmentId)}`
+      + ` churn=${cap.churnCreates}/${cap.churnCap} all=${cap.allCreates}/${cap.ceiling} until=${cap.cappedUntil}`).join(", ")}`;
+  }
+  return { message, details: { createRefusals: refusals, createCapped: active }, ceilingHeld: active.some(cap => cap.reason === "ceiling") };
 }
 function acquireOutcomeTotals(): { spare: number; cold: number } {
   let spare = 0, cold = 0;
@@ -867,16 +915,20 @@ function createReadySpareOperations(config: Config, key: ReadySpareKey, ttlSecon
     stop: async spare => { await stopSandbox(config, spare.id); },
     desired: () => freshSpareDesired(key),
     async allowCreate() {
+      // Every spare-labelled box created in the last hour, claimed or not, in
+      // any state: labels are immutable, so a claimed box still says spare.
+      // The keeper subtracts this worker's proofs of use (#20869).
       const inventory = await listBoatSandboxes(config, [["owner", `paperclip:${key.companyId}`], ["purpose", "spare"]]);
       const cutoff = Date.now() - 60 * 60 * 1000;
       let recent = 0;
       for (const sandbox of inventory) {
         if (sandbox.labels.owner !== `paperclip:${key.companyId}` || sandbox.labels.purpose !== "spare") throw new Error("Boat hourly spare inventory returned foreign ownership");
         const createdAt = Date.parse(sandbox.createdAt);
-        if (!Number.isFinite(createdAt)) return false;
+        // Unknown is not a count: fail closed without reporting a cap.
+        if (!Number.isFinite(createdAt)) throw new Error("Boat hourly spare inventory omitted createdAt");
         if (createdAt >= cutoff) recent++;
       }
-      return recent < 12;
+      return { recentSpareCreates: recent };
     },
   };
 }
@@ -1032,7 +1084,9 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     boatRateLimitPauseUntil = 0;
     preparedEnvDirectories.clear();
     readySpares.start();
+    readySpares.setRefusalListener(reportCreateCapRefusal);
     knownSparePools.clear();
+    claimedSpareLeases.clear();
     pluginContext = ctx; duplexContext = ctx.duplexChannel; duplexLogger = ctx.logger;
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -1055,6 +1109,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const companyId = context?.companyId;
     if (!companyId) return;
     subscribeCompanyActivity(companyId);
+    readySpares.setCreateCeiling(companyId, readyCreateCeilingPerHour(newConfig));
     const configuredCount = readySpareCount(newConfig);
     const environments = readySpareEnvironmentIds(newConfig);
     const spareMax = readySpareMax(newConfig);
@@ -1077,7 +1132,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     clearSpareRefreshTimerIfIdle();
   },
-  onDuplexChannelOpen: params => duplexChannels.open(params),
+  onDuplexChannelOpen: params => {
+    recordSpareUse(params.companyId, params.providerLeaseId, "duplex_open");
+    return duplexChannels.open(params);
+  },
   onDuplexChannelWrite: params => duplexChannels.write(params),
   onDuplexChannelStop: params => duplexChannels.stop(params),
   onDuplexChannelClose: params => duplexChannels.close(params),
@@ -1093,10 +1151,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       await maintainReadySpares(true);
       const totals = acquireOutcomeTotals();
       const status = checked ? `Boat resident status probes passed for ${checked} bound leases (not live Boat qualification).` : "Boat sandbox provider healthy";
-      return { status: "ok", message: `${status}; acquire outcomes spare=${totals.spare} cold=${totals.cold}` };
+      // While a create is refused, health names it (create_capped). The churn
+      // cap only delays spares (runs still create cold), so it stays ok; the
+      // absolute ceiling refuses run creates too, so it reports degraded.
+      const caps = createCapHealth();
+      return { status: caps.ceilingHeld ? "degraded" : "ok", message: `${status}; acquire outcomes spare=${totals.spare} cold=${totals.cold}${caps.message}`, details: caps.details };
     } catch {
       const totals = acquireOutcomeTotals();
-      return { status: "error", message: `Boat SSH guardian status probe failed; acquire outcomes spare=${totals.spare} cold=${totals.cold}` };
+      const caps = createCapHealth();
+      return { status: "error", message: `Boat SSH guardian status probe failed; acquire outcomes spare=${totals.spare} cold=${totals.cold}${caps.message}`, details: caps.details };
     }
   },
   async onShutdown() {
@@ -1119,6 +1182,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     } finally {
       readySpares.reset();
       knownSparePools.clear();
+      claimedSpareLeases.clear();
       spareClaimStore = undefined;
       duplexContext = undefined; duplexLogger = undefined; pluginContext = undefined; runnerIngressGenerationStore.reset();
       // The host process exits after this hook. Clearing the transition flag
@@ -1207,6 +1271,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         spareMax = readySpareMax(companyConfig);
         demandWindowMinutes = readySpareDemandWindowMinutes(companyConfig);
         spareIdleMinutes = readySpareIdleMinutes(companyConfig);
+        readySpares.setCreateCeiling(params.companyId, readyCreateCeilingPerHour(companyConfig));
         hasSpareSetting = true;
       } catch { duplexLogger?.warn("Boat ready spare setting lookup failed", { companyId: params.companyId }); }
     }
@@ -1214,6 +1279,14 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     const policy = { baseDesired: baseSpares, spareMax, demandWindowMinutes };
     const createOrdinaryLease = async (): Promise<PluginEnvironmentLease> => {
       let id: string | undefined;
+      if (shuttingDown) throw new Error("Boat provider is shutting down");
+      // The absolute hourly ceiling holds run creates too; nothing is sent to Boat.
+      const admission = readySpares.admitRunCreate(params.companyId, params.environmentId);
+      if (!admission.admitted) {
+        const { refusal } = admission;
+        throw new Error(`Boat create_capped: reason=${refusal.reason}; ${refusal.allCreates} of ${refusal.ceiling} Boat creates this hour`
+          + ` for this company (createCeilingPerHour); retry after ${refusal.cappedUntil}.`);
+      }
       try {
         if (shuttingDown) throw new Error("Boat provider is shutting down");
         const created = await request(c, "/sandboxes", { method: "POST", signal: AbortSignal.timeout(30_000), headers: { "Idempotency-Key": attemptId }, body: JSON.stringify(createSandboxBody(c, ttl, labels, from)) });
@@ -1266,7 +1339,10 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         // Immediately begin the replacement while shared lease preparation
         // runs; no claims can see the transferred ID again.
         queueSpareReconciliation(spareKey, demandedSpares, ttl, spareOperations, spareIdleMinutes, policy);
-        return await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
+        const lease = await finishAcquisition(params, c, id, ready, claimedSpare.labels, remoteCwd, snapshot, claimName, claimedSpare);
+        // The run's acquire is now bound to this box; a step on it proves use.
+        bindClaimedSpare(params.companyId, params.environmentId, id);
+        return lease;
       }
       await recordOutcomeOnce("cold", claimResult.reason);
       if (shuttingDown) throw new Error("Boat provider is shutting down");
@@ -1408,6 +1484,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {
+    unbindClaimedSpare(params.providerLeaseId);
     await recordCompanySpareActivity(params.companyId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config); const id = params.providerLeaseId;
@@ -1420,6 +1497,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
   },
   async onEnvironmentStopLease(params: PluginEnvironmentReleaseLeaseParams) {
+    unbindClaimedSpare(params.providerLeaseId);
     if (!params.providerLeaseId) throw new Error("Boat stop requires an exact providerLeaseId");
     const c = parse(params.config);
     preparedEnvDirectories.delete(params.providerLeaseId);
@@ -1430,6 +1508,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
   },
   async onEnvironmentDestroyLease(params: PluginEnvironmentDestroyLeaseParams) {
+    unbindClaimedSpare(params.providerLeaseId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config);
     preparedEnvDirectories.delete(params.providerLeaseId);
@@ -1465,6 +1544,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     if (!/^\/api\/runner\/v1\/connect\/[A-Za-z0-9_-]+$/.test(params.path)) throw new Error("Boat runner ingress path is invalid.");
     const id = params.lease.providerLeaseId;
     if (!id) throw new Error("Boat runner ingress requires a provider lease id.");
+    recordSpareUse(params.companyId, id, "runner_ingress");
     const c = parse(params.config);
     const result = await acquireRunnerIngress("sandbox_lookup", () => request(c, `/sandboxes/${encodeURIComponent(id)}`));
     let sandbox = result.sandbox ?? result;
@@ -1501,6 +1581,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   },
   async onEnvironmentExecute(params: PluginEnvironmentExecuteParams): Promise<PluginEnvironmentExecuteResult> {
     const id = params.lease.providerLeaseId; if (!id) return { exitCode: 1, timedOut: false, stdout: "", stderr: "No Boat lease ID available." };
+    recordSpareUse(params.companyId, id, "execute");
     const c = parse(params.config); validEnv(params.env);
     let stdinPath: string | null = null, envPath: string | null = null;
     const base = `/sandboxes/${encodeURIComponent(id)}/files`;
