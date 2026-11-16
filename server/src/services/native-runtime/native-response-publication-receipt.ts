@@ -28,6 +28,7 @@ type Receipt = {
   firstAttemptAt: string;
   lastAttemptAt: string;
   lastReason: NativeResponsePublicationReason;
+  lastRefusalReason?: string;
   lastError?: string | null;
   nextAttemptAt?: string | null;
   reasonCode?: string;
@@ -67,7 +68,7 @@ function patchReceipt(tx: Db, runId: string, receipt: Receipt) {
  * the bounded retry is exhausted and the failure has been recorded. */
 export async function recordNativeResponsePublicationAttempt(db: Db, input: {
   companyId: string; issueId: string; runId: string;
-  reason: NativeResponsePublicationReason; error?: unknown;
+  reason: NativeResponsePublicationReason; error?: unknown; refusalReasonCode?: string;
 }): Promise<{ state: "retrying"; nextAttemptAt: number } | { state: "failed" } | null> {
   return db.transaction(async transaction => {
     const tx = transaction as unknown as Db;
@@ -90,6 +91,9 @@ export async function recordNativeResponsePublicationAttempt(db: Db, input: {
       firstAttemptAt: previous?.state === "retrying" ? previous.firstAttemptAt : now.toISOString(),
       lastAttemptAt: now.toISOString(),
       lastReason: input.reason,
+      ...(input.reason === "publication_refused"
+        ? { lastRefusalReason: input.refusalReasonCode ?? previous?.lastRefusalReason ?? "task_reply_recovery_refused" }
+        : previous?.lastRefusalReason ? { lastRefusalReason: previous.lastRefusalReason } : {}),
       lastError: errorText(input.error),
     };
     if (attempts < NATIVE_RESPONSE_PUBLICATION_MAX_ATTEMPTS) {
@@ -100,7 +104,8 @@ export async function recordNativeResponsePublicationAttempt(db: Db, input: {
         companyId: input.companyId, runId: run.id, agentId: run.agentId,
         eventType: "run.response_publication.retrying", stream: "system", level: "warn",
         message: `Final reply publication ${input.reason === "publication_error" ? "failed" : "was refused"}; retry ${attempts + 1} of ${NATIVE_RESPONSE_PUBLICATION_MAX_ATTEMPTS} is scheduled`,
-        payload: { attempts, reason: input.reason, nextAttemptAt: nextAttemptAt.toISOString() },
+        payload: { attempts, reason: input.reason, ...(base.lastRefusalReason ? { lastRefusalReason: base.lastRefusalReason } : {}),
+          nextAttemptAt: nextAttemptAt.toISOString() },
       });
       return { state: "retrying" as const, nextAttemptAt: nextAttemptAt.getTime() };
     }
@@ -112,14 +117,15 @@ export async function recordNativeResponsePublicationAttempt(db: Db, input: {
       companyId: input.companyId, runId: run.id, agentId: run.agentId,
       eventType: "run.response_publication.failed", stream: "system", level: "error",
       message: `The accepted final reply could not be published to the task after ${attempts} attempts`,
-      payload: { reasonCode: NATIVE_RESPONSE_PUBLICATION_FAILED, attempts, lastReason: input.reason, owner },
+      payload: { reasonCode: NATIVE_RESPONSE_PUBLICATION_FAILED, attempts, lastReason: input.reason,
+        ...(base.lastRefusalReason ? { lastRefusalReason: base.lastRefusalReason } : {}), owner },
     });
     await logActivity(tx, {
       companyId: input.companyId, actorType: "system", actorId: "native-response-publication",
       action: "issue.response_publication_failed", entityType: "issue", entityId: input.issueId,
       agentId: run.agentId, runId: run.id,
       details: { runId: run.id, reasonCode: NATIVE_RESPONSE_PUBLICATION_FAILED, attempts, lastReason: input.reason,
-        lastError: base.lastError, owner },
+        ...(base.lastRefusalReason ? { lastRefusalReason: base.lastRefusalReason } : {}), lastError: base.lastError, owner },
     });
     return { state: "failed" as const };
   });

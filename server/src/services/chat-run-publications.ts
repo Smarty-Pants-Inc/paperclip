@@ -50,6 +50,43 @@ const OWNERSHIP_ATTENTION_CODES = [
 
 export { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON };
 
+type ChatPublicationBindings = Awaited<ReturnType<typeof resolveChatOriginPublicationBindings>>;
+
+async function areGitHubOnlyChatBindings(db: Db, companyId: string, bindings: ChatPublicationBindings) {
+  if (bindings.length === 0) return false;
+  const githubEndpoints = await db
+    .select({ id: chatEndpoints.id })
+    .from(chatEndpoints)
+    .innerJoin(chatGitHubConfigurations, and(
+      eq(chatGitHubConfigurations.companyId, chatEndpoints.companyId),
+      eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
+    ))
+    .where(and(
+      eq(chatEndpoints.companyId, companyId),
+      eq(chatEndpoints.provider, "github"),
+      inArray(chatEndpoints.id, bindings.map(binding => binding.endpointId)),
+    ));
+  return bindings.every(binding => githubEndpoints.some(endpoint => endpoint.id === binding.endpointId));
+}
+
+/**
+ * True only for a GitHub-origin task reply whose local-write authorization is
+ * the existing GitHub-only rule (rather than another internal-write case).
+ */
+export async function isGitHubOnlyChatTaskReply(
+  db: Db,
+  input: { companyId: string; issueId: string; runId: string },
+): Promise<boolean> {
+  const [run] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).limit(1);
+  const context = run?.contextSnapshot as Record<string, unknown> | null | undefined;
+  if (context?.source !== "chat:github" || typeof context.chatConversationId !== "string" ||
+    !context.chatConversationId.trim() || run?.resultJson?.finalizationReasonCode === "governed_response_waiting" ||
+    await hasChatRunOwnedProviderInteraction(db, input)) return false;
+  const bindings = await resolveChatOriginPublicationBindings(db, input.companyId, input.issueId, input.runId);
+  if (!bindings.some(binding => binding.conversationId === context.chatConversationId)) return false;
+  return areGitHubOnlyChatBindings(db, input.companyId, bindings);
+}
 
 /**
  * Heartbeat's presentation resolver may externalize its selected final prose
@@ -99,19 +136,7 @@ export async function resolveChatRunPresentationAuthorizationReason(
   }
   // GitHub replies are authored through task-scoped tools. Runner-selected
   // final prose stays local even when no tool reply has been sent yet.
-  const githubEndpoints = await db
-    .select({ id: chatEndpoints.id })
-    .from(chatEndpoints)
-    .innerJoin(chatGitHubConfigurations, and(
-      eq(chatGitHubConfigurations.companyId, chatEndpoints.companyId),
-      eq(chatGitHubConfigurations.endpointId, chatEndpoints.id),
-    ))
-    .where(and(
-      eq(chatEndpoints.companyId, input.companyId),
-      eq(chatEndpoints.provider, "github"),
-      inArray(chatEndpoints.id, bindings.map(binding => binding.endpointId)),
-    ));
-  if (bindings.every(binding => githubEndpoints.some(endpoint => endpoint.id === binding.endpointId))) {
+  if (await areGitHubOnlyChatBindings(db, input.companyId, bindings)) {
     return "internal_agent_write";
   }
   return CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON;

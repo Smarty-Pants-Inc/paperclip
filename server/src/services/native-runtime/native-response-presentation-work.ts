@@ -56,8 +56,11 @@ export function nativeResponsePresentationWork(db: Db) {
     if (signal?.aborted) throw new Error("Native response presentation recovery stopped");
     const recoveryStartedAt = Date.now();
     let failure: unknown = null;
+    let refusalReasonCode: string | undefined;
     try {
-      await recoverCommittedNativeChatResponse(db, { ...scope, runId: entry.id, onlyWhenDue: true });
+      const recovery = await recoverCommittedNativeChatResponse(db, { ...scope, runId: entry.id, onlyWhenDue: true,
+        includeRefusalReason: true });
+      if (typeof recovery === "object") refusalReasonCode = recovery.refusalReasonCode;
     } catch (error) {
       // Ordinary task replies own a durable, bounded retry below. Other
       // presentation classes keep the coordinator's in-memory backoff.
@@ -75,7 +78,7 @@ export function nativeResponsePresentationWork(db: Db) {
     // it silently: schedule a bounded retry or record the named failure.
     const attempt = await recordNativeResponsePublicationAttempt(db, {
       companyId: entry.companyId, issueId: entry.issueId, runId: entry.id,
-      reason: failure ? "publication_error" : "publication_refused", error: failure,
+      reason: failure ? "publication_error" : "publication_refused", error: failure, refusalReasonCode,
     });
     return attempt?.state === "retrying" ? { ...entry, dueAt: attempt.nextAttemptAt } : null;
   }

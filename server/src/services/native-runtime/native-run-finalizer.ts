@@ -107,7 +107,7 @@ import {
   resolveHeartbeatRunResponse,
   selectHeartbeatRunFinalAgentMessage,
 } from "../heartbeat-run-summary.js";
-import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
+import { isGitHubOnlyChatTaskReply, resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
 import { settledResponsePublicationSql } from "./native-response-publication-receipt.js";
 import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitration.js";
 import {
@@ -1004,21 +1004,30 @@ export async function repairCommittedNativeChatResponse(
   }
 }
 
+type NativeChatResponseRecoveryInput = { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean };
+export type NativeChatResponseRecoveryRefusal = { refusalReasonCode: string };
+
+export function recoverCommittedNativeChatResponse(
+  db: Db,
+  input: NativeChatResponseRecoveryInput & { includeRefusalReason: true },
+): Promise<boolean | NativeChatResponseRecoveryRefusal>;
+export function recoverCommittedNativeChatResponse(db: Db, input: NativeChatResponseRecoveryInput): Promise<boolean>;
 export async function recoverCommittedNativeChatResponse(
   db: Db,
-  input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
-): Promise<boolean> {
+  input: NativeChatResponseRecoveryInput & { includeRefusalReason?: true },
+): Promise<boolean | NativeChatResponseRecoveryRefusal> {
   return withRunResponsePresentationTiming(input.runId, () => recoverCommittedNativeChatResponseInScope(db, input));
 }
 
 async function recoverCommittedNativeChatResponseInScope(
   db: Db,
-  input: { companyId: string; issueId: string; runId: string; onlyWhenDue?: boolean },
-): Promise<boolean> {
+  input: NativeChatResponseRecoveryInput & { includeRefusalReason?: true },
+): Promise<boolean | NativeChatResponseRecoveryRefusal> {
   let agentId: string | null = null;
   let materialized = false;
   let conversationReply = false;
   let settledWithoutReply = false;
+  let refusalReasonCode: string | null = null;
   const entered = beginRunPhase("response.transaction.entry");
   try {
     materialized = await measureRunPhase("response.transaction", () => db.transaction(async (transaction) => {
@@ -1201,8 +1210,13 @@ async function recoverCommittedNativeChatResponseInScope(
         && run.contextSnapshot.conversationSessionGeneration === issue.conversationSessionGeneration;
       // A deferred ordinary-task review still needs its recorded final reply.
       // Publishing that reply must not resolve the interaction or the task.
+      const externalChatContext = isExternalChatPresentationContext(run.contextSnapshot);
+      const preliminaryReplyAuthorization = externalChatContext
+        ? await resolveChatRunPresentationAuthorizationReason(tx, input) : null;
+      const githubTaskReply = preliminaryReplyAuthorization === "internal_agent_write" &&
+        await isGitHubOnlyChatTaskReply(tx, input);
       const ordinaryTaskReply = (!conversation || currentConversation) &&
-        !isExternalChatPresentationContext(run.contextSnapshot) &&
+        (!externalChatContext || githubTaskReply) &&
         ((result.reportedWorkDisposition === "done" && terminal.reportedWorkDisposition === "done") ||
           (!conversation && result.reportedWorkDisposition === "needs_review" && terminal.reportedWorkDisposition === "needs_review") ||
           // A conversation turn can yield while an approval, an execution
@@ -1213,7 +1227,10 @@ async function recoverCommittedNativeChatResponseInScope(
         terminal.runTerminalState === "succeeded" &&
         terminal.turnTerminalState === "completed" &&
         (ordinaryTaskReply || blockedTaskReply);
-      const replyAuthorization = taskReplyEligible ? await resolveChatRunPresentationAuthorizationReason(tx, input) : null;
+      if (!taskReplyEligible && externalChatContext)
+        refusalReasonCode = "task_reply_ineligible:external_chat_context";
+      const replyAuthorization = taskReplyEligible
+        ? preliminaryReplyAuthorization ?? await resolveChatRunPresentationAuthorizationReason(tx, input) : null;
       const externalChatReply = blockedTaskReply &&
         isExternalChatPresentationContext(run.contextSnapshot, replyAuthorization === CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON);
       if (taskReplyEligible && replyAuthorization && (blockedTaskReply || replyAuthorization === "internal_agent_write")) {
@@ -1243,7 +1260,10 @@ async function recoverCommittedNativeChatResponseInScope(
             return candidate ? [candidate] : [];
           }),
         });
-        if (!finalAgentMessage && !blockedTaskReply) return false;
+        if (!finalAgentMessage && !blockedTaskReply) {
+          refusalReasonCode = "no_final_agent_message";
+          return false;
+        }
         const comments = await tx.select({ id: issueComments.id, body: issueComments.body, presentation: issueComments.presentation })
           .from(issueComments).where(and(
             eq(issueComments.companyId, input.companyId),
@@ -1286,7 +1306,10 @@ async function recoverCommittedNativeChatResponseInScope(
           settledWithoutReply = true;
           return false;
         }
-        if (!resolved.text || resolved.decision.commentAction !== "create") return false;
+        if (!resolved.text || resolved.decision.commentAction !== "create") {
+          refusalReasonCode = "task_reply_response_not_creatable";
+          return false;
+        }
         await notifyChatRunMilestones(tx, input);
         const comment = await issueService(db).addComment(input.issueId, resolved.text,
           { agentId: run.agentId, runId: run.id },
@@ -1309,7 +1332,10 @@ async function recoverCommittedNativeChatResponseInScope(
         terminal.runTerminalState !== "succeeded" ||
         terminal.turnTerminalState !== "completed" ||
         terminal.reportedWorkDisposition !== "yielded"
-      ) return false;
+      ) {
+        refusalReasonCode ??= "task_reply_recovery_refused";
+        return false;
+      }
       await authorizeCommittedChatResponse(db, tx, {
         ...input,
         agentId: run.agentId,
@@ -1384,7 +1410,9 @@ async function recoverCommittedNativeChatResponseInScope(
       eventType: "run.presentation.resolved",
     });
   }
-  return materialized;
+  return materialized || (input.includeRefusalReason
+    ? { refusalReasonCode: refusalReasonCode ?? "task_reply_recovery_refused" }
+    : false);
 }
 
 /** Presentation recovery is independent from re-arbitrating issue status. */
