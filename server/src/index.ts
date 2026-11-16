@@ -1,4 +1,5 @@
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
+import { drainAgentFileCheckpoints } from "./services/agent-directory-working-copies.js";
 import { closeProcessRunAdmission, isProcessRunAdmissionClosed } from "./services/heartbeat/run-admission.js";
 import { createRunStartHandover, registerRunStartHandover } from "./services/run-start-handover.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
@@ -2298,14 +2299,15 @@ async function startServerWithDatabaseTeardown(
 
     await abortStuckMultipartUploads(signal, 5_000);
 
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
-        signal,
-        drain: drainHeartbeatExecutionFinalizers,
-        timeoutMs: 30_000,
-        log: logger,
-      });
-    }
+    // Hot restart leaves detached native executions running for reattach. Join
+    // only their already-started file saves, not the execution promises, before
+    // the DB pools close. Ordinary shutdown retains its full execution join.
+    await drainRunExecutionFinalizersForShutdown({
+      signal,
+      drain: skipHeartbeatDrain ? drainAgentFileCheckpoints : drainHeartbeatExecutionFinalizers,
+      timeoutMs: 30_000,
+      log: logger,
+    });
 
     await workspaceRecoveryStop;
 
