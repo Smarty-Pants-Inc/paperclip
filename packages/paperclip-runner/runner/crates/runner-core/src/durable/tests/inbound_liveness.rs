@@ -335,6 +335,147 @@ fn inbound_liveness_protocol_pings_keep_an_idle_listener_connection_alive() {
     assert_eq!(closed_at, Duration::from_secs(300 + 100 + 120 + 1));
 }
 
+// RFL 07:59Z contract ruling: every inbound message, control frames included
+// Keep: #20825's half-open listener failure path, with control messages inside
+// a fragmented data message. Only the VirtualClock advances protocol time;
+// channel barriers and real Pongs establish that each step was consumed.
+#[test]
+fn inbound_liveness_fragmented_message_with_interleaved_pings_survives_121s() {
+    use tungstenite::protocol::frame::{
+        coding::{Data, OpCode},
+        Frame,
+    };
+
+    let (endpoint, address) = liveness_listener_endpoint();
+    let config = config(address.port());
+    let state = test_state(&config);
+    let expected = control(
+        &state,
+        "connection_1",
+        "ping",
+        json!({"message": "fragmented across the liveness window: intact"}),
+    );
+    let clock = test_clock::VirtualClock::new();
+    clock.install();
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (connected, runner_connected) = mpsc::channel();
+    let (steps, runner_steps) = mpsc::channel();
+    let (observed, runner_observed) = mpsc::channel();
+    let (checked, runner_checked) = mpsc::channel();
+    let controller = {
+        let (config, state, expected, clock, finished) = (
+            config.clone(),
+            state.clone(),
+            expected.clone(),
+            clock.clone(),
+            finished.clone(),
+        );
+        thread::spawn(move || {
+            let _finished = LivenessFinished(finished);
+            let mut socket = liveness_dial(address).unwrap();
+            let expires = current_unix_ms().unwrap() + 600_000;
+            let mut secure = liveness_bootstrap(&mut socket, &config, &state, expires);
+            send_secure(
+                &mut socket,
+                &mut secure,
+                &config,
+                &welcome(
+                    &state,
+                    "connection_1",
+                    Some("lease-secret"),
+                    expires,
+                    0,
+                    vec![],
+                ),
+            );
+            runner_connected.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            let encrypted = secure
+                .encrypt(&serde_json::to_vec(&expected).unwrap(), true)
+                .unwrap();
+            let bytes = serde_json::to_vec(&encrypted).unwrap();
+            let split = bytes.len() / 3;
+            let fragment = |socket: &mut WebSocket<TcpStream>,
+                            range: std::ops::Range<usize>,
+                            opcode,
+                            final_fragment| {
+                socket
+                    .send(Message::Frame(Frame::message(
+                        bytes[range].to_vec(),
+                        OpCode::Data(opcode),
+                        final_fragment,
+                    )))
+                    .unwrap();
+            };
+            fragment(&mut socket, 0..split, Data::Text, false);
+            steps.send(0_u64).unwrap();
+            runner_observed.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            for at in [20_u64, 40, 60, 80, 100] {
+                clock.set(Duration::from_secs(at));
+                if at == 100 {
+                    fragment(&mut socket, split..2 * split, Data::Continue, false);
+                }
+                let payload = at.to_be_bytes().to_vec();
+                socket.send(Message::Ping(payload.clone().into())).unwrap();
+                steps.send(at).unwrap();
+                assert_eq!(socket.read().unwrap(), Message::Pong(payload.into()));
+                runner_observed.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            }
+            clock.set(Duration::from_secs(119));
+            fragment(&mut socket, 2 * split..bytes.len(), Data::Continue, true);
+            steps.send(119).unwrap();
+            let delivered =
+                liveness_receive_secure(&mut socket, &mut secure, &config, LIVENESS_OBSERVE);
+            assert_eq!(
+                delivered, expected,
+                "fragmented message was not delivered intact"
+            );
+            runner_observed.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            clock.set(Duration::from_secs(120));
+            socket.send(Message::Ping(vec![120].into())).unwrap();
+            steps.send(120).unwrap();
+            assert_eq!(socket.read().unwrap(), Message::Pong(vec![120].into()));
+            runner_observed.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            clock.set(Duration::from_secs(121));
+            steps.send(121).unwrap();
+            runner_observed.recv_timeout(LIVENESS_OBSERVE).unwrap();
+            assert!(
+                !liveness_runner_closed(&socket),
+                "connection closed at 121 s"
+            );
+            checked.send(()).unwrap();
+        })
+    };
+    let ticket = BootstrapTicket::new("bootstrap-secret".to_owned()).unwrap();
+    let outcome = liveness_connect(&endpoint, &config, &state, Some(&ticket), None, &finished).map(
+        |(mut transport, _)| {
+            connected.send(()).unwrap();
+            for at in [0_u64, 20, 40, 60, 80, 100, 119, 120, 121] {
+                assert_eq!(runner_steps.recv_timeout(LIVENESS_OBSERVE).unwrap(), at);
+                let message = transport.receive_json().unwrap_or_else(|error| {
+                    panic!("runnerd closed fragmented/pinged connection at {at} s: {error}")
+                });
+                if at == 119 {
+                    assert_eq!(message, Some(expected.clone()));
+                    transport.send_json(&expected).unwrap();
+                } else {
+                    assert!(message.is_none(), "premature data delivery at {at} s");
+                }
+                if at != 121 {
+                    assert_eq!(transport.last_inbound, Some(clock.now()));
+                }
+                observed.send(()).unwrap();
+            }
+            // Keep runnerd's transport alive until the controller has checked
+            // the socket; leaving this scope would itself close the connection.
+            runner_checked.recv_timeout(LIVENESS_OBSERVE).unwrap();
+        },
+    );
+    if let Err(panic) = controller.join() {
+        std::panic::resume_unwind(panic);
+    }
+    outcome.expect("runner never connected");
+}
+
 /// Judged row (b): a silent peer (no FIN, no frames) is closed at 120 s +/- 1 s;
 /// the slot frees and a fresh controller upgrade, dialed while the slot was
 /// still held, is admitted and mutually authenticates.
