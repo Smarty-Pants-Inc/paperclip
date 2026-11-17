@@ -1,4 +1,5 @@
 import { CoordinatorSidebar } from "./CoordinatorSidebar";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { isWaitingToStart } from "../lib/agent-queue-wait";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import {
@@ -294,7 +295,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               <SidebarNavItem to="/org" label="Org" icon={Network} />
               <SidebarNavItem to="/apps" label="Connectors" icon={Unplug} />
               <SidebarNavItem to="/timeline" label="Timeline" icon={GanttChartSquare} />
-              <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />
+              {!COST_BUDGET_UI_HIDDEN && <SidebarNavItem to="/costs" label="Costs" icon={DollarSign} />}
               <SidebarNavItem to="/activity" label="Activity" icon={History} />
               <SidebarNavItem to="/activity/commentary" label="Commentary" icon={History} />
               <SidebarNavItem to="/company/settings" label="Settings" icon={Settings} />

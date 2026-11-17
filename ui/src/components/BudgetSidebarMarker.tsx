@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { DollarSign } from "lucide-react";
 
 export type BudgetSidebarMarkerLevel = "healthy" | "warning" | "critical";
@@ -21,6 +22,7 @@ export function BudgetSidebarMarker({
   title?: string;
   level?: BudgetSidebarMarkerLevel;
 }) {
+  if (COST_BUDGET_UI_HIDDEN) return null;
   const accessibleTitle = title ?? defaultTitles[level];
 
   return (

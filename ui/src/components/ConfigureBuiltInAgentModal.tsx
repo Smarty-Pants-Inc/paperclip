@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { describeError } from "@/api/errors";
 import { useMemo, useState } from "react";
 import { agentHarnessType } from "@paperclipai/shared";
@@ -215,7 +216,7 @@ export function ConfigureBuiltInAgentModal({
             </InlineBanner>
           )}
 
-          <Field label="Monthly budget (optional)" hint="Leave blank for no cap.">
+          {!COST_BUDGET_UI_HIDDEN && <Field label="Monthly budget (optional)" hint="Leave blank for no cap.">
             <div className="flex items-center gap-2">
               <span className="text-sm text-muted-foreground">$</span>
               <Input
@@ -230,7 +231,7 @@ export function ConfigureBuiltInAgentModal({
               />
               <span className="text-sm text-muted-foreground">/ month</span>
             </div>
-          </Field>
+          </Field>}
 
           {error && (
             <p className="text-sm text-destructive" role="alert">

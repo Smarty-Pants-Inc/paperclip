@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { FoldVertical, Loader2 } from "lucide-react";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { cn, COST_FIGURES_HIDDEN } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { timeAgo } from "@/lib/timeAgo";
@@ -138,7 +139,7 @@ export function ContextUsageCard({ usage, compact }: { usage: ContextUsage; comp
             : "Close to full. The agent will compact its context soon."}
         </p>
       ) : null}
-      {totals || usage.lastTurn || usage.costUsd != null || usage.compactions ? (
+      {totals || usage.lastTurn || (!COST_BUDGET_UI_HIDDEN && usage.costUsd != null) || usage.compactions ? (
         <dl className="mt-3 flex flex-col gap-1 border-t border-border pt-2">
           {totals?.inputTokens != null ? (
             <Row
@@ -159,7 +160,7 @@ export function ContextUsageCard({ usage, compact }: { usage: ContextUsage; comp
               muted
             />
           ) : null}
-          {usage.costUsd != null ? <Row label="Cost" value={COST_FIGURES_HIDDEN ? "—" : `$${usage.costUsd.toFixed(2)}`} /> : null}
+          {!COST_BUDGET_UI_HIDDEN && usage.costUsd != null ? <Row label="Cost" value={COST_FIGURES_HIDDEN ? "—" : `$${usage.costUsd.toFixed(2)}`} /> : null}
           {usage.compactions ? <Row label="Compactions" value={String(usage.compactions)} muted /> : null}
         </dl>
       ) : null}

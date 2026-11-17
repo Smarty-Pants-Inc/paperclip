@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { Link, useParams, useNavigate, useLocation, Navigate } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { PROJECT_COLORS, PROJECT_ICON_NAMES, isUuidLike, type BudgetPolicySummary } from "@paperclipai/shared";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { budgetsApi } from "../api/budgets";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { instanceSettingsApi } from "../api/instanceSettings";
@@ -692,7 +693,7 @@ export function ProjectDetail() {
     if (cachedTab === "configuration") {
       return <Navigate to={`/projects/${canonicalProjectRef}/configuration`} replace />;
     }
-    if (cachedTab === "budget") {
+    if (!COST_BUDGET_UI_HIDDEN && cachedTab === "budget") {
       return <Navigate to={`/projects/${canonicalProjectRef}/budget`} replace />;
     }
     if (cachedTab === "plugin-operations" && project?.managedByPlugin) {
@@ -800,7 +801,7 @@ export function ProjectDetail() {
             className="text-xl font-bold"
           />
           <ProjectStatusPill project={project} />
-          {project.pauseReason === "budget" ? (
+          {!COST_BUDGET_UI_HIDDEN && project.pauseReason === "budget" ? (
             <div className="inline-flex items-center gap-2 rounded-full border border-red-500/30 bg-red-500/10 px-3 py-1 text-(length:--text-micro) font-medium uppercase tracking-(--tracking-caps) text-red-800 dark:text-red-200">
               <span className="h-2 w-2 rounded-full bg-red-400" />
               Paused by budget hard stop
@@ -876,7 +877,7 @@ export function ProjectDetail() {
             ...(project.managedByPlugin ? [{ value: "plugin-operations", label: "Plugin operations" }] : []),
             ...(showWorkspacesTab ? [{ value: "workspaces", label: "Workspaces" }] : []),
             { value: "configuration", label: "Configuration" },
-            { value: "budget", label: "Budget" },
+            ...(!COST_BUDGET_UI_HIDDEN ? [{ value: "budget", label: "Budget" }] : []),
             ...pluginTabItems.map((item) => ({
               value: item.value,
               label: item.label,
@@ -937,7 +938,7 @@ export function ProjectDetail() {
         </div>
       )}
 
-      {activeTab === "budget" && resolvedCompanyId ? (
+      {!COST_BUDGET_UI_HIDDEN && activeTab === "budget" && resolvedCompanyId ? (
         <div className="max-w-3xl">
           <BudgetPolicyCard
             summary={projectBudgetSummary}

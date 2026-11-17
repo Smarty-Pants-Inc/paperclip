@@ -2,6 +2,7 @@ import { describeError } from "../api/errors";
 import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "@/lib/router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { approvalsApi } from "../api/approvals";
 import { agentsApi } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
@@ -69,13 +70,14 @@ export function Approvals() {
     },
   });
 
-  const filtered = (data ?? [])
+  const visibleApprovals = (data ?? []).filter(approval => !COST_BUDGET_UI_HIDDEN || approval.type !== "budget_override_required");
+  const filtered = visibleApprovals
     .filter(
       (a) => statusFilter === "all" || a.status === "pending" || a.status === "revision_requested",
     )
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
-  const pendingCount = (data ?? []).filter(
+  const pendingCount = visibleApprovals.filter(
     (a) => a.status === "pending" || a.status === "revision_requested",
   ).length;
 

@@ -1,4 +1,5 @@
 import { useCoordinatorWorkspaceEnabled } from "./hooks/useCoordinatorWorkspaceEnabled";
+import { COST_BUDGET_UI_HIDDEN } from "./lib/cost-visibility";
 import { ORGANIZATION_CREATION_HIDDEN } from "./lib/organization-creation";
 import { AgentChats } from "./pages/AgentChats";
 import { lazy, Suspense, useEffect, type ReactNode } from "react";
@@ -44,6 +45,11 @@ import { useCloudInstance } from "./hooks/useCloudInstance";
 import { useStreamlinedUiEnabled } from "./hooks/useStreamlinedUiEnabled";
 import { cloudStackCreateUrl } from "./lib/cloudLinks";
 import { navigateTopLevel } from "@/lib/browserNavigation";
+
+function HiddenMoneyEntityRedirect({ entity }: { entity: "agents" | "projects" }) {
+  const { agentId, projectId } = useParams();
+  return <Navigate to={entity === "agents" ? `/agents/${agentId}/overview` : `/projects/${projectId}/issues`} replace />;
+}
 
 const AuthPage = lazy(() => import("./pages/Auth").then((module) => ({ default: module.AuthPage })));
 const BoardClaimPage = lazy(() => import("./pages/BoardClaim").then((module) => ({ default: module.BoardClaimPage })));
@@ -293,6 +299,9 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       ))}
       <Route path="agents/new" element={<NewAgent />} />
       <Route path="agents/:agentId" element={<AgentDetail />} />
+      {COST_BUDGET_UI_HIDDEN && ["cost", "costs", "budget", "budgets"].map(tab => (
+        <Route key={tab} path={`agents/:agentId/${tab}`} element={<HiddenMoneyEntityRedirect entity="agents" />} />
+      ))}
       <Route path="agents/:agentId/:tab" element={<AgentDetail />} />
       <Route path="agents/:agentId/runs/:runId" element={<AgentDetail />} />
       <Route path="projects" element={<Projects />} />
@@ -305,7 +314,7 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       </Route>
       <Route path="projects/:projectId/workspaces" element={<ProjectDetail />} />
       <Route path="projects/:projectId/configuration" element={<ProjectDetail />} />
-      <Route path="projects/:projectId/budget" element={<ProjectDetail />} />
+      <Route path="projects/:projectId/budget" element={COST_BUDGET_UI_HIDDEN ? <HiddenMoneyEntityRedirect entity="projects" /> : <ProjectDetail />} />
       <Route element={<IsolatedWorkspacesRouteGate />}>
         <Route path="workspaces" element={<Workspaces />} />
       </Route>
@@ -378,24 +387,27 @@ function boardRoutes(streamlinedUiEnabled: boolean, combinedInboxTasksEnabled: b
       <Route path="activity" element={streamlinedUiEnabled ? <CompanyActivity /> : <ProductionSurface><ProductionCompanyActivity /></ProductionSurface>} />
       <Route path="activity/commentary" element={<AuditHub section="commentary" />} />
       <Route path="activity/runs" element={<AuditHub section="runs" />} />
-      <Route path="activity/costs" element={<AuditHub section="costs" />} />
-      <Route path="activity/budgets" element={<AuditHub section="budgets" />} />
+      <Route path="activity/costs" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditHub section="costs" />} />
+      <Route path="activity/budgets" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditHub section="budgets" />} />
       <Route path="activity/timeline" element={<AuditHub section="timeline" />} />
       {streamlinedUiEnabled ? (
         <>
           <Route path="audit" element={<AuditCompatibilityRedirect to="/activity" forceAgentMode />} />
           <Route path="audit/activity" element={<AuditCompatibilityRedirect to="/activity" />} />
           <Route path="audit/runs" element={<AuditCompatibilityRedirect to="/activity/runs" />} />
-          <Route path="audit/costs" element={<AuditCompatibilityRedirect to="/activity/costs" />} />
-          <Route path="audit/budgets" element={<AuditCompatibilityRedirect to="/activity/budgets" />} />
+          <Route path="audit/costs" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditCompatibilityRedirect to="/activity/costs" />} />
+          <Route path="audit/budgets" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditCompatibilityRedirect to="/activity/budgets" />} />
           <Route path="audit/timeline" element={<AuditCompatibilityRedirect to="/activity/timeline" />} />
           <Route path="runs" element={<AuditCompatibilityRedirect to="/activity/runs" />} />
-          <Route path="costs" element={<AuditCompatibilityRedirect to="/activity/costs" />} />
-          <Route path="budgets" element={<AuditCompatibilityRedirect to="/activity/budgets" />} />
+          <Route path="costs" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditCompatibilityRedirect to="/activity/costs" />} />
+          <Route path="budgets" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <AuditCompatibilityRedirect to="/activity/budgets" />} />
         </>
       ) : (
         <>
-          <Route path="costs" element={<Costs />} />
+          <Route path="costs" element={COST_BUDGET_UI_HIDDEN ? <Navigate to="/dashboard" replace /> : <Costs />} />
+          {COST_BUDGET_UI_HIDDEN && ["budgets", "audit/costs", "audit/budgets"].map(path => (
+            <Route key={path} path={path} element={<Navigate to="/dashboard" replace />} />
+          ))}
           <Route path="audit" element={<Navigate to="/activity?mode=agents" replace />} />
         </>
       )}

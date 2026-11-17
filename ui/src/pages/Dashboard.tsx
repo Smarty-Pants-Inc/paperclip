@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { companyProjectsQuery } from "@/lib/company-projects-query";
 import { useAccountIdentity } from "@/api/companies-query";
 import { AgentIdentity } from "../components/AgentIdentity";
@@ -434,7 +435,7 @@ export function Dashboard() {
 
       {data && (
         <>
-          {data.budgets.activeIncidents > 0 ? (
+          {!COST_BUDGET_UI_HIDDEN && data.budgets.activeIncidents > 0 ? (
             <div className="flex items-start justify-between gap-3 rounded-xl border border-red-500/20 bg-(image:--gradient-extract-1) px-4 py-3">
               <div className="flex items-start gap-2.5">
                 <PauseCircle className="mt-0.5 h-4 w-4 shrink-0 text-red-700 dark:text-red-300" />
@@ -481,7 +482,7 @@ export function Dashboard() {
                 </span>
               }
             />
-            <MetricCard
+            {!COST_BUDGET_UI_HIDDEN && <MetricCard
               appearance={designSandbox ? "card" : "plain"}
               icon={DollarSign}
               value={formatCents(data.costs.monthSpendCents)}
@@ -494,16 +495,16 @@ export function Dashboard() {
                     : "Unlimited budget"}
                 </span>
               }
-            />
+            />}
             <MetricCard
               appearance={designSandbox ? "card" : "plain"}
               icon={ShieldCheck}
-              value={data.pendingApprovals + data.budgets.pendingApprovals}
+              value={data.pendingApprovals + (COST_BUDGET_UI_HIDDEN ? 0 : data.budgets.pendingApprovals)}
               label="Pending Approvals"
               to="/approvals"
               description={
                 <span>
-                  {data.budgets.pendingApprovals > 0
+                  {!COST_BUDGET_UI_HIDDEN && data.budgets.pendingApprovals > 0
                     ? `${data.budgets.pendingApprovals} budget overrides awaiting board review`
                     : "Awaiting board review"}
                 </span>

@@ -1,8 +1,9 @@
 import { describeError } from "../api/errors";
 import { AgentIdentity } from "@/components/AgentIdentity";
 import { useEffect, useMemo, useState } from "react";
-import { Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
+import { Navigate, Link, useNavigate, useParams, useSearchParams } from "@/lib/router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { approvalsApi } from "../api/approvals";
 import { agentsApi } from "../api/agents";
 import { useCompany } from "../context/CompanyContext";
@@ -146,6 +147,7 @@ export function ApprovalDetail() {
   if (isLoading) return <PageSkeleton variant="detail" />;
   if (!approval) return <p className="text-sm text-muted-foreground">Approval not found.</p>;
 
+  if (COST_BUDGET_UI_HIDDEN && approval.type === "budget_override_required") return <Navigate to="/dashboard" replace />;
   const payload = approval.payload as Record<string, unknown>;
   const linkedAgentId = typeof payload.agentId === "string" ? payload.agentId : null;
   const isActionable = approval.status === "pending" || approval.status === "revision_requested";

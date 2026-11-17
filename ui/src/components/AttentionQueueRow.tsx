@@ -1,3 +1,4 @@
+import { isHiddenMoneyAttentionItem } from "../lib/cost-visibility";
 import { memo, useState, type KeyboardEvent, type ReactNode } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
@@ -127,6 +128,7 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
   selected = false,
   evidence,
 }: AttentionQueueRowProps) {
+  if (isHiddenMoneyAttentionItem(item)) return null;
   const meta = sourceMeta(item.sourceKind);
   // Colour + glyph are borrowed wholesale from the task status system, so a
   // blocking decision reads exactly like a blocked task (DESIGN.md principle 5).

@@ -10,6 +10,7 @@ import { issuesApi } from "../api/issues";
 import { authApi } from "../api/auth";
 import { agentsApi } from "../api/agents";
 import { instanceSettingsApi } from "../api/instanceSettings";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import {
   CommandDialog,
@@ -378,10 +379,10 @@ export function CommandPalette() {
             <Bot className="mr-2 h-4 w-4" />
             Agents
           </CommandItem>
-          <CommandItem onSelect={() => go("/costs")}>
+          {!COST_BUDGET_UI_HIDDEN && <CommandItem onSelect={() => go("/costs")}>
             <DollarSign className="mr-2 h-4 w-4" />
             Costs
-          </CommandItem>
+          </CommandItem>}
           <CommandItem onSelect={() => go("/activity")}>
             <History className="mr-2 h-4 w-4" />
             Activity

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { estimateStatusCardCost } from "./format";
 
 export interface StatusCardSettingsValue {
@@ -276,7 +277,7 @@ export function StatusCardSettingsForm({
       ) : null}
 
       <div className="flex items-center gap-2 text-sm">
-        <span className="font-semibold">Estimated cost</span>
+        <span className="font-semibold">{COST_BUDGET_UI_HIDDEN ? "Estimated tokens" : "Estimated cost"}</span>
         <span className="text-muted-foreground">=</span>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -287,7 +288,7 @@ export function StatusCardSettingsForm({
           <TooltipContent className="max-w-(--sz-18rem) text-left">
             <p>{costEstimate.primary}</p>
             {costEstimate.note ? <p className="mt-1 opacity-80">{costEstimate.note}</p> : null}
-            <p className="mt-1 opacity-80">Rough estimate from typical update sizes; actual cost is tracked per update.</p>
+            <p className="mt-1 opacity-80">{COST_BUDGET_UI_HIDDEN ? "Rough estimate from typical update sizes; actual tokens are tracked per update." : "Rough estimate from typical update sizes; actual cost is tracked per update."}</p>
           </TooltipContent>
         </Tooltip>
       </div>

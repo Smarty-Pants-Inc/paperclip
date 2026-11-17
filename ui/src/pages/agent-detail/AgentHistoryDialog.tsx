@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { useState } from "react";
 import { RotateCcw } from "lucide-react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -38,8 +39,9 @@ const KEY_LABELS: Record<string, string> = {
 
 export function revisionSummary(revision: Pick<AgentConfigRevision, "changedKeys" | "rolledBackFromRevisionId">): string {
   if (revision.rolledBackFromRevisionId) return "Restored an earlier version";
-  if (revision.changedKeys.length === 0) return "Saved with no tracked changes";
-  const labels = revision.changedKeys.map((key) => KEY_LABELS[key] ?? key);
+  const visibleKeys = revision.changedKeys.filter(key => !COST_BUDGET_UI_HIDDEN || key !== "budgetMonthlyCents");
+  if (visibleKeys.length === 0) return revision.changedKeys.length ? "Saved configuration" : "Saved with no tracked changes";
+  const labels = visibleKeys.map((key) => KEY_LABELS[key] ?? key);
   const sentence = labels.length === 1 ? labels[0] : `${labels.slice(0, -1).join(", ")} and ${labels[labels.length - 1]}`;
   return `Changed ${sentence}`;
 }
@@ -129,7 +131,7 @@ export function AgentHistoryDialog({
                   <span className="block text-sm text-foreground">{revisionSummary(revision)}</span>
                   {revision.changedKeys.length > 0 ? (
                     <span className="mt-1 flex flex-wrap gap-1">
-                      {revision.changedKeys.map((key) => (
+                      {revision.changedKeys.filter(key => !COST_BUDGET_UI_HIDDEN || key !== "budgetMonthlyCents").map((key) => (
                         <AgentChip key={key} mono>
                           {key}
                         </AgentChip>

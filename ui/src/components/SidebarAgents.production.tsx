@@ -46,6 +46,7 @@ import {
   type AgentSidebarSortMode,
   writeAgentSortMode,
 } from "../lib/agent-order";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { BudgetSidebarMarker } from "./BudgetSidebarMarker";
 import { SidebarNavItem } from "./SidebarNavItem.production";
 import { SidebarSection, type SidebarSectionRadioChoice } from "./SidebarSection";
@@ -152,7 +153,7 @@ function SidebarAgentItem({
   const pauseResumeDisabledLabel = disabled
     ? "Updating..."
     : isBudgetPaused
-      ? "Budget paused"
+      ? (COST_BUDGET_UI_HIDDEN ? "Paused" : "Budget paused")
       : isPaused && hasInvalidOrgChain
         ? "Invalid org chain"
       : pauseResumeLabel;
@@ -273,7 +274,7 @@ function SidebarAgentItem({
               onPauseResume(agent, isPaused ? "resume" : "pause");
             }}
             disabled={pauseResumeDisabled}
-            title={isBudgetPaused ? "Agent was paused by budget limits" : undefined}
+            title={isBudgetPaused && !COST_BUDGET_UI_HIDDEN ? "Agent was paused by budget limits" : undefined}
           >
             {isPaused ? <PlayCircle className="size-4" /> : <PauseCircle className="size-4" />}
             <span>{pauseResumeDisabledLabel}</span>

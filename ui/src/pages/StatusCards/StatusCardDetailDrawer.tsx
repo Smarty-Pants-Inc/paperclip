@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -391,7 +392,7 @@ export function StatusCardDetailDrawer({
                   <div className="text-xs text-muted-foreground">
                     Today: {todayRollup.updateCount}{" "}
                     {todayRollup.updateCount === 1 ? "update" : "updates"} ·{" "}
-                    {formatTokens(todayRollup.totalTokens)} · {formatCents(todayRollup.totalCostCents)}
+                    {formatTokens(todayRollup.totalTokens)}{!COST_BUDGET_UI_HIDDEN && <> · {formatCents(todayRollup.totalCostCents)}</>}
                     {card.refreshPolicy.dailyTokenCap ? ` · daily cap ${formatTokens(card.refreshPolicy.dailyTokenCap)}` : ""}
                   </div>
                   <div className="divide-y divide-border">
@@ -409,7 +410,7 @@ export function StatusCardDetailDrawer({
                           </span>
                         </div>
                         <p className="mt-1 text-xs text-muted-foreground">
-                          {formatTokenSplit(update.inputTokens, update.outputTokens)} · {formatCents(update.costCents)}
+                          {formatTokenSplit(update.inputTokens, update.outputTokens)}{!COST_BUDGET_UI_HIDDEN && <> · {formatCents(update.costCents)}</>}
                           {update.model ? ` · ${update.model}` : ""}
                           {update.changes.length > 0 ? ` · ${update.changes.length} changes` : ""}
                         </p>

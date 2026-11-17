@@ -1,3 +1,4 @@
+import { isHiddenMoneyAttentionItem } from "./cost-visibility";
 import type { AttentionItem } from "@paperclipai/shared";
 import { attentionDetailLine, sourceMeta } from "./attention";
 
@@ -25,6 +26,7 @@ export function isAttentionObligationEvidence(item: AttentionItem): boolean {
  * stays a card of its own, so nothing of the obligation disappears.
  */
 export function foldAttentionObligations(items: readonly AttentionItem[]): FoldedAttentionObligations {
+  items = items.filter(item => !isHiddenMoneyAttentionItem(item));
   const ids = new Set(items.map((item) => item.id));
   const cards: AttentionItem[] = [];
   const evidenceByLeadId = new Map<string, AttentionItem[]>();
