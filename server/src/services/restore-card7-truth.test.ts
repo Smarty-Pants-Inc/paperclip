@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, ne } from "drizzle-orm";
 import { afterAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns,
+import { agentWakeupRequests, agents, companies, createDb, environmentLeases, environments, executionWorkspaces, heartbeatRuns,
   issueRecoveryActions, issues } from "@paperclipai/db";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "../__tests__/helpers/recovery-postgres.js";
 import { preserveRemoteWorkspacePreparationFailure } from "./native-runtime/native-workspace-finalization-state.js";
@@ -13,6 +13,8 @@ import { STOP_PROOF_MAX_REARMS, STOP_PROOF_RECOVERY_SCHEMA } from "./system-reco
 import { activityService } from "./activity.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { requestTaskRetry } from "./task-retry.js";
+import { retryRefusedBeforeAdmission } from "./task-retry-eligibility.js";
+import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
 
 // Literal on purpose: the words the person reads while files are only owed.
 const RECOVERING_TEXT = "Recovering your saved work; your message is kept and runs when it's back.";
@@ -190,5 +192,51 @@ const OWED_RECHECK_BOUND_MS = 60_000;
       stopProofRecovery: { schema: STOP_PROOF_RECOVERY_SCHEMA, rearms: STOP_PROOF_MAX_REARMS } } })
       .where(and(eq(issueRecoveryActions.id, f.actionId)));
     expect(chatWaitWords(await chatRunResult(f))).toBeNull();
+  }, 120_000);
+
+  // fam-retry STEP 2: card7's exhausted stop wait and the fold's
+  // retryRefusedBeforeAdmission are ONE decision. The API (a new click and a
+  // repeat of an unrun click), the chat's pre-admission check and the card all
+  // read the same authority and say card7's words.
+  for (const code of ["copyback_stop_unconfirmed", "agent_stop_unconfirmed"] as const) {
+    it(`ONE DECISION: exhausted ${code} -> API, repeat, chat check and card refuse with card7's words`, async () => {
+      const f = await owedHold();
+      const repeatKey = randomUUID();
+      // An earlier click that never got a run (its idempotent repeat comes later).
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        triggerDetail: "manual", reason: "task_retry", status: "deferred_issue_execution",
+        idempotencyKey: `task-retry:${repeatKey}`, requestedByActorType: "user", requestedByActorId: "user-1",
+        payload: { issueId: f.issueId, taskRetry: { schema: "paperclip.task-retry.v1", generationId: randomUUID(),
+          sourceRunId: f.runId, actorId: "user-1", actorSource: "local_implicit", strategy: "evaluate" } } });
+      await exhaustOnStop(f, code);
+      const words = WAIT_TEXT[code];
+      const input = { db, companyId: f.companyId, issueId: f.issueId, actorId: "user-1",
+        actorSource: "local_implicit" as const, observedRunId: f.runId };
+      const refused = { reason: "workspace_restore_stop_wait", message: words };
+      expect(await requestTaskRetry({ ...input, idempotencyKey: randomUUID() }))
+        .toMatchObject({ accepted: false, waitingOnStop: true, refused });
+      expect(await requestTaskRetry({ ...input, idempotencyKey: repeatKey }))
+        .toMatchObject({ accepted: false, waitingOnStop: true, refused });
+      // The chat Retry's pre-admission check is the same function.
+      expect(await retryRefusedBeforeAdmission(db, { companyId: f.companyId, issueId: f.issueId, sourceRunId: f.runId }))
+        .toMatchObject({ canRetry: false, userAction: "wait", reason: "workspace_restore_stop_wait", cardText: words });
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      const card = await taskInterruptionPresentation(db, issue!);
+      expect(card?.canRetry).toBe(false);
+      expect(card?.retryWait?.message).toBe(words);
+      // No wake was queued by either click.
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(wakes).toHaveLength(1);
+    }, 120_000);
+  }
+
+  it("ONE DECISION NEGATIVE: agent stop with every re-arm spent is not the stop-wait refusal", async () => {
+    const f = await owedHold();
+    await exhaustOnStop(f, "agent_stop_unconfirmed");
+    await db.update(issueRecoveryActions).set({ evidence: { ...(await holds(f.companyId))[0].evidence,
+      stopProofRecovery: { schema: STOP_PROOF_RECOVERY_SCHEMA, rearms: STOP_PROOF_MAX_REARMS } } })
+      .where(and(eq(issueRecoveryActions.id, f.actionId)));
+    const authority = await retryRefusedBeforeAdmission(db, { companyId: f.companyId, issueId: f.issueId, sourceRunId: f.runId });
+    expect(authority?.reason).not.toBe("workspace_restore_stop_wait");
   }, 120_000);
 });
