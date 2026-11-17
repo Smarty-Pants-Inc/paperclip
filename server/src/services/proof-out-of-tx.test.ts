@@ -56,7 +56,7 @@ const support = await getEmbeddedPostgresTestSupport();
         intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } } });
     await db.insert(nativeRunFinalizations).values({ runId: sourceRunId, companyId, issueId, phase: "terminal_failure", failureCode: "native_retry_cancelled" });
     // The warm policy's handoff: lease retained, cleanup success, NO stop receipt (S10nofile rows, lease afdb2aa2).
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: variant === "ephemeral" ? "active" : "retained", leasePolicy: variant === "ephemeral" ? "ephemeral" : "reuse_by_environment",
       cleanupStatus: "success", metadata: variant === "stop_in_flight" ? { pendingCleanupInFlight: true, pendingCleanupReason: "warm_window_expired" } : {} });
     const comments = ["A", "B", "C"].map((body, index) => ({ id: randomUUID(), companyId, issueId, authorType: "user" as const,

@@ -65,7 +65,7 @@ const support = await getEmbeddedPostgresTestSupport();
           intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } } });
     await db.insert(nativeRunFinalizations).values({ runId: sourceRunId, companyId, issueId, phase: "terminal_failure", failureCode: "native_retry_cancelled" });
     const leaseId = randomUUID(), providerLeaseId = "bx_warm";
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, heartbeatRunId: sourceRunId, provider: "daytona", providerLeaseId,
       status: "retained", leasePolicy: "reuse_by_environment", cleanupStatus: "success", metadata: {} });
     const base = stoppedAt.getTime() - 3_000;
     const comments = ["M2", "M3", "M4"].map((body, index) => ({ id: randomUUID(), companyId, issueId, authorType: "user" as const,
