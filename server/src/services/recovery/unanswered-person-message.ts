@@ -718,8 +718,19 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const automaticRecoveryDeadline = async (): Promise<number | null> => {
     if (recoveryDeadline !== undefined) return recoveryDeadline;
     recoveryDeadline = null;
-    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded" && !boardHold
+    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded"
       && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
+      // The shared predicate scopes automatic recovery to THIS run. An older
+      // predecessor's board stop must not veto it, but a real stop on this run
+      // still wins, even when another action has pending restored delivery.
+      const [runBoardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+        eq(issueRecoveryActions.ownerType, "board"), inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->'freshContinuation'->>'sourceRunId' = ${run.id}`,
+          sql`${run.id} = any(string_to_array(${issueRecoveryActions.fingerprint}, ':'))`))).limit(1);
+      if (runBoardHold) return recoveryDeadline;
       const [terminal] = await q.select({ at: nativeRunFinalizations.updatedAt }).from(nativeRunFinalizations).where(and(
         eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
         eq(nativeRunFinalizations.phase, "terminal_failure"), isNotNull(nativeRunFinalizations.failureCode)));
