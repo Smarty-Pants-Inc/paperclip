@@ -4,7 +4,7 @@ import type { CreateConfigValues, TranscriptEntry as SharedTranscriptEntry } fro
 // Keep native run-event spill evidence on the UI's tool-result projection.
 export type TranscriptEntry =
   | Exclude<SharedTranscriptEntry, { kind: "tool_result" }>
-  | (Extract<SharedTranscriptEntry, { kind: "tool_result" }> & { outputTruncated?: boolean });
+  | (Extract<SharedTranscriptEntry, { kind: "tool_result" }> & { outputTruncated?: boolean; fullOutputBytes?: number });
 
 // Re-export shared types so local consumers don't need to change imports
 export type { StdoutLineParser, CreateConfigValues } from "@paperclipai/adapter-utils";

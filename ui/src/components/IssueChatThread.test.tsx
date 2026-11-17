@@ -4270,11 +4270,11 @@ describe("IssueChatThread", () => {
       expect(container.textContent).not.toContain(path);
       act(() => tool!.click());
       expect(container.textContent).toContain("Saved output preview");
-      expect(container.textContent).toContain("The full output is kept on the agent's machine while it runs.");
+      expect(container.textContent).toContain("The full output stays on the agent's machine only while it runs.");
       expect(container.textContent).not.toContain("[Full output:");
       expect(container.textContent).not.toContain(path);
       const link = [...container.querySelectorAll("a")].find(anchor => anchor.textContent === "Open the run log");
-      expect(link?.getAttribute("href")).toContain(`/runs/${run.runId}`);
+      expect(link).toBeUndefined();
       act(() => root.unmount());
     },
   );
@@ -4307,7 +4307,7 @@ describe("IssueChatThread", () => {
       expect(tool).toBeDefined();
       act(() => tool!.click());
       expect(container.textContent).toContain(output);
-      expect(container.textContent).not.toMatch(/full output is kept|runner saved only part|Open the run log/);
+      expect(container.textContent).not.toMatch(/full output stays|runner saved only part|Open the run log/);
       act(() => root.unmount());
     },
   );

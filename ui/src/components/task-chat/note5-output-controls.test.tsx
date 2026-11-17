@@ -31,30 +31,40 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
   beforeEach(() => { container = document.createElement("div"); document.body.append(container); root = createRoot(container); });
   afterEach(() => { act(() => root.unmount()); container.remove(); });
   const render = (child: React.ReactNode) => act(() => root.render(<MemoryRouter><ThemeProvider>{child}</ThemeProvider></MemoryRouter>));
-  it("names the kept full text without the forbidden labels and links to the saved run", () => {
+  it("names the kept full text without forbidden labels or a misleading saved-run link", () => {
     render(<TaskChatProtocolActivityDetails item={base} />);
     expect(container.textContent).not.toMatch(/truncated|saved only part|\bcut\b/i);
-    expect(container.textContent).toContain("The full output is kept on the agent's machine while it runs.");
-    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.textContent).toContain("run log");
-    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.closest("p")?.textContent).toBe("The full output is kept on the agent's machine while it runs. Open the run log.");
+    expect(container.textContent).toContain("Showing part of this output. The full output stays on the agent's machine only while it runs.");
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).toBeNull();
     expect(container.querySelector("pre")?.textContent).toBe(text);
   });
+  it("shows the UTF-8 excerpt size of a 102400-byte spill without a link or truncated label", () => {
+    const fullOutput = "é".repeat(51200);
+    expect(new TextEncoder().encode(fullOutput)).toHaveLength(102400);
+    const output = fullOutput.slice(0, 20480) + "\n" + fullOutput.slice(-4096) + "\n";
+    const marker = "[Full output: /tmp/x.json (102400 bytes; the excerpt above is its first 40 KiB and last 8 KiB; use read(/tmp/x.json, offset, limit) or rg on that path to see more)]";
+    render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: output + marker }} />);
+    expect(container.querySelector("pre")?.textContent).toBe(output);
+    expect(container.textContent).toContain("Showing part of this output (48 KB of 100 KB). The full output stays on the agent's machine only while it runs.");
+    expect(container.querySelector("a")).toBeNull();
+    expect(container.textContent).not.toMatch(/truncated|\[Full output:|\/tmp\/x\.json/i);
+  });
   // RFL's four qualified production-component regressions (round 2).
-  it("RFL: canonical spilled tool shows one kept line, a run link and no private path", () => {
+  it("RFL: canonical spilled tool shows one kept line, no run link and no private path", () => {
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: "FIRST\n[Full output: /tmp/private-spill.log (102400 bytes; sha256: abc123)]\nLAST" }} />);
-    expect(container.textContent?.match(/The full output is kept on the agent's machine while it runs\./g)).toHaveLength(1);
+    expect(container.textContent?.match(/The full output stays on the agent's machine only while it runs\./g)).toHaveLength(1);
     expect(container.textContent).not.toContain("/tmp/private-spill.log");
-    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).toBeNull();
   });
   it("RFL: unflagged ordinary output shows no kept line", () => {
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: "Complete output" }} />);
-    expect(container.textContent).not.toContain("The full output is kept");
+    expect(container.textContent).not.toContain("The full output stays");
     expect(container.querySelector("pre")?.textContent).toBe("Complete output");
   });
   it("RFL: unflagged documentation mention must not invent a producer flag", () => {
     const output = "The documentation describes the [Full output: marker syntax.";
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output }} />);
-    expect(container.textContent).not.toContain("The full output is kept");
+    expect(container.textContent).not.toContain("The full output stays");
     expect(container.querySelector("pre")?.textContent).toBe(output);
   });
   it("RFL: an indented spill box-path marker must not reach the person", () => {
@@ -73,14 +83,14 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     const after = "LAST\t ";
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: before + marker + after }} />);
     expect(container.querySelector("pre")?.textContent).toBe(before + suffix + after);
-    expect(container.textContent?.match(/The full output is kept on the agent's machine while it runs\./g)).toHaveLength(1);
+    expect(container.textContent?.match(/The full output stays on the agent's machine only while it runs\./g)).toHaveLength(1);
     expect(container.innerHTML).not.toContain("/tmp/private-spill.log");
   });
   it("hides only the spill marker line in compact provider details", () => {
     const output = "  FIRST_BYTE\n\nLAST_BYTE\t \n";
     render(<TaskChatProtocolActivityDetails item={{ ...base, outputTruncated: false, output: output + "[Full output: /tmp/compact-spill.log (102400 bytes; sha256: abc123)]\nAFTER_MARKER" }} />);
     expect(container.querySelector("pre")?.textContent).toBe(output + "AFTER_MARKER");
-    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
+    expect(container.textContent?.split("The full output stays on the agent's machine only while it runs.")).toHaveLength(2);
     expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/compact-spill|saved only part|truncated/i);
   });
   it("hides the spill marker in legacy provider output and summary without needing a true flag", () => {
@@ -89,7 +99,8 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     render(<RunTranscriptView entries={[{ kind: "provider_activity", ts: "2026-11-17T00:00:00Z", family: "tool_execution", eventType: "tool.started", status: "running", title: "Tool", summary: spilled, payload: { output: spilled, outputTruncated: false } }]} />);
     expect(container.querySelector("pre")?.textContent).toBe(output);
     expect(container.querySelector("p.whitespace-pre-wrap")?.textContent).toBe(output);
-    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
+    expect(container.textContent).toContain("Showing part of this output (29 B of 100 KB).");
+    expect(container.textContent?.split("The full output stays on the agent's machine only while it runs.")).toHaveLength(2);
     expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/legacy-spill/);
   });
   it.each([
@@ -118,7 +129,8 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
       if (view === "nice") act(() => container.querySelector<HTMLButtonElement>('button[aria-label^="Expand"]')!.click());
     }
     expect([...container.querySelectorAll("pre")].some(node => node.textContent === output)).toBe(true);
-    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
+    expect(container.textContent?.split("The full output stays on the agent's machine only while it runs.")).toHaveLength(2);
+    expect(container.textContent).toContain(outputTruncated ? "Showing part of this output." : "Showing part of this output (50 B of 98 KB).");
     expect(container.innerHTML).not.toMatch(/\[Full output:|\/tmp\/native-spill/);
   });
   it.each(["bubble", "nice", "raw"] as const)("renders the final producer text as is, never fullText metadata (%s)", (view) => {
@@ -175,11 +187,11 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     expect(container.querySelector("pre")?.textContent).toBe(text);
     expect(container.querySelector('[data-testid="task-chat-tool-target-detail"]')?.textContent).toBe(text);
   });
-  it("preserves legacy activity output and full expanded summary with a saved-run link", () => {
+  it("preserves legacy activity output and full expanded summary without a misleading saved-run link", () => {
     render(<RunTranscriptView runLogHref="/agents/agent-1/runs/run-1" entries={[{ kind: "provider_activity", ts: "2026-11-17T00:00:00Z", family: "tool_execution", eventType: "tool.started", status: "running", title: "Tool", summary: text, payload: { output: text, outputTruncated: true } }]} />);
     expect(container.querySelector("pre")?.textContent).toBe(text);
     expect(container.querySelector("p.whitespace-pre-wrap")?.textContent).toBe(text);
-    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).toBeNull();
     expect(container.textContent).not.toMatch(/truncated/i);
   });
   it("judge: exact 40000-character final answer reaches actual Markdown DOM", () => {
@@ -217,7 +229,7 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     if (item.kind !== "protocol" || item.surface !== "provider_activity") throw new Error("expected activity");
     render(<TaskChatProtocolActivityDetails item={item} />);
     expect(container.querySelector("pre")?.textContent).toBe(output);
-    expect(container.textContent).not.toMatch(/runner saved only part|full output is kept/);
+    expect(container.textContent).not.toMatch(/runner saved only part|full output stays/);
   });
   it("judge: native diff fallback renders the saved-run reference as an anchor", () => {
     const event = { id: 1, companyId: "c", agentId: "a", runId: "r", seq: 1, stream: null, level: null, color: null, message: null, eventType: "tool.execution.completed", createdAt: new Date("2026-11-17T00:00:00Z"), payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, runId: "r", eventType: "tool.execution.completed", payload: { schema: "paperclip.tool.execution.v1", executionId: "edit", transport: "builtin", operation: "edit", name: "Edit", status: "completed", output: "", fileChanges: [{ path: "a.txt", operation: "modify", additions: 1, deletions: 0, diff: "+hello", diffTruncated: true }] } } } } as HeartbeatRunEvent;
@@ -244,7 +256,7 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
   it("independent: a flagged producer trace notice must contain a saved-run anchor", () => {
     const trace = { status: "truncated", expiresAt: "2099-01-01T00:00:00Z", frameCount: 1, byteCount: 10 } as any;
     render(<ProviderTraceStatusBadge {...{ trace, runLogHref: "/agents/agent-1/runs/run-1" }} />);
-    expect(container.textContent).toMatch(/runner saved only part|full output is kept/);
+    expect(container.textContent).toMatch(/runner saved only part|full output stays/);
     expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')).not.toBeNull();
   });
   it.each([["tint", TintSheetTable], ["hybrid", HybridSheetTable]] as const)("independent: lab %s sheet should not append a custom cut label instead of a real paging control", (_name, SheetTable) => {

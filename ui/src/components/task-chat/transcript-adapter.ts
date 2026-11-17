@@ -928,6 +928,7 @@ export function transcriptToTaskChatItems(
             }
             const displayedOutput = savedOutputForDisplay(entry.content, entry.outputTruncated);
             if (displayedOutput.outputTruncated) existing.outputTruncated = true;
+            if (displayedOutput.fullOutputBytes !== undefined) existing.fullOutputBytes = displayedOutput.fullOutputBytes;
             const detail = formatToolResultDetail(displayedOutput.output);
             if (detail) {
               existing.detail =

@@ -245,6 +245,7 @@ export interface TaskChatToolItem {
   detail?: string;
   /** A producer flag or full-output marker, not a browser display limit. */
   outputTruncated?: boolean;
+  fullOutputBytes?: number;
   diff?: TaskChatDiff;
   /** Resolved permission decision badge, when one applied. */
   decision?: "allowed" | "rejected";
@@ -440,6 +441,7 @@ export interface TaskChatProviderActivityItem {
   children: TaskChatProtocolChild[];
   output?: string;
   outputTruncated?: boolean;
+  fullOutputBytes?: number;
   /** Index of the latest provider event coalesced into this activity. */
   transcriptIndex?: number;
   /** Provider activity identity, e.g. the delegation id for a subagent. */

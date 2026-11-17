@@ -1702,7 +1702,7 @@ function IssueChatToolPart({
       : result === undefined
         ? ""
         : formatToolPayload(result);
-  const { output: resultText = "", outputTruncated } = savedOutputForDisplay(rawResultText);
+  const { output: resultText = "", outputTruncated, fullOutputBytes } = savedOutputForDisplay(rawResultText);
   const inputDetails = describeToolInput(toolName, parsedArgs);
   const displayName = displayToolName(toolName, parsedArgs);
   const isCommand = isCommandTool(toolName, parsedArgs);
@@ -1793,7 +1793,7 @@ function IssueChatToolPart({
                 </CopyablePreBlock>
               </div>
             ) : null}
-            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept output={resultText} fullOutputBytes={fullOutputBytes} /> : null}
           </div>
         ) : null}
       </div>
@@ -1834,7 +1834,7 @@ function IssueChatProviderActivity({
   const sources = Array.isArray(payload.sources)
     ? payload.sources
     : [];
-  const { output = "", outputTruncated } = savedOutputForDisplay(
+  const { output = "", outputTruncated, fullOutputBytes } = savedOutputForDisplay(
     typeof payload.output === "string" ? payload.output : "", payload.outputTruncated === true,
   );
   const effectiveModel =
@@ -1885,7 +1885,7 @@ function IssueChatProviderActivity({
         {open && hasDetails ? (
           <div className="mt-1 space-y-2 rounded-md border border-border/50 bg-accent/15 p-2 text-xs">
             {summary ? <p className="whitespace-pre-wrap break-words">{summary}</p> : null}
-            {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={runLogHref} /> : null}
+            {outputTruncated ? <SavedOutputNotice fullTextKept output={output} fullOutputBytes={fullOutputBytes} /> : null}
             {steps.map((entry, index) => {
               const step =
                 typeof entry === "object" && entry !== null

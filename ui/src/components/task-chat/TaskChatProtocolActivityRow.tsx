@@ -128,7 +128,7 @@ function ResearchDetails({ item }: { item: TaskChatProviderActivityItem }) {
       ) : null}
       <DetailList details={additionalDetails} />
       {item.output ? <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre> : null}
-      {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
+      {item.outputTruncated ? <SavedOutputNotice fullTextKept output={item.output} fullOutputBytes={item.fullOutputBytes} /> : null}
     </div>
   );
 }
@@ -180,7 +180,7 @@ function ProviderDetails({ item, neutral = false }: { item: TaskChatProviderActi
       {item.output ? (
         <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre>
       ) : null}
-      {item.outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
+      {item.outputTruncated ? <SavedOutputNotice fullTextKept output={item.output} fullOutputBytes={item.fullOutputBytes} /> : null}
     </div>
   );
 }
@@ -294,7 +294,8 @@ export function hasTaskChatProtocolActivityDetails(item: TaskChatProtocolItem): 
 
 export function TaskChatProtocolActivityDetails({ item, neutral = false }: { item: TaskChatProtocolItem; neutral?: boolean }) {
   if (item.surface === "provider_activity") {
-    item = { ...item, ...savedOutputForDisplay(item.output, item.outputTruncated), summary: savedOutputForDisplay(item.summary).output };
+    const displayed = savedOutputForDisplay(item.output, item.outputTruncated);
+    item = { ...item, ...displayed, fullOutputBytes: displayed.fullOutputBytes ?? item.fullOutputBytes, summary: savedOutputForDisplay(item.summary).output };
   }
   const detail = detailContent(item, neutral);
   if (item.surface === "resource") {

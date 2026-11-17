@@ -56,7 +56,7 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
   const RowIcon = toolTaxonomy(item.rawName ?? item.name).icon;
   const providerIcons = useProviderToolIcons(item.rawName ?? item.name);
   const [showDetail, setShowDetail] = useTaskChatExpansion(item.id, false);
-  const { output: detail, outputTruncated } = savedOutputForDisplay(item.detail, item.outputTruncated);
+  const { output: detail, outputTruncated, fullOutputBytes = item.fullOutputBytes } = savedOutputForDisplay(item.detail, item.outputTruncated);
   const expandable = Boolean(item.target || detail || item.diff || outputTruncated);
 
   return (
@@ -146,7 +146,7 @@ export function TaskChatToolCard({ item }: { item: TaskChatToolItem }) {
           {detail}
         </pre>
       ) : null}
-      {outputTruncated && showDetail ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
+      {outputTruncated && showDetail ? <SavedOutputNotice fullTextKept output={detail} fullOutputBytes={fullOutputBytes} /> : null}
       {item.diff && showDetail ? (
         item.diff.lines && item.diff.lines.length > 0 ? (
           <div className="ml-1.5 mt-1 min-w-0 max-w-full" data-testid="task-chat-tool-diff">

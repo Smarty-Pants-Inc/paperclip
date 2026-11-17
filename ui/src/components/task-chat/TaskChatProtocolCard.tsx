@@ -298,7 +298,8 @@ function ProviderActivityCard({
 }: {
   item: TaskChatProviderActivityItem;
 }) {
-  const item = { ...rawItem, ...savedOutputForDisplay(rawItem.output, rawItem.outputTruncated), summary: savedOutputForDisplay(rawItem.summary).output };
+  const displayed = savedOutputForDisplay(rawItem.output, rawItem.outputTruncated);
+  const item = { ...rawItem, ...displayed, fullOutputBytes: displayed.fullOutputBytes ?? rawItem.fullOutputBytes, summary: savedOutputForDisplay(rawItem.summary).output };
   if (item.family === "plan_proposal") return <PlanProposalCard item={item} />;
   const Icon = FAMILY_ICON[item.family];
   const hasDetails =
@@ -408,7 +409,7 @@ function ProviderActivityCard({
             </pre>
           ) : null}
           {item.outputTruncated ? (
-            <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
+            <SavedOutputNotice fullTextKept output={item.output} fullOutputBytes={item.fullOutputBytes} />
           ) : null}
         </details>
       ) : null}

@@ -563,7 +563,7 @@ describe("WorkspaceFileBrowser", () => {
       return ok(query?.offset === LIST_LIMIT ? last : first);
     });
     renderBrowser(vi.fn(), { initialQuery: "proof", autoFocusSearch: false });
-    expect(container.textContent).not.toMatch(/runner saved only part|full output is kept/);
+    expect(container.textContent).not.toMatch(/runner saved only part|full output stays/);
     expect(container.textContent).not.toContain("LAST_FILE.md");
     const more = [...container.querySelectorAll("button")].find(button => button.textContent === "Show more files");
     expect(more).toBeDefined();

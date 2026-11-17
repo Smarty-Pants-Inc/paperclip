@@ -15,17 +15,20 @@
  * "read with offset/limit" (pi-coding-agent/dist/extensions/codemode/execute.js:404).
  * Both inference and stripping MUST use this one matcher.
  */
-export const SAVED_OUTPUT_MARKER = /^[^\S\r\n]*\[Full output: [^\r\n]+? \((?:\d+ bytes; [^\r\n]*?|read (?:it )?with offset\/limit)\)\](?:[^\S\r\n]*\r?\n|$)?/gm;
+export const SAVED_OUTPUT_MARKER = /^[^\S\r\n]*\[Full output: [^\r\n]+? \((?:(\d+) bytes; [^\r\n]*?|read (?:it )?with offset\/limit)\)\](?:[^\S\r\n]*\r?\n|$)?/gm;
 
 /** Hide only validated spill markers, preserving all other bytes. */
 export function savedOutputForDisplay(output: string | undefined, outputTruncated = false) {
   let hasSpillMarker = false;
-  const displayOutput = output?.replace(SAVED_OUTPUT_MARKER, () => {
+  let fullOutputBytes: number | undefined;
+  const displayOutput = output?.replace(SAVED_OUTPUT_MARKER, (_marker, bytes: string | undefined) => {
+    if (!hasSpillMarker && bytes !== undefined) fullOutputBytes = Number(bytes);
     hasSpillMarker = true;
     return "";
   });
   return {
     output: displayOutput,
+    fullOutputBytes,
     // An explicit producer flag remains authoritative. Legacy runners may
     // lose it; only a validated marker can recover that evidence from text.
     outputTruncated: outputTruncated || hasSpillMarker,

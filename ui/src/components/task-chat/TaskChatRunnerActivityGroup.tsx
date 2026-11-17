@@ -420,14 +420,14 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
         {item.detail ?? item.label}
       </p>
     );
-  const { output: detail, outputTruncated } = savedOutputForDisplay(item.detail, item.outputTruncated);
+  const { output: detail, outputTruncated, fullOutputBytes = item.fullOutputBytes } = savedOutputForDisplay(item.detail, item.outputTruncated);
   if (item.diff?.lines?.length)
     return (
       <>
         <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
         {outputTruncated ? <>
           {detail ? <pre className="whitespace-pre-wrap break-words font-mono">{detail}</pre> : null}
-          <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} />
+          <SavedOutputNotice fullTextKept output={detail} fullOutputBytes={fullOutputBytes} />
         </> : null}
       </>
     );
@@ -443,7 +443,7 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
           {detail}
         </pre>
       ) : null}
-      {outputTruncated ? <SavedOutputNotice fullTextKept runLogHref={item.runLogHref} /> : null}
+      {outputTruncated ? <SavedOutputNotice fullTextKept output={detail} fullOutputBytes={fullOutputBytes} /> : null}
       {item.decision ? <p>Permission {item.decision}</p> : null}
       {item.diff ? (
         <p className="break-all font-mono">
