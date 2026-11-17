@@ -33,6 +33,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH` | `2` | Maximum depth of agent-created task trees (root depth is 1); board-created trees are exempt. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
 | `PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES` | `25` | Maximum active (not done or cancelled) children per parent created through the child helper. The value is a positive integer and applies server-wide. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
 | `PAPERCLIP_MAX_PLAN_DECOMPOSITION_CHILDREN` | `25` | Maximum children per accepted-plan decomposition request, injected into server validation and OpenAPI; the shared/browser schema keeps its default of 25. The active-child helper limit applies independently. The value is a positive integer. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
+| `PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT` | `3` | Maximum concurrent board concierge chats per server. The value is a positive integer. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
 
 Daytona connectivity for `paperclip_runner` uses authenticated provider
 WebSocket ingress and follows the instance experimental setting

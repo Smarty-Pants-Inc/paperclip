@@ -62,7 +62,16 @@ export function isConciergeReply(comment: {
 }
 
 /** Max simultaneous `claude` subprocesses across all board-chat requests. */
-const MAX_CONCURRENT_BOARD_CHATS = 3;
+export const MAX_CONCURRENT_BOARD_CHATS = 3;
+export const BOARD_CHAT_MAX_CONCURRENT_ENV = "PAPERCLIP_BOARD_CHAT_MAX_CONCURRENT";
+
+/** Missing or invalid settings preserve the upstream board-chat concurrency cap. */
+export function resolveBoardChatMaxConcurrent(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[BOARD_CHAT_MAX_CONCURRENT_ENV]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return MAX_CONCURRENT_BOARD_CHATS;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : MAX_CONCURRENT_BOARD_CHATS;
+}
 
 export function boardChatRoutes(
   db: Db,
@@ -139,7 +148,7 @@ export function boardChatRoutes(
 
     // Back-pressure: each request holds a subprocess + SSE stream for up to
     // 2 minutes; cap simultaneous spawns instead of forking without bound.
-    if (liveBoardChats >= MAX_CONCURRENT_BOARD_CHATS) {
+    if (liveBoardChats >= resolveBoardChatMaxConcurrent()) {
       res.status(429).json({
         error: "Too many concurrent board chats — retry shortly",
         code: "BOARD_CHAT_BUSY",
