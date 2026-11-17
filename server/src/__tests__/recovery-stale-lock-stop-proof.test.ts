@@ -639,6 +639,99 @@ describe("stale-lock sweep requires execution Stop proof", () => {
       expect((await onePass(f)).cards).toMatchObject([{ cause: "execution_stop_pending", status: "escalated" }]);
     });
 
+  // adopt-stopu-card2 (rf-4 F12). Live gate 4 (U e02cad41): card 56bcdc6a was written by
+  // owner "recovery.sweep_stale_issue_locks" (service.ts sweepStaleIssueLocks -> recordTaskStopPending)
+  // 3.7 s after a person's Stop, BEFORE the export and the receipt: the warm lease was still
+  // unreleased (the stop_and_retain release follows the export), so the deferral's
+  // pending_cleanup-only predicate returned false. Two writers raise this card for a person's
+  // Stop: (A) that sweep and (B) the cleanup retry (heartbeat/recovery.ts ->
+  // recordPersonStopCleanupPending). Both must read ONE bound. recordedAt stands in for the clock.
+  const PERSON_CARD = "Stop pending: Paperclip cannot confirm that the previous execution stopped. " +
+    "Messages you send are saved and will be sent once the stop is confirmed.";
+  async function stopRecordedAgo(f: { runId: string }, ms: number) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson,
+      nativeCancellation: { ...(run!.resultJson!.nativeCancellation as Record<string, unknown>),
+        recordedAt: new Date(Date.now() - ms).toISOString() } } }).where(eq(heartbeatRuns.id, f.runId));
+    return (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId)))[0]!;
+  }
+  const cleanupRetryWriter = async (run: typeof heartbeatRuns.$inferSelect) =>
+    (await import("../services/recovery/stop-pending.js")).recordPersonStopCleanupPending(db, run);
+  // The stop's phases while in flight: lease not yet released (live row), the cancel-finalize
+  // export owning the finalizer, the stop_and_retain request recorded, its cleanup in flight.
+  const PHASES = ["unreleased", "export-owned", "requested", "in-flight"] as const;
+  async function personStopIn(phase: typeof PHASES[number]) {
+    if (phase === "requested" || phase === "in-flight") return boundedPersonStop(phase === "in-flight");
+    return warmStopFixture(phase === "export-owned" ? "coordinator_owned" : "missing");
+  }
+
+  it.each(PHASES)("U card LIVE (%s): the sweep at Stop + 20 s and a failed cleanup retry then raise no card", async phase => {
+    const f = await personStopIn(phase);
+    const before = await task(f.issueId);
+    const run = await stopRecordedAgo(f, 20_000);
+    expect((await onePass(f)).cards).toEqual([]);
+    await cleanupRetryWriter(run);
+    expect((await onePass(f)).cards).toEqual([]);
+    expect(await task(f.issueId)).toEqual(before);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+  });
+
+  it.each(PHASES.flatMap(phase => (["sweep-first", "retry-first", "sweep-only", "retry-only"] as const)
+    .map(order => [phase, order] as const)))("U card at the bound (%s, %s): exactly one card, with the person's true copy",
+    async (phase, order) => {
+      const f = await personStopIn(phase);
+      const run = await stopRecordedAgo(f, 5 * 60_000 + 1_000);
+      const writers = { "sweep-first": ["sweep", "retry", "sweep"], "retry-first": ["retry", "sweep", "retry"],
+        "sweep-only": ["sweep", "sweep"], "retry-only": ["retry", "retry"] }[order];
+      for (const writer of writers) writer === "sweep" ? await onePass(f) : await cleanupRetryWriter(run);
+      const cards = await stopActions(f.issueId);
+      expect(cards.map(card => [card.cause, card.status])).toEqual([["execution_stop_pending", "escalated"]]);
+      expect(cards[0]!.nextAction).toBe(PERSON_CARD);
+      expect((cards[0]!.evidence as Record<string, any>).stopPending).toMatchObject({ personStop: true });
+      const read = await (await import("../services/issue-recovery-actions.js")).issueRecoveryActionService(db)
+        .getActiveForIssue(f.companyId, f.issueId);
+      expect(read?.nextAction).toBe(PERSON_CARD);
+    });
+
+  it("U card: a late receipt after the card retires it and releases the claims once", async () => {
+    const f = await personStopIn("requested");
+    await stopRecordedAgo(f, 5 * 60_000 + 1_000);
+    expect((await onePass(f)).cards.map(card => card.status)).toEqual(["escalated"]);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const { cards } = await onePass(f);
+    expect(cards.map(card => [card.status, card.outcome])).toEqual([["resolved", "restored"]]);
+    expect(await task(f.issueId)).toMatchObject({ checkoutRunId: null, executionRunId: null });
+    expect((await onePass(f)).cards).toHaveLength(1);
+  });
+
+  it("U card: a receipt before the bound means no card ever, from either writer", async () => {
+    const f = await personStopIn("requested");
+    await stopRecordedAgo(f, 2 * 60_000);
+    expect((await onePass(f)).cards).toEqual([]);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(lease!, { providerLeaseId: lease!.providerLeaseId, state: "stopped" }) } })
+      .where(eq(environmentLeases.id, f.lease.id));
+    const run = await stopRecordedAgo(f, 10 * 60_000);
+    await cleanupRetryWriter(run);
+    expect((await onePass(f)).cards).toEqual([]);
+    await cleanupRetryWriter(run);
+    expect(await stopActions(f.issueId)).toEqual([]);
+  });
+
+  it.each(["unreleased", "export-owned"] as const)("U card control (%s): a non-person stop at Stop + 20 s still gets the generic card", async phase => {
+    const f = await personStopIn(phase);
+    const run = await stopRecordedAgo(f, 20_000);
+    await db.update(heartbeatRuns).set({ resultJson: { ...run.resultJson, cancelledByActorType: "agent" } }).where(eq(heartbeatRuns.id, f.runId));
+    const { cards } = await onePass(f);
+    expect(cards.map(card => card.status)).toEqual(["escalated"]);
+    expect(cards[0]!.nextAction).toContain("The task stays held until Stop is proved");
+    expect((cards[0]!.evidence as Record<string, any>).stopPending.personStop).toBeFalsy();
+  });
+
   it("a stop_and_retain Stop with no receipt yet keeps the card even with a settled-turn receipt", async () => {
     const f = await warmStopFixture("settled");
     await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } })
