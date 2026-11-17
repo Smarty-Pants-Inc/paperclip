@@ -667,10 +667,16 @@ suite("fresh-continuation fallback", () => {
         await boardHeldNativeRun(issueId, at(0), { wakeCommentId: latest.id }); break;
       }
       case "D157_queued_wake_never_runs": {
+        // Production shape: enqueue writes the queued wake and its queued run in one
+        // transaction (heartbeat/queue.ts:5618-5668), so a queued wake always has its run.
         latest = await message("Please answer this accepted request.", -60_000, false);
-        await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
           requestedByActorType: "user", requestedByActorId: userId, idempotencyKey: `conversation-comment:${latest.id}`,
-          payload: { issueId, commentId: latest.id }, createdAt: at(-59_000), requestedAt: at(-59_000) }); break;
+          payload: { issueId, commentId: latest.id }, createdAt: at(-59_000), requestedAt: at(-59_000) }).returning();
+        const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+          createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+          contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
+        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id)); break;
       }
       case "D160_workspace_pending": {
         latest = await message("Please answer this accepted request.", -60_000);
@@ -678,9 +684,15 @@ suite("fresh-continuation fallback", () => {
         await db.insert(nativeRunFinalizations).values({ runId: pending.id, companyId, issueId, phase: "workspace_pending", recoveryState: "pending", leaseOwner: null } as never); break;
       }
       case "D168_carrying_queued_run_never_starts": {
+        // The person's own wake owns the queued run (heartbeat/queue.ts:5618-5668).
         latest = await message("Please answer this accepted request.", -60_000);
-        await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
-          createdAt: at(-59_000), responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }); break;
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: "issue_commented", status: "queued",
+          requestedByActorType: "user", requestedByActorId: userId, payload: { issueId, commentId: latest.id },
+          createdAt: at(-59_000), requestedAt: at(-59_000) }).returning();
+        const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, invocationSource: "on_demand", status: "queued",
+          createdAt: at(-59_000), responsibleUserId: userId, wakeupRequestId: wake!.id,
+          contextSnapshot: { issueId, wakeReason: "issue_commented", wakeCommentId: latest.id } }).returning();
+        await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id)); break;
       }
     }
     await occupySlot();
@@ -689,31 +701,53 @@ suite("fresh-continuation fallback", () => {
       const heartbeat = heartbeatService(db);
       // Every production owner a tick drives (heartbeat.ts:4752 stranded sweep,
       // index.ts executionDisposition + executionContinuation queues).
-      for (const elapsed of [90_001, 119_999, 120_000]) {
+      const tick = async (elapsed: number) => {
         vi.setSystemTime(t.getTime() + elapsed);
         await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId });
         await settleUnrecoverableExecutions(db);
         await deliverReconciledExecutions(db, heartbeat.wakeup);
+      };
+      // A person's queued run that never starts (D157/D168, RFL 19:17Z): at enqueue + 10 min it is
+      // a failed start the card owns (failed + Retry), not a live run; the queued run is no second outcome.
+      const startBoundMs = 600_000;
+      const observe = async () => {
+        const card = await taskInterruptionPresentation(db, await issue(issueId));
+        const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system")))).filter(c => !c.deletedAt && !(c.metadata as Record<string, unknown> | null)?.supersededByIncident);
+        const live = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])))).filter(r =>
+          !(r.status === "queued" && !r.startedAt && Date.now() - r.createdAt.getTime() >= startBoundMs));
+        const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
+        const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
+        // A wake still queued for the message (no run yet) is the wake queue's owned, pending delivery (D157).
+        const queuedWakes = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.runId} is null`,
+          inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+          sql`(${agentWakeupRequests.idempotencyKey} like 'conversation-comment%' and ${agentWakeupRequests.payload}->>'commentId' = ${latest.id})`));
+        const outcomes = notes.length + live.length + queuedWakes.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+        console.info(JSON.stringify({ f3PinRehome: { shape, elapsedMs: Date.now() - t.getTime(), card: card && { state: card.state, canRetry: card.canRetry },
+          notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length, redeliveries: redeliveries.length, outcomes } }));
+        expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
+        expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
+        if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);
+        return { card, redeliveries: redeliveries.length };
+      };
+      for (const elapsed of [90_001, 119_999, 120_000]) await tick(elapsed);
+      const first = await observe();
+      if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
+        expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
+        // Enqueued at t - 59 s: the bound passes at t + 541 s.
+        for (const elapsed of [540_999, 541_000]) await tick(elapsed);
+        const bounded = await observe();
+        expect(bounded.card, "at enqueue + 10 min: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+        expect(bounded.redeliveries, "the card is the one outcome; no redelivery beside it").toBe(0);
+        // The Retry is real: it is accepted for the run the card shows and joins it, never a second run.
+        const receipt = await requestTaskRetry({ db, companyId, issueId, actorId: userId, idempotencyKey: randomUUID(),
+          observedRunId: bounded.card!.observedRunId });
+        expect(receipt).toMatchObject({ accepted: true, stale: false });
+        expect((await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.issueId, issueId)))).length).toBe(1);
       }
-      const card = await taskInterruptionPresentation(db, await issue(issueId));
-      const notes = (await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
-        eq(issueComments.authorType, "system")))).filter(c => !c.deletedAt && !(c.metadata as Record<string, unknown> | null)?.supersededByIncident);
-      const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
-      const redeliveries = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
-        eq(agentWakeupRequests.idempotencyKey, `conversation-comment-redelivery:${latest.id}`)));
-      const [after] = await db.select().from(issueComments).where(eq(issueComments.id, latest.id));
-      // A wake still queued for the message (no run yet) is the wake queue's owned, pending delivery (D157).
-      const queuedWakes = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-        eq(agentWakeupRequests.companyId, companyId), sql`${agentWakeupRequests.runId} is null`,
-        inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
-        sql`(${agentWakeupRequests.idempotencyKey} like 'conversation-comment%' and ${agentWakeupRequests.payload}->>'commentId' = ${latest.id})`));
-      const outcomes = notes.length + live.length + queuedWakes.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
-      console.info(JSON.stringify({ f3PinRehome: { shape, card: card && { state: card.state, canRetry: card.canRetry },
-        notes: notes.length, live: live.map(r => r.contextSnapshot?.wakeCommentId ?? null), queuedWakes: queuedWakes.length, redeliveries: redeliveries.length, outcomes } }));
-      expect(after).toMatchObject({ body: latest.body, authorUserId: userId, deletedAt: null });
-      expect(outcomes, "exactly one truthful outcome, never zero or two").toBe(1);
-      if (live.length) expect(live.map(r => r.contextSnapshot?.wakeCommentId)).toEqual([latest.id]);
     } finally { vi.useRealTimers(); }
   }, 120_000);
 

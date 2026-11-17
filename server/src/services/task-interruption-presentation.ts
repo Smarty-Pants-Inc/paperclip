@@ -43,6 +43,14 @@ const QUEUED_INTERRUPT_HANDOFF_GRACE_MS = 5 * 60_000;
 const QUEUED_INPUT_DISPATCH_GRACE_MS = 2 * 60_000;
 const AUTOMATIC_DISPOSITION_GRACE_MS = 2 * 60_000;
 const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
+// A run a person asked for that has not started by this long after it was
+// queued is a failed start for that person: the card shows it with Retry
+// instead of "working" forever (D157/D168). Upstream's own queued-run bounds
+// are not person-facing: the dispatch redrive (queued-run-dispatch-liveness.ts:6-7)
+// only re-pokes the dispatcher, the I7 report (recovery/ownership-invariant-report.ts:150)
+// only logs, and the assigned-work sweep's stalled test (recovery/stalled-queued-run-sql.ts:28,
+// QUEUED_RUN_AGING_MS = 60 min) needs an hour plus passed-over starts.
+const PERSON_QUEUED_RUN_START_BOUND_MS = 10 * 60_000;
 const FAILED_ATTEMPT_STATUSES = new Set(["failed", "timed_out"]);
 const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
 const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
@@ -113,6 +121,8 @@ type ProjectionState = {
   freshContinuation?: { state: "continuing"; pendingSince?: number } | { state: "scheduled"; nextCheckAt: number };
   automaticDispositionAt?: number;
   waitingContinuation?: { queuedAt: number; personRequested: boolean };
+  /** The queued run is one a person asked for (the dispatcher's own person-origin rule). */
+  personQueuedRun?: boolean;
   recoveryHandedToPerson?: boolean;
 };
 
@@ -294,6 +304,11 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
       && Number.isFinite(interruptAt) && now - interruptAt < QUEUED_INTERRUPT_HANDOFF_GRACE_MS
       && !(retryWait?.sourceRunId === run.id && retryWait.preparationStatus) && system?.state !== "exhausted")
     return { ...base, intentId: interruptWait.id, state: "working" };
+  // A person's run that never started is a failed start, with Retry, once
+  // its bound passes; until then it is working (D157/D168).
+  if (run.status === "queued" && input.personQueuedRun && run.createdAt
+      && now - run.createdAt.getTime() >= PERSON_QUEUED_RUN_START_BOUND_MS)
+    return { ...base, state: "failed", canRetry: true };
   const waiting = input.waitingContinuation;
   if (run.status === "queued" && waiting && !waiting.personRequested && run.agentId === issue.assigneeAgentId
       && now - waiting.queuedAt >= WAITING_CONTINUATION_MOVE_FORWARD_MS)
@@ -703,6 +718,16 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       eq(agentWakeupRequests.companyId, companyId), inArray(agentWakeupRequests.runId, queuedContinuationIds),
       eq(agentWakeupRequests.requestedByActorType, "user"))),
   ]) : [[], []];
+  // Queued runs past the person start bound: is each one a person asked for?
+  const overdueQueuedIds = runs.filter(run => run.status === "queued" && run.createdAt
+    && run.createdAt.getTime() <= Date.now() - PERSON_QUEUED_RUN_START_BOUND_MS).map(run => run.id);
+  const personQueuedRunIds = new Set<string>();
+  if (overdueQueuedIds.length) {
+    const { personOriginRunSql } = await import("./heartbeat/queued-run-line.js");
+    const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.id, overdueQueuedIds), personOriginRunSql(sql`${companyId}::uuid`, sql`${heartbeatRuns.id}`)));
+    for (const row of rows) personQueuedRunIds.add(row.id);
+  }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));
   const personRequestedRunIds = new Set(personRows.flatMap(row => row.runId ? [row.runId] : []));
   const waitingContinuationFor = (run: typeof runs[number] | undefined): ProjectionState["waitingContinuation"] =>
@@ -830,6 +855,7 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       freshContinuation: freshContinuationFor(issue.id, facts.run?.id),
       automaticDispositionAt: automaticDispositionAt.get(issue.id),
       waitingContinuation: waitingContinuationFor(facts.run),
+      personQueuedRun: facts.run ? personQueuedRunIds.has(facts.run.id) : false,
       recoveryHandedToPerson: handedToPerson.has(issue.id),
       interruptWait: interruptWaitFor(issue.id),
       projectAccessAllowed: denied?.length === 0,
