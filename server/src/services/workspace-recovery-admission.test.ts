@@ -37,7 +37,7 @@ import { attachPreservedWorkspaceSnapshots } from "./workspace-recovery-snapshot
 import { adoptHistoricalWorkspaceRecoveries } from "./workspace-recovery-backfill.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import request from "supertest";
@@ -1719,6 +1719,81 @@ describe("automatic retained workspace recovery", () => {
       expect(deps.enqueueWakeup).toHaveBeenCalledWith(original.agentId,
         expect.objectContaining({ requestedByActorType: "user", requestedByActorId: "operator" }), wake.id);
       expect(queueDeps.executeRun).not.toHaveBeenCalled();
+    } finally { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); }
+  }, 30_000);
+
+  // cr-recon (gate 3, run b5612a51): a Boat remote, agent_files, pi_rpc chat.
+  // The person presses Stop mid-command and sends a message within seconds. The
+  // follow-up was admitted before the stopped run's copy-back hold existed, and
+  // reaches the production dispatch claim (heartbeat/queue.ts claimQueuedRun ->
+  // run-dispatch adapters/postgres.ts cancelStaleQueuedRun) while that copy-back
+  // is still in flight. It must wait (bounded) for the restore to settle and then
+  // run once on its first wake. It is never cancelled as "saved files could not
+  // be put back", never replayed, and the stopped run's unsynced bytes stay intact.
+  it("cr-recon: a message sent seconds after a Boat pi_rpc Stop waits for the in-flight copy-back and runs once on its first wake", async () => {
+    const t = await queuedResetFixture(true);
+    const { f, original, reset: message, wake, queued, deps, control, execution, queue } = t;
+    await db.update(agents).set({ adapterConfig: { provider: "pi_rpc", instructionsBundleMode: "agent_files" } })
+      .where(eq(agents.id, original.agentId));
+    await db.update(issueComments).set({ body: "Stop that. Just tell me which file you were editing." })
+      .where(eq(issueComments.id, message.id));
+    // Production shape: the follow-up's own wake is queued with its run.
+    await db.update(agentWakeupRequests).set({ status: "queued", claimedAt: null }).where(eq(agentWakeupRequests.id, wake.id));
+    const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+    const unsyncedSha = sha(await readFile(path.join(f.remote, "saved.txt")));
+    try {
+      // Admitted before the hold existed: the claim waits for the stopped run.
+      expect(await queue.claimQueuedRun(queued)).toBeNull();
+      expect((await run(queued.id)).status).toBe("queued");
+      // Stop settlement records the copy-back obligation; the restore starts
+      // but cannot settle yet (the Stop is not yet confirmed).
+      await recordRequiredWorkspaceRestoreFailure(db, await run(f.runId), { workspaceRestoreFailure: "restore_failed" }, f.lease);
+      const [hold] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+        eq(issueRecoveryActions.sourceIssueId, f.issueId), eq(issueRecoveryActions.fingerprint, `native-workspace:${f.runId}`)));
+      f.actionId = hold.id; f.input.actionId = hold.id;
+      await recoverRetainedWorkspace(f.input);
+      // The stopped run's process has ended and its Stop is confirmed (as at
+      // 10:16:38Z); the copy-back has not run yet.
+      await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success", metadata: { ...f.lease.metadata,
+        remoteExecutionTermination: remoteTerminationReceipt(f.lease, { providerLeaseId: f.providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, f.lease.id));
+      await control.acknowledgeRemoteStop(f.runId, f.companyId);
+      deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId);
+      expect(["queued", "recovering"]).toContain(readWorkspaceRecovery((await action(f.actionId)).evidence)?.status);
+      expect(readSystemRecovery((await action(f.actionId)).evidence)?.state).not.toBe("complete");
+
+      // Copy-back in flight: the production claim waits; it does not cancel.
+      expect(await queue.claimQueuedRun(await run(queued.id))).toBeNull();
+      const waiting = await run(queued.id);
+      expect(waiting).toMatchObject({ status: "queued", errorCode: null, startedAt: null, finishedAt: null });
+      expect(JSON.stringify(waiting)).not.toContain("could not be put back");
+      const [waitingWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(waitingWake).toMatchObject({ status: "queued", runId: queued.id });
+
+      // The restore settles on its own retries.
+      await control.resumeRemoteStopComments(await run(f.runId));
+      await vi.waitFor(async () => {
+        await Promise.all(await reconcileRetainedWorkspaces(db, f.environmentRuntime, async current => {
+          if (current.id === f.runId) await control.resumeRemoteStopComments(current);
+        }) ?? []);
+        expect(readSystemRecovery((await action(f.actionId)).evidence)?.state).toBe("complete");
+      }, { timeout: 10_000, interval: 10 });
+      expect(sha(await readFile(path.join(f.remote, "saved.txt")))).toBe(unsyncedSha);
+      expect(sha(await readFile(path.join(f.host, "saved.txt")))).toBe(unsyncedSha);
+
+      // The same first wake now runs, once. (The fixture's unrelated slot
+      // holder is not part of this chat: the live agent had no other run.)
+      await db.delete(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, original.agentId),
+        eq(heartbeatRuns.status, "running"), sql`${heartbeatRuns.contextSnapshot} is null`));
+      const claimed = await queue.claimQueuedRun(await run(queued.id));
+      expect(claimed?.id).toBe(queued.id);
+      expect((await run(queued.id)).status).toBe("running");
+      const [ranWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id));
+      expect(ranWake.runId).toBe(queued.id);
+      const others = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.issueId}`, inArray(heartbeatRuns.status, ["queued", "running"])));
+      expect(others.map(row => row.id)).toEqual([queued.id]);
+      expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+      expect(sha(await readFile(path.join(f.remote, "saved.txt")))).toBe(unsyncedSha);
     } finally { deps.activeRunExecutions.delete(f.runId); execution.finish(); adapterExecutionControls.delete(f.runId); }
   }, 30_000);
 
