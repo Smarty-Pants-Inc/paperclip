@@ -1,4 +1,5 @@
 import { notifyNativeStatusWakeWork } from "../deferred-execution-notifications.js";
+import { nativeStatusSuccessorState } from "./native-status-successor.js";
 import { assertAgentInteraction } from "../agent-interaction-policy.js";
 import { forbidden, HttpError } from "../../errors.js";
 import { agentInteractionDeliveryDenial, agentWakeInteractionTexts, INTERACTION_DELIVERY_DENIED, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
@@ -474,6 +475,8 @@ export async function enqueueWake(input: {
   originRunId?: string;
   originOperation?: "assign" | "comment";
 }) {
+  const successor = await nativeStatusSuccessorState(input.tx, input);
+  if (successor.skipReason) return null;
   const existing = await input.tx
     .select({ id: agentWakeupRequests.id })
     .from(agentWakeupRequests)
@@ -546,7 +549,8 @@ export async function enqueueWake(input: {
   return inserted.id;
 }
 
-async function refusedWakePolicy(tx: Db, companyId: string, wakeId: string) {
+async function refusedWakePolicy(tx: Db, companyId: string, wakeId: string | null) {
+  if (!wakeId) return null;
   const [wake] = await tx.select({ error: agentWakeupRequests.error, payload: agentWakeupRequests.payload })
     .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id, wakeId), eq(agentWakeupRequests.companyId, companyId)));
   return wake?.error === INTERACTION_DELIVERY_DENIED
@@ -2327,20 +2331,30 @@ export async function commitNativeStatusDecision(input: {
       ]),
     );
     for (const effect of input.decision.effects) {
-      materialized.push(
-        await materializeDecisionEffect({
-          tx: tx as unknown as Db,
-          companyId: input.companyId,
-          issue,
-          runId: input.runId,
-          decisionId: decisionRow.id,
-          actorAgentId: originRun?.agentId ?? null,
-          effect,
-          failpoint: input.failpoint,
-          preMaterializedEffects,
-          terminalRunsToEmit,
-        }),
-      );
+      const delivered = await materializeDecisionEffect({
+        tx: tx as unknown as Db,
+        companyId: input.companyId,
+        issue,
+        runId: input.runId,
+        decisionId: decisionRow.id,
+        actorAgentId: originRun?.agentId ?? null,
+        effect,
+        failpoint: input.failpoint,
+        preMaterializedEffects,
+        terminalRunsToEmit,
+      });
+      if (delivered.targetType === "agent_wakeup_request" && delivered.targetId === null) {
+        const successor = await nativeStatusSuccessorState(tx as unknown as Db, {
+          companyId: input.companyId, issueId: input.issueId, reason: "issue_status_changed",
+          originRunId: input.runId, payload: { nativeDecisionId: decisionRow.id,
+            ...(effect.kind === "schedule_retry" ? { retryCause: effect.cause } : {}) },
+        });
+        if (successor.skipReason) {
+          delivered.deliveryState = "skipped";
+          delivered.payload = { ...delivered.payload, skipReason: successor.skipReason };
+        }
+      }
+      materialized.push(delivered);
     }
 
     let updated: typeof issues.$inferSelect;
@@ -2735,7 +2749,7 @@ export async function commitNativeStatusDecision(input: {
           deliveryState: effect.deliveryState ?? "delivered",
           attemptCount: 1,
           deliveredAt: effect.deliveryState === "skipped" ? null : new Date(),
-          lastError: effect.deliveryState === "skipped" ? INTERACTION_DELIVERY_DENIED : null,
+          lastError: effect.deliveryState === "skipped" ? String(effect.payload.skipReason ?? INTERACTION_DELIVERY_DENIED) : null,
         })
         .onConflictDoNothing();
     }
