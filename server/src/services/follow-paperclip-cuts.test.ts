@@ -1,4 +1,4 @@
-// Follow-Paperclip Cuts A + B (adopt-lead 05:37Z; spec fp-FINAL-WITH-RFL-FIXES, RFL A-5 / B-5 / B-2).
+// Follow-Paperclip Cuts A + B (RFL A-5 / B-5; B-2's K=2 policy was withdrawn).
 // RED first, test-only: these pin the behaviour the two cuts must reach, through the real acquisition,
 // the real fresh-continuation fallback and delivery, and the real unanswered-message sweep. Only provider
 // I/O is a controlled peer (the Boat plugin worker).
@@ -15,15 +15,14 @@ import { truncateTablesWithDeadlockRetry } from "../__tests__/helpers/truncate-w
 import { environmentRuntimeService } from "./environment-runtime.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 import {
-  FRESH_CONTINUATION_PENDING_BOUND_MS, FRESH_CONTINUATIONS_PER_CHAIN, FRESH_CONTINUATION_WINDOW_MS,
-  continueHeldExecutions, ensureFreshContinuation, resetBacklogContinuationPacingForTests,
+  FRESH_CONTINUATION_PENDING_BOUND_MS,
+  ensureFreshContinuation, resetBacklogContinuationPacingForTests,
 } from "./fresh-continuation-fallback.js";
 import { heartbeatService } from "./heartbeat.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { settleUnansweredPersonMessagesForTask, UNANSWERED_MESSAGE_SETTLE_MS } from "./recovery/unanswered-person-message.js";
 
 // Custody peer, the same rule as environment-runtime-reusable-resume-replacement.test.ts: a lease's backup verifies only when
 // its stamp authorizes that exact provider lease. Everything else in the module is the real implementation.
@@ -37,12 +36,8 @@ const support = await getEmbeddedPostgresTestSupport();
 const suite = support.supported ? describe : describe.skip;
 // A typed fresh-thread refusal (runner-reconciliation-refusal.ts FRESH_THREAD_REFUSAL_CODES).
 const TYPED = "runner_remote_state_unavailable";
-// B-2 (RFL ruled 05:51Z): the ONE bound is the fork's K=2 chain cap; this is the text the person sees when it is
-// reached. "Press Retry" only where the task view proves a Retry control in that state, so the ruled default applies.
-const BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, and both attempts failed. "
-  + "Your message and the saved work are kept. Send a new message to try again.";
 
-suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
+suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5)", () => {
   let db!: ReturnType<typeof createDb>;
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | undefined;
   let companyId = "", agentId = "", userId = "";
@@ -265,70 +260,6 @@ suite("follow-Paperclip Cuts A + B: REDs (A-5, B-5, B-2)", () => {
     expect.soft(old, "stopped and kept through the stop-only owner: billing stops, the disk stays").toMatchObject({
       status: "pending_cleanup", metadata: { sandboxStopAndRetain: { schema: "paperclip.sandbox-stop-and-retain.v1", providerLeaseId } } });
   }, 60_000);
-
-  // ---------------------------------------------------------------- B-5 + B-2
-  // The kept held-notice writer returns early for the typed family (native-session-executor.ts noticeHeldUnfinishedPredecessor,
-  // `if (freshThreadRefusalCode(error)) return`). After Cut B the typed family is an ordinary failure: the fallback continues it
-  // (its user text is the recovery action's nextAction, no thread comment), and the ONE thread note owner is the unanswered-message
-  // sweep (recovery/unanswered-person-message.ts). B-2: the ONE bound is the K=2 chain cap; #21394's hourly window does not
-  // re-open it.
-  describe("B-5 / B-2: a typed chain that reaches the one bound gets exactly one note, from the unanswered-message sweep", () => {
-    async function failContinuation(runId: string, issueId: string) {
-      const now = new Date();
-      const [task] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null, blockedTransitionAt: now })
-        .where(eq(issues.id, issueId)).returning();
-      const [run] = await db.update(heartbeatRuns).set({ status: "failed", runtimeMode: "native", nativeIssueId: issueId,
-        nativePhase: "terminal_failure", errorCode: TYPED, error: TYPED, startedAt: new Date(now.getTime() - 1_000), finishedAt: now })
-        .where(eq(heartbeatRuns.id, runId)).returning();
-      if (run!.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: now })
-        .where(eq(agentWakeupRequests.id, run!.wakeupRequestId));
-      await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "terminal_failure",
-        recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation" });
-      const hold = await issueRecoveryActionService(db).upsertSourceScoped({ companyId, sourceIssueId: issueId,
-        kind: "active_run_watchdog", ownerType: "board", returnOwnerAgentId: agentId, cause: "native_continuation_requires_reconciliation",
-        fingerprint: `native-continuation:${runId}`, nextAction: "Continue from the last saved work.",
-        evidence: { runId, originalFailureCode: TYPED, nativeFailureBlock: { runId, statusVersion: task!.statusVersion } } });
-      const [record] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold.id));
-      await settleUnrecoverableExecutions(db, record!.createdAt);
-      return now;
-    }
-
-    it("K=2 typed continuations, then the bound: no third run (even past the hourly window), one note within the settle time", async () => {
-      await company();
-      const f = await heldTypedMessage();
-      await occupySlot();
-      let source = f.runId;
-      // The first failure is the message's own run; continue it, then fail each continuation the same typed way.
-      await settleUnrecoverableExecutions(db, f.finishedAt);
-      for (let attempt = 1; attempt <= FRESH_CONTINUATIONS_PER_CHAIN; attempt++) {
-        await continueHeldExecutions(db);
-        await deliver();
-        const next = await successors(source);
-        expect(next, `continuation ${attempt} is delivered`).toHaveLength(1);
-        expect(next[0]!.contextSnapshot).toMatchObject({ wakeCommentIds: [f.messageId] });
-        await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(Date.now() + 30_000) });
-        expect.soft(await currentSystemNotes(f.issueId), `no thread note while continuation ${attempt} is owed`).toHaveLength(0);
-        source = next[0]!.id as typeof source;
-        await failContinuation(source, f.issueId);
-      }
-      const endedAt = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, source)))[0]!.finishedAt!;
-      // B-2: the bound holds. Neither the held backlog nor delivery starts a third, even after #21394's hourly window.
-      for (const at of [0, FRESH_CONTINUATION_WINDOW_MS + 60_000]) {
-        await continueHeldExecutions(db, new Date(Date.now() + at));
-        await deliver();
-      }
-      expect.soft(await successors(source), "the K=2 bound: no third continuation").toHaveLength(0);
-      // B-5: the one note, from the unanswered-message sweep, within its settle time after the last run ended.
-      const acceptance = endedAt.getTime() + UNANSWERED_MESSAGE_SETTLE_MS + 1_000;
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(acceptance) });
-      await settleUnansweredPersonMessagesForTask(db, { companyId, issueId: f.issueId, now: new Date(acceptance + 60_000) });
-      const notes = await currentSystemNotes(f.issueId);
-      expect(notes, `exactly one note, posted by ${UNANSWERED_MESSAGE_SETTLE_MS / 1000 + 1} s after the last run ended`).toHaveLength(1);
-      expect(notes[0]!.metadata).toMatchObject({ authorizationReason: `unanswered_message:${f.messageId}` });
-      expect(notes[0]!.body).toBe(BOUND_REACHED_TEXT);
-      expect(notes[0]!.createdAt.getTime() - endedAt.getTime()).toBeLessThan(UNANSWERED_MESSAGE_SETTLE_MS + 60_000);
-    }, 60_000);
-  });
 
   // Keep the reference so a missing export is a type error, not a silent skip.
   void sql;

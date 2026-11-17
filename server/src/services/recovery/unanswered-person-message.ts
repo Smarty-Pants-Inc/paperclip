@@ -22,7 +22,6 @@ import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-ses
 import { conversationTurnAnswered } from "../native-runtime/native-governance.js";
 import { buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { keyValueRow } from "./notice-format.js";
-import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
@@ -92,10 +91,6 @@ export const UNANSWERED_MESSAGE_NO_RUN_TEXT =
   "Your message is saved, but no run started for it. Sending it again is safe; if it fails again, assign this agent a new task.";
 export const UNANSWERED_MESSAGE_NO_REPLY_TEXT =
   "This run finished without a reply to your message. Sending it again is safe.";
-/** The ONE bound (follow-Paperclip B-2, RFL 05:51Z): the fork's K=2 fresh-continuation chain cap. */
-export const FRESH_CONTINUATION_BOUND = 2;
-export const UNANSWERED_MESSAGE_BOUND_REACHED_TEXT = "Paperclip tried to continue this task twice from its saved work, "
-  + "and both attempts failed. Your message and the saved work are kept. Send a new message to try again.";
 
 // Codes the notice metadata may name. A run's error is reduced to its leading
 // code token; anything not listed is unclassified_failure, never raw text.
@@ -449,28 +444,19 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // Only a run that carries THIS message is evidence about it. An unrelated
   // run (a timer, or the continuation that replaced a cancelled deferred wake
   // with no comment ids) is not: the message's own wake path decides.
-  const messageRun = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
+  const run = runs.find(candidate => runCarriesMessage(candidate.contextSnapshot, message.id)) ?? null;
   // Paperclip's per-turn response rule (doc/execution-semantics.md:2649-2658,
   // native-governance.ts conversationTurnAnswered): only a pending question or
   // confirmation card that the message's OWN run created stands in for its
   // reply. A card from an earlier turn or one the board addressed to someone
   // else, and any approval, can hold the task but do not answer the message.
-  if (messageRun && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: messageRun.id }))) {
+  if (run && !(await conversationTurnAnswered({ db: q, companyId: issue.companyId, issueId: issue.id, runId: run.id }))) {
     return { kind: "answered" };
   }
 
-  // A failed fresh continuation that descends from the message's run is the
-  // run the person's message ended on: the automatic lineage, typed or not,
-  // ends there (fork-lead a6342a4d4, fresh-continuation-chain.ts).
-  const latest = runs[0];
-  const run = messageRun && latest && latest.id !== messageRun.id
-    && ["failed", "timed_out", "interrupted", "cancelled"].includes(latest.status)
-    && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-      runId: latest.id, ancestorRunId: messageRun.id }) ? latest : messageRun;
-
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
-  // and its carrying run, messageRun; a refused successor below never
+  // and its carrying run; a refused successor below never
   // restarts it) the first time this step defers to such an attempt,
   // and the wait ends at T0 + PENDING_WAIT_BOUND_MS. An attempt that never
   // starts (a re-wake that is never claimed, a finalization stuck in a pending
@@ -483,13 +469,13 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
         eq(activityLog.action, PENDING_WAIT_ACTION), sql`${activityLog.details}->>'messageId' = ${message.id}`,
-        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`));
+        sql`coalesce(${activityLog.details}->>'runId', '') = ${run?.id ?? ""}`));
       waitT0 = wait?.at ? new Date(wait.at).getTime() : null;
     }
     const bound = (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
     if (bound <= now.getTime()) return null;
     return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
-      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
+      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: run?.id ?? null } } : {}) };
   };
 
   // Only a turn IN PROGRESS keeps an unbounded wait (a quiet healthy turn is
@@ -669,13 +655,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
-  // The ONE bound: the message's automatic lineage used its K=2 fresh
-  // continuations and the last one failed. Nothing further starts by itself.
-  const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
-    && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
-      >= FRESH_CONTINUATION_BOUND);
   const body = paused ? agentPausedText(pausedName)
-    : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
@@ -685,7 +665,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       body,
       tone: "warning",
       nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
-        : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
+        : held ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
     recoveryOwner: null,
