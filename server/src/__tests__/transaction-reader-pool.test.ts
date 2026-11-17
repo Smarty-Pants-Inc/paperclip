@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
 import {
-  agents, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, issues, projects, projectWorkspaces,
+  agents, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, issues, projects, projectWorkspaces,
 } from "@paperclipai/db";
 import { issueService } from "../services/issues.js";
 import { executionWorkspaceService } from "../services/execution-workspaces.js";
@@ -71,5 +71,19 @@ const support = await getEmbeddedPostgresTestSupport();
       executionWorkspaceId: null, projectWorkspaceId: source.id, executionWorkspacePreference: null,
       executionWorkspaceSettings: { mode: "shared_workspace" },
     });
+  });
+
+  it("creates a user-assigned issue in an existing transaction without borrowing from the pool", async () => {
+    const { companyId } = await fixture();
+    const userId = randomUUID();
+    await db.insert(companyMemberships).values({
+      companyId, principalType: "user", principalId: userId, status: "active", membershipRole: "member",
+    });
+    const created = await db.transaction(tx => withinDeadline(issueService(db).create(companyId, {
+      title: "Human task from a chat transaction", assigneeUserId: userId,
+    }, tx)));
+    expect(created).toMatchObject({ companyId, title: "Human task from a chat transaction", assigneeUserId: userId });
+    const [stored] = await db.select().from(issues).where(eq(issues.id, created.id));
+    expect(stored).toMatchObject({ companyId, assigneeUserId: userId });
   });
 });
