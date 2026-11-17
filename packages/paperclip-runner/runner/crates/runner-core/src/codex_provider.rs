@@ -5862,7 +5862,7 @@ while IFS= read -r line; do
     *'"method":"run.attach"'*)
       id=${line#*\"id\":}; id=${id%%,*}
       printf '%s\n' '{"method":"paperclip/providerPerformance","params":{"threadId":"reader-tail-thread","spans":[{"name":"runner.pi.attach","outcome":"ok"}]}}'
-      __EXTRA__
+      if [ -z "$swept" ]; then swept=1; __EXTRA__; fi
       printf '{"id":%s,"result":true}\n' "$id" ;;
     *'"method":"turn/start"'*)
       printf '%s\n' '{"id":3,"result":{"turn":{"id":"reader-tail-1"}}}'
@@ -5942,6 +5942,43 @@ done
             "settled attach tail must not refuse the answer run: {attached:?}"
         );
         assert!(accounting.is_empty());
+        provider.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_drains_a_late_settled_turn_item_swept_in_by_the_first_attach() {
+        // A parked turn's late tool item (e.g. a long sibling callback that
+        // finished after release) still sits in Pi's stdout; the first
+        // attach's run.attach request reads and buffers it with the timing.
+        let mut provider = pi_attach_with_buffered_tail_provider(
+            r#"printf '%s\n' '{"method":"item/completed","params":{"threadId":"reader-tail-thread","turnId":"reader-tail-1","item":{"id":"sibling","type":"dynamicToolCall","status":"completed"}}}'"#,
+        );
+        let context = json!({"runId": "answer-run"});
+        assert!(provider
+            .attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new()
+            )
+            .unwrap());
+        assert_eq!(provider.pending_messages.len(), 2);
+        let attached = provider.attach_run_in_place(
+            [],
+            None,
+            Some(("Answer run", &context, "answer-run")),
+            &mut Vec::new(),
+        );
+        assert!(attached.as_ref().is_ok_and(|kept| *kept), "{attached:?}");
+        // Only this attach's own fresh timing frame remains for the next poll;
+        // the parked turn's late item was drained as settled history.
+        let left = provider
+            .pending_messages
+            .iter()
+            .map(|message| message.value["method"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(left, ["paperclip/providerPerformance"]);
         provider.shutdown().unwrap();
     }
 
