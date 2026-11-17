@@ -34,7 +34,7 @@ import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuationCauseIsSystemOwnedSql, continuesAutomaticallySql,
   isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
-import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop,
+import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop, shownCutAnswer,
   THINKING_CAP_STOP_CONTINUATION_INSTRUCTION, type CutAnswerCause } from "./heartbeat-run-summary.js";
 import { readRunAnswerEvents, readThinkingCapStop } from "./thinking-cap-stop.js";
 
@@ -232,7 +232,7 @@ async function createdObjects(tx: Db, run: typeof heartbeatRuns.$inferSelect): P
 export function freshContinuationNote(input: { runId: string; unverified: string[]; workspace: "restored_last_save" | "kept";
   created?: FreshContinuationCreatedObjects;
   /** dl-n5-cont: the run's answer was cut after streaming text; where to pick it up. */
-  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean } | { thinkingOnlyCapStop: true; ask?: string | null } | null }) {
+  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean; partial?: boolean } | { thinkingOnlyCapStop: true; ask?: string | null } | null }) {
   const actions = input.unverified.length
     ? `These actions of that run have unverified outcomes: ${input.unverified.join(", ")}. For each one, first check whether it took effect.`
     : "No action of that run is recorded with an unknown outcome; check the task's recent history before repeating any side effect.";
@@ -285,17 +285,22 @@ export function thinkingCapStopRecoveryOpening(ask: string | null): string {
 export async function readSourceRunCutAnswer(tx: Pick<Db, "select">,
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId"> & Partial<Pick<typeof heartbeatRuns.$inferSelect, "finishedAt">>,
   issue?: Pick<typeof issues.$inferSelect, "id" | "title" | "description"> | null):
-  Promise<{ text: string; cause: CutAnswerCause; posted: boolean } | { thinkingOnlyCapStop: true; ask: string | null } | null> {
+  Promise<{ text: string; cause: CutAnswerCause; posted: boolean; partial?: boolean } | { thinkingOnlyCapStop: true; ask: string | null } | null> {
   const rows = await readRunAnswerEvents(tx, run.companyId, run.id);
   const cut = readFailedTurnStreamedAnswer(rows);
   // dl-n5-cont2 item 3: a pi_output_truncated turn that streamed no answer
   // text spent its whole output budget thinking; the continuation is told to
   // write the answer now (dl-n5-cont3: at the 'high' run-level override).
   if (!cut) return readThinkingOnlyCapStop(rows) ? { thinkingOnlyCapStop: true, ask: await readPersonAsk(tx, run, issue ?? null) } : null;
-  const [posted] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt),
-    eq(issueComments.body, cut.candidate.text))).limit(1);
-  return { text: cut.text, cause: cut.cause, posted: Boolean(posted) };
+  // dl-n5-cont4: compared with what the run REALLY posted (its comments in the
+  // DB), item by item: the opening quotes the ending the person was shown and
+  // never says none was shown when some was.
+  const postedBodies = (await tx.select({ body: issueComments.body }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt)))
+    .orderBy(asc(issueComments.createdAt), asc(issueComments.id))).map(row => row.body);
+  const shown = shownCutAnswer(cut, postedBodies);
+  if (!shown) return { text: cut.text, cause: cut.cause, posted: false };
+  return { text: shown.text, cause: cut.cause, posted: true, ...(shown.whole ? {} : { partial: true }) };
 }
 
 async function readPersonAsk(tx: Pick<Db, "select">, run: { companyId: string; finishedAt?: Date | null },

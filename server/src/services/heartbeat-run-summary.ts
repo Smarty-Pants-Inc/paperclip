@@ -478,6 +478,33 @@ const CUT_ANSWER_NOTE: Record<CutAnswerCause, string> = {
   failed: "The answer stopped here because the run failed mid-answer. Paperclip is continuing it from exactly this point in the next reply.",
 };
 
+/** The answer items of one turn as one reply, in order, separated by a blank line (dl-n5-cont3 F3). */
+export function joinAnswerPieces(pieces: readonly string[]): string {
+  return pieces.reduce((joined, piece) => !joined ? piece
+    : `${joined}${joined.endsWith("\n\n") ? "" : joined.endsWith("\n") ? "\n" : "\n\n"}${piece}`, "");
+}
+
+/**
+ * dl-n5-cont4: how much of a cut answer the person was REALLY shown, read
+ * from the bodies the run posted (in order). The leading answer items found
+ * whole, in order, in the posted text; `whole` when every item was shown.
+ */
+export function shownCutAnswer(cut: { pieces: readonly string[]; text: string; candidate: { text: string } },
+  postedBodies: readonly string[]): { text: string; whole: boolean } | null {
+  if (postedBodies.includes(cut.candidate.text)) return { text: cut.text, whole: true };
+  const posted = postedBodies.join("\n");
+  let from = 0;
+  const shown: string[] = [];
+  for (const piece of cut.pieces) {
+    const at = posted.indexOf(piece, from);
+    if (at < 0) break;
+    shown.push(piece);
+    from = at + piece.length;
+  }
+  if (shown.length === 0) return null;
+  return { text: joinAnswerPieces(shown), whole: shown.length === cut.pieces.length };
+}
+
 /**
  * dl-n5-cont (Paul NOTE 5): a turn that streamed answer text as item.delta
  * events and then FAILED (pi_output_truncated at the output cap, a provider
@@ -492,6 +519,10 @@ const CUT_ANSWER_NOTE: Record<CutAnswerCause, string> = {
 export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; payload: unknown }[]): {
   itemId: string;
   itemIds: string[];
+  /** dl-n5-cont4: each answer item's whole text, in order (the pieces `text` joins). */
+  pieces: string[];
+  /** dl-n5-cont4: the seq of the failed turn's first answer event. */
+  startSeq: number;
   text: string;
   cause: CutAnswerCause;
   candidate: CompletedFinalAgentMessageCandidate & { reasonCode: string };
@@ -499,25 +530,34 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
   const ordered = [...rows].sort((a, b) => a.seq - b.seq);
   const eventOf = (row: { payload: unknown }) => record(record(row.payload).prpEvent);
   let lastTerminal: { seq: number; event: Record<string, unknown> } | null = null;
+  let previousTerminalSeq = 0;
   for (const row of ordered) {
     const event = eventOf(row);
     if (typeof event.eventType === "string" && /^turn\.(completed|failed|cancelled|interrupted)$/u.test(event.eventType)) {
+      if (lastTerminal) previousTerminalSeq = lastTerminal.seq;
       lastTerminal = { seq: row.seq, event };
     }
   }
   if (!lastTerminal || lastTerminal.event.eventType !== "turn.failed") return null;
   const failedTurnId = typeof lastTerminal.event.turnId === "string" ? lastTerminal.event.turnId : null;
   // dl-n5-cont3 F3: EVERY agentMessage item the failed turn streamed, in the
-  // order its first delta arrived; never only the last one.
+  // order its first delta arrived; never only the last one. dl-n5-cont4: an
+  // item that COMPLETED is one of the turn's answer items too (even with no
+  // stored delta), in the order it first appeared.
   const itemIds: string[] = [];
+  let startSeq: number | null = null;
   for (const row of ordered) {
     if (row.seq > lastTerminal.seq) break;
     const event = eventOf(row);
-    if (event.eventType !== "item.delta" || typeof event.itemId !== "string") continue;
-    if (failedTurnId && typeof event.turnId === "string" && event.turnId !== failedTurnId) continue;
-    if (record(event.payload).kind === "agentMessage" && !itemIds.includes(event.itemId)) itemIds.push(event.itemId);
+    if ((event.eventType !== "item.delta" && event.eventType !== "item.completed") || typeof event.itemId !== "string") continue;
+    if (failedTurnId && typeof event.turnId === "string" ? event.turnId !== failedTurnId : row.seq <= previousTerminalSeq) continue;
+    const payload = record(event.payload);
+    if (payload.kind !== "agentMessage" && payload.kind !== "assistant_message") continue;
+    if (event.eventType === "item.completed" && !(typeof payload.text === "string" && payload.text.trim())) continue;
+    if (!itemIds.includes(event.itemId)) itemIds.push(event.itemId);
+    startSeq ??= row.seq;
   }
-  if (itemIds.length === 0) return null;
+  if (itemIds.length === 0 || startSeq === null) return null;
   const completedText = (id: string) => {
     for (const row of ordered) {
       const event = eventOf(row);
@@ -538,13 +578,14 @@ export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; paylo
     if (piece.trim()) pieces.push(piece);
   }
   if (pieces.length === 0) return null;
-  const text = pieces.reduce((joined, piece) => !joined ? piece
-    : `${joined}${joined.endsWith("\n\n") ? "" : joined.endsWith("\n") ? "\n" : "\n\n"}${piece}`, "");
+  const text = joinAnswerPieces(pieces);
   const itemId = itemIds[itemIds.length - 1]!;
   const cause = cutAnswerCause(record(record(lastTerminal.event.payload).error).code);
   return {
     itemId,
     itemIds,
+    pieces,
+    startSeq,
     text,
     cause,
     candidate: {
@@ -612,7 +653,9 @@ const CUT_ANSWER_TAIL_CHARS = 600;
  * repeats it or points at text the person did not see. When it was not
  * posted, it restarts the whole answer and says so plainly.
  */
-export function cutAnswerContinuationInstruction(input: { text: string; cause: CutAnswerCause | string; posted: boolean }): string {
+export function cutAnswerContinuationInstruction(input: { text: string; cause: CutAnswerCause | string; posted: boolean;
+  /** dl-n5-cont4: only the leading part of what was written (`text`) was posted. */
+  partial?: boolean }): string {
   const why = input.cause === "output_limit" ? "it hit the model's output limit"
     : input.cause === "stream_ended" ? "the connection to the model ended mid-answer" : "the run failed mid-answer";
   if (!input.posted) {
@@ -622,7 +665,10 @@ export function cutAnswerContinuationInstruction(input: { text: string; cause: C
   }
   const tail = input.text.slice(-CUT_ANSWER_TAIL_CHARS);
   // dl-n5-cont3 F1: the prefix is always posted whole, so its ending was shown.
-  const shown = "The part you had written was posted to the person as your reply, exactly as written. ";
+  // dl-n5-cont4: when only its leading items were posted, it says so; `text` is what was shown.
+  const shown = input.partial
+    ? "Only the first part of what you had written was posted to the person as your reply, exactly as written; the rest was not shown to them. "
+    : "The part you had written was posted to the person as your reply, exactly as written. ";
   return `Your previous answer to the person stopped before it finished because ${why}. ${shown}`
     + `It ends with exactly this text:\n\n<<<END OF POSTED TEXT\n${tail}\nEND OF POSTED TEXT>>>\n\n`
     + "Continue exactly where it stopped: begin with the next words after that ending, as one answer. Do not repeat or summarize "
