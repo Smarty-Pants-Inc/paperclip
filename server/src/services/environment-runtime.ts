@@ -1880,12 +1880,25 @@ function createSandboxEnvironmentDriver(
     for (const lease of [...input.leases, ...(input.closedActiveTips?.leases ?? [])]) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease) && !closedActiveTipIds.has(lease.id)) continue;
-      // CR6: retiring the box loses agent files written after the last turn-end
-      // save. Collect them first with the Stop collector, while the box is
-      // live. Anything short of a verified save (a held save, an unreadable
-      // box, no collector) fails closed: never destroyed, only stopped and kept.
+      // CR6: save post-turn agent files to the server before stopping and
+      // keeping the old source. A held save stays held; never destroy its box.
+      const copiesToCollect = await agentFileCopiesToCollectOnLease(db, lease);
       let agentFilesSettled = true;
-      for (const runId of await agentFileCopiesToCollectOnLease(db, lease)) {
+      let inspectedForCollection = false;
+      let collectionObservation: PluginEnvironmentLeaseObservation | undefined;
+      if (copiesToCollect.length && ["released", "expired"].includes(lease.status)) {
+        // G7: never resume an idled-out box to collect. Turn-end saves remain
+        // on the server; any later box-only files stay on the kept disk.
+        if (hasBoundRemoteStopReceipt(lease) || hasStopOnlyCleanup(lease)
+          || lease.metadata?.pendingCleanupInFlight === true) continue;
+        inspectedForCollection = true;
+        collectionObservation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(lease) })
+          .catch(() => undefined);
+      }
+      const canCollect = !inspectedForCollection || collectionObservation?.providerLeaseId === lease.providerLeaseId
+        && ["active", "running"].includes(String(collectionObservation?.state));
+      if (!canCollect) agentFilesSettled = false;
+      for (const runId of canCollect ? copiesToCollect : []) {
         const collected = await options.agentFileCollector?.current?.({ environment: input.environment, lease, runId })
           .catch((error: unknown) => { logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed"); return null; });
         if (!collected || !agentFileCopyRetirementSettled(collected)) agentFilesSettled = false;
@@ -1922,8 +1935,9 @@ function createSandboxEnvironmentDriver(
           && stale.metadata?.pendingCleanupInFlight !== true) {
           // A stale boot source is not stop authority. GET the recorded resource
           // outside transactions, then reuse the fallback's snapshot/CAS owner.
-          const observation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(stale) })
-            .catch(() => undefined);
+          const observation = inspectedForCollection ? collectionObservation
+            : await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(stale) })
+              .catch(() => undefined);
           await prepareInspectedSourceSandboxStop(db, stale, observation);
         }
         continue;
