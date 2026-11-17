@@ -1,5 +1,6 @@
 import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
-import { WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT } from "@paperclipai/shared";
+import { WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT,
+  WORKSPACE_RESTORE_PERSON_BOUND_MS } from "@paperclipai/shared";
 import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate,
   withoutUnavailableRetry } from "./execution-blocker.js";
@@ -181,8 +182,14 @@ function restoreStopWaitText(code: "copyback_stop_unconfirmed" | "agent_stop_unc
   return code === "copyback_stop_unconfirmed" ? WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT : WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT;
 }
 /** The restoreStopWait fact of one hold's evidence (card7's exhaustedStopWait,
- * carve-out included). */
-export function restoreStopWaitFact(evidence: Record<string, unknown> | null | undefined) {
+ * carve-out included). restore-card8 item 5 (rf-3 J5): an owed hold's wait ends
+ * at the person bound (WORKSPACE_RESTORE_PERSON_BOUND_MS after the hold was
+ * written, the run projection's rule): the card and chat then read it as
+ * delayed and this authority offers Retry. */
+export function restoreStopWaitFact(evidence: Record<string, unknown> | null | undefined, holdWrittenAt?: Date | null,
+  now = Date.now()) {
+  if (evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true && holdWrittenAt
+    && holdWrittenAt.getTime() + WORKSPACE_RESTORE_PERSON_BOUND_MS <= now) return null;
   return exhaustedStopWait(readSystemRecovery(evidence), evidence);
 }
 /** The restoreStopWait fact for a task: the same rows restore-card7's admission
@@ -197,11 +204,12 @@ async function readRestoreStopWait(db: Db, input: { companyId: string; issueId: 
       eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`)))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   if (!latest || ["queued", "running", "scheduled_retry"].includes(latest.status)) return null;
-  const records = await db.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+  const records = await db.select({ evidence: issueRecoveryActions.evidence, createdAt: issueRecoveryActions.createdAt })
+    .from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
     sql`${issueRecoveryActions.evidence}->>'runId' = ${latest.id}`));
   for (const record of records) {
-    const code = restoreStopWaitFact(record.evidence);
+    const code = restoreStopWaitFact(record.evidence, record.createdAt);
     if (code) return code;
   }
   return null;

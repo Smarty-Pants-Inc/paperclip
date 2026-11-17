@@ -494,6 +494,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;
   // Retry is a person's control on this task. Say so, so an agent reading this
   // record points the person to it instead of re-running the work itself.
+  // restore-card8 item 5 (J4/J7): an owed hold not adopted yet has no worker
+  // state to carry the delayed words; past the bound it says them itself.
+  if (restoreDelayed && !workspaceRecoveryState && retryOffered) nextAction = WORKSPACE_RESTORE_DELAYED_TEXT;
   if (canRetry && decideRetryAuthority({ ...authorityFacts, retrySource: true }).canRetry && !eligibleContinuation)
     nextAction += ` ${EXECUTION_BLOCKER_PERSON_RETRY_ACTION}`;
   // A paused assignee: the one true action is Resume, on every surface.

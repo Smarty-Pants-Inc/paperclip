@@ -8,8 +8,16 @@ import { workspaceExportCauses, workspaceRecoverySourceEligible, type WorkspaceR
 import { capturePolicyRearmDueAt, capturePolicyRearmPendingCondition, retainedSourceFallbackDueAt,
   retainedSourceFallbackPendingCondition, stopProofRearmDueAt, stopProofRearmPendingCondition } from "./workspace-recovery-fallback-discovery.js";
 
+/** restore-card8 item 5 (rf-3 J7): the longest an adoption waits for a row lock.
+ * A hold locked by another writer is not adopted on this pass (the statement
+ * fails with lock_not_available and the backfill counts it); the person bound
+ * keeps the card and chat actionable meanwhile. Never a remote call in the tx. */
+export const SYSTEM_RECOVERY_ADOPTION_LOCK_TIMEOUT_MS = 2_000;
+export const adoptionLockTimeoutSql = sql.raw(`set local lock_timeout = '${SYSTEM_RECOVERY_ADOPTION_LOCK_TIMEOUT_MS}ms'`);
+
 export async function adoptSystemRecovery(db: Db, source: WorkspaceRecoverySourceIdentity) {
   return db.transaction(async tx => {
+    await tx.execute(adoptionLockTimeoutSql);
     const [existing] = await tx.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions)
       .where(and(eq(issueRecoveryActions.companyId, source.companyId), eq(issueRecoveryActions.id, source.actionId),
         eq(issueRecoveryActions.sourceIssueId, source.issueId))).for("update");

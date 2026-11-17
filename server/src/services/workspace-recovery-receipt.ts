@@ -80,25 +80,31 @@ export function recoveredWorkMessage(runStatus: string | null | undefined, retry
  * same rule as the run projection (workspace-restore-recovery-state.ts). */
 export function workspaceRestoreDelayed(state: { status: string } | undefined, evidence: Record<string, unknown>,
   holdWrittenAt: Date | null | undefined, now = Date.now()) {
-  return Boolean(state && (state.status === "queued" || state.status === "recovering")
-    && evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
+  // restore-card8 item 5: the bound covers every owed hold still in progress, as
+  // the run projection does: not adopted yet (no workspaceRecovery: queued, J4/J7),
+  // queued/recovering, or waiting on an unconfirmed stop (J5).
+  const inProgress = state
+    ? state.status === "queued" || state.status === "recovering" || Boolean(exhaustedStopWait(readSystemRecovery(evidence), evidence))
+    : !readWorkspaceRecovery(evidence);
+  return Boolean(inProgress && evidence[WORKSPACE_RESTORE_PENDING_KEY] === true
     && holdWrittenAt && holdWrittenAt.getTime() + WORKSPACE_RESTORE_PERSON_BOUND_MS <= now);
 }
 
 export function savedWorkOffersRetry(state: { status: string; canRetry: boolean } | undefined,
   runStatus: string | null | undefined, workspaceRepairRequired: boolean, evidence: Record<string, unknown>,
   holdWrittenAt?: Date | null) {
-  if (!state || (runStatus !== "failed" && runStatus !== "timed_out")) return false;
-  if (state.status === "recovered") return !workspaceRepairRequired;
+  if (runStatus !== "failed" && runStatus !== "timed_out") return false;
+  if (state?.status === "recovered") return !workspaceRepairRequired;
   // Past the person bound Retry is offered while the worker continues: the
   // accepted Retry is a durable intent bound to this hold (task-retry.ts), so it
   // continues from the last saved version and the hold keeps the files.
   if (workspaceRestoreDelayed(state, evidence, holdWrittenAt)) return true;
+  if (!state) return false;
   const ownerRecovery = evidence.workspaceOwnerRecovery as { state?: unknown } | undefined;
   const recovery = readSystemRecovery(evidence);
   // Waiting on an unconfirmed stop: Retry cannot release it. The one Retry
   // authority decides it (its restoreStopWait fact), as for the chat and the API.
-  if (!decideRetryAuthority({ restoreStopWait: restoreStopWaitFact(evidence), retrySource: true }).canRetry) return false;
+  if (!decideRetryAuthority({ restoreStopWait: restoreStopWaitFact(evidence, holdWrittenAt), retrySource: true }).canRetry) return false;
   // restore-card8 (rf-3 J8): an agent stop with every re-arm spent is not that
   // wait (card7's carve-out): it is re-checked no more, so it keeps the Retry
   // the chat and the API offer. Other evidence re-checks still re-arm by themselves.
