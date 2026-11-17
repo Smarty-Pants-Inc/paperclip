@@ -20,6 +20,7 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
+import { retireReplacedReusableSandboxLeaseAfterRestore } from "../services/reusable-sandbox-resume-replacement.ts";
 
 // Durable harness-backup verification has its own tests. Here it is a boundary:
 // a lease-bound stamp verifies, a missing stamp (an older release's lease) does not.
@@ -198,17 +199,25 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
 
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
-      previousProviderLeaseId: seeded.providerLeaseId });
+      previousProviderLeaseId: seeded.providerLeaseId, retirePreviousLeaseAfterRestore: seeded.lease.id });
     const resumes = call.mock.calls.filter(([, method]) => method === "environmentResumeLease");
     // Retried inside the run, then stopped well short of the five-minute deadline.
     expect(resumes.length).toBeGreaterThan(1);
     for (const [, , , timeoutMs] of resumes) expect(timeoutMs).toBeLessThanOrEqual(90_000);
-    // The old sandbox is handed to the cleanup sweep; no synchronous destroy
-    // delays the first turn.
+    // No synchronous destroy delays the first turn, and nothing is marked
+    // for cleanup before the executor acknowledges the restore on the new box.
     expect(call).not.toHaveBeenCalledWith(seeded.pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
+    await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({
+      status: "retained", cleanupStatus: null, providerLeaseId: seeded.providerLeaseId,
+    });
+    // The executor's restore acknowledgement hands the old sandbox to the cleanup sweep, once.
+    await expect(retireReplacedReusableSandboxLeaseAfterRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: seeded.runId })).resolves.toBe(true);
     await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({
       status: "pending_cleanup", cleanupStatus: "failed", failureReason: "resume_failed",
     });
+    await expect(retireReplacedReusableSandboxLeaseAfterRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: seeded.runId })).resolves.toBe(false);
   });
 
   it("keeps the preserved lease when the replacement cannot be created, so the next attempt replaces it", async () => {
@@ -233,10 +242,13 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const retry = worker(seeded, async () => { step(); return await refuse(); });
     const acquired = await acquire(seeded, retry.runtime, retryRunId);
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
-      previousProviderLeaseId: seeded.providerLeaseId });
+      previousProviderLeaseId: seeded.providerLeaseId, retirePreviousLeaseAfterRestore: seeded.lease.id });
     // The replacement carries the verified harness backup, so the session restores
     // without waiting for the old sandbox to be deleted.
     expect(acquired.lease.metadata?.nativeHarnessBackup).toMatchObject({ authorizedProviderLeaseId: seeded.providerLeaseId });
+    await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({ status: "retained" });
+    await retireReplacedReusableSandboxLeaseAfterRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: retryRunId });
     await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({ status: "pending_cleanup" });
   });
 
@@ -250,7 +262,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     });
     const acquired = await acquire(seeded, runtime);
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
-      previousProviderLeaseId: seeded.providerLeaseId });
+      previousProviderLeaseId: seeded.providerLeaseId, retirePreviousLeaseAfterRestore: seeded.lease.id });
     // A 409 reports the idle sandbox busy, so the run waits up to the idle
     // resume budget (real retry delays) before it replaces it.
   }, 60_000);
@@ -271,11 +283,16 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
-      previousProviderLeaseId: seeded.providerLeaseId, cause: "native_predecessor_retirement_unproven" });
+      previousProviderLeaseId: seeded.providerLeaseId, cause: "native_predecessor_retirement_unproven",
+      retirePreviousLeaseAfterRestore: seeded.lease.id });
     // The new sandbox restores the saved session from the verified backup.
     expect(acquired.lease.metadata?.nativeHarnessBackup).toMatchObject({ authorizedProviderLeaseId: seeded.providerLeaseId });
     expect(call).not.toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.anything(), expect.anything());
-    // The old sandbox, with the Runner on it, is kept for the cleanup sweep.
+    // The old sandbox, with the Runner on it, goes to the cleanup sweep only
+    // after the restore on the new sandbox is acknowledged.
+    await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({ status: "retained" });
+    await retireReplacedReusableSandboxLeaseAfterRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: seeded.runId });
     await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({ status: "pending_cleanup" });
   });
 
