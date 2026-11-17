@@ -140,7 +140,13 @@ const support = await getEmbeddedPostgresTestSupport();
     await Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true })));
   });
 
-  type Variant = { edit: boolean; settled: boolean; exportFails: boolean };
+  type Variant = { edit: boolean; settled: boolean; exportFails: boolean;
+    /** r4 WORK (live e9608e9c): NSE's settle of the person's Stop on the coordinator. "settled" =
+     * terminal_failure/native_retry_cancelled, no lease owner, no result (NSE :14280-14290), written
+     * whether the warm session was retained or CLOSED; "owned" = a coordinator still owned (not settled). */
+    coordinator?: "settled" | "owned";
+    /** The live row's executionCancellation state at the boundary (default acknowledged). */
+    executionCancellationState?: string };
   async function stopMidTurn(variant: Variant) {
     const root = await mkdtemp(join(tmpdir(), "paperclip-cancel-finalize-"));
     roots.push(root);
@@ -204,7 +210,8 @@ const support = await getEmbeddedPostgresTestSupport();
       const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: stoppedAt,
         resultJson: { stopReason: "cancelled", cancelledByActorType: "user", cancelledByUserId: "board",
-          executionCancellation: { state: "acknowledged" },
+          executionCancellation: variant.executionCancellationState === "requested"
+            ? { state: "requested", requestedAt: stoppedAt.toISOString() } : { state: "acknowledged" },
           nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
             reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
@@ -212,6 +219,11 @@ const support = await getEmbeddedPostgresTestSupport();
           ...(variant.settled ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
             companyId, issueId, runId, sessionId, bootId: "boot", generation: 1 } } : {}) },
       }).where(eq(heartbeatRuns.id, runId));
+      if (variant.coordinator) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
+        phase: variant.coordinator === "settled" ? "terminal_failure" : "observed",
+        failureCode: variant.coordinator === "settled" ? "native_retry_cancelled" : null,
+        leaseOwner: variant.coordinator === "settled" ? null : "live-owner",
+        controllerBootId: "boot", controllerGeneration: 1 });
       runnerState.fail = variant.exportFails;
       callsAtStop = runnerState.calls;
       throw stop;
@@ -323,6 +335,63 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
     expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toBeUndefined();
     expect(f.events.filter(event => event.eventType.startsWith("workspace_export_"))).toEqual([]);
+    expect(f.excluded).toBe(true);
+  }, 60_000);
+
+  // ---- pl/r4-work: the live r4 row (run e9608e9c, box bx_jn26j28b -> successor dfd8e50c on spare bx_c9vw2pju) ----
+  /** The acquisition reuse filter (environment-runtime.ts:2113-2117) over the stopped run's box and a
+   * pre-warmed spare reusable lease of the same agent/issue: which boxes the +0 successor may take. */
+  async function boxRelationship(f: Awaited<ReturnType<typeof stopMidTurn>>) {
+    const spareLeaseId = randomUUID(), spareProviderLeaseId = `bx_spare${randomUUID().slice(0, 4)}`;
+    await db.insert(environmentLeases).values({ id: spareLeaseId, companyId: f.companyId, issueId: f.issueId,
+      provider: "daytona", providerLeaseId: spareProviderLeaseId, status: "retained", cleanupStatus: "success",
+      leasePolicy: "reuse_by_environment", metadata: {} });
+    const candidates = await db.select().from(environmentLeases)
+      .where(sql`${environmentLeases.id} in (${f.leaseId}, ${spareLeaseId})`);
+    const kept: string[] = [];
+    for (const lease of candidates) {
+      if (!await nativeWorkspaceExportPendingForResource(db, lease, f.successorRunId)) kept.push(lease.providerLeaseId!);
+    }
+    return { kept, relationship: kept.includes(f.providerLeaseId) ? "SAME" : "NEW", spareProviderLeaseId };
+  }
+
+  function liveFields(f: Awaited<ReturnType<typeof stopMidTurn>>, relationship: string) {
+    const result = f.stopped.resultJson as Record<string, any>;
+    const profile = f.stoppedRunProfile as Record<string, any>;
+    return { status: f.stopped.status, errorCode: f.stopped.errorCode,
+      executionCancellationState: result?.executionCancellation?.state,
+      nativeRetainedIdleCheckpoint: profile?.nativeRetainedIdleCheckpoint ?? "ABSENT",
+      nativeCancelledWarmExport: profile?.nativeCancelledWarmExport?.state ?? "ABSENT",
+      nativeWorkspaceSyncState: f.reference?.state, boxRelationship: relationship };
+  }
+
+  it("r4 WORK RED: a person's Stop whose warm Pi session was CLOSED (no retained-idle receipt) but settled by NSE on the coordinator: the bounded export finalizes and the +0 successor keeps the SAME box (not the pre-warmed spare), edit sha-equal", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false, coordinator: "settled",
+      executionCancellationState: "requested" });
+    const boxes = await boxRelationship(f);
+    const fields = liveFields(f, boxes.relationship);
+    // eslint-disable-next-line no-console
+    console.log(`R4WORK_FIELDS ${JSON.stringify(fields)}`);
+    // Live r4 (MATCH at base): cancelled / cancelled / requested / ABSENT / ABSENT / prepared / NEW.
+    expect(fields).toEqual({ status: "cancelled", errorCode: "cancelled", executionCancellationState: "requested",
+      nativeRetainedIdleCheckpoint: "ABSENT", nativeCancelledWarmExport: "finalized",
+      nativeWorkspaceSyncState: "finalized", boxRelationship: "SAME" });
+    // No stop writer (person's Stop teardown, 22f's proof-error intent, the warm-expiry sweep, the settle
+    // predicate's reuse filter) meets an unexported turn on this box any more.
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(await nativeWorkspaceExportPendingForResource(db, lease, null)).toBe(false);
+    expect(sha(await readFile(join(f.host, "task.txt"), "utf8"))).toBe(sha(EDIT));
+    expect(await successorOnSameBox(f)).toBe("adopt_remote");
+    expect(sha(await readFile(join(f.box, "task.txt"), "utf8"))).toBe(sha(EDIT));
+  }, 60_000);
+
+  it("r4 WORK guard: a coordinator still OWNED (the Stop is not settled) runs no export, as before", async () => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false, coordinator: "owned",
+      executionCancellationState: "requested" });
+    expect(f.runnerState.calls).toBe(f.callsAtStop);
+    expect(f.reference).toMatchObject({ state: "prepared", finalHostSha256: null });
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toBeUndefined();
     expect(f.excluded).toBe(true);
   }, 60_000);
 
