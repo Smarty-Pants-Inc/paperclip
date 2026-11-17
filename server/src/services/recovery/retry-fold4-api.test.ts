@@ -9,6 +9,7 @@ import { UNRESTORED_FILES_NEXT_ACTION } from "../legacy-execution-recovery.js";
 import { requestTaskRetry } from "../task-retry.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
+import { heartbeatService } from "../heartbeat.js";
 
 // retry-fold4 (rf-3 finding A, judge R8 general): the Retry API reads the ONE
 // authority's decision. Every Retry the card does not offer, a fresh click OR
@@ -49,17 +50,40 @@ describe("retry fold 4: the Retry API refuses every Retry the card does not offe
   const retry = (f: Awaited<ReturnType<typeof seed>>, idempotencyKey = randomUUID()) => requestTaskRetry({ db,
     companyId: f.companyId, issueId: f.issueId, actorId: "board", actorSource: "local_implicit", observedRunId: f.runId, idempotencyKey });
 
-  it("R8/A: a Retry while the assignee is PAUSED is refused with the card's one instruction (Resume), nothing saved", async () => {
+  // SUPERSEDED BY REPLACEMENT (RFL record SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117):
+  // upstream's workspace-recovery-warm-handoff.test.ts "wakes physical
+  // preservation from HTTP Retry ..." pauses the agent and expects the Retry
+  // ACCEPTED (202) for file preservation with no provider turn. Was: 409
+  // agent_paused, nothing saved.
+  it("(superseded by replacement: upstream paused-Retry preservation, RFL record SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117) R8/A: a Retry while the assignee is PAUSED is refused with the card's one instruction (Resume), nothing saved", async () => {
     const f = await seed();
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
     const card = await getExecutionBlocker(db, f.companyId, f.issueId);
     expect(card).toMatchObject({ canRetry: false, nextAction: PAUSED });
-    const before = await db.select().from(agentWakeupRequests);
-    await expect(retry(f)).rejects.toMatchObject({ status: 409,
-      details: { code: "retry_not_available", reason: "agent_paused", userAction: "resume", nextAction: "Resume this agent to continue." } });
-    expect(await db.select().from(agentWakeupRequests)).toEqual(before);
+    const key = randomUUID();
+    const answer = await retry(f, key);
+    // Accepted for preservation only, in the card's paused words (Resume): never
+    // "working", never a retry countdown.
+    expect(answer).toMatchObject({ accepted: true, held: { reason: "agent_paused", message: PAUSED } });
+    expect(JSON.stringify(answer)).not.toMatch(/working|Trying again/i);
+    expect(await retry(f, key)).toMatchObject({ accepted: true, requestId: answer.requestId,
+      held: { reason: "agent_paused", message: PAUSED } });
     const presentation = await taskInterruptionPresentation(db, await f.issue());
     expect(presentation).toMatchObject({ canRetry: false, userAction: "resume" });
+    expect(presentation?.retryAdmission).toBeUndefined();
+  });
+
+  it("fam-retry5 NEGATIVE: a paused agent's accepted Retry starts no run (no heartbeat_run row, no provider turn) while paused", async () => {
+    const f = await seed();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agentId));
+    const answer = await retry(f);
+    expect(answer).toMatchObject({ accepted: true, held: { reason: "agent_paused" } });
+    const heartbeat = heartbeatService(db);
+    await Promise.allSettled([heartbeat.resumeTaskRetry(f.companyId, answer.requestId!), heartbeat.resumeQueuedRuns()]);
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+    expect(runs.map(run => run.id)).toEqual([f.runId]);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, answer.requestId!));
+    expect(wake?.runId ?? null).toBeNull();
   });
 
   // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
