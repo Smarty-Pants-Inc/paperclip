@@ -105,6 +105,7 @@ import {
   CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON,
   findHeartbeatRunCompletionComment,
   isExternalChatPresentationContext,
+  isPendingCommitPresentation,
   readAcceptedTaskContinuationSummary,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
@@ -1110,7 +1111,9 @@ async function recoverCommittedNativeChatResponseInScope(
       const recordedPresentation = record(record(run.resultJson).presentationDecision);
       if (
         typeof recordedPresentation.commentId === "string" ||
-        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create") ||
+        (recordedPresentation.commentAction !== undefined && recordedPresentation.commentAction !== "create" &&
+          // A provisional live none recorded before this commit is still pending.
+          !isPendingCommitPresentation(recordedPresentation)) ||
         record(run.contextSnapshot).skipIssueComment === true
       )
         return false;

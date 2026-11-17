@@ -2,6 +2,7 @@ import { alias, QueryBuilder } from "drizzle-orm/pg-core";
 import { and, asc, eq, exists, gt, inArray, isNotNull, isNull, ne, notExists, or, sql } from "drizzle-orm";
 import { chatActions, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, nativeRunResults, statusDecisions, statusDecisionEffects } from "@paperclipai/db";
 import type { NativeResponsePresentationScope } from "../native-response-presentation-notifications.js";
+import { NATIVE_PRESENTATION_PENDING_COMMIT } from "../heartbeat-run-summary.js";
 
 const laterDecisions = alias(statusDecisions, "later_status_decisions");
 
@@ -32,7 +33,10 @@ export function nativeResponsePresentationCandidates(scope?: NativeResponsePrese
       isNotNull(heartbeatRuns.finishedAt), eq(nativeRunFinalizations.phase, "committed"), isNull(nativeRunFinalizations.leaseOwner),
       eq(nativeRunResults.schemaStatus, "accepted"),
       sql`jsonb_typeof(${heartbeatRuns.resultJson} #> '{presentationDecision,commentId}') is distinct from 'string'`,
-      sql`coalesce(${heartbeatRuns.resultJson} #> '{presentationDecision,commentAction}', '"create"'::jsonb) = '"create"'::jsonb`,
+      or(sql`coalesce(${heartbeatRuns.resultJson} #> '{presentationDecision,commentAction}', '"create"'::jsonb) = '"create"'::jsonb`,
+        // A live none recorded before its finalization committed stays pending.
+        sql`${heartbeatRuns.resultJson} #> '{presentationDecision,commentAction}' = '"none"'::jsonb
+          and coalesce(${heartbeatRuns.resultJson} #> '{presentationDecision,reasonCodes}', '[]'::jsonb) @> ${JSON.stringify([NATIVE_PRESENTATION_PENDING_COMMIT])}::jsonb`),
       // A reply whose bounded publication retries are exhausted stays visible
       // as a named failure instead of being retried forever.
       sql`${heartbeatRuns.resultJson} #>> '{responsePublication,state}' is distinct from 'failed'`,
