@@ -1134,16 +1134,48 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
-  it("JUDGE no person comment card Retry is not just a re-poke", async () => {
+  // Superseded by replacement (RFL record SUPERSEDE-B-NOCOMMENT-RETRY-1117; rf-3 ruling 11-17): the judge's
+  // original body asserted the OLD run itself starts. The bar is the opposite: Retry cancels the stuck run
+  // while queued and starts ONE fresh assignment run. Title kept; body replaced in place with the bar.
+  it("(superseded by replacement: cancel stuck run + one fresh run, RFL record SUPERSEDE-B-NOCOMMENT-RETRY-1117) JUDGE no person comment card Retry is not just a re-poke", async () => {
     const f = await judgeQueued(false), heartbeat = heartbeatService(db);
     const before = await taskInterruptionPresentation(db, await issue(f.issueId));
     expect(before).toMatchObject({ state:"failed",canRetry:true,observedRunId:f.queued.id });
-    const response = await request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
+    const app = retryRouteApp();
+    const response = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
     await heartbeat.drainActiveRunExecutions();
     const after = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const others = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId)))
+      .filter(r => r.id !== f.source.id && r.id !== f.queued.id);
     const old = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.queued.id)))[0]!;
-    console.info(JSON.stringify({ judgeNoMessage:{ route:response.status,receipt:response.body,before,after,old:{id:old.id,status:old.status,startedAt:old.startedAt} } }));
-    expect(old.startedAt, "the reachable person-facing Retry must change the stalled path").not.toBeNull();
+    const fresh = await others();
+    console.info(JSON.stringify({ judgeNoMessageSuperseded:{ route:response.status,receipt:response.body,before,after,old:{id:old.id,status:old.status,startedAt:old.startedAt},
+      fresh: fresh.map(r => ({ id:r.id,status:r.status,startedAt:r.startedAt,retryOfRunId:r.retryOfRunId,context:r.contextSnapshot })) } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    expect(old, "the old run is cancelled while still queued").toMatchObject({ status:"cancelled", startedAt:null });
+    expect(fresh, "exactly ONE fresh assignment run").toHaveLength(1);
+    expect(fresh[0]!.startedAt, "the fresh run started").not.toBeNull();
+    expect(fresh[0]!.retryOfRunId, "no retry ancestry").toBeNull();
+    expect(fresh[0]!.contextSnapshot).toMatchObject({ issueId:f.issueId, wakeReason:"issue_assigned" });
+    expect(fresh[0]!.contextSnapshot, "only the assignment: no carried comment").not.toHaveProperty("wakeCommentIds");
+    expect(fresh[0]!.contextSnapshot, "only the assignment: no carried comment").not.toHaveProperty("wakeCommentId");
+    const { context } = await providerInputFor(fresh[0]!, f.issueId);
+    expect((context.paperclipWake as Record<string, unknown> | undefined)?.reason, "the input is the assignment").toBe("issue_assigned");
+    const second = await request(app).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await others()).map(r => r.id), "a second press starts nothing").toEqual([fresh[0]!.id]);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const pressed = Date.now();
+    try {
+      for (const later of [600_000, 1_200_000]) {
+        vi.setSystemTime(pressed + later);
+        await heartbeat.resumeQueuedRunsAfterDrain({ companyId }); await heartbeat.drainActiveRunExecutions();
+        const [oldLater] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.queued.id));
+        expect(oldLater, `the old run never starts (+${later / 60_000} min)`).toMatchObject({ status:"cancelled", startedAt:null });
+      }
+    } finally { vi.useRealTimers(); }
+    console.info(JSON.stringify({ judgeNoMessageSupersededOnce:{ second:second.status, runs:(await others()).map(r => r.id) } }));
+    expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
   },120_000);
 
   // fix12 item 1 (rf-3 (1), RFL bar as fix10b): a person's ASSIGNMENT with no carried comment reaches
@@ -1189,6 +1221,31 @@ suite("fresh-continuation fallback", () => {
     console.info(JSON.stringify({ fix12NoCommentOnce: { second: second.status, secondBody: second.body, runs: (await others()).map(r => r.id) } }));
     expect(oldAfter, "the old run never starts later").toMatchObject({ status: "cancelled", startedAt: null });
     expect((await others()).map(r => r.id), "a second press and later passes start nothing").toEqual([fresh[0]!.id]);
+    // A task that is no longer this agent's open work (closed, backlog, assigned to another agent) has no
+    // input to carry: Retry cancels nothing and starts nothing (task-retry.ts startPersonQueuedRunFresh).
+    const [otherAgent] = await db.insert(agents).values({ companyId, name: "Other assignee", status: "idle", adapterType: "paperclip_runner" }).returning();
+    // A person-agent conversation cannot be closed or reassigned (issues_conversation_identity_check): those two
+    // leave the conversation as the product does, and become an ordinary task.
+    const leaveConversation = { conversationAgentId: null, conversationUserId: null, conversationState: null };
+    for (const [label, change] of [["closed", { status: "done", ...leaveConversation }], ["backlog", { status: "backlog" }],
+      ["another assignee", { assigneeAgentId: otherAgent!.id, ...leaveConversation }]] as const) {
+      // One person-agent conversation per company: retire the previous fixture's conversation identity.
+      await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+        .where(and(eq(issues.companyId, companyId), eq(issues.conversationAgentId, agentId)));
+      const g = await judgeQueued(false);
+      await db.update(issues).set(change as never).where(eq(issues.id, g.issueId));
+      const press = await request(app).post(`/api/issues/${g.issueId}/retry`).send({ observedRunId: g.queued.id, idempotencyKey: randomUUID() });
+      await heartbeat.drainActiveRunExecutions();
+      const rows = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, g.issueId));
+      const [kept] = rows.filter(r => r.id === g.queued.id);
+      const started = rows.filter(r => r.id !== g.source.id && r.startedAt);
+      const created = rows.filter(r => r.id !== g.source.id && r.id !== g.queued.id);
+      console.info(JSON.stringify({ fix13NotOpenWork: { label, route: press.status, body: press.body,
+        old: { status: kept!.status, startedAt: kept!.startedAt, errorCode: kept!.errorCode }, created: created.map(r => r.id), started: started.map(r => r.id) } }));
+      expect(created, `${label}: no fresh run`).toEqual([]);
+      expect(started, `${label}: nothing started`).toEqual([]);
+      expect(kept!.errorCode, `${label}: the Retry did not replace the run`).not.toBe("person_queued_run_replaced");
+    }
   }, 120_000);
 
   // fix12 item 2b (rf-3 22:23Z): the external-bot gate (heartbeat/queue.ts claimQueuedRun
