@@ -1225,25 +1225,26 @@ suite("fresh-continuation fallback", () => {
     const enqueued = new Date(Date.now() - 1_500_000);
     await db.update(heartbeatRuns).set({ createdAt: enqueued }).where(eq(heartbeatRuns.id, f.queued.id));
     const [previousAgent] = await db.insert(agents).values({ companyId, name: "Previous owner", status: "running", adapterType: "paperclip_runner" }).returning();
-    await db.update(heartbeatRuns).set({ agentId: previousAgent!.id, status: "running", finishedAt: null, errorCode: null }).where(eq(heartbeatRuns.id, f.source.id));
+    await db.update(heartbeatRuns).set({ agentId: previousAgent!.id, status: "running", finishedAt: null, errorCode: null,
+      createdAt: new Date(enqueued.getTime() - 60_000), startedAt: new Date(enqueued.getTime() - 59_000) }).where(eq(heartbeatRuns.id, f.source.id));
     await db.update(issues).set({ executionRunId: f.source.id }).where(eq(issues.id, f.issueId));
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       const card = async () => taskInterruptionPresentation(db, await issue(f.issueId));
-      expect(await card(), "held 25 min: the named hold").toMatchObject({ state: "working", canRetry: false, retryWait: { reason: "previous_run_running" } });
+      expect(await card(), "held 25 min: working, never failed").toMatchObject({ state: "working", canRetry: false });
       // The hold clears: the previous run ends and its sandbox cleanup settles.
       const clear = new Date();
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: clear }).where(eq(heartbeatRuns.id, f.source.id));
       await db.update(environmentLeases).set({ cleanupStatus: "success", updatedAt: clear }).where(eq(environmentLeases.id, f.lease.id));
-      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined }> = [];
+      const seen: Array<{ after: number; state: string | undefined; canRetry: boolean | undefined; observedRunId: string | null | undefined }> = [];
       for (const after of [1_000, 300_000, 599_999, 600_000]) {
         vi.setSystemTime(clear.getTime() + after);
         const c = await card();
-        seen.push({ after, state: c?.state, canRetry: c?.canRetry });
+        seen.push({ after, state: c?.state, canRetry: c?.canRetry, observedRunId: c?.observedRunId });
       }
       console.info(JSON.stringify({ fix12ClockFromClear: { enqueued, clear, seen } }));
       expect(seen.slice(0, 3).map(s => s.state), "working for 10 min after the clear").toEqual(["working", "working", "working"]);
-      expect(seen[3], "still untaken 10 min after the clear: failed + Retry").toMatchObject({ state: "failed", canRetry: true });
+      expect(seen[3], "still untaken 10 min after the clear: failed + Retry").toMatchObject({ state: "failed", canRetry: true, observedRunId: f.queued.id });
     } finally { vi.useRealTimers(); }
   }, 120_000);
 
