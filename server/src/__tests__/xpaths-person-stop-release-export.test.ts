@@ -125,7 +125,11 @@ describe.skipIf(!support.supported)("adopt-stopu-xpaths: a person's Stop never s
       startedAt: new Date(stoppedAt.getTime() - 60_000), finishedAt: stoppedAt,
       controllerLeaseExpiresAt: new Date(stoppedAt.getTime() - 1),
       contextSnapshot: { issueId, taskId: issueId },
-      runnerProfileJson: { nativeResourceDisposition: "keep_running" },
+      runnerProfileJson: { nativeResourceDisposition: "keep_running",
+        // pl/r4-work3 (a): NSE's settle of the person's Stop recorded the closed
+        // session's clean close (the stopped turn's tools are gone) before the crash.
+        nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1", companyId, issueId, runId,
+          sessionId: null, clean: true, at: stoppedAt.toISOString() } },
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "row20-person", nativeCancellation: {
         schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
         reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
