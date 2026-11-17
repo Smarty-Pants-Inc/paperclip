@@ -55,7 +55,8 @@ import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { createRunUsageRecorder } from "../usage-receipts.js";
 import { syncPluginTaskCredentialHandoff, registerPluginTaskCredentialHandoff } from "../plugin-task-credential-writeback.js";
 import { resolvePluginTaskResume } from "../environment-task-runtime.js";
-import { environmentTaskOperationSchema, environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { environmentTaskOperationSchema, environmentTaskResultSchema, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { sandboxStateTransitionFailure } from "../reusable-sandbox-resume-replacement.js";
 import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
@@ -14410,6 +14411,21 @@ async function readRemoteRunnerProviderState(input: {
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
 const REMOTE_RUNNER_PROCESS_POLL_MS = 1_000;
+// A live sandbox may archive for longer than one observation window. Cap the
+// total failed-observation time retained by this monitor, not each transition;
+// healthy reads and supervision parking do not replenish this allowance.
+const REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS = 10 * 60_000;
+
+function remoteRunnerSandboxTransitionRefusal(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if ((cause as { code?: unknown }).code === "boat_sandbox_state_transition") return true;
+    // Worker RPC drops string codes. Use its typed error envelope and the
+    // existing transition classifier, never arbitrary transport error text.
+    if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR &&
+        sandboxStateTransitionFailure(cause)) return true;
+  }
+  return false;
+}
 
 // Linux boot identity plus start ticks identifies a process generation across
 // PID reuse. exec preserves both the launch shell's PID and its start ticks.
@@ -14946,16 +14962,19 @@ export function createRemoteRunnerProcessLauncher(input: {
         attributes: { identitySource: "remote_marker", detached: true },
       });
 
+      let retainedTransitionMs = 0;
       while (true) {
         const supervision = input.sandboxRetention?.supervision;
         await supervision?.waitUntilActive();
         // Controller detach parks supervision without fabricating remote exit.
         if (supervision?.detached) return await new Promise<Awaited<RunnerProcessHandle["completion"]>>(() => {});
         const monitorGeneration = supervision?.generation;
+        const observationStartedAt = Date.now();
         const observed = await readRemoteRunnerRecoveryProbe({
           runner,
           stage: "process_verification",
-          deadline: Date.now() + REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+          deadline: observationStartedAt + Math.min(REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+            REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs),
           readOnly: true,
           request: {
             command: "sh",
@@ -14971,9 +14990,20 @@ export function createRemoteRunnerProcessLauncher(input: {
             ],
             bypassSession: true,
           },
-        }).catch(error => {
+        }).catch(async error => {
           if (supervision && !supervision.accepts(monitorGeneration!)) return null;
-          throw error;
+          if (pendingSignal || !remoteRunnerSandboxTransitionRefusal(error)) throw error;
+          retainedTransitionMs += Math.max(0, Date.now() - observationStartedAt);
+          if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw error;
+          const waitStartedAt = Date.now();
+          // There is no sandbox-state event on this command boundary. Reuse
+          // the active-process safety-net cadence; do not infer exit or launch.
+          await new Promise<void>(resolve => setTimeout(resolve, Math.min(REMOTE_RUNNER_PROCESS_POLL_MS,
+            REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs)));
+          if (supervision && !supervision.accepts(monitorGeneration!)) return null;
+          retainedTransitionMs += Math.max(0, Date.now() - waitStartedAt);
+          if (pendingSignal || retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw error;
+          return null;
         });
         if (supervision && !supervision.accepts(monitorGeneration!)) continue;
         if (!observed) continue;
