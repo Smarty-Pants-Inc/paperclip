@@ -3,7 +3,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join, relative } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -15,7 +16,7 @@ import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/
 import { createIsolatedTestHome } from "../../__tests__/helpers/isolated-test-home.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
-import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter } from "./native-runner-checkpoint.js";
+import { loadNativeRunnerCheckpoint, nativeRunnerCheckpointWriter, restoreNativeRunnerCheckpoint } from "./native-runner-checkpoint.js";
 import { createNativeControllerRecovery, NativeControllerRecoveryWaitingError, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import { currentNativeControllerIdentity } from "./native-restart-recovery.js";
 import { lockSourceRecoveryCoordinators } from "./native-source-recovery-ownership.js";
@@ -25,6 +26,7 @@ import { recordTaskStopPending } from "../recovery/stop-pending.js";
 import { recoveryService } from "../recovery/service.js";
 import { nativeUserStopRecoveryHeld } from "./native-user-stop-settlement.js";
 import { FRESH_THREAD_STARTED_NOTE } from "./fresh-thread-stop-gate.js";
+import { readBackQuarantineRecheck, repairStopOnlyQuarantinedCopies } from "./quarantined-stop-copies.js";
 import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
@@ -2007,5 +2009,93 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     }[scenario]);
     expect(await quarantined()).toHaveLength(scenario === "live controller lease" ? 0 : expectedQuarantine);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
+  }, 60_000);
+
+  /** quar-oneoff (RFL + rf-3): an image before s6409 refused the Stop
+   * follow-up with journal_commands_unsettled(runner.suspend.pending) and moved
+   * the projected root into quarantine (quarantineRunnerdStateRoot, reason
+   * identity_indeterminate). Reproduce exactly that rename of the projected
+   * root. */
+  async function quarantineLikePreS6409(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
+    // The projection a fresh launch makes from the stopped run's checkpoint.
+    const root = scopedRunnerdStateRoot(prior.executionFor(prior.runId));
+    expect(await restoreNativeRunnerCheckpoint(db, { companyId, issueId: prior.issueId, runId: prior.runId }, root,
+      prior.native.normalizedSessionId)).not.toBeNull();
+    const name = `${basename(root)}.identity_indeterminate.${Date.now()}.${process.pid}.${randomUUID()}`;
+    await mkdir(join(stateDirectory, "quarantine"), { recursive: true, mode: 0o700 });
+    await rename(root, join(stateDirectory, "quarantine", name));
+    return { name, stateKey: basename(root) };
+  }
+
+  /** Every file under `path` with its bytes: contents byte-identical check. */
+  function treeBytes(path: string): Record<string, string> {
+    const out: Record<string, string> = {};
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir).sort()) {
+        const entry = join(dir, name);
+        if (statSync(entry).isDirectory()) walk(entry);
+        else out[relative(path, entry)] = createHash("sha256").update(readFileSync(entry)).digest("hex");
+      }
+    };
+    walk(path);
+    return out;
+  }
+
+  it("quar-oneoff: a Stop-only quarantined copy is archived byte-identical after its root is re-projected, and the next follow-up is admitted",
+    async () => {
+      const { prior, followUp } = await seedStoppedOwnerWithPendingSuspend();
+      const { name, stateKey } = await quarantineLikePreS6409(prior);
+      const copyBytes = treeBytes(join(stateDirectory, "quarantine", name));
+      expect(Object.keys(copyBytes)).toContain("control-plane/control-plane-state.json");
+      // Dry run counts and changes nothing.
+      const before = treeBytes(stateDirectory);
+      const dry = await repairStopOnlyQuarantinedCopies(db);
+      expect(dry).toMatchObject({ apply: false, matching: 1, archived: 0, blocked: 0 });
+      expect(dry.companies[companyId]!.matching[0]).toMatchObject({ runId: prior.runId, issueId: prior.issueId, agentId,
+        copy: name, reason: "journal_commands_unsettled(runner.suspend.pending)", state: "matching" });
+      expect(treeBytes(stateDirectory)).toEqual(before);
+      // Today (no repair): even after the Stop's suspend settles, the frozen copy keeps the chat dead.
+      let stop = answerSuspendWhileWaiting(followUp);
+      try {
+        expect(await followUp.start()).toBe(stranded("quarantine_journal_commands_unsettled(runner.suspend.pending)"));
+      } finally { stop(); }
+      // Apply: root re-projected from its checkpoint, the copy moved, never altered.
+      const applied = await repairStopOnlyQuarantinedCopies(db, { apply: true });
+      expect(applied).toMatchObject({ apply: true, matching: 1, archived: 1, blocked: 0 });
+      expect(applied.companies[companyId]!.matching[0]).toMatchObject({ copy: name, state: "archived",
+        reprojected: "restored", archivedTo: `quarantine-archive/${name}`, recheck: null });
+      expect(existsSync(join(stateDirectory, "quarantine", name))).toBe(false);
+      expect(treeBytes(join(stateDirectory, "quarantine-archive", name))).toEqual(copyBytes);
+      expect(readBackQuarantineRecheck(stateKey)).toBeNull();
+      // Apply twice = same result.
+      const afterFirst = treeBytes(stateDirectory);
+      const again = await repairStopOnlyQuarantinedCopies(db, { apply: true });
+      expect(again).toMatchObject({ matching: 0, archived: 0, blocked: 0 });
+      expect(treeBytes(stateDirectory)).toEqual(afterFirst);
+      followUp.logs.length = 0;
+      stop = answerSuspendWhileWaiting(followUp);
+      try {
+        expect(await followUp.start()).toBe(ADMITTED);
+      } finally { stop(); }
+      expect(treeBytes(join(stateDirectory, "quarantine-archive", name))).toEqual(copyBytes);
+    }, 90_000);
+
+  it("quar-oneoff: a quarantined copy whose runner.suspend predates the Stop is untouched and still refuses", async () => {
+    const { followUp } = await seedStoppedOwnerWithPendingSuspend("after suspend");
+    // The refusal is not the Stop's own, so even this image quarantines the root.
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    const [name] = await quarantined();
+    const copyBytes = treeBytes(join(stateDirectory, "quarantine", name!));
+    const before = treeBytes(stateDirectory);
+    for (const apply of [false, true]) {
+      const result = await repairStopOnlyQuarantinedCopies(db, { apply });
+      expect(result).toMatchObject({ matching: 0, archived: 0, nonMatching: 1 });
+      expect(result.companies[companyId]!.nonMatchingByReason).toEqual({ unsettled_not_stop_issued: 1 });
+    }
+    expect(treeBytes(stateDirectory)).toEqual(before);
+    expect(treeBytes(join(stateDirectory, "quarantine", name!))).toEqual(copyBytes);
+    expect(await followUp.start()).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    expect(existsSync(join(stateDirectory, "quarantine", name!))).toBe(true);
+    expect(readBackQuarantineRecheck(name!.split(".")[0]!)).toBe("root_missing");
   }, 60_000);
 });
