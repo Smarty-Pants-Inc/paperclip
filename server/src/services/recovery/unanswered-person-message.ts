@@ -480,6 +480,19 @@ export const NATIVE_REPAIR_DEFERRAL_EVENT = "unanswered_message.native_repair_de
 export const PENDING_WAIT_ACTION = "issue.unanswered_message_wait";
 export const PENDING_WAIT_BOUND_MS = 2 * 60_000;
 
+const issueRunSql = (issueId: string) =>
+  or(eq(heartbeatRuns.nativeIssueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`);
+
+/** The shared person-stop exclusion, WHOLE (person-stopped-message.ts): the message's SENDER stopped this
+ * run AND the run had STARTED answering the message. Never one half alone. */
+async function senderStoppedWhileAnswering(q: Db, companyId: string,
+  run: { id: string; status: string; errorCode: string | null; resultJson: Record<string, unknown> | null;
+    contextSnapshot: unknown } | undefined,
+  message: { id: string; authorUserId?: string | null }): Promise<boolean> {
+  if (!run || !message.authorUserId || !stoppedBySender(run, message.authorUserId)) return false;
+  return runStartedAnswering(q, { companyId, runId: run.id, messageId: message.id, contextSnapshot: run.contextSnapshot });
+}
+
 /** The one predicate: run outside the fence to skip the lock in the common
  * case, and again unchanged inside it before writing. Reads only. */
 async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
@@ -518,7 +531,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       // as pending input. The owed earlier message (in discovery's scope, one without a notice first) decides.
       const row = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
         issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
-      const [earlier] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+      const candidates = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
         authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
         eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
         eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
@@ -528,7 +541,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
           and n.issue_id = ${issueComments.issueId}
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false))`,
-          desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+          desc(issueComments.createdAt), desc(issueComments.id)).limit(20);
+      // A message is owed only if its SENDER did not stop the run that had STARTED answering it: the same
+      // whole exclusion as below (senderStoppedWhileAnswering), judged on the newest run that carried it.
+      // R-ONCE makes such a message not ANSWERED; it is still sender-stopped, and owes no resend notice.
+      const carriers = candidates.length ? await q.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+        errorCode: heartbeatRuns.errorCode, resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
+          issueRunSql(issue.id))).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(50) : [];
+      let earlier: (typeof candidates)[number] | undefined;
+      for (const candidate of candidates) {
+        const carrier = carriers.find(run => runCarriesMessage(run.contextSnapshot, candidate.id));
+        if (await senderStoppedWhileAnswering(q, issue.companyId, carrier, candidate)) continue;
+        earlier = candidate;
+        break;
+      }
       if (!earlier) return { kind: "answered" };
       message = earlier;
     }
@@ -552,7 +579,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         issueId: sql`${issueComments.issueId}` })));
     if (held) return { kind: "person_held" };
   }
-  const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
+  const issueRun = issueRunSql(issue.id);
   // The SENDER stopped (Stop or Interrupt) the run that had STARTED answering
   // this message: they ended it on purpose, so "send it again" would redo the
   // stopped work. Only this agent's NEWEST run on the task counts (a later
@@ -566,8 +593,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       resultJson: heartbeatRuns.resultJson, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId), issueRun))
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-    if (newest && stoppedBySender(newest, message.authorUserId) && await runStartedAnswering(q, {
-      companyId: issue.companyId, runId: newest.id, messageId: message.id, contextSnapshot: newest.contextSnapshot })) {
+    if (await senderStoppedWhileAnswering(q, issue.companyId, newest, message)) {
       return { kind: "person_stopped", noticeId: noticed?.id ?? null };
     }
   }
