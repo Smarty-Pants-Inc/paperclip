@@ -49,7 +49,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   // M2-M4 held behind a running turn, then the person's Stop on a warm handed-off box.
-  async function seed(options: { receipt?: boolean } = {}) {
+  async function seed(options: { receipt?: boolean; person?: boolean } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), sourceRunId = randomUUID();
     const stoppedAt = new Date(Date.now() - 60_000);
     await db.insert(companies).values({ id: companyId, name: "Warm Stop", defaultResponsibleUserId: "board", issuePrefix: `W${companyId.replaceAll("-", "")}` });
@@ -59,7 +59,9 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: sourceRunId, companyId, agentId, nativeIssueId: issueId, runtimeMode: "native",
       status: "cancelled", errorCode: "cancelled", contextSnapshot: { issueId }, finishedAt: stoppedAt,
       runnerProfileJson: { nativeResourceDisposition: "keep_running" },
-      resultJson: { stopReason: "cancelled", cancelledByActorType: "user", cancelledByUserId: "board",
+      resultJson: options.person === false
+        // adopt-stopu-bound2 control: a non-person stop (no person's Stop intent).
+        ? { stopReason: "cancelled", cancelledByActorType: "system" } : { stopReason: "cancelled", cancelledByActorType: "user", cancelledByUserId: "board",
         executionCancellation: { state: "acknowledged" },
         nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: sourceRunId, companyId,
           issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
@@ -238,42 +240,128 @@ const support = await getEmbeddedPostgresTestSupport();
       vi.useRealTimers();
       await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 200 });
       expect((await wakeOf(nextId)).status).not.toBe("deferred_issue_execution");
+      expect((await seenBy(f, nextId)).cards).toEqual([]);   // adopt-stopu-bound2: late receipt, no card
       const seen = await import("../__tests__/helpers/person-facing-lines.js").then(m => m.personFacingText(db, f.companyId, f.issueId));
       await evidence(`late ${JSON.stringify({ atStop, rePoll, successors: (await successors(f)).length, willStartAutomatically: seen.text.includes("will start automatically") })}`);
     } finally { vi.useRealTimers(); }
   }, 60_000);
 
-  it("U9 GAP: the receipt never arrives: no deadline; at 2 h the message is still held with the Stop/Send line, no card; Send is held behind remote_cleanup", async () => {
+  // adopt-stopu-bound2: the receipt never arrives. BOUND, by line:
+  //   the environment-cleanup worker sweeps with backoffMs = ENVIRONMENT_CLEANUP_RETRY_MS
+  //   = 5 min (environment-cleanup-work.ts, environment-cleanup-state.ts:7); the
+  //   lease is due at updatedAt + 5 min (recovery.ts sweep cutoff), so the first
+  //   retry runs 5 min after the Stop. Without the receipt that retry raises the
+  //   existing Stop-pending card (PERSON_STOP_CARD_ATTEMPTS = 1) for a person's
+  //   Stop. Stop -> card = 5 min (+ at most one 30 s worker tick).
+  // Counts only this row's lease (other rows' leases in this database stay stuck too).
+  const stuckRuntime = (calls: { n: number; runId: string }, receiptAt?: number) => ({
+    retryPendingSandboxTeardown: async ({ lease }: { lease: { providerLeaseId: string | null; heartbeatRunId: string | null } }) => {
+      if (lease.heartbeatRunId !== calls.runId) throw new Error("sandbox_stop_pending");
+      calls.n += 1;
+      if (receiptAt !== undefined && calls.n >= receiptAt) return { providerLeaseId: lease.providerLeaseId, state: "stopped" };
+      throw new Error("sandbox_stop_pending");   // Boat's stop stuck: no receipt
+    },
+  }) as never;
+  const RETRY_MS = 5 * 60_000;   // ENVIRONMENT_CLEANUP_RETRY_MS
+  const CARD = "execution_stop_pending:escalated";
+  const leaseOf = async (f: { sourceRunId: string }) =>
+    (await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, f.sourceRunId)))[0]!;
+
+  it("U9 BOUND: the receipt never arrives: at 5 min the Stop-pending card + its true line; Send then shows no 'will start automatically'", async () => {
     const f = await seed({ receipt: false });
     const nextId = await heldAfterStop(f);
+    const calls = { n: 0, runId: f.sourceRunId };
     const service = heartbeatService(db);
+    const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls) });
     const t0 = Date.now();
     vi.useFakeTimers({ toFake: ["Date"], now: t0 });
     const trail: unknown[] = [];
     try {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
       await service.resumeRemoteStopComments(run);
-      for (const at of [31_000, 62_000, 10 * 60_000, 2 * 60 * 60_000]) {
-        vi.setSystemTime(t0 + at);
-        await service.resumeQueuedRuns();
-        await recoveryService(db, { enqueueWakeup: vi.fn() } as never).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
-        trail.push({ atMs: at, ...await seenBy(f, nextId) });
-      }
-      // The person presses Send at 2 h.
+      vi.setSystemTime(t0 + 4 * 60_000);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });   // not due yet
+      const before = await seenBy(f, nextId);
+      trail.push({ atMs: 4 * 60_000, attempts: calls.n, ...before });
+      expect(calls.n).toBe(0);
+      expect(before.cards).toEqual([]);
+      vi.setSystemTime(t0 + RETRY_MS);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });   // the first retry: still no receipt
+      const atBound = await seenBy(f, nextId);
+      trail.push({ atMs: RETRY_MS, attempts: calls.n, ...atBound });
+      expect(calls.n).toBe(1);
+      expect(atBound.cards).toEqual([CARD]);
+      expect(atBound.blocker).toContain("Paperclip cannot confirm that the previous execution stopped.");
+      expect(atBound.status).toBe("deferred_issue_execution");
+      // The person presses Send at the bound.
       const queue = await readQueue(f);
       const sent = await request(app(f.companyId)).post(`/api/issues/${f.issueId}/queued-comments/interrupt`)
         .send({ queueId: queue.queueId, revision: queue.revision, targetRunId: null });
-      vi.setSystemTime(t0 + 2 * 60 * 60_000 + 31_000);
+      vi.setSystemTime(t0 + RETRY_MS + 31_000);
       await service.resumeQueuedRuns();
-      const afterSend = { status: sent.status, body: sent.body, successors: (await successors(f)).length,
-        wakes: (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
-          .map(w => ({ id: w.id === nextId ? "next" : w.id === f.queueId ? "queue" : "other", status: w.status,
-            wait: (w.payload as Record<string, any> | null)?.executionWait ?? null })) };
-      trail.push({ afterSend });
+      const wakes = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+        .map(w => ({ id: w.id === nextId ? "next" : w.id === f.queueId ? "queue" : "other", status: w.status,
+          wait: (w.payload as Record<string, any> | null)?.executionWait ?? null }));
+      const afterSendQueue = await readQueue(f);
+      const seen = await personFacingText(db, f.companyId, f.issueId);
+      const lines = [seen.text, sent.body?.executionWait?.message ?? "", afterSendQueue.executionWait?.message ?? "",
+        ...wakes.map(w => w.wait?.message ?? "")].join("\n").toLowerCase();
+      trail.push({ afterSend: { status: sent.status, sendLine: sent.body?.executionWait ?? null,
+        queueLine: afterSendQueue.executionWait ?? null, successors: (await successors(f)).length, wakes } });
+      expect(await successors(f)).toHaveLength(0);
+      expect(wakes.find(w => w.id === "queue")?.wait).toMatchObject({ reason: "execution_stop_pending",
+        message: "Stop pending: Paperclip cannot confirm that the previous execution stopped. Your message is saved." });
+      expect(lines).not.toContain("will start automatically");
+    } finally { vi.useRealTimers(); await evidence(`bound ${JSON.stringify(trail)}`); }
+  }, 60_000);
+
+  it("U9 BOUND, receipt after the card: the retry that gets the receipt retires the card and admits the message once", async () => {
+    const f = await seed({ receipt: false });
+    const nextId = await heldAfterStop(f);
+    const calls = { n: 0, runId: f.sourceRunId };
+    const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls, 2) });
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    try {
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      await heartbeatService(db).resumeRemoteStopComments(run);
+      vi.setSystemTime(t0 + RETRY_MS);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+      expect((await seenBy(f, nextId)).cards).toEqual([CARD]);
+      vi.setSystemTime(t0 + 2 * RETRY_MS + 1_000);
+      await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });   // the receipt lands
+      vi.useRealTimers();
+      expect(calls.n).toBe(2);
+      await vi.waitFor(async () => expect(await successors(f)).toHaveLength(1), { timeout: 15_000, interval: 200 });
+      const after = await seenBy(f, nextId);
+      await evidence(`receiptAfterCard ${JSON.stringify({ attempts: calls.n, ...after, successors: (await successors(f)).length })}`);
+      expect(after.cards).toEqual(["execution_stop_pending:resolved"]);
+      expect(after.status).not.toBe("deferred_issue_execution");
     } finally { vi.useRealTimers(); }
-    await evidence(`never ${JSON.stringify(trail)}`);
-    expect(await successors(f)).toHaveLength(0);
-    expect(trail[3]).toMatchObject({ status: "deferred_issue_execution", wait: null, cards: [], blocker: null, queueLine: STOP_LINE });
+  }, 60_000);
+
+  it("U9 control: a non-person stop's cleanup escalation is unchanged (no card; capped at 5 attempts, then 30 min)", async () => {
+    const f = await seed({ receipt: false, person: false });
+    const calls = { n: 0, runId: f.sourceRunId };
+    const cleanup = heartbeatService(db, { environmentRuntime: stuckRuntime(calls) });
+    const t0 = Date.now();
+    vi.useFakeTimers({ toFake: ["Date"], now: t0 });
+    const capped: unknown[] = [];
+    try {
+      for (let attempt = 1; attempt <= 5; attempt += 1) {
+        vi.setSystemTime(t0 + attempt * (RETRY_MS + 1_000));
+        await cleanup.sweepPendingCleanupLeases({ backoffMs: RETRY_MS });
+        const metadata = (await leaseOf(f)).metadata as Record<string, unknown>;
+        capped.push({ attempts: metadata.pendingCleanupRetryAttempts, warned: metadata.pendingCleanupRetryCapWarned ?? null,
+          retryAfterMinutes: (Number(metadata.pendingCleanupRetryAfterMs) - Date.now()) / 60_000 });
+      }
+      const lease = await leaseOf(f);
+      expect(calls.n).toBe(5);
+      expect(capped.map(row => (row as { retryAfterMinutes: number }).retryAfterMinutes)).toEqual([5, 5, 5, 5, 30]);
+      expect(lease.metadata?.pendingCleanupRetryAfterMs).toBe(t0 + 5 * (RETRY_MS + 1_000) + 30 * 60_000);
+      expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))).toHaveLength(0);
+      await evidence(`control ${JSON.stringify({ attempts: calls.n, capped, retryAfterMs: lease.metadata?.pendingCleanupRetryAfterMs, t0 })}`);
+    } finally { vi.useRealTimers(); }
   }, 60_000);
 
   // adopt-stopu PAUSE row (unit): after a Stop + a successor, the agent's pause is not
