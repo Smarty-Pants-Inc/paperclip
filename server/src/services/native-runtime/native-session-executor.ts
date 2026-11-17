@@ -290,7 +290,6 @@ import {
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
 import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
-import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -361,12 +360,10 @@ import {
   type NativeRunTrace,
 } from "./native-run-trace.js";
 import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js";
-import { parseStrictIsoInstant } from "./strict-iso-instant.js";
 import { readNativeRunWakeRequestedAtMs } from "./native-run-wake-anchor.js";
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { HELD_CONVERSATION_NOTICE_REASON_PREFIX, materializePiSessionRecoveryNotice, piSessionRecovery,
   readUnsupersededHeldConversationNotice, writeRestoreUnavailableContinuationNotice } from "./pi-session-recovery-notice.js";
-import { resolvePredecessorRunnerLease } from "./predecessor-runner-lease.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
@@ -481,9 +478,6 @@ type NativeSessionStartup = {
   unstartedClaim?: { leaseOwner: string; attempt: number; failureCode?: typeof NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE };
   /** A provider session handle was published; a turn may have followed it. */
   sessionPublished?: boolean;
-  /** One fresh identity exchange per attempt, shared by nested admission checks. */
-  resumedSandboxProbeDecision?: Promise<boolean>;
-  warmOwnerIdentitySpan?: NativeRunHistoricalSpan;
   /** Restart recovery reattaches a provider that may already have worked. */
   providerWorkMayPrecede?: boolean;
   executionContext?: NativeExecutionContext;
@@ -754,8 +748,6 @@ type WarmNativeSession = {
   ingressOwner?: NativeWarmIngressOwner;
   onReleased: () => void;
   sessionCheckpointPersisted?: (snapshot: PersistedNativeSession) => void;
-  runnerConnectionLive?: () => boolean;
-  runnerIdentityCheck?: () => Promise<boolean>;
   pluginTaskId?: string;
   sandboxProviderLeaseId?: string;
   /** The sandbox that holds this owner's Runner, when it runs in one. */
@@ -6206,7 +6198,7 @@ const GONE_REMOTE_RUNNER_DELIVERY_COMMANDS = new Set(["run.attach", "semantic_to
   "session.goal.get"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; remoteRunnerStopped?: boolean; parkedGovernedWait?: boolean } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; remoteRunnerGone?: boolean; parkedGovernedWait?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
@@ -6230,10 +6222,7 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     // a delivery that it never acknowledged.
     const goneCommandTypes = options.remoteRunnerGone ? new Set([...LOCAL_RUNNER_LIFECYCLE_COMMANDS, ...GONE_REMOTE_RUNNER_DELIVERY_COMMANDS])
       : LOCAL_RUNNER_LIFECYCLE_COMMANDS;
-    // A remote Runner whose own environment restarted can no longer act on its
-    // lifecycle commands either. Its deliveries and tool answers still count.
-    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone
-      || options.remoteRunnerStopped) && Array.isArray(control.commands)
+    const settledCommands = ((options.localRunner && lifecycle === "not_suspended") || options.remoteRunnerGone) && Array.isArray(control.commands)
       ? commands.filter(command => !goneCommandTypes.has(String(command.type)) || command.status === "completed")
       : commands;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
@@ -6317,7 +6306,7 @@ function retirementReasonName(kind: keyof typeof RETIREMENT_REASON_NAMES, value:
  * settled journal prove it finished, so the same retirement applies. A local
  * warm Runner, or a resumed sandbox that still holds it, keeps the live path.
  */
-export async function inspectFinishedPerTurnRunnerdOwner(input: {
+async function inspectFinishedPerTurnRunnerdOwner(input: {
   db: Db;
   root: string;
   identity: RunnerdDurableIdentity;
@@ -6326,12 +6315,11 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
 }): Promise<{ finished: true; run: typeof heartbeatRuns.$inferSelect; recheck: () => Promise<string | null> }
-  | { finished: false; refused: string; generationLost: boolean }> {
+  | { finished: false; refused: string }> {
   const target = input.runnerExecutionTarget;
   // A resumed sandbox still holds the prior Runner's own lifecycle, which its
   // existing recovery path reads. Plugin tasks own a separate saved checkpoint.
-  let generationLost = false;
-  const refuse = (refused: string) => ({ finished: false as const, refused, generationLost });
+  const refuse = (refused: string) => ({ finished: false as const, refused });
   const lifecycle = input.execution.session.lifecyclePolicy.mode;
   const localRunner = !target || target.kind === "local";
   // Lost warm owners use the same settled-result and exact process/provider
@@ -6341,15 +6329,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner || target.runnerTask) {
       return refuse("target_not_sandbox_runner");
     }
-    // Any resumed box can have lost its idle Runner, even without a provider
-    // restart label. That label is never proof: use the shared exact-generation
-    // probe, including on an ordinary resume of a still-running box.
-    if (resumedSandboxRunner(target)) {
-      if (!await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd, identity: input.identity })) {
-        return refuse("restarted_sandbox_runner_generation_not_lost");
-      }
-      generationLost = true;
-    } else if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
+    if (!["created", "replacement"].includes(target.sandboxLeaseAcquisition?.outcome ?? "")) {
       return refuse(`sandbox_${retirementReasonName("sandboxOutcome", target.sandboxLeaseAcquisition?.outcome)}`);
     }
   }
@@ -6365,15 +6345,14 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
   try { originalBytes = readBoundedNativeFile(statePath, NATIVE_CONTROL_PLANE_STATE_MAX_BYTES, "runner_durable_identity_too_large").toString("utf8"); }
   catch { return refuse("journal_unreadable"); }
   const { binding } = input.execution;
-  const remoteRunnerStopped = !localRunner && resumedSandboxRunner(target);
-  const remoteRunnerGone = !localRunner && !remoteRunnerStopped && await priorRemoteSandboxLeasesEnded(input.db, {
+  const remoteRunnerGone = !localRunner && await priorRemoteSandboxLeasesEnded(input.db, {
     companyId: binding.companyId, runId: identity.runId,
     currentProviderLeaseId: target?.kind === "remote" && target.transport === "sandbox"
       ? target.sandboxLeaseAcquisition?.providerLeaseId : undefined,
   });
   const parkedGovernedWait = remoteRunnerGone && await priorRunParkedOnGovernedWait(input.db, {
     companyId: binding.companyId, issueId: binding.issueId, runId: identity.runId });
-  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait };
+  const projectionOptions = { localRunner, controlBytes: input.projectedControlBytes, remoteRunnerGone, parkedGovernedWait };
   const projection = readSettledRunnerdProjection(input.root, identity, projectionOptions);
   if (projection.refused !== undefined) return refuse(projection.refused);
   const controlBytes = projection.bytes;
@@ -6449,7 +6428,7 @@ export async function inspectFinishedPerTurnRunnerdOwner(input: {
     for (const name of readdirSync(quarantine)) {
       if (!name.startsWith(`${basename(input.root)}.`)) continue;
       if (quarantinedBootstrapOfOwnerHeldNoProviderWork(resolve(quarantine, name), identity, localRunner)) continue;
-      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, remoteRunnerStopped, parkedGovernedWait });
+      const copy = readSettledRunnerdProjection(resolve(quarantine, name), identity, { localRunner, remoteRunnerGone, parkedGovernedWait });
       if (copy.refused !== undefined) return refuse(`quarantine_${copy.refused}`);
     }
   }
@@ -6514,70 +6493,6 @@ async function priorRemoteSandboxLeasesEnded(db: Db, input: {
   } catch {
     return false;
   }
-}
-
-function resumedSandboxRunner(target: AdapterExecutionTarget | null | undefined): boolean {
-  return target?.kind === "remote" && target.transport === "sandbox" && !!target.runner && !target.runnerTask
-    && target.sandboxLeaseAcquisition?.outcome === "resumed";
-}
-
-// Lease reuse is also reported as "resumed" on an ordinary running box. Only
-// a fresh runner-owned command answer on the retained authenticated PRP channel
-// avoids the loss probe. Transport pongs/inbound age are never evidence here.
-// Stopped/archived resumes and cache misses retain the existing probe path.
-async function resumedSandboxRunnerNeedsProbe(input: {
-  execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
-}): Promise<boolean> {
-  const target = input.runnerExecutionTarget;
-  if (!resumedSandboxRunner(target)) return false;
-  const resumedFromState = target?.kind === "remote" && target.transport === "sandbox"
-    ? target.sandboxLeaseAcquisition?.resumedFromState : undefined;
-  if (resumedFromState === "stopped" || resumedFromState === "archived") return true;
-  const entry = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
-  if (!entry) return true;
-  const startup = nativeSessionStartups.get(input.execution.binding.runId);
-  const check = async () => {
-    const startedAtMs = Date.now();
-    let matches = false;
-    try { matches = await entry.runnerIdentityCheck?.() === true; }
-    catch { /* An error is not ownership evidence: keep the generation probe. */ }
-    if (startup) startup.warmOwnerIdentitySpan = {
-      name: "native.controller.warm_owner_identity_check", startedAtMs, endedAtMs: Date.now(),
-      outcome: matches ? "ok" : "failed",
-    };
-    return !matches;
-  };
-  // The startup reservation is run-owned and removed on completion. Never memoize
-  // on the warm entry: the next turn must issue a new unpredictable commandId.
-  return startup ? (startup.resumedSandboxProbeDecision ??= check()) : check();
-}
-
-/** An idle Runner can exit while its sandbox remains running. A resume from a
- * stopped state is likewise only a trigger, never proof of generation loss.
- * Return its exact identity only after the shared process-generation loss probe
- * AND the ordinary finished-owner proofs (committed or cleanly stopped result,
- * released lease, stopped controller, settled journal). The existing authority
- * rotation keeps Pi's history and archives the old Runner; no third retirement
- * rule is introduced. */
-async function provenLostResumedSandboxRunner(input: Omit<Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0], "identity">,
-  holdLostOwner = false)
-  : Promise<DurableRecoveryIdentity | null> {
-  if (!await resumedSandboxRunnerNeedsProbe(input) || !isSafeNativeStateDirectory(input.root)) return null;
-  const identity = readRunnerdDurableIdentity(input.root);
-  if (!identity || !durableIdentityMatchesSession(identity, input.execution) || identity.runId === input.execution.binding.runId) return null;
-  const proof = await inspectFinishedPerTurnRunnerdOwner({ ...input, identity: identity as RunnerdDurableIdentity });
-  if (!proof.finished) {
-    await input.onLog?.("stderr", `[paperclip-runner] restarted sandbox owner ${String(identity.runId)} not retired: ${proof.refused}\n`);
-    if (holdLostOwner && proof.generationLost) {
-      throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${proof.refused}`);
-    }
-    return null;
-  }
-  const changed = await proof.recheck();
-  if (changed && holdLostOwner) {
-    throw new Error(`runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=${changed}`);
-  }
-  return changed ? null : identity as unknown as DurableRecoveryIdentity;
 }
 
 async function retireFinishedPerTurnRunnerdOwner(input: Parameters<typeof inspectFinishedPerTurnRunnerdOwner>[0])
@@ -6740,7 +6655,6 @@ async function assertPluginTaskReattachmentBinding(input: {
 async function migrateRunnerdStateRootForExecution(input: {
   db: Db;
   execution: NativeExecutionInput;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   preparedExecutionAdmission?: NativePreparedExecutionAdmission;
   allowVerifiedBackup: boolean;
   retainedWarmOwnerRunId?: string;
@@ -6918,16 +6832,9 @@ async function migrateRunnerdStateRootForExecution(input: {
       let retirementRefusal = "";
       if (verification === "terminal_state_indeterminate" && !input.retainedWarmOwnerRunId
         && (!input.restartRecovery || input.restartRecovery.kind === "bootstrap_incomplete")) {
-        if (resumedSandboxRunner(input.runnerExecutionTarget)) {
-          // The backend's existing authority rotation archives the exact lost
-          // owner, keeping its journal and provider files in place.
-          if (await provenLostResumedSandboxRunner({ ...input, root: scoped })) return;
-          retirementRefusal = "; retirement_refused=restarted_sandbox_owner_unproven";
-        } else {
-          const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
-          if (retirement.retired) return;
-          if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
-        }
+        const retirement = await retireFinishedPerTurnRunnerdOwner({ ...input, root: scoped, identity });
+        if (retirement.retired) return;
+        if (retirement.refused !== "lifecycle_not_per_turn") retirementRefusal = `; retirement_refused=${retirement.refused}`;
       }
       if (
         verification !== "verified" &&
@@ -7834,7 +7741,6 @@ function idleWarmNativeSessionOwnerRunId(input: {
 
 async function restorePerTurnRunnerdController(input: {
   db: Db; execution: NativeExecutionInput;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
 }): Promise<void> {
@@ -7851,7 +7757,7 @@ async function restorePerTurnRunnerdController(input: {
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
   if (!reference) {
     if (existsSync(resolve(root, "control-plane", "control-plane-state.json"))) return;
-    if (!await restoreNativeControllerProjections(input.db, input.execution, root, input.predecessorEnvironmentRuntime)) return;
+    if (!await restoreNativeControllerProjections(input.db, input.execution, root)) return;
   } else {
     if (!durableIdentityMatchesSession(reference, input.execution)) return;
     if (identity?.runId === input.execution.binding.runId) return;
@@ -7876,7 +7782,6 @@ async function restorePerTurnRunnerdController(input: {
     }
     const recovered = await resolveNativeControllerRecovery(input.db, {
       ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
-      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
     });
     if (recovered.kind === "recoverable") {
       await refreshFinishedPerTurnRunnerdProjection(input, root, reference, recovered.checkpoint.runId, !identity, referenceBytes);
@@ -7903,7 +7808,6 @@ async function refreshFinishedPerTurnRunnerdProjection(
       [reference.runId, sourceRunId, input.execution.binding.runId]);
     const recovered = await resolveNativeControllerRecovery(tx as unknown as Db, {
       ...input.execution.binding, currentRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution),
-      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
     });
     if (recovered.kind !== "recoverable" || recovered.checkpoint.runId !== sourceRunId) return refuse("source_changed");
     const scratch = mkdtempSync(join(tmpdir(), "paperclip-controller-projection-"));
@@ -7972,33 +7876,6 @@ async function refreshFinishedPerTurnRunnerdProjection(
       rmSync(scratch, { recursive: true, force: true });
     }
   });
-}
-
-/** A predecessor with no committed result is gone only by the shared
- * predicate on THIS box: its own durable lease must name this sandbox and its
- * recorded directory, and the box's marker probe must report its process
- * absent (45) or of another generation (47). */
-async function failedPredecessorRunnerGone(input: { db: Db; execution: NativeExecutionInput },
-  target: AdapterExecutionTarget, prior: RunnerdDurableIdentity): Promise<boolean> {
-  if (target.kind !== "remote" || target.transport !== "sandbox" || !target.runner) return false;
-  const { companyId } = input.execution.binding;
-  try {
-    const [owner] = await input.db.select({ resultId: nativeRunFinalizations.resultId, leaseOwner: nativeRunFinalizations.leaseOwner })
-      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
-        eq(nativeRunFinalizations.runId, prior.runId)));
-    if (!owner || owner.resultId !== null || owner.leaseOwner !== null) return false;
-    const predecessor = await resolvePredecessorRunnerLease(input.db, { companyId, runId: prior.runId });
-    const box = target.sandboxLeaseAcquisition?.providerLeaseId;
-    if (!predecessor || !box || predecessor.providerLeaseId !== box) return false;
-    const [lease] = await input.db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
-      .where(and(eq(environmentLeases.companyId, companyId), eq(environmentLeases.id, predecessor.leaseId)));
-    const recordedCwd = lease?.metadata?.remoteCwd;
-    if (typeof recordedCwd !== "string" || recordedCwd !== target.remoteCwd) return false;
-    return await remoteRunnerGenerationLost({ runner: target.runner, remoteCwd: target.remoteCwd,
-      identity: prior as unknown as Record<string, unknown> });
-  } catch {
-    return false;
-  }
 }
 
 /** The banner text for a conversation held behind an unfinished predecessor. */
@@ -8116,22 +7993,8 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
     if (!target.runner) throw new Error("native_controller_recovery_dependency_unavailable:runner_state_reader");
     // The retained Runner wrote under its own lease's directory, which differs
     // from this target when the workspace moved within the same sandbox.
-    let retained: { remoteCwd: string };
-    try {
-      const runner = target.runner;
-      retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
-        successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target,
-        sourceRunnerGenerationLost: probe => remoteRunnerGenerationLost({ runner, ...probe }) });
-    } catch (error) {
-      // Clone L: a failed predecessor with no result whose Runner died with
-      // its archived box has no retained state to adopt. Only a proven-gone
-      // owner (its process absent or of another generation on this same box)
-      // skips the retained read; the lost-owner retirement and rotation then
-      // decide. Anything else keeps the refusal, made visible once.
-      if (!(error instanceof Error) || error.message !== "native_controller_recovery_missing_evidence:retained_sandbox_binding") throw error;
-      if (await failedPredecessorRunnerGone(input, target, prior)) return;
-      throw error;
-    }
+    const retained = await assertNativeRetainedSandboxBinding(input.db, { ...input.execution.binding, runId: prior.runId,
+      successorRunId: input.execution.binding.runId, normalizedSessionId: nativeSessionKey(input.execution), target });
     movedAllocation = retained.remoteCwd !== target.remoteCwd;
     state = await readRemoteRunnerState({ runner: target.runner,
       stateDirectory: remoteRunnerStateDirectory(retained.remoteCwd, nativeSessionKey(input.execution)) });
@@ -8192,7 +8055,6 @@ function controllerProjectionInput(input: { db: Db; execution: NativeExecutionIn
  * the original external marker can precede several in-process warm turns. */
 async function restoreWarmRunnerdController(input: {
   db: Db; execution: NativeExecutionInput;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   managedAiAccountIdentity?: string; managedAiCredentialIdentity?: string;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
@@ -8204,7 +8066,7 @@ async function restoreWarmRunnerdController(input: {
   const identity = readRunnerdDurableIdentity(root);
   const reference = identity ?? readRunnerdDurableIdentity(root, true);
   if (!idleWarmNativeSessionOwnerRunId(input) && (!reference || !existsSync(nativeSessionCheckpointPath(input.execution)))) {
-    if (await restoreNativeControllerProjections(input.db, input.execution, root, input.predecessorEnvironmentRuntime)) {
+    if (await restoreNativeControllerProjections(input.db, input.execution, root)) {
       await restoreRemoteSuspendedRunnerCheckpoint(input, root);
       return;
     }
@@ -8240,11 +8102,9 @@ async function restoreWarmRunnerdController(input: {
   if (!retainedRunId) await restoreRemoteSuspendedRunnerCheckpoint(input, root);
 }
 
-async function restoreNativeControllerProjections(db: Db, execution: NativeExecutionInput, root: string,
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe): Promise<boolean> {
+async function restoreNativeControllerProjections(db: Db, execution: NativeExecutionInput, root: string): Promise<boolean> {
   const recovered = await resolveNativeControllerRecovery(db, {
     ...execution.binding, currentRunId: execution.binding.runId, normalizedSessionId: nativeSessionKey(execution),
-    predecessorEnvironmentRuntime,
   });
   if (recovered.kind === "no_prior_execution") return false;
   if (recovered.kind === "waiting_for_owner") {
@@ -11016,8 +10876,6 @@ async function executePaperclipNativeSessionUnnoticed(input: {
   turnTimeoutMs?: number;
   leaseOwner?: string;
   restartRecovery?: NativeRestartRecoveryClaim;
-  /** Original restart authority retained when the remote reattach path is abandoned. */
-  restartRecoveryFence?: NativeRestartRecoveryClaim;
   /** Release recovery preparation's renewal after execution owns its reference. */
   onExecutionLeaseAcquired?: () => Promise<void>;
   onSpawn?: (meta: {
@@ -11071,7 +10929,6 @@ async function executePaperclipNativeSessionUnnoticed(input: {
   managedAiAccountIdentity?: string;
   managedAiCredentialWriteback?: ManagedAiCredentialWritebackBinding;
   billingIdentity?: Pick<AdapterExecutionResult, "provider" | "biller" | "billingType">;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   onTaskDispatched?: () => Promise<void> | void;
   pluginTaskDescription?: PluginTaskDescription;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
@@ -11451,96 +11308,6 @@ const NATIVE_ATTEMPT_PROVIDER_KINDS: ReadonlySet<string> = new Set([
   "cursor_cloud", "codex", "opencode", "claude_managed", "aws_agentcore", "acpx", "pi_rpc",
 ]);
 
-/**
- * A restart claim names the sandbox from the interrupted attempt. Abandon it
- * only when the acquired lease itself records a replacement of that exact
- * provider lease (or its retired predecessor points at this replacement).
- * A changed environment-lease id alone is not enough: reusable handoffs can
- * still name the same live box.
- */
-async function remoteReattachLeaseWasReplaced(input: {
-  db: Pick<Db, "select">;
-  execution: NativeExecutionInput;
-  leaseOwner?: string;
-  claim: Extract<NativeRestartRecoveryClaim, { kind: "reattach_remote_runner" }>;
-  target: AdapterExecutionTarget | null | undefined;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
-}): Promise<boolean> {
-  const { claim, target, predecessorEnvironmentRuntime } = input;
-  const binding = input.execution.binding;
-  if (claim.remote.kind === "plugin_task" || claim.runId !== binding.runId
-    || claim.leaseOwner !== input.leaseOwner || !claim.remote.providerLeaseId || !claim.remote.remoteCwd
-    || !predecessorEnvironmentRuntime?.readPredecessorSandboxRecord) return false;
-  const remoteClaim = claim.remote;
-  if (target?.kind !== "remote" || target.transport !== "sandbox"
-    || target.runnerTask || !target.leaseId || !target.environmentId || !target.providerKey
-    || target.sandboxLeaseAcquisition?.outcome !== "replacement") return false;
-  const acquiredProviderLeaseId = target.sandboxLeaseAcquisition.providerLeaseId;
-  if (!acquiredProviderLeaseId || acquiredProviderLeaseId === remoteClaim.providerLeaseId) return false;
-  const leases = await input.db.select().from(environmentLeases).where(and(
-    eq(environmentLeases.companyId, binding.companyId),
-    eq(environmentLeases.environmentId, target.environmentId),
-    inArray(environmentLeases.providerLeaseId, [acquiredProviderLeaseId, remoteClaim.providerLeaseId]),
-  ));
-  const acquired = leases.find(lease => lease.id === target.leaseId);
-  if (!acquired || acquired.companyId !== binding.companyId || acquired.environmentId !== target.environmentId
-    || acquired.status !== "active" || acquired.heartbeatRunId !== claim.runId
-    || acquired.issueId !== binding.issueId || acquired.executionWorkspaceId !== binding.executionWorkspaceId
-    || acquired.provider !== target.providerKey || acquired.providerLeaseId !== acquiredProviderLeaseId
-    || record(acquired.metadata).remoteCwd !== target.remoteCwd) return false;
-  const targetAcquisition = target.sandboxLeaseAcquisition;
-  const recordedAcquisition = record(record(acquired.metadata).sandboxLeaseAcquisition);
-  if (recordedAcquisition.outcome !== "replacement"
-    || (typeof recordedAcquisition.providerLeaseId === "string" && recordedAcquisition.providerLeaseId !== acquiredProviderLeaseId)
-    || recordedAcquisition.previousProviderLeaseId !== targetAcquisition.previousProviderLeaseId) return false;
-  const predecessors = leases.filter(lease => lease.id !== acquired.id && lease.companyId === binding.companyId
-    && lease.environmentId === target.environmentId && lease.heartbeatRunId === claim.runId
-    && lease.provider === target.providerKey && lease.providerLeaseId === remoteClaim.providerLeaseId
-    && lease.issueId === binding.issueId && lease.executionWorkspaceId === binding.executionWorkspaceId
-    && record(lease.metadata).remoteCwd === remoteClaim.remoteCwd);
-  if (predecessors.length !== 1) return false;
-  const predecessor = predecessors[0]!;
-  const keptAfterReplacement = record(record(predecessor.metadata)[REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY]);
-  const directlyLinked = targetAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId
-    && recordedAcquisition.previousProviderLeaseId === remoteClaim.providerLeaseId;
-  const keptAndLinked = keptAfterReplacement.runId === claim.runId && keptAfterReplacement.replacementLeaseId === acquired.id;
-  if (!directlyLinked && !keptAndLinked) return false;
-
-  const [priorRun] = await input.db.select({ runnerInstanceId: heartbeatRuns.runnerInstanceId, nativeSessionId: heartbeatRuns.nativeSessionId })
-    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, binding.companyId), eq(heartbeatRuns.id, claim.runId)));
-  if (!priorRun?.runnerInstanceId || priorRun.nativeSessionId !== nativeSessionKey(input.execution)) return false;
-
-  const predecessorRunner: CommandManagedRuntimeRunner = {
-    execute: async request => {
-      const [scope] = await input.db.select({ lease: environmentLeases, environment: environments })
-        .from(environmentLeases)
-        .innerJoin(environments, eq(environments.id, environmentLeases.environmentId))
-        .where(and(eq(environmentLeases.id, predecessor.id), eq(environmentLeases.companyId, binding.companyId),
-          sql`${environmentLeases.environmentId} = ${target.environmentId}`));
-      if (!scope || scope.lease.companyId !== binding.companyId || scope.lease.environmentId !== target.environmentId
-        || scope.lease.heartbeatRunId !== claim.runId || scope.lease.issueId !== binding.issueId
-        || scope.lease.executionWorkspaceId !== binding.executionWorkspaceId || scope.lease.provider !== target.providerKey
-        || scope.lease.providerLeaseId !== remoteClaim.providerLeaseId
-        || record(scope.lease.metadata).remoteCwd !== remoteClaim.remoteCwd || scope.environment.driver !== "sandbox") {
-        throw new Error("native_replacement_predecessor_scope_changed");
-      }
-      const result = await predecessorEnvironmentRuntime.execute({ ...request,
-        environment: scope.environment as EnvironmentDriverExecuteInput["environment"],
-        lease: scope.lease as EnvironmentDriverExecuteInput["lease"], readOnlyProbe: true });
-      return { ...result, signal: result.signal ?? null, pid: null, startedAt: null };
-    },
-  };
-  const acquiredAt = predecessor.acquiredAt instanceof Date && Number.isFinite(predecessor.acquiredAt.getTime())
-    ? { at: predecessor.acquiredAt.toISOString(), source: "run" as const } : null;
-  return await remoteRunnerGenerationLost({ runner: predecessorRunner, remoteCwd: remoteClaim.remoteCwd,
-    identity: { runnerInstanceId: priorRun.runnerInstanceId, normalizedSessionId: priorRun.nativeSessionId },
-    predecessor: {
-      readSandbox: () => predecessorEnvironmentRuntime.readPredecessorSandboxRecord!({ companyId: binding.companyId, leaseId: predecessor.id }),
-      start: acquiredAt, providerLeaseId: remoteClaim.providerLeaseId, probedProviderLeaseId: remoteClaim.providerLeaseId,
-    },
-  });
-}
-
 /** The provider gate at the start of a native attempt (pi_rpc launches through runnerd like ACPX). */
 export function isNativeAttemptProviderSupported(execution: Pick<NativeExecutionInput, "provider" | "schema">): boolean {
   return NATIVE_ATTEMPT_PROVIDER_KINDS.has(execution.provider.kind)
@@ -11554,17 +11321,6 @@ async function executePaperclipNativeSessionAttempt(
   cleanupOnly = false,
   ownDiagnosticLease?: (lease: NativeDiagnosticLease) => void,
 ): Promise<AdapterExecutionResult> {
-  const restartRecoveryClaim = input.restartRecoveryFence ?? input.restartRecovery;
-  if (input.restartRecovery?.kind === "reattach_remote_runner"
-    && await remoteReattachLeaseWasReplaced({ db: input.db, execution: input.execution,
-      leaseOwner: input.leaseOwner, claim: input.restartRecovery, target: input.runnerExecutionTarget,
-      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime })) {
-    // Stop trying to adopt a Runner whose exact predecessor is proven gone.
-    // Keep the original claim separately: the coordinator transaction below
-    // still checks its run, owner, boot, PID, and generation before dispatch.
-    // The cold path retains its normal conversation-restore behavior.
-    input = { ...input, restartRecovery: undefined, restartRecoveryFence: input.restartRecovery };
-  }
   if (input.execution.provider.kind === "acpx" && input.execution.provider.agent === "antigravity") {
     const candidate = resolveAntigravityCandidateAdmission({
       companyId: input.execution.binding.companyId, model: input.execution.provider.model,
@@ -11627,8 +11383,7 @@ async function executePaperclipNativeSessionAttempt(
       "paperclip_runner_provider_unsupported: ACPX candidate requires exact host qualification authorization",
     );
   }
-  const identityCheckSpan = nativeSessionStartups.get(input.execution.binding.runId)?.warmOwnerIdentitySpan;
-  const preparationSpans = [...(input.preparationSpans ?? []), ...(identityCheckSpan ? [identityCheckSpan] : [])];
+  const preparationSpans = input.preparationSpans ?? [];
   const preparationStarts = nativeRunPreparationStarts(
     preparationSpans,
     Date.now(),
@@ -11650,7 +11405,7 @@ async function executePaperclipNativeSessionAttempt(
     budget: {
       adapter: speedBudgetAdapter(input.execution.provider),
       environment: !input.runnerExecutionTarget || input.runnerExecutionTarget.kind === "local" ? "local" : "remote",
-      restartRecovery: Boolean(restartRecoveryClaim),
+      restartRecovery: Boolean(input.restartRecovery),
     },
   });
   controllerTrace = trace;
@@ -11793,12 +11548,7 @@ async function executePaperclipNativeSessionAttempt(
       await logPostTerminalEvents(root, input.onLog);
     }
     if (durableIdentityMatchesSession(identity, input.execution) && identity.runId !== input.execution.binding.runId &&
-        runnerdAuthorityLifecycleWithVerifiedBackup({ root, identity, execution: input.execution, allowVerifiedBackup: true }) !== "suspended"
-        // Core's idle close leaves the authoritative suspend on the box, not
-        // necessarily in the server projection. Prove generation loss before
-        // selecting live adoption, or it reconnects forever to the exited Runner.
-        && !await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-          runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })) {
+        runnerdAuthorityLifecycleWithVerifiedBackup({ root, identity, execution: input.execution, allowVerifiedBackup: true }) !== "suspended") {
       let releasedSource = portableSource?.identity;
       remoteWarmRecovery = await inspectRemoteWarmSessionRecovery({
         db: input.db, execution: input.execution, target: input.runnerExecutionTarget, identity,
@@ -11833,7 +11583,6 @@ async function executePaperclipNativeSessionAttempt(
       onLog: input.onLog,
       restartRecovery: input.restartRecovery,
       runnerExecutionTarget: input.runnerExecutionTarget,
-      predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
       bootstrapRetryLeaseOwner: input.leaseOwner,
       managedAiAccountIdentity: input.managedAiAccountIdentity, managedAiCredentialIdentity: input.managedAiCredentialIdentity,
     }));
@@ -11946,7 +11695,7 @@ async function executePaperclipNativeSessionAttempt(
           }
           // A cancellation can win after heartbeat dispatch admission but
           // before this claim. Never revive a terminal run or a settled startup.
-          const stopRecovery = restartRecoveryClaim?.kind === "reattach_remote_runner"
+          const stopRecovery = input.restartRecovery?.kind === "reattach_remote_runner"
             && await readClaimedNativeStopRecovery(tx as unknown as Db, { ...boundRun, id: input.execution.binding.runId }, leaseOwner);
           if ((cleanupOnly && !stopRecovery) || boundRun.status !== "running" || (boundRun.resultJson?.startupCancellation && !stopRecovery) ||
               coordinator.phase === "terminal_failure") {
@@ -11986,7 +11735,7 @@ async function executePaperclipNativeSessionAttempt(
             coordinator.leaseOwner !== leaseOwner
           )
             throw new NativeControllerDetachedForRestartError();
-          const recovering = restartRecoveryClaim;
+          const recovering = input.restartRecovery;
           if (
             recovering &&
             (recovering.runId !== coordinator.runId ||
@@ -12129,7 +11878,7 @@ async function executePaperclipNativeSessionAttempt(
           const startup = nativeSessionStartups.get(input.execution.binding.runId);
           if (!startup) throw new Error("native_session_startup_owner_missing");
           startup.leaseOwner = leaseOwner;
-          if (!restartRecoveryClaim) freshClaimAttempt = claimedAttempt;
+          if (!input.restartRecovery) freshClaimAttempt = claimedAttempt;
           // Own renewal as soon as the claim commits, including slow tracing,
           // accounting history and retained-session cleanup before dispatch.
           startup.executionLeaseRenewal = startNativeSessionExecutionLeaseRenewal({
@@ -12155,7 +11904,7 @@ async function executePaperclipNativeSessionAttempt(
       { parentName: "task.prepare" },
     );
     const startup = nativeSessionStartups.get(input.execution.binding.runId);
-    if (restartRecoveryClaim && startup?.priorRestartDetach !== undefined
+    if (input.restartRecovery && startup?.priorRestartDetach !== undefined
       && nativeRunsDetachingForRestart.get(input.execution.binding.runId) === startup.priorRestartDetach) {
       nativeRunsDetachingForRestart.delete(input.execution.binding.runId);
     }
@@ -12164,38 +11913,6 @@ async function executePaperclipNativeSessionAttempt(
     // must prove its same-controller successor. Shared staging stays after
     // strict predecessor suspension; it cannot run on a failed claim/Stop.
     const ingress = nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget);
-    const warmScope = nativeSessionScopeKey(input.execution);
-    // claimedStopCleanup: this attempt is the Stop's own cleanup claim on the
-    // STOPPED run (restart recovery reattaching its remote Runner only to settle
-    // the cancellation; readClaimedNativeStopRecovery), not a new turn. It runs
-    // no new provider work, so it neither probes nor retires the idle owner;
-    // the next real message's attempt (claimedStopCleanup false) does.
-    const idleOwner = input.useRunnerd && !claimedStopCleanup ? warmNativeSessions.get(warmScope) : undefined;
-    // The identity command is durable maintenance: the completed source writer
-    // needs this successor's claimed lease before it may persist that command.
-    // Keep the check before warm reattach/provider work, not before the claim.
-    // Managed instruction handoff reserves this owner for the successor itself;
-    // only another run's preparation (or an unrelated busy turn) excludes it.
-    if (idleOwner && (!idleOwner.busy || idleOwner.instructionPreparationRunId === input.execution.binding.runId)
-      && (!idleOwner.preparingRunId || idleOwner.preparingRunId === input.execution.binding.runId)
-      && (!idleOwner.instructionPreparationRunId || idleOwner.instructionPreparationRunId === input.execution.binding.runId)
-      && idleOwner.runId !== input.execution.binding.runId && await resumedSandboxRunnerNeedsProbe(input)) {
-      const root = scopedRunnerdStateRoot(input.execution);
-      await restoreWarmRunnerdController(input);
-      if (await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-        runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog }, true)) {
-        // Idle close may have suspended the box's Runner but failed its final
-        // controller/checkpoint cleanup. Only detach this proven-dead owner;
-        // ordinary backend authority rotation still fences/preserves history.
-        await detachReleasedWarmNativeSession(idleOwner);
-        forgetWarmNativeSession(warmScope, idleOwner);
-      }
-    }
-    const claimedIdentityCheckSpan = startup?.warmOwnerIdentitySpan;
-    if (claimedIdentityCheckSpan && claimedIdentityCheckSpan !== identityCheckSpan) {
-      preparationSpans.push(claimedIdentityCheckSpan);
-      await trace.record({ ...claimedIdentityCheckSpan, parentName: "task.prepare" }, { deferRunLog: true });
-    }
     if (input.useRunnerd && !claimedStopCleanup) await retireSupersededWarmNativeSessions(
       nativeSessionOwnerScope(input.execution, input.runnerExecutionTarget?.environmentId ?? null),
       nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), input.execution.binding.runId,
@@ -13610,8 +13327,6 @@ async function executePaperclipNativeSessionAttempt(
                   }
                   if (existing.session !== session) {
                     existing.sessionCheckpointPersisted = runnerdBackend?.sessionCheckpointPersisted;
-                    existing.runnerConnectionLive = runnerdBackend?.runnerConnectionLive;
-                    existing.runnerIdentityCheck = runnerdBackend?.runnerIdentityCheck;
                   }
                   const ingress = input.useRunnerd ? nativeWarmIngressIdentity(input.execution, input.runnerExecutionTarget) : undefined;
                   existing.ingressOwner = ingress ? { ...input.execution.binding, ingress,
@@ -13628,8 +13343,6 @@ async function executePaperclipNativeSessionAttempt(
                       return ingress ? { ...input.execution.binding, ingress, controllerBootId: controller.bootId, controllerGeneration } : undefined;
                     })(),
                     sessionCheckpointPersisted: runnerdBackend?.sessionCheckpointPersisted,
-                    runnerConnectionLive: runnerdBackend?.runnerConnectionLive,
-                    runnerIdentityCheck: runnerdBackend?.runnerIdentityCheck,
                     onReleased: () => releaseRetainedNativeSessionCleanup(input.db, {
                       companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
                     }, { companyId: input.execution.binding.companyId, runId: input.execution.binding.runId,
@@ -16846,149 +16559,6 @@ export async function verifyRemoteRunnerReattachment(input: {
   };
 }
 
-/** Boat (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"): after
- * 10 minutes stopped, a resume always starts a new machine from the snapshot.
- * Core requires 15. */
-export const PREDECESSOR_LONG_STOP_MS = 15 * 60_000;
-/** Whether a predecessor sandbox stopped for at least PREDECESSOR_LONG_STOP_MS
- * proves its Runner gone by itself. RFL ruled yes (2026-11-13) under exact
- * conditions: a fresh provider read at decision time, the provider-neutral
- * state exactly stopped with a stoppedAt, and the provider's clock when it
- * sends one.
- * Set false to require a failed marker probe as well. */
-export const PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE = true;
-/** Bound on the caller's read of the predecessor's provider record. */
-export const PREDECESSOR_SANDBOX_READ_TIMEOUT_MS = 15_000;
-
-/** The provider's own record of the PREDECESSOR's sandbox (its own
- * providerLeaseId, never the current box), as the provider plugin reads it
- * (Boat: GET /sandboxes/{id}). Never derived from a lease label. */
-export type PredecessorSandboxRecord =
-  /** The provider no longer has the sandbox (Boat: 404; a cancelled sandbox is reported once, then 404). */
-  | { kind: "gone" }
-  | {
-      kind: "present";
-      /** Provider-neutral state: "stopped" or "running" (from the typed observation). */
-      state: string;
-      /** When the sandbox last stopped, by any cause; null while it is not stopped (Boat stoppedAt). */
-      stoppedAt: string | null;
-      /** The sandbox kernel's last restart on its machine: every process running then ended (Boat lastReboot.at). */
-      lastRebootAt: string | null;
-      /** The provider's clock for this answer (the response's Date header), when it sent one. */
-      observedAt?: string | null;
-    };
-
-/** The predecessor Runner's own recorded start, and which record it is. */
-export type PredecessorStart = { at: string; source: "process" | "run" };
-
-
-/**
- * The shared "prior owner proven gone" predicate for a remote Runner (RFL F1).
- * A prior owner is gone ONLY on one of: a different boot generation of its box,
- * its process verified absent, the provider's own record that its box is gone
- * or rebooted after it started, or a successful close of that exact owner
- * (runnerd's own `suspended` runner state; checked by the transport's
- * rotation). Never on a lease label such as resumedFromState stopped/archived,
- * and never on a failed close.
- *
- * Provider record (optional `predecessor`; existing callers pass none, and
- * keep the marker probe alone). `readSandbox` must be a FRESH read of the
- * predecessor's own sandbox id at decision time, never cached state. RFL's
- * decision table, fail-closed:
- * - gone (the provider no longer has it): lost;
- * - lastRebootAt later than the predecessor's recorded start: lost;
- * - timestamps must be strict ISO 8601 instants with a zone and real calendar
- *   fields (parseStrictIsoInstant); any other value proves nothing;
- * - state exactly stopped (provider-neutral), with a strict stoppedAt not in
- *   the future and at least PREDECESSOR_LONG_STOP_MS before now (the
- *   provider's clock, observedAt, when it sent one, else this server's): lost
- *   (PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE); any other stop: not proven;
- * - state running, and the probe reaches that same sandbox
- *   (providerLeaseId === probedProviderLeaseId): the marker probe below;
- * - anything else (another state, a different probed box, a failed,
- *   timed-out or thrown read): NOT proven, with no marker fallback.
- *
- * Marker probe (the current box): the box's launch marker for this session
- * names that runner instance with a recorded start generation
- * ("linux:<boot_id>:<start ticks>"), and the process it names is not running
- * (45) or now has a different generation (47): another boot, or a reused pid.
- * A live matching process, a missing or foreign marker, or a failed probe
- * proves nothing. Callers keep every other fence.
- */
-export async function remoteRunnerGenerationLost(input: {
-  runner: CommandManagedRuntimeRunner;
-  remoteCwd: string;
-  identity: Record<string, unknown>;
-  predecessor?: {
-    readSandbox: () => Promise<PredecessorSandboxRecord>;
-    start: PredecessorStart | null;
-    /** The predecessor's recorded provider lease id: its own sandbox. */
-    providerLeaseId: string;
-    /** The provider lease id of the box `runner` reaches (the marker probe's box). */
-    probedProviderLeaseId: string | null;
-  };
-  longStopProvesLossAlone?: boolean;
-  now?: () => number;
-}): Promise<boolean> {
-  const { runnerInstanceId, normalizedSessionId } = input.identity;
-  if (typeof runnerInstanceId !== "string" || !runnerInstanceId || typeof normalizedSessionId !== "string" || !normalizedSessionId) return false;
-  if (input.predecessor) {
-    // RFL decision table: with a predecessor read requested, only its
-    // conclusive answers decide. A failed, timed-out or thrown read and every
-    // inconclusive observation are NOT proven; nothing falls through to a
-    // probe of some other box.
-    const record = await readPredecessorSandbox(input.predecessor.readSandbox);
-    if (!record) return false;
-    if (record.kind === "gone") return true;
-    // Strict instants only: an impossible or zone-less timestamp proves nothing.
-    const rebootAt = parseStrictIsoInstant(record.lastRebootAt);
-    const startAt = parseStrictIsoInstant(input.predecessor.start?.at);
-    if (rebootAt !== null && startAt !== null && rebootAt > startAt) return true;
-    if (record.state === "stopped") {
-      // Exactly the provider-neutral "stopped" (the plugin maps Boat's
-      // archived-with-stoppedAt to it); a missing, future or short stop is
-      // not proven.
-      const stoppedAt = parseStrictIsoInstant(record.stoppedAt);
-      const now = parseStrictIsoInstant(record.observedAt) ?? (input.now ?? Date.now)();
-      return (input.longStopProvesLossAlone ?? PREDECESSOR_LONG_STOP_PROVES_LOSS_ALONE)
-        && stoppedAt !== null && stoppedAt <= now && now - stoppedAt >= PREDECESSOR_LONG_STOP_MS;
-    }
-    // Only a running predecessor sandbox may be decided by the marker probe,
-    // and only when the probe reaches that same sandbox.
-    if (record.state !== "running" || input.predecessor.providerLeaseId !== input.predecessor.probedProviderLeaseId) return false;
-  }
-  const identityPath = posix.join(remoteRunnerStateDirectory(input.remoteCwd, normalizedSessionId), "runner-process.identity");
-  try {
-    const marker = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
-      args: ["-c", REMOTE_RECOVERY_MARKER_READ_SCRIPT, "paperclip-runner-generation-marker", identityPath] });
-    if (marker.exitCode !== 0 || marker.timedOut) return false;
-    const nonce = marker.stdout.split("\n")[0] ?? "";
-    if (!/^[a-zA-Z0-9_-]+$/.test(nonce)) return false;
-    const owner = parseRemoteRunnerProcessIdentity(marker.stdout, { nonce, runnerInstanceId });
-    if (!owner?.processStartFingerprint) return false;
-    const check = await input.runner.execute({ command: "sh", bypassSession: true, timeoutMs: 10_000,
-      args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, "paperclip-runner-generation-check", identityPath, nonce,
-        runnerInstanceId, String(owner.pid), owner.processStartFingerprint] });
-    return !check.timedOut && (check.exitCode === 45 || check.exitCode === 47);
-  } catch {
-    return false;
-  }
-}
-
-async function readPredecessorSandbox(read: () => Promise<PredecessorSandboxRecord>): Promise<PredecessorSandboxRecord | null> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      read(),
-      new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), PREDECESSOR_SANDBOX_READ_TIMEOUT_MS); timer.unref?.(); }),
-    ]);
-  } catch {
-    return null;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 /** Best effort: a missing, slow or unreadable file leaves the recovery outcome unchanged. */
 async function readRemoteRunnerExitEvidence(runner: CommandManagedRuntimeRunner, diagnosticsDirectories: string[], deadline: number):
   Promise<{ runnerExitEvidence?: string }> {
@@ -17716,7 +17286,6 @@ export async function createRunnerdBackend(input: {
   observability?: ProviderObservabilityLaunch;
   runnerEnvironment?: NodeJS.ProcessEnv;
   prepareRunnerEnvironment?: () => Promise<NodeJS.ProcessEnv | undefined>;
-  predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   /** Private grant materialization; never a user-configured host path. */
   managedAiCredentialHome?: string;
   managedAiCredentialIdentity?: string;
@@ -17795,7 +17364,6 @@ export async function createRunnerdBackend(input: {
         onLog: input.onLog,
         restartRecovery: input.restartRecovery,
         runnerExecutionTarget: input.runnerExecutionTarget,
-        predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime,
       });
     }
     input.executionContext?.signal.throwIfAborted();
@@ -17928,10 +17496,6 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 }
 
 type ManagedRunnerdBackend = NativeSessionBackend & {
-  /** Synchronous local transport state; never contacts the allocation. */
-  runnerConnectionLive?: () => boolean;
-  /** Fresh PRP command/result exchange for this backend's recorded generation. */
-  runnerIdentityCheck?: () => Promise<boolean>;
   sandboxRetention?: SandboxRunnerRetention;
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
   bindDiagnosticSession?(session: NativeSession): void;
@@ -17966,10 +17530,6 @@ async function createRunnerdBackendWithinSessionClaim(
       ...(input.executionContext?.active && startupOperation ? { executionContext: input.executionContext } : {}) });
   } : rawPluginTask;
   let runnerControlPlane: DurablePrpControlPlane | undefined;
-  let runnerEnsureConnected: ((input: { deadline: number; signal: AbortSignal }) => Promise<void>) | undefined;
-  // Captured once for this backend/warm entry, not read back from a potentially
-  // replaced control-plane identity on the next turn.
-  let warmRunnerInstanceId: string | undefined;
   if (pluginTask && input.runnerIngressAuthorized !== true) throw new Error("runner_ingress_unavailable");
   if (pluginTask && (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8")) {
     throw new Error("Plugin Runner tasks require a workspace session");
@@ -18619,14 +18179,6 @@ async function createRunnerdBackendWithinSessionClaim(
     remoteTarget?.transport === "sandbox"
       ? (remoteTarget.sandboxLeaseAcquisition ?? null)
       : null;
-  // A sandbox resumed from a stopped state may still hold a dead Runner's last,
-  // unsuspended state. Authority rotation may archive it only after its
-  // process generation is proven gone and the ordinary finished-owner proofs
-  // pass; anything unproven keeps the refusal.
-  const lostRunnerSource = !pluginTask && !input.restartRecovery && !input.remoteWarmRecovery
-    ? await provenLostResumedSandboxRunner({ db: input.db, root, execution: input.execution,
-      runnerExecutionTarget: input.runnerExecutionTarget, onLog: input.onLog })
-    : null;
   let verifyRetainedRemoteProcess: (() => Promise<void>) | undefined;
   // Capability support alone is not guardian qualification. A provider must
   // explicitly opt this exact allocation into the resident fd4 guardian, and
@@ -19523,15 +19075,7 @@ async function createRunnerdBackendWithinSessionClaim(
                       const restoresRetiredSource = !provenRestart && state.incompleteReason === "unavailable"
                         && backupAvailable && remoteTarget.reusableLeaseConfigured === true
                         && await retiredSourceBackupAuthorized();
-                      // A resumed sandbox keeps its proven-lost Runner's last state
-                      // for authority rotation to archive. The provider files beside
-                      // it stay in place for the same conversation.
-                      const lostOwnerState = !provenRestart && !restoresRetiredSource && lostRunnerSource !== null
-                        && state.incompleteReason === "not_suspended" && state.notSuspendedRunId === lostRunnerSource.runId;
-                      if (lostOwnerState) {
-                        await input.onLog?.("stdout", `[paperclip-runner] Run ${lostRunnerSource.runId} stopped with its restarted sandbox; `
-                          + "retiring its runner and resuming the same conversation.\n");
-                      } else if (restoresRetiredSource) {
+                      if (restoresRetiredSource) {
                         await measureNativeRunnerSpan(input.trace, "sandbox.lease.replacement", restoreVerifiedHarnessBackup, {
                           attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
                             lifecycleMode: input.execution.session.lifecyclePolicy.mode, outcome: "resumed", reason: "state_absent" },
@@ -20392,8 +19936,7 @@ async function createRunnerdBackendWithinSessionClaim(
     process: { runnerStateDirectory: remoteStateDirectory,
       readRunnerState: remoteStateDirectory && remoteCommandRunner
         ? () => readRemoteRunnerState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory }) : undefined,
-      prepareExternalRunnerState, archiveExternalRunnerState, runnerProcessLauncher: remoteProcessLauncher, adoptExistingRunner: adoptedProcess,
-      ...(lostRunnerSource ? { lostRunnerSource } : {}) },
+      prepareExternalRunnerState, archiveExternalRunnerState, runnerProcessLauncher: remoteProcessLauncher, adoptExistingRunner: adoptedProcess },
     target, sandboxRetention,
     controllerPersistence: input.controllerPersistence ? nativeRunnerCheckpointPersistence(
       input.db, input.controllerPersistence.bootId, () => {
@@ -20417,10 +19960,6 @@ async function createRunnerdBackendWithinSessionClaim(
     },
     beforeConnect: async (identity, authority) => {
       runnerControlPlane = authority;
-      // Cold registration omits the optional attachment identity. Capture the
-      // initialized controller's expected generation once, before authentication;
-      // only a fresh authenticated runner.identity answer can prove it live.
-      warmRunnerInstanceId ??= (identity ?? authority.store?.state.identity)?.runnerInstanceId;
       await input.remoteWarmRecovery?.revalidate();
       if (stagedRecovery && authority.store.state.stagedRunAttachment) {
         const current = await verifyStagedAttachmentRestart(input, stagedRecovery);
@@ -20738,11 +20277,6 @@ async function createRunnerdBackendWithinSessionClaim(
             }
           : undefined,
         ...nonTaskExecutionDriver,
-        controlPlaneRegistration: nonTaskExecutionDriver.controlPlaneRegistration ? async (...args) => {
-          const registration = await nonTaskExecutionDriver.controlPlaneRegistration!(...args);
-          runnerEnsureConnected = registration.ensureConnected;
-          return registration;
-        } : undefined,
         get authorityRunId() { return nonTaskExecutionDriver.authorityRunId; },
       });
       return antigravityCredential?.home ? bindAntigravityTransportRetirement(bundle) : bundle.transport;
@@ -20814,37 +20348,6 @@ async function createRunnerdBackendWithinSessionClaim(
   };
   let replacementBackend: ManagedRunnerdBackend | null = null;
   return {
-    runnerConnectionLive: () => replacementBackend
-      ? replacementBackend.runnerConnectionLive?.() ?? false
-      : (runnerControlPlane?.activeRunnerConnectionCount() ?? 0) > 0,
-    runnerIdentityCheck: async () => {
-      if (replacementBackend) return await replacementBackend.runnerIdentityCheck?.() ?? false;
-      const core = runnerControlPlane, expected = warmRunnerInstanceId;
-      if (!core || expected === undefined) return false;
-      if (core.activeRunnerConnectionCount() !== 0 || !runnerEnsureConnected) {
-        return await core.checkRunnerIdentity?.(expected) === true;
-      }
-      // A parked ingress is not evidence of a lost generation. Reopen only the
-      // existing authenticated route, never launch/attach or issue provider work.
-      // Reconnect and the nonce'd command share one total admission deadline.
-      const deadline = Date.now() + 1_500;
-      const abort = new AbortController();
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        return await Promise.race([
-          (async () => {
-            await runnerEnsureConnected!({ deadline, signal: abort.signal });
-            const remainingMs = deadline - Date.now();
-            if (abort.signal.aborted || remainingMs <= 0 || core.activeRunnerConnectionCount() !== 1) return false;
-            return await core.checkRunnerIdentity?.(expected, remainingMs) === true;
-          })(),
-          new Promise<boolean>(resolve => {
-            timer = setTimeout(() => { abort.abort(); resolve(false); }, Math.max(0, deadline - Date.now()));
-          }),
-        ]);
-      } catch { return false; }
-      finally { clearTimeout(timer); abort.abort(); }
-    },
     sandboxRetention,
     restartAdoptedRunner: () => replacementBackend ? replacementBackend.restartAdoptedRunner?.() === true : restartAdoptedRunner,
     bindManagedSession: (session, options) => replacementBackend

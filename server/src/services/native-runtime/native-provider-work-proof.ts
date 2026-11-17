@@ -1,7 +1,5 @@
 import { and, eq, ne, sql } from "drizzle-orm";
-import { environments, environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints, toolInvocations, type Db } from "@paperclipai/db";
-import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
-import type { EnvironmentRuntimeService, EnvironmentDriverExecuteInput } from "../environment-runtime.js";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, nativeRunFinalizations, nativeRunResults, nativeRunnerCheckpoints, toolInvocations, type Db } from "@paperclipai/db";
 import { hasNativeExecutionStartEvidence } from "./native-restart-recovery.js";
 import { hasNativePreDispatchFailureRecord } from "../heartbeat/run-failure-cause.js";
 /** Durable run events that prove a provider session did work in a run. */
@@ -37,23 +35,17 @@ export async function provesNoNativeRunProviderWork(db: Pick<Db, "execute">, inp
     && row.acceptedResult === false && row.finalizedResult === false);
 }
 
-export type FailedNativePredecessorProbe = Pick<EnvironmentRuntimeService, "execute"> &
-  Partial<Pick<EnvironmentRuntimeService, "readPredecessorSandboxRecord">>;
 type ProofDb = Pick<Db, "select" | "execute">;
 type Predecessor = typeof heartbeatRuns.$inferSelect;
 
-/** P1 switch. Off until the generation-loss helper is judged same-box and
- * fail-closed (Image C); with it off, a failed predecessor that has execution
- * start evidence stays HELD with its visible notice. P2 alone frees the
- * claimed, never-launched rows (SMA-43 shape). */
-export const FAILED_PREDECESSOR_P1_ENABLED = false;
-
 /** ONE failed-predecessor gate, shared by resume selection and legacy identity
- * walk-back. P1 proves the old physical generation gone; P2 proves no execution
- * ever started. A claim (attempt/generation > 0) is not execution evidence.
+ * walk-back: it proves no execution ever started (P2) or a pre-dispatch
+ * receipt. A claim (attempt/generation > 0) is not execution evidence. A
+ * failed predecessor that may have started stays a barrier; Paperclip's
+ * retire-or-replace-the-box path governs a resumed box, not a liveness probe.
  * Existing caller fences still apply; unknown/missing evidence stays held. */
 export async function canBypassFailedNativePredecessor(db: ProofDb, input: {
-  companyId: string; runId: string; predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
+  companyId: string; runId: string;
 }): Promise<boolean> {
   const [row] = await db.select({ run: heartbeatRuns, owner: nativeRunFinalizations })
     .from(heartbeatRuns).leftJoin(nativeRunFinalizations, and(
@@ -67,8 +59,7 @@ export async function canBypassFailedNativePredecessor(db: ProofDb, input: {
     return preDispatchWithoutAllocationOrExecution(db, row.run, row.owner);
   }
   if (!row.owner || row.owner.phase !== "terminal_failure" || row.owner.leaseOwner !== null || row.owner.leaseExpiresAt !== null) return false;
-  return (FAILED_PREDECESSOR_P1_ENABLED && await predecessorGenerationLost(db, row.run, input.predecessorEnvironmentRuntime))
-    || await terminalCompleteWithoutExecutionStart(db, row.run); // P1 OR P2
+  return terminalCompleteWithoutExecutionStart(db, row.run);
 }
 
 /** The failure owner records this only when its dispatch gate was explicitly
@@ -126,29 +117,6 @@ async function preDispatchWithoutAllocationOrExecution(db: ProofDb, run: Predece
   if ((run.processPid !== null || run.processGroupId !== null || run.processStartedAt !== null) && !evidence.inheritedProcess) return false;
   if (await hasNativeExecutionStartEvidence(db, run)) return false;
   return provesNoNativeRunProviderWork(db, { companyId: run.companyId, runId: run.id });
-}
-
-/** Never probe the successor's box. Resolve the predecessor's exact saved lease
- * and cwd, and execute read-only marker/process checks there, without acquire,
- * resume, close, or fallback to a replacement allocation. */
-async function predecessorGenerationLost(db: ProofDb, run: Predecessor, runtime?: FailedNativePredecessorProbe): Promise<boolean> {
-  if (!runtime || !run.nativeSessionId || !run.runnerInstanceId || !run.nativeIssueId) return false;
-  const leases = await db.select({ lease: environmentLeases, environment: environments }).from(environmentLeases)
-    .innerJoin(environments, eq(environments.id, environmentLeases.environmentId)).where(and(
-      eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
-      eq(environmentLeases.issueId, run.nativeIssueId)));
-  if (leases.length !== 1) return false;
-  const { lease, environment } = leases[0]!;
-  const remoteCwd = lease.metadata?.remoteCwd;
-  if (environment.driver !== "sandbox" || !lease.providerLeaseId || typeof remoteCwd !== "string" || !remoteCwd.startsWith("/")) return false;
-  try {
-    const { remoteRunnerGenerationLost } = await import("./native-session-executor.js");
-    const runner = { execute: request => runtime.execute({ ...request,
-      environment: environment as EnvironmentDriverExecuteInput["environment"],
-      lease: lease as EnvironmentDriverExecuteInput["lease"] }) } as CommandManagedRuntimeRunner;
-    return await remoteRunnerGenerationLost({ runner, remoteCwd,
-      identity: { runnerInstanceId: run.runnerInstanceId, normalizedSessionId: run.nativeSessionId } });
-  } catch { return false; }
 }
 
 async function terminalCompleteWithoutExecutionStart(db: ProofDb, run: Predecessor): Promise<boolean> {
