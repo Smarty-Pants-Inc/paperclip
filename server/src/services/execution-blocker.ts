@@ -21,6 +21,7 @@ import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-loc
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { EXECUTION_FINALIZATION_DEADLINE_EXCEEDED, EXECUTION_FINALIZATION_DEADLINE_MESSAGE } from "./execution-control-deadline.js";
 import { NATIVE_HUMAN_SELF_HANDOFF_KEY } from "./native-runtime/native-human-self-handoff.js";
+import { retainedWarmHandoffLease } from "./native-runtime/handed-off-warm-lease.js";
 
 const blockerContextKeys = ["issueId", "taskId", "source", "connectionIntentResolution",
   "interactionKind", "interactionStatus", "mutation", "interactionId"] as const;
@@ -85,6 +86,17 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
     sql`${environmentLeases.metadata}->'workspaceRecoveryCleanup' is not null`,
   ))).filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
+  // S048: a person's warm Stop handed this box off to the next message. A lease
+  // that passes the shared marker-bound predicate (retainedWarmHandoffLease:
+  // this run's lease, the Send gate's runner-exit marker naming this run, either
+  // active-before-release or retained/success) is that handoff, not cleanup.
+  // Failed cleanup, stop-only cleanup and another run's marker never pass it.
+  const [owner] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    nativeIssueId: heartbeatRuns.nativeIssueId, runnerProfileJson: heartbeatRuns.runnerProfileJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, runId))).limit(1);
+  if (owner) recoveredStopped.push(...(await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
+  ))).filter(lease => retainedWarmHandoffLease(owner, lease, { kind: "runner_exit" })).map(lease => lease.id));
   // A missing predecessor row owns nothing: deleting a run nulls its leases'
   // run reference and removes its finalization coordinator. Failing closed on
   // absence stranded the successor with no next action (invariants 3 and 7).
