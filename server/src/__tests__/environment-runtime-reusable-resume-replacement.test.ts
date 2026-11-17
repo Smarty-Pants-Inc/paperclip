@@ -197,7 +197,8 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
 
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
-    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed" });
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
+      previousProviderLeaseId: seeded.providerLeaseId });
     const resumes = call.mock.calls.filter(([, method]) => method === "environmentResumeLease");
     // Retried inside the run, then stopped well short of the five-minute deadline.
     expect(resumes.length).toBeGreaterThan(1);
@@ -231,7 +232,8 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
       .where(eq(executionWorkspaces.id, seeded.executionWorkspaceId));
     const retry = worker(seeded, async () => { step(); return await refuse(); });
     const acquired = await acquire(seeded, retry.runtime, retryRunId);
-    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed" });
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
+      previousProviderLeaseId: seeded.providerLeaseId });
     // The replacement carries the verified harness backup, so the session restores
     // without waiting for the old sandbox to be deleted.
     expect(acquired.lease.metadata?.nativeHarnessBackup).toMatchObject({ authorizedProviderLeaseId: seeded.providerLeaseId });
@@ -247,8 +249,11 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
         data: environmentResumeErrorData(Object.assign(new Error("private"), { statusCode: 409 })) });
     });
     const acquired = await acquire(seeded, runtime);
-    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed" });
-  });
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
+      previousProviderLeaseId: seeded.providerLeaseId });
+    // A 409 reports the idle sandbox busy, so the run waits up to the idle
+    // resume budget (real retry delays) before it replaces it.
+  }, 60_000);
 
   // Staging: a run could not retire its predecessor's warm
   // Runner on this sandbox, did no provider work, and asked for a fresh one.
@@ -266,7 +271,7 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
-      cause: "native_predecessor_retirement_unproven" });
+      previousProviderLeaseId: seeded.providerLeaseId, cause: "native_predecessor_retirement_unproven" });
     // The new sandbox restores the saved session from the verified backup.
     expect(acquired.lease.metadata?.nativeHarnessBackup).toMatchObject({ authorizedProviderLeaseId: seeded.providerLeaseId });
     expect(call).not.toHaveBeenCalledWith(seeded.pluginId, "environmentResumeLease", expect.anything(), expect.anything());
@@ -402,7 +407,8 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
 
     expect(acquired.lease.providerLeaseId).toBe("replacement-sandbox");
-    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed" });
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
+      previousProviderLeaseId: seeded.providerLeaseId });
     expect(acquired.lease.metadata?.nativeHarnessBackup).toBeUndefined();
     expect(call.mock.calls.filter(([, method]) => method === "environmentResumeLease").length).toBeGreaterThan(1);
     expect(clock.elapsed()).toBeLessThanOrEqual(330_000);
