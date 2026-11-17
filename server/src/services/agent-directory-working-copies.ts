@@ -6,7 +6,8 @@ import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
 import { prepareAdapterExecutionTargetRuntime, runAdapterExecutionTargetShellCommand, type AdapterExecutionTarget, type PreparedAdapterExecutionTargetRuntime } from "@paperclipai/adapter-utils/execution-target";
-import { withDirectoryMergeLock, mergeDirectoryWithBaseline, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, mergeDirectoryWithBaseline, directorySnapshotSha256, parseDirectorySnapshot, serializeDirectorySnapshot, type DirectoryMergeLockOperation, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { createHash } from "node:crypto";
 import { AGENT_FILES_CONTRACT, AgentFileLimitError, agentFileStore, agentStorageWarning, inspectAgentDirectory, type AgentFileConflict } from "./agent-file-store.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import { excludeAgentRuntimeFromGit } from "./agent-instruction-git-exclusion.js";
@@ -95,6 +96,25 @@ function pendingConflicts(row: Copy): AgentFileConflict[] {
   const value = row.receipt?.pendingConflicts ?? row.receipt?.conflicts;
   return Array.isArray(value) ? value as AgentFileConflict[] : [];
 }
+/**
+ * Warm-session freshness covers only the DECLARED INSTRUCTION set: the loaded
+ * entry plus every top-level file of the agent directory (for a managed bundle:
+ * AGENTS.md, RULES.md, DECISIONS.md, PREFERENCES.md, MODELS.md, LANDSCAPE.md).
+ * Nothing in a managed bundle marks instruction versus note files (the adapter
+ * config names only the entry; exportFiles lists every file), so this path rule
+ * is the declaration. Nested paths (memory/**, archive/**, templates/**,
+ * work/**) are notes: a sibling saving one refreshes an idle warm directory
+ * instead of retiring its session. A new session still restores the whole
+ * canonical folder, notes included.
+ */
+export function isDeclaredInstructionPath(name: string, entryFile: string): boolean {
+  return name === entryFile || !name.includes("/");
+}
+export function declaredInstructionDigest(snapshot: DirectorySnapshot, entryFile: string): string {
+  const entries = [...snapshot.entries].filter(([name, entry]) => entry.kind !== "dir" && isDeclaredInstructionPath(name, entryFile))
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+  return createHash("sha256").update(JSON.stringify(entries)).digest("hex");
+}
 function actor(row: Copy): AuthorizationActor {
   return { type: "agent", companyId: row.companyId, agentId: row.agentId, runId: row.runId, onBehalfOfUserId: row.responsibleUserId };
 }
@@ -125,8 +145,48 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (!row || row.agentId !== agentId || row.state !== "warm_saved" || row.errorCode || !await owns(row)) return false;
     const entry = baseline(row).entries.get(row.entryFile);
     if (entry?.kind !== "file" || entry.hash !== row.receipt?.sessionEntryHash) return false;
-    return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) =>
-      directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(root))) === row.baseHash);
+    return store.locked(companyId, agentId, actor(row), false, async (_tx, _agent, root) => {
+      const canonical = checkpointSnapshot(await cachedAgentFileManifest(root));
+      if (directorySnapshotSha256(canonical) === row.baseHash) return true;
+      // Notes-only drift is refreshed into the idle local tree at handoff.
+      // Remote trees keep the whole-directory retirement fence.
+      return row.location === "local" && declaredInstructionDigest(canonical, row.entryFile) === declaredInstructionDigest(baseline(row), row.entryFile);
+    });
+  }
+  /** Copy canonical note changes (never declared instruction files) into an
+   * idle local warm tree that still equals its last checkpoint, under the
+   * caller's canonical lock. Returns the rebased baseline. */
+  async function refreshWarmNotes(row: Copy, canonicalRoot: string, canonical: DirectorySnapshot) {
+    const before = baseline(row);
+    if (row.location !== "local") throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
+    const observed = await observeLocalAgentDirectory(row.localRoot).catch(() => null);
+    if (observed?.digest !== agentDirectoryBaselineDigest(before)) throw new AgentDirectoryReuseInvalidatedError("Warm agent directory changed after its checkpoint");
+    const names = [...new Set([...[...before.entries].map(([name]) => name), ...[...canonical.entries].map(([name]) => name)])]
+      .filter(name => !isDeepStrictEqual(before.entries.get(name), canonical.entries.get(name)));
+    if (names.some(name => isDeclaredInstructionPath(name, row.entryFile) && (before.entries.get(name)?.kind ?? canonical.entries.get(name)?.kind) !== "dir")) {
+      throw new AgentDirectoryReuseInvalidatedError("Managed agent instructions changed before warm directory handoff");
+    }
+    const target = (name: string) => path.join(row.localRoot, ...name.split("/"));
+    // Removed or retyped paths first (deepest first), then additions in order.
+    for (const name of [...names].sort((a, b) => b.length - a.length)) {
+      const next = canonical.entries.get(name);
+      if (!next || next.kind !== before.entries.get(name)?.kind) await fs.rm(target(name), { recursive: true, force: true });
+    }
+    for (const name of [...names].sort()) {
+      const next = canonical.entries.get(name);
+      if (next?.kind === "dir") await fs.mkdir(target(name), { recursive: true, mode: 0o700 });
+      else if (next?.kind === "file") {
+        await fs.mkdir(path.dirname(target(name)), { recursive: true, mode: 0o700 });
+        await fs.cp(path.join(canonicalRoot, ...name.split("/")), target(name), { force: true, preserveTimestamps: true });
+        await fs.chmod(target(name), next.mode & 0o777);
+      }
+    }
+    const verified = await observeLocalAgentDirectory(row.localRoot).catch(() => null);
+    if (verified?.digest !== agentDirectoryBaselineDigest(canonical)) throw new AgentDirectoryReuseInvalidatedError("Warm agent directory note refresh could not be verified");
+    const manifest = row.receipt?.checkpointManifest as AgentFileManifest | undefined;
+    const refreshed = new Set(names);
+    return { baseHash: directorySnapshotSha256(canonical), baseline: serializeDirectorySnapshot(canonical),
+      checkpointManifest: manifest ? { ...manifest, entries: manifest.entries.filter(([name]) => !refreshed.has(name)) } : undefined };
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
@@ -185,9 +245,19 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         try { return await store.locked(input.companyId, input.agentId, bound, false, async (_tx, lockedAgent, canonical) => {
           // The reservation's earlier check is only a hint. Serialize this last
           // validation and ownership transfer with every canonical writer.
-          if (current.entryFile !== deriveBundleState(lockedAgent).entryFile ||
-              directorySnapshotSha256(checkpointSnapshot(await cachedAgentFileManifest(canonical))) !== current.baseHash) {
+          if (current.entryFile !== deriveBundleState(lockedAgent).entryFile) {
             throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
+          }
+          const canonicalSnapshot = checkpointSnapshot(await cachedAgentFileManifest(canonical));
+          if (directorySnapshotSha256(canonicalSnapshot) !== current.baseHash) {
+            // Only declared instruction files retire a warm session. A sibling's
+            // note (memory/**, archive/**, ...) is copied into the idle tree.
+            if (declaredInstructionDigest(canonicalSnapshot, current.entryFile) !== declaredInstructionDigest(baseline(current), current.entryFile)) {
+              throw new AgentDirectoryReuseInvalidatedError("Managed agent files changed before warm directory handoff");
+            }
+            const refreshed = await refreshWarmNotes(current, canonical, canonicalSnapshot);
+            Object.assign(successor!, await patch(successor!, { baseHash: refreshed.baseHash,
+              receipt: { ...successor!.receipt, baseline: refreshed.baseline, checkpointManifest: refreshed.checkpointManifest } }));
           }
           // The controller-owned marker fences old callbacks. Attach the new
           // collector immediately after it moves, before fallible bookkeeping.
@@ -409,7 +479,18 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       prior = lockedPrior;
       const current = await inspectAgentDirectory(canonical);
-      const canonicalChanged = agentDirectoryBaselineDigest(current.snapshot) !== agentDirectoryBaselineDigest(baseline(prior));
+      let canonicalChanged = agentDirectoryBaselineDigest(current.snapshot) !== agentDirectoryBaselineDigest(baseline(prior));
+      let refreshed: Awaited<ReturnType<typeof refreshWarmNotes>> | null = null;
+      // Only declared instruction files retire a retained session; a sibling's
+      // note is copied into the idle local tree (see isDeclaredInstructionPath).
+      if (canonicalChanged && !observedChange && prior.location === "local"
+        && declaredInstructionDigest(current.snapshot, prior.entryFile) === declaredInstructionDigest(baseline(prior), prior.entryFile)) {
+        refreshed = await refreshWarmNotes(prior, canonical, current.snapshot).catch(error => {
+          if (error instanceof AgentDirectoryReuseInvalidatedError) return null;
+          throw error;
+        });
+        if (refreshed) canonicalChanged = false;
+      }
       if (canonicalChanged && !input.allowRetirementHandoff) return null;
       await notifyInstructionCollection(tx, { companyId: input.companyId, runId: prior.runId });
       await notifyInstructionCollection(tx, { companyId: input.companyId, runId: input.runId });
@@ -431,7 +512,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       const { createdAt: _createdAt, updatedAt: _updatedAt, ...values } = prior;
       const [next] = await tx.insert(copies).values({ ...values, runId: input.runId, responsibleUserId: bound.onBehalfOfUserId!, state: "prepared",
-        receipt: { ...prior.receipt, materializationRunId: prior.receipt?.materializationRunId ?? prior.runId,
+        ...(refreshed ? { baseHash: refreshed.baseHash } : {}),
+        receipt: { ...prior.receipt, ...(refreshed ? { baseline: refreshed.baseline, checkpointManifest: refreshed.checkpointManifest } : {}), materializationRunId: prior.receipt?.materializationRunId ?? prior.runId,
           ...(remote ? { cleanup: { leaseId: remote.leaseId, remoteCwd: remote.remoteCwd } } : {}),
           ...(observedChange || canonicalChanged ? { retirementRequired: true } : {}) }, updatedAt: new Date(),
       }).returning();
