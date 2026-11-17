@@ -352,7 +352,13 @@ async function undoMove(db: Db | Tx, workspaceId: string, pending: IsolatedRepos
   }
 }
 
-export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx) => Promise<T>) {
+/** pl/keepalive5: the move's lifecycle-lock session died (failed keepalive ping); another owner may hold the lock. */
+export class WorkspaceMoveLockLostError extends Error {
+  override name = "WorkspaceMoveLockLostError";
+  constructor(cause?: unknown) { super("workspace_move_lock_lost", { cause }); }
+}
+
+export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (tx: Tx, signal?: AbortSignal) => Promise<T>) {
   return withIsolatedRepositorySourceLock(db, workspace.companyId, workspace.sourceIssueId!, () =>
     withWorkspaceSourceLocks(db, { companyId: workspace.companyId, projectIds: workspace.projectId ? [workspace.projectId] : [] }, async () => {
       for (const cwd of localWorkspaceSourcePaths(workspace)) await retainCurrentWorkspaceSource(cwd);
@@ -361,7 +367,12 @@ export function withWorkspaceMoveLocks<T>(db: Db, workspace: Workspace, work: (t
           pg_try_advisory_xact_lock(hashtextextended(${`execution_workspace_lifecycle:${workspace.id}`}, 0)) as locked,
           (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
         if (!rows[0]?.locked) throw new Error("lifecycle_busy");
-        return withWorkspaceLockKeepalive(tx, Number(rows[0]?.idle_timeout_ms), () => work(tx));
+        // pl/keepalive5: a failed ping aborts work's signal; a lost lock is a failure, never a success.
+        const lost = new AbortController();
+        const result = await withWorkspaceLockKeepalive(tx, Number(rows[0]?.idle_timeout_ms), () => work(tx, lost.signal),
+          { onLost: cause => lost.abort(new WorkspaceMoveLockLostError(cause)) });
+        lost.signal.throwIfAborted();
+        return result;
       }));
     }), true);
 }
@@ -383,16 +394,20 @@ function skip(result: IsolatedRepositoryRehomeResult, error: unknown) {
   return reason;
 }
 
-export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Workspace, options: {
+export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Workspace, callerOptions: {
   dryRun?: boolean; now?: Date; signal?: AbortSignal; limits?: Partial<RestorePointLimits>; hooks?: IsolatedRepositoryRehomeHooks;
 } = {}): Promise<IsolatedRepositoryRehomeResult> {
+  let options = callerOptions;
   const result = emptyResult();
   const candidate = isIsolatedRepositoryRehomeCandidate(snapshot);
   if (!snapshot.sourceIssueId || (!candidate && !hasPendingIsolatedRepositoryRehomeCleanup(snapshot))) return { ...result, reason: "not_candidate" };
   try {
-    return await withWorkspaceMoveLocks(db, snapshot, async tx => {
+    return await withWorkspaceMoveLocks(db, snapshot, async (tx, lost) => {
+      // pl/keepalive5: the lock-loss signal joins the caller's; every signal-taking git step and the host writes below re-check it.
+      if (lost) options = { ...callerOptions, signal: callerOptions.signal ? AbortSignal.any([callerOptions.signal, lost]) : lost };
       const [row] = await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, snapshot.id), eq(executionWorkspaces.companyId, snapshot.companyId)));
       if (!row || row.updatedAt.getTime() !== snapshot.updatedAt.getTime()) throw new Error("workspace_changed");
+      options.signal?.throwIfAborted();
       if (!candidate) return await cleanupRehomedSource(db, tx, row, result, options);
       if (!await workspaceMoveEligible(tx, row)) throw new Error("live_or_unresolved_consumer");
       let recipe: GitCacheRestoration | null = null;
@@ -410,6 +425,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if (interrupted.base !== base || interrupted.from !== old.cwd || interrupted.branch !== branch
           || interrupted.target !== path.join(await fs.realpath(base), standardWorktreeSuffix(branch))) throw new Error("invalid_rehome_record");
         if (options.dryRun) return { ...result, outcome: "dry_run" as const, reason: "interrupted_rehome_pending", from: row.cwd, to: interrupted.target };
+        options.signal?.throwIfAborted();
         await undoMove(tx, row.id, interrupted);
         await writePending(db, row.id, null);
       }
@@ -425,6 +441,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       result.candidateBytes = await allocatedBytes(clone, () => { options.signal?.throwIfAborted(); return true; }).catch(() => 0);
       if (options.dryRun) return { ...result, outcome: "dry_run" as const };
       const admins = [path.basename(old.admin)];
+      options.signal?.throwIfAborted();
       const locks = await acquireGitExpirationLocks(rehomeLockLocations(clone, admins, branch), lockToken(row.id))
         .catch(() => { throw new Error("worktree_git_busy"); });
       const pending: IsolatedRepositoryRehomePending = { base, from: old.cwd, target, branch, head: old.head, previousTip, moves };
@@ -441,6 +458,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         const history = [old.head, ...reflog, ...(SHA.test(original) ? [original] : [])];
         const present = await presentCommits(base, history, options.signal);
         if (history.some(sha => !present.has(sha))) throw new Error("history_not_transferred");
+        options.signal?.throwIfAborted();
         await writePending(db, row.id, pending);
         recorded = true;
         if (previousTip) await git(base, ["update-ref", branchRef, old.head, previousTip], { signal: options.signal });
@@ -451,6 +469,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
             if (value) await git(base, ["config", "--local", `branch.${branch}.${key}`, value], { signal: options.signal });
           }
         }
+        options.signal?.throwIfAborted();
         await fs.mkdir(path.dirname(target), { recursive: true });
         await assertSafeBaseConfig(base, options.signal);
         await options.hooks?.beforeWorktreeAdd?.({ from: old.cwd, to: target });
@@ -459,12 +478,14 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         ownsTarget = true;
         if (manifest) await applyRestorePoint({ cwd: target, manifest, signal: options.signal });
         const newAdmin = (await git(target, ["rev-parse", "--absolute-git-dir"], { signal: options.signal })).trim();
+        options.signal?.throwIfAborted();
         await fs.mkdir(path.join(newAdmin, "logs"), { recursive: true });
         await fs.copyFile(path.join(old.admin, "logs", "HEAD"), path.join(newAdmin, "logs", "HEAD")).catch(async (error: NodeJS.ErrnoException) => {
           if (error.code !== "ENOENT") throw error;
           await fs.rm(path.join(newAdmin, "logs", "HEAD"), { force: true });
         });
         if (original) await fs.copyFile(path.join(old.admin, "ORIG_HEAD"), path.join(newAdmin, "ORIG_HEAD"));
+        options.signal?.throwIfAborted();
         await moveTransferItems(old.cwd, target, moves, linkedBases);
         await options.hooks?.beforeVerify?.({ from: old.cwd, to: target });
         const after = await currentRestorePointSnapshot(old.cwd, options.signal);
@@ -476,6 +497,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         if ((await git(target, ["symbolic-ref", "--short", "HEAD"], { signal: options.signal })).trim() !== branch) throw new Error("branch_identity_changed");
         await assertTransferredItems(old.cwd, target, moves, linkedBases);
         const at = (options.now ?? new Date()).toISOString();
+        options.signal?.throwIfAborted();
         await db.transaction(async updateTx => {
           const [current] = await updateTx.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, row.id)).for("update");
           if (!current || current.updatedAt.getTime() !== row.updatedAt.getTime()) throw new Error("workspace_changed");
@@ -492,7 +514,8 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
         committed = true;
       } finally {
         try {
-          if (!committed && recorded) {
+          // pl/keepalive5: after a lock loss the pending record stays; the next owner's interrupted-move recovery undoes it.
+          if (!committed && recorded && !lost?.aborted) {
             await undoMove(tx, row.id, pending, ownsTarget);
             await writePending(db, row.id, null);
           }
@@ -502,6 +525,7 @@ export async function rehomeIsolatedRepositoryWorkspace(db: Db, snapshot: Worksp
       result.outcome = "rehomed";
       const [updated] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, row.id));
       await options.hooks?.afterDatabaseUpdate?.(updated!);
+      options.signal?.throwIfAborted();
       return await cleanupRehomedSource(db, tx, updated!, result, options);
     });
   } catch (error) {
