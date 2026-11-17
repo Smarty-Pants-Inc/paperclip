@@ -750,6 +750,39 @@ suite("fresh-continuation fallback", () => {
     expect(notes[0].body).toBe(d10 ? FRESH_THREAD_STARTED_NOTE : NATIVE_CONTINUATION_REFUSED_ACTION);
   }, 60_000);
 
+  // D081 re-homed (never-OK, stack135 F2). The K=2 bound-note oracle is retired
+  // with its owner; the person's accepted message custody is not.
+  it.each([
+    "native_controller_recovery_unsupported:metadata_format",
+    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=journal_terminal_unsettled",
+  ])("a person's accepted message keeps its exact body, author and presence through repeated fallback refusals: %s", async error => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    await db.update(issues).set({ conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", responsibleUserId: userId }).where(eq(issues.id, f.issueId));
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: userId, body: "Please help with this task.", createdAt: new Date(Date.now() - 12 * 60_000) }).returning();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    const before = (await db.select().from(issueComments).where(eq(issueComments.id, message!.id)))[0]!;
+    const finishFailedWake = async (run: typeof heartbeatRuns.$inferSelect) => {
+      if (run.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+    };
+    const sweep = async () => { await settleUnrecoverableExecutions(db); await continueHeldExecutions(db); await deliver(); };
+    await settleUnrecoverableExecutions(db);
+    let source = await expectOneFreshSuccessor(f);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await refuseContinuation(source, error); await finishFailedWake(source);
+      for (let pass = 0; pass < 3; pass++) await sweep();
+      const next = await successors(source.id);
+      if (!next.length) break;
+      source = next[0]!;
+    }
+    const after = (await db.select().from(issueComments).where(eq(issueComments.id, message!.id)))[0];
+    expect(after).toMatchObject({ authorType: "user", authorUserId: userId, body: "Please help with this task.", deletedAt: null });
+    expect(after).toEqual(before);
+  }, 60_000);
+
   it("delivers an older pending typed fallback once without a physical-stop admission receipt", async () => {
     const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
     await bindSourceThread(f);

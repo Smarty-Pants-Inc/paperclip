@@ -2236,4 +2236,60 @@ suite("fresh-continuation fallback", () => {
     expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "held_recovery" }))
       .toEqual({ kind: "person_owned", reason: "retry_needed" });
   }, 60_000);
+
+  // D054 re-homed (never-OK, stack135 F2). The fork lineage walk
+  // (fresh-continuation-chain.ts) is gone; the per-task automatic-attempt
+  // ledgers that replaced it own scope and bounded input now.
+  it("company/task scope and malformed or unbounded ledger input stay bounded at the automatic-attempt ledgers", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+    const at = new Date();
+    const recordedAt = new Date(at.getTime() - 5 * 60_000).toISOString();
+    const record = (sourceIssueId: string, fingerprint: string, when: string) => ({ companyId, sourceIssueId,
+      kind: "active_run_watchdog" as const, status: "resolved" as const, cause: "fresh_continuation", fingerprint, nextAction: "Continue",
+      evidence: { freshContinuation: { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: f.runId, recordedAt: when, trigger: "held_recovery" } } });
+    await db.insert(issueRecoveryActions).values(record(f.issueId, `scope-${randomUUID()}`, recordedAt));
+    expect(await sharedContinuationAttempts(db, companyId, f.issueId, at)).toHaveLength(1);
+    expect((await taskAutomaticAttempts(db, companyId, f.issueId, at)).all).toHaveLength(1);
+    // Another company or another task never sees, or is charged by, this task's records.
+    expect(await sharedContinuationAttempts(db, randomUUID(), f.issueId, at)).toEqual([]);
+    expect(await sharedContinuationAttempts(db, companyId, randomUUID(), at)).toEqual([]);
+    expect((await taskAutomaticAttempts(db, randomUUID(), f.issueId, at)).all).toEqual([]);
+    expect((await taskAutomaticAttempts(db, companyId, randomUUID(), at)).all).toEqual([]);
+    const [other] = await db.insert(issues).values({ companyId, title: "Sibling", status: "todo", assigneeAgentId: agentId }).returning();
+    expect(await sharedContinuationAttempts(db, companyId, other!.id, at)).toEqual([]);
+    // Malformed durable input is ignored, never thrown and never counted.
+    await db.insert(issueRecoveryActions).values(record(f.issueId, `bad-${randomUUID()}`, "9999-not-a-date"));
+    await expect(sharedContinuationAttempts(db, companyId, f.issueId, at)).resolves.toHaveLength(1);
+    await expect(taskAutomaticAttempts(db, companyId, f.issueId, at)).resolves.toMatchObject({ all: [expect.any(Date)] });
+    // Unbounded history is read with a bound, so a long-lived task cannot make the brake read unbounded rows.
+    await db.insert(issueRecoveryActions).values(Array.from({ length: 80 }, () => record(f.issueId, `many-${randomUUID()}`, recordedAt)));
+    const many = await sharedContinuationAttempts(db, companyId, f.issueId, at);
+    expect(many.length).toBeGreaterThanOrEqual(6);
+    expect(many.length).toBeLessThanOrEqual(64 * 3);
+  }, 60_000);
+
+  // D146 re-homed (never-OK, stack135 F2). The U5 notice that owned this is
+  // deleted; the person-visible card and any recovery notice now own it.
+  it.each([
+    ["adapter_failed", "Something exploded at /srv/secret/path with token abc123", /exploded|secret|abc123/],
+    ["brand_new_failure_code", "brand_new_failure_code: provider said something private", /brand_new|private/],
+  ])("raw error text never shows on the card or a notice for a person's failed message: %s", async (errorCode, error, raw) => {
+    const f = await unfinishedRun({ runtime: "native", errorCode, error, hold: "none" });
+    const ended = new Date(Date.now() - 121_000);
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please answer this.", createdAt: new Date(ended.getTime() - 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", conversationAgentId: agentId, conversationUserId: userId,
+      conversationState: "active", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ finishedAt: ended,
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } }).where(eq(heartbeatRuns.id, f.runId));
+    await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    await settleUnrecoverableExecutions(db);
+    const card = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const blocker = await getExecutionBlocker(db, companyId, f.issueId);
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+    const visible = JSON.stringify({ card, blocker, notices: notices.map(n => ({ body: n.body, presentation: n.presentation, metadata: n.metadata })) });
+    expect(card ?? blocker ?? notices[0], "the failure is shown to the person somewhere").toBeTruthy();
+    expect(visible).not.toMatch(raw);
+    expect(visible).not.toMatch(/\/srv\/|token/);
+  }, 60_000);
 });
