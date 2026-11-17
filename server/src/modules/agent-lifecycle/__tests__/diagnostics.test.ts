@@ -90,7 +90,7 @@ describe("lifecycle failure diagnostics", () => {
     expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying" }, error)).toBe(false);
   });
 
-  it.each(["verifying", "resuming"] as const)("allowlists environment transients in %s even with an exhausted host budget", phase => {
+  it.each(["verifying", "resuming"] as const)("retries all non-budgeted host failures in %s even with an exhausted host budget", phase => {
     const context = { stage: "host" as const, phase, verificationFailures: 3 };
     for (const [error, code] of [
       [{ code: "test_environment_unavailable" }, "test_environment_unavailable"],
@@ -100,12 +100,12 @@ describe("lifecycle failure diagnostics", () => {
       expect(lifecycleVerificationNeedsRetry(context, error)).toBe(false);
       expect(lifecycleFailureMessage(context, error)).not.toMatch(/private|Automatic verification is paused/);
     }
-    // Neither HTTP status nor provider message text proves a transient.
+    // Unclassified failures also retry: no positive allowlist is required.
     for (const error of [unprocessable("native_probe_cleanup_pending"),
       unprocessable("private detail", { code: "other_failure" }),
       { details: { code: "native_probe_cleanup_pending" } }, { code: "native_probe_cleanup_pending" },
       new Error("test_environment_unavailable"), { code: "TEST_ENVIRONMENT_UNAVAILABLE" }]) {
-      expect(lifecycleVerificationNeedsRetry(context, error)).toBe(true);
+      expect(lifecycleVerificationNeedsRetry(context, error)).toBe(false);
     }
   });
 
@@ -133,12 +133,13 @@ describe("lifecycle failure diagnostics", () => {
     expect(lifecycleVerificationNeedsRetry(context, { code: reason })).toBe(false);
   });
 
-  it.each(["verifying", "resuming"] as const)("bounds every %s host failure, including unknown codes and uncoded exceptions", phase => {
+  it.each(["verifying", "resuming"] as const)("budgets only harness_test_failed in host verifying, not %s unknown failures", phase => {
     for (const error of [{ code: "harness_test_failed" }, { code: "ECONNRESET" }, { code: "runner_revision_mismatch" }, new Error("private quota")]) {
       for (const verificationFailures of [1, 2, 3, 8_000]) {
         const context = { stage: "host" as const, phase, attempts: 8_000, verificationFailures };
-        expect(lifecycleVerificationNeedsRetry(context, error)).toBe(verificationFailures >= 3);
-        if (verificationFailures >= 3) {
+        const parks = phase === "verifying" && "code" in error && error.code === "harness_test_failed" && verificationFailures >= 3;
+        expect(lifecycleVerificationNeedsRetry(context, error)).toBe(parks);
+        if (parks) {
           expect(lifecycleFailureMessage(context, error)).toContain("Automatic verification is paused");
           expect(lifecycleFailureMessage(context, error)).not.toMatch(/private|retry automatically|check again automatically/);
         }
@@ -161,7 +162,7 @@ describe("lifecycle failure diagnostics", () => {
     if (stage === "transition") store.change.mockRejectedValue(error);
     await worker.process(agent.id);
     expect(store.defer).toHaveBeenCalledWith(agent, expect.any(String), expect.stringContaining(expected), expect.any(Date),
-      ...(stage === "host" ? [{ retryRequired: true, verificationFailures: 1 }] : []));
+      ...(stage === "host" ? [{ retryRequired: true }] : []));
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("secret provider output");
     expect(JSON.stringify(store.defer.mock.calls)).not.toContain("unknown private code");
     await worker.stop();

@@ -451,27 +451,47 @@ The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
 A database lease permits one active attempt for each agent.
 The worker renews that lease during external calls.
-Host failures during verification or resume spend the operation's consecutive
-`verificationFailures` budget, including provider allocation failures before a test
-starts, except for positively identified transient environment failures:
-`test_environment_unavailable` and an HTTP error with detail code
-`native_probe_cleanup_pending`. These two failures preserve the counter and use the
-ordinary one-minute automatic retry. Lifecycle verification reconciles retained
-cleanup for the selected account before acquiring another test box or lease; no
-second probe starts until the original retirement and credential handoff complete.
-The operation records its first consecutive transient failure in
-`transientFailureSince`. Before ten minutes it shows no error line; from ten minutes
-it shows one line in `lifecycleError`: “Waiting for its environment; retrying
-automatically”. Retries continue. A non-transient result, successful host step,
-configuration repair or explicit Retry resets that timestamp, and readiness clears
-the line. This uses the existing retry deadline, not a new timer. Other failed attempts use
-the shared bounded exponential backoff at the saved
-`retryAt` (one minute, two minutes, four minutes, capped at five minutes); scans
-and direct claims both honor that deadline. Three consecutive failures park the
-operation with `retryRequired: true` and a fixed, secret-safe `lifecycleError`
-identifying the last failure category. Known configuration or account failures
-park immediately. Host completion resets the counter. Retry or a configuration
-repair clears the parked operation's budget; a restart alone does not.
+Only a host failure in `verifying` classified as `harness_test_failed` spends
+`verificationFailures`. Three such failed tests park the operation with
+`retryRequired: true` and the true, secret-safe reason. Known configuration or
+account failures still park immediately in verification or resume. Unknown host
+failures, allocation failures, `test_environment_unavailable`, and
+`native_probe_cleanup_pending` do not spend this budget and cannot trip its
+three-failure park, even when an earlier test count remains. This follows upstream
+01451fae's worker.ts:84–96 and failure.ts:34–38 (`fix-failed-paperclip-run`).
+
+Non-budgeted, non-configuration/account host failures during verification or
+resume save `retryAt` with backoff from the first failure: 60 seconds, 120 seconds,
+240 seconds, 480 seconds, then 900 seconds (15-minute cap). The independent
+`transientFailures` count survives restarts and counts failed host work, not
+claims deferred before that work. This is a deliberate cost-guard departure from
+upstream's fixed 60-second ordinary-error retry: every probe can consume a Boat
+start, and [Boat's documented daily start limits](https://docs.boat.dev/limits)
+make continuous one-minute retries across stuck hires unsafe. The limit is per
+operation, not a guarantee that fleet-wide starts fit any particular Boat plan.
+With instantaneous attempts, including the initial attempt and the endpoint,
+continuous failure makes 8 attempts over one hour and 12 over two hours.
+
+Lifecycle verification reconciles retained cleanup for the selected account
+before acquiring another test box or lease; no second probe starts until the
+original retirement and credential handoff complete. The verifier releases each
+acquired target in its `finally` block, including failed attempts; environment
+lease cleanup records its release receipt.
+The operation records the first consecutive non-budgeted host failure in
+`transientFailureSince`. Before ten minutes it shows no error line; at the first
+evaluation at or after ten minutes it shows one line in `lifecycleError`:
+“Waiting for its environment; retrying automatically”. The existing shared
+coordinator schedules that visibility deadline independently of the next probe;
+direct worker evaluations also surface it. Updating the line never changes
+`retryAt`, claims a lease, or spends a probe start. Retries continue. A
+budgeted/configuration failure, successful host step, configuration repair or
+explicit Retry resets that timestamp and backoff count; readiness clears the line.
+This uses the existing retry deadline, not a new timer. Other ordinary errors
+retain the 60-second retry. Budgeted tests retain the shared backoff (one minute,
+two minutes, four minutes, capped at five minutes); scans and direct claims honor
+the saved deadline. Host completion resets the verification counter. Retry or a
+configuration repair clears a parked operation's budget; a restart alone does not.
+Already-parked hires require the documented Retry API, not an automatic reset.
 
 Stop work (`pausing`, `terminating`, `cleaning_up`) counts incomplete host or
 required-plugin attempts in the saved operation's `stopFailures`. Both `pending`

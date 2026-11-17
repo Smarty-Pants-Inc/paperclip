@@ -879,10 +879,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
   it("retains the failed phase and the same operation for retry", async () => {
     let fail = true;
-    const work = worker(async agent => { if (agent.lifecycleState === "verifying" && fail) throw new Error("private detail"); return "complete"; });
+    const work = worker(async agent => { if (agent.lifecycleState === "verifying" && fail) throw Object.assign(new Error("private detail"), { code: "harness_test_failed" }); return "complete"; });
     const agent = await hire(); await work.process(agent.id);
     const failed = await current(agent.id);
     expect(failed.lifecycleState).toBe("verifying");
+    expect(failed.lifecycleError).not.toBeNull();
     expect(failed.lifecycleError).not.toContain("private detail");
     fail = false;
     await createAgentLifecycle(db).retry(agent.id); await work.process(agent.id);

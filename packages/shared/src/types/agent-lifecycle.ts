@@ -23,8 +23,10 @@ export interface AgentLifecycleOperation {
   retryRequired?: boolean;
   /** Failed generic host verification tests for this saved configuration. */
   verificationFailures?: number;
-  /** First consecutive transient environment failure in this operation; survives worker restarts. */
+  /** First consecutive non-budgeted host failure in this operation; survives worker restarts. */
   transientFailureSince?: string;
+  /** Consecutive non-budgeted host failures, independent of claims and the verification budget. */
+  transientFailures?: number;
   /** Incomplete host/plugin Stop attempts for this saved operation. */
   stopFailures?: number;
   attempts: number;

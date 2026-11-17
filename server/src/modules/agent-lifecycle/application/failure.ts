@@ -37,9 +37,8 @@ const configurationFailures = new Set([
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
   const code = lifecycleFailureCode(error) ?? "";
   return ["verifying", "resuming"].includes(context.phase ?? "") && context.stage === "host"
-    && !isTransientLifecycleVerificationFailure(error)
     && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code)
-      || (context.verificationFailures ?? 0) >= 3);
+      || (context.phase === "verifying" && code === "harness_test_failed" && (context.verificationFailures ?? 0) >= 3));
 }
 
 export function lifecycleFailureCode(error: unknown): string | undefined {
@@ -52,12 +51,6 @@ export function lifecycleFailureCode(error: unknown): string | undefined {
   if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
   return codes.find((code): code is string =>
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
-}
-
-/** Only positive environment evidence bypasses the fork's non-transient host fuse. */
-export function isTransientLifecycleVerificationFailure(error: unknown): boolean {
-  const code = lifecycleFailureCode(error);
-  return code === "test_environment_unavailable" || code === "native_probe_cleanup_pending";
 }
 
 export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {

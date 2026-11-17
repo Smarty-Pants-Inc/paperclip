@@ -261,12 +261,124 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     // Preserve the base's actual third-failure park as evidence, before asserting GREEN.
     console.info("TRANSIENT_RETRY_OBSERVATIONS", phase, JSON.stringify(observations));
     expect(observations[2].operation).not.toHaveProperty("retryRequired");
-    for (const { before, after, operation } of observations) {
+    for (const [index, { before, after, operation }] of observations.entries()) {
       expect(operation?.verificationFailures ?? 0).toBe(0);
-      expect(Date.parse(operation!.retryAt!)).toBeGreaterThanOrEqual(before + 60_000);
-      expect(Date.parse(operation!.retryAt!)).toBeLessThanOrEqual(after + 60_000);
+      const delay = 60_000 * 2 ** index;
+      expect(Date.parse(operation!.retryAt!)).toBeGreaterThanOrEqual(before + delay);
+      expect(Date.parse(operation!.retryAt!)).toBeLessThanOrEqual(after + delay);
     }
     expect(runHost).toHaveBeenCalledTimes(3);
+  });
+
+  it("three UNCLASSIFIED host failures do not park the hire and the next ordinary attempt reaches ready", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-11-17T12:00:00Z"));
+      let attempts = 0;
+      const onReady = vi.fn();
+      const work = createLifecycleWorker(createLifecycleStore(db, createAgentLifecycleEffects()), {
+        requiredPluginIds: async () => [], runPlugin: async () => "complete", onReady,
+        runHost: async agent => {
+          if (agent.lifecycleState === "verifying" && ++attempts <= 3) throw new Error("private unclassified host failure");
+          return "complete";
+        },
+      }, () => {});
+      workers.push(work);
+      const agent = await createAgentLifecycle(db).requestHire(companyId, { name: "Recorded unclassified hire", adapterType: "process" });
+      const observations = [];
+      let operationId: string | undefined;
+      for (let failure = 1; failure <= 3; failure++) {
+        const now = Date.now();
+        await work.process(agent.id);
+        const row = await current(agent.id);
+        observations.push(row.lifecycleOperation);
+        operationId ??= row.lifecycleOperation!.id;
+        expect.soft(row.lifecycleOperation!.id).toBe(operationId);
+        expect.soft(row.lifecycleOperation?.verificationFailures ?? 0).toBe(0);
+        expect.soft(row.lifecycleOperation?.retryRequired).not.toBe(true);
+        expect.soft(row.lifecycleOperation?.transientFailures).toBe(failure);
+        const due = Date.parse(row.lifecycleOperation!.retryAt ?? "");
+        expect.soft(due).toBe(now + 60_000 * 2 ** (failure - 1));
+        // Preserve the third-failure park on RED; never edit the saved row to wake it.
+        vi.setSystemTime(Number.isFinite(due) ? due : now + 60_000);
+      }
+      console.info("UNCLASSIFIED_RETRY_OBSERVATIONS", JSON.stringify(observations));
+      await work.process(agent.id);
+      expect(attempts).toBe(4);
+      expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+      expect(onReady).toHaveBeenCalledOnce();
+      expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailures");
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each([60, 120])("cost guard: continuous UNCLASSIFIED failure has bounded attempts over %s simulated minutes", async minutes => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = new Date("2026-11-17T12:00:00Z").getTime();
+      vi.setSystemTime(start);
+      const [agent] = await db.insert(agents).values({ companyId, name: "Unclassified cost guard", status: "paused", adapterType: "opencode_local",
+        lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+        runtimeConfig: { aiConnection: { mode: "responsible_user", provider: "openrouter", method: "api_key" } },
+        lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+      const accountKey = randomUUID();
+      const connections = aiConnections.aiConnectionService;
+      vi.spyOn(aiConnections, "aiConnectionService").mockImplementation(database => ({ ...connections(database),
+        select: async () => ({ connection: { credentialSecretRefs: [] }, grant: { id: accountKey, credentialSecretRefs: [] },
+          attribution: { grantId: accountKey, connectionId: accountKey } } as never),
+      }));
+      const tests = environmentTests.agentEnvironmentTestService;
+      const released: Array<{ id: string; outcome: string | undefined }> = [];
+      vi.spyOn(environmentTests, "agentEnvironmentTestService").mockImplementation((database, manager) => ({ ...tests(database, manager),
+        resolveAdapterTestEnvironmentId: async () => null,
+        resolveAdapterTestExecutionContext: async () => {
+          const [lease] = await db.insert(environmentLeases).values({ companyId, provider: "fixture", providerLeaseId: randomUUID() }).returning();
+          return { executionTarget: null, environmentName: null, fallbackChecks: [], release: async outcome => {
+            await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date() })
+              .where(eq(environmentLeases.id, lease.id));
+            released.push({ id: lease.id, outcome });
+          } };
+        },
+        testManagedEnvironment: async () => { throw new Error("private unclassified outage"); },
+      }));
+      vi.spyOn(aiRuntime, "withManagedAiProbe").mockImplementation(async (_db, input, probe) => probe({ config: input.config,
+        attribution: { grantId: accountKey, connectionId: accountKey } } as never));
+      // Exercise the real verifier's finally on EVERY acquired synthetic target.
+      // Credentials/remote provider remain substituted; these are SQL receipts,
+      // not claims of physical Boat retirement on a deployed gate.
+      const verifier = agentHarnessVerificationService(db, {} as never);
+      const store = createLifecycleStore(db, createAgentLifecycleEffects());
+      const runHost = vi.fn((row: LifecycleAgent) => verifier.verify(row));
+      const driver = { requiredPluginIds: async () => [], runPlugin: async () => "complete" as const, runHost };
+      let work = createLifecycleWorker(store, driver, () => {}); workers.push(work);
+      const atMinutes: number[] = [];
+      while (Date.now() <= start + minutes * 60_000) {
+        const now = Date.now();
+        await work.process(agent.id);
+        atMinutes.push((now - start) / 60_000);
+        const row = await current(agent.id);
+        expect(row.lifecycleOperation?.verificationFailures ?? 0).toBe(0);
+        expect(row.lifecycleOperation?.retryRequired).not.toBe(true);
+        expect(row.lifecycleOperation?.transientFailures).toBe(atMinutes.length);
+        const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+        expect(leases).toHaveLength(atMinutes.length);
+        expect(released).toHaveLength(atMinutes.length);
+        expect(released.every(receipt => receipt.outcome === "failed")).toBe(true);
+        expect(leases.every(lease => lease.status === "released" && lease.cleanupStatus === "success" && lease.releasedAt !== null)).toBe(true);
+        const due = Date.parse(row.lifecycleOperation!.retryAt!);
+        expect(due - now).toBe(Math.min(60_000 * 2 ** (atMinutes.length - 1), 900_000));
+        expect(await store.claim(agent.id, "early", new Date(due - 1))).toBeNull();
+        if (atMinutes.length === 3) {
+          await work.stop(); work = createLifecycleWorker(store, driver, () => {}); workers.push(work);
+        }
+        vi.setSystemTime(due);
+      }
+      const receipts = await db.select({ id: environmentLeases.id, providerLeaseId: environmentLeases.providerLeaseId,
+        status: environmentLeases.status, cleanupStatus: environmentLeases.cleanupStatus, releasedAt: environmentLeases.releasedAt })
+        .from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+      console.info("UNCLASSIFIED_COST_RECEIPT", JSON.stringify({ minutes, attempts: runHost.mock.calls.length, atMinutes, released, receipts }));
+      expect(runHost).toHaveBeenCalledTimes(minutes === 60 ? 8 : 12);
+      expect((await current(agent.id)).lifecycleError).toBe("Waiting for its environment; retrying automatically");
+    } finally { vi.useRealTimers(); }
   });
 
   it("refuses a retained-cleanup retry before acquiring another probe box or lease", async () => {
@@ -290,8 +402,11 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         attribution: { grantId: accountKey, connectionId: accountKey } } as never),
     }));
     const allocate = vi.fn(async () => {
-      await db.insert(environmentLeases).values({ companyId, provider: "fixture", providerLeaseId: "next-probe" });
-      return { executionTarget: null, environmentName: null, fallbackChecks: [], release: async () => {} };
+      const [lease] = await db.insert(environmentLeases).values({ companyId, provider: "fixture", providerLeaseId: "next-probe" }).returning();
+      return { executionTarget: null, environmentName: null, fallbackChecks: [], release: async () => {
+        await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date() })
+          .where(eq(environmentLeases.id, lease.id));
+      } };
     });
     const tests = environmentTests.agentEnvironmentTestService;
     vi.spyOn(environmentTests, "agentEnvironmentTestService").mockImplementation((database, manager) => ({ ...tests(database, manager),
@@ -318,7 +433,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       expect(allocate).toHaveBeenCalledOnce();
       const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
       expect(leases).toHaveLength(2);
-      expect(leases.find(row => row.id === original.id)).toMatchObject({ status: "released", cleanupStatus: "success" });
+      expect(leases.every(row => row.status === "released" && row.cleanupStatus === "success" && row.releasedAt !== null)).toBe(true);
+      console.info("PROBE_RELEASE_RECEIPTS", JSON.stringify(leases.map(({ id, providerLeaseId, status, cleanupStatus, releasedAt }) =>
+        ({ id, providerLeaseId, status, cleanupStatus, releasedAt }))));
     } finally { cleanupAllowed = true; retire(); await reconcileRetainedAiCleanup(scope); }
   });
 
@@ -349,8 +466,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const runHost = vi.fn(async (): Promise<"complete"> => { throw Object.assign(new Error("private environment detail"), { code: "test_environment_unavailable" }); });
     const driver = { requiredPluginIds: async () => [], runPlugin: async () => "complete" as const, runHost };
     let work = createLifecycleWorker(clockStore, driver, () => {}); workers.push(work);
-    for (let minute = 0; minute <= 11; minute++) {
-      if (minute === 4) {
+    for (const [index, minute] of [0, 1, 3, 7, 15, 30].entries()) {
+      if (minute === 3) {
         await work.stop();
         work = createLifecycleWorker(clockStore, driver, () => {}); workers.push(work);
       }
@@ -358,15 +475,62 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       await work.process(agent.id);
       const row = await current(agent.id);
       expect(row.lifecycleOperation).toMatchObject({ id: agent.lifecycleOperation!.id,
-        transientFailureSince: first.toISOString(), retryAt: new Date(now.getTime() + 60_000).toISOString() });
+        transientFailureSince: first.toISOString(), transientFailures: index + 1,
+        retryAt: new Date(now.getTime() + Math.min(60_000 * 2 ** index, 900_000)).toISOString() });
       expect(row.lifecycleOperation).not.toHaveProperty("retryRequired");
       expect(row.lifecycleError).toBe(minute < 10 ? null : "Waiting for its environment; retrying automatically");
     }
     runHost.mockResolvedValue("complete");
-    now = new Date(first.getTime() + 12 * 60_000);
+    now = new Date(first.getTime() + 45 * 60_000);
     await work.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
     expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailureSince");
+  });
+
+  it("schedules the ten-minute warning between probes across restart without admitting or counting another attempt", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const start = new Date("2026-11-17T12:00:00Z").getTime();
+      vi.setSystemTime(start);
+      const [agent] = await db.insert(agents).values({ companyId, name: "Warning deadline", status: "paused",
+        lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+        lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+      const runHost = vi.fn(async (): Promise<"complete"> => { throw new Error("private host outage"); });
+      const driver = { requiredPluginIds: async () => [], runHost, runPlugin: async () => "complete" as const };
+      let work = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true); workers.push(work);
+      for (const minute of [0, 1, 3, 7]) {
+        vi.setSystemTime(start + minute * 60_000);
+        await work.sweep();
+      }
+      const before = await current(agent.id);
+      expect(before.lifecycleError).toBeNull();
+      expect(before.lifecycleOperation).toMatchObject({ transientFailures: 4, retryAt: new Date(start + 15 * 60_000).toISOString() });
+      await work.stop();
+      work = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true); workers.push(work);
+      expect(await work.hasPending()).toBe(false);
+      expect(work.nextRunAt()).toBe(start + 10 * 60_000);
+      vi.setSystemTime(start + 10 * 60_000 - 1);
+      await work.sweep();
+      expect((await current(agent.id)).lifecycleError).toBeNull();
+      vi.setSystemTime(start + 10 * 60_000);
+      expect(await work.hasPending()).toBe(true);
+      await work.sweep();
+      const visible = await current(agent.id);
+      expect(visible.lifecycleError).toBe("Waiting for its environment; retrying automatically");
+      expect(visible.lifecycleOperation).toEqual(before.lifecycleOperation);
+      expect(runHost).toHaveBeenCalledTimes(4);
+      expect(await work.hasPending()).toBe(false);
+      expect(work.nextRunAt()).toBe(start + 15 * 60_000);
+      console.info("WARNING_DEADLINE_RECEIPT", JSON.stringify({ before: before.lifecycleOperation,
+        visibleError: visible.lifecycleError, after: visible.lifecycleOperation, attempts: runHost.mock.calls.length,
+        nextRunAt: work.nextRunAt() }));
+      runHost.mockResolvedValue("complete");
+      vi.setSystemTime(start + 15 * 60_000);
+      await work.sweep();
+      expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+      expect(await work.hasPending()).toBe(false);
+      expect(work.nextRunAt()).toBeNull();
+    } finally { vi.useRealTimers(); }
   });
 
   it.each([599_999, 600_000])("uses the first transient failure, not operation age, at the %s ms warning boundary", async elapsed => {
@@ -404,8 +568,8 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailureSince");
   });
 
-  // Keep reason: Image B-s4 905542b5 retried allocation errors without accounting.
-  it.each(["verifying", "resuming"] as const)("bounds every %s host failure, spaces attempts and survives restart", async phase => {
+  // Money guard: allocation failures retry, but every saved deadline backs off.
+  it.each(["verifying", "resuming"] as const)("cost-bounds %s allocation failures without parking and survives restart", async phase => {
     const [agent] = await db.insert(agents).values({ companyId, name: "Bounded provider allocation", status: "idle",
       lifecycleState: phase, lifecycleRequiredPluginIds: [],
       lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
@@ -417,8 +581,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       const before = Date.now();
       await work.sweep();
       const row = await current(agent.id);
-      expect(row.lifecycleOperation?.verificationFailures).toBe(failure);
-      if (failure < 3) {
+      expect(row.lifecycleOperation?.verificationFailures).toBeUndefined();
+      expect(row.lifecycleOperation?.transientFailures).toBe(failure);
+      {
         const retryAt = Date.parse(row.lifecycleOperation!.retryAt!);
         const expectedDelay = 60_000 * 2 ** (failure - 1);
         expect(retryAt).toBeGreaterThanOrEqual(before + expectedDelay);
@@ -432,26 +597,26 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
       }
     }
-    const parked = await current(agent.id);
-    expect(parked.lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
-    expect(parked.lifecycleOperation).not.toHaveProperty("retryAt");
-    expect(parked.lifecycleError).toContain("provider allocation failed");
-    expect(parked.lifecycleError).toContain("Automatic verification is paused");
-    expect(parked.lifecycleError).not.toContain("private quota detail");
+    const waiting = await current(agent.id);
+    expect(waiting.lifecycleOperation).toMatchObject({ transientFailures: 3 });
+    expect(waiting.lifecycleOperation).not.toHaveProperty("retryRequired");
+    expect(waiting.lifecycleError).toBeNull();
     await work.stop();
     const restarted = configureAgentLifecycle(db, driver); workers.push(restarted);
     await restarted.sweep(); await restarted.process(agent.id);
-    expect(await store.claim(agent.id, "tomorrow", new Date(Date.now() + 86_400_000))).toBeNull();
-    expect(runHost).toHaveBeenCalledTimes(3);
+    expect(runHost).toHaveBeenCalledTimes(4);
+    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ transientFailures: 4, retryAt: expect.any(String) });
   });
 
-  it("bounds Runner revision failures and accepts an explicit repaired retry", async () => {
+  it("retries Runner revision failures without spending the harness budget and accepts explicit Retry", async () => {
     const { agent, work, runHost } = await failed("runner_revision_mismatch");
     for (let check = 0; check < 2; check++) {
       await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
       await work.process(agent.id);
     }
-    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
+    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ transientFailures: 3, retryAt: expect.any(String) });
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("retryRequired");
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("verificationFailures");
     runHost.mockImplementation(async () => "complete");
     await createAgentLifecycle(db).retry(agent.id);
     await work.process(agent.id);
