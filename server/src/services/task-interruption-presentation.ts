@@ -956,7 +956,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     const facts = await readRetryAuthorityFacts(db, { companyId, issueId });
     const authority = decideRetryAuthority({ ...facts, stopGate,
       automaticRecovery, restoreHold, retrySource: presentation.canRetry });
-    if (authority.canRetry) continue;
+    // fam-retry2: an accept-held Retry is not a second Retry button; the card
+    // keeps upstream's withheld Retry and says the hold's words.
+    if (authority.canRetry && authority.admission !== "held") continue;
     // Judge R9: Paperclip is continuing by itself; the card says so in the
     // authority's words (the same words the transcript note carries).
     if (authority.reason === "automatic_recovery") {
