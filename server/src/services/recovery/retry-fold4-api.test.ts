@@ -84,6 +84,14 @@ describe("retry fold 4: the Retry API refuses every Retry the card does not offe
     expect(runs.map(run => run.id)).toEqual([f.runId]);
     const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, answer.requestId!));
     expect(wake?.runId ?? null).toBeNull();
+    // No false line after preservation: the card stays paused + Resume, never
+    // "working" and never a retry countdown ("Trying again in 60s" reads
+    // state retry_scheduled / nextRetryAt).
+    const presentation = await taskInterruptionPresentation(db, await f.issue());
+    expect(presentation).toMatchObject({ state: "waiting_for_user", canRetry: false, userAction: "resume", nextRetryAt: null,
+      retryWait: { reason: "agent_paused", message: PAUSED } });
+    const card = await getExecutionBlocker(db, f.companyId, f.issueId);
+    expect(card).toMatchObject({ canRetry: false, nextAction: PAUSED });
   });
 
   // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): a held
