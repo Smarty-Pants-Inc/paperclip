@@ -11,9 +11,8 @@ import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
-import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome, preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
-import { hasAcknowledgedNativeRunStopRequest } from "./acknowledged-native-stop.js";
-import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
+import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
+import { handedOffWarmLeaseSettled } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -42,9 +41,6 @@ import { canResumePreservedResultFinalization } from "./preserved-result-finaliz
 import { isServerReplacementInterruption } from "./server-replacement-interruption.js";
 import { normalizeAgentNameKey } from "./agent-name-key.js";
 import { liftInterruptionBlock } from "./interruption-block-release.js";
-
-/** Lease policies whose box a warm Stop can hand off (native-failed-workspace-recovery). */
-const reusableNativeLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
   "id" | "companyId" | "agentId" | "status" | "startedAt" | "finishedAt" | "createdAt" |
@@ -583,13 +579,7 @@ export async function admitExplicitNativeContinuation(input: {
       const handedOff = new Set<string>();
       for (const lease of leases) {
         if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
-        if (run.runtimeMode !== "native" || lease.status !== "retained" || lease.releasedAt
-          || !reusableNativeLeasePolicies.includes(lease.leasePolicy)
-          || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease)
-          || nativeStopWorkspaceOutcome({ admittedDisposition: admittedNativeResourceDisposition(run.runnerProfileJson),
-            stopped: run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run), source: lease }) !== "handoff") break;
-        const { handedOffWarmOwnerRunnerExited } = await import("./native-runtime/native-session-executor.js");
-        if (!await handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId })) break;
+        if (!await handedOffWarmLeaseSettled(run, lease)) break;
         handedOff.add(lease.id);
       }
       if (!leases.every(lease => handedOff.has(lease.id) || hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
