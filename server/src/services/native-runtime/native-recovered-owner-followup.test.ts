@@ -424,6 +424,60 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("starting a new runner for this conversation");
   }, 60_000);
 
+  it.each([false, true].flatMap(external => ["no transaction", "coordinator changed", "coordinator timestamp changed"].map(scenario => ({ external, scenario }))))(
+    "probes a resumed projection before locking: $scenario (external=$external)", async ({ external, scenario }) => {
+      const fixture = await staleProjection("codex", external), { prior, latest, followUp, root, path } = fixture;
+      await recordPriorLeaseOnSameSandbox(prior, followUp);
+      await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId,
+        issueId: prior.issueId, heartbeatRunId: latest.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
+        status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+      type Transaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+      let active: Transaction | undefined, probes = 0, checks = 0, openProbeTransactions = 0, changed = false;
+      const transaction = db.transaction.bind(db);
+      const spy = vi.spyOn(db, "transaction").mockImplementation((callback, config) => transaction(async tx => {
+        active = tx;
+        try { return await callback(tx); }
+        finally { active = undefined; }
+      }, config));
+      const execute = followUp.remoteExecute.getMockImplementation()!;
+      followUp.remoteExecute.mockImplementation(async request => {
+        const text = JSON.stringify(request);
+        if (text.includes("paperclip-runner-generation-")) {
+          probes++;
+          if (active) openProbeTransactions++;
+          if (scenario === "no transaction") expect(active, "remote probe must not hold a transaction").toBeUndefined();
+        }
+        if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false,
+          stdout: Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", ...latest.identity,
+            lifecycle: "suspended", outbox: [], pendingTerminalDelivery: null, pendingProviderCleanup: null,
+            warmTransition: null })).toString("base64"), stderr: "" };
+        const result = await execute(request);
+        if (text.includes("paperclip-runner-generation-check") && ++checks === 2 && scenario !== "no transaction") {
+          await (active ?? db).update(nativeRunFinalizations).set(scenario === "coordinator changed"
+            ? { controllerGeneration: 2 } : { updatedAt: new Date(Date.now() + 60_000) })
+            .where(eq(nativeRunFinalizations.runId, latest.runId));
+          changed = true;
+        }
+        return result;
+      });
+      try {
+        const outcome = await followUp.start("resumed");
+        expect(probes).toBeGreaterThan(0);
+        if (scenario === "no transaction") {
+          expect(openProbeTransactions, "remote probe must not hold a transaction").toBe(0);
+          expect(outcome).toBe(ADMITTED);
+          expect(JSON.parse(await readFile(path, "utf8")).identity).toEqual(latest.identity);
+          expect(await archivedOwners(root)).toEqual([prior.runId]);
+        } else {
+          expect(changed).toBe(true);
+          expect(outcome).toBe("native_runner_checkpoint_projection_held:source_changed");
+          expect(await readFile(path, "utf8")).toBe(fixture.originalBytes);
+          expect(await archivedOwners(root)).toEqual([]);
+        }
+        await fixture.assertBackup();
+      } finally { spy.mockRestore(); }
+    }, 60_000);
+
   it("starts an unclaimed remote follow-up from the previous owner's external marker under a bootstrap claim", async () => {
     const fixture = await staleProjection("codex", true);
     expect(await fixture.followUp.start("created", { kind: "bootstrap_incomplete", runId: fixture.followUp.runId,
