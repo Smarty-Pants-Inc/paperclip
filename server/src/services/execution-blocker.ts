@@ -15,7 +15,7 @@ import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeR
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
 import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
-import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, stoppedBeforeWorkWasSaved, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "./native-local-process-stop.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
@@ -472,8 +472,16 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const retryOffered = canRetry && (!chatBinding || recoveredFailure) && heldRetryOffersRetry(heldRefusal);
   const heldConversation = workspaceRecoveryState?.status === "recovered"
     ? await readUnsupersededHeldConversationNotice(db, { companyId, issueId }) : null;
+  // This receipt describes the source run, not deferred user messages. Read
+  // the coordinator's durable pre-provider evidence rather than inferring
+  // saved work from a recovery pass that may have had nothing to preserve.
+  const [sourceFailure] = workspaceRecoveryState?.status === "recovered" && run?.runtimeMode === "native"
+    && ["failed", "timed_out"].includes(run.status) ? await db.select({ failureDetail: nativeRunFinalizations.failureDetail })
+      .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
+        eq(nativeRunFinalizations.issueId, issueId), eq(nativeRunFinalizations.runId, run.id))).limit(1) : [];
   const workspaceRecovery = workspaceRecoveryState?.status === "recovered"
-    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered, Boolean(heldConversation)) }
+    ? { ...workspaceRecoveryState, message: recoveredWorkMessage(run?.status, retryOffered, Boolean(heldConversation),
+      stoppedBeforeWorkWasSaved(run?.status, sourceFailure?.failureDetail)) }
     : workspaceRecoveryState && { ...workspaceRecoveryState, canRetry: workspaceRecoveryState.canRetry && retryOffered };
   let nextAction = action.status === "active" && action.cause === EXECUTION_FINALIZATION_DEADLINE_EXCEEDED
     ? EXECUTION_FINALIZATION_DEADLINE_MESSAGE : action.nextAction;

@@ -16,11 +16,11 @@ import type { ExecutionProjection } from "@paperclipai/shared";
 import { EXECUTION_CONTROL_DEADLINE_MS } from "./execution-control-deadline.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
 import { retryIdempotentDatabaseOperation } from "../database-retry.js";
-import { readWorkspaceRecovery, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
+import { readWorkspaceRecovery, recoveredWorkMessage, stoppedBeforeWorkWasSaved, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { readUnsupersededHeldConversationNotices } from "./native-runtime/pi-session-recovery-notice.js";
 import { readTaskDrain } from "./task-admission.js";
 import { getStartupRecoveryState, startupQueuedRunPassOutstanding } from "../startup-recovery-state.js";
-import { hasPendingRunCleanup } from "./execution-blocker.js";
+import { getExecutionBlocker, hasPendingRunCleanup } from "./execution-blocker.js";
 import { isAgentAwaitingSetup } from "../modules/agent-lifecycle/index.js";
 import { NATIVE_RESPONSE_WAKE_WAITING_REASON } from "./native-runtime/status-arbiter.js";
 import { agentQueueLinesForRuns } from "./heartbeat/queued-run-line.js";
@@ -311,6 +311,10 @@ export async function executionProjectionsForRuns(
     .map(row => row.issueId))];
   const heldConversations = await read(() => readUnsupersededHeldConversationNotices(db,
     { companyId, issueIds: recoveredIssueIds }));
+  // The exceptional pre-provider receipt must name the same available action
+  // as the card. Reuse its admission-backed Retry decision, once per task;
+  // ordinary list projections keep their existing batched diagnostic reads.
+  const preProviderBlockers = new Map<string, Awaited<ReturnType<typeof getExecutionBlocker>>>();
   for (const run of runs) {
     const issueId = run.nativeIssueId ?? text(run.contextSnapshot?.issueId);
     const matching = recovery.filter(
@@ -321,6 +325,13 @@ export async function executionProjectionsForRuns(
     );
     const action =
       matching.find((row) => row.status !== "resolved") ?? matching[0];
+    let recoveredInstruction: string | undefined;
+    if (issueId && run.runtimeMode === "native" && readWorkspaceRecovery(action?.evidence ?? null)?.status === "recovered"
+      && stoppedBeforeWorkWasSaved(run.status, coordinatorByRun.get(run.id)?.failureDetail)) {
+      if (!preProviderBlockers.has(issueId)) preProviderBlockers.set(issueId, await read(() => getExecutionBlocker(db, companyId, issueId)));
+      const blocker = preProviderBlockers.get(issueId);
+      recoveredInstruction = blocker?.runId === run.id ? blocker.nextAction : undefined;
+    }
     projections.set(
       run.id,
       projectExecution(
@@ -337,6 +348,7 @@ export async function executionProjectionsForRuns(
         run.status === "queued" && !run.startedAt ? routineHolderByIssue.get(issueIdOf(run) ?? "") : undefined,
         cleanupHeldRuns.has(run.id),
         Boolean(issueId && heldConversations.has(issueId)),
+        recoveredInstruction,
       ),
     );
   }
@@ -371,6 +383,8 @@ export function projectExecution(
   nativeCleanupHold = false,
   /** A standing prior-owner notice, read in the batch above, not run status. */
   heldConversation = false,
+  /** The card's admission-backed instruction for a pre-provider failure. */
+  recoveredInstruction?: string,
 ): ExecutionProjection {
   const detail = coordinator?.failureDetail ?? {};
   const successorRunId = text(detail.successorRunId);
@@ -405,8 +419,12 @@ export function projectExecution(
     Object.assign(projection, { phase, label });
   if (recoveryAction?.status === "resolved" && recoveryAction.evidence?.automaticRecovery) {
     projection.cause = recoveryAction.cause;
-    projection.nextAction = workspaceRecoveryDisplay(recoveryAction.evidence, run.id,
-      { status: run.status, retryOffered: false, heldConversation })?.message
+    projection.nextAction = recoveredInstruction ?? (run.runtimeMode === "native"
+      && readWorkspaceRecovery(recoveryAction.evidence)?.status === "recovered"
+      && stoppedBeforeWorkWasSaved(run.status, detail)
+      ? recoveredWorkMessage(run.status, false, heldConversation, true)
+      : workspaceRecoveryDisplay(recoveryAction.evidence, run.id,
+        { status: run.status, retryOffered: false, heldConversation })?.message)
       ?? recoveryAction.nextAction;
     const continuation = recoveryAction.evidence.explicitUserContinuation as
       { previousRunId?: unknown; runId?: unknown } | undefined;
