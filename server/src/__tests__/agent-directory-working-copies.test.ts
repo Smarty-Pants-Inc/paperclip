@@ -114,6 +114,68 @@ describe("persistent agent directories", () => {
       receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } }).where(eq(agentInstructionWorkingCopies.companyId, companyId));
   }, (runId, error) => queueGitExclusionNextTry(db, companyId, agentId, userId, runId, error));
 
+  // pl/keepalive5 (caller 1): the disposable remote copy's operation lock is a transaction advisory lock with a keepalive.
+  it("(keepalive5 caller 1) a lost agent-directory operation lock stops the collection before the projection removal", async () => {
+    const copy = await run();
+    const projection = path.join(path.dirname(resolveManagedInstructionsRoot({ id: agentId, companyId, name: "", adapterConfig: {} })),
+      "file-sync", "runs", copy.runId, "live");
+    const lockRoot = path.resolve(projection, "../../..");
+    await fs.mkdir(projection, { recursive: true });
+    await fs.writeFile(path.join(projection, "marker.txt"), "projection bytes\n");
+    await db.update(agentInstructionWorkingCopies).set({ location: `remote:${randomUUID()}`, localRoot: projection, state: "saved",
+      processStoppedAt: new Date(), nextAttemptAt: null }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+    vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
+    const [{ name }] = await db.execute(sql`select current_database() as name`) as unknown as Array<{ name: string }>;
+    await db.execute(sql.raw(`alter database "${name}" set idle_in_transaction_session_timeout = '3s'`));
+    const lockKey = `agent-directory:${companyId}:${agentId}`;
+    let releaseMerge!: () => void, mergeHeld!: () => void;
+    const merge = new Promise<void>(resolve => { releaseMerge = resolve; });
+    const held = new Promise<void>(resolve => { mergeHeld = resolve; });
+    // A concurrent local writer holds the directory merge lock, so the collection waits inside its PG lock.
+    const holder = withDirectoryMergeLock(lockRoot, async () => { mergeHeld(); await merge; });
+    try {
+      await held;
+      const collection = copies.collectStopped({ companyId, runId: copy.runId }).then(value => ({ value }), (error: unknown) => ({ error }));
+      let lockers: Array<{ pid: number }> = [];
+      await vi.waitFor(async () => {
+        lockers = await db.execute(sql`select pid from pg_locks where locktype = 'advisory' and granted
+          and classid::bigint = ((hashtextextended(${lockKey}, 0) >> 32) & 4294967295)
+          and objid::bigint = (hashtextextended(${lockKey}, 0) & 4294967295)`) as unknown as Array<{ pid: number }>;
+        expect(lockers).toHaveLength(1);
+      }, { timeout: 10_000 });
+      await db.execute(sql`select pg_terminate_backend(${lockers[0]!.pid})`);
+      let second = false;
+      for (let attempt = 0; attempt < 50 && !second; attempt += 1) {
+        second = await db.transaction(async tx => {
+          const rows = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${lockKey}, 0)) as acquired`);
+          const acquired = rows[0]?.acquired === true;
+          if (acquired) await fs.writeFile(path.join(projection, "next.txt"), "the next owner's write\n");
+          return acquired;
+        });
+        if (!second) await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      expect(second).toBe(true);
+      await new Promise(resolve => setTimeout(resolve, 2_500));
+      releaseMerge();
+      await holder;
+      const result = await collection;
+      // A dead connection can reject the caller early while the guarded work runs on: give a late removal time to land.
+      await vi.waitFor(async () => { expect(await fs.stat(projection).then(() => true, () => false)).toBe(false); }, { timeout: 5_000 })
+        .catch(() => undefined);
+      // Head: no removal after the merge-lock wait once the lock is lost, and the caller sees a failure.
+      expect(await fs.readFile(path.join(projection, "next.txt"), "utf8").catch(() => "removed")).toBe("the next owner's write\n");
+      expect(await fs.readFile(path.join(projection, "marker.txt"), "utf8").catch(() => "removed")).toBe("projection bytes\n");
+      expect("error" in result ? "failed" : `resolved ${String((result.value as { state?: string } | null)?.state)}`).toBe("failed");
+    } finally {
+      releaseMerge();
+      await holder.catch(() => undefined);
+      await db.execute(sql.raw(`alter database "${name}" reset idle_in_transaction_session_timeout`));
+      vi.unstubAllEnvs();
+      await db.update(agentInstructionWorkingCopies).set({ receipt: { schema: "paperclip.agent-files.v1", cleanupPending: false } })
+        .where(eq(agentInstructionWorkingCopies.companyId, companyId));
+    }
+  }, 60_000);
+
   describe("post-save directory cleanup worker", () => {
     afterEach(async () => {
       vi.useRealTimers(); vi.restoreAllMocks();
