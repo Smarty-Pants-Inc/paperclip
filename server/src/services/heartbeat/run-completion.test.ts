@@ -983,6 +983,29 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(resolved.decision.commentAction).toBe("reuse");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
+  it.each(["case", "numbers", "unknown label", "wrapper"])(
+    "rf-2 (c): a damaged %s never makes the last physical part the reply", async (damage) => {
+      const answer = `\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\ntail\n`;
+      const { post, reply, rows } = await chatRunForReply();
+      await post(answer);
+      const posted = await rows();
+      const first = posted[0]!;
+      const part = first.metadata!.answerPart!;
+      const body = damage === "case" ? first.body.replace(/^part /u, "pArt ")
+        : damage === "numbers" ? first.body.replace(/^part \d+ of \d+/u, "part 999 of 1000")
+        : damage === "unknown label" ? `edited label\n${first.body.slice(part.label.length)}`
+        : `${first.body.slice(0, -part.suffix.length)}damaged closing wrapper`;
+      await db.update(issueComments).set({ body }).where(eq(issueComments.id, first.id));
+      const { comment, resolved } = await reply();
+      const expected = damage === "case" || damage === "numbers" ? answer
+        : (await rows()).map(row => row.body).join("");
+      expect(sameBytes(resolved.text, expected)).toBe(true);
+      expect(comment!.id).toBe(first.id);
+      expect(comment!.answerPartCommentIds).toEqual(posted.map(row => row.id));
+      expect(resolved.text).not.toBe(posted.at(-1)!.body);
+    }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  );
+
   it("F3: with the recorded wrappers, a fence spanning a boundary strips back to the source, byte-equal", async () => {
     const answer = `\`\`\`ts\n${probeAnswer(300 * 1024)}\`\`\`\ntail\n`;
     const { post, rows } = await chatRunForReply();
