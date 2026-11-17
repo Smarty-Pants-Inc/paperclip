@@ -73,7 +73,10 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused"]);
+/** Setup completes by itself; a stalled setup gets one factual waiting note. */
+export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
+export const SETUP_WAIT_BOUND_MS = 10 * 60_000;
+const WAITING_KIND_CODES = new Set(["waiting_to_start", "agent_paused", UNANSWERED_MESSAGE_AGENT_SETUP_CODE]);
 /** Paperclip's pause model: POST /agents/:id/resume is allowed for a board user
  * or an agent that manages the paused agent (routes/agents.ts:6017-6023 ->
  * assertCanManageAgentLifecycle :2613-2623 -> agent-subtree-management.ts:34-39
@@ -337,17 +340,17 @@ export async function settleUnansweredPersonMessage(
   });
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
+  if ((decision.kind === "pending" || decision.kind === "notice") && decision.recordWait) {
+    await logActivity(db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
+      action: PENDING_WAIT_ACTION, entityType: "issue", entityId: issue.id, issueId: issue.id,
+      details: { boundMs: PENDING_WAIT_BOUND_MS, ...decision.recordWait } });
+  }
   if (decision.kind === "pending") {
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
         agentId: decision.recordDeferral.agentId, eventType: NATIVE_REPAIR_DEFERRAL_EVENT, stream: "system", level: "info",
         message: "The unanswered-message notice waits for the native blocked-request repair to publish.",
         payload: { messageId: decision.recordDeferral.messageId, boundMs: NATIVE_REPAIR_PUBLISH_BOUND_MS } });
-    }
-    if (decision.recordWait) {
-      await logActivity(db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
-        action: PENDING_WAIT_ACTION, entityType: "issue", entityId: issue.id, issueId: issue.id,
-        details: { messageId: decision.recordWait.messageId, runId: decision.recordWait.runId, boundMs: PENDING_WAIT_BOUND_MS } });
     }
     return { kind: "pending", recheckAt: decision.recheckAt };
   }
@@ -383,10 +386,12 @@ export async function settleUnansweredPersonMessage(
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
+type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
-      recordWait?: { messageId: string; runId: string | null } }
+      recordWait?: WaitRecord }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
+      recordWait?: WaitRecord;
       /** Set when this replaces the message's standing waiting note. */
       upgradeCommentId?: string };
 
@@ -477,18 +482,24 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // runs) then no longer keeps the message silent: the decision continues and
   // the fenced writer posts the one notice; a later answer supersedes it.
   let waitT0: number | null | undefined;
-  const bounded = async (recheckAt: number): Promise<Decision | null> => {
+  let setupWaitRecord: WaitRecord | undefined;
+  const bounded = async (recheckAt: number, setup = false): Promise<Decision | null> => {
     if (waitT0 === undefined) {
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
         eq(activityLog.companyId, issue.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issue.id),
         eq(activityLog.action, PENDING_WAIT_ACTION), sql`${activityLog.details}->>'messageId' = ${message.id}`,
-        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`));
+        sql`coalesce(${activityLog.details}->>'runId', '') = ${messageRun?.id ?? ""}`,
+        sql`coalesce(${activityLog.details}->>'waitKind', 'attempt') = ${setup ? "setup" : "attempt"}`));
       waitT0 = wait?.at ? new Date(wait.at).getTime() : null;
     }
-    const bound = (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
+    // Setup's clock starts with the saved message, never the first sweep.
+    // Keep its record separate so it cannot consume a later retry's bound.
+    if (setup && waitT0 === null) setupWaitRecord = { messageId: message.id, runId: messageRun?.id ?? null,
+      waitKind: "setup", startedAt: message.createdAt.toISOString(), boundMs: SETUP_WAIT_BOUND_MS };
+    const bound = setup ? message.createdAt.getTime() + SETUP_WAIT_BOUND_MS : (waitT0 ?? now.getTime()) + PENDING_WAIT_BOUND_MS;
     if (bound <= now.getTime()) return null;
     return { kind: "pending", recheckAt: Math.min(recheckAt, bound),
-      ...(waitT0 === null ? { recordWait: { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
+      ...(waitT0 === null ? { recordWait: setupWaitRecord ?? { messageId: message.id, runId: messageRun?.id ?? null } } : {}) };
   };
 
   // Only a turn IN PROGRESS keeps an unbounded wait (a quiet healthy turn is
@@ -520,15 +531,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     lifecycleHolds: agents.lifecycleHolds, pauseReason: agents.pauseReason, lifecycleError: agents.lifecycleError })
     .from(agents).where(and(eq(agents.companyId, issue.companyId), eq(agents.id, agentId)));
   // Setup uses the compatibility status "paused", but completes by itself.
-  // Its saved message remains an obligation: recheck through the existing
-  // sweep deadline, without a pause/resume notice or a second wake. Explicit
-  // holds, operator pauses and lifecycle failures keep their existing path.
+  // Its saved message remains an obligation: use the existing sweep deadline
+  // and bound, never a second wake. After ten minutes, one true setup note
+  // stands until readiness or error. Explicit holds/pauses/errors keep their path.
+  let settingUp = false;
   if (agentRow?.status === "paused" && ["preparing", "verifying"].includes(agentRow.lifecycleState)
     && (agentRow.pauseReason == null || agentRow.pauseReason === "setup")
     && (agentRow.lifecycleHolds ?? []).length === 0 && !agentRow.lifecycleError) {
-    return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    const wait = await bounded(now.getTime() + 30_000, true);
+    if (wait) return wait;
+    if (upgrading && standingWaitingCode === UNANSWERED_MESSAGE_AGENT_SETUP_CODE) {
+      return { kind: "pending", recheckAt: now.getTime() + 30_000 };
+    }
+    settingUp = true;
   }
-  const agentPaused = Boolean(agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
+  const agentPaused = Boolean(!settingUp && agentRow && (agentRow.status === "paused" || ["paused", "pausing"].includes(agentRow.lifecycleState)
     || (agentRow.lifecycleHolds ?? []).length > 0));
   // Import intentionally parks automations until activation. It lost neither
   // the message nor an attempt: do not annotate every carried-over open task.
@@ -544,7 +561,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     }
   }
   let waitingToStart = false;
-  if (liveRuns.length && !agentPaused) {
+  if (liveRuns.length && !agentPaused && !settingUp) {
     const wait = await bounded(now.getTime() + 30_000);
     if (wait) return wait;
     waitingToStart = liveRuns.some(candidate => runCarriesMessage(candidate.contextSnapshot, message.id));
@@ -556,7 +573,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"]), eq(issueRecoveryActions.ownerType, "board")))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
-  if (!boardHold && !agentPaused) {
+  if (!boardHold && !agentPaused && !settingUp) {
     const wakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
       inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"])));
@@ -567,7 +584,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   }
 
   let code: string;
-  if (agentPaused) {
+  if (settingUp) {
+    code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
+  } else if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   } else if (waitingToStart) {
     // Still true only until T0 + PENDING_WAIT_START_BOUND_MS; after that the
@@ -685,17 +704,21 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const boundReached = Boolean(!paused && !waiting && run && TERMINAL.includes(run.status) && run.status !== "succeeded"
     && (await freshContinuationChain(q as Db, { companyId: issue.companyId, issueId: issue.id, runId: run.id })).attempts
       >= FRESH_CONTINUATION_BOUND);
-  const body = paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+  // Server-local HH:MM: the instance's time zone, not an assumed UTC zone.
+  const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
+  const body = settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
+    : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
       : held ? HELD_PREDECESSOR_NOTICE : UNANSWERED_MESSAGE_TEXT;
   const notice = buildStrandedRecoveryEscalationNotice({
     seed: {
-      title: paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
+      title: settingUp ? `${pausedName} is still being set up` : paused ? `${pausedName} is paused` : waiting ? "Your message is waiting to start" : "Your message wasn't answered",
       body,
       tone: paused ? "warning" : waiting ? "info" : "warning",
-      nextAction: paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
+      nextAction: settingUp ? "No action is needed; your message is saved."
+        : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
@@ -707,7 +730,8 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     failureCode: waiting ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
-  return { kind: "notice", reason, code, notice, ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
+  return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),
+    ...(upgrading ? { upgradeCommentId: upgrading } : {}) };
 }
 
 

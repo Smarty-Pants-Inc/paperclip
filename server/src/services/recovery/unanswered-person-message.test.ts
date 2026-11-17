@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   approvals,
@@ -17,7 +18,7 @@ import {
   environmentLeases,
 } from "@paperclipai/db";
 import { and, eq, gt, isNull, sql } from "drizzle-orm";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
@@ -796,13 +797,15 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const f = await fixture();
     await db.update(agents).set({ status: "paused", lifecycleState, pauseReason, lifecycleHolds: [], lifecycleError: null })
       .where(eq(agents.id, f.agentId));
-    const commentId = await f.message("My first chat message, while setup is still running.");
-    // The fixture's message is already older than both settle and no-run grace.
+    // Four minutes old: past settle/no-run grace, but inside the setup bound.
+    const commentId = await f.message("My first chat message, while setup is still running.", 11 * 60_000);
+    // RED must reach the production heartbeat entry before a direct settle assertion.
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
     const now = new Date();
     expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId, now }))
       .toEqual({ kind: "pending", recheckAt: now.getTime() + 30_000 });
-    await f.sweep();
-    await settleAt(f, 11 * 60_000);
+    await settleAt(f, 2 * 60_000);
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
@@ -814,6 +817,77 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect((await settleAt(f, 13 * 60_000)).kind).toBe("answered");
     expect(await f.visible()).toHaveLength(0);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(1);
+  });
+
+  // Keep: judge NOTE7c-fix2 caught a setup wait that stayed silent forever.
+  it.each(["preparing", "verifying"] as const)("NOTE7c stalled %s: the production sweep posts exactly one true setup note at ten minutes", async lifecycleState => {
+    const start = new Date();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(start);
+    try {
+      const f = await fixture();
+      await db.update(agents).set({ status: "paused", lifecycleState, pauseReason: "setup", lifecycleHolds: [], lifecycleError: null })
+        .where(eq(agents.id, f.agentId));
+      const commentId = await f.message("Please answer when setup finishes.", 900_000);
+      // A delayed first sweep must not restart the ten-minute message clock.
+      vi.setSystemTime(new Date(start.getTime() + 240_000));
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      const waits = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.unanswered_message_wait")));
+      expect(waits).toHaveLength(1);
+      expect(waits[0]!.details).toMatchObject({ messageId: commentId, waitKind: "setup", startedAt: start.toISOString(), boundMs: 600_000 });
+      vi.setSystemTime(new Date(start.getTime() + 600_000 - 1));
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      vi.setSystemTime(new Date(start.getTime() + 600_000));
+      await f.sweep();
+      const [note] = await f.visible();
+      expect(await f.visible()).toHaveLength(1);
+      const hhmm = `${String(start.getHours()).padStart(2, "0")}:${String(start.getMinutes()).padStart(2, "0")}`;
+      expect(note!.body).toBe(`Managed Pi is still being set up (since ${hhmm}). Your message is saved and will be answered as soon as it's ready.`);
+      expect(note!.metadata?.authorizationReason).toBe(`unanswered_message:${commentId}`);
+      expect(rowsOf(note!).some(row => row.label === "Failure code")).toBe(false);
+      expect(JSON.stringify(note)).not.toMatch(/paused|resume|send.*again/i);
+      for (const elapsed of [660_000, 3_600_000, 25 * 3_600_000, 7 * 24 * 3_600_000]) {
+        vi.setSystemTime(new Date(start.getTime() + elapsed));
+        await f.sweep();
+        expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: note!.body }]);
+      }
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, "issue.unanswered_message_wait")))).toHaveLength(1);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId))).toHaveLength(0);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId))).toHaveLength(0);
+      // A setup error still takes the existing error path, updating the same note.
+      vi.setSystemTime(new Date(start.getTime() + 720_000));
+      await db.update(agents).set({ lifecycleError: "Saved execution configuration failed verification." }).where(eq(agents.id, f.agentId));
+      await f.sweep();
+      expect((await f.visible()).map(n => ({ id: n.id, body: n.body }))).toEqual([{ id: note!.id, body: PAUSED_TEXT }]);
+      await resume(f);
+      const runId = await f.run({ commentId, status: "succeeded" });
+      await f.reply(runId);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("NOTE7c late discovery: a first sweep after ten minutes records setup's message start and posts immediately", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "paused", lifecycleState: "preparing", pauseReason: "setup", lifecycleHolds: [], lifecycleError: null })
+      .where(eq(agents.id, f.agentId));
+    const commentId = await f.message("Setup was already stalled when the sweep first ran.");
+    const [message] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+    await f.sweep();
+    const [note] = await f.visible();
+    expect(await f.visible()).toHaveLength(1);
+    expect(note!.body).toContain("Managed Pi is still being set up (since ");
+    const [wait] = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+      eq(activityLog.action, "issue.unanswered_message_wait")));
+    expect(wait!.details).toMatchObject({ waitKind: "setup", startedAt: message!.createdAt.toISOString(), boundMs: 600_000 });
+    await f.sweep();
+    expect((await f.visible()).map(n => n.id)).toEqual([note!.id]);
   });
 
   it.each([
