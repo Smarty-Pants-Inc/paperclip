@@ -175,9 +175,17 @@ acknowledges only the captured bytes. Lost remote bytes or missing stop proof
 cannot become a successful save.
 
 Warm reuse requires the actual live session, the same remote environment and
-provider lease, and unchanged canonical files since its last checkpoint. An
-editor or another task changing canonical files retires that session before a
-fresh copy is restored. A directory-path mismatch also forces retirement. Only
+provider lease, and unchanged declared instruction files since its last
+checkpoint. The declared instruction files are the loaded entry plus every
+top-level file of the agent directory (for example `AGENTS.md`, `RULES.md`,
+`DECISIONS.md`, `PREFERENCES.md`, `MODELS.md`, `LANDSCAPE.md`). An editor or
+another task changing one of them retires that session before a fresh copy is
+restored. When another task changes only nested files (notes such as
+`memory/**`, `archive/**`, `templates/**`, `work/**`), an idle local warm
+directory that still matches its checkpoint receives those files in place and
+keeps its session; a remote warm directory is still retired. A new session
+always restores the whole canonical folder, notes included. A directory-path
+mismatch also forces retirement. Only
 the loaded instruction entry participates in the runtime instruction digest;
 ordinary memory/image edits do not change it. Changes to loaded instructions,
 policy, credentials or provider configuration may still replace the process.
