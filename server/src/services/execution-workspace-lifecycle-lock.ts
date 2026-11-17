@@ -7,6 +7,12 @@ import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lo
 
 type Transaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 
+/** pl/keepalive5: the lifecycle-lock session died (failed keepalive ping); another owner may hold the lock. */
+export class ExecutionWorkspaceLifecycleLockLostError extends Error {
+  override name = "ExecutionWorkspaceLifecycleLockLostError";
+  constructor(cause?: unknown) { super("execution_workspace_lifecycle_lock_lost", { cause }); }
+}
+
 export async function acquireExecutionWorkspaceLifecycleLock(
   tx: Transaction,
   workspaceId: string,
@@ -19,7 +25,7 @@ export async function acquireExecutionWorkspaceLifecycleLock(
 export async function withExecutionWorkspaceLifecycleLock<T>(
   db: Db,
   workspaceId: string,
-  work: (tx: Transaction) => Promise<T>,
+  work: (tx: Transaction, signal?: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const [source] = await db.select({ companyId: executionWorkspaces.companyId, projectId: executionWorkspaces.projectId,
     providerType: executionWorkspaces.providerType, sourceIssueId: executionWorkspaces.sourceIssueId, cwd: executionWorkspaces.cwd, providerRef: executionWorkspaces.providerRef }).from(executionWorkspaces).where(eq(executionWorkspaces.id, workspaceId));
@@ -47,11 +53,16 @@ export async function withExecutionWorkspaceLifecycleLock<T>(
       const rows = await tx.execute(
         sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`,
       );
-      return withWorkspaceLockKeepalive(
+      // pl/keepalive5: a failed ping aborts work's signal; a lost lock is a failure, never a success.
+      const lost = new AbortController();
+      const result = await withWorkspaceLockKeepalive(
         tx,
         Number(rows[0]?.idle_timeout_ms),
-        () => work(tx),
+        () => work(tx, lost.signal),
+        { onLost: cause => lost.abort(new ExecutionWorkspaceLifecycleLockLostError(cause)) },
       );
+      lost.signal.throwIfAborted();
+      return result;
     }),
   );
   return (projectIds.length || issueIds.length) && source
