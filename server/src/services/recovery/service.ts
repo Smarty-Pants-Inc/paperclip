@@ -115,7 +115,7 @@ import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
-import { clearTaskStopPending, hasTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
+import { clearTaskStopPending, hasTaskStopPending, recordTaskStopPending, settleTaskStopPending } from "./stop-pending.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -3661,10 +3661,17 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
-      // A live run/child or terminal task cannot settle a Stop inspection.
-      // Its guarded release owner alone removes the task-visible hold.
+      // Another owner (notably native restart recovery) may already have
+      // released the claims. Recheck this hold's exact saved runs, not the
+      // task's current claimant or workflow status, under task -> run locks.
       if (hasTaskStopPending(action)) {
-        result.skipped += 1;
+        const publications: ActivityPublication[] = [];
+        const settled = await db.transaction(tx => settleTaskStopPending(tx as unknown as Db, action, publications));
+        for (const publication of publications) publishActivity(publication);
+        if (settled === "resolved") {
+          result.resolved += 1;
+          result.issueIds.push(issue.id);
+        } else result.skipped += 1;
         continue;
       }
       // Only the board's stop confirmation, or the resource's own release, settles this request:
