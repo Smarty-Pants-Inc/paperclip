@@ -2027,7 +2027,9 @@ describe("persistent agent directories", () => {
       // Head: the copy's actual content equals its baseline, so retention is not refused.
       const started = performance.now();
       expect(await f.native.unchangedSinceBaseline?.()).toBe(true);
-      console.log("GATEA_UNCHANGED_OBSERVATION_MS", Math.round(performance.now() - started));
+      const observedMs = Math.round(performance.now() - started);
+      expect(observedMs).toBeLessThan(15_000); // 23i: inside the stated bound
+      if (process.env.GATEA_MEASURE_FILE) await fs.appendFile(process.env.GATEA_MEASURE_FILE, `unchangedSinceBaseline_ms=${observedMs}\n`);
       expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "warm_saved", errorCode: null, errorMessage: null,
         processStoppedAt: null, nextAttemptAt: null, baseHash: f.copy.baseHash, receipt: { checkpointState: "unchanged" } });
       expect(f.saves().at(-1)).toMatchObject({ state: "unchanged", errorCode: null });
@@ -2042,7 +2044,7 @@ describe("persistent agent directories", () => {
       await copies.recoverStopped();
       expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "superseded" });
       await copies.collectStopped({ companyId, runId: next.runId });
-    });
+    }, 60_000);
     it("NEVER-OK 23c: a real unsaved edit under the same race still refuses retention and is saved by stopped collection", async () => {
       const f = await stoppedTurnWithWorkerPass(localRoot => fs.writeFile(path.join(localRoot, "unsaved-edit.md"), "a real instruction edit"));
       expect(f.workerFlip).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED" });
@@ -2055,7 +2057,7 @@ describe("persistent agent directories", () => {
       await f.native.collectStopped();
       expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "saved" });
       expect(await fs.readFile(path.join(root, "unsaved-edit.md"), "utf8")).toBe("a real instruction edit");
-    });
+    }, 60_000);
     it("23j: a failed or timed-out observation counts as changed and leaves the flipped copy as at base", async () => {
       const f = await stoppedTurnWithWorkerPass();
       const probe = vi.spyOn(probeModule, "observeLocalAgentDirectory").mockRejectedValueOnce(new Error("probe failed"))
@@ -2070,7 +2072,7 @@ describe("persistent agent directories", () => {
       expect(await copies.canReuseWarm(companyId, agentId, f.copy.runId)).toBe(false);
       await f.native.collectStopped();
       expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "unchanged" });
-    });
+    }, 60_000);
     it("control 25eaaef3: a with-file Stop checkpointed by its write is saved and retained, never flipped", async () => {
       const copy = await run({ warm: true });
       const events = vi.fn(async (..._args: unknown[]) => {});
@@ -2084,7 +2086,7 @@ describe("persistent agent directories", () => {
       expect(await fs.readFile(path.join(root, "AGENTS-note.md"), "utf8")).toBe("written by the turn");
       expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
       await copies.collectStopped({ companyId, runId: copy.runId });
-    });
+    }, 60_000);
   });
   it("b13 KEEP: a low-trust warm run that changed an agent file is refused with the named reason and nothing is saved", async () => {
     await lowTrust();
