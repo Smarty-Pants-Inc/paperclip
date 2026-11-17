@@ -495,6 +495,21 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const [runs, waits, agentRows, projectRows, pauseRows, approvalRows, companyRows, admissionWaits] = await Promise.all([
     db.select({ issueId: requestedIssueId, id: heartbeatRuns.id, status: heartbeatRuns.status,
       createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt, agentId: heartbeatRuns.agentId, companyId: heartbeatRuns.companyId,
+      // When the person wrote the LATEST message this failed attempt carried: its
+      // wakeCommentId/commentId, any wakeCommentIds entry (queued-batch coalescing
+      // keeps the older scalar and appends the newer id there) or its first-turn
+      // input. The approval boundary (approvalOwnsTask) is this message, not the
+      // run row: a message can fold into a run queued before the approval.
+      carriedMessageAt: sql<Date | null>`case when ${heartbeatRuns.status} in ('failed', 'timed_out') then (
+        select max(carried.created_at) from issue_comments carried
+        where carried.company_id = ${heartbeatRuns.companyId} and carried.issue_id = ${requestedUuid}
+          and carried.author_user_id is not null and carried.author_agent_id is null
+          and (carried.id::text in (${heartbeatRuns.contextSnapshot}->>'wakeCommentId', ${heartbeatRuns.contextSnapshot}->>'commentId')
+            or (jsonb_typeof(${heartbeatRuns.contextSnapshot}->'wakeCommentIds') = 'array'
+              and ${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> jsonb_build_array(carried.id::text))
+            or (jsonb_typeof(${heartbeatRuns.contextSnapshot}#>'{firstTurnQueuedInput,commentIds}') = 'array'
+              and ${heartbeatRuns.contextSnapshot}#>'{firstTurnQueuedInput,commentIds}' @> jsonb_build_array(carried.id::text)))) end`
+        .mapWith(value => value == null ? null : new Date(value)),
       nativeIssueId: heartbeatRuns.nativeIssueId, runtimeMode: heartbeatRuns.runtimeMode, startedAt: heartbeatRuns.startedAt,
       processPid: heartbeatRuns.processPid, processGroupId: heartbeatRuns.processGroupId,
       agentAdapter: agents.adapterType,
@@ -907,14 +922,17 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const agentMap = new Map(agentRows.map(agent => [agent.id, agent]));
   const projectMap = new Map(projectRows.map(project => [project.id, project]));
   const pauses = new Set(pauseRows.map(row => row.issueId));
-  // An approval asked for before a FAILED (or timed-out) latest attempt was
-  // created does not explain that failure: that attempt was started for other
-  // input (a person's later message), so its failure and Retry stay visible
-  // instead of the older approval's wait (D128/D153/D180). The approval itself
-  // stays pending in its own UI; a newer approval still owns the task's state.
-  const approvalOwnsTask = (issueId: string, run: { status: string; createdAt: Date } | undefined) =>
+  // An approval asked for before the person's LATEST message that a FAILED (or
+  // timed-out) latest attempt carried does not explain that failure: the
+  // attempt was answering that later message, so its failure and Retry stay
+  // visible instead of the older approval's wait (D128/D153/D180). The boundary
+  // is the message's createdAt, not the run row's: production coalescing folds
+  // a newer message into a run queued before the approval (rf-3, the removed
+  // re-offer's shape). A run that carried no message falls back to its own row.
+  // The approval stays pending in its own UI; a newer approval still owns the task.
+  const approvalOwnsTask = (issueId: string, run: { status: string; createdAt: Date; carriedMessageAt?: Date | null } | undefined) =>
     approvalRows.some(row => row.issueId === issueId && (!run || !FAILED_ATTEMPT_STATUSES.has(run.status)
-      || row.createdAt.getTime() >= run.createdAt.getTime()));
+      || row.createdAt.getTime() >= (run.carriedMessageAt ?? run.createdAt).getTime()));
   const admissionWaitMap = byIssue(admissionWaits);
   const launchWaits = [...retryWaitMap].flatMap(([issueId, wait]) => {
     const run = runMap.get(issueId);
