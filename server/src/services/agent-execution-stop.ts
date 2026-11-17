@@ -1,7 +1,7 @@
 import { readProcessStartedAt } from "./hot-restart.js";
 import { readLeaseReleaseDeferral } from "./environment-lease-release-deferral.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
-import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
@@ -14,32 +14,12 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
 
 export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Promise<string | null> {
   if (!agentIds.length) return null;
-  const condition = inArray(heartbeatRuns.agentId, agentIds);
-  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
-  return executionStopBlocker(db, condition, or(
+  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  const leases = await db.select().from(environmentLeases).where(or(
     inArray(environmentLeases.heartbeatRunId, runIds),
     inArray(sql`${environmentLeases.metadata}->>'agentId'`, agentIds),
-  )!);
-}
-
-/** Task recovery uses read-only Stop proof, scoped to its owners rather than
- * unrelated runs of the assignee. The caller holds task/run locks: coordinator
- * writes here would invert native reacquisition's coordinator -> run order.
- * Expired coordinator settlement remains the agent lifecycle owner's duty. */
-export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds: string[]) {
-  const ids = [...new Set(runIds)];
-  if (!ids.length) return true;
-  return (await executionStopBlocker(db, and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, ids))!,
-    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false)) === null;
-}
-
-async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
-  expectedRunCount?: number, settleCoordinators = true): Promise<string | null> {
-  const runs = await db.select().from(heartbeatRuns).where(condition);
-  // A missing or cross-company binding cannot establish execution Stop.
-  if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_missing";
-  const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
-  const leases = await db.select().from(environmentLeases).where(leaseCondition);
+  ));
   const deferred = leases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
   if (leases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
@@ -86,9 +66,6 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return "legacy_stop_unproven";
   }
-  // Task/run-lock callers only read proof. They must never wait for a
-  // coordinator write while a native owner waits for their run lock.
-  if (!settleCoordinators) return null;
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {
     const [cleared] = await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null, updatedAt: now })

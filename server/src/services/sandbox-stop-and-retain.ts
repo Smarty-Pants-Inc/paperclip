@@ -220,24 +220,6 @@ export async function prepareUnconfirmedSourceSandboxStop(db: Db, lease: typeof 
  * `operator_required` native session cleanup gate (#20806). */
 export const NATIVE_CLEANUP_GATE_OWNER_STOP_KEY = "nativeCleanupGateOwner";
 
-/** The task's previous native session could not be closed, so its owner holds
- * the task's cleanup gate and every later run of the task waits on it. Its run
- * has ended; stop and keep the exact sandbox it ran in through the stop-only
- * contract, whose sweep dispatches the stop and retries until the provider
- * confirms. The first stop is due now: waiting cannot settle the owner. Never
- * destroys, never stops an ended or already-stopping allocation; the caller
- * verifies the owner, the ended run and that no other lease holds the sandbox. */
-export async function prepareCleanupGateOwnerStop(db: Db, lease: typeof environmentLeases.$inferSelect) {
-  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
-    || !["active", "retained"].includes(lease.status) || lease.metadata?.pendingCleanupInFlight === true
-    || hasStopOnlyCleanup(lease)
-    // An active lease's bound receipt already proves the stop; keep that proof.
-    || (lease.status === "active" && hasBoundRemoteStopReceipt(lease))
-    || (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed"
-    || lease.metadata?.pluginLeaseCleanupMethod !== undefined || lease.metadata?.runnerTaskRetiring === true) return null;
-  return prepareStopAndRetain(db, lease, lease.status, { [NATIVE_CLEANUP_GATE_OWNER_STOP_KEY]: true });
-}
-
 /** Only an exact positive RUNNING provider GET can authorize a stop request.
  * Error, absent, unknown and foreign observations leave ended rows unchanged.
  * The existing cleanup owner dispatches only from pending_cleanup; preserve

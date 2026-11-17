@@ -115,8 +115,6 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
-import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
-import { clearTaskStopPending, hasTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
@@ -3717,12 +3715,6 @@ export function recoveryService(
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
-      // A live run/child or terminal task cannot settle a Stop inspection.
-      // Its guarded release owner alone removes the task-visible hold.
-      if (hasTaskStopPending(action)) {
-        result.skipped += 1;
-        continue;
-      }
       // Only the board's stop confirmation, or the resource's own release, settles this request:
       // the reserved resource stays reserved however the task ends.
       if (action.cause === OWNER_UNPROVABLE_CAUSE) {
@@ -4356,23 +4348,6 @@ export function recoveryService(
         return null;
       }
 
-      // A non-invokable assignee can still own a running provider. Escalation
-      // changes status and clears both task locks, so require the lifecycle's
-      // execution Stop proof under the same task/run locks as that write.
-      // Neither a cancellation request nor a terminal status alone proves Stop.
-      const ownerRunIds = [...new Set([current.checkoutRunId, current.executionRunId]
-        .filter((id): id is string => id !== null))];
-      if (ownerRunIds.length) {
-        await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, current.companyId), inArray(heartbeatRuns.id, ownerRunIds),
-        )).orderBy(asc(heartbeatRuns.id)).for("update");
-        if (!await runExecutionsHaveStopped(tx as unknown as Db, current.companyId, ownerRunIds)) {
-          await recordTaskStopPending(tx as unknown as Db, { companyId: current.companyId, issueId: current.id,
-            runIds: ownerRunIds, source: "recovery.stranded_assigned_issue" }, publications);
-          return null;
-        }
-      }
-
       // Acceptance holds the same issue lock before writing its successor.
       // An awaiting-release handoff need not change the issue's version or
       // owner, and generic recovery must not cancel that durable successor.
@@ -4385,13 +4360,10 @@ export function recoveryService(
       )).limit(1).then((rows) => rows[0] ?? null);
       if (pendingHandoff) return null;
 
-      await clearTaskStopPending(tx as unknown as Db, { companyId: current.companyId, issueId: current.id,
-        runIds: ownerRunIds }, publications);
       return applyStrandedAssignedIssueEscalation(input, tx, publications, postCommitActions);
     });
-    // A retained Stop hold also commits a visible recovery diagnostic.
-    for (const publication of publications) publishActivity(publication);
     if (updated) {
+      for (const publication of publications) publishActivity(publication);
       await executeIssuePostCommitActions(db, postCommitActions);
     }
     return updated;
@@ -6984,8 +6956,7 @@ export function recoveryService(
     // but keeps both task locks for that resume. Clearing them lets another
     // run take the task first, and then the resume can never run. Only a
     // closed task releases them here. A phase label on a run that the native
-    // resume owner cannot claim (notably cancelled) is not an owner. Let that
-    // task reach the same guarded Stop inspection and bounded diagnostic below.
+    // resume owner cannot claim (notably cancelled) is not an owner.
     // Match claimNativeSessionResumptions' run-status gate in both the snapshot
     // and the write fence, without changing eligible same-run retry behavior.
     const pendingResumeLock = sql<boolean>`exists (select 1 from ${nativeRunFinalizations} pending_resume
@@ -7039,27 +7010,11 @@ export function recoveryService(
       }
 
       await deps.beforeStaleLockClear?.(issue.id);
-      const publications: ActivityPublication[] = [];
       const updated = await db.transaction(async tx => {
         const [locked] = await tx.select({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
           .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id))).for("update");
         if (!locked || locked.checkoutRunId !== issue.checkoutRunId || locked.executionRunId !== issue.executionRunId) return null;
-        // Terminal status alone does not prove that execution stopped. Match
-        // checkout's task-before-run order and escalation's task-scoped Stop
-        // gate before releasing either claim or publishing hold-release work.
-        const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
-          .filter((id): id is string => id !== null))];
-        if (ownerRunIds.length) {
-          await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-            eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
-          )).orderBy(asc(heartbeatRuns.id)).for("update");
-          if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
-          await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
-            runIds: ownerRunIds, source: "recovery.sweep_stale_issue_locks" }, publications);
-          return null;
-        }
-        }
-        for (const runId of ownerRunIds) {
+        for (const runId of new Set([locked.checkoutRunId, locked.executionRunId])) {
           if (runId && await nativeManualAdmissionHoldsExecution(tx as unknown as Db,
             { companyId: issue.companyId, runId, issueId: issue.id })) return null;
         }
@@ -7095,14 +7050,9 @@ export function recoveryService(
         // are promoted through the one outbox path (section E), only when the
         // guarded clear actually released it. The promotion registers its own
         // work signals before its write.
-        if (cleared) {
-          await clearTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
-            runIds: ownerRunIds }, publications);
-          await promoteDeferredWorkIntents(tx, { companyId: issue.companyId, trigger: "lock_released", issueId: issue.id });
-        }
+        if (cleared) await promoteDeferredWorkIntents(tx, { companyId: issue.companyId, trigger: "lock_released", issueId: issue.id });
         return cleared;
       });
-      for (const publication of publications) publishActivity(publication);
 
       if (!updated) continue;
 
