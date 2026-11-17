@@ -2306,6 +2306,36 @@ suite("fresh-continuation fallback", () => {
     expect(again[0]!.metadata).toEqual(retired.metadata);
   }, 60_000);
 
+  // stack135 F3 re-home of D002/D010/D013/D018/D171 (S1-pause). The U5 paused
+  // note is gone; the card owns the one truthful explanation: the agent is
+  // paused, a person resumes it, and nothing asks to send the message again.
+  it("a paused agent's unanswered message shows one resume instruction, never send-again, across repeated passes", async () => {
+    const f = await unfinishedRun({ runtime: "native", errorCode: "agent_paused", status: "cancelled", hold: "none" });
+    const [message] = await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "user", authorUserId: userId,
+      body: "Please keep going.", createdAt: new Date(Date.now() - 5 * 60_000) }).returning();
+    await db.update(issues).set({ status: "in_progress", blockedTransitionAt: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", wakeCommentId: message!.id } })
+      .where(eq(heartbeatRuns.id, f.runId));
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", lifecycleHolds: ["manual"] }).where(eq(agents.id, agentId));
+    try {
+      const cards = [];
+      for (let pass = 0; pass < 3; pass++) {
+        await heartbeatService(db).reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+        cards.push(await taskInterruptionPresentation(db, await issue(f.issueId)));
+      }
+      expect(cards[0]).toMatchObject({ responsibility: "user", state: "waiting_for_user", userAction: "resume", canRetry: false });
+      expect(cards[2]).toEqual(cards[0]);
+      const visible = JSON.stringify({ cards, notices: await db.select().from(issueComments).where(and(
+        eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system"))) });
+      expect(visible).not.toMatch(/send (it|a new message)|again/i);
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.issueId, f.issueId),
+        inArray(heartbeatRuns.status, ["queued", "running"])))).toHaveLength(0);
+      expect((await db.select().from(issueComments).where(eq(issueComments.id, message!.id)))[0]).toMatchObject({ deletedAt: null });
+    } finally {
+      await db.update(agents).set({ status: "idle", pauseReason: null, lifecycleHolds: [] }).where(eq(agents.id, agentId));
+    }
+  }, 60_000);
+
   // D146 re-homed (never-OK, stack135 F2). The U5 notice that owned this is
   // deleted; the person-visible card and any recovery notice now own it.
   it.each([
