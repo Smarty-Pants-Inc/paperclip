@@ -36,6 +36,8 @@ export class HostMutationRefusedError extends Error {
 
 export type HostMutationDrain = {
   readonly closed: boolean;
+  /** Aborted (with the close reason) once this gate, or an outer gate it is joined to, closes. */
+  readonly signal: AbortSignal;
   readonly inFlight: number;
   run<T>(fn: () => Promise<T>): Promise<T>;
   cleanup<T>(fn: () => Promise<T>): Promise<T>;
@@ -54,6 +56,7 @@ export function createHostMutationDrain(): HostMutationDrain {
   let closeReason: unknown;
   let inFlight = 0;
   let waiters: Array<() => void> = [];
+  const gate = new AbortController();
   const settle = () => {
     inFlight -= 1;
     if (inFlight === 0) { const ready = waiters; waiters = []; for (const wake of ready) wake(); }
@@ -68,12 +71,17 @@ export function createHostMutationDrain(): HostMutationDrain {
   return {
     get closed() { return closed; },
     get inFlight() { return inFlight; },
+    signal: gate.signal,
     run(fn) {
       if (closed) return Promise.reject(new HostMutationRefusedError(closeReason));
       return track(fn);
     },
     cleanup: track,
-    close(reason) { if (!closed) { closed = true; closeReason = reason; } },
+    close(reason) {
+      if (closed) return;
+      closed = true; closeReason = reason;
+      gate.abort(reason ?? new HostMutationRefusedError());
+    },
     async closeAndDrain(capMs, reason) {
       this.close(reason);
       if (inFlight === 0) return { drained: true };
@@ -95,9 +103,33 @@ const store: AsyncLocalStorage<HostMutationDrain> =
   ((globalThis as Record<symbol, unknown>)[STORE_KEY] as AsyncLocalStorage<HostMutationDrain> | undefined)
   ?? ((globalThis as Record<symbol, unknown>)[STORE_KEY] = new AsyncLocalStorage<HostMutationDrain>()) as AsyncLocalStorage<HostMutationDrain>;
 
-/** Run `fn` (and everything it starts) under `drain`. */
-export function withHostMutationDrain<T>(drain: HostMutationDrain, fn: () => Promise<T>): Promise<T> {
-  return store.run(drain, fn);
+/**
+ * pl/keepalive6: an inner owner's gate JOINED to the gate of the owner it runs
+ * inside (e.g. a lifecycle lock taken inside a held source lock). A host
+ * mutation through the joined gate is refused once EITHER gate is closed and
+ * is counted in flight by BOTH, so the outer owner's drain also waits for the
+ * inner owner's writes. Its signal aborts with whichever gate closes first.
+ * Closing the joined view closes only the inner gate.
+ */
+export function joinHostMutationDrains(outer: HostMutationDrain, inner: HostMutationDrain): HostMutationDrain {
+  const signal = AbortSignal.any([outer.signal, inner.signal]);
+  return {
+    get closed() { return outer.closed || inner.closed; },
+    get inFlight() { return inner.inFlight; },
+    signal,
+    run: (fn) => outer.closed ? outer.run(fn) : outer.run(() => inner.run(fn)),
+    cleanup: (fn) => outer.cleanup(() => inner.cleanup(fn)),
+    close: (reason) => inner.close(reason),
+    closeAndDrain: (capMs, reason) => inner.closeAndDrain(capMs, reason),
+    drained: () => inner.drained(),
+  };
+}
+
+/** Run `fn` (and everything it starts) under `drain`. With `parent` (the
+ * owner this work runs inside, captured before any connection callback can
+ * lose the async context), the gate is joined to it: see joinHostMutationDrains. */
+export function withHostMutationDrain<T>(drain: HostMutationDrain, fn: () => Promise<T>, parent?: HostMutationDrain): Promise<T> {
+  return store.run(parent && parent !== drain ? joinHostMutationDrains(parent, drain) : drain, fn);
 }
 
 export function currentHostMutationDrain(): HostMutationDrain | undefined {
