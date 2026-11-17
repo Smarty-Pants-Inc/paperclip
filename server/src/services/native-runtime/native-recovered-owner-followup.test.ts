@@ -1587,6 +1587,120 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(followUp.logs.join("")).not.toContain("waiting for the Stop's runner lifecycle command");
   }, 60_000);
 
+  /** S095 (rf-3, live on b4c6d53b): the successor's fence runs while the
+   * person's Stop of the owner is recorded (run cancelled by the user,
+   * executionCancellation requested) but its acknowledgement is still pending
+   * (nativeCancellation.dispatchState "pending"). Returns the write that lands
+   * the acknowledgement: the same receipt seedClosedStoppedOwner wrote. */
+  async function holdStopAcknowledgement(prior: { runId: string }) {
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const acknowledged = stopped.resultJson as Record<string, unknown>;
+    const { acknowledgementAuditId: _audit, acknowledgedAt: _at, ...intent } = acknowledged.nativeCancellation as Record<string, unknown>;
+    await db.update(heartbeatRuns).set({ resultJson: { ...acknowledged,
+      nativeCancellation: { ...intent, dispatchState: "pending", dispatched: false } } }).where(eq(heartbeatRuns.id, prior.runId));
+    return async () => { await db.update(heartbeatRuns).set({ resultJson: acknowledged }).where(eq(heartbeatRuns.id, prior.runId)); };
+  }
+
+  /** The PRODUCTION entry (native-session-executor.ts executePaperclipNativeSession)
+   * for the live shape: a Boat remote sandbox (box created for the successor),
+   * a warm pi_rpc chat with its agent_files instruction working copy. */
+  async function executeFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    followUp: Awaited<ReturnType<typeof admitFollowUp>>, timeoutMs: number) {
+    const bound = warmSessionReleaseWait.timeoutMs;
+    warmSessionReleaseWait.timeoutMs = timeoutMs;
+    try {
+      return await executePaperclipNativeSession({ db, execution: prior.executionFor(followUp.runId),
+        runnerInstanceId: followUp.native.runnerInstanceId, useRunnerd: true,
+        onLog: async (_stream: "stdout" | "stderr", chunk: string) => { followUp.logs.push(chunk); },
+        instructionWorkingCopy: { runId: followUp.runId, root: join(stateDirectory, "agent-files", followUp.runId),
+          preparationKey: "agent-files", hasChanges: async () => false, collectStopped: async () => undefined },
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "boat", environmentId: followUp.environmentId,
+          leaseId: followUp.leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
+          runner: { execute: followUp.remoteExecute },
+          sandboxLeaseAcquisition: { outcome: "created", providerLeaseId: followUp.providerLeaseId } } as never,
+      } as never).then(() => "completed", (error: unknown) => error);
+    } finally {
+      warmSessionReleaseWait.timeoutMs = bound;
+    }
+  }
+
+  const failureText = (failure: unknown) => failure instanceof Error
+    ? [failure.message, (failure.cause as Error | undefined)?.message ?? ""].join(" | ") : String(failure);
+
+  it("S095: a person's Stop still awaiting its acknowledgement at the successor's fence defers without a quarantined copy; "
+    + "once the acknowledgement lands the four proofs admit the next inspection", async () => {
+    const { prior, followUp } = await seedClosedStoppedOwner();
+    const landAcknowledgement = await holdStopAcknowledgement(prior);
+    // Production entry while the acknowledgement is pending: the bound passes with it still pending.
+    const first = await executeFollowUp(prior, followUp, 300);
+    expect.soft(await quarantined(), "no quarantined copy after the pending-acknowledgement fence").toEqual([]);
+    expect.soft(failureText(first), "the fence's outcome").toBe(failureText(new NativeControllerRecoveryWaitingError(new Date())));
+    expect.soft(first).toBeInstanceOf(NativeControllerRecoveryWaitingError);
+    expect.soft(followUp.logs.join("")).toContain(`waiting for the acknowledgement of the person's Stop of run ${prior.runId}`);
+    const [finalization] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, followUp.runId));
+    expect.soft(finalization).toMatchObject({ phase: "retryable_failure", attempt: 0, failureCode: "native_controller_recovery_waiting_for_owner" });
+    expect(followUp.remoteExecute).not.toHaveBeenCalled();
+    // The acknowledgement lands; all four exemption proofs hold. The next inspection admits.
+    await landAcknowledgement();
+    const { outcome } = await startWithBound(followUp, 5_000);
+    expect(outcome, "the next inspection after the acknowledgement landed").toBe(ADMITTED);
+    expect(await quarantined()).toEqual([]);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+    const [successor] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect((successor.runnerProfileJson?.sessionCheckpoint as Record<string, unknown>).providerSessionId)
+      .toBe("provider-session-before-recovery");
+  }, 60_000);
+
+  it("S095: the acknowledgement landing during the successor's wait is judged by the four proofs at once (no quarantine)", async () => {
+    const { prior, followUp } = await seedClosedStoppedOwner();
+    const landAcknowledgement = await holdStopAcknowledgement(prior);
+    const timer = setInterval(() => {
+      if (!followUp.logs.join("").includes("waiting for the acknowledgement of the person's Stop")) return;
+      clearInterval(timer);
+      void landAcknowledgement();
+    }, 10);
+    try {
+      const { outcome, elapsedMs } = await startWithBound(followUp, 5_000);
+      expect(outcome).toBe(ADMITTED);
+      expect(elapsedMs).toBeLessThan(5_000);
+    } finally {
+      clearInterval(timer);
+    }
+    expect(await quarantined()).toEqual([]);
+    expect(await archivedOwners(await sessionRoot())).toEqual([prior.runId]);
+  }, 60_000);
+
+  it("S095: a runner.suspend journaled before the person's Stop still quarantines and refuses once the acknowledgement lands", async () => {
+    const { prior, followUp } = await seedClosedStoppedOwner({ suspend: "before Stop" });
+    const landAcknowledgement = await holdStopAcknowledgement(prior);
+    const timer = setInterval(() => {
+      if (!followUp.logs.join("").includes("waiting for the acknowledgement of the person's Stop")) return;
+      clearInterval(timer);
+      void landAcknowledgement();
+    }, 10);
+    try {
+      expect((await startWithBound(followUp, 5_000)).outcome).toBe(stranded("journal_commands_unsettled(runner.suspend.pending)"));
+    } finally {
+      clearInterval(timer);
+    }
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain("waiting for the Stop's runner lifecycle command");
+  }, 60_000);
+
+  it("S095: an owner without a pending person's Stop keeps today's quarantine and refusal, with no wait", async () => {
+    const { prior, followUp } = await seedClosedStoppedOwner({ suspend: "before Stop" });
+    await holdStopAcknowledgement(prior);
+    // The Stop was not the person's: an agent's stop of the run.
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ resultJson: { ...stopped.resultJson, cancelledByActorType: "agent" } })
+      .where(eq(heartbeatRuns.id, prior.runId));
+    const { outcome, elapsedMs } = await startWithBound(followUp, 5_000);
+    expect(outcome).toMatch(/^runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=/);
+    expect(elapsedMs).toBeLessThan(5_000);
+    expect(await quarantined()).toHaveLength(1);
+    expect(followUp.logs.join("")).not.toContain("waiting for the acknowledgement of the person's Stop");
+  }, 60_000);
+
   // Staging PAP-4196 (run.attach) and PAP-3443 (semantic_tool.result): the
   // per-turn owner committed its result and its sandbox was destroyed after the
   // turn, but its journal still held a delivery that its Runner never
