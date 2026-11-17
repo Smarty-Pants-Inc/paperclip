@@ -14,7 +14,8 @@ import { notifyInstructionCollection } from "../instruction-collection-notificat
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { boundRunIssueId } from "../run-task-binding.js";
 import { REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE, REMOTE_WORKSPACE_RESTORE_FAILED_CODE } from "../remote-workspace-transport.js";
-import { REUSABLE_SANDBOX_RESUME_FAILED_CODE } from "../reusable-sandbox-resume-error.js";
+import { REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE, REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+  REUSABLE_SANDBOX_RESUME_FAILED_CODE, reusableSandboxBackupUnrestorableInstruction } from "../reusable-sandbox-resume-error.js";
 import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "../plugin-worker-unavailable-error.js";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
 import { RUNNER_REVISION_MISMATCH_CODE } from "../runner-revision-mismatch.js";
@@ -2793,7 +2794,10 @@ export function recoveryService(
         : { routingPolicy: STRANDED_BOARD_ESCALATION_POLICY },
       attemptCount: input.attemptCount,
       nextAction:
-        recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
+        // The card says the same one true thing as the notice.
+        input.latestRun?.errorCode === REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE
+          ? REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION
+        : recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
           ? "The agent finished without saying whether the task is done. Mark the task done if it is, or press Retry to let the agent continue from the saved work."
           : recoveryCause === "process_lost"
             ? RETRY_FROM_SAVED_WORK_NEXT_ACTION
@@ -4426,9 +4430,14 @@ export function recoveryService(
       attemptCount: input.attemptCount,
     }, tx);
     const executionBlocker = await getExecutionBlocker(tx as unknown as Db, input.issue.companyId, input.issue.id);
+    // Retry eligibility for this card and its notice is the blocker's canRetry
+    // (execution-blocker.ts getExecutionBlocker: canRetry/retryOffered).
     const retryOffered = !(executionBlocker && executionBlocker.canRetry === false);
+    const backupUnrestorable = input.latestRun?.errorCode === REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE;
     if (!retryOffered && /\bretry\b/i.test(recoveryAction.nextAction ?? "")) {
-      recoveryAction.nextAction = withoutRetryInstruction(recoveryAction.nextAction!);
+      recoveryAction.nextAction = backupUnrestorable
+        ? reusableSandboxBackupUnrestorableInstruction(false, executionBlocker?.nextAction)
+        : withoutRetryInstruction(recoveryAction.nextAction!);
       await tx.update(issueRecoveryActions).set({ nextAction: recoveryAction.nextAction })
         .where(and(eq(issueRecoveryActions.companyId, input.issue.companyId), eq(issueRecoveryActions.id, recoveryAction.id)));
     }
@@ -4516,6 +4525,7 @@ export function recoveryService(
       recoveryCause,
       recoveryActionId: recoveryAction.id,
       retryOffered,
+      nextStepWithoutRetry: executionBlocker?.nextAction ?? null,
       continuesAutomatically: Boolean(input.latestRun) && recoveryAction.kind === STRANDED_KIND
         && recoveryAction.ownerType === "board" && input.latestRun?.agentId === input.issue.assigneeAgentId
         && strandedRunCauseIsTemporary({

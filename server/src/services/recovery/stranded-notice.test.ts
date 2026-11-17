@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { noticeMetadataReferencesRecoveryAction } from "./successful-run-handoff.js";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
+import { REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_DEFAULT_NEXT_STEP } from "../reusable-sandbox-resume-error.js";
+import { NEW_TASK_CONTINUE_ACTION } from "../execution-blocker.js";
 import {
   DEFAULT_STRANDED_RECOVERY_NOTICE_BODY,
   buildConfigurationIncompleteRecoveryNoticeSeed,
@@ -404,6 +406,38 @@ it("tells the person the one true thing when a chat's saved box could not be res
   const text = JSON.stringify(notice);
   expect(text).not.toContain("did not start the saved sandbox in time");
   expect(text).not.toContain("tries again automatically");
+});
+
+// step 2e (3): "Press Retry" only when the chat offers Retry at that moment
+// (recovery/service.ts passes the execution blocker's canRetry as retryOffered).
+// Otherwise the sentence ends "the old box is kept." plus the step that IS
+// available, never a Retry or a "holding saved work" claim.
+it.each([
+  ["Retry offered", true, undefined,
+    "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Press Retry."],
+  ["Retry not offered (in-app chat)", false,
+    "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Create a new task to continue the work.",
+    "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Create a new task to continue the work."],
+  ["Retry not offered (bound external chat)", false, "Send a new chat message to continue this conversation.",
+    "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Send a new chat message to continue this conversation."],
+  ["Retry not offered (no blocker)", false, null,
+    "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Create a new task to continue the work."],
+] as const)("says Press Retry only when Retry is offered: %s", (_label, retryOffered, nextStepWithoutRetry, expected) => {
+  const notice = buildStrandedRecoveryEscalationNotice({
+    seed: buildImmediateExecutionPathRecoveryNoticeSeed({ status: "in_progress" }),
+    recoveryActionId: "backup-recovery", recoveryOwner: null, retryOffered, nextStepWithoutRetry,
+    sourceRun: { id: "failed-run", status: "failed", errorCode: "reusable_sandbox_backup_unrestorable" },
+  });
+  expect(notice.body).toBe(expected);
+  expect(allRows(notice.metadata).find(row => row.label === "Next action")?.value).toBe(expected);
+  if (!retryOffered) {
+    expect(JSON.stringify(notice)).not.toMatch(/Retry/);
+    expect(JSON.stringify(notice)).not.toContain("holding this task");
+  }
+});
+
+it("falls back to the blocker's always-available new-task action", () => {
+  expect(REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_DEFAULT_NEXT_STEP).toBe(NEW_TASK_CONTINUE_ACTION);
 });
 
 it("names the managed AI connection a plugin Runner-task environment requires", () => {

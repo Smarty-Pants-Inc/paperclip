@@ -62,8 +62,30 @@ export function findReusableSandboxResumeError(error: unknown): ReusableSandboxR
  */
 export const REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE = "reusable_sandbox_backup_unrestorable";
 
+export const REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_KEPT =
+  "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept.";
+
 export const REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION =
-  "This chat's saved box couldn't be restored. Nothing was deleted; the old box is kept. Press Retry.";
+  `${REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_KEPT} Press Retry.`;
+
+/** Equals NEW_TASK_CONTINUE_ACTION (execution-blocker.ts), the action that is always available. */
+export const REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_DEFAULT_NEXT_STEP = "Create a new task to continue the work.";
+
+/**
+ * The one true instruction for a chat whose saved box could not be restored.
+ * "Press Retry" only when the chat offers Retry at that moment (the execution
+ * blocker's `canRetry`); otherwise the sentence ends "the old box is kept."
+ * and names the step that IS available: the blocker's own next action with
+ * any Retry sentence removed (for a bound external chat, "Send a new chat
+ * message..."), else creating a new task. Never "Paperclip is holding this
+ * task until its saved work is settled": nothing is held for this chat.
+ */
+export function reusableSandboxBackupUnrestorableInstruction(retryOffered: boolean, nextStepWithoutRetry?: string | null): string {
+  if (retryOffered) return REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION;
+  const offered = (nextStepWithoutRetry ?? "").replace(REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_KEPT, "")
+    .split(/(?<=[.!?])\s+/).map(sentence => sentence.trim()).filter(sentence => sentence && !/\bretry\b/i.test(sentence)).join(" ");
+  return `${REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_KEPT} ${offered || REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_DEFAULT_NEXT_STEP}`;
+}
 
 export type ReusableSandboxBackupFailure =
   | "hash_mismatch" | "size_mismatch" | "object_missing" | "backup_missing" | "reference_invalid";
