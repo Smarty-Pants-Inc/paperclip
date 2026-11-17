@@ -852,6 +852,93 @@ describe("persistent agent directories", () => {
     expect(await fx.surviving()).toBe(fx.note);
   }, 60_000);
 
+  // F2c: review-fleet-4's four remaining destroy routes (f2-judge-extra), ported.
+  const writeJudgeEvidence = async (name: string, proof: unknown) => {
+    if (process.env.TASK_OUT) await fs.writeFile(path.join(process.env.TASK_OUT, name), JSON.stringify(proof, null, 2));
+  };
+
+  it("JUDGE overlap: second failed destroy cannot unprotect the first in-flight destroy", async () => {
+    const fx = await boundLeaseFixture();
+    let entered!: () => void, finish!: () => void;
+    const entry = new Promise<void>(r => { entered = r; });
+    const gate = new Promise<void>(r => { finish = r; });
+    const original = fx.call.getMockImplementation()!;
+    fx.call.mockImplementationOnce(async (...args: any[]) => { entered(); await gate; return (original as any)(...args); });
+    fx.call.mockImplementationOnce(async () => { throw new Error("second destroy failed before deletion"); });
+    const first = fx.runtime.destroyRunLease({ environment: fx.environment, lease: await fx.lease() });
+    try {
+      await entry;
+      const claimA = (await fx.lease()).metadata?.agentFileDestroyClaim;
+      await fx.runtime.destroyRunLease({ environment: fx.environment, lease: await fx.lease() });
+      const afterSecond = await fx.lease();
+      const collected = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+      const heldBeforeFirstFinishes = Boolean(collected?.receipt?.savePending);
+      finish(); await first;
+      const proof = { claimA, claimAfterSecond: afterSecond.metadata?.agentFileDestroyClaim ?? null,
+        heldBeforeFirstFinishes, providerCalls: fx.call.mock.calls.map(c => c[1]), surviving: await fx.surviving(), expected: fx.note };
+      console.log("JUDGE_OVERLAPPING_DESTROYS", JSON.stringify(proof));
+      await writeJudgeEvidence("overlapping-destroys-evidence.json", proof);
+      expect.soft(heldBeforeFirstFinishes).toBe(false);
+      expect.soft(await fx.surviving()).toBe(fx.note);
+    } finally { finish(); await first; }
+  }, 60_000);
+
+  it("JUDGE alias: collection pin protects all lease rows for the same provider source", async () => {
+    const fx = await boundLeaseFixture();
+    const source = await fx.lease(), aliasId = randomUUID();
+    await db.insert(environmentLeases).values({ id: aliasId, companyId, environmentId: source.environmentId,
+      provider: source.provider, providerLeaseId: source.providerLeaseId, leasePolicy: source.leasePolicy,
+      status: "released", metadata: source.metadata });
+    const envs = environmentService(db);
+    const capture = checkpointsModule.captureAgentFileCheckpoint;
+    let injected = false, pinned: unknown;
+    const spy = vi.spyOn(checkpointsModule, "captureAgentFileCheckpoint").mockImplementation(async (...args) => {
+      if (!injected) {
+        injected = true; pinned = (await fx.lease()).metadata?.agentFileCollectionPins;
+        await fx.runtime.destroyRunLease({ environment: fx.environment, lease: (await envs.getLeaseById(aliasId))! });
+      }
+      return capture(...args);
+    });
+    try {
+      const collected = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+      const proof = { pinned, held: Boolean(collected?.receipt?.savePending), providerCalls: fx.call.mock.calls.map(c => c[1]), surviving: await fx.surviving(), expected: fx.note };
+      console.log("JUDGE_ALIAS_PIN", JSON.stringify(proof));
+      await writeJudgeEvidence("alias-pin-evidence.json", proof);
+      expect.soft(fx.call).not.toHaveBeenCalled();
+      expect.soft(await fx.surviving()).toBe(fx.note);
+    } finally { spy.mockRestore(); }
+  }, 60_000);
+
+  it("JUDGE missing environment: recorded plugin destroy still respects durable save hold", async () => {
+    const fx = await boundLeaseFixture();
+    const source = await fx.lease();
+    await db.update(environmentLeases).set({ environmentId: null, status: "active",
+      metadata: { ...source.metadata, driver: "plugin", pluginKey: source.provider,
+        driverKey: source.provider, environmentId: fx.environment.id, pluginLeaseCleanupMethod: "destroy" } })
+      .where(eq(environmentLeases.id, source.id));
+    const held = await copies.collectStopped({ companyId, runId: fx.copy.runId });
+    expect(held?.receipt?.savePending).toBeTruthy();
+    const released = await fx.runtime.releaseRunLeases(fx.copy.runId, "released");
+    const proof = { held: true, released: released.length, providerCalls: fx.call.mock.calls.map(c => c[1]), surviving: await fx.surviving(), expected: fx.note };
+    console.log("JUDGE_MISSING_ENVIRONMENT", JSON.stringify(proof));
+    await writeJudgeEvidence("missing-environment-evidence.json", proof);
+    expect.soft(fx.call).not.toHaveBeenCalled();
+    expect.soft(await fx.surviving()).toBe(fx.note);
+  }, 60_000);
+
+  it("JUDGE D11: destroyed receipt without completed destroy cannot clear live claim", async () => {
+    const fx = await boundLeaseFixture();
+    const claim = await claimLeaseForDestroyUnlessHeld(db, await fx.lease());
+    const lease = await fx.lease();
+    await environmentService(db).releaseLease(lease.id, "expired", { cleanupStatus: "success",
+      remoteExecutionTermination: remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "destroyed" }) });
+    const proof = { claim, claimAfterReceipt: (await fx.lease()).metadata?.agentFileDestroyClaim ?? null,
+      providerCalls: fx.call.mock.calls.length, surviving: await fx.surviving() };
+    console.log("JUDGE_D11", JSON.stringify(proof));
+    await writeJudgeEvidence("d11-receipt-evidence.json", proof);
+    expect((await fx.lease()).metadata?.agentFileDestroyClaim).toBe(claim);
+  }, 60_000);
+
   it("round trips nested text, empty directories and binary bytes independently of task files", async () => {
     const first = await run();
     expect(first.localRoot.startsWith(path.join(home, ".paperclip-runtime"))).toBe(false);
