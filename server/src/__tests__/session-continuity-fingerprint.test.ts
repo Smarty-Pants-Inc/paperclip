@@ -78,7 +78,7 @@ describe("session config fingerprint: upgrade keeps saved sessions (#20853)", ()
   // session would reset once at deploy (the very loss #20853 removes).
   const PRE_20853_FINGERPRINT = "v1:sha256:ad9a666abb4f8ca60dc7951e7b937321ed87a1d391cad2a8d84fb4276b74e5b7";
   it("the pre-#20853 shape of an unchanged config is still computed for compatibility", async () => {
-    expect((await buildEffectiveRunSessionConfigMetadata({ ...base(), legacyFingerprintShape: true })).fingerprint)
+    expect((await buildEffectiveRunSessionConfigMetadata({ ...base(), legacyComposition: true })).fingerprint)
       .toBe(PRE_20853_FINGERPRINT);
   });
 });
