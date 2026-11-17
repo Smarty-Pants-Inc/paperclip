@@ -17,6 +17,7 @@ import {
   completionContracts,
   createDb,
   environmentLeases,
+  externalObjectMentions,
   heartbeatRuns,
   heartbeatRunEvents,
   issueComments,
@@ -31,6 +32,9 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueService } from "../services/issues.js";
+import { externalObjectService } from "../services/external-objects.js";
+import { instanceSettingsService } from "../services/instance-settings.js";
+import { invalidateInstanceSettingsCache } from "../services/instance-settings-cache.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
@@ -1727,6 +1731,52 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     ]);
     expect(wake?.status).toBe("cancelled");
     expect(runs.map((run) => run.id)).toEqual([seeded.runId]);
+  });
+
+  // Keep reason: #18700 pool starvation on the real author-delete route.
+  // DELETE /api/issues/:id/comments/:commentId -> tombstoneComment transaction
+  // -> afterTombstone -> syncCommentSafely -> enabled -> getExperimental.
+  it("deletes a comment and its external mentions with a cold settings cache and pool max 1", async () => {
+    const seeded = await seedQueue();
+    await db.update(agentWakeupRequests).set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.id, seeded.wakeId));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, seeded.runId));
+    await db.update(issues).set({ executionRunId: null, assigneeAgentId: null })
+      .where(eq(issues.id, seeded.issueId));
+    await db.update(issueComments).set({ body: "Review https://github.com/acme/app/pull/42" })
+      .where(eq(issueComments.id, seeded.commentIds[0]));
+    await instanceSettingsService(db).updateExperimental({ enableExternalObjects: true });
+    await externalObjectService(db).syncComment(seeded.commentIds[0]);
+    const mentions = () => db.select().from(externalObjectMentions)
+      .where(eq(externalObjectMentions.sourceRecordId, seeded.commentIds[0]));
+    expect(await mentions()).toHaveLength(1);
+    const single = createDb(tempDb!.connectionString, { maxConnections: 1 });
+    try {
+      const client = app(seeded.companyId, "queue-owner", undefined, single);
+      const transaction = single.transaction.bind(single);
+      // getGeneral may warm the shared row before the transaction starts.
+      // Simulate a normal concurrent settings-change invalidation once the
+      // only connection is held, without mocking any query or flag read.
+      vi.spyOn(single, "transaction").mockImplementation((callback, config) =>
+        transaction(async (tx) => {
+          invalidateInstanceSettingsCache();
+          return callback(tx);
+        }, config),
+      );
+      const deleted = await request(client)
+        .delete(`/api/issues/${seeded.issueId}/comments/${seeded.commentIds[0]}`)
+        .timeout({ deadline: 3000 });
+      expect(deleted.status, JSON.stringify(deleted.body)).toBe(200);
+      expect(deleted.body.deletedAt).not.toBeNull();
+      expect(await mentions()).toEqual([]);
+      const [stored] = await db.select().from(issueComments)
+        .where(eq(issueComments.id, seeded.commentIds[0]));
+      expect(stored.deletedAt).not.toBeNull();
+    } finally {
+      await single.$client.end({ timeout: 0 });
+      await instanceSettingsService(db).updateExperimental({ enableExternalObjects: false });
+    }
   });
 
   it.each([false, true])("routes comment cancellation through the queue (promoted=%s)", async (promoted) => {

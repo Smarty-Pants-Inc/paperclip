@@ -391,7 +391,7 @@ export function externalObjectService(
     resolvers?: ExternalObjectResolver[];
     pluginWorkerManager?: PluginWorkerManager;
     github?: GitHubExternalObjectProviderOptions | false;
-    enabled?: boolean | (() => boolean | Promise<boolean>);
+    enabled?: boolean | ((dbOrTx?: any) => boolean | Promise<boolean>);
   } = {},
 ) {
   const githubProvider = opts.github === false ? null : createGitHubExternalObjectProvider(db, opts.github);
@@ -443,8 +443,8 @@ export function externalObjectService(
     )!;
   }
 
-  async function isEnabled() {
-    if (typeof opts.enabled === "function") return await opts.enabled();
+  async function isEnabled(dbOrTx?: any) {
+    if (typeof opts.enabled === "function") return await opts.enabled(dbOrTx);
     return opts.enabled ?? true;
   }
 
@@ -563,7 +563,7 @@ export function externalObjectService(
   }
 
   async function syncIssue(issueId: string, dbOrTx: any = db) {
-    if (!(await isEnabled())) return;
+    if (!(await isEnabled(dbOrTx))) return;
     const runSync = async (tx: any) => {
       const issue = await issueById(issueId, tx);
       if (!issue) throw notFound("Issue not found");
@@ -599,7 +599,7 @@ export function externalObjectService(
 
   async function syncComment(commentId: string, dbOrTx: any = db) {
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
+      if (!(await isEnabled(tx))) return;
       const comment = await tx
         .select({
           id: issueComments.id,
@@ -629,7 +629,7 @@ export function externalObjectService(
 
   async function syncDocument(documentId: string, dbOrTx: any = db) {
     const runSync = async (tx: any) => {
-      if (!(await isEnabled())) return;
+      if (!(await isEnabled(tx))) return;
       const document = await tx
         .select({
           documentId: documents.id,
