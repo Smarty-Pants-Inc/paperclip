@@ -438,6 +438,122 @@ describe("persistent agent directories", () => {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
       return runId;
     }
+    describe("Paul's managed bundle: notes do not retire a warm chat (notes-digest)", () => {
+      const instructionFiles = ["AGENTS.md", "RULES.md", "DECISIONS.md", "PREFERENCES.md", "MODELS.md", "LANDSCAPE.md"];
+      const note = "memory/2026-11-17-playful-handover-sma612.md";
+      async function paulBundle() {
+        // Exact mode: managed, entry AGENTS.md, top-level instruction files + memory/** archive/** templates/** work/**.
+        await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } })
+          .where(eq(agents.id, agentId));
+        await fs.rm(path.join(root, "policy"), { recursive: true, force: true });
+        for (const name of instructionFiles) await fs.writeFile(path.join(root, name), `# ${name}\n`);
+        await fs.writeFile(path.join(root, "DECISIONS.md"), "# Decisions\nDECISION-FACT: the blue kettle is retired.\n");
+        for (const [name, body] of [["memory/README.md", "notes\n"], ["memory/2026-11-16-old.md", "old note\n"], ["archive/README.md", "archive\n"],
+          ["templates/project-lead.md", "template\n"], ["work/sma408_check.py", "print(1)\n"]]) {
+          await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+          await fs.writeFile(path.join(root, name), body);
+        }
+      }
+      async function siblingSaves(relative: string, body: string) {
+        const sibling = await run();
+        await fs.mkdir(path.dirname(path.join(sibling.localRoot, relative)), { recursive: true });
+        await fs.writeFile(path.join(sibling.localRoot, relative), body);
+        expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(body);
+      }
+      async function onDisk(dir: string) {
+        const out: string[] = [];
+        const walk = async (rel: string) => {
+          for (const e of await fs.readdir(path.join(dir, rel), { withFileTypes: true })) {
+            const next = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) await walk(next); else out.push(next);
+          }
+        };
+        await walk("");
+        return out.sort();
+      }
+
+      it("keeps chat A warm on its SAME directory after a sibling saves a memory note; a NEW chat sees the note and DECISIONS", async () => {
+        await paulBundle();
+        const chatA = await run({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
+        const before = await onDisk(root);
+        await siblingSaves(note, "NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // Warm chat A: its FIRST next turn reuses the same materialization (no retirement, no fresh restore).
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(true);
+        const turn2 = await run({ warm: true, reuseRunId: chatA.runId });
+        expect(turn2.localRoot).toBe(chatA.localRoot);
+        expect(turn2.executionRoot).toBe(chatA.executionRoot);
+        expect(await copies.get(companyId, chatA.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: turn2.runId } });
+        // The runner's 'instructions' for the warm turn are unchanged (no refresh_required).
+        const contextFor = async (copy: typeof chatA) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
+          adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
+          runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
+        const [contextA, context2] = [await contextFor(chatA), await contextFor(turn2)];
+        expect(context2.instructions).toEqual(contextA.instructions);
+        expect(context2.aggregateDigest).toBe(contextA.aggregateDigest);
+        // ...and still sees the sibling's note on disk.
+        expect(await fs.readFile(path.join(turn2.localRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // A NEW chat started after the note restores the whole folder: the note and DECISIONS.md facts.
+        const chatB = await run({ warm: true });
+        expect(chatB.localRoot).not.toBe(chatA.localRoot);
+        expect(await fs.readFile(path.join(chatB.localRoot, note), "utf8")).toContain("NOTE-FACT");
+        expect(await fs.readFile(path.join(chatB.localRoot, "DECISIONS.md"), "utf8")).toContain("DECISION-FACT");
+        expect(await onDisk(chatB.localRoot)).toEqual([...before, note].sort());
+
+        // Never-OK: chat A's own later save keeps every note (nothing dropped or moved).
+        await fs.writeFile(path.join(turn2.localRoot, "memory/2026-11-17-chat-a.md"), "chat A note\n");
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId }))?.state).toBe("warm_saved");
+        await copies.collectStopped({ companyId, runId: turn2.runId });
+        await copies.collectStopped({ companyId, runId: chatB.runId });
+        expect(await onDisk(root)).toEqual([...before, note, "memory/2026-11-17-chat-a.md"].sort());
+        expect(await fs.readFile(path.join(root, note), "utf8")).toContain("NOTE-FACT");
+      }, 20_000);
+
+      it.each(["AGENTS.md", "DECISIONS.md"])("still retires the warm chat when a sibling edits %s", async edited => {
+        await paulBundle();
+        const chatA = await run({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
+        await siblingSaves(edited, `# ${edited} edited\n`);
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        await copies.collectStopped({ companyId, runId: chatA.runId });
+        const fresh = (await copies.prepare({ ...target(), runId, cwd: home, warm: true }))!;
+        expect(fresh.localRoot).not.toBe(chatA.localRoot);
+        expect(await fs.readFile(path.join(fresh.localRoot, edited), "utf8")).toBe(`# ${edited} edited\n`);
+      }, 20_000);
+
+      it("adopts a retained session after a sibling note without retirement; the note is on disk", async () => {
+        await paulBundle();
+        const first = await run();
+        expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
+        await siblingSaves(note, "NOTE-FACT adopt\n");
+        const secondId = await nextRun();
+        const second = await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home });
+        expect(second).toMatchObject({ runId: secondId, localRoot: first.localRoot });
+        expect(second?.receipt?.retirementRequired).toBeUndefined();
+        expect(await fs.readFile(path.join(first.localRoot, note), "utf8")).toBe("NOTE-FACT adopt\n");
+        expect(await copies.hasChanges({ companyId, runId: secondId })).toBe(false);
+        await copies.collectStopped({ companyId, runId: secondId });
+        expect(await fs.readFile(path.join(root, note), "utf8")).toBe("NOTE-FACT adopt\n");
+        await copies.release(companyId, first.runId);
+      }, 20_000);
+
+      it("adoption still refuses a retained session after a DECISIONS.md edit", async () => {
+        await paulBundle();
+        const first = await run();
+        expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
+        await siblingSaves("DECISIONS.md", "# changed\n");
+        const secondId = await nextRun();
+        expect(await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home })).toBeNull();
+        await copies.collectStopped({ companyId, runId: first.runId });
+      }, 20_000);
+    });
+
     it("adopts one physical root and fences stale cleanup through final save", async () => {
       const first = await run();
       expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
