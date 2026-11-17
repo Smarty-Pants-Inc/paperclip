@@ -118,6 +118,7 @@ import {
   verifyNativeHarnessBackupStamp,
 } from "./native-harness-backup-stamp.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { stageRemoteLaunchAssets } from "./remote-launch-assets.js";
 import { prepareIsolatedCodexHome } from "../../vendor/paperclip-runner/testing.js";
 import { nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { forwardRemoteMcpRequest } from "./remote-mcp-relay.js";
@@ -5674,6 +5675,103 @@ describe("remote provider checkpoint restores", () => {
     } finally {
       await chmod(join(root, "instructions"), 0o700).catch(() => undefined);
       await chmod(join(root, "remote", "context", "instructions"), 0o700).catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  // Warm chat after an instruction-entry change (gate 1/5 and fresh, 11-17):
+  // the instructions destination is reused across launches and its previous
+  // bundle is sealed 0o555/0o444. A changed bundle must replace it on the
+  // first launch, with no failure and no old file mixed into the new bundle.
+  it.each([true, false])("replaces a warm read-only instruction bundle on the first launch after its entry changes (native sync: %s)", async nativeSync => {
+    const root = await mkdtemp(join(tmpdir(), "paperclip-warm-instructions-"));
+    const writable = async (path: string): Promise<void> => {
+      const stat = await lstat(path).catch(() => null);
+      if (!stat || stat.isSymbolicLink() || !stat.isDirectory()) return;
+      await chmod(path, 0o700);
+      for (const name of await readdir(path)) await writable(join(path, name));
+    };
+    try {
+      const filesystemRoot = join(root, "remote", "filesystem");
+      const targetInstructions = join(filesystemRoot, "context", "instructions");
+      const codexHome = join(root, "remote", "codex-home");
+      const transfers: string[][] = [];
+      const syncIn = vi.fn(async (operations: Array<{ files: Array<{ sourcePath: string; targetPath: string }> }>) => {
+        for (const operation of operations) for (const file of operation.files) {
+          await mkdir(dirname(file.targetPath), { recursive: true });
+          await cp(file.sourcePath, file.targetPath);
+        }
+      });
+      const execute = vi.fn(async (command: { command: string; args?: string[]; stdin?: string }) => {
+        const result = spawnSync(command.command, command.args ?? [], { input: command.stdin, encoding: "utf8" });
+        return { exitCode: result.status, signal: null, pid: null, startedAt: null, timedOut: false,
+          stdout: result.stdout, stderr: result.stderr };
+      });
+      const launch = async (bundle: Record<string, string>) => {
+        const local = await mkdtemp(join(root, "launch-"));
+        const sourceInstructions = join(local, "instructions");
+        await mkdir(join(sourceInstructions, "docs"), { recursive: true });
+        for (const [name, text] of Object.entries(bundle)) await writeFile(join(sourceInstructions, name), text, { mode: 0o444 });
+        await chmod(join(sourceInstructions, "docs"), 0o555);
+        await chmod(sourceInstructions, 0o555);
+        const source = nativeRuntimeContextFixture();
+        source.instructions.bundle.rootPath = sourceInstructions;
+        const target = nativeRuntimeContextFixture();
+        target.instructions.bundle.rootPath = targetInstructions;
+        await writeFile(join(local, "runtime-context.json"), JSON.stringify(target), { mode: 0o600 });
+        await stageRemoteLaunchAssets({
+          root: local,
+          transport: "sandbox",
+          runner: { ...(nativeSync ? { syncIn } : {}), execute } as never,
+          persistenceDirectories: [{ name: "codex-home", location: "filesystem", targetPath: codexHome }],
+          runtimeContext: { source, target, filesystemRoot },
+          caBundleMapping: null,
+          stageFile: async () => { throw new Error("unexpected single-file transfer"); },
+          stageDirectory: async () => { throw new Error("unexpected single-directory transfer"); },
+          stageAssets: async assets => {
+            transfers.push(assets.map(asset => asset.targetPath));
+            await stageRemoteRunnerAssets({ target: { kind: "remote", transport: "sandbox", remoteCwd: root } as never,
+              runner: { ...(nativeSync ? { syncIn } : {}), execute } as never, assets });
+          },
+        });
+      };
+      const tree = async (path: string, prefix = ""): Promise<string[]> => {
+        const entries: string[] = [];
+        for (const name of (await readdir(path)).sort()) {
+          const child = join(path, name), stat = await lstat(child);
+          // Extraction applies the remote umask to nested entries; compare names.
+          entries.push(`${prefix}${name}`);
+          if (stat.isDirectory()) entries.push(...await tree(child, `${prefix}${name}/`));
+        }
+        return entries;
+      };
+
+      // The warm chat's first answered turn: a cold destination.
+      await launch({ "AGENTS.md": "Be brief.\n", "docs/old-guide.md": "Old guide.\n" });
+      expect(await readFile(join(targetInstructions, "AGENTS.md"), "utf8")).toBe("Be brief.\n");
+      expect((await lstat(targetInstructions)).mode & 0o777).toBe(0o555);
+
+      // A sibling run appends one line to the entry and drops a document: a new
+      // bundle digest staged into the same, sealed, warm destination.
+      await expect(launch({ "AGENTS.md": "Be brief.\nAnswer in French.\n", "docs/new-guide.md": "New guide.\n" }))
+        .resolves.toBeUndefined();
+      expect(transfers).toHaveLength(2);
+      expect(transfers[1]).toContain(targetInstructions);
+      expect(await readFile(join(targetInstructions, "AGENTS.md"), "utf8")).toBe("Be brief.\nAnswer in French.\n");
+      expect(await tree(targetInstructions)).toEqual([
+        "AGENTS.md", "docs", "docs/new-guide.md",
+      ]);
+      expect(await readFile(join(targetInstructions, "docs", "new-guide.md"), "utf8")).toBe("New guide.\n");
+      expect((await lstat(targetInstructions)).mode & 0o777).toBe(0o555);
+      // No retained copy of the old bundle beside the live destination.
+      expect(await readdir(dirname(targetInstructions))).toEqual(["instructions"]);
+
+      // The next person message on the same warm box reuses the staged bundle.
+      await launch({ "AGENTS.md": "Be brief.\nAnswer in French.\n", "docs/new-guide.md": "New guide.\n" });
+      expect(transfers).toHaveLength(3);
+      expect(transfers[2]).not.toContain(targetInstructions);
+    } finally {
+      await writable(root);
       await rm(root, { recursive: true, force: true });
     }
   });
