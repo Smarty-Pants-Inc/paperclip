@@ -5,7 +5,7 @@ import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
-  issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, projects, type Db } from "@paperclipai/db";
+  issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, nativeRunResults, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
 import { EXECUTION_RECONCILIATION_CAUSES, HEARTBEAT_RUN_STATUSES, readProviderFailure, type TaskInterruptionPresentation } from "@paperclipai/shared";
 import { captureTaskInterruptionFailure } from "../sentry.js";
@@ -51,6 +51,11 @@ const WAITING_CONTINUATION_MOVE_FORWARD_MS = 15 * 60_000;
 // only logs, and the assigned-work sweep's stalled test (recovery/stalled-queued-run-sql.ts:28,
 // QUEUED_RUN_AGING_MS = 60 min) needs an hour plus passed-over starts.
 const PERSON_QUEUED_RUN_START_BOUND_MS = 10 * 60_000;
+// The stranded sweep applies a native run's accepted blocked result to its
+// task (recovery/service.ts repairNativeBlockedWait). Past this, a task still
+// in progress under that result was refused the repair (an edited carried
+// message, a later status decision), and the card shows failed + Retry (D122).
+const NATIVE_BLOCKED_WAIT_REPAIR_GRACE_MS = 2 * 60_000;
 const FAILED_ATTEMPT_STATUSES = new Set(["failed", "timed_out"]);
 const NO_WORK_CONTINUATION_HANDOFF_GRACE_MS = 30_000;
 const NO_WORK_CONTINUATION_CAUSES = new Set(["native_predecessor_retirement_unproven", "native_failed_before_provider_turn"]);
@@ -78,6 +83,8 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   nativeFinalizationRetry?: boolean;
   /** A saved-result Retry of this succeeded run is still being applied. */
   nativeFinalizationRetryPending?: boolean;
+  /** When this succeeded native run's accepted blocked result (with an unblock action) was committed. */
+  nativeBlockedResultAt?: Date | null;
   /** The configured model id the provider rejected (native_provider_model_rejected only). */
   rejectedModel?: string | null;
   /** A cleanup-gate refusal after this run's own provider turn completed; its work is saved. */
@@ -266,6 +273,11 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
   // Retry took effect: the saved result is being applied again.
   if (run.status === "succeeded" && run.nativeFinalizationRetryPending)
     return { ...base, state: "working", recoveryStep: "finishing_recovery" };
+  // An accepted blocked result the sweep never applied leaves the task in
+  // progress with nothing running: a failed attempt, not a resolved one (D122).
+  if (run.status === "succeeded" && run.nativeBlockedResultAt && issue.status === "in_progress" && !run.nativeFinalizationRetry
+      && now - run.nativeBlockedResultAt.getTime() >= NATIVE_BLOCKED_WAIT_REPAIR_GRACE_MS)
+    return { ...base, state: "failed", canRetry: true };
   if (run.status === "succeeded" && !wait && !run.nativeFinalizationRetry) return base;
   const providerFailure = run.status === "failed" || run.status === "scheduled_retry"
     ? readProviderFailure(run.resultJson?.providerFailure) : null;
@@ -518,6 +530,23 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and coalesce(${nativeRunFinalizations.failureDetail}->>'successorRunId', '') = '')`.mapWith(value => value == null ? null : new Date(value)),
       nativeFinalizationRetry: exhaustedNativeFinalizationCondition(),
       nativeFinalizationRetryPending: savedResultRetryPendingCondition(),
+      // The predicate of recovery/service.ts nativeBlockedUnblockAction: a committed,
+      // accepted, contract-bound blocked result with an unblock action.
+      nativeBlockedResultAt: sql<Date | null>`(select ${nativeRunFinalizations.updatedAt} from ${nativeRunFinalizations}
+        inner join ${nativeRunResults} on ${nativeRunResults.id} = ${nativeRunFinalizations.resultId}
+          and ${nativeRunResults.companyId} = ${nativeRunFinalizations.companyId} and ${nativeRunResults.issueId} = ${nativeRunFinalizations.issueId}
+          and ${nativeRunResults.runId} = ${nativeRunFinalizations.runId}
+        where ${nativeRunFinalizations.companyId} = ${heartbeatRuns.companyId} and ${nativeRunFinalizations.runId} = ${heartbeatRuns.id}
+          and ${nativeRunFinalizations.issueId} = ${heartbeatRuns.nativeIssueId} and ${nativeRunFinalizations.phase} = 'committed'
+          and ${nativeRunResults.schemaStatus} = 'accepted' and ${nativeRunResults.completionContractId} = ${heartbeatRuns.completionContractId}
+          and ${heartbeatRuns.runtimeMode} = 'native' and ${heartbeatRuns.status} = 'succeeded'
+          and ${nativeRunResults.resultJson}#>>'{result,schema}' = 'paperclip.run_result.v1'
+          and ${nativeRunResults.resultJson}#>>'{result,reportedWorkDisposition}' = 'blocked'
+          and ${nativeRunResults.resultJson}#>>'{terminal,runTerminalState}' = 'succeeded'
+          and ${nativeRunResults.resultJson}#>>'{terminal,reportedWorkDisposition}' = 'blocked'
+          and ${nativeRunResults.resultJson}#>>'{result,blocker,scope}' in ('current_track', 'task_wide')
+          and nullif(btrim(${nativeRunResults.resultJson}#>>'{result,blocker,unblockAction}'), '') is not null
+        limit 1)`.mapWith(value => value == null ? null : new Date(value)),
       // The run whose resultJson supplied providerFailure. A scheduled retry
       // shows its predecessor's reason, so redaction must use that run's registry.
       providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null

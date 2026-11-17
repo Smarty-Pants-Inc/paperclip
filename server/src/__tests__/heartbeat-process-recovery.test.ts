@@ -17025,6 +17025,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  // F3 D122 (RFL 19:17Z ruling 2). When the sweep refuses the native
+  // blocked-wait repair, the task's card owns the outcome: failed + Retry, one
+  // outcome, never silence and never a fall-through to ordinary recovery.
+  it.each(["edited_message", "later_status_decision"] as const)(
+    "a refused native blocked-wait repair (%s) shows the card's failed + Retry, exactly one outcome",
+    async (refusal) => {
+      const { companyId, issueId, runId, commentId } = await seedNativeBlockedBoardRequest();
+      if (refusal === "edited_message")
+        await db.update(issueComments).set({ body: "Edited after the run finished.", updatedAt: new Date(Date.now() + 1_000) })
+          .where(eq(issueComments.id, commentId));
+      if (refusal === "later_status_decision")
+        await db.update(issues).set({ lastStatusDecisionId: randomUUID() }).where(eq(issues.id, issueId));
+      const heartbeat = heartbeatService(db);
+      const wakesBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+      vi.useFakeTimers({ toFake: ["Date"] });
+      try {
+        for (const elapsed of [0, 60_000, 180_000]) {
+          vi.setSystemTime(Date.now() + elapsed);
+          const swept = await heartbeat.reconcileStrandedAssignedIssues();
+          expect(swept.escalated, "the repair stays refused").toBe(0);
+          expect(swept.continuationRequeued, "no fall-through to ordinary recovery").toBe(0);
+        }
+        const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(task).toMatchObject({ status: "in_progress", unblockDescriptor: null });
+        const notes = await db.select().from(issueComments).where(and(eq(issueComments.issueId, issueId),
+          eq(issueComments.authorType, "system")));
+        const live = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+          inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"])));
+        const card = await taskInterruptionPresentation(db, task!);
+        const outcomes = notes.length + live.length + (card && ["failed", "retry_scheduled"].includes(card.state) ? 1 : 0);
+        console.info(JSON.stringify({ d122: { refusal, card: card && { state: card.state, canRetry: card.canRetry },
+          notes: notes.length, live: live.length, outcomes } }));
+        expect(card).toMatchObject({ state: "failed", canRetry: true, observedRunId: runId });
+        expect(outcomes, "exactly one outcome: the card").toBe(1);
+        expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId)))
+          .toHaveLength(wakesBefore.length);
+        expect(mockAdapterExecute).not.toHaveBeenCalled();
+        // The Retry is real: the person's click is admitted for the run the card shows.
+        expect(await requestTaskRetry({ db, companyId, issueId, actorId: "responsible-user", idempotencyKey: randomUUID(),
+          observedRunId: card!.observedRunId })).toMatchObject({ accepted: true, stale: false });
+      } finally { vi.useRealTimers(); }
+    },
+  );
+
   it("preserves a later routed native attention decision after its wake was coalesced", async () => {
     const { companyId, issueId, runId, contractId } =
       await seedNativeBlockedBoardRequest();
