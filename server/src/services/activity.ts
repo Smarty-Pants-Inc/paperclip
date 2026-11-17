@@ -159,6 +159,8 @@ export function activityService(db: Db) {
         'workspaceRestoreFailure', case when ${heartbeatRuns.resultJson} ->> 'workspaceRestoreFailure'
           in (${workspaceRestoreFailureCodesSql})
           then ${heartbeatRuns.resultJson} -> 'workspaceRestoreFailure' end,
+        'workspaceRestorePending', case when ${heartbeatRuns.resultJson} -> 'workspaceRestorePending' = 'true'::jsonb
+          then to_jsonb(true) end,
         'workspaceRestorePath', case when length(${heartbeatRuns.resultJson} ->> 'workspaceRestorePath') <= 180
           then ${heartbeatRuns.resultJson} -> 'workspaceRestorePath' end,
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'

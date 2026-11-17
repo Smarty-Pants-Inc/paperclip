@@ -1,5 +1,5 @@
 import type { heartbeatRuns } from "@paperclipai/db";
-import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { hasWorkspaceRestoreFailure, WORKSPACE_RESTORE_PENDING_KEY } from "@paperclipai/shared";
 
 export const LEGACY_WORKSPACE_RECOVERY_KEY = "workspaceRestoreRecovery";
 export const LEGACY_WORKSPACE_RECOVERY_SCHEMA = "paperclip.workspace-restore-recovery.v1";
@@ -42,5 +42,8 @@ export function preserveWorkspaceRestoreRecoveryMetadata(
   return hasRequiredWorkspaceRecovery(current) ? { ...incoming,
     workspaceRestoreFailure: current!.workspaceRestoreFailure,
     workspaceRestoreRecovery: current!.workspaceRestoreRecovery,
+    // Owed files stay owed unless this write itself reports a restore failure.
+    ...(current![WORKSPACE_RESTORE_PENDING_KEY] === true && !hasWorkspaceRestoreFailure(incoming)
+      ? { [WORKSPACE_RESTORE_PENDING_KEY]: true } : {}),
   } : incoming;
 }
