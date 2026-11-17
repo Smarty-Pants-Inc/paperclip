@@ -11,6 +11,7 @@ import { nativeRunHasStopRequest } from "./native-run-stop-request.js";
 import { NATIVE_ENVIRONMENT_BLOCKER_CODE, NATIVE_ENVIRONMENT_BLOCKER_HINT, NATIVE_ENVIRONMENT_BLOCKER_MAX_RETRIES, NATIVE_ENVIRONMENT_BLOCKER_MESSAGE,
   NATIVE_ENVIRONMENT_BLOCKER_RETRY_DELAY_MS } from "./native-environment-blocker.js";
 import { NativeStatusRaceError } from "./status-decision-committer.js";
+import { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE, nativeMidStreamCutStartsFresh, readNativeMidStreamCut } from "./native-mid-stream-cut.js";
 
 type NativeRetryTarget = {
   tx: Db;
@@ -29,6 +30,9 @@ type NativeRetryLane = {
   exhaustedError: string;
   context?: (run: typeof heartbeatRuns.$inferSelect) => Record<string, unknown>;
   refuseStopped?: boolean;
+  /** The retry resumes the failed run's provider session instead of starting a fresh one. */
+  resumeSession?: boolean;
+  dropContext?: string[];
 };
 
 /** Called under the finalizer's issue/coordinator locks, in the status-effect transaction. */
@@ -60,6 +64,36 @@ export async function materializeNativeEnvironmentBlockerRetry(input: NativeRetr
   });
 }
 
+/**
+ * dl famlong-u1: the ONE recovery successor of a turn the provider cut
+ * mid-stream. A cap stop with no answer text starts a FRESH session (the
+ * thinking-cap recovery level, 'high', applies to exactly that run: see
+ * isThinkingCapStopRecoveryRun); an EOF or other provider error, and a cap
+ * stop that had started its answer, resume the session. A second cut is
+ * bounded by the arbiter (failedTurnContinuationUsed), not by this lane.
+ */
+export async function materializeNativeMidStreamCutRetry(input: NativeRetryTarget) {
+  const cut = await readNativeMidStreamCut(input.tx, { companyId: input.companyId, runId: input.runId });
+  return materializeNativeFreshSessionRetry(input, {
+    reason: NATIVE_MID_STREAM_CUT_CODE,
+    maxRetries: Number.MAX_SAFE_INTEGER,
+    delayMs: () => 0,
+    message: NATIVE_MID_STREAM_CUT_MESSAGE,
+    idempotencyPrefix: "native-mid-stream-cut",
+    exhaustedError: "native_mid_stream_cut_retry_exhausted",
+    refuseStopped: true,
+    resumeSession: !nativeMidStreamCutStartsFresh(cut),
+    dropContext: ["nativeStatusWakeIntentId", "statusDecisionSource", "source"],
+    context: run => ({
+      previousRunId: run.id,
+      source: NATIVE_MID_STREAM_CUT_CODE,
+      nativeMidStreamCut: cut,
+      livenessContinuationSourceRunId: run.id,
+      livenessContinuationReason: NATIVE_MID_STREAM_CUT_CODE,
+    }),
+  });
+}
+
 async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane: NativeRetryLane) {
   const [run] = await input.tx.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
@@ -86,12 +120,14 @@ async function materializeNativeFreshSessionRetry(input: NativeRetryTarget, lane
     "commentIds", "latestCommentId", "resumeIntent", "followUpRequested",
     "paperclipWake", "paperclipWakeComment", "paperclipTaskMarkdown", "paperclipTaskMarkdownCompact",
     "paperclipTaskMarkdownAssignment", "paperclipTaskMarkdownAssignmentCompact", "paperclipTurnContext",
+    // A resumed recovery is not the generic status wake and not a fresh start.
+    ...(lane.resumeSession ? ["forceFreshSession"] : []), ...(lane.dropContext ?? []),
   ]) delete predecessorContext[key];
   const contextSnapshot = {
     ...predecessorContext,
     issueId: input.issueId,
     taskId: input.issueId,
-    forceFreshSession: true,
+    ...(lane.resumeSession ? {} : { forceFreshSession: true }),
     retryOfRunId: run.id,
     retryReason: lane.reason,
     wakeReason: lane.reason,
