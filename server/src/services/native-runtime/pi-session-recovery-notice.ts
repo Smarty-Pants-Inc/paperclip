@@ -66,18 +66,24 @@ const uncommittedNoticeWrites = new WeakMap<object, Map<string, string>>();
 export async function supersedeHeldConversationNotice(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], input: {
   companyId: string; issueId: string; heldSessionId: string | null; reason: string;
 }): Promise<void> {
-  if (!input.heldSessionId) return;
   const [current] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
     sql`${issueComments.metadata}->>'authorizationReason' = ${input.reason}`,
     sql`${issueComments.metadata}->>'supersededByCommentId' is null`)).limit(1);
   if (!current) return;
+  // The fresh thread is now the conversation's one current notice. A standing
+  // unanswered-message notice is superseded, never deleted: its keyed row
+  // still records the open obligation, which only an answer clears
+  // (unanswered-person-message.ts), and a later failure upgrade re-presents it.
   await tx.update(issueComments).set({ metadata: sql`jsonb_set(${issueComments.metadata},
     '{supersededByCommentId}', to_jsonb(${current.id}::text))` }).where(and(
     eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt),
-    sql`${issueComments.metadata}->>'authorizationReason' = ${`${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${input.heldSessionId}`}`,
+    input.heldSessionId
+      ? sql`(${issueComments.metadata}->>'authorizationReason' = ${`${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${input.heldSessionId}`}
+        or starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_NOTICE_REASON_PREFIX}))`
+      : sql`starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_NOTICE_REASON_PREFIX})`,
     sql`${issueComments.metadata}->>'supersededByCommentId' is null`));
 }
 
@@ -127,6 +133,11 @@ export async function writePiSessionHistoryLossNotice(db: Db,
  * conversation is held behind an unfinished predecessor; the normalized native
  * session id follows it. */
 export const HELD_CONVERSATION_NOTICE_REASON_PREFIX = "native_prior_owner_held:";
+
+/** authorizationReason prefix of the unanswered-person-message notice
+ * (UNANSWERED_MESSAGE_REASON_PREFIX, unanswered-person-message.ts, which
+ * imports this module); the person message id follows it. */
+const UNANSWERED_MESSAGE_NOTICE_REASON_PREFIX = "unanswered_message:";
 
 export type HeldConversationNotice = {
   commentId: string;
