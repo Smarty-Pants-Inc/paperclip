@@ -5,7 +5,7 @@ import path from "node:path";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { canonicalRepositoryRoot } from "./execution-workspace-source-roots.js";
 import { readWorkspaceGitSourceRoots } from "./workspace-git-source-roots.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
 
 type SourceTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type SourceLockScope = { db: Db; companyId: string; keys: Set<string>; transaction: SourceTransaction; active: boolean;
@@ -95,7 +95,8 @@ function heldScope(): SourceLockScope | undefined {
 export function withIndependentWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
   action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
-  return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait));
+  // pl/keepalive6: an independent owner: its host-mutation gate is not joined to an enclosing one.
+  return sourceLocks.exit(() => withWorkspaceSourceLocks(db, input, action, tryOnly, wait, true));
 }
 
 export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, issueId: string,
@@ -105,7 +106,10 @@ export function withIsolatedRepositorySourceLock<T>(db: Db, companyId: string, i
 
 export async function withWorkspaceSourceLocks<T>(db: Db,
   input: { companyId: string; issueIds?: readonly string[]; projectIds?: readonly string[] },
-  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait): Promise<T> {
+  action: (transaction: SourceTransaction, signal?: AbortSignal) => Promise<T>, tryOnly = false, wait?: WorkspaceSourceLockWait,
+  independent = false): Promise<T> {
+  // pl/keepalive6: the enclosing held lock's host-mutation gate, captured before the lock connection opens.
+  const parentGate = independent ? undefined : currentHostMutationDrain();
   if (wait && (!Number.isSafeInteger(wait.waitMs) || wait.waitMs < 1 || wait.waitMs > 2_147_483_647))
     throw new Error("workspace_source_wait_invalid");
   const keys = [...new Set([
@@ -143,23 +147,22 @@ export async function withWorkspaceSourceLocks<T>(db: Db,
     return joined;
   }
   return withDedicatedDbConnection(db, connection => connection.transaction(async transaction => {
-    const lost = new AbortController();
     const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait,
-      lost: lost.signal };
+      lost: parentGate?.signal };
     try {
       if (wait) {
         await acquireQueuedSourceLocks(db, transaction, keys, wait);
         for (const key of keys) scope.keys.add(key);
       } else await acquire(scope, tryOnly);
       const rows = await transaction.execute(sql`select setting::bigint as idle_timeout_ms from pg_settings where name = 'idle_in_transaction_session_timeout'`);
-      // pl/keepalive5: a failed ping aborts the action's signal; a lost scope is a failure, never a success.
-      const result = await withWorkspaceLockKeepalive(transaction, Number(rows[0]?.idle_timeout_ms),
-        () => sourceLocks.run(scope, async () => {
-          lost.signal.throwIfAborted();
-          return action(transaction, lost.signal);
-        }), { onLost: cause => lost.abort(new WorkspaceSourceLockLostError(cause)) });
-      lost.signal.throwIfAborted();
-      return result;
+      // pl/keepalive6: a failed ping closes this scope's host-mutation gate (joined to any enclosing held
+      // lock's gate); the action's signal is the combined one; in-flight host writes drain before the release.
+      return await withHeldLockHostDrain({ lock: transaction, idleTimeoutMs: Number(rows[0]?.idle_timeout_ms),
+        parent: parentGate, label: "workspace source lock", lostError: cause => new WorkspaceSourceLockLostError(cause) },
+      (signal) => {
+        scope.lost = signal;
+        return sourceLocks.run(scope, () => action(transaction, signal));
+      });
     } finally {
       scope.active = false;
     }
