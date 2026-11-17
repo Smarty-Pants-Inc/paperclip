@@ -3870,7 +3870,9 @@ export function heartbeatService(
           return;
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
-          await preserveNativeWorkspaceOnFailure();
+          // A warm (keep_running) box keeps a cancelled turn's prepared files in place
+          // (heartbeat/run-control.ts warm rule); only a stopping box needs a hold.
+          if (providerResourceDispositionForRun !== "keep_running") await preserveNativeWorkspaceOnFailure();
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
