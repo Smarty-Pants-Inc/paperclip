@@ -8057,7 +8057,11 @@ export async function noticeHeldUnfinishedPredecessor(input: { db: Db; execution
         eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system"),
         isNull(issueComments.deletedAt), sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`)).limit(1);
       if (unanswered) return;
-      await issueService(input.db).addComment(issueId, HELD_PREDECESSOR_NOTICE, {}, { authorType: "system", presentation: {
+      // rf-3 FAIL 3: the note's instruction is the one Retry authority's at post
+      // time (Retry's words; Resume for a paused agent), never a fixed one.
+      const { readHeldConversationNoticeText } = await import("../task-retry-eligibility.js");
+      const body = await readHeldConversationNoticeText(tx as unknown as Db, { companyId, issueId });
+      await issueService(input.db).addComment(issueId, body, {}, { authorType: "system", presentation: {
         kind: "system_notice", tone: "warning", density: "compact", detailsDefaultOpen: true,
       }, metadata: { version: 1, authorizationReason: `${HELD_CONVERSATION_NOTICE_REASON_PREFIX}${normalizedSessionId}`,
         sections: [{ rows: [{ type: "run_link", runId, agentId, title: "Held conversation" }] }] } }, tx);
