@@ -1760,10 +1760,30 @@ impl CodexProvider {
         }
         let blockers = self.warm_run_attachment_blockers()?;
         if !blockers.is_empty() {
+            // Name what is buffered (bounded method names only, never params)
+            // so a live refusal says which provider frames were left behind.
+            let buffered = self
+                .pending_messages
+                .iter()
+                .take(8)
+                .map(|message| {
+                    let method = message.value.get("method").and_then(Value::as_str);
+                    match (method, message.value.get("id").is_some()) {
+                        (Some(method), true) => format!("request:{}", bounded_method(method)),
+                        (Some(method), false) => bounded_method(method),
+                        (None, _) => "response".to_owned(),
+                    }
+                })
+                .collect::<Vec<_>>();
             return Err(LocalRunnerError::invalid(
                 format!(
-                    "Codex warm run attachment requires an idle live provider with no pending work ({})",
-                    blockers.join(",")
+                    "Codex warm run attachment requires an idle live provider with no pending work ({}){}",
+                    blockers.join(","),
+                    if buffered.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; buffered {}: {}", self.pending_messages.len(), buffered.join(","))
+                    }
                 ),
             ));
         }
@@ -5894,7 +5914,12 @@ done
         let context = json!({"runId": "answer-run"});
         // run.prepare for the person's answer run rebinds in place.
         assert!(provider
-            .attach_run_in_place([], None, Some(("Answer run", &context, "answer-run")), &mut Vec::new())
+            .attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new()
+            )
             .unwrap());
         // Exactly this frame sits in pending_messages, buffered by request().
         let buffered = provider
@@ -5933,7 +5958,12 @@ done
             let mut provider = pi_attach_with_buffered_tail_provider(extra);
             let context = json!({"runId": "answer-run"});
             assert!(provider
-                .attach_run_in_place([], None, Some(("Answer run", &context, "answer-run")), &mut Vec::new())
+                .attach_run_in_place(
+                    [],
+                    None,
+                    Some(("Answer run", &context, "answer-run")),
+                    &mut Vec::new()
+                )
                 .unwrap());
             assert_eq!(provider.pending_messages.len(), 2, "{extra}");
             let attached = provider.attach_run_in_place(
@@ -5942,7 +5972,17 @@ done
                 Some(("Answer run", &context, "answer-run")),
                 &mut Vec::new(),
             );
-            assert!(attached.is_err(), "{extra}: live work must refuse: {attached:?}");
+            assert!(
+                attached.is_err(),
+                "{extra}: live work must refuse: {attached:?}"
+            );
+            if extra.contains("item/tool/call") {
+                // The refusal names the buffered frames; nothing was answered.
+                assert!(attached.unwrap_err().to_string().ends_with(
+                    "(pending_messages); buffered 2: paperclip/providerPerformance,request:item/tool/call"
+                ));
+                assert_eq!(provider.pending_messages.len(), 2);
+            }
             provider.shutdown().unwrap();
         }
     }
