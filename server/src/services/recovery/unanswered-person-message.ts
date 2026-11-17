@@ -15,7 +15,7 @@ import {
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 import { issueService } from "../issues.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { queuedCommentIdsFromWakePayload } from "../issue-queued-comment-queue.js";
 import { HELD_PREDECESSOR_NOTICE } from "../native-runtime/held-predecessor-notice-text.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
@@ -212,12 +212,17 @@ function inScopeSql(m: { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL }
         or coalesce(w.payload->'_paperclipWakeContext'->'wakeCommentIds', '[]'::jsonb) ? ${m.id}::text)))`;
 }
 
-/**
- * SQL: this issue row has a person's message within the lookback that no agent
- * answered and that has no notice yet, or an unanswered-message notice that a
- * later agent comment answered. The stranded sweep visits such tasks in every
- * open status, including blocked.
- */
+/** Discovery only: recheck a standing notice when upstream schedules recovery.
+ * The decision below still reads the card's authoritative projection. */
+function scheduledRecoveryCheckSql(companyId: SQL, issueId: SQL): SQL {
+  return sql`exists (select 1 from ${issueRecoveryActions} a
+    where a.company_id = ${companyId} and a.source_issue_id = ${issueId}
+      and a.evidence#>>'{freshContinuationCheck,kind}' in ('backoff', 'exact_recovery_pending')
+      and (a.evidence#>>'{freshContinuationCheck,nextCheckAt}')::bigint > ${Date.now()})`;
+}
+
+/** SQL: a still-unanswered message, or a notice to retire after an answer or
+ * a newly scheduled automatic retry. Includes every open task status. */
 export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId: AnyPgColumn): SQL {
   const since = new Date(Date.now() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString();
   return sql`(exists (select 1 from ${issueComments} m
@@ -226,6 +231,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
         and not ${answeredSql(rawMessage("m"))}
         and not exists (select 1 from ${issueComments} n where n.company_id = m.company_id and n.issue_id = m.issue_id
           and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || m.id::text
+          and n.deleted_at is null
           and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or exists (select 1 from ${issueComments} n
       join ${issueComments} m on m.company_id = n.company_id and m.issue_id = n.issue_id
@@ -233,7 +239,8 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and ${answeredSql(rawMessage("m"))}))`;
+      and (${answeredSql(rawMessage("m"))}
+        or ${scheduledRecoveryCheckSql(sql`n.company_id`, sql`n.issue_id`)})))`;
 }
 
 /**
@@ -252,13 +259,15 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and not exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
         and n.issue_id = ${issueComments.issueId}
         and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+        and n.deleted_at is null
         and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)))
     or (${issueComments.authorType} = 'system' and ${issueComments.deletedAt} is null
       and starts_with(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
       and exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and ${answeredSql(rawMessage("m"))})))`;
+          and (${answeredSql(rawMessage("m"))}
+            or ${scheduledRecoveryCheckSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`)}))))`;
 }
 
 export type UnansweredMessageOutcome =
@@ -306,7 +315,7 @@ export async function settleUnansweredPersonMessage(
   const now = input.now ?? new Date();
   const [issue] = await db.select({
     id: issues.id, companyId: issues.companyId, status: issues.status, hiddenAt: issues.hiddenAt,
-    assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt,
+    assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, createdAt: issues.createdAt, projectId: issues.projectId,
   }).from(issues).where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)));
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
@@ -334,6 +343,25 @@ export async function settleUnansweredPersonMessage(
 
   const decision = await decideUnansweredMessage(db, issue, now, input.nativeBlockedRepairApplies);
   if (decision.kind === "pending") {
+    if (decision.retireCommentId) {
+      const publications: ActivityPublication[] = [];
+      await db.transaction(async tx => {
+        const [current] = await tx.select().from(issues)
+          .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
+        if (!current) return;
+        const fenced = await decideUnansweredMessage(tx as unknown as Db, current, now, input.nativeBlockedRepairApplies);
+        if (fenced.kind !== "pending" || !fenced.retireCommentId || fenced.retireCommentId !== decision.retireCommentId) return;
+        // Like an answered notice, an obsolete instruction is no longer current.
+        // Keep the row for history and reuse its key if a real failure follows.
+        const [retired] = await tx.update(issueComments).set({ deletedAt: now, updatedAt: now }).where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+          eq(issueComments.id, fenced.retireCommentId), isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+        if (retired) await logActivity(tx as unknown as Db, { companyId: issue.companyId, actorType: "system", actorId: "recovery",
+          action: "issue.updated", entityType: "issue", entityId: issue.id, issueId: issue.id,
+          details: { source: "unanswered_message_retry_scheduled", commentId: retired.id } }, publications);
+      });
+      publications.forEach(publishActivity);
+    }
     if (decision.recordDeferral) {
       await appendHeartbeatRunEvent(db, { companyId: issue.companyId, runId: decision.recordDeferral.runId,
         agentId: decision.recordDeferral.agentId, eventType: NATIVE_REPAIR_DEFERRAL_EVENT, stream: "system", level: "info",
@@ -354,17 +382,18 @@ export async function settleUnansweredPersonMessage(
     // under it: an answer (prose or the turn's own card), a held notice, a
     // newer message, a run or a wake that committed while this sweep waited
     // means no notice.
-    await tx.select({ id: issues.id }).from(issues)
+    const [current] = await tx.select().from(issues)
       .where(and(eq(issues.id, issue.id), eq(issues.companyId, issue.companyId))).for("no key update");
-    const fenced = await decideUnansweredMessage(tx as unknown as Db, issue, now, input.nativeBlockedRepairApplies);
+    if (!current) return null;
+    const fenced = await decideUnansweredMessage(tx as unknown as Db, current, now, input.nativeBlockedRepairApplies);
     if (fenced.kind !== "notice" || fenced.reason !== decision.reason
       || fenced.upgradeCommentId !== decision.upgradeCommentId) return null;
     if (fenced.upgradeCommentId) {
       // The SAME note (same key) becomes the failure text: still one note.
       const [updated] = await tx.update(issueComments).set({ body: fenced.notice.body, presentation: fenced.notice.presentation,
-        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, updatedAt: now })
-        .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId),
-          isNull(issueComments.deletedAt))).returning({ id: issueComments.id });
+        metadata: { ...fenced.notice.metadata, authorizationReason: fenced.reason }, deletedAt: null, updatedAt: now })
+        .where(and(eq(issueComments.id, fenced.upgradeCommentId), eq(issueComments.companyId, issue.companyId)))
+        .returning({ id: issueComments.id });
       return updated?.id ?? null;
     }
     const comment = await issueService(tx as unknown as Db).addComment(issue.id, fenced.notice.body, {}, {
@@ -378,9 +407,9 @@ export async function settleUnansweredPersonMessage(
 }
 
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
-  assigneeAgentId: string | null; assigneeUserId: string | null };
+  assigneeAgentId: string | null; assigneeUserId: string | null; projectId: string | null };
 type Decision = Exclude<UnansweredMessageOutcome, { kind: "noticed" | "pending" }>
-  | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
+  | { kind: "pending"; recheckAt: number; retireCommentId?: string; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: { messageId: string; runId: string | null } }
   | { kind: "notice"; reason: string; code: string; notice: ReturnType<typeof buildStrandedRecoveryEscalationNotice>;
       /** Set when this replaces the message's standing waiting note. */
@@ -419,7 +448,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` }))).limit(1);
   if (answer) return { kind: "answered" };
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
-  const [noticed] = await q.select({ id: issueComments.id,
+  const [noticed] = await q.select({ id: issueComments.id, deletedAt: issueComments.deletedAt,
     waiting: sql<boolean>`coalesce(${issueComments.metadata}->'sections' @> ${WAITING_ROW_JSON}::jsonb, false)`,
     waitingCode: sql<string | null>`(select r->>'value' from jsonb_array_elements(coalesce(${issueComments.metadata}->'sections', '[]'::jsonb)) sec,
       jsonb_array_elements(coalesce(sec->'rows', '[]'::jsonb)) r where r->>'label' = ${WAITING_ROW_LABEL} limit 1)` })
@@ -427,8 +456,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
   // A standing WAITING note is still an open obligation: it must stay true.
-  if (noticed && !noticed.waiting) return { kind: "noticed_before" };
-  const upgrading = noticed?.waiting ? noticed.id : null;
+  const upgrading = noticed && (noticed.waiting || noticed.deletedAt) ? noticed.id : null;
   const standingWaitingCode = noticed?.waiting ? noticed.waitingCode : null;
 
   // The run this message started (the latest run that carries it), if any.
@@ -454,7 +482,22 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     return { kind: "answered" };
   }
 
-  // Every wait for a further attempt is BOUNDED, except a turn in progress:
+  // The task's CURRENT automatic retry owns the instruction, even when a
+  // fallback failed before taking this message. Do not turn its rolling-hour
+  // back-off into a competing "send again" instruction after our 2-minute
+  // wait. Card and transcript already show this one automatic next action;
+  // this sweep posts no extra note on every recovery attempt or recheck.
+  const { taskInterruptionPresentation } = await import("../task-interruption-presentation.js");
+  const interruption = await taskInterruptionPresentation(q, issue);
+  const retryAt = Date.parse(interruption?.nextRetryAt ?? "");
+  if (interruption?.responsibility === "system" && interruption.state === "retry_scheduled"
+    && !interruption.canRetry && retryAt > now.getTime()) {
+    return { kind: "pending", recheckAt: retryAt,
+      ...(noticed && !noticed.deletedAt ? { retireCommentId: noticed.id } : {}) };
+  }
+  if (noticed && !noticed.waiting && !noticed.deletedAt) return { kind: "noticed_before" };
+
+  // Every unowned wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
   // and its carrying run; a refused successor below never
   // restarts it) the first time this step defers to such an attempt,

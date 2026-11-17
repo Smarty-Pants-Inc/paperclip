@@ -297,6 +297,25 @@ Unknown admission reconciles the same request key. Backoff and real user gates
 replace Thinking when work is not active. Saved input is editable; Steer and
 Interrupt require a live target. Technical diagnostics remain inspectable.
 
+### Automatic fresh-continuation limits
+
+System-owned failures, including conversation refusals and permanently lost saved
+files, share upstream's limit of six automatic continuations per task in a rolling
+hour. The task lock serializes recording. The shared ledger counts fresh
+continuations, assigned-work continuations and automatic scheduler retries;
+assigned-work continuations from saved work are counted once, not again as a
+plain sweep wake. There is no separate two-attempt source-chain cap.
+
+After the allowance is spent, the interruption projection says `retry_scheduled`
+with `canRetry: false` until the next automatic check. The unanswered-message
+sweep follows that current task projection, even if the latest fallback never
+took the message. Its ordinary two-minute pending-wait bound cannot override an
+owned future retry. The card and transcript own the one automatic instruction;
+the sweep adds no competing resend note on each attempt or recheck. A previously
+posted conflicting notice is retired under the issue fence and its row retained;
+if a real failure later needs a notice, the same message key is reused. Actual
+pause, approval, credential and other user decisions keep their own instructions.
+
 ## Qualification
 
 Run the focused PostgreSQL/filesystem suites from `server/`:

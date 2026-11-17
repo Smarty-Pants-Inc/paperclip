@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   approvals,
@@ -23,7 +24,7 @@ import { executionProjectionsForRuns } from "../execution-projection.js";
 import { heartbeatService } from "../heartbeat.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
-import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
+import { settleUnansweredPersonMessage, settleUnansweredPersonMessages, PENDING_WAIT_ACTION, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY } from "./unanswered-person-message.js";
 
@@ -103,6 +104,64 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
   };
+
+  // Keep: recorded step 1b presentation mismatch. The database-backed sweep
+  // must not ask a person to resend while the card owns an automatic retry.
+  it.each([false, true])("step 1b follows the current retry schedule after the message's wait expires (old notice=%s)", async oldNotice => {
+    const f = await fixture();
+    const messageId = await f.message();
+    const sourceId = await f.run({ commentId: messageId, status: "failed", errorCode: "adapter_failed" });
+    // A fallback may fail before taking the message. Its current task state,
+    // not just the message's first run, owns the next instruction.
+    const latestId = await f.run({ status: "failed", retryOfRunId: sourceId,
+      errorCode: "native_continuation_requires_reconciliation", wakeReason: "issue_recovery_action_restored" });
+    const retryAt = new Date(Date.now() + 45 * 60_000);
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "system", cause: "native_continuation_requires_reconciliation",
+      fingerprint: `step1b:${latestId}`, nextAction: "Paperclip will retry automatically.",
+      evidence: { runId: latestId, freshContinuationCheck: { kind: "backoff", nextCheckAt: retryAt.getTime() } } });
+    await db.insert(activityLog).values({ companyId: f.companyId, actorType: "system", actorId: "recovery",
+      action: PENDING_WAIT_ACTION, entityType: "issue", entityId: f.issueId,
+      createdAt: new Date(Date.now() - 10 * 60_000), details: { messageId, runId: sourceId } });
+    if (oldNotice) await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+      authorType: "system", body: NOT_ANSWERED,
+      metadata: { version: 1, authorizationReason: `unanswered_message:${messageId}`, recoveryResponsibility: "user", sections: [] } });
+    const { taskInterruptionPresentation } = await import("../task-interruption-presentation.js");
+    const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(await taskInterruptionPresentation(db, task!)).toMatchObject({ state: "retry_scheduled", canRetry: false,
+      nextRetryAt: retryAt.toISOString() });
+    // Both the startup query and the worker's batched comment query must
+    // discover an already-posted wrong instruction for retirement.
+    const discovered = await db.select({ authorType: issueComments.authorType }).from(issueComments).where(and(
+      eq(issueComments.issueId, f.issueId), unansweredPersonMessageCommentCondition()));
+    expect(discovered.map(row => row.authorType)).toEqual([oldNotice ? "system" : "user"]);
+    for (let pass = 0; pass < 3; pass++) {
+      expect(await settleUnansweredPersonMessages(db, { companyId: f.companyId, issueId: f.issueId }))
+        .toMatchObject({ noticed: 0, pending: 1 });
+      expect(await f.visible()).toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId }))
+        .toEqual({ kind: "pending", recheckAt: retryAt.getTime() });
+    }
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.nativeIssueId, f.issueId))).toHaveLength(2);
+    const retiredActivities = await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+      sql`${activityLog.details}->>'source' = 'unanswered_message_retry_scheduled'`));
+    expect(retiredActivities).toHaveLength(oldNotice ? 1 : 0);
+    // An actual human gate still owns its instruction over a saved schedule.
+    await db.update(agents).set({ status: "paused", lifecycleState: "paused" }).where(eq(agents.id, f.agentId));
+    expect(await taskInterruptionPresentation(db, task!)).toMatchObject({ state: "waiting_for_user", userAction: "resume" });
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId }))
+      .toMatchObject({ kind: "noticed", code: "agent_paused" });
+    expect((await f.visible())[0].body).toContain("is paused");
+    await db.update(agents).set({ status: "active", lifecycleState: "ready" }).where(eq(agents.id, f.agentId));
+    // Once upstream no longer schedules a retry, the ordinary failure path is
+    // still available. Reuse the old note rather than leaving a permanent ban.
+    await db.update(issueRecoveryActions).set({ evidence: { runId: latestId } })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(await settleUnansweredPersonMessage(db, { companyId: f.companyId, issueId: f.issueId }))
+      .toMatchObject({ kind: "noticed" });
+    expect(await f.visible()).toHaveLength(1);
+    expect((await f.visible())[0].body).toBe(NOT_ANSWERED);
+  });
 
   // Keep: recorded D10 F0 catch. One continuation must not abort the ordinary conversations behind it.
   it("RFL round4 F0 sweeps a continued conversation with five ordinary unanswered ones without throwing", async () => {
