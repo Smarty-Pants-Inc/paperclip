@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, or, sql, type SQL } from "drizzle-orm";
 import {
   agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
@@ -444,7 +444,7 @@ function isRetryFreshProviderThread(action: typeof issueRecoveryActions.$inferSe
     && action.fingerprint === `fresh-continuation:retry:${run.id}`
     // Selected by admission (its readiness) or, for a Retry admission did not
     // route, by this run's own workspace preparation (same record, same run).
-    && (readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === sourceRunId
+    && (readiness.mode === "fresh_isolated_workspace" && readiness.sourceRunId === (fresh.retrySourceRunId ?? sourceRunId)
       || fresh.selectedAt === "preparation" && fresh.sourceRunId === sourceRunId);
 }
 
@@ -484,8 +484,18 @@ export async function recordRetryFreshProviderThread(db: Db, input: {
   /** Run preparation chose the fresh workspace (no admission readiness). */
   selectedAt?: "preparation";
 }): Promise<string | null> {
-  const [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+  let [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.agentId, input.agentId))).for("update");
+  // A Retry can name a run a hold cancelled before it started (it never had a
+  // thread). The thread the new box must not restore is the one the task's
+  // last native run owned before it.
+  if (source && source.status === "cancelled" && !source.startedAt && !source.nativeSessionId
+      && source.errorCode === "execution_reconciliation_required") {
+    [source] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+      eq(heartbeatRuns.agentId, input.agentId), eq(heartbeatRuns.nativeIssueId, input.issueId), eq(heartbeatRuns.runtimeMode, "native"),
+      sql`${heartbeatRuns.nativeSessionId} is not null`, lt(heartbeatRuns.createdAt, source.createdAt)))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1).for("update");
+  }
   if (!source || source.runtimeMode !== "native" || source.nativeIssueId !== input.issueId || !source.nativeSessionId
     || !UNFINISHED_STATUSES.includes(source.status) || !source.finishedAt) return null;
   // The admitting transaction's clock: never later than its successor's created_at.
@@ -494,6 +504,7 @@ export async function recordRetryFreshProviderThread(db: Db, input: {
   const isolation: FreshContinuationIsolation = "fresh_isolated_workspace";
   const freshContinuation = { schema: FRESH_CONTINUATION_SCHEMA, sourceRunId: source.id, trigger: input.trigger,
     failureCode: source.errorCode ?? null, delivery: "caller_owns", recordedAt, isolation, stopProof: "unproven_isolated",
+    ...(source.id !== input.sourceRunId ? { retrySourceRunId: input.sourceRunId } : {}),
     ...(input.selectedAt ? { selectedAt: input.selectedAt } : {}) };
   const reconciliation = { runId: source.id, providerStopped: true, providerStopProof: "isolated",
     workspaceRepairEvidence: `The Retry of run ${source.id} starts in a new isolated workspace; no unverified files are applied.`,
