@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { auditSectionHref, type AuditSection } from "./audit/audit-navigation";
 
 export type AgentAuditView = Extract<AuditSection, "activity" | "runs" | "costs" | "budgets">;
@@ -19,7 +20,7 @@ export type AgentDetailView =
 
 export type AgentLocalDetailView = Exclude<AgentDetailView, "run-detail">;
 
-export const AGENT_DETAIL_NAVIGATION: ReadonlyArray<{
+const ALL_AGENT_DETAIL_NAVIGATION: ReadonlyArray<{
   label: string;
   items: ReadonlyArray<{ value: AgentLocalDetailView; label: string }>;
 }> = [
@@ -45,6 +46,11 @@ export const AGENT_DETAIL_NAVIGATION: ReadonlyArray<{
   },
 ] as const;
 
+export const AGENT_DETAIL_NAVIGATION = ALL_AGENT_DETAIL_NAVIGATION.map(section => ({
+  ...section,
+  items: section.items.filter(item => !COST_BUDGET_UI_HIDDEN || (item.value !== "costs" && item.value !== "budgets")),
+}));
+
 const HIDDEN_VIEW_LABELS: Partial<Record<AgentLocalDetailView, string>> = {
   skills: "Skills",
   tools: "Tools",
@@ -65,6 +71,7 @@ export function agentDetailViewLabel(view: AgentLocalDetailView): string {
 }
 
 export function parseAgentDetailView(value: string | null): AgentLocalDetailView {
+  if (COST_BUDGET_UI_HIDDEN && ["cost", "costs", "budget", "budgets"].includes(value ?? "")) return "overview";
   if (value === "identity" || value === "instructions" || value === "prompts") return "instructions";
   if (value === "skills") return "skills";
   if (value === "runtime" || value === "configure" || value === "configuration") return "runtime";

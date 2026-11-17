@@ -13,6 +13,7 @@ import { ArtifactEmptyGraphic } from "@/components/artifacts/v1/ArtifactEmptyGra
 import { EmptyState } from "../components/EmptyState";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { QueryErrorState, useQueryView } from "../components/QueryView";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { formatDate, formatNumber, formatProjectBudget, projectUrl } from "../lib/utils";
 import {
   isStarred,
@@ -234,7 +235,7 @@ export function Projects() {
                             >
                               {taskCount.label}
                             </span>
-                            {project.budget && (
+                            {!COST_BUDGET_UI_HIDDEN && project.budget && (
                               <span className="hidden text-xs text-muted-foreground tabular-nums sm:inline">
                                 {formatProjectBudget(project.budget)}
                               </span>

@@ -34,6 +34,7 @@ import { useCompany } from "../context/CompanyContext";
 import { useToastActions } from "../context/ToastContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useSidebar } from "../context/SidebarContext";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import { useDialogActions } from "../context/DialogContext";
 import { useIssueExternalObjectSummaries } from "../hooks/useIssueExternalObjects";
@@ -413,7 +414,7 @@ export function FailedRunInboxRow({
       : interruption?.state === "failed" ? "Couldn’t finish this attempt. Your message is saved."
         : interruption?.state === "waiting_for_user" ? ({
           approval: "Approval required", reconnect: "Reconnect account", assign_agent: "Assign an agent", choose_model: "Choose a supported model",
-          resume: "Work is paused", budget: "Budget limit reached",
+          resume: "Work is paused", budget: COST_BUDGET_UI_HIDDEN ? "Work is paused" : "Budget limit reached",
           project_access: "Agent needs project access",
           confirm_owner_stop: "Confirm the previous server stopped",
           confirm_run_stopped: "Confirm the previous run stopped",
@@ -1496,7 +1497,7 @@ function StreamlinedInbox({
     [heartbeatRuns, dismissedAtByKey, issueById, knownFailureContextIds, contextIssuesError],
   );
   const approvalsToRender = useMemo(() => {
-    let filtered = getApprovalsForTab(approvals ?? [], tab, allApprovalFilter, currentUserId);
+    let filtered = getApprovalsForTab((approvals ?? []).filter(approval => !COST_BUDGET_UI_HIDDEN || approval.type !== "budget_override_required"), tab, allApprovalFilter, currentUserId);
     if (tab === "mine") {
       filtered = filtered.filter(
         (a) => !isInboxEntityDismissed(dismissedAtByKey, `approval:${a.id}`, a.updatedAt),
@@ -2559,6 +2560,7 @@ function StreamlinedInbox({
     !hasRunFailures &&
     !dismissedAlerts.has("alert:agent-errors");
   const showBudgetAlert =
+    !COST_BUDGET_UI_HIDDEN &&
     showCompanyAlerts &&
     !!dashboard &&
     dashboard.costs.monthBudgetCents > 0 &&

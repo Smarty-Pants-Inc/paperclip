@@ -5,6 +5,7 @@ import { statusCardsApi } from "@/api/statusCards";
 import { Button } from "@/components/ui/button";
 import { queryKeys } from "@/lib/queryKeys";
 import { formatDateTime } from "@/lib/utils";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { formatCents, formatTokens, rollupUpdates } from "./format";
 import type { StatusCardView } from "./types";
 
@@ -37,7 +38,7 @@ export function ArchivedStatusCardRow({
         <p className="truncate text-sm font-semibold">{card.title ?? "Untitled card"}</p>
         <p className="mt-0.5 text-xs text-muted-foreground" title={card.archivedAt ? formatDateTime(card.archivedAt) : undefined}>
           archived {shortDate(card.archivedAt)} · last summary {shortDate(card.lastGeneratedAt)}
-          {rollup ? ` · lifetime ${formatTokens(rollup.totalTokens)} / ${formatCents(rollup.totalCostCents)}` : ""}
+          {rollup ? ` · lifetime ${formatTokens(rollup.totalTokens)}${COST_BUDGET_UI_HIDDEN ? "" : ` / ${formatCents(rollup.totalCostCents)}`}` : ""}
         </p>
       </div>
       {/* View is the more common intent on an archived row (reading the last

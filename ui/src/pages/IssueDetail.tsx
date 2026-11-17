@@ -104,6 +104,7 @@ import {
   isRetainedWorkspaceExportCause,
   readRecoveryReconcileWorkspaceId,
 } from "../lib/recovery-reconcile";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { agentsApi } from "../api/agents";
 import { authApi } from "../api/auth";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
@@ -3074,19 +3075,19 @@ function IssueDetailActivityTab({
       {shouldShowCostSummary && (
         <div className="mb-3 px-3 py-2 rounded-lg border border-border">
           <div className="text-sm font-medium text-muted-foreground mb-1">
-            Cost Summary
+            {COST_BUDGET_UI_HIDDEN ? "Usage Summary" : "Cost Summary"}
           </div>
           {!issueCostSummary.hasCost &&
           !issueCostSummary.hasTokens &&
           !hasIssueTreeCost ? (
             <div className="text-xs text-muted-foreground">
-              No cost data yet.
+              {COST_BUDGET_UI_HIDDEN ? "No usage data yet." : "No cost data yet."}
             </div>
           ) : (
             <div className="space-y-1 text-xs text-muted-foreground tabular-nums">
               <div className="flex flex-wrap gap-3">
                 <span className="font-medium text-foreground">This task</span>
-                {issueCostSummary.hasCost ? (
+                {!COST_BUDGET_UI_HIDDEN && issueCostSummary.hasCost ? (
                   <span className="font-medium text-foreground">
                     {COST_FIGURES_HIDDEN ? "—" : `$${issueCostSummary.cost.toFixed(4)}`}
                   </span>
@@ -3108,14 +3109,14 @@ function IssueDetailActivityTab({
                 {!issueCostSummary.hasCost &&
                 !issueCostSummary.hasTokens &&
                 !issueCostSummary.hasRuntime ? (
-                  <span>No direct cost data.</span>
+                  <span>{COST_BUDGET_UI_HIDDEN ? "No direct usage data." : "No direct cost data."}</span>
                 ) : null}
               </div>
               {hasIssueTreeCost && issueTreeCostSummary ? (
                 <div className="flex flex-wrap gap-3">
                   <span className="font-medium text-foreground">
                     Including sub-tasks{" "}
-                    {COST_FIGURES_HIDDEN ? "—" : (issueTreeCostSummary.costCents / 100).toLocaleString(
+                    {!COST_BUDGET_UI_HIDDEN && (COST_FIGURES_HIDDEN ? "—" : (issueTreeCostSummary.costCents / 100).toLocaleString(
                       undefined,
                       {
                         style: "currency",
@@ -3123,7 +3124,7 @@ function IssueDetailActivityTab({
                         minimumFractionDigits: 4,
                         maximumFractionDigits: 4,
                       },
-                    )}
+                    ))}
                   </span>
                   <span>
                     Tokens {formatTokens(issueTreeCostTokens)}

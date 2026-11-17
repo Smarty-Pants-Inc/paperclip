@@ -18,6 +18,7 @@ import { companiesApi } from "../api/companies";
 import { accessApi } from "../api/access";
 import { assetsApi } from "../api/assets";
 import { describeError } from "@/api/errors";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import { Button } from "@/components/ui/button";
 import { NativeSelect } from "@/components/ui/select";
@@ -422,7 +423,7 @@ export function CompanySettings() {
           fallbackError="Couldn't save the default decision owner."
           save={saveDefaultDecisionOwner}
         />
-        <DecisionOwnerField
+        {!COST_BUDGET_UI_HIDDEN && <DecisionOwnerField
           label="Budget owner"
           hint="A budget hard stop also goes to this user's For you list, with Raise limit and Keep paused. The Company view still shows it to every operator."
           testId="company-settings-budget-owner"
@@ -432,7 +433,7 @@ export function CompanySettings() {
           membersLoading={membersQuery.isLoading}
           fallbackError="Couldn't save the budget owner."
           save={saveBudgetOwner}
-        />
+        />}
       </div>
 
       {/* Interaction governance. Held to the form column like the sections

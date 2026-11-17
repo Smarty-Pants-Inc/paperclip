@@ -17,6 +17,7 @@ import { IssueStatusBadge } from "../components/StatusBadge";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { useHiddenSettings } from "../hooks/useHiddenSettings";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { queryKeys } from "../lib/queryKeys";
 import {
   formatCents,
@@ -78,8 +79,8 @@ function WindowColumn({ stats }: { stats: UserProfileWindowStats }) {
       <div className="grid grid-cols-2 gap-x-5 gap-y-1.5 pt-3 text-xs tabular-nums text-muted-foreground">
         <span>Tokens</span>
         <span className="text-right text-foreground">{formatTokens(tokens)}</span>
-        <span>Spend</span>
-        <span className="text-right text-foreground">{formatCents(stats.costCents)}</span>
+        {!COST_BUDGET_UI_HIDDEN && <><span>Spend</span>
+        <span className="text-right text-foreground">{formatCents(stats.costCents)}</span></>}
         <span>Created</span>
         <span className="text-right text-foreground">{formatNumber(stats.createdIssues)}</span>
         <span>Open</span>
@@ -193,7 +194,7 @@ function UsageList({
               </div>
               <div className="flex items-baseline gap-4 text-xs tabular-nums sm:justify-end">
                 <span className="text-muted-foreground">{formatTokens(totalTokens(row))}</span>
-                <span className="font-medium">{formatCents(row.costCents)}</span>
+                {!COST_BUDGET_UI_HIDDEN && <span className="font-medium">{formatCents(row.costCents)}</span>}
               </div>
             </li>
           ))}
@@ -311,7 +312,7 @@ export function UserProfile() {
         </div>
 
         <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-4">
-          <HeroStat label="All-time tokens" value={formatTokens(allTimeTokens)} hint={formatCents(allTime?.costCents ?? 0) + " spent"} />
+          <HeroStat label="All-time tokens" value={formatTokens(allTimeTokens)} hint={COST_BUDGET_UI_HIDDEN ? undefined : formatCents(allTime?.costCents ?? 0) + " spent"} />
           <HeroStat label="Completed" value={formatNumber(allTime?.completedIssues ?? 0)} hint={allTime ? `${completionRate(allTime)} rate` : undefined} />
           <HeroStat label="Open assigned" value={formatNumber(allTime?.assignedOpenIssues ?? 0)} hint={`${formatNumber(allTime?.createdIssues ?? 0)} created`} />
           <HeroStat label="7-day actions" value={formatNumber(last7?.activityCount ?? 0)} hint={`${formatNumber(last7?.commentCount ?? 0)} comments`} />

@@ -13,6 +13,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/EmptyState";
 import { InlineBanner } from "@/components/InlineBanner";
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { formatCents, formatTokens } from "./format";
 import { StatusCardTile } from "./StatusCardTile";
 import { ArchivedStatusCardRow } from "./ArchivedStatusCardRow";
@@ -128,7 +129,7 @@ export function StatusCards() {
         <div className="flex items-center gap-4">
           {showCostMeter ? (
             <span className="text-xs text-muted-foreground">
-              Today: {formatTokens(todayTotals.tokens)} · ~{formatCents(todayTotals.cents)}
+              Today: {formatTokens(todayTotals.tokens)}{!COST_BUDGET_UI_HIDDEN && <> · ~{formatCents(todayTotals.cents)}</>}
             </span>
           ) : null}
           <Button onClick={() => setCreateOpen(true)} disabled={!selectedCompanyId}>

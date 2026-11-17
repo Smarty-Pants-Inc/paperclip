@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useCoordinatorWorkspaceEnabled } from "../hooks/useCoordinatorWorkspaceEnabled";
@@ -955,7 +956,7 @@ function CaughtUpNote({ filtered, view, snoozedBelow = false }: { filtered: bool
 const ZERO_STATE_DETAIL: Record<AttentionPersonalView, string> = {
   mine: "Nothing needs a decision from you right now.",
   unassigned: "Every open card has an owner.",
-  company: "No failed runs, agent errors, budget stops or join requests.",
+  company: COST_BUDGET_UI_HIDDEN ? "No failed runs, agent errors or join requests." : "No failed runs, agent errors, budget stops or join requests.",
   archived: "Cards you archive or snooze for yourself show here. Restore one to see it again.",
   all: "Nobody has a card waiting right now.",
 };

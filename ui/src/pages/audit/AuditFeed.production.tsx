@@ -1,4 +1,5 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { COST_BUDGET_UI_HIDDEN, isHiddenMoneyAction } from "@/lib/cost-visibility";
 import { useEffect, useMemo, useState } from "react";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { Download, ScrollText, ShieldAlert } from "lucide-react";
@@ -348,7 +349,7 @@ export function AuditFeed({
   const items = useMemo(() => {
     const pages = feed.data?.pages ?? [];
     const visible = hasBasicPage ? pages.filter((page) => page.accessTier !== "full") : pages;
-    return visible.flatMap((page) => page.items);
+    return visible.flatMap((page) => page.items).filter(item => !isHiddenMoneyAction(item.action));
   }, [feed.data, hasBasicPage]);
   // Access may be revoked between cursor requests. Treat the least-privileged
   // page as authoritative until every cached page has been fetched again.
@@ -523,7 +524,7 @@ export function AuditFeed({
               <SelectValue placeholder="Action" />
             </SelectTrigger>
             <SelectContent>
-              {ACTION_DOMAINS.map((d) => (
+              {ACTION_DOMAINS.filter(d => !COST_BUDGET_UI_HIDDEN || d.value !== "cost.").map((d) => (
                 <SelectItem key={d.value} value={d.value}>
                   {d.label}
                 </SelectItem>

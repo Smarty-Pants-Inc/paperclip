@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "@/lib/cost-visibility";
 import { cn } from "@/lib/utils";
 import { Gauge } from "lucide-react";
 import type { TaskChatUsageItem } from "./task-chat-model";
@@ -26,7 +27,7 @@ export function TaskChatUsageReadout({ item }: { item: TaskChatUsageItem }) {
             · ↑{(inputTokens ?? 0).toLocaleString()} ↓{(outputTokens ?? 0).toLocaleString()}
           </span>
         ) : null}
-        {costUsd != null ? <span>· ${costUsd.toFixed(4)}</span> : null}
+        {!COST_BUDGET_UI_HIDDEN && costUsd != null ? <span>· ${costUsd.toFixed(4)}</span> : null}
       </div>
       {item.detail ? <div>{item.detail}</div> : null}
       {contextWindowSize ? (

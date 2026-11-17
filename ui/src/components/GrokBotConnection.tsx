@@ -1,3 +1,4 @@
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { describeError } from "@/api/errors";
 import { useEffect, useId, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -55,7 +56,7 @@ export function GrokBotConnection({ companyId, agentId }: { companyId?: string; 
   const recovering = state.data?.recoveryNeeded || routine?.recoveryNeeded;
   const pending = exchange && ["prepared", "sending", "accepted"].includes(exchange.status) && Date.parse(exchange.expiresAt) > Date.now();
   return <section aria-label="Grok Bot connection" className="space-y-4 text-sm">
-    <p className="text-muted-foreground">Runs in Grok Bot. The Bot retains its apps and persistent context. Paperclip supplies task coordination and first-party tools. Usage and spending are not reported.</p>
+    <p className="text-muted-foreground">Runs in Grok Bot. The Bot retains its apps and persistent context. Paperclip supplies task coordination and first-party tools. {COST_BUDGET_UI_HIDDEN ? "Usage is not reported." : "Usage and spending are not reported."}</p>
     {state.isPending && <p role="status">Loading connection…</p>}
     {error && <p role="alert" className="text-destructive">{describeError(error).body}</p>}
     {state.data && !state.data.enabled && <p className="text-muted-foreground">Enable Grok Bot, Assistant connections (MCP), and Paperclip Runner on an authenticated public HTTPS instance.</p>}

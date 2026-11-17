@@ -65,6 +65,7 @@ import { SourceResolvedFoldCallout } from "../components/SourceResolvedFoldCallo
 import { SourceResolvedFoldBadge } from "../components/SourceResolvedFoldBadge";
 import { readSourceResolvedWatchdogFold } from "../lib/source-resolved-watchdog-fold";
 import { formatCents, formatDate, relativeTime, formatTokens, visibleRunCostUsd, visibleRunTokenTotal } from "../lib/utils";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { cn, COST_FIGURES_HIDDEN } from "../lib/utils";
 import { describeRunRetryState } from "../lib/runRetryState";
 import { Button } from "@/components/ui/button";
@@ -225,7 +226,7 @@ export function parseAgentDetailView(value: string | null): AgentDetailView {
   if (value === "skills") return "skills";
   if (value === "tools") return "tools";
   if (value === "channels") return "channels";
-  if (value === "budget") return "budget";
+  if (value === "budget") return COST_BUDGET_UI_HIDDEN ? "dashboard" : "budget";
   if (value === "audit") return "audit";
   if (value === "runs") return value;
   return "dashboard";
@@ -902,7 +903,7 @@ export function AgentDetail() {
           }
         >
           Ships with Paperclip and powers <strong>{builtInFeatureLabel}</strong>. Configure it like
-          any agent — model, instructions, budget. It can be paused but not deleted; pausing it
+          any agent — model, instructions{!COST_BUDGET_UI_HIDDEN && ", budget"}. It can be paused but not deleted; pausing it
           pauses {builtInFeatureLabel}.
         </InlineBanner>
       )}
@@ -940,7 +941,7 @@ export function AgentDetail() {
           onValueChange={handleAgentTabChange}
         >
           <PageTabBar
-            items={AGENT_DETAIL_TABS.filter((item) => item.value !== "channels" || chatConnectorsEnabled)}
+            items={AGENT_DETAIL_TABS.filter((item) => (!COST_BUDGET_UI_HIDDEN || item.value !== "budget") && (item.value !== "channels" || chatConnectorsEnabled))}
             value={activeView}
             onValueChange={handleAgentTabChange}
           />
@@ -1094,7 +1095,7 @@ export function AgentDetail() {
         <AuditFeed companyId={resolvedCompanyId} lockedAgentId={agent.id} hideHeader />
       ) : null}
 
-      {activeView === "budget" && resolvedCompanyId ? (
+      {!COST_BUDGET_UI_HIDDEN && activeView === "budget" && resolvedCompanyId ? (
         <div className="max-w-3xl">
           <BudgetPolicyCard
             summary={agentBudgetSummary}
@@ -1420,10 +1421,10 @@ function CostsSection({
               <span className="text-xs text-muted-foreground block">Cached tokens</span>
               <span className="text-lg font-semibold">{formatTokens(runtimeState.totalCachedInputTokens)}</span>
             </div>
-            <div>
+            {!COST_BUDGET_UI_HIDDEN && <div>
               <span className="text-xs text-muted-foreground block">Total cost</span>
               <span className="text-lg font-semibold">{formatCents(runtimeState.totalCostCents)}</span>
-            </div>
+            </div>}
           </div>
         </div>
       )}
@@ -1436,7 +1437,7 @@ function CostsSection({
                 <th scope="col" className="text-left px-3 py-2 font-medium text-muted-foreground">Run</th>
                 <th scope="col" className="text-right px-3 py-2 font-medium text-muted-foreground">Input</th>
                 <th scope="col" className="text-right px-3 py-2 font-medium text-muted-foreground">Output</th>
-                <th scope="col" className="text-right px-3 py-2 font-medium text-muted-foreground">Cost</th>
+                {!COST_BUDGET_UI_HIDDEN && <th scope="col" className="text-right px-3 py-2 font-medium text-muted-foreground">Cost</th>}
               </tr>
             </thead>
             <tbody>
@@ -1448,12 +1449,12 @@ function CostsSection({
                     <td className="px-3 py-2 font-mono">{run.id.slice(0, 8)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{formatTokens(metrics.input)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{formatTokens(metrics.output)}</td>
-                    <td className="px-3 py-2 text-right tabular-nums">
+                    {!COST_BUDGET_UI_HIDDEN && <td className="px-3 py-2 text-right tabular-nums">
                       {metrics.cost > 0
                         ? (COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(4)}`)
                         : "-"
                       }
-                    </td>
+                    </td>}
                   </tr>
                 );
               })}
@@ -2679,7 +2680,7 @@ function RunListItem({ run, isSelected, agentId }: { run: HeartbeatRun; isSelect
       {(metrics.totalTokens > 0 || metrics.cost > 0) && (
         <div className="flex items-center gap-2 pl-5.5 text-(length:--text-micro) text-muted-foreground tabular-nums">
           {metrics.totalTokens > 0 && <span>{formatTokens(metrics.totalTokens)} tok</span>}
-          {metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
+          {!COST_BUDGET_UI_HIDDEN && metrics.cost > 0 && <span>{COST_FIGURES_HIDDEN ? "—" : `$${metrics.cost.toFixed(3)}`}</span>}
         </div>
       )}
     </Link>
@@ -3146,10 +3147,10 @@ function RunDetail({ run: initialRun, agentRouteId, adapterType, adapterConfig }
                 <div className="text-xs text-muted-foreground">Cached</div>
                 <div className="text-sm font-medium font-mono">{formatTokens(metrics.cached)}</div>
               </div>
-              <div>
+              {!COST_BUDGET_UI_HIDDEN && <div>
                 <div className="text-xs text-muted-foreground">Cost</div>
                 <div className="text-sm font-medium font-mono">{COST_FIGURES_HIDDEN ? "—" : metrics.cost > 0 ? `$${metrics.cost.toFixed(4)}` : "-"}</div>
-              </div>
+              </div>}
             </div>
           )}
         </div>

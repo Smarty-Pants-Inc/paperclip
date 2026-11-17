@@ -2,6 +2,7 @@ import { createContext, useContext, useId, useRef, useState, type ReactNode } fr
 import { Check, ChevronDown, Loader2, RotateCcw, TriangleAlert } from "lucide-react";
 import type { Agent, Issue, IssueCommentMetadata, IssueRecoveryAction } from "@paperclipai/shared";
 import { Button } from "@/components/ui/button";
+import { COST_BUDGET_UI_HIDDEN } from "../lib/cost-visibility";
 import { cn } from "@/lib/utils";
 import { timeAgo } from "@/lib/timeAgo";
 
@@ -58,7 +59,7 @@ export function dispositionRetryUnavailableReason(snapshot: DispositionRecoveryS
 
 function descriptionFor(snapshot: DispositionRecoverySnapshot) {
   const start = "The agent stopped without recording an outcome or a next step.";
-  if (snapshot.reason === "owner_budget_blocked") return `${start} Automatic recovery stopped because a spending or pause limit prevents the agent from running.`;
+  if (snapshot.reason === "owner_budget_blocked") return COST_BUDGET_UI_HIDDEN ? `${start} Automatic recovery stopped because the agent is paused.` : `${start} Automatic recovery stopped because a spending or pause limit prevents the agent from running.`;
   if (snapshot.reason === "owner_not_invokable") return `${start} Automatic recovery stopped because the assigned agent is unavailable.`;
   if (snapshot.reason === "unchanged_source_state_exhausted") {
     const attempts = snapshot.attemptCount === 2 ? "Two" : String(snapshot.attemptCount);
