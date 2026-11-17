@@ -24,7 +24,8 @@ import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { logger } from "../middleware/logger.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
@@ -966,7 +967,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
     if (row.receipt?.warm === true && !settled(row)) {
-      row = await checkpoint(row, target, true, signal);
+      row = await hostMutation(() => checkpoint(row, target, true, signal));
       // Never release a stopped copy while retained aside copies are unsurfaced.
       if (row.errorCode === "AGENT_FILES_ASIDE_UNSURFACED") return row;
       live();
@@ -1001,7 +1002,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           if (directorySnapshotSha256(mirrored.snapshot) !== mirrorHash) throw new Error("Retained agent-file mirror changed; its source is kept for review");
           inspected = mirrored;
         }
-        inspected ??= await retrieve(row, target, signal);
+        // pl/keepalive6: the projection write and the canonical save go through the held lock's gate.
+        inspected ??= await hostMutation(() => retrieve(row, target, signal));
         live();
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
@@ -1011,7 +1013,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
           signal?.throwIfAborted();
-          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, conflicts } = await hostMutation(() => store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row))));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
         row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
@@ -1132,17 +1134,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
       const quoted = paths.map(p => `'${p.replaceAll("'", `'"'"'`)}'`).join(" ");
       signal?.throwIfAborted();
-      const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
-        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
+      const remoteCleanupFailed = await hostMutation(() => runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
+        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 })).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
     } else if (!destroyed && row.processStoppedAt && settled(row) && row.location !== "local") {
       // Rebind only the current host-owned lease. Never acquire a replacement.
       signal?.throwIfAborted();
-      cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
+      cleanupPending ||= !await hostMutation(() => cleanupRemoteAfterRestart(row)).catch(() => false);
     }
     if (settled(row) && row.processStoppedAt) {
       signal?.throwIfAborted();
-      try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
+      try { await hostMutation(() => fs.rm(path.dirname(row.localRoot), { recursive: true, force: true })); }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
         await patch(row, { receipt: { ...row.receipt, cleanupPending: true } });
@@ -1242,6 +1244,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
   }
   async function serial<T>(row: Copy, fn: (current: Copy, signal?: AbortSignal) => Promise<T>, operation: DirectoryMergeLockOperation, signal?: AbortSignal): Promise<T> {
     signal?.throwIfAborted();
+    // pl/keepalive6: an enclosing held lock's gate, captured before the operation lock connection opens.
+    const parentGate = currentHostMutationDrain();
     const run = async (lost?: AbortSignal) => {
       const lockRoot = path.resolve(disposableRemoteCopy(row) ? projectionRoot(row) : row.localRoot, "../../..");
       if (disposableRemoteCopy(row)) await fs.mkdir(lockRoot, { recursive: true, mode: 0o700 });
@@ -1278,13 +1282,20 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout')) as idle_timeout_ms,
         pg_backend_pid() as pid, (select backend_start::text from pg_stat_activity where pid = pg_backend_pid()) as backend_start`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      // pl/keepalive5: a failed ping aborts the operation's signal; a lost lock is a failure, never a success.
-      // (target adaptation: the caller's AF-ABORT signal and the lost lock are one combined signal.)
-      const lost = new AbortController();
-      const held = signal ? AbortSignal.any([signal, lost.signal]) : lost.signal;
-      const work = withWorkspaceLockKeepalive(dedicated, Number(lock.idle_timeout_ms ?? 0), () => run(held),
-        { onLost: cause => lost.abort(new AgentDirectoryOperationLockLostError(cause)) })
-        .then(result => { lost.signal.throwIfAborted(); return result; });
+      // pl/keepalive6: a failed ping closes the operation's host-mutation gate (joined to any enclosing held lock's);
+      // its writes are refused after the loss and in-flight ones drain before the lock is released.
+      // (target adaptation: the caller's AF-ABORT signal is combined with the gate's signal.)
+      // (target adaptation: this is a SESSION lock, and the client transparently reconnects a terminated session,
+      // so a plain `select 1` would succeed on a new backend that holds no lock. The keepalive ping therefore
+      // checks that it still runs on the backend that took the lock; a replaced backend is a lost lock.)
+      const lockSession: Pick<Db, "execute"> = { execute: (async () => {
+        const rows = await dedicated.execute(sql`select pg_backend_pid() as pid`);
+        if (Number(rows[0]?.pid) !== Number(lock.pid)) throw new AgentDirectoryOperationLockLostError(new Error("agent_directory_lock_session_replaced"));
+        return rows;
+      }) as unknown as Db["execute"] };
+      const work = withHeldLockHostDrain({ lock: lockSession, idleTimeoutMs: Number(lock.idle_timeout_ms ?? 0), parent: parentGate,
+        label: "agent directory operation lock", lostError: cause => new AgentDirectoryOperationLockLostError(cause) },
+      (held) => run(signal ? AbortSignal.any([signal, held]) : held));
       if (!signal) return work;
       // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
       // at the abort, not when a held provider call returns; the abandoned
