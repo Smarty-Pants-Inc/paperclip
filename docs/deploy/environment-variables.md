@@ -31,6 +31,7 @@ All environment variables that Paperclip uses for server configuration.
 | `PAPERCLIP_SETTING_DEFAULTS` | (unset) | JSON object replacing the schema default of selected instance settings, for hosting operators. See [Operator setting defaults](#operator-setting-defaults). |
 | `PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT` | `20` | Maximum number of writes one heartbeat run can make to issues other than its source issue. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
 | `PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH` | `2` | Maximum depth of agent-created task trees (root depth is 1); board-created trees are exempt. The value is a positive integer and applies to every agent on the server. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
+| `PAPERCLIP_MAX_ACTIVE_CHILD_ISSUES` | `25` | Maximum active (not done or cancelled) children per parent created through the child helper. The value is a positive integer and applies server-wide. An empty, zero, negative, or non-integer value is ignored and the default stays in force. |
 
 Daytona connectivity for `paperclip_runner` uses authenticated provider
 WebSocket ingress and follows the instance experimental setting
