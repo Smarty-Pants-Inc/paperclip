@@ -64,7 +64,7 @@ import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-r
 import { prepareHeartbeatWorkspace, RetryWorkspaceRefused } from "./heartbeat/workspace-preparation.js";
 import { nativeRecoveryClaimRelinquished, ownNativeExecutionLeaseLapsed, releaseLapsedNativeRestartClaim } from "./native-runtime/native-execution-lease.js";
 import { executeHeartbeatRuntime, NativeSessionResumeScheduledError, NativeWorkspaceFinalizeScheduledError } from "./heartbeat/runtime-execution.js";
-import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
+import { nativeStopWorkspaceOutcome, preserveNativeFailedWorkspace } from "./native-runtime/native-failed-workspace-recovery.js";
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { prepareAndSelectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
@@ -3875,7 +3875,10 @@ export function heartbeatService(
           return;
         }
         if (err instanceof NativeCancellationPendingRecoveryError) {
-          await preserveNativeWorkspaceOnFailure();
+          // The shared Stop policy: an ordinary Stop on a warm (keep_running) box is
+          // a handoff and writes no hold; only a stopping box needs one.
+          if (nativeStopWorkspaceOutcome({ admittedDisposition: providerResourceDispositionForRun, stopped: true })
+            !== "handoff") await preserveNativeWorkspaceOnFailure();
           await cancelRunInternal(
             run.id,
             "Recovered durable native run cancellation",
