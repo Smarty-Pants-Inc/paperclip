@@ -914,6 +914,18 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
   };
 }
 
+/** A person stopped this chat's own turn while that person's messages waited behind it. */
+async function personStoppedChatTurnHasQueuedMessages(tx: Db, run: ReleaseRun, issue: IssueRow): Promise<boolean> {
+  if (run.status !== "cancelled" || issue.conversationAgentId !== run.agentId || issue.assigneeAgentId !== run.agentId ||
+      issue.assigneeUserId || parseObject(run.resultJson).cancelledByActorType !== "user") return false;
+  const [queued] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+    eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS), eq(agentWakeupRequests.requestedByActorType, "user"),
+    sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+  )).limit(1);
+  return Boolean(queued);
+}
+
 async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<boolean> {
   const applies =
     run.runtimeMode === "native" &&
@@ -1460,10 +1472,17 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         // When a reassignment committed while that stop was still settling, the
         // new assignee's wake parked behind this run; it is explicit new work
         // and must run now, or the task is left with no run at all.
-        const handoffAssigneeAgentId = preDrain.kind === "released" &&
-          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false }).kind === "proceed" &&
+        const releasedOnlyByStop = preDrain.kind === "released" &&
+          decidePreDrain({ ...preDrainFacts, executionCancellationAcknowledged: false }).kind === "proceed";
+        const handoffAssigneeAgentId = releasedOnlyByStop &&
           issueRow?.assigneeAgentId && !issueRow.assigneeUserId && issueRow.assigneeAgentId !== run.agentId
-          ? issueRow.assigneeAgentId : undefined;
+          ? issueRow.assigneeAgentId
+          // Agent Chat: a person's Stop ends only the turn they stopped. The
+          // messages a person queued behind it are the conversation's next
+          // turn and nothing else sends them, so they start now, in order.
+          // The stopped turn stays cancelled and plans no retry of its own.
+          : releasedOnlyByStop && issueRow && await personStoppedChatTurnHasQueuedMessages(tx, run, issueRow)
+            ? run.agentId : undefined;
 
         if (preDrain.kind === "released" && !handoffAssigneeAgentId) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
