@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -71,4 +73,55 @@ test("a failed build fails the preflight", t => {
 test("a build that reports success without its outputs fails the preflight", t => {
   const { root } = worktree(t);
   assert.throws(() => pluginSdkBuildStep(root, () => 0), /no completion marker/);
+});
+
+test("workspace link preflight repairs links without server code or build outputs", t => {
+  const rootDir = fileURLToPath(new URL("../../", import.meta.url));
+  const fixture = mkdtempSync(path.join(os.tmpdir(), "workspace-links-"));
+  t.after(() => rmSync(fixture, { recursive: true, force: true }));
+
+  function writePackage(directory, manifest) {
+    const target = path.join(fixture, directory);
+    mkdirSync(target, { recursive: true });
+    writeFileSync(path.join(target, "package.json"), JSON.stringify(manifest));
+    return target;
+  }
+
+  writePackage(".", { type: "module" });
+  const shared = writePackage("packages/shared", { name: "@paperclipai/shared" });
+  const nested = writePackage("packages/plugins/example", { name: "@paperclipai/example" });
+  writePackage("server", {
+    name: "@paperclipai/server",
+    dependencies: { "@paperclipai/shared": "workspace:*", external: "1.0.0" },
+    devDependencies: { "@paperclipai/example": "workspace:*" },
+  });
+  writePackage("ui", { name: "@paperclipai/ui" });
+  writePackage("cli", { name: "paperclipai" });
+  const scope = path.join(fixture, "server/node_modules/@paperclipai");
+  mkdirSync(scope, { recursive: true });
+  const sharedLink = path.join(scope, "shared");
+  const nestedLink = path.join(scope, "example");
+  symlinkSync(nested, sharedLink);
+  mkdirSync(path.join(fixture, "scripts"));
+  const script = path.join(fixture, "scripts/ensure-workspace-package-links.ts");
+  copyFileSync(path.join(rootDir, "scripts/ensure-workspace-package-links.ts"), script);
+
+  function preflight() {
+    const result = spawnSync(process.execPath, [path.join(rootDir, "cli/node_modules/tsx/dist/cli.mjs"), script], {
+      cwd: os.tmpdir(),
+      encoding: "utf8",
+      timeout: 30_000,
+    });
+    assert.equal(result.error, undefined);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    return result.stdout;
+  }
+
+  assert.match(preflight(), /detected stale workspace package links for server/);
+  assert.equal(realpathSync(sharedLink), shared);
+  assert.equal(realpathSync(nestedLink), nested);
+  assert.equal(existsSync(path.join(fixture, "server/node_modules/external")), false);
+  assert.equal(existsSync(path.join(shared, "dist")), false);
+  assert.equal(existsSync(path.join(fixture, "server/src")), false);
+  assert.equal(preflight(), "");
 });
