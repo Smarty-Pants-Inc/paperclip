@@ -254,6 +254,31 @@ export async function prepareInspectedSourceSandboxStop(db: Db, lease: typeof en
   return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: lease });
 }
 
+/** Intent marker of a stop requested for an ended box whose cleanup failed and
+ * which the worker could not inspect (fix13, RFL 23:00Z). */
+export const UNINSPECTABLE_FAILED_CLEANUP_STOP_KEY = "uninspectableFailedCleanup";
+
+/** Every paid box has an owner AND an expiry; a provider TTL is only an expiry
+ * (a run-lease TTL refresh can push it out). An ended row whose cleanup FAILED,
+ * with no stop receipt, whose exact box the worker cannot inspect (the GET
+ * errored, or the plugin, its credentials or the inspect method is unavailable,
+ * or the answer is not about this box) would otherwise stay released/failed
+ * with no owner: nothing re-reads such a row. It gets the SAME stop-only owner a
+ * positive RUNNING GET gets: one stop by its exact provider id, dispatched and
+ * retried by the pending-cleanup sweep until the provider confirms stopped or
+ * gone; the ended row is then restored with that receipt. Never destroys; the
+ * owner refuses a box another lease holds. An exact answer about this box
+ * (running, stopped, gone) stays with the inspected owner above. */
+export async function prepareUninspectableFailedCleanupSandboxStop(db: Db, lease: typeof environmentLeases.$inferSelect, observation: unknown) {
+  if (lease.cleanupStatus !== "failed" || !["released", "expired"].includes(lease.status)) return null;
+  const resource = observation && typeof observation === "object" && !Array.isArray(observation)
+    ? observation as { providerLeaseId?: unknown; state?: unknown } : null;
+  if (resource && resource.providerLeaseId === lease.providerLeaseId && typeof resource.state === "string" && resource.state) return null;
+  if (!lease.heartbeatRunId || !lease.provider || lease.provider === "local" || !lease.providerLeaseId
+    || lease.metadata?.pendingCleanupInFlight === true || hasStopOnlyCleanup(lease) || hasBoundRemoteStopReceipt(lease)) return null;
+  return prepareStopAndRetain(db, lease, lease.status, { endedLeaseEvidence: lease, [UNINSPECTABLE_FAILED_CLEANUP_STOP_KEY]: true });
+}
+
 /** A deliberate user Retry re-arms only the existing, validated stop owner.
  * It never changes allocation identity, resumes a provider, or clears proof.
  * In-flight cleanup and workspace-export recovery keep their own budgets. */
