@@ -2250,7 +2250,7 @@ pub(crate) fn validate_semantic_tool_input(
             .is_some_and(|summary| summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS)
     {
         return Err(DurableRunnerError::invalid(
-            "semantic completion summary exceeds the 12,000 character limit",
+            "semantic completion summary exceeds the 12,000 character limit (completion_summary_over_cap); the whole answer belongs in the final assistant message",
         ));
     }
     Ok(input.clone())

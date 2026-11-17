@@ -77,6 +77,7 @@ fn invalid_tool_call_result(
                     .safe_provider_message()
                     .unwrap_or(GENERIC_INVALID_TOOL_CALL_MESSAGE),
                 "retryable": false,
+                "reason": error.denial_code(),
             },
         }),
         is_error: true,
@@ -5529,6 +5530,9 @@ impl CodexCommandExecutor {
         if let Some(guidance) = error.safe_provider_message() {
             payload["inputSchemaGuidance"] = json!(guidance);
         }
+        if let Some(denial_code) = error.denial_code() {
+            payload["denialCode"] = json!(denial_code);
+        }
         let event = NormalizedProviderEvent {
             event_type: "harness.diagnostic".to_owned(),
             priority: EventPriority::P0,
@@ -5823,11 +5827,11 @@ impl CodexCommandExecutor {
         // retry's changed evidence cannot replace that input or dispatch work.
         if !pi_held_replay {
             if let Err(error) = validate_semantic_tool_input(&operation_id, &input) {
-                return self.reject_tool_call(
-                    call_id,
-                    operation_id,
-                    ProviderBridgeError::invalid(error.to_string()),
-                );
+                // H5: the over-cap refusal returns its cure, not the generic
+                // "rejected" text that made the model shrink and retry blind.
+                let error = ProviderBridgeError::completion_summary_over_cap_in(&operation_id, &input)
+                    .unwrap_or_else(|| ProviderBridgeError::invalid(error.to_string()));
+                return self.reject_tool_call(call_id, operation_id, error);
             }
         }
         let identity = self.event_identity()?;

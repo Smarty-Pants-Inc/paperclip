@@ -40,6 +40,12 @@ const REPLAY_FILTER_WORDS: usize = 32_768;
 const ACTIVE_TURN_RECEIPT_LIMIT_MESSAGE: &str =
     "durable provider tool receipt limit reached for the active turn";
 const COMPLETION_INPUT_SCHEMA_HINT: &str = "Invalid paperclip_finish arguments. Required fields: reportedWorkDisposition, summary, completionClaim, evidence, and verification. When reportedWorkDisposition is yielded, continuation must include kind=response_wake or monitor, summary, and idempotencyKey.";
+// H5 (dl-finish-cap2): the over-cap refusal names its cause and its one cure.
+// The generic hint above lists fields only, so a model resends a shortened
+// answer, again and again (16 minutes live). The answer belongs whole in the
+// final assistant message; the summary is only a short opening.
+pub(crate) const COMPLETION_SUMMARY_OVER_CAP_CODE: &str = "completion_summary_over_cap";
+pub(crate) const COMPLETION_SUMMARY_OVER_CAP_HINT: &str = "paperclip_finish was refused because summary is longer than 12,000 characters; nothing was recorded. Do not shorten the answer and do not retry with another long summary. Call paperclip_finish once more with the same fields and a summary that is only the answer's opening, copied verbatim, between 11,000 and 12,000 characters long. Then send the WHOLE answer, unshortened, as your final assistant message; Paperclip delivers it whole at any length.";
 const HUMAN_INPUT_SCHEMA_HINT: &str = "Invalid request_human_input arguments. Put version and supersedeOnUserComment at payload.version and payload.supersedeOnUserComment, never at the root. For questions, use payload.version=1 and a complete payload.questionSet. Preserve question and option IDs. Correct the arguments and retry.";
 const APPROVAL_INPUT_SCHEMA_HINT: &str = "Invalid request_human_input arguments. Put version and supersedeOnUserComment at payload.version and payload.supersedeOnUserComment, never at the root. Keep approval requests in their confirmation or checkbox interactionKind; do not replace them with questions. Correct the arguments and retry.";
 const BLOCK_INPUT_SCHEMA_HINT: &str = "Invalid paperclip_block arguments. Required fields: reportedWorkDisposition=blocked, summary, completionClaim, evidence, verification, and blocker. blocker must include reasonCode, owner, unblockAction, and scope.";
@@ -233,6 +239,7 @@ pub struct ProviderToolBridge {
 pub struct ProviderBridgeError {
     message: String,
     safe_provider_message: Option<String>,
+    denial_code: Option<&'static str>,
 }
 
 impl ProviderBridgeError {
@@ -240,6 +247,7 @@ impl ProviderBridgeError {
         Self {
             message: message.into(),
             safe_provider_message: None,
+            denial_code: None,
         }
     }
 
@@ -260,7 +268,33 @@ impl ProviderBridgeError {
         Self {
             message: format!("provider arguments for {operation_id} failed JSON Schema validation"),
             safe_provider_message: safe_provider_message.map(str::to_owned),
+            denial_code: None,
         }
+    }
+
+    /// The over-cap refusal for a completion report, if this input is one.
+    pub(crate) fn completion_summary_over_cap_in(operation_id: &str, input: &Value) -> Option<Self> {
+        (matches!(operation_id, "paperclip_finish" | "paperclip_block")
+            && input
+                .get("summary")
+                .and_then(Value::as_str)
+                .is_some_and(|summary| summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS))
+        .then(|| Self::completion_summary_over_cap(operation_id))
+    }
+
+    fn completion_summary_over_cap(operation_id: &str) -> Self {
+        Self {
+            message: format!(
+                "provider summary for {operation_id} exceeds the {MAX_COMPLETION_SUMMARY_CHARS} character limit"
+            ),
+            safe_provider_message: Some(COMPLETION_SUMMARY_OVER_CAP_HINT.to_owned()),
+            denial_code: Some(COMPLETION_SUMMARY_OVER_CAP_CODE),
+        }
+    }
+
+    /// A stable, countable reason for a refusal the provider can correct.
+    pub fn denial_code(&self) -> Option<&'static str> {
+        self.denial_code
     }
 
     fn with_schema_locations(mut self, validator: &jsonschema::Validator, input: &Value) -> Self {
@@ -697,24 +731,16 @@ impl ProviderToolBridge {
                 "tool {operation_id} has an invalid durable input JSON Schema"
             ))
         })?;
+        // Before schema validation: an authorized schema may carry the same
+        // maxLength, whose generic hint would hide the cure.
+        if let Some(error) = ProviderBridgeError::completion_summary_over_cap_in(&operation_id, &input) {
+            return Err(error);
+        }
         if !validator.is_valid(&input) {
             return Err(
                 ProviderBridgeError::input_schema_validation(&operation_id, &input)
                     .with_schema_locations(&validator, &input),
             );
-        }
-        if matches!(
-            operation_id.as_str(),
-            "paperclip_finish" | "paperclip_block"
-        ) && input
-            .get("summary")
-            .and_then(Value::as_str)
-            .is_some_and(|summary| summary.chars().count() > MAX_COMPLETION_SUMMARY_CHARS)
-        {
-            return Err(ProviderBridgeError::input_schema_validation(
-                &operation_id,
-                &input,
-            ));
         }
         bounded_json(&input, MAX_TOOL_VALUE_BYTES, "provider tool input")?;
         let call = PendingToolCall {
@@ -1721,8 +1747,9 @@ mod tests {
             .expect_err("an over-limit completion summary must fail before durable emission");
         assert_eq!(
             error.safe_provider_message(),
-            Some(COMPLETION_INPUT_SCHEMA_HINT)
+            Some(COMPLETION_SUMMARY_OVER_CAP_HINT)
         );
+        assert_eq!(error.denial_code(), Some(COMPLETION_SUMMARY_OVER_CAP_CODE));
         assert!(!over_limit.has_call_receipt("call-over-limit"));
     }
 

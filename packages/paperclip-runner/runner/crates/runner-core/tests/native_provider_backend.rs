@@ -4272,3 +4272,99 @@ fn pi_rpc_missing_result_deadline_emits_failure_and_next_turn_starts() {
     executor.shutdown().unwrap();
     fs::remove_dir_all(directory).unwrap();
 }
+
+// H5 (dl-finish-cap2, RFL FAIL on 9a75d258): a Pi chat answer of 28 KB put
+// whole into paperclip_finish.summary. The real runner bridge refuses it over
+// 12,000 characters and returns its guidance over the real tool transport; the
+// fixture provider acts only on that returned text. Generic field guidance
+// names no length, so the provider shrinks and retries a refused finish (16
+// minutes live). The over-cap guidance must close the loop at one refusal: a
+// short verbatim opening is accepted and the whole answer is the final message.
+#[test]
+#[cfg(unix)]
+fn pi_rpc_oversized_finish_is_refused_once_and_the_whole_answer_stays_final() {
+    let directory = temporary_directory("pi-rpc-oversized-finish");
+    let (config, payload, mut input) =
+        pi_rpc_finish_fixture(&directory, "--follow-finish-denial");
+    let whole: String = (0..700)
+        .map(|line| format!("{line:04} drwxr-xr-x paul paul 4096 Nov 17 output\n"))
+        .collect();
+    assert!(whole.len() >= 28_000, "{}", whole.len());
+    input["summary"] = json!(whole);
+    fs::write(
+        directory.join("finish-input.json"),
+        serde_json::to_vec(&input).unwrap(),
+    )
+    .unwrap();
+    let mut executor = start_pi_rpc_finish(&directory, &config, payload);
+    let mut events = Vec::new();
+    let mut accepted_summaries = Vec::new();
+    let mut sequence = 4;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut settled = false;
+    while !settled && std::time::Instant::now() < deadline {
+        let batch = executor.poll_events().unwrap();
+        executor.acknowledge_events(batch.len()).unwrap();
+        for event in batch {
+            if event.event_type == "semantic_tool.input" {
+                let tool = &event.payload["semantic_tool"];
+                accepted_summaries.push(tool["input"]["summary"].as_str().unwrap().to_owned());
+                executor
+                    .execute(&command(
+                        sequence,
+                        "semantic_tool.result",
+                        json!({"callId":tool["callId"], "operationId":"paperclip_finish",
+                            "isError":false, "result":{"accepted":true}}),
+                    ))
+                    .unwrap();
+                sequence += 1;
+            }
+            settled |= matches!(event.event_type.as_str(), "turn.completed" | "turn.failed");
+            events.push(event);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The server-seam test replays this exact runner event stream
+    // (server/src/__tests__/fixtures/h5-pi-rpc-oversized-finish-events.json).
+    if let Ok(path) = std::env::var("PAPERCLIP_H5_RUNNER_EVENTS_OUT") {
+        let stream = events
+            .iter()
+            .map(|event| json!({"eventType": event.event_type, "payload": event.payload}))
+            .collect::<Vec<_>>();
+        fs::write(path, serde_json::to_vec_pretty(&stream).unwrap()).unwrap();
+    }
+    executor.shutdown().unwrap();
+    let denials = events
+        .iter()
+        .filter(|event| {
+            event.event_type == "harness.diagnostic"
+                && event.payload["code"] == "semantic_tool_denied"
+                && event.payload["operationId"] == "paperclip_finish"
+        })
+        .collect::<Vec<_>>();
+    let calls = fs::read_to_string(directory.join("fake-opencode-calls.log")).unwrap_or_default();
+    let shrinks = calls.matches("finish-denial:shrink-and-retry").count();
+    assert!(settled, "the turn must settle: {events:?}");
+    assert_eq!(
+        (denials.len(), shrinks),
+        (1, 0),
+        "a refused oversized finish must not be shrunk and repeated: {}",
+        calls.lines().find(|line| line.starts_with("finish-denial-text:")).unwrap_or_default()
+    );
+    assert_eq!(denials[0].payload["denialCode"], "completion_summary_over_cap");
+    assert_eq!(accepted_summaries.len(), 1);
+    // The server's review gate floor (issues.ts) accepts 11,000..=12,000.
+    assert!((11_000..=12_000).contains(&accepted_summaries[0].chars().count()));
+    assert!(whole.starts_with(&accepted_summaries[0]));
+    // The provider followed the returned cure: its whole answer is its own
+    // final-channel agent message after the accepted finish, carried whole.
+    assert_eq!(calls.matches("finish-denial:whole-answer-final-message").count(), 1);
+    let finals = events
+        .iter()
+        .filter(|event| event.event_type == "item.completed" && event.payload["channel"] == "final")
+        .collect::<Vec<_>>();
+    assert_eq!(finals.len(), 1, "{events:?}");
+    assert_eq!(finals[0].payload["text"].as_str(), Some(whole.as_str()));
+    assert!(events.iter().any(|event| event.event_type == "turn.completed"));
+    fs::remove_dir_all(directory).unwrap();
+}

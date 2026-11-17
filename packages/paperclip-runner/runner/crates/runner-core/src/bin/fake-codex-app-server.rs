@@ -810,6 +810,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let repair_assigned_discovery = args
         .iter()
         .any(|value| value == "--repair-assigned-discovery");
+    // H5 (dl-finish-cap2): act on a refused oversized paperclip_finish the way
+    // a model does, by reading only the guidance the runner returned. Generic
+    // schema guidance names no length, so the model shrinks and retries; the
+    // over-cap guidance says to keep the answer whole and finish once briefly.
+    let follow_finish_denial = args
+        .iter()
+        .any(|value| value == "--follow-finish-denial");
+    let mut finish_attempt: u64 = 0;
+    let mut pending_whole_answer: Option<String> = None;
     let repair_first_task_confirmation = args
         .iter()
         .any(|value| value == "--repair-first-task-confirmation");
@@ -1168,6 +1177,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         if message.get("method").is_none()
             && message.get("id") == Some(&json!("terminal-result-request"))
         {
+            if follow_finish_denial {
+                let input = terminal_result
+                    .as_ref()
+                    .ok_or("--follow-finish-denial requires --terminal-result-file")?;
+                let whole = input["summary"].as_str().ok_or("finish input omitted summary")?.to_owned();
+                if message.pointer("/result/success") == Some(&json!(true)) {
+                    log_call(call_log.as_deref(), "terminal-result:accepted")?;
+                    if let Some(answer) = pending_whole_answer.take() {
+                        send(json!({"method": "item/completed", "params": {
+                            "threadId": state.thread_id, "turnId": state.active_turn_id,
+                            "item": {"id": "whole-answer", "type": "agentMessage", "phase": "final_answer", "status": "completed", "text": answer}
+                        }}))?;
+                    }
+                    finish_turn(&state_path, &mut state, "completed")?;
+                    continue;
+                }
+                log_call(call_log.as_deref(), "terminal-result:rejected")?;
+                let text = message
+                    .pointer("/result/contentItems/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                log_call(call_log.as_deref(), &format!("finish-denial-text:{text}"))?;
+                finish_attempt += 1;
+                let mut retry = input.clone();
+                if text.contains("Do not shorten the answer") {
+                    log_call(call_log.as_deref(), "finish-denial:whole-answer-final-message")?;
+                    retry["summary"] = json!(whole.chars().take(11_500).collect::<String>());
+                    pending_whole_answer = Some(whole);
+                } else if finish_attempt < 20 {
+                    log_call(call_log.as_deref(), "finish-denial:shrink-and-retry")?;
+                    let keep = (whole.chars().count() as u64 * 9u64.pow(finish_attempt as u32)
+                        / 10u64.pow(finish_attempt as u32)) as usize;
+                    retry["summary"] = json!(whole.chars().take(keep).collect::<String>());
+                } else {
+                    finish_turn(&state_path, &mut state, "failed")?;
+                    continue;
+                }
+                send(json!({
+                    "id": "terminal-result-request", "method": "item/tool/call",
+                    "params": {"threadId": state.thread_id, "turnId": state.active_turn_id,
+                        "callId": format!("terminal-result-call-{finish_attempt}"),
+                        "tool": "paperclip_finish", "arguments": retry}
+                }))?;
+                continue;
+            }
             let success = message.pointer("/result/success") == Some(&json!(true));
             log_call(
                 call_log.as_deref(),
