@@ -4,6 +4,7 @@ import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from ".
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { hasStopOnlyCleanup, prepareSupersededWarmSandboxStop } from "../sandbox-stop-and-retain.js";
 import { warmSandboxExpiryCandidateCondition } from "../warm-sandbox-expiry.js";
+import { logger } from "../../middleware/logger.js";
 
 /** Lease policies whose box a warm Stop can hand off (native-failed-workspace-recovery). */
 const reusableNativeLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
@@ -79,8 +80,15 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
         const [candidate] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
           eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
           warmSandboxExpiryCandidateCondition())).limit(1);
-        if (candidate && handedOffWarmLease(run, candidate))
-          await prepareSupersededWarmSandboxStop(db, candidate, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms });
+        const requested = candidate && handedOffWarmLease(run, candidate)
+          ? await prepareSupersededWarmSandboxStop(db, candidate, { [HANDED_OFF_WARM_STOP_KEY]: true, proofTimedOutMs: handedOffWarmProofTimeout.ms })
+          : null;
+        // rf-4 row 21 (the kind): a refusal is never silent. No intent here means
+        // the box is not a stop candidate (warmSandboxExpiryCandidateCondition:
+        // e.g. another live lease holds the same provider box, or a stop is in flight).
+        if (!requested) logger.warn({ runId: run.id, leaseId: lease.id, providerLeaseId: lease.providerLeaseId,
+          candidate: Boolean(candidate), timeoutMs: handedOffWarmProofTimeout.ms },
+          "handed-off warm proof timed out; no stop-and-retain intent written (the box is not a stop candidate)");
         return "timed_out" as const;
       }
       outcome = "unproven";
