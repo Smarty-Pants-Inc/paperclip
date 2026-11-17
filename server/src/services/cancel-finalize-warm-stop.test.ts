@@ -145,6 +145,12 @@ const support = await getEmbeddedPostgresTestSupport();
      * terminal_failure/native_retry_cancelled, no lease owner, no result (NSE :14280-14290), written
      * whether the warm session was retained or CLOSED; "owned" = a coordinator still owned (not settled). */
     coordinator?: "settled" | "owned";
+    /** pl/r4-work3 (a): NSE's record of the CLOSED session's close for this Stop
+     * (native-session-executor.ts releaseWarmNativeSession onStoppedSessionClose):
+     * "clean" = closeWarmNativeSession did not throw (the Pi transport ladder completed;
+     * on the Boat path the Runner's suspension receipt was accepted); "threw" = the close
+     * threw (swallowed by the release, recorded here). Absent = no record at all. */
+    closeProof?: "clean" | "threw";
     /** The live row's executionCancellation state at the boundary (default acknowledged). */
     executionCancellationState?: string };
   async function stopMidTurn(variant: Variant) {
@@ -217,7 +223,11 @@ const support = await getEmbeddedPostgresTestSupport();
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
         runnerProfileJson: { ...current.runnerProfileJson,
           ...(variant.settled ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-            companyId, issueId, runId, sessionId, bootId: "boot", generation: 1 } } : {}) },
+            companyId, issueId, runId, sessionId, bootId: "boot", generation: 1 } } : {}),
+          ...(variant.closeProof ? { nativeStoppedSessionClose: { schema: "paperclip.native-stopped-session-close.v1",
+            companyId, issueId, runId, sessionId, clean: variant.closeProof === "clean",
+            ...(variant.closeProof === "threw" ? { failure: "Pi RPC process did not exit after bounded shutdown escalation" } : {}),
+            at: stoppedAt.toISOString() } } : {}) },
       }).where(eq(heartbeatRuns.id, runId));
       if (variant.coordinator) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
         phase: variant.coordinator === "settled" ? "terminal_failure" : "observed",
@@ -367,7 +377,7 @@ const support = await getEmbeddedPostgresTestSupport();
 
   it("r4 WORK RED: a person's Stop whose warm Pi session was CLOSED (no retained-idle receipt) but settled by NSE on the coordinator: the bounded export finalizes and the +0 successor keeps the SAME box (not the pre-warmed spare), edit sha-equal", async () => {
     const f = await stopMidTurn({ edit: true, settled: false, exportFails: false, coordinator: "settled",
-      executionCancellationState: "requested" });
+      executionCancellationState: "requested", closeProof: "clean" });
     const boxes = await boxRelationship(f);
     const fields = liveFields(f, boxes.relationship);
     // eslint-disable-next-line no-console
@@ -393,6 +403,39 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
     expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toBeUndefined();
     expect(f.excluded).toBe(true);
+  }, 60_000);
+
+  // ---- pl/r4-work3 (a) rf-3: in the CLOSED case the export runs only on a clean-close proof ----
+  const TOOLS_NOT_PROVEN_LINE = "Stopped, but the box's tools could not be proven stopped, so the workspace was not copied back. The box is kept.";
+  it.each([
+    ["the close THREW (recorded unclean)", "threw"],
+    ["no close record at all", undefined],
+  ] as const)("r4work3 (a) RED: closed case, %s: no export, 'prepared' kept, the true line, the box stays protected", async (_label, closeProof) => {
+    const f = await stopMidTurn({ edit: true, settled: false, exportFails: false, coordinator: "settled",
+      executionCancellationState: "requested", closeProof });
+    // Not one box command after the Stop: nothing copied while a stopped tool may still write.
+    expect(f.runnerState.calls).toBe(f.callsAtStop);
+    expect(f.reference).toMatchObject({ state: "prepared", finalHostSha256: null });
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
+    expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "tools_not_proven_stopped" });
+    const deferred = f.events.filter(event => event.eventType === "workspace_export_deferred");
+    expect(deferred).toHaveLength(1);
+    expect(deferred[0]).toMatchObject({ level: "warn", message: TOOLS_NOT_PROVEN_LINE });
+    expect(f.events.filter(event => event.eventType === "provider.notice.recorded").map(event => event.message))
+      .toEqual([TOOLS_NOT_PROVEN_LINE]);
+    expect(f.events.filter(event => event.eventType === "workspace_export_finalized")).toEqual([]);
+    // The box stays a protected export source (reuse filter), and the lease is untouched (not stopped/archived).
+    expect(f.excluded).toBe(true);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    expect(lease.status).toBe("retained");
+  }, 60_000);
+
+  it("r4work3 (a) guard: the RETAINED branch (idle receipt) exports with no close record, as before", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false, coordinator: "settled" });
+    expect(f.stoppedRunProfile?.nativeStoppedSessionClose).toBeUndefined();
+    expect(f.reference?.state).toBe("finalized");
+    expect(f.excluded).toBe(false);
   }, 60_000);
 
   // ---- pl/cancel-finalize2: rf-4's three findings ----
