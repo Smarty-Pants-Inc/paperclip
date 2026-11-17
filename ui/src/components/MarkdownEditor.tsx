@@ -1451,7 +1451,6 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
       }}
       onKeyDownCapture={(e) => {
         if (readOnly || e.nativeEvent.isComposing || e.keyCode === 229) return;
-        if (e.key === "Enter" && (e.shiftKey || e.altKey)) return;
         if (
           (e.key === "Backspace" || e.key === "Delete")
           && e.target instanceof HTMLElement
@@ -1467,6 +1466,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           onSubmit(submitChord(e) ?? "default");
           return;
         }
+        // Resolve explicit send chords before leaving modified Enter with the
+        // editor. Shift+Enter/newlines and AltGraph must not accept autocomplete.
+        if (e.key === "Enter" && (e.shiftKey || e.altKey)) return;
 
         // Mention keyboard handling
         if (mentionActive) {

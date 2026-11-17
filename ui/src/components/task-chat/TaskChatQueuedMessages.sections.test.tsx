@@ -42,6 +42,16 @@ const withReset = () => queueOf([
   entry("behind", "After reset", { deliveryIntent: "steer", behindReset: true, queueId: "wake-3", queueRevision: "rev-3" }),
 ]);
 
+const drag = vi.hoisted(() => ({ end: null as null | ((event: any) => unknown) }));
+vi.mock("@dnd-kit/core", async (original) => {
+  const actual = await original<typeof import("@dnd-kit/core")>();
+  const React = await import("react");
+  return { ...actual, DndContext: (props: any) => {
+    drag.end = props.onDragEnd;
+    return React.createElement(actual.DndContext, props);
+  } };
+});
+
 describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -73,6 +83,99 @@ describe("TaskChatQueuedMessages: Steering and Queued sections", () => {
   const rowIds = (section: string) => [...container.querySelectorAll<HTMLElement>(
     `[data-testid="task-chat-queued-section-${section}"] [data-testid^="task-chat-queued-message-"]`)]
     .map((row) => row.dataset.testid!.replace("task-chat-queued-message-", ""));
+
+  it("JUDGE D1: drops into Steering refuse /new and behind-reset rows without any mutation", async () => {
+    const props = render({ queue: withReset() });
+    for (const id of ["reset", "behind"]) {
+      await act(async () => { await drag.end!({ active: { id }, over: { id: "m1" } }); });
+      expect(props.onReorder).not.toHaveBeenCalled();
+      expect(props.onSetIntent).not.toHaveBeenCalled();
+      expect(container.textContent).toContain(id === "reset" ? "/new always waits for this turn" : "this message is behind /new");
+    }
+  });
+
+  it("JUDGE D1: moving a Queued row into nonempty Steering stores the server order and mode", async () => {
+    const props = render();
+    await act(async () => { await drag.end!({ active: { id: "m3" }, over: { id: "m2" } }); });
+    expect(props.onReorder).toHaveBeenCalledWith(["m1", "m3", "m2", "m4", "m5"], "rev-1");
+    expect(props.onSetIntent).toHaveBeenCalledWith("m3", "steer");
+    expect(rowIds("steering")).toEqual(["m1", "m3", "m2", "m4"]);
+  });
+
+  // Keep reason: rf5's real empty-section drop and silently clamped message regressions.
+  it("drops a Queued row into empty Steering at the head and stores Steer", async () => {
+    const props = render({ queue: queueOf([
+      entry("q1", "First queued", { deliveryIntent: "queue" }),
+      entry("q2", "Second queued", { deliveryIntent: "queue" }),
+    ]) });
+    expect(q('[data-testid="task-chat-queued-drop-steering"]')).not.toBeNull();
+    await act(async () => { await drag.end!({ active: { id: "q2" }, over: { id: "task-chat-queued-drop-steering" } }); });
+    expect(props.onReorder).toHaveBeenCalledWith(["q2", "q1"], "rev-1");
+    expect(props.onSetIntent).toHaveBeenCalledWith("q2", "steer");
+    expect(rowIds("steering")).toEqual(["q2"]);
+    expect(rowIds("queued")).toEqual(["q1"]);
+  });
+
+  it("an already-head Queue row can drop into empty Steering without changing its order", async () => {
+    const props = render({ queue: queueOf([entry("q1", "First queued", { deliveryIntent: "queue" })]) });
+    await act(async () => { await drag.end!({ active: { id: "q1" }, over: { id: "task-chat-queued-drop-steering" } }); });
+    expect(props.onSetIntent).toHaveBeenCalledWith("q1", "steer");
+    expect(rowIds("steering")).toEqual(["q1"]);
+  });
+
+  it.each(["reset", "behind"])("empty Steering refuses %s with the /new reason and no mutation", async (id) => {
+    const props = render({ queue: queueOf(withReset().entries.slice(1)) });
+    await act(async () => { await drag.end!({ active: { id }, over: { id: "task-chat-queued-drop-steering" } }); });
+    expect(props.onReorder).not.toHaveBeenCalled();
+    expect(props.onSetIntent).not.toHaveBeenCalled();
+    expect(container.textContent).toContain(id === "reset" ? "/new always waits for this turn" : "this message is behind /new");
+    expect(rowIds("steering")).toEqual([]);
+  });
+
+  it.each([
+    { readOnly: true },
+    { onSetIntent: undefined },
+    { queue: queueOf([entry("q1", "Queued", { deliveryIntent: "queue" })], { steeringDisposition: "unsupported" }) },
+  ])("empty Steering cannot mutate when unavailable: %j", async (overrides) => {
+    const props = render({ queue: queueOf([entry("q1", "Queued", { deliveryIntent: "queue" })]), ...overrides });
+    await act(async () => { await drag.end!({ active: { id: "q1" }, over: { id: "task-chat-queued-drop-steering" } }); });
+    expect(props.onReorder).not.toHaveBeenCalled();
+    if (props.onSetIntent) expect(props.onSetIntent).not.toHaveBeenCalled();
+    expect(rowIds("steering")).toEqual([]);
+  });
+
+  it("a failed empty-Steering drop restores the row and shows the error", async () => {
+    render({ queue: queueOf([entry("q1", "Queued", { deliveryIntent: "queue" })]),
+      onReorder: vi.fn().mockRejectedValue(new Error("conflict")) });
+    await act(async () => { await drag.end!({ active: { id: "q1" }, over: { id: "task-chat-queued-drop-steering" } }); });
+    expect(rowIds("queued")).toEqual(["q1"]);
+    expect(container.textContent).toContain("Previous order restored");
+  });
+
+  it("clicking the preview expands the FULL long message and collapses again", () => {
+    const text = "A paragraph that must remain readable in full. ".repeat(30) + "Final uncut words.";
+    render({ queue: queueOf([entry("long", text, { deliveryIntent: "queue" })]) });
+    const preview = q('[data-testid="task-chat-queued-preview-long"]')!;
+    expect(preview).not.toBeNull();
+    expect(preview.getAttribute("aria-expanded")).toBe("false");
+    expect(preview.getAttribute("aria-label")).toContain(text);
+    expect(preview.querySelector(".line-clamp-2")).not.toBeNull();
+    flushSync(() => preview.click());
+    expect(preview.getAttribute("aria-expanded")).toBe("true");
+    expect(preview.querySelector(".line-clamp-2")).toBeNull();
+    expect(preview.textContent).toBe(text);
+    flushSync(() => preview.click());
+    expect(preview.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it.each(["Enter", " "])("the message preview also expands with keyboard %j", (key) => {
+    render();
+    const preview = q('[data-testid="task-chat-queued-preview-m1"]')!;
+    expect(preview).not.toBeNull();
+    expect(preview.tabIndex).toBe(0);
+    flushSync(() => preview.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true })));
+    expect(preview.getAttribute("aria-expanded")).toBe("true");
+  });
 
   it("org: lists every one of five waiting messages, never collapsing to one row", () => {
     render();

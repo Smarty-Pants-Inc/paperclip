@@ -1,4 +1,7 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { instanceExperimentalSettingsSchema } from "@paperclipai/shared";
+import { queryKeys } from "@/lib/queryKeys";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { IssueQueuedCommentEntry, IssueQueuedCommentQueue } from "@paperclipai/shared";
 import { TaskChatComposer } from "@/components/task-chat/TaskChatComposer";
@@ -40,14 +43,24 @@ const SAVED_ANSWER = [entry("answer", `Answered: Deployment choices\n\n${JSON.st
 
 type Args = {
   composer: "idle" | "working" | "unavailable" | "reset-draft";
-  list: "none" | "five" | "behind-new" | "paused" | "unsteerable" | "saved-answer" | "read-only";
+  list: "none" | "five" | "behind-new" | "paused" | "unsteerable" | "saved-answer" | "read-only" | "empty-steering" | "long-message";
   mobile: boolean;
+  legacySubmit: boolean;
 };
 
-function Note6Queue({ composer, list, mobile }: Args) {
+function Note6Queue({ composer, list, mobile, legacySubmit }: Args) {
+  const client = useMemo(() => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    queryClient.setQueryData(queryKeys.instance.experimentalSettings,
+      instanceExperimentalSettingsSchema.parse({ enableLegacyComposerSubmit: legacySubmit }));
+    return queryClient;
+  }, [legacySubmit]);
+  useEffect(() => () => client.clear(), [client]);
+  const [submitted, setSubmitted] = useState("");
   const [entries, setEntries] = useState(list === "behind-new" ? BEHIND_NEW : list === "none" ? []
     : list === "saved-answer" ? SAVED_ANSWER
-      : list === "unsteerable" ? FIVE.map((candidate) => ({ ...candidate, deliveryIntent: "queue" as const })) : FIVE);
+      : list === "long-message" ? [entry("long", "Keep the entire release checklist readable, including the final paragraph.\n\n" + "Check the composer shortcuts, preserve the queued messages, and verify the mobile layout before shipping. ".repeat(12) + "\n\nFinal paragraph: report every result without cutting any instructions.", { deliveryIntent: "queue" })]
+      : list === "unsteerable" || list === "empty-steering" ? FIVE.map((candidate) => ({ ...candidate, deliveryIntent: "queue" as const })) : FIVE);
   const working = composer !== "idle";
   const queue: IssueQueuedCommentQueue = {
     issueId: "note6", queueId: "wake-1", state: "deferred", targetRunId: working ? "run-1" : null,
@@ -56,10 +69,12 @@ function Note6Queue({ composer, list, mobile }: Args) {
     entries: entries.map((candidate, position) => ({ ...candidate, position })),
   };
   return (
+    <QueryClientProvider client={client}>
     <main className={`flex min-h-screen flex-col bg-background text-foreground ${mobile ? "p-3" : "p-6"}`}>
       <div className={`mx-auto flex w-full flex-1 flex-col ${mobile ? "max-w-full" : "max-w-3xl"}`}>
         <div className="flex-1 space-y-3 py-6 text-sm">
           <p className="rounded-lg bg-card px-4 py-3">I’m updating the composer and checking the responsive layout.</p>
+          {submitted ? <p role="status" data-testid="note6-submitted">{submitted}</p> : null}
         </div>
         <div className="relative isolate flex flex-col">
           {list !== "none" ? <TaskChatQueuedMessages
@@ -80,7 +95,9 @@ function Note6Queue({ composer, list, mobile }: Args) {
           /> : null}
           <div className="relative z-10">
             <TaskChatComposer
-              onAdd={async () => {}}
+              onAdd={async (body, _reopen, _reassignment, _attachmentIds, _clientRequestId, _runSettings, mode) => {
+                setSubmitted(`${mode ?? "send"}: ${body}`);
+              }}
               workMode="standard"
               conversationMode
               steeringDisposition={composer === "unavailable" ? "unsupported" : working ? "available" : null}
@@ -91,6 +108,7 @@ function Note6Queue({ composer, list, mobile }: Args) {
         </div>
       </div>
     </main>
+    </QueryClientProvider>
   );
 }
 
@@ -106,16 +124,19 @@ const meta = {
       "status": "current",
       "implementation": "production",
       "boundary": "fixtures",
-      "notes": "Production composer and queue with fixture queues: one merged wake (five messages) and a /new boundary with later wakes. No backend or provider runs.",
+      "notes": "Production composer/editor and queue with fixture queues: five messages, a /new boundary, empty Steering drop target, expandable long text, and both submit-key preferences. Submission is shown as a local receipt; drag callbacks store local order and intent. No backend or provider runs.",
     },
   },
-  args: { composer: "working", list: "five", mobile: false },
+  args: { composer: "working", list: "five", mobile: false, legacySubmit: false },
 } satisfies Meta<typeof Note6Queue>;
 
 export default meta;
 type Story = StoryObj<typeof meta>;
 
 export const WorkingFiveWaiting: Story = {};
+export const LegacySubmitKeys: Story = { args: { legacySubmit: true } };
+export const EmptySteeringDropTarget: Story = { args: { list: "empty-steering" } };
+export const ExpandableLongMessage: Story = { args: { list: "long-message" } };
 export const IdleSend: Story = { args: { composer: "idle", list: "none" } };
 export const SteeringUnavailable: Story = { args: { composer: "unavailable", list: "unsteerable" } };
 export const SteeringPaused: Story = { args: { composer: "unavailable", list: "paused" } };

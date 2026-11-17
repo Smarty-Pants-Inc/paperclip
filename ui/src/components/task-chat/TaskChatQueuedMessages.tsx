@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   DndContext,
   KeyboardSensor,
@@ -6,6 +6,7 @@ import {
   closestCenter,
   useSensor,
   useSensors,
+  useDroppable,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
@@ -139,6 +140,19 @@ export function steeringCount(entries: IssueQueuedCommentEntry[]): number {
 
 const ROW_BUTTON = "flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2 text-xs font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring disabled:cursor-not-allowed disabled:opacity-45 max-sm:h-11 max-sm:min-w-11 max-sm:justify-center";
 
+const EMPTY_STEERING_DROP_ID = "task-chat-queued-drop-steering";
+
+function EmptySteeringDropTarget({ disabled, children }: { disabled: boolean; children: ReactNode }) {
+  const { setNodeRef, isOver } = useDroppable({ id: EMPTY_STEERING_DROP_ID, disabled });
+  return (
+    <p ref={setNodeRef} data-testid={EMPTY_STEERING_DROP_ID}
+      className={cn("px-1.5 pb-1 text-xs text-muted-foreground", !disabled && "flex min-h-11 items-center rounded-md border border-dashed border-border",
+        isOver && !disabled && "bg-accent text-foreground ring-2 ring-ring")}>
+      {children}
+    </p>
+  );
+}
+
 function SortableQueuedMessage({
   entry,
   queue,
@@ -175,6 +189,7 @@ function SortableQueuedMessage({
   onDiscard: () => void;
   onCancelAutoSteer: () => void;
 }) {
+  const [expanded, setExpanded] = useState(false);
   const immutableResponse = entry.source?.kind === "interaction";
   const reset = isResetEntry(entry);
   const behindReset = !reset && entry.behindReset === true;
@@ -239,11 +254,28 @@ function SortableQueuedMessage({
       </button> : null}
 
       <div className="flex min-w-24 max-w-full flex-1 flex-col items-start gap-0.5 overflow-hidden px-1" title={label || undefined}>
-        {label ? <MarkdownBody
-          className="w-full min-w-0 line-clamp-2 sm:line-clamp-1 [&_p]:m-0!"
+        {label ? <div
+          role="button"
+          tabIndex={0}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? "Collapse queued message" : "Expand full queued message"}: ${label}`}
+          title={expanded ? "Collapse message" : "Expand full message"}
+          data-testid={`task-chat-queued-preview-${entry.comment.id}`}
+          className="w-full min-w-0 cursor-pointer rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+          onClick={(event) => {
+            if ((event.target as HTMLElement).closest("a, button")) return;
+            setExpanded((current) => !current);
+          }}
+          onKeyDown={(event) => {
+            if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) return;
+            event.preventDefault();
+            setExpanded((current) => !current);
+          }}
+        ><MarkdownBody
+          className={cn("w-full min-w-0 [&_p]:m-0!", !expanded && "line-clamp-2")}
           linkIssueReferences={false}
           mediaMode="omit"
-        >{label}</MarkdownBody> : null}
+        >{label}</MarkdownBody></div> : null}
         {reset ? <span className="text-xs text-muted-foreground" data-testid={`task-chat-queued-reset-caption-${entry.comment.id}`}>{RESET_ROW_CAPTION}</span> : null}
         {behindReset ? <span className="text-xs text-muted-foreground" data-testid={`task-chat-queued-behind-reset-caption-${entry.comment.id}`}>Behind /new: can't steer</span> : null}
         {images.length ? <div className="flex min-w-0 max-w-full flex-wrap items-center gap-1" role="group" aria-label="Queued images">
@@ -450,6 +482,7 @@ export function TaskChatQueuedMessages({
   async function handleDragEnd(event: DragEndEvent) {
     const { active, over } = event;
     if (
+      readOnly ||
       !queue.queueId ||
       !over ||
       active.id === over.id ||
@@ -461,18 +494,23 @@ export function TaskChatQueuedMessages({
     const activeCommentId = String(active.id);
     const moved = entries.find((entry) => entry.comment.id === activeCommentId);
     const from = entries.findIndex((entry) => entry.comment.id === activeCommentId);
+    const emptySteeringDrop = over.id === EMPTY_STEERING_DROP_ID;
     const overIndex = entries.findIndex((entry) => entry.comment.id === String(over.id));
-    if (!moved || overIndex < 0) return;
-    // The drop takes the section of the row it lands on.
+    if (!moved || (!emptySteeringDrop && overIndex < 0)) return;
+    // The empty section is its own target; ordinary drops take the row's section.
     const steeringRows = steeringCount(entries);
+    if (emptySteeringDrop && steeringRows !== 0) return;
     const fromSection = from < steeringRows ? "steering" : "queued";
-    const toSection = overIndex < steeringRows ? "steering" : "queued";
+    const toSection = emptySteeringDrop || overIndex < steeringRows ? "steering" : "queued";
     if (toSection === "steering" && fromSection === "queued" && (atOrBehindReset(moved) || moved.source?.kind === "interaction")) {
       setVisibleError(isResetEntry(moved) ? "Can't move to Steering: /new always waits for this turn" : BEHIND_RESET_STEER_REASON);
       return;
     }
     const intentChange: "steer" | "queue" | null = toSection !== fromSection ? (toSection === "steering" ? "steer" : "queue") : null;
-    const reordered = reorderQueuedMessageEntries(entries, activeCommentId, String(over.id));
+    if (intentChange && (!onSetIntent || (intentChange === "steer" && queue.steeringDisposition !== "available"))) return;
+    const reordered = emptySteeringDrop
+      ? from === 0 ? entries : reorderQueuedMessageEntries(entries, activeCommentId, entries[0].comment.id)
+      : reorderQueuedMessageEntries(entries, activeCommentId, String(over.id));
     if (!reordered) return;
     const next = intentChange
       ? reordered.map((entry) => entry.comment.id === activeCommentId ? { ...entry, deliveryIntent: intentChange } : entry)
@@ -693,13 +731,13 @@ export function TaskChatQueuedMessages({
                       : "Sent after the agent finishes this turn, top first"}</span> : null}
                 </h3>
                 {rows.length === 0 ? (
-                  <p className="px-1.5 pb-1 text-xs text-muted-foreground">
-                    {section === "steering"
-                      ? queue.steeringDisposition !== "available"
-                        ? "This runner can't take messages mid-turn, so everything waits in the queue. Use Interrupt now to send one first."
-                        : readOnly ? "Nothing steering." : "Nothing steering. Drag a message here, or press Steer on it."
-                      : "Nothing queued."}
-                  </p>
+                  section === "steering" ? <EmptySteeringDropTarget
+                    disabled={readOnly || !queue.queueId || !onSetIntent || Boolean(pending || reordering) || queue.steeringDisposition !== "available"}
+                  >
+                    {queue.steeringDisposition !== "available"
+                      ? "This runner can't take messages mid-turn, so everything waits in the queue. Use Interrupt now to send one first."
+                      : readOnly || !onSetIntent ? "Nothing steering." : "Nothing steering. Drag a message here, or press Steer on it."}
+                  </EmptySteeringDropTarget> : <p className="px-1.5 pb-1 text-xs text-muted-foreground">Nothing queued.</p>
                 ) : rows.map((entry) => {
                   const action = pending?.commentId === entry.comment.id ? pending.action : null;
                   const busy = Boolean(pending || reordering);

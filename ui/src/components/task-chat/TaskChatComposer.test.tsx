@@ -311,6 +311,56 @@ function renderComposer(props: ComponentProps<typeof TaskChatComposer>) {
   render(<TaskChatComposer {...props} />);
 }
 
+// Judge rf5 cases run through the production composer and MarkdownEditor capture handler.
+// Keep reason: recorded real catch — the pure resolver missed dead advertised shortcuts.
+describe("JUDGE actual MarkdownEditor through TaskChatComposer send chords", () => {
+  const combinations = [
+    { legacy: false, name: "Enter", keys: {}, mode: "steer" },
+    { legacy: false, name: "Ctrl+Enter", keys: { ctrlKey: true }, mode: "queue" },
+    { legacy: false, name: "Meta+Enter", keys: { metaKey: true }, mode: "queue" },
+    { legacy: false, name: "Ctrl+Alt+Enter", keys: { ctrlKey: true, altKey: true }, mode: "interrupt" },
+    { legacy: false, name: "Meta+Alt+Enter", keys: { metaKey: true, altKey: true }, mode: "interrupt" },
+    { legacy: true, name: "Ctrl+Enter", keys: { ctrlKey: true }, mode: "steer" },
+    { legacy: true, name: "Meta+Enter", keys: { metaKey: true }, mode: "steer" },
+    { legacy: true, name: "Ctrl+Shift+Enter", keys: { ctrlKey: true, shiftKey: true }, mode: "queue" },
+    { legacy: true, name: "Meta+Shift+Enter", keys: { metaKey: true, shiftKey: true }, mode: "queue" },
+    { legacy: true, name: "Ctrl+Alt+Enter", keys: { ctrlKey: true, altKey: true }, mode: "interrupt" },
+    { legacy: true, name: "Meta+Alt+Enter", keys: { metaKey: true, altKey: true }, mode: "interrupt" },
+  ];
+  it.each(combinations)("$name sends $mode (legacy=$legacy)", async ({legacy, keys, mode}) => {
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    client.setQueryData(queryKeys.instance.experimentalSettings, { enableLegacyComposerSubmit: legacy });
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<QueryClientProvider client={client}><TaskChatComposer onAdd={onAdd} onStop={async () => {}} steeringDisposition="available" conversationMode workMode="standard" /></QueryClientProvider>);
+    typeText("A real composer chord");
+    const event = new KeyboardEvent("keydown", {key:"Enter", ...keys, bubbles:true, cancelable:true});
+    flushSync(() => editable().dispatchEvent(event));
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+    expect(onAdd.mock.calls[0]?.[6]).toBe(mode);
+    expect(event.defaultPrevented).toBe(true);
+    client.clear();
+  });
+
+  it.each([false, true])("AltGraph is ignored and newline stays in the editor (legacy=%s)", async legacy => {
+    const client = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    client.setQueryData(queryKeys.instance.experimentalSettings, { enableLegacyComposerSubmit: legacy });
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<QueryClientProvider client={client}><TaskChatComposer onAdd={onAdd} onStop={async () => {}} steeringDisposition="available" conversationMode workMode="standard" /></QueryClientProvider>);
+    typeText("Keep draft");
+    const altGraph = new KeyboardEvent("keydown", {key:"Enter", ctrlKey:true, altKey:true, bubbles:true, cancelable:true});
+    Object.defineProperty(altGraph,"getModifierState",{value:(key:string)=>key==="AltGraph"});
+    flushSync(() => editable().dispatchEvent(altGraph));
+    const newline = new KeyboardEvent("keydown", {key:"Enter", shiftKey:!legacy, bubbles:true,cancelable:true});
+    flushSync(() => editable().dispatchEvent(newline));
+    await flushAsync();
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(altGraph.defaultPrevented).toBe(false);
+    expect(newline.defaultPrevented).toBe(false);
+    client.clear();
+  });
+});
+
 describe("TaskChatComposer", () => {
   describe("plain HTTP without randomUUID", () => {
     beforeEach(() => {
