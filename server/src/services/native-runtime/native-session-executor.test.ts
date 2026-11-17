@@ -14336,6 +14336,105 @@ describe("native warm session supervision", () => {
       },
     );
 
+    // Paul's SMA-4 (b34f4ecb, fd8621d4): a person's Stop or the queued-message
+    // Interrupt cancels the turn; the next message's run retires the warm
+    // predecessor through the configuration-changed path. Its close checkpoint
+    // is refused by the harness-storage fence (native_harness_storage_owner_superseded):
+    // issues.executionRunId already names this successor and the cancelled
+    // predecessor never commits. That refusal is permanent, so it can never be
+    // the reason the first follow-up fails once the Launcher proves the old
+    // Runner stopped. Without that proof no second writer may start.
+    it.each([
+      { route: "stop", launcher: "stopped" },
+      { route: "interrupt", launcher: "stopped" },
+      { route: "stop", launcher: "stop-unconfirmed" },
+      { route: "interrupt", launcher: "stop-unconfirmed" },
+    ] as const)("answers the first follow-up after a person's $route when the cancelled owner's checkpoint is superseded by it (launcher: $launcher)", async ({ route, launcher }) => {
+      const { base, next } = fixture(`chat-retire-${route}-${launcher}`);
+      const identity = { runnerInstanceId: "runner", environmentLeaseId: "lease", runId: base.binding.runId,
+        normalizedSessionId: base.session.normalizedSessionId!, turnId: "turn", itemId: "item" };
+      let stopped = false;
+      const task = vi.fn(async (operation: any) => {
+        if (operation.kind === "describe") return { kind: "description", taskId: "old-task", launchPreparationVersion: 1,
+          projectAuthCheckVersion: 1, runner: { version: "fixture", digest: `sha256:${"a".repeat(64)}` } };
+        if (operation.kind === "stop" && launcher === "stop-unconfirmed") throw new Error("launcher stop unavailable");
+        if (operation.kind === "stop") stopped = true;
+        if (operation.kind === "status") return { kind: "status", taskId: "old-task", phase: stopped ? "cancelled" : "running", executionStopped: stopped };
+        return { kind: "accepted", taskId: "old-task" };
+      });
+      const createOwner = pluginTaskRuntime.createPluginRunnerTaskOwner;
+      let owner!: ReturnType<typeof createOwner>;
+      const ownerFactory = vi.spyOn(pluginTaskRuntime, "createPluginRunnerTaskOwner").mockImplementation(input => {
+        owner = createOwner({ ...input, adoptIdentity: identity });
+        return owner;
+      });
+      onTestFinished(() => ownerFactory.mockRestore());
+      const backend = await createRunnerdBackend({ db: leaseDb(base),
+        execution: { ...base, session: { ...base.session, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } } },
+        runnerInstanceId: "runner", runnerIngressAuthorized: true,
+        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: ".", leaseId: "lease", runnerTask: task } });
+      const registration = await owner.registration({} as never, base.binding.runId);
+      // The production fence error (native-harness-backup-storage.ts fence():
+      // executionRunId names another run and the owner is not committed),
+      // rethrown by releaseRunnerProcessOwnership after its checkpoint.
+      const superseded = new Error("native_harness_storage_owner_superseded");
+      let closePromise: Promise<void> | undefined;
+      const close = vi.fn(() => closePromise ??= (async () => {
+        await registration.release();
+        throw superseded;
+      })());
+      const session = { close };
+      backend.bindManagedSession(session as never);
+      const collectStopped = vi.fn(async () => undefined);
+      const retirementFailed = vi.fn(async () => {});
+      const cancelled = { ...result, terminal: { runTerminalState: "cancelled" } };
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.(session); return cancelled;
+      }).mockImplementationOnce(async options => {
+        // A fresh thread: never the predecessor's half-closed transport.
+        expect(options.existingSession).toBeUndefined();
+        return result;
+      });
+      try {
+        await executePaperclipNativeSession({ db: leaseDb(base), execution: base, runnerInstanceId: "runner",
+          instructionWorkingCopy: { hasChanges: async () => false, collectStopped, retirementFailed } });
+        // Interrupt: the follow-up starts at once (suppressImmediateRecovery);
+        // Stop: the follow-up arrives after the cancelled turn settled.
+        if (route === "stop") await new Promise(resolve => setTimeout(resolve, 0));
+        const followUp = { ...next, session: base.session, binding: { ...next.binding, runId: `${base.binding.runId}-follow-up` } };
+        const attempt = executePaperclipNativeSession({ db: leaseDb(followUp), execution: followUp,
+          runnerInstanceId: "runner", refreshTools: true });
+        if (launcher === "stopped") {
+          // Answered on its FIRST run: no failed run, no "send again".
+          await expect(attempt).resolves.toBeDefined();
+          expect(state.execute).toHaveBeenCalledTimes(2);
+          // The cancelled turn's own teardown, then this follow-up's retirement.
+          expect(close.mock.calls).toEqual([[{ reason: "warm native session failed" }],
+            [{ reason: "warm native session configuration changed" }]]);
+          // Never-OK: the stopped owner's files are collected, not dropped.
+          expect(collectStopped).toHaveBeenCalledOnce();
+          // Only the cancelled turn's own failed teardown kept them for later.
+          expect(retirementFailed).toHaveBeenCalledOnce();
+          expect(retirementFailed.mock.invocationCallOrder[0]).toBeLessThan(collectStopped.mock.invocationCallOrder[0]!);
+          expect(owner.isRetired()).toBe(true);
+        } else {
+          // The old Runner may still be running: no second writer starts, and the
+          // run reports the one typed refusal its fallback replaces the sandbox on.
+          await expect(attempt).rejects.toMatchObject({ code: "native_predecessor_retirement_unproven",
+            predecessorRunId: base.binding.runId });
+          expect(state.execute).toHaveBeenCalledOnce();
+          expect(collectStopped).not.toHaveBeenCalled();
+          // The predecessor's files stay kept for later collection.
+          expect(retirementFailed).toHaveBeenCalled();
+        }
+        expect(task.mock.calls.some(([operation]) => operation.kind === "read_state")).toBe(false);
+      } finally {
+        close.mockResolvedValue(undefined);
+        await closeIdleWarmNativeSessionsForRestart();
+        ownerFactory.mockRestore();
+      }
+    });
+
     it.each(["contained", "handoff-unconfirmed"] as const)(
       "stops an idle warm owner whose close cannot settle when its environment is deleted (%s)", async mode => {
         const { base } = fixture(`idle-unsettled-${mode}`);
