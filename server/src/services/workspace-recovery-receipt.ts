@@ -6,7 +6,7 @@ import { z } from "zod";
 import { readNativeWorkspaceSyncReference, type NativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readSnapshot } from "./workspace-recovery-snapshot.js";
-import { exhaustedSystemRecoveryAction, isCapturePolicyRearmable, readSystemRecovery } from "./system-recovery-state.js";
+import { exhaustedStopWait, exhaustedSystemRecoveryAction, isCapturePolicyRearmable, readSystemRecovery } from "./system-recovery-state.js";
 import { verifiedUnchangedRestoredSnapshot, verifiedWorkspaceSnapshotReuse } from "./remote-workspace-snapshot-reuse-receipt.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 
@@ -84,6 +84,8 @@ export function savedWorkOffersRetry(state: { status: string; canRetry: boolean 
   if (workspaceRestoreDelayed(state, evidence, holdWrittenAt)) return true;
   const ownerRecovery = evidence.workspaceOwnerRecovery as { state?: unknown } | undefined;
   const recovery = readSystemRecovery(evidence);
+  // Waiting on an unconfirmed stop: Retry cannot release it (one decision with the chat).
+  if (exhaustedStopWait(recovery, evidence)) return false;
   return state.canRetry && !(ownerRecovery?.state === "operator_required" && evidence.workspaceOwnerStop == null)
     && recovery?.state === "exhausted" && !recovery.freshAttemptRunId && recovery.failure?.retryClass !== "recheck_evidence"
     && !isCapturePolicyRearmable(recovery);
@@ -94,7 +96,7 @@ export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runI
   const state = readWorkspaceRecovery(evidence);
   if (!state || state.runId !== runId) return undefined;
   return { status: state.status, stage: state.stage,
-    canRetry: state.status === "blocked" && state.retryable === true,
+    canRetry: state.status === "blocked" && state.retryable === true && !exhaustedStopWait(readSystemRecovery(evidence), evidence),
     message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
       : state.status === "recovered" ? recoveredWorkMessage(run?.status, run?.retryOffered ?? false)
         : blockedWorkspaceRecoveryMessage(evidence) ?? state.message ?? "Recovery of this task's saved work has not finished.",

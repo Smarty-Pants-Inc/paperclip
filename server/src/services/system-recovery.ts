@@ -130,12 +130,37 @@ export function unadoptedWorkspaceRecoveryCondition() {
   )!;
 }
 
+/** The periodic fallback for a lost wake (rf-3 15:30Z (2)): while any owed
+ * restore hold is unsettled the worker re-checks at most this long apart. A new
+ * bound, not a worker schedule constant: retries, backoff and window are unchanged. */
+export const OWED_RESTORE_HOLD_RECHECK_MS = 60_000;
+/** An owed hold (workspaceRestorePending) the worker has not settled: no
+ * systemRecovery yet or one still scheduled/running/awaiting evidence, and its
+ * workspaceRecovery (if any) still queued/recovering. */
+export function unsettledOwedRestoreHoldCondition() {
+  return and(
+    sql`${issueRecoveryActions.evidence}->'workspaceRestorePending' = 'true'::jsonb`,
+    sql`coalesce(${issueRecoveryActions.evidence}#>>'{systemRecovery,state}', 'scheduled') in ('scheduled', 'running', 'awaiting_evidence')`,
+    sql`coalesce(${issueRecoveryActions.evidence}#>>'{workspaceRecovery,status}', 'queued') in ('queued', 'recovering')`,
+  )!;
+}
+
 export async function nextWorkspaceRecoveryAt(db: Db): Promise<number | null> {
   // A hold written but not yet adopted is due now, so a lost wake cannot leave
   // it unscheduled. Adoption removes it from this set on the worker's next run.
   const [unadopted] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
     .where(unadoptedWorkspaceRecoveryCondition()).limit(1);
   if (unadopted) return 0;
+  const [owed] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+    .where(unsettledOwedRestoreHoldCondition()).limit(1);
+  const at = await nextScheduledWorkspaceRecoveryAt(db);
+  // Periodic fallback: an unsettled owed hold re-arms the coordinator within the bound.
+  if (!owed) return at;
+  const fallback = Date.now() + OWED_RESTORE_HOLD_RECHECK_MS;
+  return at === null ? fallback : Math.min(at, fallback);
+}
+
+async function nextScheduledWorkspaceRecoveryAt(db: Db): Promise<number | null> {
   const rows = await db.select({ at: sql<number>`case
     when ${retainedSourceFallbackPendingCondition()} then ${retainedSourceFallbackDueAt()}
     when ${stopProofRearmPendingCondition()} then ${stopProofRearmDueAt()}
