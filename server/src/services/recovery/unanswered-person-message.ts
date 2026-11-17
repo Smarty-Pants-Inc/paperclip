@@ -544,7 +544,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // A board-owned hold means nothing moves by itself: queued wakes behind it
   // do not count as a further attempt.
   const [activeRecovery] = await q.select({ id: issueRecoveryActions.id, nextAction: issueRecoveryActions.nextAction,
-    ownerType: issueRecoveryActions.ownerType }).from(issueRecoveryActions).where(and(
+    ownerType: issueRecoveryActions.ownerType, wakePolicy: issueRecoveryActions.wakePolicy }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
@@ -656,10 +656,14 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // the Retry remedy, even when classified as system-owned recovery. Do not
   // contradict it with "send the message again". A hold alone, a deleted
   // notice, an older run's notice, or an automatic continuation is not enough.
-  // Require the producer's affirmative "Press Retry" sentence, not merely
-  // "retry": a stale card says "do not retry from this older card".
+  // Prefer the existing structured manual Retry policy. Older recovery
+  // records have only nextAction prose: Retry can follow setup instructions
+  // ("restore access, then press Retry"), but a negated remedy cannot cover it.
   // This decision is re-read unchanged under the issue fence before writing.
-  if (run && activeRecovery && /(?:^|[.!?]\s+)Press Retry\b/i.test(activeRecovery.nextAction)) {
+  const retryRemedy = activeRecovery?.wakePolicy?.type === "manual_retry"
+    || (activeRecovery && /\bretry\b/i.test(activeRecovery.nextAction)
+      && !/\b(?:do\s+not\s+retry|automatic\s+retr(?:y|ies)\s+(?:(?:is|are)\s+)?stopped|retry\s+is\s+not\s+available)\b/i.test(activeRecovery.nextAction));
+  if (run && activeRecovery && retryRemedy) {
     const recoveryNotices = await q.select({ metadata: issueComments.metadata }).from(issueComments).where(and(
       eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
       eq(issueComments.authorType, "system"), isNull(issueComments.deletedAt), gt(issueComments.createdAt, message.createdAt),
