@@ -43,7 +43,10 @@ import { settleUnansweredPersonMessagesForTask, unansweredPersonMessageCondition
 //   mid-thinking) -> 3a301e73 resumed.
 // These run the REAL scheduling path: runner terminal -> finalizeNativeRun ->
 // arbiter -> status-decision committer -> the wake / retry dispatchers.
-type CutShape = "cap_no_text" | "eof_mid_thinking" | "provider_error_mid_answer" | "refusal";
+type CutShape = "cap_no_text" | "cap_mid_answer" | "eof_mid_thinking" | "provider_error_mid_answer" | "transport_mid_answer" | "refusal";
+const CAP_EXHAUSTED_NOTE = "The model ran out of output budget before answering. Press Retry to try once more.";
+const CONNECTION_EXHAUSTED_NOTE = "The connection to the model dropped before the answer finished, twice. Press Retry to try once more.";
+const PARTIAL_ANSWER = "Step 1: snapshot the invoices table. Step 2: ";
 const ASK = "Write the full migration plan for the billing tables, every step, nothing left out.";
 const STORED = { provider: "pi_rpc", model: "paperclip/faux", piRpcThinkingLevel: "xhigh" };
 
@@ -88,8 +91,10 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       failed(2, { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false })];
     if (shape === "eof_mid_thinking") return [item(1, "reasoning", "considering the tables ".repeat(50)),
       failed(2, { code: "pi_provider_error", message: "unexpected EOF" })];
-    if (shape === "provider_error_mid_answer") return [item(1, "agentMessage", "Step 1: snapshot the invoices table. Step 2: "),
-      failed(2, { code: "pi_provider_error", message: "upstream connect error: stream reset" })];
+    if (shape === "cap_mid_answer") return [item(1, "agentMessage", PARTIAL_ANSWER),
+      failed(2, { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit." })];
+    if (shape === "provider_error_mid_answer" || shape === "transport_mid_answer") return [item(1, "agentMessage", PARTIAL_ANSWER),
+      failed(2, { code: shape === "transport_mid_answer" ? "pi_rpc_transport_failed" : "pi_provider_error", message: "upstream connect error: stream reset" })];
     return [failed(1, { code: "pi_provider_error", stopCategory: "reasoning_extraction",
       message: "This request appears to violate our Terms of Service. Please see the Usage Policies." })];
   }
@@ -147,7 +152,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
   }
 
   /** Real completion publication, replay and the unanswered-message worker boundary. */
-  async function assertOnePublishedNoteAfterSweep(issueId: string, runId: string) {
+  async function assertOnePublishedNoteAfterSweep(issueId: string, runId: string, expectedBody = CAP_EXHAUSTED_NOTE) {
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
@@ -165,7 +170,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       readFailureReportSecrets: () => [],
       adapterResult: { exitCode: 1, signal: null, timedOut: false, sessionId: "fixture-provider-session",
         sessionParams: { sessionId: "fixture-provider-session" }, errorCode: "adapter_failed",
-        errorMessage: "Pi's final assistant response reached its output limit.", resultJson: run.resultJson ?? {},
+        errorMessage: run.error ?? "Provider turn failed", resultJson: run.resultJson ?? {},
         nativeFinalization: { schema: "paperclip.native-finalization.v1", runtimeMode: "native", runId, issueId, companyId, result: {},
           terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" },
           turnId: null, sourceInstanceId: run.runnerInstanceId!, normalizedSessionId: run.nativeSessionId!, providerSessionId: "fixture-provider-session",
@@ -186,7 +191,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
       .filter(comment => comment.authorType !== "user" && !comment.deletedAt);
     expect(comments).toHaveLength(1);
     expect(comments[0]).toMatchObject({ createdByRunId: runId,
-      body: "The model ran out of output budget before answering. Press Retry to try once more." });
+      body: expectedBody });
     expect(comments[0]!.body).not.toMatch(/continuing|wasn't answered|Sending it again is safe/u);
     expect(await db.select({ id: issues.id }).from(issues).where(and(eq(issues.id, issueId),
       unansweredPersonMessageCondition(issues.id, issues.companyId)))).toEqual([]);
@@ -308,6 +313,28 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(manual[0]!.status).toBe("queued");
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
+
+  // Real executor -> finalizer -> dispatch -> completion/replay -> sweep, for
+  // every cut mix. No provider execution or additional automatic send is allowed.
+  const cuts = ["cap_no_text", "cap_mid_answer", "eof_mid_thinking", "provider_error_mid_answer", "transport_mid_answer"] as const;
+  it.each(cuts.flatMap(first => cuts.map(last => [first, last] as const)))(
+    "exhausted cut %s -> %s publishes the LAST failure once, never a generic resend",
+    async (firstShape, lastShape) => {
+      const issueId = await task();
+      const first = await cutTurn(issueId, firstShape);
+      const { heartbeat, successors } = await dispatchEverything(issueId, first.runId);
+      expect(successors).toHaveLength(1);
+      const second = await cutTurn(issueId, lastShape, successors[0]!.id);
+      expect(second.decision.reasonCode).toBe("native_run_failed_continuation_exhausted");
+      const after = await dispatchEverything(issueId, first.runId);
+      expect(after.successors.map(run => run.id)).toEqual([second.runId]);
+      expect(await genericWakes(issueId)).toEqual([]);
+      const note = lastShape.startsWith("cap_") ? CAP_EXHAUSTED_NOTE : CONNECTION_EXHAUSTED_NOTE;
+      const prefix = lastShape.endsWith("mid_answer") ? `${PARTIAL_ANSWER}\n\n— ` : "";
+      await assertOnePublishedNoteAfterSweep(issueId, second.runId, prefix + note);
+      await heartbeat.drainActiveRunExecutions();
+    }, 180_000,
+  );
 
   it("RED gate 5 (6490dd70 -> 3a301e73): an EOF mid-thinking has ONE successor through recovery, resuming the session, and no generic wake", async () => {
     const issueId = await task();

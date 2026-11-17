@@ -2,6 +2,7 @@ import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { writeRuntimeRunPointer } from "./runtime-run-pointer.js";
 import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { readRunAnswerEvents, readThinkingCapStop, thinkingCapStopCandidate } from "../thinking-cap-stop.js";
+import { readExhaustedNativeMidStreamCutCandidate } from "../native-runtime/native-mid-stream-cut.js";
 import { settleReattachRun } from "./run-admission.js";
 import { readNativeStartupCleanup } from "../native-runtime/native-startup-cleanup.js";
 import { isContextCompactionRun } from "../context-compaction.js";
@@ -2550,6 +2551,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // the completed item is inside it, never posted on its own as well. A
     // completed answer of an EARLIER turn keeps its selection unchanged.
     const streamedRows = await readRunAnswerEvents(db, companyId, runId);
+    // The last cut of the ONE automatic successor ends the lane, whatever
+    // kind its parent was. Publish its note even with no answer text; with
+    // text, keep it whole but never promise another automatic continuation.
+    const exhaustedCut = await readExhaustedNativeMidStreamCutCandidate(db, { companyId, runId }, streamedRows);
+    if (exhaustedCut) return exhaustedCut;
     const cut = readFailedTurnStreamedAnswer(streamedRows);
     if (cut && (!selected || selected.seq >= cut.startSeq)) return cut.candidate;
     if (selected) return selected;

@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
-import { cutAnswerContinuationInstruction, readThinkingOnlyCapStop } from "../heartbeat-run-summary.js";
+import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, readThinkingOnlyCapStop,
+  THINKING_CAP_STOP_AGAIN_NOTE, type CompletedFinalAgentMessageCandidate } from "../heartbeat-run-summary.js";
 import { readRunAnswerEvents } from "../thinking-cap-stop.js";
 
 export { NATIVE_MID_STREAM_CUT_CODE, NATIVE_MID_STREAM_CUT_MESSAGE, NATIVE_PROVIDER_REFUSAL_TERMINAL_REASON,
@@ -50,6 +51,40 @@ export function isNativeMidStreamCutRecoveryRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "retryOfRunId" | "scheduledRetryReason">,
 ): boolean {
   return Boolean(run.retryOfRunId) && run.scheduledRetryReason === NATIVE_MID_STREAM_CUT_CODE;
+}
+
+export const NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE =
+  "The connection to the model dropped before the answer finished, twice. Press Retry to try once more.";
+
+/**
+ * The cut lane's ONE automatic successor also failed: publish the last cut's
+ * true note, not a promise to continue. Keep any streamed answer whole, but
+ * replace its continuing note. A refusal is owned by the refusal path, never
+ * described as a dropped connection. A person's Retry has no cut-lane marking.
+ * Publication uses the normal attributed completion reply, so the unanswered
+ * sweep sees this message's notice duty discharged through its run lineage.
+ */
+export async function readExhaustedNativeMidStreamCutCandidate(
+  db: Pick<Db, "select">, input: { companyId: string; runId: string },
+  rows: readonly { seq: number; payload: unknown }[],
+): Promise<(CompletedFinalAgentMessageCandidate & { reasonCode: string }) | null> {
+  const cut = classifyNativeMidStreamCut(rows);
+  if (!cut || cut === "provider_refusal") return null;
+  const [run] = await db.select({ retryOfRunId: heartbeatRuns.retryOfRunId, scheduledRetryReason: heartbeatRuns.scheduledRetryReason })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId))).limit(1);
+  if (!run || !isNativeMidStreamCutRecoveryRun(run)) return null;
+  const terminal = [...rows].sort((a, b) => b.seq - a.seq).find(row =>
+    record(record(row.payload).prpEvent).eventType === "turn.failed")!;
+  const event = record(record(terminal.payload).prpEvent);
+  const prefix = readFailedTurnStreamedAnswer(rows)?.text;
+  const note = cut === "provider_error" ? NATIVE_MID_STREAM_CUT_CONNECTION_EXHAUSTED_NOTE : THINKING_CAP_STOP_AGAIN_NOTE;
+  return {
+    seq: terminal.seq,
+    sourceEventId: typeof event.sourceEventId === "string" ? event.sourceEventId : null,
+    channel: "final",
+    text: prefix ? `${prefix}${prefix.endsWith("\n") ? "" : "\n"}\n— ${note}` : note,
+    reasonCode: `native_mid_stream_cut_exhausted_${cut}`,
+  };
 }
 
 /** Failed-turn retries that follow their predecessor's task ownership the same way. */
