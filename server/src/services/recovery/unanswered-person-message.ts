@@ -79,6 +79,8 @@ export const UNANSWERED_MESSAGE_UNCLASSIFIED_CODE = "unclassified_failure";
  * carries it and is replaced in place by the no-run text at the bound. */
 const WAITING_ROW_LABEL = "Waiting code";
 const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] }]);
+/** S124: the parked-wake note replaces a standing waiting note in place. */
+export const UNANSWERED_WAITING_ROW_JSON = WAITING_ROW_JSON;
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
