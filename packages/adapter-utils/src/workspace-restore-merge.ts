@@ -601,39 +601,54 @@ async function withCanonicalDirectoryMergeLock<T>(
 async function copySnapshotEntry(sourceDir: string, targetDir: string, relative: string, entry: SnapshotEntry, signal?: AbortSignal): Promise<void> {
   const sourcePath = path.join(sourceDir, relative);
   const targetPath = path.join(targetDir, relative);
+  // An aborted owner (deadline or lost ownership) mutates nothing more: check
+  // after every awaited step and before every host mutation in each branch.
+  const guard = () => signal?.throwIfAborted();
 
   if (entry.kind === "dir") {
+    guard();
     const existing = await fs.lstat(targetPath).catch(() => null);
     if (existing?.isDirectory()) {
       return;
     }
     if (existing) {
+      guard();
       await fs.rm(targetPath, { recursive: true, force: true }).catch(() => undefined);
     }
+    guard();
     await fs.mkdir(targetPath, { recursive: true });
     return;
   }
 
+  guard();
   await fs.mkdir(path.dirname(targetPath), { recursive: true });
   if (entry.kind === "symlink") {
+    guard();
     await fs.rm(targetPath, { recursive: true, force: true });
+    guard();
     await fs.symlink(entry.target, targetPath);
     return;
   }
   // An interrupted restore must not leave a truncated current file. Keep the
   // incoming tree until its owner records success; exact retries deduplicate.
   const temporary = path.join(path.dirname(targetPath), `.paperclip-merge-${randomUUID()}`);
+  // The temporary is this restore's own uniquely named file: the finally still
+  // removes it after an abort (it is never another owner's file).
   try {
+    guard();
     await fs.copyFile(sourcePath, temporary, fsConstants.COPYFILE_FICLONE).catch(async () => {
+      guard();
       await fs.copyFile(sourcePath, temporary);
     });
+    guard();
     await fs.chmod(temporary, entry.mode);
     const file = await fs.open(temporary, "r");
     try { await file.sync(); } finally { await file.close(); }
     const existing = await fs.lstat(targetPath).catch(() => null);
     // An aborted owner publishes nothing more: check before the replace.
-    signal?.throwIfAborted();
+    guard();
     if (existing?.isDirectory()) await fs.rm(targetPath, { recursive: true, force: true });
+    guard();
     await fs.rename(temporary, targetPath);
   } finally { await fs.rm(temporary, { force: true }); }
 
@@ -792,6 +807,8 @@ export async function mergeDirectoryWithBaseline(input: {
       const current = input.snapshots?.current ?? await capture(canonicalTargetDir,
         input.conflictPolicy === "reject" ? { exclude: [], diskBacked: true } : options);
       try {
+        // The current-tree capture is awaited: check after it, before any write.
+        signal?.throwIfAborted();
         if (input.conflictPolicy === "reject") {
           const conflicts = directoryMergeConflicts(input.baseline, source, current);
           if (conflicts.length) throw new DirectoryMergeConflict(conflicts);
