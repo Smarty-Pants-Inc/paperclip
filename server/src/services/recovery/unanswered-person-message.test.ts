@@ -2794,6 +2794,33 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
     });
 
+    // H3 card carry, the COLLECTING side of RFL F2 (app-lead 23:36Z): the real carry (readContinuationCommentInput, the seam
+    // every successor seed uses) WRITES the card's interaction id into the successor's own pending input, so the successor's
+    // completed final answer is attributed to the card. Without it the person gets a false "not answered" notice.
+    it("H3 card carry: the REAL carry writes the card into the successor's own pending input; its completed answer is ANSWERED; no notice", async () => {
+      const f = await fixture({ status: "in_progress" });
+      const root = await f.run({ commentId: await f.message(), status: "succeeded" });
+      const card = await answeredCard(f, root);
+      const first = await resume(f, card.id, "failed");
+      const seed = await readContinuationCommentInput(db, { ...f, runId: first });
+      expect.soft(seed, "the failed answer-resume run's card answer is carried").toMatchObject({ interactionIds: [card.id], interactionId: card.id });
+      const successor = await f.run({ status: "succeeded", retryOfRunId: first });
+      await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_continuation_needed", ...seed } })
+        .where(eq(heartbeatRuns.id, successor));
+      await f.reply(successor);
+      const m = { id: sql`${card.id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+        createdAt: sql`${(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id)))[0]!.resolvedAt!.toISOString()}::timestamptz` };
+      const [row] = await db.select({ answered: completedPersonMessageAnswerSql(m) }).from(issues).where(eq(issues.id, f.issueId));
+      await f.sweep(); await f.sweep();
+      const notices = await cardNotices(f);
+      console.log("H3_CARD_CARRY_ATTRIBUTED", JSON.stringify({ card: card.id, first, successor, seed, answered: row!.answered,
+        notices: notices.map(n => ({ id: n.id, body: n.body })) }));
+      expect(row!.answered, "the successor's completed final answer is ANSWERED for the carried card").toBe(true);
+      expect(notices, "no false notice").toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect((await readContinuationCommentInput(db, { ...f, runId: first })).interactionIds ?? [], "answered: never carried again").not.toContain(card.id);
+    });
+
     it("supersedes(RFL F2 pending-only attribution, 22:41Z): guard: answer, answer-resume fails, successor answers: no notice", async () => {
       // RFL F2: the successor carries the answer in its own pending input (resume helper); was ancestry-only.
       const f = await fixture({ status: "in_progress" });
