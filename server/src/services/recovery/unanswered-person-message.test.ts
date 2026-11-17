@@ -1161,6 +1161,58 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       .toHaveLength(1);
   });
 
+  // Keep: rf5 H4 F1 caught confirmation acceptance changing pending -> accepted,
+  // which made the original input look unanswered again. Use the production
+  // creation and resolution services, not a hand-written terminal status.
+  it.each([
+    { chat: true, decision: "accept" }, { chat: false, decision: "accept" },
+    { chat: true, decision: "reject" }, { chat: false, decision: "reject" },
+    { chat: true, decision: "skip" }, { chat: false, decision: "skip" },
+    { chat: true, decision: "withdraw" }, { chat: false, decision: "withdraw" },
+  ] as const)("H4 confirmation reply: $decision leaves no notice or carry (chat=$chat)", async ({ chat, decision }) => {
+    const f = await fixture({ chat, status: "in_progress" });
+    const messageId = await f.message("Apply the proposed change.");
+    const sourceRunId = await f.run({ commentId: messageId, status: "running" });
+    const svc = issueThreadInteractionService(db);
+    const scope = { id: f.issueId, companyId: f.companyId };
+    const card = await svc.create(scope, {
+      kind: "request_confirmation", sourceRunId, continuationPolicy: "none",
+      payload: { version: 1, prompt: "Apply this change?", rejectRequiresReason: true },
+    }, { agentId: f.agentId, runId: sourceRunId });
+    expect(card.status).toBe("pending");
+    // Align the real card/run with the fixture's elapsed settlement clock.
+    await db.update(issueThreadInteractions).set({ createdAt: f.at() }).where(eq(issueThreadInteractions.id, card.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: f.at() }).where(eq(heartbeatRuns.id, sourceRunId));
+    const noticesEver = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      sql`starts_with(${issueComments.metadata}->>'authorizationReason', 'unanswered_message:')`));
+    const assertQuiet = async () => {
+      await f.sweep();
+      expect(await noticesEver(), "no notice, including soft-deleted notices").toHaveLength(0);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect(await readContinuationCommentInput(db, { ...f, runId: sourceRunId })).toEqual({});
+      expect(await db.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.id, messageId), unansweredPersonMessageCommentCondition()))).toHaveLength(0);
+    };
+    await assertQuiet();
+    const actor = { userId: f.userId };
+    const reason = { reason: "Keep the current behavior." };
+    const resolved = decision === "accept"
+      ? (await svc.acceptInteraction({ ...scope, projectId: null, goalId: null }, card.id, {}, actor)).interaction
+      : decision === "reject" ? await svc.rejectInteraction(scope, card.id, reason, actor)
+      : decision === "skip" ? await svc.skipInteraction(scope, card.id, reason, actor)
+      : await svc.withdrawInteraction(scope, card.id, reason, actor);
+    const expectedStatus = { accept: "accepted", reject: "rejected", skip: "cancelled", withdraw: "cancelled" };
+    expect(resolved).toMatchObject({ status: expectedStatus[decision], resolvedByUserId: f.userId });
+    await assertQuiet();
+    // Cross the 10-minute no-reply grace as well as ordinary settlement, then
+    // sweep twice. No provider reply or continuation wake can mask this bug.
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(heartbeatRuns.id, sourceRunId));
+    await assertQuiet();
+    await assertQuiet();
+    expect(await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+      eq(issueComments.authorType, "agent")))).toHaveLength(0);
+  });
+
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
     "PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
       const f = await fixture();
@@ -1174,7 +1226,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
           kind, status: "pending", sourceRunId: runId, createdByAgentId: f.agentId, createdAt: f.at(),
           payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
-        for (const status of ["pending", "answered"]) {
+        for (const status of kind === "ask_user_questions" ? ["pending", "answered"] : ["pending", "accepted", "rejected"]) {
           await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
           expect(await settleUnansweredPersonMessage(db, f), `${kind}/${status}`).toEqual({ kind: "answered" });
           expect(await readContinuationCommentInput(db, { ...f, runId })).toEqual({});
@@ -1188,7 +1240,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       }
     });
 
-  it.each(["cancelled", "expired", "other-run", "other-task", "other-company", "board"])(
+  it.each(["cancelled", "expired", "failed", "cancelled-by-admin", "expired-by-admin", "other-run", "other-task", "other-company", "board"])(
     "PV2 card-answer guard: %s is not an answered message", async variant => {
       const f = await fixture();
       const messageId = await f.message();
@@ -1197,7 +1249,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const unrelatedRun = await f.run({ status: "succeeded" });
       await db.insert(issueThreadInteractions).values({ companyId: variant === "other-company" ? other.companyId : f.companyId,
         issueId: variant === "other-task" ? other.issueId : f.issueId, kind: "ask_user_questions",
-        status: ["cancelled", "expired"].includes(variant) ? variant : "answered",
+        status: variant.endsWith("-by-admin") ? variant.split("-")[0] : ["cancelled", "expired", "failed"].includes(variant) ? variant : "answered",
+        ...(variant.endsWith("-by-admin") ? { resolvedByUserId: f.userId,
+          result: { version: 1, outcome: "issue_closed", answers: [] } } : {}),
         sourceRunId: variant === "other-run" ? unrelatedRun : sourceRunId,
         createdByAgentId: variant === "board" ? null : f.agentId, createdAt: f.at(), payload: { version: 1, questions: [] } });
       expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: "no_reply" });
