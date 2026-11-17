@@ -1,0 +1,27 @@
+{
+  "name": "@smarty-pants/plugin-g12-backstop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Code-only GitHub review/check backstop using Paperclip scheduled jobs",
+  "license": "MIT",
+  "files": ["dist", "INSTALL.md"],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
+    "build": "node esbuild.config.mjs",
+    "test": "vitest run --config vitest.config.ts",
+    "typecheck": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps && tsc --noEmit"
+  },
+  "dependencies": {"@paperclipai/plugin-sdk": "workspace:*"},
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  },
+  "engines": {"node": ">=24.11.0"}
+}

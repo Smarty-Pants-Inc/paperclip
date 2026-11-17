@@ -1,0 +1,104 @@
+import { G12Error, G12ErrorCode as Code } from "./errors.js";
+
+export interface G12Config {
+  enabled: boolean;
+  companyId: string;
+  appId: number;
+  installationId: number;
+  privateKeyRef: { type: "secret_ref"; secretId: string; version?: "latest" | number };
+  repos: string[];
+  maxGetsPerTick: number;
+  missingReviewMinutes: number;
+  owners: Record<string, { agentId: string; issueId: string }>;
+}
+
+const uuid = "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$";
+const repo = "^(?!\\.{1,2}/)[A-Za-z0-9_.-]+/(?!\\.{1,2}$)[A-Za-z0-9_.-]+$";
+const login = "^[A-Za-z0-9][A-Za-z0-9-]*(\\[bot\\])?$";
+
+// One ref, at one fixed path. No inline keys, trigger credentials or arbitrary URLs.
+export const configSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["enabled", "companyId", "appId", "installationId", "privateKeyRef", "repos", "owners"],
+  properties: {
+    enabled: { type: "boolean", default: false },
+    companyId: { type: "string", pattern: uuid },
+    appId: { type: "integer", minimum: 1 },
+    installationId: { type: "integer", minimum: 1 },
+    privateKeyRef: {
+      type: "object", additionalProperties: false, required: ["type", "secretId"],
+      properties: {
+        type: { type: "string", const: "secret_ref" },
+        secretId: { type: "string", pattern: uuid },
+        version: { anyOf: [{ type: "string", const: "latest" }, { type: "integer", minimum: 1 }] },
+      },
+    },
+    repos: { type: "array", minItems: 1, maxItems: 500, uniqueItems: true, items: { type: "string", pattern: repo } },
+    maxGetsPerTick: { type: "integer", minimum: 2, maximum: 1000, default: 200 },
+    missingReviewMinutes: { type: "integer", minimum: 1, maximum: 1440, default: 15 },
+    owners: {
+      type: "object", minProperties: 1, propertyNames: { pattern: login },
+      additionalProperties: {
+        type: "object", additionalProperties: false, required: ["agentId", "issueId"],
+        properties: { agentId: { type: "string", pattern: uuid }, issueId: { type: "string", pattern: uuid } },
+      },
+    },
+  },
+};
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function keys(value: Record<string, unknown>, allowed: string[]) {
+  if (Object.keys(value).some((key) => !allowed.includes(key))) throw new G12Error(Code.ConfigUnknownField);
+}
+function matches(value: unknown, pattern: string): value is string {
+  return typeof value === "string" && new RegExp(pattern).test(value);
+}
+function positive(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+/** Validate again in the worker: config may arrive by startup replay, not the form. */
+export function parseConfig(value: unknown): G12Config {
+  if (!record(value)) throw new G12Error(Code.ConfigInvalid);
+  keys(value, Object.keys(configSchema.properties));
+  if (typeof value.enabled !== "boolean" || !matches(value.companyId, uuid) ||
+      !positive(value.appId) || !positive(value.installationId)) throw new G12Error(Code.ConfigIdentity);
+  const ref = value.privateKeyRef;
+  if (!record(ref)) throw new G12Error(Code.ConfigSecretRef);
+  keys(ref, ["type", "secretId", "version"]);
+  if (ref.type !== "secret_ref" || !matches(ref.secretId, uuid) ||
+      (ref.version !== undefined && ref.version !== "latest" && !positive(ref.version))) {
+    throw new G12Error(Code.ConfigSecretRef);
+  }
+  if (!Array.isArray(value.repos) || value.repos.length < 1 || value.repos.length > 500 ||
+      !value.repos.every((name) => matches(name, repo))) throw new G12Error(Code.ConfigRepos);
+  const repos = value.repos.map((name: string) => name.toLowerCase());
+  if (new Set(repos).size !== repos.length) throw new G12Error(Code.ConfigDuplicateRepo);
+  const maxGetsPerTick = value.maxGetsPerTick ?? 200;
+  if (!positive(maxGetsPerTick) || maxGetsPerTick < 2 || maxGetsPerTick > 1000) throw new G12Error(Code.ConfigGetLimit);
+  const minutes = value.missingReviewMinutes ?? 15;
+  if (!positive(minutes) || minutes > 1440) throw new G12Error(Code.ConfigMinutes);
+  if (!record(value.owners) || Object.keys(value.owners).length === 0) throw new G12Error(Code.ConfigOwners);
+  const owners: G12Config["owners"] = Object.create(null);
+  const issueAgents = new Map<string, string>();
+  for (const [author, owner] of Object.entries(value.owners)) {
+    if (!matches(author, login) || !record(owner)) throw new G12Error(Code.ConfigOwner);
+    keys(owner, ["agentId", "issueId"]);
+    if (!matches(owner.agentId, uuid) || !matches(owner.issueId, uuid)) throw new G12Error(Code.ConfigOwner);
+    const normalized = author.toLowerCase();
+    if (Object.hasOwn(owners, normalized)) throw new G12Error(Code.ConfigDuplicateOwner);
+    if (issueAgents.has(owner.issueId) && issueAgents.get(owner.issueId) !== owner.agentId) {
+      throw new G12Error(Code.ConfigConflictingIssueOwner);
+    }
+    issueAgents.set(owner.issueId, owner.agentId);
+    owners[normalized] = { agentId: owner.agentId, issueId: owner.issueId };
+  }
+  return {
+    enabled: value.enabled, companyId: value.companyId, appId: value.appId, installationId: value.installationId,
+    privateKeyRef: { type: "secret_ref", secretId: ref.secretId, ...(ref.version === undefined ? {} : { version: ref.version as "latest" | number }) },
+    repos, maxGetsPerTick, missingReviewMinutes: minutes, owners,
+  };
+}
