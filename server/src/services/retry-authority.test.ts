@@ -8,11 +8,13 @@ import {
 } from "./native-runtime/held-predecessor-notice-text.js";
 import { RECOVERING_SAVED_WORK_NEXT_ACTION, WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
 import { withoutUnavailableRetry } from "./execution-blocker.js";
+import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
 
 // Retry fold: the STATE TABLE of the one authority. Each row is a judge-bar
 // state; the decision gives canRetry, the card text, the transcript note, the
 // structured next action and the user action TOGETHER (R15: card = transcript).
-const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; userAction: string; text: string | null }> = [
+const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; userAction: string; text: string | null;
+  admission?: "held" }> = [
   { row: "R1 A manager Stop, Retry accepted", facts: { stopKind: "manager", retrySource: true }, canRetry: true, userAction: "retry", text: STOPPED_TASK_RETRY_MESSAGE },
   { row: "R1/R10 F1 manager Stop, Retry source refused", facts: { stopKind: "manager", retrySource: false }, canRetry: false, userAction: "new_task", text: STOPPED_TASK_NEW_TASK_MESSAGE },
   { row: "R2 C own Stop unproven, waiting", facts: { stopGate: "waiting", retrySource: true }, canRetry: false, userAction: "wait", text: RETRY_STOP_WAIT_MESSAGE },
@@ -32,21 +34,26 @@ const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; 
   { row: "supersedes: no work saved, held", facts: { stoppedBeforeWork: true, savedWork: "recovered", heldConversation: true, retrySource: true }, canRetry: true, userAction: "retry", text: NO_SAVED_WORK_RETRY_MESSAGE },
   { row: "no work saved, held, Retry source refused", facts: { stoppedBeforeWork: true, heldConversation: true, retrySource: false }, canRetry: false, userAction: "new_task", text: NO_SAVED_WORK_NEW_TASK_MESSAGE },
   // RESTORE HOLD: the words are legacy-execution-recovery.ts's (restore-card), delegated, not mapped here.
-  { row: "restore hold, files owed", facts: { restoreHold: { [WORKSPACE_RESTORE_PENDING_KEY]: true }, retrySource: true }, canRetry: false, userAction: "wait", text: RECOVERING_SAVED_WORK_NEXT_ACTION },
+  // fam-retry2 (upstream wins): accepted and HELD, in the hold's words.
+  { row: "restore hold, files owed", facts: { restoreHold: { [WORKSPACE_RESTORE_PENDING_KEY]: true }, retrySource: true }, canRetry: true, userAction: "wait", text: RECOVERING_SAVED_WORK_NEXT_ACTION, admission: "held" },
+  { row: "restore hold, Paperclip's workspace recovery owns the files", facts: { restoreHold: { workspaceRestoreFailure: "restore_failed",
+    workspaceRestoreRecovery: { schema: LEGACY_WORKSPACE_RECOVERY_SCHEMA } }, retrySource: true }, canRetry: true, userAction: "wait",
+    text: workspaceRestoreHoldNextAction({ workspaceRestoreFailure: "restore_failed" }), admission: "held" },
   { row: "restore hold, restore failed", facts: { restoreHold: { workspaceRestoreFailure: "restore_failed" }, retrySource: true }, canRetry: false, userAction: "new_task",
     text: withoutUnavailableRetry(workspaceRestoreHoldNextAction({ workspaceRestoreFailure: "restore_failed" }), false) },
 ];
 
 describe("retry fold: one authority state table", () => {
-  it.each(rows)("$row", ({ facts, canRetry, userAction, text }) => {
+  it.each(rows)("$row", ({ facts, canRetry, userAction, text, admission }) => {
     const decision = decideRetryAuthority(facts);
     expect(decision).toMatchObject({ canRetry, userAction, cardText: text });
+    expect(decision.admission).toBe(admission);
     // R15: the card and the transcript note carry the SAME instruction, exactly.
     expect(decision.transcriptNotice).toBe(decision.cardText);
     // The structured next action is the card's own instruction (or none, when the card names no action).
     if (decision.nextAction) expect(decision.cardText).toContain(decision.nextAction);
     // Retry is offered exactly where the user action is Retry.
-    expect(decision.canRetry).toBe(decision.userAction === "retry");
+    expect(decision.canRetry).toBe(decision.userAction === "retry" || decision.admission === "held");
     if (!decision.canRetry) expect(decision.cardText ?? "").not.toMatch(/Press Retry|Retry continues/);
   });
 
