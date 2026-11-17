@@ -6,9 +6,9 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
+import { hasAcknowledgedNativeRunStopRequest, hasAcknowledgedNativeStopIntent } from "./acknowledged-native-stop.js";
 import { hasStopOnlyCleanup } from "./sandbox-stop-and-retain.js";
-import { retainedWarmHandoffLease } from "./native-runtime/handed-off-warm-lease.js";
+import { HANDED_OFF_WARM_EXIT_KEY, retainedWarmHandoffLease } from "./native-runtime/handed-off-warm-lease.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -73,6 +73,29 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
       nativeSessionId: run.nativeSessionId, bootId: coordinator.controllerBootId, generation: coordinator.controllerGeneration }));
 }
 
+/** pl/pausing: a person's Stop handed this cancelled warm run's box off, the
+ * Send's s3 fence then PROVED the run's Runner exited (its persisted
+ * HANDED_OFF_WARM_EXIT_KEY stamp names this run), and the successor took the
+ * same box (environments.ts replacesReusableLeaseId: this row expired, released,
+ * cleanup success, with the reusableLeaseSuccessor binding naming this lease and
+ * run). Execution of this run there has stopped, and the box is the successor's,
+ * so no stop receipt for this run will ever be written: the lease is settled as
+ * already handed off. Whole-agent Stop only (never the task/claim path). */
+function handedOffToSuccessor(run: Run, lease: Lease): boolean {
+  const exit = lease.metadata?.[HANDED_OFF_WARM_EXIT_KEY] as { runId?: unknown } | undefined;
+  const raw = lease.metadata?.reusableLeaseSuccessor;
+  const successor = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : null;
+  return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeRunStopRequest(run)
+    && lease.heartbeatRunId === run.id && lease.companyId === run.companyId
+    && lease.status === "expired" && !!lease.releasedAt && lease.cleanupStatus === "success"
+    && lease.leasePolicy === "reuse_by_environment" && !!lease.provider && lease.provider !== "local" && !!lease.providerLeaseId
+    && exit?.runId === run.id && !!successor && successor.schema === "paperclip.reusable-lease-handoff.v1"
+    && successor.previousLeaseId === lease.id && successor.previousRunId === run.id
+    && successor.companyId === lease.companyId && successor.provider === lease.provider
+    && successor.providerLeaseId === lease.providerLeaseId
+    && typeof successor.successorRunId === "string" && successor.successorRunId !== run.id;
+}
+
 /** The retained warm box a keep_running Stop hands off: remote, active,
  * reuse_by_environment, unreleased, no cleanup, no release deferral and no
  * stop_and_retain. Shape only; it proves nothing about Stop by itself. */
@@ -125,7 +148,8 @@ async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
     if (handedOff.has(run.id)) continue;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
+      if (run.status === "cancelled" && !runLeases.every(lease => hasRemoteTerminationReceipt(lease)
+        || (settleCoordinators && handedOffToSuccessor(run, lease)))) return "remote_stop_unconfirmed";
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
