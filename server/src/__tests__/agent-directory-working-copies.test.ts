@@ -19,7 +19,8 @@ const execFile = promisify(execFileCallback);
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { spawn } from "node:child_process";
 import { eq, sql } from "drizzle-orm";
 import { agentFileStore, fileHash, inspectAgentFile, inspectAgentDirectory, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
 import { agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
@@ -579,12 +580,34 @@ describe("persistent agent directories", () => {
         };
         const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), leaseId: "", remoteCwd, runner };
         await db.insert(environments).values({ id: executionTarget.environmentId, name: `Boat sandbox ${executionTarget.environmentId}`, driver: "sandbox" });
+        // The parked chat on the box: a runnerd stand-in with ONE idle provider
+        // child, journalled in the runner's real process-lineage layout
+        // (runner-core process_lineage/journal.rs). backgroundChild() adds a
+        // live tool/background job under runnerd.
+        const runnerStateDirectory = path.join(remoteCwd, ".paperclip-runtime", "paperclip-runner", "sessions", createHash("sha256").update(randomUUID()).digest("hex"), "runner");
+        await fs.mkdir(path.join(runnerStateDirectory, "process-lineage"), { recursive: true });
+        const started = async (pid: number) => { const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8"); return Number(stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19]); };
+        const runnerd = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process");
+          const children = [];
+          const start = () => { const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); children.push(child); process.stdout.write(child.pid + "\\n"); };
+          process.stdin.on("data", () => start()); process.on("SIGTERM", () => { for (const child of children) child.kill("SIGKILL"); process.exit(0); }); start();`], { stdio: ["pipe", "pipe", "inherit"] });
+        const childPids: number[] = [];
+        let waiting: ((pid: number) => void) | null = null;
+        runnerd.stdout!.setEncoding("utf8").on("data", (chunk: string) => { for (const line of chunk.split("\n").filter(Boolean)) { childPids.push(Number(line)); waiting?.(Number(line)); } });
+        onTestFinished(() => { runnerd.kill("SIGTERM"); });
+        const nextChild = () => new Promise<number>(resolve => { waiting = pid => { waiting = null; resolve(pid); }; });
+        const providerPid = childPids[0] ?? await nextChild();
+        const writer = { pid: runnerd.pid!, started: await started(runnerd.pid!) }, provider: [number, number] = [providerPid, await started(providerPid)];
+        await fs.writeFile(path.join(runnerStateDirectory, "process-lineage", `writer-${writer.pid}.json`), JSON.stringify({ schema: "paperclip.runner.process-lineage-writer.v1", writer }));
+        await fs.writeFile(path.join(runnerStateDirectory, "process-lineage", `lineage-${writer.pid}-0.json`), JSON.stringify({ schema: "paperclip.runner.process-lineage.v1",
+          writer, root: provider, members: [provider], groups: [], sessions: [], sampled_through: provider[1] }));
+        const backgroundChild = async () => { const next = nextChild(); runnerd.stdin!.write("x"); return next; };
         const prepare = async (options: { warm?: boolean; reuseRunId?: string } = {}) => {
           const runId = await nextRun();
           executionTarget.leaseId = randomUUID();
           await db.insert(environmentLeases).values({ id: executionTarget.leaseId, companyId, environmentId: executionTarget.environmentId,
             heartbeatRunId: runId, provider: "daytona", providerLeaseId: "boat-fixture-allocation" });
-          return (await copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, ...options }))!;
+          return (await copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, ...(options.reuseRunId ? { runnerStateDirectory } : {}), ...options }))!;
         };
         // A sibling task on the same sandbox saves through its own remote run.
         const siblingSavesRemote = async (relative: string, body: string) => {
@@ -594,7 +617,7 @@ describe("persistent agent directories", () => {
           expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: executionTarget }))?.state).toBe("saved");
           expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(body);
         };
-        return { executionTarget, prepare, siblingSavesRemote };
+        return { executionTarget, prepare, siblingSavesRemote, runnerStateDirectory, backgroundChild };
       }
       const contextFor = async (copy: { runId: string; executionRoot: string }) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
         adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
@@ -715,22 +738,25 @@ describe("persistent agent directories", () => {
           const runId = await nextRun();
           try {
             let handoffError: unknown;
-            await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId })
+            await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId, runnerStateDirectory: boat.runnerStateDirectory })
               .catch(error => { handoffError = error; });
             expect({ bytes: await fs.readFile(path.join(chatA.executionRoot, f)), refused: handoffError instanceof AgentDirectoryReuseInvalidatedError },
               `${timing}: never overwrite the warm writer's bytes or accept a raced handoff`).toEqual({ bytes, refused: true });
             expect(handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
-            expect((handoffError as Error).message).toBe(timing === "after-checkpoint" ? "Warm agent directory changed after its checkpoint" : "Warm agent directory note refresh could not be verified");
+            // A same-file write is caught IN placement (moved-aside bytes differ
+            // from the baseline) and put back; a disjoint write by the post-check.
+            expect((handoffError as Error).message).toBe(timing === "after-checkpoint" ? "Warm agent directory changed after its checkpoint"
+              : timing === "between-capture-and-rename" ? "Warm agent directory note refresh could not be verified" : "Warm agent directory note refresh failed");
             const deliveries = upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"));
             const renames = shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram));
             expect(deliveries).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
             expect(renames).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
             expect(raced).toBe(timing !== "after-checkpoint");
             const captures = capture.mock.calls.flatMap(([input], index) => input.runId === chatA.runId ? [capture.mock.results[index]!.value] : []);
-            expect(captures).toHaveLength(timing === "after-checkpoint" ? 1 : 2);
+            expect(captures).toHaveLength(timing === "between-capture-and-rename" ? 2 : 1);
             const observed = fileCheckpoints.checkpointSnapshot((await captures[0]!).manifest);
             expect(directorySnapshotSha256(observed) === chatA.baseHash).toBe(timing !== "after-checkpoint");
-            if (timing !== "after-checkpoint") {
+            if (timing === "between-capture-and-rename") {
               const verified = fileCheckpoints.checkpointSnapshot((await captures[1]!).manifest);
               const canonical = fileCheckpoints.checkpointSnapshot(await fileCheckpoints.cachedAgentFileManifest(root));
               expect(directorySnapshotSha256(verified)).not.toBe(directorySnapshotSha256(canonical));
@@ -753,6 +779,122 @@ describe("persistent agent directories", () => {
         }
       }, 90_000);
 
+      // RFL ruling (a)+(b): a race INSIDE delivery keeps the agent's change and
+      // takes the existing retirement + fresh restore. One helper per shape.
+      async function raceDuringDelivery(input: { baseline: Record<string, string>; sibling: (boat: Awaited<ReturnType<typeof sandbox>>) => Promise<void>;
+        race: (warmRoot: string) => Promise<void> }) {
+        await paulBundle();
+        for (const [name, body] of Object.entries(input.baseline)) await fs.writeFile(path.join(root, name), body);
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await input.sibling(boat);
+        const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+        let raced = false;
+        const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async uploadInput => {
+          if (uploadInput.adapterKey.startsWith("agent-notes-")) { await input.race(chatA.executionRoot); raced = true; }
+          return actualUpload(uploadInput);
+        });
+        const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+        const runId = await nextRun();
+        let handoffError: unknown;
+        try {
+          await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId, runnerStateDirectory: boat.runnerStateDirectory })
+            .catch(error => { handoffError = error; });
+          return { boat, chatA, runId, raced, handoffError, applies: shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram)).length };
+        } finally { upload.mockRestore(); shell.mockRestore(); }
+      }
+
+      it("REMOTE sandbox never-OK: a delete that lands during delivery is not resurrected", async () => {
+        const f = "memory/warm-deleted.md";
+        const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+          sibling: boat => boat.siblingSavesRemote(f, "sibling F'\n"), race: async warm => fs.unlink(path.join(warm, f)) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        await expect(fs.stat(path.join(result.chatA.executionRoot, f))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await copies.get(companyId, result.runId)).toBeNull();
+        expect((await copies.get(companyId, result.chatA.runId))?.state).toBe("warm_saved");
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: a write to a file on the remove list that lands during delivery survives", async () => {
+        const b = "memory/warm-removed.md";
+        const bytes = Buffer.from("warm writer kept B\n");
+        const result = await raceDuringDelivery({ baseline: { [b]: "B\n" },
+          sibling: async boat => {
+            const sibling = await boat.prepare();
+            await fs.unlink(path.join(sibling.executionRoot, b));
+            await fs.writeFile(path.join(sibling.executionRoot, note), "sibling note\n");
+            expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: boat.executionTarget }))?.state).toBe("saved");
+            await expect(fs.stat(path.join(root, b))).rejects.toMatchObject({ code: "ENOENT" });
+          },
+          race: async warm => fs.writeFile(path.join(warm, b), bytes) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect(await fs.readFile(path.join(result.chatA.executionRoot, b))).toEqual(bytes);
+        // Retirement saves the agent's bytes first; the fresh restore has them.
+        expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, b))).toEqual(bytes);
+        const fresh = (await copies.prepare({ ...target(), runId: result.runId, cwd: home, target: result.boat.executionTarget, warm: true }))!;
+        expect(await fs.readFile(path.join(fresh.executionRoot, b))).toEqual(bytes);
+        await copies.collectStopped({ companyId, runId: result.runId, target: result.boat.executionTarget });
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: a live background child of the chat falls back with no delivery", async () => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await boat.siblingSavesRemote(note, "sibling note\n");
+        await boat.backgroundChild();
+        const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime");
+        const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+        const runId = await nextRun();
+        try {
+          await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId, runnerStateDirectory: boat.runnerStateDirectory }))
+            .rejects.toThrow("Warm runner quiescence is unproven");
+          expect(upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"))).toHaveLength(0);
+          expect(shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram))).toHaveLength(0);
+        } finally { upload.mockRestore(); shell.mockRestore(); }
+        await expect(fs.stat(path.join(chatA.executionRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+        // Without the runner's state directory nothing is delivered either.
+        const runId2 = await nextRun();
+        await expect(copies.prepare({ ...target(), runId: runId2, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toThrow("Warm runner quiescence is unproven");
+        // The existing fallback: collect the old owner (no unsaved change), then restore fresh.
+        expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("unchanged");
+        const fresh = (await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true }))!;
+        expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe("sibling note\n");
+        await copies.collectStopped({ companyId, runId, target: boat.executionTarget });
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: EEXIST on no-replace placement keeps the agent's bytes", async () => {
+        // The path is recreated between the move-aside and link(2): a preload
+        // performs that write inside the real program's first linkSync call.
+        const boat = await sandbox();
+        const warmRoot = path.join(boat.executionTarget.remoteCwd, "warm-root"), source = path.join(warmRoot, ".paperclip-runtime", "notes-x", "files");
+        const f = "memory/eexist.md", baselineBytes = "baseline\n", agentBytes = "agent recreated\n", sibling = "sibling\n";
+        await fs.mkdir(path.join(warmRoot, "memory"), { recursive: true });
+        await fs.mkdir(path.join(source, "memory"), { recursive: true });
+        await fs.writeFile(path.join(warmRoot, f), baselineBytes);
+        await fs.writeFile(path.join(source, f), sibling);
+        const preload = path.join(boat.executionTarget.remoteCwd, "eexist-preload.cjs");
+        await fs.writeFile(preload, `const fs = require("node:fs"); const link = fs.linkSync; let once = false;
+          fs.linkSync = (from, to) => { if (!once) { once = true; fs.writeFileSync(to, ${JSON.stringify(agentBytes)}); } return link(from, to); };`);
+        const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+        const plan = { root: warmRoot, source, aside: path.join(warmRoot, ".paperclip-runtime", "notes-x", "aside"), runner: boat.runnerStateDirectory,
+          remove: [], dirs: [], files: [[f, 0o600, { "": sha(baselineBytes) }, sha(sibling)]] };
+        const result = await execFile(process.execPath, ["-r", preload, "-e", applyWarmNotesProgram, JSON.stringify(plan)]).then(() => null, error => error as { code: number; stderr: string });
+        expect(result?.code).not.toBe(0);
+        expect(result?.stderr).toContain("EEXIST");
+        // The agent's recreated bytes stay in the tree; the moved-aside original is kept, never deleted.
+        expect(await fs.readFile(path.join(warmRoot, f), "utf8")).toBe(agentBytes);
+        expect(result?.stderr).toContain("agent bytes kept aside");
+        expect(await fs.readFile(path.join(plan.aside, "0"), "utf8")).toBe(baselineBytes);
+      }, 30_000);
+
       it("REMOTE sandbox never-OK: chat A's unsynced write survives a sibling note (no refresh over a dirty tree)", async () => {
         await paulBundle();
         const boat = await sandbox();
@@ -762,7 +904,7 @@ describe("persistent agent directories", () => {
         await fs.writeFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "A-UNSYNCED\n");
         await boat.siblingSavesRemote(note, "NOTE-FACT sibling\n");
         const runId = await nextRun();
-        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId, runnerStateDirectory: boat.runnerStateDirectory }))
           .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
         // The tree was not touched: A's write is still there and the sibling's note was not pushed over it.
         expect(await fs.readFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
@@ -785,7 +927,7 @@ describe("persistent agent directories", () => {
         await boat.siblingSavesRemote(edited, `# ${edited} edited\n`);
         expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
         const runId = await nextRun();
-        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId, runnerStateDirectory: boat.runnerStateDirectory }))
           .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
         expect(await fs.readFile(path.join(chatA.executionRoot, edited), "utf8")).not.toBe(`# ${edited} edited\n`);
         await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget });
