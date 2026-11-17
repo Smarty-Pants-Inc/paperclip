@@ -110,6 +110,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
 import * as runEventWriter from "../heartbeat-run-events.js";
+import * as executorModule from "./native-session-executor.js";
 import { NativePermissionDeclinedError } from "./native-permission-decline.js";
 import { NativeExecutionContext } from "./native-execution-context.js";
 import { resolvePaperclipRunnerNativeProviderInput } from "./provider-profile.js";
@@ -8750,6 +8751,130 @@ describe("native governed waits", () => {
     await observing;
     expect(delayedObservation.consume(replayedEvent)).toBeNull();
   });
+
+  it("does not park a Pi turn while a sibling tool from the same batch is still running", async () => {
+    // Pi runs one assistant message's tool calls as a batch: it reports every
+    // tool as started (kind "tool", or "commandExecution" for bash) before
+    // its host callbacks reach the Runner one at a time. When the question's
+    // callback answers first, parking on that answer stops the provider while
+    // the sibling still runs. Its callback then never gets a result, and the
+    // Runner's saved state keeps that call pending (a live-looking turn).
+    const waitResult = nativeGovernedWaitResult({
+      interaction: { id: "interaction-batch", title: "Answer the question", summary: null },
+      completionContract: {
+        revision: "contract-v1",
+        objective: "Ask, then continue",
+        criteria: [{ id: "objective", requirement: "Get the answer" }],
+      },
+    });
+    const observation = createGovernedWaitEventObservation(async () => waitResult);
+    let seq = 0;
+    const event = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => {
+      seq += 1;
+      return {
+        schema: "paperclip.prp.event.v1" as const,
+        sourceInstanceId: "runner-pi",
+        sourceEventId: `runner-pi:event:${seq}`,
+        sourceSeq: seq,
+        sourceKind: "runner" as const,
+        runId: "run-pi",
+        normalizedSessionId: "session-pi",
+        turnId: "turn-pi",
+        itemId,
+        eventType,
+        schemaVersion: 1,
+        priority: 0 as const,
+        emittedAt: "2026-11-17T00:00:00.000Z",
+        payload,
+      };
+    };
+    const piTool = (name: string) => ({ kind: "tool", toolName: name });
+    // The executor observes every event; only item.completed is eligible.
+    const observe = async (next: PrpEvent) => {
+      await observation.observe(next, next.eventType === "item.completed");
+      return observation.consume(next);
+    };
+
+    expect(await observe(event("item.started", "pi-tool:question", piTool("request_human_input")))).toBeNull();
+    expect(await observe(event("item.started", "pi-tool:sibling", piTool("read_task_files")))).toBeNull();
+    // The question's host callback runs and answers; the sibling's callback
+    // has not reached the Runner yet.
+    expect(await observe(event("item.started", "call-question", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "call-question", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "pi-tool:question", piTool("request_human_input")))).toBeNull();
+    // The sibling's callback runs to its own result before the turn parks.
+    expect(await observe(event("item.started", "call-sibling", { kind: "dynamicToolCall" }))).toBeNull();
+    expect(await observe(event("item.completed", "call-sibling", { kind: "dynamicToolCall" }))).toBeNull();
+    // Once Pi reports the whole batch finished, the wait parks the turn.
+    expect(await observe(event("item.completed", "pi-tool:sibling", piTool("read_task_files")))).toEqual(waitResult);
+  });
+
+  it.each(["final message", "question fallback"] as const)(
+    "does not park a Boat Pi turn while a foreground sibling still runs (S2p-fg): %s",
+    async (trigger) => {
+      // Through runnerd (Boat), the Pi facade forwards tool items as Codex
+      // items: a tool's item.* carries kind "tool_use" and its execution
+      // arrives only as tool.execution.* (runner-core provider_events.rs).
+      const waitResult = nativeGovernedWaitResult({
+        interaction: { id: "interaction-boat", title: "Answer the question", summary: null },
+        completionContract: {
+          revision: "contract-v1",
+          objective: "Ask, then continue",
+          criteria: [{ id: "objective", requirement: "Get the answer" }],
+        },
+      });
+      const observation = createGovernedWaitEventObservation(async () => waitResult);
+      let seq = 0;
+      const event = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => {
+        seq += 1;
+        return {
+          schema: "paperclip.prp.event.v1" as const, sourceInstanceId: "runnerd-boat", sourceEventId: `runnerd-boat:${seq}`,
+          sourceSeq: seq, sourceKind: "runner" as const, runId: "run-boat", normalizedSessionId: "session-boat",
+          turnId: "turn-boat", itemId, eventType, schemaVersion: 1, priority: 0 as const,
+          emittedAt: "2026-11-17T00:00:00.000Z", payload,
+        };
+      };
+      // The executor's eligibility (native-session-executor.ts observe call
+      // sites): a completion, or a materialized durable question fallback.
+      const observe = async (next: PrpEvent, fallback = false) => {
+        await observation.observe(next, ["item.completed", "tool.execution.completed"].includes(next.eventType) || fallback);
+        return observation.consume(next);
+      };
+      const item = (id: string, status: string) => ({ provider: "pi_rpc", itemId: id, kind: "tool_use", status, channel: "detail" });
+      const execution = (id: string, name: string, transport: string, status: string) => ({
+        schema: "paperclip.tool.execution.v1", executionId: id, transport, name, status });
+
+      expect(await observe(event("item.started", "pi-bash", item("pi-bash", "inProgress")))).toBeNull();
+      expect(await observe(event("item.started", "pi-question", item("pi-question", "inProgress")))).toBeNull();
+      expect(await observe(event("tool.execution.started", "pi-bash", execution("pi-bash", "sleep 120", "process", "running")))).toBeNull();
+      expect(await observe(event("tool.execution.started", "pi-question", execution("pi-question", "request_human_input", "dynamic", "running")))).toBeNull();
+      // The question card exists now (its Core callback ran); bash still runs.
+      const parkTrigger = trigger === "final message"
+        ? event("item.completed", "pi-message:block:0", { kind: "agentMessage", channel: "final", text: "I asked you." })
+        : event("runtime_request.expired", "pi-question", { reason: "durable_handoff", replayAllowed: false });
+      expect(await observe(parkTrigger, trigger === "question fallback")).toBeNull();
+      // (b) The person answers while the sibling still runs: still no park.
+      expect(await observe(event("tool.execution.completed", "pi-question", execution("pi-question", "request_human_input", "dynamic", "completed")))).toBeNull();
+      expect(await observe(event("item.completed", "pi-question", item("pi-question", "completed")))).toBeNull();
+      // The wait parks as soon as the last sibling completes.
+      expect(await observe(event("tool.execution.completed", "pi-bash", execution("pi-bash", "sleep 120", "process", "completed")))).toEqual(waitResult);
+
+      // Codex through runnerd reports tools only as tool.execution.*, and the
+      // question's own call can stay open until the park: it never blocks it.
+      const codex = createGovernedWaitEventObservation(async () => waitResult);
+      const codexObserve = async (next: PrpEvent, fallback = false) => {
+        await codex.observe(next, ["item.completed", "tool.execution.completed"].includes(next.eventType) || fallback);
+        return codex.consume(next);
+      };
+      expect(await codexObserve(event("tool.execution.started", "codex-bash", execution("codex-bash", "sleep 120", "process", "running")))).toBeNull();
+      expect(await codexObserve(event("tool.execution.started", "codex-question", execution("codex-question", "request_human_input", "dynamic", "running")))).toBeNull();
+      const codexTrigger = trigger === "final message"
+        ? event("item.completed", "codex-message", { kind: "agentMessage", channel: "final", text: "I asked you." })
+        : event("runtime_request.expired", "codex-question", { reason: "durable_handoff", replayAllowed: false });
+      expect(await codexObserve(codexTrigger, trigger === "question fallback")).toBeNull();
+      expect(await codexObserve(event("tool.execution.completed", "codex-bash", execution("codex-bash", "sleep 120", "process", "completed")))).toEqual(waitResult);
+    },
+  );
 });
 
 type LeaseCoordinator = {
@@ -27936,5 +28061,161 @@ describe("released native session tool authority", () => {
     await expect(admitted.dynamicToolHandler!(call(assignedTool("first").name))).rejects.toThrow("unknown tool");
     expect(first.execute).not.toHaveBeenCalled();
     expect(state.createAssignedMcpTools).toHaveBeenCalledTimes(2);
+  });
+});
+
+// Independent PS3 checks, appended to a scratch copy of the existing test file.
+describe("PS3 independent judge", () => {
+  const waitResult = nativeGovernedWaitResult({ interaction: { id: "ps3-question", title: "Continue?", summary: null }, completionContract: execution.completionContract.contract });
+  let seq = 0;
+  const ev = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => ({
+    schema: "paperclip.prp.event.v1", sourceInstanceId: "runner", sourceEventId: `ps3:${++seq}`, sourceSeq: seq,
+    sourceKind: "runner", runId: execution.binding.runId, normalizedSessionId: "session", turnId: "ps3-turn", itemId,
+    eventType, schemaVersion: 1, priority: 0, emittedAt: "2026-11-17T00:00:00.000Z", payload,
+  });
+  const ex = (executionId: string, name: string) => ({ schema: "paperclip.tool.execution.v1", executionId, name, transport: "process", operation: "execute", status: "running", output: null, outputBytes: 0, outputTruncated: false, outputDigest: null });
+  const feed = async (o: ReturnType<typeof createGovernedWaitEventObservation>, e: PrpEvent) => {
+    await o.observe(e, ["item.completed", "tool.execution.completed"].includes(e.eventType)); return o.consume(e);
+  };
+  it("closes a Codex tool reported in BOTH item and execution shapes exactly once", async () => {
+    const o = createGovernedWaitEventObservation(async () => waitResult);
+    expect(await feed(o, ev("item.started", "command-A", { kind: "commandExecution" }))).toBeNull();
+    expect(await feed(o, ev("tool.execution.started", "attachment-turn", ex("command-A", "sleep 120")))).toBeNull();
+    expect(await feed(o, ev("tool.execution.started", "attachment-turn", ex("question-Q", "request_human_input")))).toBeNull();
+    // Both terminal forms are received, as happens at a compatibility boundary.
+    const first = await feed(o, ev("tool.execution.completed", "attachment-turn", { ...ex("command-A", "sleep 120"), status: "completed" }));
+    const second = await feed(o, ev("item.completed", "command-A", { kind: "commandExecution", status: "completed" }));
+    expect([first, second].filter(Boolean)).toEqual([waitResult]);
+  });
+  it("runnerd execution IDs keep a Codex bash open when question shares envelope itemId", async () => {
+    const o = createGovernedWaitEventObservation(async () => waitResult);
+    expect(await feed(o, ev("tool.execution.started", "attachment-turn", ex("command-A", "sleep 120")))).toBeNull();
+    expect(await feed(o, ev("tool.execution.started", "attachment-turn", ex("question-Q", "request_human_input")))).toBeNull();
+    expect(await feed(o, ev("item.completed", "message-final", { kind: "agentMessage", channel: "final" }))).toBeNull();
+    expect(await feed(o, ev("tool.execution.completed", "attachment-turn", { ...ex("command-A", "sleep 120"), status: "completed" }))).toEqual(waitResult);
+  });
+  it("two runnerd Codex siblings do not park when only first completes", async () => {
+    const o = createGovernedWaitEventObservation(async () => waitResult);
+    await feed(o, ev("tool.execution.started", "attachment-turn", ex("command-A", "sleep 120")));
+    await feed(o, ev("tool.execution.started", "attachment-turn", ex("command-B", "sleep 180")));
+    expect(await feed(o, ev("tool.execution.completed", "attachment-turn", { ...ex("command-A", "sleep 120"), status: "completed" }))).toBeNull();
+    expect(await feed(o, ev("tool.execution.completed", "attachment-turn", { ...ex("command-B", "sleep 180"), status: "completed" }))).toEqual(waitResult);
+  });
+  it.each(["Pi", "Codex"] as const)("executor accepts runnerd-shaped %s events and parks only after bash real output", async (provider) => {
+    seq = 0;
+    const appendEvent = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockImplementation(async (_db, input: any) => ({ row: { seq: input.nativeSource?.sourceSeq ?? seq } as never, disposition: "committed" as const, highestContiguousSourceSeq: seq }));
+    onTestFinished(() => appendEvent.mockRestore());
+    vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })) } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    const db = leaseDb(); const select = db.select.bind(db);
+    db.select = ((fields?: Record<string, unknown>) => {
+      const original = select(fields as never);
+      return { from: (table: unknown) => {
+        if (table !== issueThreadInteractions) return original.from(table as never);
+        const query: any = { where: () => query, orderBy: () => query, limit: () => query,
+          then: (resolve: (rows: unknown[]) => unknown, reject: (e: unknown) => unknown) => Promise.resolve(fields ? [{ id: "ps3-question", title: "Continue?", summary: null }] : []).then(resolve, reject) };
+        return query;
+      } };
+    }) as typeof db.select;
+    const order: string[] = [];
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      const send = async (e: PrpEvent) => {
+        await options.controlPlane.appendEvent(e);
+        const parked = options.resolveGovernedWait({ event: e });
+        if (parked) order.push("park");
+        return parked;
+      };
+      if (provider === "Pi") await send(ev("item.started", "pi-bash", { kind: "tool_use" }));
+      await send(ev("tool.execution.started", "attachment-turn", ex("pi-bash", "sleep 0.02")));
+      if (provider === "Pi") {
+        await send(ev("item.started", "question-call", { kind: "dynamicToolCall", toolName: "request_human_input" }));
+        expect(await send(ev("item.completed", "question-call", { kind: "dynamicToolCall", toolName: "request_human_input" }))).toBeNull();
+      } else {
+        await send(ev("tool.execution.started", "attachment-turn", { ...ex("question-Q", "request_human_input"), transport: "dynamic" }));
+        expect(await send(ev("item.completed", "final-message", { kind: "agentMessage", channel: "final", text: "I asked you." }))).toBeNull();
+      }
+      const output = execFileSync("bash", ["-c", "sleep 0.02; printf PS3_BASH_COMPLETED"], { encoding: "utf8" });
+      expect(output).toBe("PS3_BASH_COMPLETED"); order.push(output);
+      const executionPark = await send(ev("tool.execution.completed", "attachment-turn", { ...ex("pi-bash", "sleep 0.02"), status: "completed" }));
+      const parked = provider === "Pi" ? await send(ev("item.completed", "pi-bash", { kind: "tool_use", status: "completed" })) : executionPark;
+      expect(parked).toEqual(waitResult);
+      return { result: parked, terminal: { runTerminalState: "succeeded" }, turnId: "ps3-turn", normalizedSessionId: "session", providerSessionId: null, driverKind: "test", driverVersion: "1", nativeEventCount: seq, highestContiguousSourceSeq: seq };
+    });
+    await executePaperclipNativeSession({ db, execution, runnerInstanceId: "runner", useRunnerd: false });
+    expect(order).toEqual(["PS3_BASH_COMPLETED", "park"]);
+    console.log(`PS3 ${provider} executor evidence: ${order.join(" -> ")}`);
+  });
+});
+
+describe("park-settle4: governed wait through the production entry point (Boat remote, pi_rpc)", () => {
+  const waitResult = nativeGovernedWaitResult({ interaction: { id: "ps4-question", title: "Continue?", summary: null }, completionContract: execution.completionContract.contract });
+  let seq = 0;
+  // runnerd shares ONE attachment itemId across every tool execution of the turn.
+  const ev = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => ({
+    schema: "paperclip.prp.event.v1", sourceInstanceId: "runner", sourceEventId: `ps4:${++seq}`, sourceSeq: seq,
+    sourceKind: "runner", runId: execution.binding.runId, normalizedSessionId: "session", turnId: "ps4-turn", itemId,
+    eventType, schemaVersion: 1, priority: 0, emittedAt: "2026-11-17T00:00:00.000Z", payload,
+  });
+  const ex = (executionId: string, name: string, transport: string, status = "running") => ({ schema: "paperclip.tool.execution.v1", executionId, name, transport, operation: "execute", status, output: null, outputBytes: 0, outputTruncated: false, outputDigest: null });
+
+  it.each(["pi_rpc", "codex"] as const)("%s: keeps the person's bash open through the question, a final message and the question's completion; parks once only after its real output, and publishes the open tool to answer delivery", async (provider) => {
+    seq = 0;
+    const input = provider === "codex" ? execution : parseNativeExecutionInput({ ...execution,
+      schema: "paperclip.native-execution-input.v9", homeMode: "isolated", executionMode: "default", planningContext: null,
+      runtimeContext: nativeRuntimeContextFixture(),
+      provider: { kind: "pi_rpc", model: "anthropic/test", profile: QUALIFIED_PI_RPC_PROFILE },
+      session: { ...execution.session, driverKind: "pi_rpc" },
+    });
+    const appendEvent = vi.spyOn(runEventWriter, "appendHeartbeatRunEvent").mockImplementation(async (_db, input: any) => ({ row: { seq: input.nativeSource?.sourceSeq ?? seq } as never, disposition: "committed" as const, highestContiguousSourceSeq: seq }));
+    onTestFinished(() => appendEvent.mockRestore());
+    vi.spyOn(issueServiceModule, "issueService").mockReturnValue({ update: vi.fn(async () => ({ status: "blocked", statusVersion: 1 })) } as unknown as ReturnType<typeof issueServiceModule.issueService>);
+    const db = leaseDb(); const select = db.select.bind(db);
+    db.select = ((fields?: Record<string, unknown>) => {
+      const original = select(fields as never);
+      return { from: (table: unknown) => {
+        if (table !== issueThreadInteractions) return original.from(table as never);
+        const query: any = { where: () => query, orderBy: () => query, limit: () => query,
+          then: (resolve: (rows: unknown[]) => unknown, reject: (e: unknown) => unknown) => Promise.resolve(fields ? [{ id: "ps4-question", title: "Continue?", summary: null }] : []).then(resolve, reject) };
+        return query;
+      } };
+    }) as typeof db.select;
+    // Optional lookup so a base without the registry fails on the park/open-tool
+    // assertions, not on a missing export.
+    const openTool = (runId: string): boolean | null =>
+      (executorModule as unknown as { nativeRunHasOpenGovernedWaitTool?: (id: string) => boolean }).nativeRunHasOpenGovernedWaitTool?.(runId) ?? null;
+    const pi = provider === "pi_rpc";
+    const order: string[] = [];
+    const openWhileRunning: (boolean | null)[] = [];
+    state.execute.mockReset().mockImplementationOnce(async options => {
+      const send = async (e: PrpEvent) => {
+        await options.controlPlane.appendEvent(e);
+        const parked = options.resolveGovernedWait({ event: e });
+        if (parked) order.push(`park@${e.eventType}:${String((e.payload as Record<string, unknown>).executionId ?? e.itemId)}`);
+        return parked;
+      };
+      // Pi through the facade and runnerd: the item.* shape (kind tool_use)
+      // and the tool.execution.* shape under the shared attachment itemId.
+      // Codex through runnerd reports its tools ONLY as tool.execution.*.
+      if (pi) await send(ev("item.started", "pi-bash", { kind: "tool_use" }));
+      await send(ev("tool.execution.started", "attachment-turn", ex("pi-bash", "sleep 0.02; printf PS4", "process")));
+      if (pi) await send(ev("item.started", "pi-question", { kind: "tool_use" }));
+      await send(ev("tool.execution.started", "attachment-turn", ex("pi-question", "request_human_input", "dynamic")));
+      openWhileRunning.push(openTool(execution.binding.runId));
+      expect(await send(ev("item.completed", "final-message", { kind: "agentMessage", channel: "final", text: "I asked you." }))).toBeNull();
+      expect(await send(ev("tool.execution.completed", "attachment-turn", ex("pi-question", "request_human_input", "dynamic", "completed")))).toBeNull();
+      if (pi) expect(await send(ev("item.completed", "pi-question", { kind: "tool_use", status: "completed" }))).toBeNull();
+      openWhileRunning.push(openTool(execution.binding.runId));
+      const output = execFileSync("bash", ["-c", "sleep 0.02; printf PS4_BASH_COMPLETED"], { encoding: "utf8" });
+      order.push(output);
+      const executionClosed = await send(ev("tool.execution.completed", "attachment-turn", ex("pi-bash", "sleep 0.02; printf PS4", "process", "completed")));
+      if (pi) expect(executionClosed).toBeNull();
+      const parked = pi ? await send(ev("item.completed", "pi-bash", { kind: "tool_use", status: "completed" })) : executionClosed;
+      expect(parked).toEqual(waitResult);
+      openWhileRunning.push(openTool(execution.binding.runId));
+      return { result: parked, terminal: { runTerminalState: "succeeded" }, turnId: "ps4-turn", normalizedSessionId: "session", providerSessionId: null, driverKind: "test", driverVersion: "1", nativeEventCount: seq, highestContiguousSourceSeq: seq };
+    });
+    await executePaperclipNativeSession({ db, execution: input, runnerInstanceId: "runner", useRunnerd: false });
+    expect(order).toEqual(["PS4_BASH_COMPLETED", pi ? "park@item.completed:pi-bash" : "park@tool.execution.completed:pi-bash"]);
+    expect(openWhileRunning).toEqual([true, true, false]);
+    console.log(`PS4 ${provider} executor evidence: ${order.join(" -> ")}; open tool published ${openWhileRunning.join(",")}`);
   });
 });
