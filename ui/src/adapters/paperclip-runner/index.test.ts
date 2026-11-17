@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { paperclipRunnerUIAdapter } from "./index";
 import { createPiProfileExtensionAdapter, PI_NOTICE_METHOD } from "../../../../packages/paperclip-runner/src/drivers/acpx/pi-extension-adapter";
 import { transcriptToTaskChatItems } from "../../components/task-chat/transcript-adapter";
+import { normalizeTranscript } from "../../components/transcript/RunTranscriptView";
 
 const piFailure = (overrides: Record<string, unknown> = {}, eventOverrides: Record<string, unknown> = {}) => ({
   type: "paperclip.prp.event",
@@ -148,6 +149,68 @@ describe("paperclip runner transcript projection", () => {
       expect(tool).toMatchObject({ detail: ordinary });
       expect(tool.outputTruncated).not.toBe(true);
     });
+  });
+  // f90bc18e's byte shape, not a claim to replay its unavailable private trace.
+  const wholeThinking = "é" + "r".repeat(4352);
+  const cutThinking = Buffer.from(wholeThinking).subarray(0, 4096).toString() + "…[truncated]";
+  const projectText = (kind: "reasoning" | "agentMessage", chunks: string[], completion: string) => {
+    const parser = paperclipRunnerUIAdapter.createStdoutParser!();
+    const parse = (eventType: string, value: string) => parser.parseLine(JSON.stringify({
+      type: "paperclip.prp.event", event: { eventType, itemId: "whole-1", payload: {
+        kind, channel: kind === "reasoning" ? "detail" : "final",
+        ...(eventType === "item.delta" ? { text: value } : { item: { id: "whole-1", type: kind, text: value } }),
+      } },
+    }), "2026-11-17T12:00:00.000Z");
+    return [...chunks.flatMap(chunk => parse("item.delta", chunk)), ...parse("item.completed", completion)];
+  };
+
+  it.each(["reasoning", "agentMessage"] as const)("keeps all 4,354 streamed bytes when %s completes with a cut prefix", kind => {
+    const entries = projectText(kind, [wholeThinking.slice(0, 1000), wholeThinking.slice(1000, 3000), wholeThinking.slice(3000)], cutThinking);
+    const items = transcriptToTaskChatItems(entries, { runId: "f90bc18e-shape", running: true });
+    const rendered = items.map(item => item.kind === "thinking" ? item.lines.join("\n") : item.kind === "message" ? item.text : "").join("");
+    expect(Buffer.byteLength(rendered)).toBe(4354);
+    expect(rendered).toBe(wholeThinking);
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+    if (kind === "reasoning") expect(items[0]).toMatchObject({ streaming: false });
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("shows the %s body and a truthful log notice without a stream", kind => {
+    const entries = projectText(kind, [], cutThinking);
+    expect(entries[0]).toMatchObject({ text: cutThinking.slice(0, -"…[truncated]".length) +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    expect(JSON.stringify(entries)).not.toContain("[truncated]");
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("keeps ordinary equal and legitimately different %s completions authoritative", kind => {
+    for (const completion of ["Streamed text", "Corrected text"]) {
+      const entries = projectText(kind, ["Streamed text"], completion);
+      expect(normalizeTranscript(entries, false)).toEqual([expect.objectContaining({ text: completion })]);
+      if (completion === "Streamed text" && kind === "reasoning") {
+        expect(entries.at(-1)).toMatchObject({ text: "", delta: true, lifecycle: "completed" });
+      } else {
+        expect(entries.at(-1)).toMatchObject({ text: completion });
+        expect(entries.at(-1)).not.toHaveProperty("delta");
+      }
+    }
+  });
+
+  it.each(["reasoning", "agentMessage"] as const)("does not preserve unrelated streamed %s for a different cut snapshot", kind => {
+    const entries = projectText(kind, ["Unrelated stream"], cutThinking);
+    expect(entries.at(-1)).toMatchObject({ text: cutThinking.slice(0, -"…[truncated]".length) +
+      `\n\nThe full ${kind === "reasoning" ? "thinking" : "response"} is kept in the run log.` });
+    expect(entries.at(-1)).not.toHaveProperty("delta");
+  });
+
+  it("keeps streamed reasoning through capped non-delta starts as well as completion", () => {
+    const parser = paperclipRunnerUIAdapter.createStdoutParser!();
+    const parse = (eventType: string, text: string) => parser.parseLine(JSON.stringify({
+      type: "paperclip.prp.event", event: { eventType, itemId: "r1", payload: {
+        kind: "reasoning", text, item: { id: "r1", type: "reasoning", text },
+      } },
+    }), "2026-11-17T12:00:00.000Z");
+    parse("item.delta", wholeThinking);
+    expect(parse("item.started", cutThinking)).toEqual([expect.objectContaining({ text: "", delta: true, lifecycle: "started" })]);
+    expect(parse("item.completed", cutThinking)).toEqual([expect.objectContaining({ text: "", delta: true, lifecycle: "completed" })]);
   });
   it("keeps both pinned Pi failure facts in diagnostics without adding a task warning", async () => {
     const adapter = createPiProfileExtensionAdapter({ workspacePath: "/fixture", sessionId: "session-1", turnId: "turn-1" });
