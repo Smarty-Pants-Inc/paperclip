@@ -6,11 +6,12 @@ import { z } from "zod";
 import { readNativeWorkspaceSyncReference, type NativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readSnapshot } from "./workspace-recovery-snapshot.js";
-import { exhaustedStopWait, exhaustedSystemRecoveryAction, isCapturePolicyRearmable, readSystemRecovery } from "./system-recovery-state.js";
+import { exhaustedStopWait, exhaustedSystemRecoveryAction, isCapturePolicyRearmable, isExhaustedStopProofWait, readSystemRecovery,
+  stopProofRearmsSpent } from "./system-recovery-state.js";
 import { verifiedUnchangedRestoredSnapshot, verifiedWorkspaceSnapshotReuse } from "./remote-workspace-snapshot-reuse-receipt.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
 import { RECOVERED_WORK_RETRY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
-import { decideRetryAuthority } from "./task-retry-eligibility.js";
+import { decideRetryAuthority, restoreStopWaitFact } from "./task-retry-eligibility.js";
 import { owedRestoreAdoptionBlocked } from "./workspace-restore-recovery-state.js";
 
 export const workspaceRecoverySchema = z.object({
@@ -95,10 +96,16 @@ export function savedWorkOffersRetry(state: { status: string; canRetry: boolean 
   if (workspaceRestoreDelayed(state, evidence, holdWrittenAt)) return true;
   const ownerRecovery = evidence.workspaceOwnerRecovery as { state?: unknown } | undefined;
   const recovery = readSystemRecovery(evidence);
-  // Waiting on an unconfirmed stop: Retry cannot release it (one decision with the chat).
-  if (exhaustedStopWait(recovery, evidence)) return false;
+  // Waiting on an unconfirmed stop: Retry cannot release it. The one Retry
+  // authority decides it (its restoreStopWait fact), as for the chat and the API.
+  if (!decideRetryAuthority({ restoreStopWait: restoreStopWaitFact(evidence), retrySource: true }).canRetry) return false;
+  // restore-card8 (rf-3 J8): an agent stop with every re-arm spent is not that
+  // wait (card7's carve-out): it is re-checked no more, so it keeps the Retry
+  // the chat and the API offer. Other evidence re-checks still re-arm by themselves.
+  const rearmsSpentStop = isExhaustedStopProofWait(recovery) && stopProofRearmsSpent(evidence);
   return state.canRetry && !(ownerRecovery?.state === "operator_required" && evidence.workspaceOwnerStop == null)
-    && recovery?.state === "exhausted" && !recovery.freshAttemptRunId && recovery.failure?.retryClass !== "recheck_evidence"
+    && recovery?.state === "exhausted" && !recovery.freshAttemptRunId
+    && (recovery.failure?.retryClass !== "recheck_evidence" || rearmsSpentStop)
     && !isCapturePolicyRearmable(recovery);
 }
 
