@@ -117,7 +117,9 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
-import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { isRetainedWarmLease, runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } from "../agent-execution-stop.js";
+import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
+import { userStopLeftUncertainty } from "../native-runtime/native-user-stop-settlement.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { hasNativeLocalProcessStop } from "../native-local-process-stop.js";
 import { isCancelledNativeStartup } from "../cancelled-native-startup.js";
@@ -4353,6 +4355,55 @@ export function recoveryService(
     return true;
   }
 
+  /** Defers, NOT Stop proof (adopt-h6-defer). A person's acknowledged Stop on
+   * a retained warm lease is settled by the executor, which writes the
+   * nativeRetainedIdleCheckpoint receipt atomically with releasing its
+   * native_retry_cancelled coordinator lease. A sweep inside that window
+   * waits for the existing recheck: this sweep's deferred deadline
+   * (recovery/work.ts reschedules the task at it; its worker reconstructs
+   * every 30s anyway). At the recheck the card path decides: the receipt
+   * landed, so provedWarmTurnHandoff (runExecutionsStoppedOrHandedOffWarm)
+   * passes and no card is written, with both claims kept; or
+   * it did not, and the card is raised and true. Every owner must be in that
+   * window; an unacknowledged or uncertain Stop, a stop_and_retain or non-warm
+   * lease, a settled coordinator without the receipt (H6 F1 case h) or an
+   * expired executor lease raises the card exactly as before. */
+  async function justStoppedWarmHandoffAwaitsReceipt(tx: Db,
+    issue: Pick<RecoveryIssue, "id" | "companyId" | "status" | "cancelledAt">, ownerRunIds: string[],
+    onDeferredDeadline?: (at: number) => void) {
+    if (issue.status === "cancelled" || issue.cancelledAt || !ownerRunIds.length) return false;
+    const runs = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
+    ));
+    if (runs.length !== ownerRunIds.length) return false;
+    const leases = await tx.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, issue.companyId), inArray(environmentLeases.heartbeatRunId, ownerRunIds),
+    ));
+    const coordinators = await tx.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, issue.companyId), inArray(nativeRunFinalizations.runId, ownerRunIds)));
+    const now = Date.now();
+    let next = Number.POSITIVE_INFINITY;
+    for (const run of runs) {
+      if (run.status !== "cancelled" || run.runtimeMode !== "native" || !hasAcknowledgedNativeStopIntent(run)) return false;
+      // The receipt already landed: the guard has decided, defer nothing.
+      if (run.runnerProfileJson?.nativeRetainedIdleCheckpoint !== undefined) return false;
+      const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
+      if (!runLeases.length || !runLeases.every(isRetainedWarmLease)) return false;
+      const coordinator = coordinators.find(row => row.runId === run.id);
+      // Only the executor still settling this Stop can issue the receipt.
+      if (!coordinator || coordinator.resultId || !coordinator.leaseOwner || !coordinator.leaseExpiresAt
+        || coordinator.leaseExpiresAt.getTime() <= now) return false;
+      if (await userStopLeftUncertainty(tx, run)) return false;
+      // One recheck after the Stop, never an open-ended wait.
+      const stoppedAt = (run.finishedAt ?? run.updatedAt).getTime();
+      const recheckAt = Math.min(stoppedAt + 30_000, coordinator.leaseExpiresAt.getTime());
+      if (now >= recheckAt) return false;
+      next = Math.min(next, recheckAt + 1);
+    }
+    onDeferredDeadline?.(next);
+    return true;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: RecoveryIssue;
     previousStatus: StrandedPreviousStatus;
@@ -4398,7 +4449,11 @@ export function recoveryService(
           eq(heartbeatRuns.companyId, current.companyId), inArray(heartbeatRuns.id, ownerRunIds),
         )).orderBy(asc(heartbeatRuns.id)).for("update");
         if (!await runExecutionsHaveStopped(tx as unknown as Db, current.companyId, ownerRunIds)) {
+          // Card path only (rf-3): a proved warm handoff raises no card and
+          // is not escalated; it keeps both claims.
+          if (await runExecutionsStoppedOrHandedOffWarm(tx as unknown as Db, current.companyId, ownerRunIds)) return null;
           if (await onlyUnreleasedLeasesWithinBoundBlockStop(tx as unknown as Db, current, ownerRunIds)) return null;
+          if (await justStoppedWarmHandoffAwaitsReceipt(tx as unknown as Db, current, ownerRunIds)) return null;
           await recordTaskStopPending(tx as unknown as Db, { companyId: current.companyId, issueId: current.id,
             runIds: ownerRunIds, source: "recovery.stranded_assigned_issue" }, publications);
           return null;
@@ -7088,6 +7143,11 @@ export function recoveryService(
         // Terminal status alone does not prove that execution stopped. Match
         // checkout's task-before-run order and escalation's task-scoped Stop
         // gate before releasing either claim or publishing hold-release work.
+        // A proven warm handoff (provedWarmTurnHandoff) does NOT pass this
+        // gate: it keeps both claims, as before d4752b6b. It only suppresses
+        // the Stop-pending card below (rf-3, adopt-h6-narrow; test: "a proven
+        // warm handoff keeps both claims, raises no card and the next message
+        // keeps the thread").
         const ownerRunIds = [...new Set([locked.checkoutRunId, locked.executionRunId]
           .filter((id): id is string => id !== null))];
         if (ownerRunIds.length) {
@@ -7095,7 +7155,11 @@ export function recoveryService(
             eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
           )).orderBy(asc(heartbeatRuns.id)).for("update");
           if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
+            // Card path only (rf-3): a proved warm handoff raises no card; it
+            // keeps both claims and promotes nothing.
+            if (await runExecutionsStoppedOrHandedOffWarm(tx as unknown as Db, issue.companyId, ownerRunIds)) return null;
             if (await onlyUnreleasedLeasesWithinBoundBlockStop(tx as unknown as Db, locked, ownerRunIds, opts?.onDeferredDeadline)) return null;
+            if (await justStoppedWarmHandoffAwaitsReceipt(tx as unknown as Db, locked, ownerRunIds, opts?.onDeferredDeadline)) return null;
             await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
               runIds: ownerRunIds, source: "recovery.sweep_stale_issue_locks" }, publications);
             return null;

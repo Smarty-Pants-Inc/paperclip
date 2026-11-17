@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
-import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { runExecutionsStoppedOrHandedOffWarm } from "../agent-execution-stop.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
@@ -93,7 +93,8 @@ export async function recheckTaskStopPending(tx: Db, input: { companyId: string;
     eq(heartbeatRuns.companyId, input.companyId), inArray(heartbeatRuns.id, runIds),
   )).orderBy(asc(heartbeatRuns.id)).for("update");
   const binding = { ...input, runIds };
-  if (await runExecutionsHaveStopped(tx, input.companyId, runIds)) {
+  // Card path: a proved warm handoff retires the card too (it releases no claim).
+  if (await runExecutionsStoppedOrHandedOffWarm(tx, input.companyId, runIds)) {
     await clearTaskStopPending(tx, binding, publications);
     return;
   }
