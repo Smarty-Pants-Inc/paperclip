@@ -1355,3 +1355,113 @@ describe("dl-n5-66k a final answer stored without text is never replaced by the 
     expect(reassembleAgentMessageFromDeltas(deltas, itemId)).toBe(answerOf(1000));
   });
 });
+
+// dl-n5-cont (Paul NOTE 5, H5; gate 1 runs 00e31d20 -> 2b6822e1 and
+// 822ce371 -> d5ac6a7f): a pi_rpc chat turn streams its answer as item.delta
+// events and then FAILS (pi_output_truncated at the 128k output cap; a
+// provider EOF mid-stream). No item.completed carries the answer. The person
+// must get the streamed prefix FIRST, and the continuation must start from
+// exactly its end, so the posted replies hold the whole answer once, in order.
+describe("dl-n5-cont a failed turn's streamed answer is posted first; the continuation picks up at its end", () => {
+  const module = runSummary as Record<string, unknown>;
+  type Candidate = ReturnType<typeof selectHeartbeatRunFinalAgentMessage>;
+  const readFailedTurnStreamedAnswer = (module.readFailedTurnStreamedAnswer
+    ?? (() => null)) as (rows: { seq: number; payload: unknown }[]) =>
+      { itemId: string; text: string; cause: "output_limit" | "stream_ended" | "failed"; candidate: NonNullable<Candidate> } | null;
+  const cutAnswerContinuationInstruction = (module.cutAnswerContinuationInstruction
+    ?? (() => "")) as (input: { text: string; cause: string; posted: boolean }) => string;
+  const turnId = "runner-1:run-00e31d20:turn-1";
+  const itemId = `${turnId}:pi-message:2:block:0`;
+  // The live shape: numbered items, 0001..0280, of which 0001..0262 streamed before the cut.
+  const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+  const whole = Array.from({ length: 280 }, (_, i) => item(i + 1)).join("") + "END\n";
+  const streamedUpTo = (n: number) => Array.from({ length: n }, (_, i) => item(i + 1)).join("");
+  const failedRunRows = (streamed: string, code: string, chunk = 61) => {
+    const rows: { seq: number; payload: unknown }[] = [];
+    let seq = 10;
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`, turnId,
+      payload: { kind: "reasoning", text: "planning the items" } } } });
+    for (let offset = 0; offset < streamed.length; offset += chunk) {
+      rows.push({ seq: seq++, payload: { prpEvent: { eventType: "item.delta", itemId, turnId, sourceEventId: `d-${seq}`,
+        payload: { kind: "agentMessage", channel: "progress", text: streamed.slice(offset, offset + chunk) } } } });
+    }
+    rows.push({ seq: seq++, payload: { prpEvent: { eventType: "turn.failed", turnId,
+      payload: { status: "failed", error: { code, message: "x", recoverable: false } } } } });
+    return rows;
+  };
+
+  it("(a) 67 KB streamed then pi_output_truncated: the posted reply holds items 0001-0262 exactly, then one true note", () => {
+    const prefix = streamedUpTo(262);
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(60_000);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_output_truncated"));
+    expect(cut).not.toBeNull();
+    expect(cut!.cause).toBe("output_limit");
+    expect(cut!.text).toBe(prefix);
+    const resolved = resolveHeartbeatRunResponse({ resultJson: {}, nativeConversationFinalResponse: true,
+      finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [cut!.candidate] }) });
+    expect(resolved.decision.commentAction).toBe("create");
+    expect(resolved.text!.startsWith(prefix)).toBe(true);
+    for (const n of [1, 131, 262]) expect(resolved.text).toContain(item(n));
+    expect(resolved.text).not.toContain(item(263));
+    const note = resolved.text!.slice(prefix.length);
+    expect(note).toMatch(/output limit/u);
+    expect(note).toMatch(/continu/iu);
+    expect(note).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
+  });
+
+  it("(a) the continuation is told exactly where the posted text ends; together the two replies hold the whole answer once", () => {
+    const prefix = streamedUpTo(262);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_output_truncated"))!;
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    expect(instruction).toMatch(/continue exactly where/iu);
+    expect(instruction).toContain(prefix.slice(-200).trim());
+    expect(instruction).toMatch(/do not repeat/iu);
+    expect(instruction).toMatch(/never (say|claim)|do not (say|claim)/iu);
+    // A continuation that follows the instruction: the rest, starting at item 0263.
+    const continuation = whole.slice(prefix.length);
+    const posted = [prefix, continuation].join("");
+    expect(posted).toBe(whole);
+    for (let n = 1; n <= 280; n++) expect(posted.split(item(n)).length - 1).toBe(1);
+  });
+
+  it("(b) provider EOF after 269 KB: n5e's plain line + excerpt, a true note, and the continuation is told the prefix was not shown whole", () => {
+    const prefix = "x".repeat(40) + "\n" + "Paragraph of the long answer, streamed before the EOF. ".repeat(4_900);
+    expect(Buffer.byteLength(prefix)).toBeGreaterThan(269_000);
+    const cut = readFailedTurnStreamedAnswer(failedRunRows(prefix, "pi_provider_error", 997))!;
+    expect(cut.cause).toBe("stream_ended");
+    expect(cut.text).toBe(prefix);
+    const resolved = resolveHeartbeatRunResponse({ resultJson: {}, nativeConversationFinalResponse: true,
+      finalAgentMessage: selectHeartbeatRunFinalAgentMessage({ candidates: [cut.candidate] }) });
+    expect(resolved.decision.commentAction).toBe("create");
+    expect(resolved.text).toMatch(/^This answer is longer than one message \(\d+ KB\)\. The full text is kept; ask me to show any part\./u);
+    expect(resolved.text).toMatch(/connection to the model ended/u);
+    expect(resolved.text).not.toMatch(/wasn't answered|send(ing)? (it )?again/iu);
+    const instruction = cutAnswerContinuationInstruction({ text: cut.text, cause: cut.cause, posted: true });
+    expect(instruction).toMatch(/continue exactly where/iu);
+    expect(instruction).toContain(prefix.slice(-120).trim());
+    expect(instruction).toMatch(/only the start of it was shown/iu);
+  });
+
+  it("(rule 3) a cut answer that was NOT posted is restarted whole, and the continuation says so plainly", () => {
+    const instruction = cutAnswerContinuationInstruction({ text: streamedUpTo(262), cause: "output_limit", posted: false });
+    expect(instruction).toMatch(/none of it was shown/iu);
+    expect(instruction).toMatch(/start(ing)? the (whole )?answer again from the beginning/iu);
+    expect(instruction).not.toMatch(/continue exactly where/iu);
+  });
+
+  it("NEGATIVE: a normal completed answer is not a cut answer (posted once, by the completed path)", () => {
+    const rows = failedRunRows(whole, "pi_output_truncated").filter(row =>
+      (row.payload as { prpEvent: { eventType: string } }).prpEvent.eventType !== "turn.failed");
+    rows.push({ seq: 9_000, payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+      payload: { kind: "agentMessage", channel: "final", text: whole } } } });
+    rows.push({ seq: 9_001, payload: { prpEvent: { eventType: "turn.completed", turnId, payload: { status: "completed" } } } });
+    expect(readFailedTurnStreamedAnswer(rows)).toBeNull();
+  });
+
+  it("NEGATIVE: a failed turn that streamed no answer text (only thinking) has no prefix, so the true notice still applies", () => {
+    const rows = failedRunRows("", "pi_output_truncated");
+    expect(readFailedTurnStreamedAnswer(rows)).toBeNull();
+    const blank = failedRunRows("   \n", "pi_output_truncated");
+    expect(readFailedTurnStreamedAnswer(blank)).toBeNull();
+  });
+});

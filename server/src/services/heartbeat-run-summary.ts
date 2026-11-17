@@ -416,6 +416,111 @@ export function readTruncatedCompletedAssistantMessageCandidate(input: {
   };
 }
 
+/** Why a turn stopped after streaming answer text (dl-n5-cont). */
+export type CutAnswerCause = "output_limit" | "stream_ended" | "failed";
+
+function cutAnswerCause(code: unknown): CutAnswerCause {
+  if (code === "pi_output_truncated" || code === "max_tokens" || code === "length") return "output_limit";
+  if (code === "pi_provider_error" || code === "pi_rpc_transport_failed" || code === "pi_turn_idle_timeout") return "stream_ended";
+  return "failed";
+}
+
+const CUT_ANSWER_NOTE: Record<CutAnswerCause, string> = {
+  output_limit: "The answer stopped here because it hit the model's output limit. Paperclip is continuing it from exactly this point in the next reply.",
+  stream_ended: "The answer stopped here because the connection to the model ended mid-answer. Paperclip is continuing it from exactly this point in the next reply.",
+  failed: "The answer stopped here because the run failed mid-answer. Paperclip is continuing it from exactly this point in the next reply.",
+};
+
+/**
+ * dl-n5-cont (Paul NOTE 5): a turn that streamed answer text as item.delta
+ * events and then FAILED (pi_output_truncated at the output cap, a provider
+ * EOF) has no completed answer, yet the person must get what was streamed,
+ * first and once. Returns the streamed prefix of the failed turn's last agent
+ * message, rebuilt with `reassembleAgentMessageFromDeltas`, and the candidate
+ * to post: the prefix (n5e's line and excerpt above 250 KiB) and ONE true note.
+ * Null when the last turn did not fail, when that item completed with text
+ * (the completed path posts it), or when no answer text was streamed.
+ */
+export function readFailedTurnStreamedAnswer(rows: readonly { seq: number; payload: unknown }[]): {
+  itemId: string;
+  text: string;
+  cause: CutAnswerCause;
+  candidate: CompletedFinalAgentMessageCandidate & { reasonCode: string };
+} | null {
+  const ordered = [...rows].sort((a, b) => a.seq - b.seq);
+  const eventOf = (row: { payload: unknown }) => record(record(row.payload).prpEvent);
+  let lastTerminal: { seq: number; event: Record<string, unknown> } | null = null;
+  for (const row of ordered) {
+    const event = eventOf(row);
+    if (typeof event.eventType === "string" && /^turn\.(completed|failed|cancelled|interrupted)$/u.test(event.eventType)) {
+      lastTerminal = { seq: row.seq, event };
+    }
+  }
+  if (!lastTerminal || lastTerminal.event.eventType !== "turn.failed") return null;
+  const failedTurnId = typeof lastTerminal.event.turnId === "string" ? lastTerminal.event.turnId : null;
+  let itemId: string | null = null;
+  for (const row of ordered) {
+    if (row.seq > lastTerminal.seq) break;
+    const event = eventOf(row);
+    if (event.eventType !== "item.delta" || typeof event.itemId !== "string") continue;
+    if (failedTurnId && typeof event.turnId === "string" && event.turnId !== failedTurnId) continue;
+    if (record(event.payload).kind === "agentMessage") itemId = event.itemId;
+  }
+  if (!itemId) return null;
+  const completedWithText = ordered.some((row) => {
+    const event = eventOf(row);
+    const payload = record(event.payload);
+    return event.eventType === "item.completed" && event.itemId === itemId && typeof payload.text === "string"
+      && payload.text.trim().length > 0;
+  });
+  if (completedWithText) return null;
+  const text = reassembleAgentMessageFromDeltas(
+    ordered.filter((row) => row.seq <= lastTerminal!.seq),
+    itemId,
+  );
+  if (!text) return null;
+  const cause = cutAnswerCause(record(record(lastTerminal.event.payload).error).code);
+  return {
+    itemId,
+    text,
+    cause,
+    candidate: {
+      seq: lastTerminal.seq,
+      text: `${presentFinalAnswerText(text)}${text.endsWith("\n") ? "" : "\n"}\n— ${CUT_ANSWER_NOTE[cause]}`,
+      sourceEventId: readCommentText(lastTerminal.event.sourceEventId),
+      channel: "final",
+      reasonCode: "failed_turn_streamed_answer_prefix",
+    },
+  };
+}
+
+const CUT_ANSWER_TAIL_CHARS = 600;
+
+/**
+ * What the continuation of a cut answer is told (dl-n5-cont rule 3). When the
+ * streamed prefix was posted, it continues from exactly its end and never
+ * repeats it or points at text the person did not see. When it was not
+ * posted, it restarts the whole answer and says so plainly.
+ */
+export function cutAnswerContinuationInstruction(input: { text: string; cause: CutAnswerCause | string; posted: boolean }): string {
+  const why = input.cause === "output_limit" ? "it hit the model's output limit"
+    : input.cause === "stream_ended" ? "the connection to the model ended mid-answer" : "the run failed mid-answer";
+  if (!input.posted) {
+    return `Your previous answer to the person stopped before it finished because ${why}, and none of it was shown to them. `
+      + "Write the whole answer now, starting the answer again from the beginning, and say plainly in one line at the top that you are "
+      + "starting the answer again from the beginning. Do not refer to any earlier reply.";
+  }
+  const tail = input.text.slice(-CUT_ANSWER_TAIL_CHARS);
+  const shown = Buffer.byteLength(JSON.stringify(input.text)) > FINAL_ANSWER_INLINE_MAX_BYTES
+    ? "The part you had written is kept in full, but it was too long for one message, so only the start of it was shown to the person as an excerpt, with a line saying the full text is kept. "
+    : "The part you had written was posted to the person as your reply, exactly as written. ";
+  return `Your previous answer to the person stopped before it finished because ${why}. ${shown}`
+    + `It ends with exactly this text:\n\n<<<END OF POSTED TEXT\n${tail}\nEND OF POSTED TEXT>>>\n\n`
+    + "Continue exactly where it stopped: begin with the next words after that ending, as one answer. Do not repeat or summarize "
+    + "any of the posted text and do not restart the answer. Never say that any part is in an earlier reply unless it is in the posted text above. "
+    + "If the rest is long, write it as compactly as the content allows.";
+}
+
 function readAcceptedSemanticSummary(resultJson: Record<string, unknown>) {
   const candidates = semanticResultCandidates(resultJson);
   for (const candidate of candidates) {

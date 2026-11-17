@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import {
-  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRuns, issueApprovals,
+  agentWakeupRequests, agents, approvals, companies, documentRevisions, documents, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueApprovals,
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
@@ -32,6 +32,7 @@ import { FRESH_THREAD_REFUSAL_CODES, isFreshThreadRefusal } from "./native-runti
 import { freshThreadStartedNote } from "./native-runtime/fresh-thread-stop-gate.js";
 import { RESTART_CLASS_FAILURE_CODES, continuationCauseIsSystemOwned, continuesAutomaticallySql, isPersonOwnedFailureCode } from "./continuation-cause.js";
 import { sharedContinuationAttempts } from "./recovery/continuation-ledger.js";
+import { cutAnswerContinuationInstruction, readFailedTurnStreamedAnswer, type CutAnswerCause } from "./heartbeat-run-summary.js";
 
 export { AUTOMATIC_CONTINUATION_WAKE_REASONS, PERSON_OWNED_FAILURE_CODES, isPersonOwnedFailureCode, isRecoveryRun } from "./continuation-cause.js";
 
@@ -219,7 +220,9 @@ async function createdObjects(tx: Db, run: typeof heartbeatRuns.$inferSelect): P
 
 /** The opening context of the continuation. It names no person who must act. */
 export function freshContinuationNote(input: { runId: string; unverified: string[]; workspace: "restored_last_save" | "kept";
-  created?: FreshContinuationCreatedObjects }) {
+  created?: FreshContinuationCreatedObjects;
+  /** dl-n5-cont: the run's answer was cut after streaming text; where to pick it up. */
+  cutAnswer?: { text: string; cause: CutAnswerCause; posted: boolean } | null }) {
   const actions = input.unverified.length
     ? `These actions of that run have unverified outcomes: ${input.unverified.join(", ")}. For each one, first check whether it took effect.`
     : "No action of that run is recorded with an unknown outcome; check the task's recent history before repeating any side effect.";
@@ -246,7 +249,27 @@ export function freshContinuationNote(input: { runId: string; unverified: string
       created.documents.length ? `saved documents ${created.documents.join(", ")}` : null,
     ].filter(Boolean).join("; ")}. Do not create or post them again; read them and continue from where they leave off.`
     : "";
-  return `The previous attempt (run ${input.runId}) was cut off before it finished. ${files}${read}${edited}${existing} ${actions} ${guidance}`;
+  const answer = input.cutAnswer ? ` ${cutAnswerContinuationInstruction(input.cutAnswer)}` : "";
+  return `The previous attempt (run ${input.runId}) was cut off before it finished. ${files}${read}${edited}${existing} ${actions} ${guidance}${answer}`;
+}
+
+/**
+ * dl-n5-cont: the streamed answer of the source run's failed turn, and whether
+ * the run posted it (run completion posts it first). Null when it streamed none.
+ */
+export async function readSourceRunCutAnswer(tx: Pick<Db, "select">, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId">) {
+  const rows = await tx.select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload }).from(heartbeatRunEvents)
+    .where(and(eq(heartbeatRunEvents.companyId, run.companyId), eq(heartbeatRunEvents.runId, run.id), or(
+      inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
+      and(inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
+        sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`))))
+    .orderBy(heartbeatRunEvents.seq);
+  const cut = readFailedTurnStreamedAnswer(rows);
+  if (!cut) return null;
+  const [posted] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, run.companyId), eq(issueComments.createdByRunId, run.id), isNull(issueComments.deletedAt),
+    eq(issueComments.body, cut.candidate.text))).limit(1);
+  return { text: cut.text, cause: cut.cause, posted: Boolean(posted) };
 }
 
 const USER_TEXT = "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work.";
@@ -807,7 +830,8 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
   if (isolation === "fresh_isolated_workspace" && delivery === "saved_input") delivery = "recorded";
   const unverified = await unverifiedActions(tx, run);
   const created = await createdObjects(tx, run);
-  const note = freshContinuationNote({ runId: run.id, unverified, created,
+  const cutAnswer = await readSourceRunCutAnswer(tx, run);
+  const note = freshContinuationNote({ runId: run.id, unverified, created, cutAnswer,
     workspace: isolation === "writer_ended" ? "kept" : "restored_last_save" });
   const decision: ExecutionReconciliation & { providerStopProof: "writer_ended" | "isolated" } = { runId: run.id, providerStopped: true,
     // Only a proven end is a stop. `isolated` means exactly: the old run's agent

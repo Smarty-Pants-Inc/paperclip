@@ -129,6 +129,7 @@ import {
   hasAcceptedSemanticResult,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readFailedTurnStreamedAnswer,
   readTruncatedCompletedAgentMessageItemId,
   readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
@@ -2530,10 +2531,33 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
               "semantic_result_missing",
           )?.seq ?? null,
       );
-    return selectHeartbeatRunFinalAgentMessage({
+    const selected = selectHeartbeatRunFinalAgentMessage({
       candidates,
       semanticResultRecoveryAfterSeq: recoveryBoundary,
     });
+    if (selected) return selected;
+    // dl-n5-cont (Paul NOTE 5): a turn that streamed its answer and then
+    // failed (pi_output_truncated at the output cap, a provider EOF) has no
+    // completed answer. Its streamed prefix, rebuilt from the stored deltas,
+    // is posted first, with one true note; the continuation picks up at its end.
+    const streamedRows = await db
+      .select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+      .from(heartbeatRunEvents)
+      .where(
+        and(
+          eq(heartbeatRunEvents.companyId, companyId),
+          eq(heartbeatRunEvents.runId, runId),
+          or(
+            inArray(heartbeatRunEvents.eventType, ["turn.completed", "turn.failed", "turn.cancelled", "turn.interrupted"]),
+            and(
+              inArray(heartbeatRunEvents.eventType, ["item.delta", "item.completed"]),
+              sql`${heartbeatRunEvents.payload} #>> '{prpEvent,payload,kind}' = 'agentMessage'`,
+            ),
+          ),
+        ),
+      )
+      .orderBy(heartbeatRunEvents.seq);
+    return readFailedTurnStreamedAnswer(streamedRows)?.candidate ?? null;
   }
 
   async function refreshContinuationSummaryForRun(

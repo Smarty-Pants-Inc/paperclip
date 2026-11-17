@@ -652,6 +652,52 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].conversationState).toBe("waiting");
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
+  // dl-n5-cont (Paul NOTE 5; gate 1 run 00e31d20): a chat turn that streamed
+  // items 0001-0262 and then FAILED at the output cap posted nothing. A failed
+  // run's streamed prefix is its reply: posted once, before any continuation.
+  it.each([true, false])("dl-n5-cont posts a failed chat turn's streamed prefix once (streamed answer: %s)", async (streamed) => {
+    const f = await fixture({ runtimeMode: "native" }, `CUT${randomUUID().slice(0, 5)}`);
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with CEO",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: "local-board",
+      conversationAgentId: f.agent.id, conversationUserId: "local-board", conversationState: "active" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, responsibleUserId: "local-board",
+      contextSnapshot: { issueId: issue.id, conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult = { ...f.input.adapterResult, exitCode: 1, errorCode: "pi_output_truncated",
+      errorMessage: "Pi's final assistant response reached its output limit.", resultJson: {} };
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+    const turnId = "turn-1", itemId = "turn-1:pi-message:2:block:0";
+    const rows = [
+      ...(streamed ? [{ seq: 1, payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", text: prefix } } } }] : []),
+      { seq: 2, payload: { prpEvent: { eventType: "turn.failed", turnId, payload: { error: { code: "pi_output_truncated" } } } } },
+    ];
+    const { readFailedTurnStreamedAnswer } = await import("../heartbeat-run-summary.js");
+    f.deps.findLatestCompletedFinalAgentMessage.mockResolvedValue(readFailedTurnStreamedAnswer(rows)?.candidate ?? null);
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId,
+        authorAgentId: f.agent.id, authorType: "agent", createdByRunId: f.run.id, body }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+
+    await f.completion.completeRun(f.input);
+
+    const posted = (await db.select().from(issueComments).where(eq(issueComments.issueId, issue.id)))
+      .filter(comment => comment.createdByRunId === f.run.id);
+    expect((await read(f.run.id)).status).toBe("failed");
+    if (!streamed) {
+      // Nothing streamed: no reply here; the unanswered-message notice stays the true note.
+      expect(posted).toHaveLength(0);
+      return;
+    }
+    expect(posted).toHaveLength(1);
+    expect(posted[0]!.body.startsWith(prefix)).toBe(true);
+    expect(posted[0]!.body.slice(prefix.length)).toMatch(/output limit/u);
+    expect(posted[0]!.body).not.toMatch(/wasn't answered|Sending it again is safe/u);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
   it("settles the accepted native exact rate-card price without replacing it with zero", async () => {
     const f = await fixture({ runtimeMode: "native" });
     const runnerInstanceId = randomUUID();

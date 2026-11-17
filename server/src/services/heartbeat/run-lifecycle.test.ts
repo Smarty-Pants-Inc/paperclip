@@ -244,6 +244,49 @@ describe.skipIf(!support.supported)("heartbeat lifecycle database wiring", () =>
     expect(persisted?.processStartedAt?.toISOString()).toBe("2026-11-16T04:20:00.000Z");
   });
 
+  // dl-n5-cont (Paul NOTE 5; gate 1 run 00e31d20): 67,391 B streamed as
+  // item.delta (items 0001-0262), then turn.failed pi_output_truncated. NOTHING
+  // was posted. The run's reply is the streamed prefix, first, with one true note.
+  it.each([
+    ["pi_output_truncated", /output limit/u],
+    ["pi_provider_error", /connection to the model ended/u],
+  ] as const)("dl-n5-cont posts the streamed prefix of a turn that failed with %s", async (code, note) => {
+    const { run, agent } = await fixture({ status: "failed", finishedAt: new Date() });
+    const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+    const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+    const turnId = `runner-1:${run.id}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    const rows: (typeof heartbeatRunEvents.$inferInsert)[] = [{ ...base, seq: 1, eventType: "item.delta",
+      payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`, turnId, payload: { kind: "reasoning", text: "plan" } } } }];
+    let seq = 2;
+    for (let offset = 0; offset < prefix.length; offset += 257) rows.push({ ...base, seq: seq++, eventType: "item.delta",
+      payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress",
+        text: prefix.slice(offset, offset + 257) } } } });
+    rows.push({ ...base, seq: seq++, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+      payload: { status: "failed", error: { code, recoverable: false } } } } });
+    await db.insert(heartbeatRunEvents).values(rows);
+    const lifecycle = createHeartbeatLifecycle(db, callbacks(db));
+    const final = await lifecycle.findLatestCompletedFinalAgentMessage(run.id, run.companyId);
+    expect(final?.channel).toBe("final");
+    expect(final?.text.startsWith(prefix)).toBe(true);
+    expect(final?.text).not.toContain(item(263));
+    expect(final?.text.slice(prefix.length)).toMatch(note);
+    expect(final?.text).not.toMatch(/wasn't answered|Sending it again is safe|are in that reply/u);
+  });
+
+  it("dl-n5-cont NEGATIVE: a failed turn that streamed only thinking has no reply (the true notice applies)", async () => {
+    const { run, agent } = await fixture({ status: "failed", finishedAt: new Date() });
+    const turnId = `runner-1:${run.id}:turn-1`;
+    const base = { companyId: run.companyId, runId: run.id, agentId: agent.id, stream: "system", level: "info", message: "e" };
+    await db.insert(heartbeatRunEvents).values([
+      { ...base, seq: 1, eventType: "item.delta", payload: { prpEvent: { eventType: "item.delta", itemId: `${turnId}:pi-thinking:1`,
+        turnId, payload: { kind: "reasoning", text: "thinking only ".repeat(500) } } } },
+      { ...base, seq: 2, eventType: "turn.failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+        payload: { status: "failed", error: { code: "pi_output_truncated" } } } } },
+    ]);
+    expect(await createHeartbeatLifecycle(db, callbacks(db)).findLatestCompletedFinalAgentMessage(run.id, run.companyId)).toBeNull();
+  });
+
   it("keeps one terminal outcome and reports only the winner of competing writes", async () => {
     const { run } = await fixture();
     const deps = callbacks(db);

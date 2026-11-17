@@ -1343,6 +1343,47 @@ suite("fresh-continuation fallback", () => {
     expect(text).not.toMatch(/operator must|recover its result|recover .*execution state|authorize rerunning/i);
   }, 60_000);
 
+  // dl-n5-cont (Paul NOTE 5; gate 1 runs 00e31d20 -> 2b6822e1): the cut turn
+  // streamed items 0001-0262 and failed with pi_output_truncated. The run
+  // posted that prefix first; its continuation must pick up at item 0263, never
+  // restart the identical ask, and never point at text the person did not see.
+  it.each([["posted", true], ["not posted", false]] as const)(
+    "dl-n5-cont rule 3: a cut answer (%s) is continued from its exact end, or restarted plainly", async (_label, posted) => {
+      const f = await unfinishedRun({ runtime: "native", errorCode: "native_session_interrupted" });
+      const item = (n: number) => `Item ${String(n).padStart(4, "0")}: ${"body text of this numbered item; ".repeat(7)}\n`;
+      const prefix = Array.from({ length: 262 }, (_, i) => item(i + 1)).join("");
+      const turnId = `runner-1:${f.runId}:turn-1`, itemId = `${turnId}:pi-message:2:block:0`;
+      const rows = [];
+      let seq = 1;
+      for (let offset = 0; offset < prefix.length; offset += 997) rows.push({ companyId, runId: f.runId, agentId, seq: seq++,
+        eventType: "item.delta", stream: "system", level: "info", message: "delta",
+        payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress",
+          text: prefix.slice(offset, offset + 997) } } } });
+      rows.push({ companyId, runId: f.runId, agentId, seq: seq++, eventType: "turn.failed", stream: "system", level: "error",
+        message: "turn failed", payload: { prpEvent: { eventType: "turn.failed", turnId,
+          payload: { status: "failed", error: { code: "pi_output_truncated", recoverable: false } } } } });
+      await db.insert(heartbeatRunEvents).values(rows);
+      const { readFailedTurnStreamedAnswer } = await import("./heartbeat-run-summary.js");
+      const cut = readFailedTurnStreamedAnswer(rows.map(row => ({ seq: row.seq, payload: row.payload })));
+      expect(cut?.text).toBe(prefix);
+      if (posted) await db.insert(issueComments).values({ companyId, issueId: f.issueId, authorAgentId: agentId,
+        createdByRunId: f.runId, body: cut!.candidate.text });
+      expect(await ensureFreshContinuation(db, { companyId, runId: f.runId, trigger: "recovery_refused" })).toMatchObject({ kind: "continued" });
+      const continuation = await buildExecutionContinuation({ db, companyId, issueId: f.issueId, agentId,
+        context: { previousRunId: f.runId }, summary: null, exposeLowTrustRaw: false });
+      const text = JSON.stringify(continuation);
+      if (posted) {
+        expect(text).toMatch(/Continue exactly where it stopped/u);
+        expect(text).toContain(JSON.stringify(item(262).trim()).slice(1, -1));
+        expect(text).toMatch(/Do not repeat or summarize any of the posted text and do not restart the answer/u);
+      } else {
+        expect(text).toMatch(/none of it was shown to them/u);
+        expect(text).toMatch(/starting the answer again from the beginning/u);
+        expect(text).not.toMatch(/Continue exactly where it stopped/u);
+      }
+      expect(text).not.toMatch(/wasn't answered|Sending it again is safe/u);
+    }, 60_000);
+
   // A task whose run completes normally gets no fallback activity at all, even
   // with an older hold on the task (a run queued across a swap that then ran).
   it("leaves a task that completes normally alone, even with an older run's hold", async () => {
