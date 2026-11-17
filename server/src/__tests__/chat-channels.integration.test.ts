@@ -65434,12 +65434,14 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       }
     });
 
-    // retry-fold6 (rf-3 M9): processFailedChatRunRetry's NORMAL prepared path
-    // reads the one Retry authority before it asks for a wake. A restore hold
-    // whose files are only owed is refused there (the card offers no Retry);
-    // removing the authority checks (failed-run-retry.ts assertChatRetryAuthority
-    // before the wake and inside its admission) lets the wake start.
-    it("retry-fold6: a prepared chat Retry under a pending restore hold is refused by the one authority before any wake, with the hold's words", async () => {
+    // retry-fold6 (rf-3 M9), rewritten for fam-retry2: processFailedChatRunRetry's
+    // NORMAL prepared path reads the one Retry authority before it asks for a
+    // wake. Under a pending restore hold the authority ACCEPTS and HOLDS: the chat
+    // Retry is not refused (it stays issued, attempts unspent, with the hold's
+    // words) and no wake starts now; a second pass is the same hold, no 2nd wake.
+    // Removing the hold check (failed-run-retry.ts retryHeldBehindRestore before
+    // the wake) lets the wake start, which this test catches.
+    it("retry-fold6 / fam-retry2: a prepared chat Retry under a pending restore hold is accepted and held by the one authority, with the hold's words, and does not wake now", async () => {
       const context = await fixture(true);
       try {
         await context.resolve().expect(200);
@@ -65448,12 +65450,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         expect(retry).toMatchObject({ status: "issued" });
         expect(retry!.payload.sourceAuthorizationPending).not.toBe(true);
         await insertPendingRestoreHold(db, { companyId: context.fixture.companyId, issueId: context.issue.id, runId: context.runId });
-        await context.service.processFailedChatRunRetry(retry!.id).catch(() => undefined);
+        await context.service.processFailedChatRunRetry(retry!.id);
         expect(context.wakeup).not.toHaveBeenCalled();
         expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
-        const [settled] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
-        expect(settled?.result).toMatchObject({ code: "failed_chat_retry_not_authorized",
-          message: RECOVERING_SAVED_WORK_NEXT_ACTION, nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION });
+        const [held] = await db.select().from(chatActions).where(eq(chatActions.id, retry!.id));
+        expect(held).toMatchObject({ status: "issued", result: { code: "failed_chat_retry_held", attemptCount: 0,
+          held: { reason: "workspace_repair_required", message: RECOVERING_SAVED_WORK_NEXT_ACTION },
+          message: RECOVERING_SAVED_WORK_NEXT_ACTION, nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+        expect(held!.result?.code).not.toBe("failed_chat_retry_not_authorized");
+        // A second pass once its recheck time is due: still held, no 2nd wake.
+        await db.update(chatActions).set({ result: { ...held!.result, retryAt: new Date(0).toISOString() } })
+          .where(eq(chatActions.id, retry!.id));
+        await context.service.processFailedChatRunRetry(retry!.id);
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
+        expect((await db.select().from(chatActions).where(eq(chatActions.id, retry!.id)))[0])
+          .toMatchObject({ status: "issued", result: { code: "failed_chat_retry_held", attemptCount: 0 } });
       } finally {
         await context.cleanup();
       }
@@ -66483,20 +66495,37 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     return { ...f, app, companyId, issueId, counts, card };
   }
 
-  it("retry-fold6 (rf-3 FAIL 1): a Boat-remote, agent_files, pi_rpc chat under a pending restore hold: the Retry route refuses with the hold's one instruction, as the card does, and saves nothing", async () => {
+  // fam-retry2 (upstream wins over fold6's refusal): a Retry under a PENDING
+  // restore hold is ACCEPTED once and HELD (no wake now), in the hold's words;
+  // a repeat returns the same held acceptance and saves nothing more.
+  it("retry-fold6 (rf-3 FAIL 1) / fam-retry2: a Boat-remote, agent_files, pi_rpc chat under a pending restore hold: the Retry route accepts and holds it with the hold's words, the card waits with the same words, and a repeat is the same held acceptance", async () => {
     const f = await boatRetryRouteFixture();
     await insertPendingRestoreHold(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId });
     const before = await f.counts();
-    // Production entry point first: POST /api/issues/:id/retry (routes/issues.ts:10429).
-    const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`)
-      .send({ observedRunId: f.runId, idempotencyKey: randomUUID() });
-    expect(response.status, JSON.stringify(response.body)).toBe(409);
-    expect(response.body).toMatchObject({ error: RECOVERING_SAVED_WORK_NEXT_ACTION, details: { code: "retry_not_available",
-      reason: "workspace_repair_required", nextAction: RECOVERING_SAVED_WORK_NEXT_ACTION } });
-    expect(f.wakeup).not.toHaveBeenCalled();
-    expect(await f.counts()).toEqual(before);
-    // Same decision as the card: no Retry, the hold's words.
+    // Before the click the card waits with the same words (the card keeps upstream's withheld Retry).
     expect(await f.card()).toMatchObject({ canRetry: false, retryWait: { message: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+    const body = { observedRunId: f.runId, idempotencyKey: randomUUID() };
+    // Production entry point first: POST /api/issues/:id/retry (routes/issues.ts -> task-retry.ts requestTaskRetry).
+    const response = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    expect(response.body).toMatchObject({ accepted: true,
+      held: { reason: "workspace_repair_required", message: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+    expect(response.body.refused).toBeUndefined();
+    expect(f.wakeup).not.toHaveBeenCalled();
+    const accepted = await f.counts();
+    expect(accepted.wakes).toBe(before.wakes + 1);
+    // The held Retry is recorded, not woken: no run.
+    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, response.body.requestId));
+    expect(held).toMatchObject({ reason: "task_retry", runId: null });
+    // After the click the card shows upstream's accepted, held Retry: Paperclip owns it, no second Retry.
+    expect(await f.card()).toMatchObject({ state: "retry_scheduled", responsibility: "system", canRetry: false });
+    // RFL: a repeat of the same click is the same held acceptance; nothing new is saved or woken.
+    const repeat = await request(f.app).post(`/api/issues/${f.issueId}/retry`).send(body);
+    expect(repeat.status, JSON.stringify(repeat.body)).toBe(202);
+    expect(repeat.body).toMatchObject({ accepted: true, requestId: response.body.requestId,
+      held: { reason: "workspace_repair_required", message: RECOVERING_SAVED_WORK_NEXT_ACTION } });
+    expect(await f.counts()).toEqual(accepted);
+    expect(f.wakeup).not.toHaveBeenCalled();
   });
 
   it("retry-fold6 (rf-3 FAIL 2, finding A): a repeat of a waiting Retry whose Stop has since expired unproven is refused at requestTaskRetry, as the card refuses it", async () => {
