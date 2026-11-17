@@ -85,6 +85,7 @@ import {
   caseHandoffs,
   companies,
   budgetPolicies,
+  environmentLeases,
   heartbeatRunWatchdogDecisions,
   heartbeatRuns,
   issueAttachments,
@@ -115,6 +116,7 @@ import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
+import { readLeaseReleaseDeferral } from "../environment-lease-release-deferral.js";
 import { clearTaskStopPending, hasTaskStopPending, recordTaskStopPending } from "./stop-pending.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
@@ -4265,6 +4267,54 @@ export function recoveryService(
     });
   }
 
+  /** A warm keep is not a failed Stop inspection. This caller-only exception
+   * grants no Stop proof and never releases a claim: expiry/cleanup must still
+   * release the lease before the ordinary guard can clear either task lock.
+   * Called only while holding the task and all bound-run locks. */
+  async function onlyHealthyWarmKeepBlocksStop(tx: Db, issue: Pick<RecoveryIssue, "id" | "companyId" | "status" | "cancelledAt">, ownerRunIds: string[]) {
+    if (issue.status === "cancelled" || issue.cancelledAt) return false;
+    const runs = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
+    ));
+    if (runs.length !== ownerRunIds.length || runs.some(run => {
+      const result = run.resultJson ?? {};
+      return !TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status) || run.errorCode === "operator_interrupted" ||
+        ["executionCancellation", "startupCancellation", "nativeCancellation", "cancellation",
+          "operatorInterrupted", "cancelledByActorType", "cancelledByUserId", "interruptedByActorType",
+          "queuedCommentInterruptQueueId"].some(key => result[key] != null && result[key] !== false);
+    })) return false;
+    const leases = await tx.select().from(environmentLeases).where(and(
+      eq(environmentLeases.companyId, issue.companyId), inArray(environmentLeases.heartbeatRunId, ownerRunIds),
+    ));
+    if (leases.some(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata))) return false;
+    // Match the guard's unreleased-lease family without changing its meaning.
+    const blockers = leases.filter(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) ||
+      lease.status === "pending_cleanup" || lease.cleanupStatus === "failed");
+    if (!blockers.length || blockers.some(lease => {
+      const metadata = lease.metadata ?? {};
+      const owner = runs.find(run => run.id === lease.heartbeatRunId);
+      // Active reusable leases intentionally outlive a successful turn. Do not
+      // require new metadata on warm keeps persisted by an earlier release.
+      return lease.status !== "active" || lease.releasedAt || lease.cleanupStatus ||
+        lease.leasePolicy !== "reuse_by_environment" || !lease.provider || lease.provider === "local" || !lease.providerLeaseId ||
+        (lease.expiresAt && lease.expiresAt.getTime() <= Date.now()) ||
+        metadata.runnerTaskRetiring === true || metadata.pluginLeaseCleanupMethod != null ||
+        metadata.sandboxStopAndRetain != null || metadata.runnerTaskStartupCleanup != null ||
+        owner?.status !== "succeeded" || owner.errorCode ||
+        (owner.resultJson?.stopReason != null && owner.resultJson.stopReason !== "completed");
+    })) return false;
+    const warmRunIds = new Set(blockers.map(lease => lease.heartbeatRunId!));
+    // The shared guard checks lease release before these independent blockers.
+    // For succeeded remote owners it ignores local Runner PIDs; so do we, but
+    // never hide an outstanding run-controller or finalization owner.
+    if (runs.some(run => warmRunIds.has(run.id) && run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
+    const coordinators = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+      inArray(nativeRunFinalizations.runId, [...warmRunIds]), isNotNull(nativeRunFinalizations.leaseOwner),
+    ));
+    if (coordinators.length) return false;
+    return runExecutionsHaveStopped(tx, issue.companyId, ownerRunIds.filter(id => !warmRunIds.has(id)));
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: RecoveryIssue;
     previousStatus: StrandedPreviousStatus;
@@ -4310,6 +4360,7 @@ export function recoveryService(
           eq(heartbeatRuns.companyId, current.companyId), inArray(heartbeatRuns.id, ownerRunIds),
         )).orderBy(asc(heartbeatRuns.id)).for("update");
         if (!await runExecutionsHaveStopped(tx as unknown as Db, current.companyId, ownerRunIds)) {
+          if (await onlyHealthyWarmKeepBlocksStop(tx as unknown as Db, current, ownerRunIds)) return null;
           await recordTaskStopPending(tx as unknown as Db, { companyId: current.companyId, issueId: current.id,
             runIds: ownerRunIds, source: "recovery.stranded_assigned_issue" }, publications);
           return null;
@@ -6973,7 +7024,7 @@ export function recoveryService(
       await deps.beforeStaleLockClear?.(issue.id);
       const publications: ActivityPublication[] = [];
       const updated = await db.transaction(async tx => {
-        const [locked] = await tx.select({ id: issues.id, checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        const [locked] = await tx.select()
           .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id))).for("update");
         if (!locked || locked.checkoutRunId !== issue.checkoutRunId || locked.executionRunId !== issue.executionRunId) return null;
         // Terminal status alone does not prove that execution stopped. Match
@@ -6986,10 +7037,11 @@ export function recoveryService(
             eq(heartbeatRuns.companyId, issue.companyId), inArray(heartbeatRuns.id, ownerRunIds),
           )).orderBy(asc(heartbeatRuns.id)).for("update");
           if (!await runExecutionsHaveStopped(tx as unknown as Db, issue.companyId, ownerRunIds)) {
-          await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
-            runIds: ownerRunIds, source: "recovery.sweep_stale_issue_locks" }, publications);
-          return null;
-        }
+            if (await onlyHealthyWarmKeepBlocksStop(tx as unknown as Db, locked, ownerRunIds)) return null;
+            await recordTaskStopPending(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
+              runIds: ownerRunIds, source: "recovery.sweep_stale_issue_locks" }, publications);
+            return null;
+          }
         }
         for (const runId of ownerRunIds) {
           if (runId && await nativeManualAdmissionHoldsExecution(tx as unknown as Db,
