@@ -6731,12 +6731,12 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
 
   // AF-ABORT (RFL row-22 wedge class, rf-4 binding bar): the REAL Stop collector
   // (heartbeat adapter -> instruction copies -> agent-directory operation lock)
-  // hangs on a provider call while it holds its ephemeral-server advisory-lock
-  // TRANSACTION and the lease collection pin. At the aggregate deadline the
+  // hangs on a provider call while it holds its ephemeral-server operation lock
+  // (at 7eff0afc an advisory-lock TRANSACTION) and the lease collection pin. At the aggregate deadline the
   // collection is ABORTED: by deadline + 1 s its transaction and lock session
   // are gone, a concurrent acquire of the same lock and rows succeeds, the
   // acquisition is done, the box is stopped and kept, and savePending is set.
-  it("AF-ABORT: a hung collector holding its lock transaction is aborted at the deadline; no transaction, lock or new remote call survives deadline + 1 s", async () => {
+  it("AF-ABORT: a hung collector holding its operation lock is aborted at the deadline; no transaction, lock or new remote call survives deadline + 1 s", async () => {
     const deadlineMs = 400;
     vi.stubEnv("PAPERCLIP_EPHEMERAL_SERVER", "true");
     const home = await mkdtemp(path.join(os.tmpdir(), "af-abort-home-"));
@@ -6845,11 +6845,13 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       .then(result => { completedAt = performance.now(); return result; });
     acquisition.catch(() => {});
     let callsBeforeRelease = -1;
+    let duringHangIdleInTransaction: Array<{ pid: number }> | null = null;
     try {
       // The real collector reaches the provider call while holding its lock transaction.
       await Promise.race([remoteStarted, new Promise((_resolve, reject) => setTimeout(() => reject(new Error("collector never reached a provider call")), deadlineMs))]);
-      const during = await idleInTransaction();
-      expect(during.length, "the hung collector holds an open lock transaction during the provider call").toBeGreaterThan(0);
+      // The operation lock is held during the provider call (checked again below:
+      // RFL bar 1, no DB transaction is open across that call).
+      duringHangIdleInTransaction = await idleInTransaction();
       await expect(concurrentAcquire()).resolves.toMatchObject({ advisory: false });
       // At the deadline + 1 s.
       const checkAt = collectorStartedAt! + deadlineMs + 1_000;
@@ -6878,6 +6880,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       await acquisition.catch(() => {});
       await new Promise(resolve => setTimeout(resolve, 300));
     }
+    expect(duringHangIdleInTransaction, "no DB transaction is open while the collector waits on its provider call").toEqual([]);
     expect(remoteInFlight).toBe(0);
     expect(remoteCalls, `the aborted collection starts no provider call after its stuck one returns: ${JSON.stringify(remoteCommands)}`).toBe(callsBeforeRelease);
     const [after] = await db.select().from(agentInstructionWorkingCopies).where(eq(agentInstructionWorkingCopies.runId, runId));

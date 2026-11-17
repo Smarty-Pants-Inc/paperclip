@@ -60,14 +60,14 @@ export function agentFileHoldInstruction(row: Pick<Copy, "receipt" | "executionR
  * preparation failed before provider use, or exact destruction was proven. */
 /**
  * AF-ABORT (RFL row-22 / rf-4): ends an agent-directory operation-lock
- * transaction when `signal` aborts, instead of when the held work returns.
+ * session when `signal` aborts, instead of when the held work returns.
  * Same pattern as pl/cancel-finalize2 (5e0eac367, the ownership callback
  * returns at the deadline) plus workspace-source-lock.ts's statement cancel:
  * a statement still running on THIS lock session (matched by pid and
  * backend_start) is cancelled with pg_cancel_backend from a control
- * connection bounded to 1 s, then the transaction callback rejects, so the
- * transaction rolls back (releasing the advisory lock) and the dedicated
- * connection closes. The abandoned work keeps no lock and re-checks `signal`.
+ * connection bounded to 1 s, then the lock callback rejects, so the
+ * dedicated connection closes and its advisory lock is released. The
+ * abandoned work keeps no lock and re-checks `signal`.
  */
 export async function endLockSessionOnAbort<T>(db: Db, session: { pid: number; backendStart: string }, work: Promise<T>, signal: AbortSignal): Promise<T> {
   work.catch(() => undefined);
@@ -1249,19 +1249,24 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // collection/cleanup operations in Postgres, without holding row locks over I/O.
     // Test instrumentation only (disarmed in production): restart chaos fails the Nth attempt with the lock's own conflict.
     crashPoint("agent_directory.operation_lock.before_acquire", { fail: () => new AgentDirectoryOperationBusyError() });
-    return withDedicatedDbConnection(db, dedicated => dedicated.transaction(async tx => {
-      const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
-        (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms,
+    // AF-ABORT (RFL row-22): a SESSION advisory lock on a dedicated one-connection
+    // client, so no DB transaction is open while the operation does provider
+    // I/O (the session is idle, never idle in transaction). The lock ends with
+    // the session: withDedicatedDbConnection closes it when the operation
+    // settles, or at once when `signal` aborts. Same key space as before, so
+    // it conflicts with any transaction-level lock on the same key.
+    return withDedicatedDbConnection(db, async dedicated => {
+      const [lock] = await dedicated.execute(sql`select pg_try_advisory_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
+        (select setting::bigint from pg_settings where name = 'idle_session_timeout') as idle_timeout_ms,
         pg_backend_pid() as pid, (select backend_start::text from pg_stat_activity where pid = pg_backend_pid()) as backend_start`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      const work = withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
+      const work = withWorkspaceLockKeepalive(dedicated, Number(lock.idle_timeout_ms ?? 0), run);
       if (!signal) return work;
-      // AF-ABORT: an aborted operation releases this lock session at once
-      // (rollback, then the dedicated connection closes), not when a held
-      // provider call returns; the abandoned work re-checks the signal and
-      // writes nothing. pl/cancel-finalize2 pattern (5e0eac367).
+      // pl/cancel-finalize2 pattern (5e0eac367): the lock session is released
+      // at the abort, not when a held provider call returns; the abandoned
+      // work re-checks the signal and writes nothing.
       return endLockSessionOnAbort(db, { pid: Number(lock.pid), backendStart: String(lock.backend_start) }, work, signal);
-    }));
+    });
   }
   async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
     // A restarted preparation repeats this run's sealed notice, not another
