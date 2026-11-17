@@ -88,6 +88,7 @@ import {
 } from "../activity-log.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { materializeNativeProviderCapacityRetry } from "./native-provider-capacity-retry.js";
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { NATIVE_PROVIDER_OVERLOADED_CODE } from "./native-provider-failure.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 
@@ -459,6 +460,54 @@ function failAt(
 ) {
   if (actual === requested)
     throw new Error(`native_status_failpoint:${actual}`);
+}
+
+/** The native-status continuation (schedule_retry) successor's OWN pending
+ * input, for ANSWERED attribution ONLY (RFL 23:38Z, SUPERSEDE-F2 rf-5). The
+ * successor continues the SAME conversation: the cut/capped turn is never
+ * re-sent, so the id goes in the one field that carriesCommentSql
+ * (person-message-answer.ts) and the sweep's runCarriesMessage/inScopeSql read
+ * but no prompt builder does: conversationReplyBoundaryCommentId. Never
+ * wakeCommentId(s)/commentId (paperclipWake comments -> wakePrompt),
+ * commentContinuation or firstTurnQueuedInput (first-turn re-delivery and
+ * the seal), or interactionId(s) (interaction responses). Collected only by
+ * the existing collector: still pending, not ANSWERED, not live-carried. The
+ * field holds one id: the latest pending input, as wakeCommentId would. */
+export async function nativeContinuationAttributionContext(
+  tx: Pick<Db, "select">,
+  input: { companyId: string; issueId: string; originRunId: string },
+): Promise<Record<string, unknown>> {
+  const carried = await readContinuationCommentInput(tx, {
+    companyId: input.companyId, issueId: input.issueId, runId: input.originRunId });
+  const ids = Array.isArray(carried.wakeCommentIds)
+    ? carried.wakeCommentIds.filter((id): id is string => typeof id === "string") : [];
+  const latest = ids.at(-1);
+  return latest ? { conversationReplyBoundaryCommentId: latest } : {};
+}
+
+/** The native-status automatic successor wake (schedule_retry: output cap,
+ * EOF, failed turn). It carries the origin run's still-pending person input as
+ * its OWN pending input for attribution only (nativeContinuationAttributionContext). */
+export async function enqueueNativeContinuationWake(input: {
+  tx: Db; companyId: string; issueId: string; agentId: string; decisionId: string; originRunId: string;
+  cause: string; summary: string;
+}) {
+  return enqueueWake({
+    tx: input.tx,
+    companyId: input.companyId,
+    issueId: input.issueId,
+    agentId: input.agentId,
+    reason: "issue_status_changed",
+    idempotencyKey: `native-status:${input.decisionId}:retry`,
+    originRunId: input.originRunId,
+    contextSnapshot: await nativeContinuationAttributionContext(input.tx, {
+      companyId: input.companyId, issueId: input.issueId, originRunId: input.originRunId }),
+    payload: {
+      nativeDecisionId: input.decisionId,
+      retryCause: input.cause,
+      retrySummary: input.summary,
+    },
+  });
 }
 
 export async function enqueueWake(input: {
@@ -903,19 +952,9 @@ async function materializeDecisionEffect(input: {
       return { effectKind: effect.kind, targetType: "heartbeat_run", targetId: retryId,
         payload: { cause: effect.cause, summary: effect.summary } };
     }
-    const wakeId = await enqueueWake({
-      tx: input.tx,
-      companyId: input.companyId,
-      issueId: input.issue.id,
-      agentId: effect.agentId,
-      reason: "issue_status_changed",
-      idempotencyKey: `native-status:${input.decisionId}:retry`,
-      originRunId: input.runId,
-      payload: {
-        nativeDecisionId: input.decisionId,
-        retryCause: effect.cause,
-        retrySummary: effect.summary,
-      },
+    const wakeId = await enqueueNativeContinuationWake({
+      tx: input.tx, companyId: input.companyId, issueId: input.issue.id, agentId: effect.agentId,
+      decisionId: input.decisionId, originRunId: input.runId, cause: effect.cause, summary: effect.summary,
     });
     return {
       effectKind: effect.kind,

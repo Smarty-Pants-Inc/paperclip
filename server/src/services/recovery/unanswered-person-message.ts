@@ -328,6 +328,15 @@ export type UnansweredMessageOutcome =
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
+/** A native-status continuation carrying the message only as its attribution
+ * field (conversationReplyBoundaryCommentId), never as prompt input. */
+function carriesForAttributionOnly(contextSnapshot: unknown, messageId: string): boolean {
+  const context = (contextSnapshot ?? {}) as Record<string, unknown>;
+  return context.statusDecisionSource === "native_status_decision"
+    && context.conversationReplyBoundaryCommentId === messageId
+    && !runCarriesMessage({ ...context, conversationReplyBoundaryCommentId: undefined }, messageId);
+}
+
 function runCarriesMessage(contextSnapshot: unknown, messageId: string): boolean {
   const context = (contextSnapshot ?? {}) as Record<string, unknown>;
   // A comment that arrived while the run prepared is delivered as its first-turn
@@ -770,9 +779,15 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       // this message's attempt even when its context no longer copies m.
       // Keep the ordinary start bound, but a proven successor is waiting
       // work, not a reason to resend its predecessor's input.
-      const descendant = Boolean(messageRun && candidate.id !== messageRun.id
+      // The native-status continuation holds m for attribution only
+      // (status-decision-committer.ts nativeContinuationAttributionContext), so
+      // it is the newest carrier itself: prove it against the carrier before it.
+      const ancestor = candidate.id === messageRun?.id && carriesForAttributionOnly(candidate.contextSnapshot, message.id)
+        ? runs.find(other => other.id !== candidate.id && runCarriesMessage(other.contextSnapshot, message.id)) ?? null
+        : messageRun;
+      const descendant = Boolean(ancestor && candidate.id !== ancestor.id
         && await freshContinuationDescendsFrom(q, { companyId: issue.companyId, issueId: issue.id,
-          runId: candidate.id, ancestorRunId: messageRun.id, includeAnswerLineage: true }));
+          runId: candidate.id, ancestorRunId: ancestor.id, includeAnswerLineage: true }));
       if (runCarriesMessage(candidate.contextSnapshot, message.id) || descendant) waitingToStart = true;
       if (descendant) { continuationWaiting = true; break; }
     }
