@@ -33,6 +33,7 @@ import {
   resolveHomeAwarePath,
 } from "./home-paths.js";
 import { loadStorageConfig, type StorageConfig } from "./storage/config.js";
+import { validateCapEnvironment } from "./cap-environment.js";
 
 if (!isCloudManagedInstance()) {
   const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
@@ -152,6 +153,7 @@ function runTailscaleAddressCommand(): string | undefined {
 }
 
 export function loadConfig(override?: PaperclipConfig | null): Config {
+  validateCapEnvironment(process.env);
   const configFile = override === undefined ? readConfigFile({ includeProvenance: true })
     : override ? { config: override, explicitStorageS3Bucket: true } : null;
   const fileConfig = configFile?.config ?? null;
