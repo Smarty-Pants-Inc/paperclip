@@ -25,7 +25,7 @@ import { requestSandboxAbsenceProof } from "./sandbox-absence-proof.js";
 import { persistActivity, publishActivity } from "./activity-log.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasVerifiedWorkspaceRepair, readWorkspaceRecovery, type WorkspaceRecovery } from "./workspace-recovery-receipt.js";
-import { withNativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
+import { withNativeWorkspaceFinalizationOwnership, type NativeWorkspaceFinalizationOwnership } from "./native-runtime/native-workspace-finalization-ownership.js";
 import { readNativeWorkspaceSyncReference, readNativeWorkspaceSyncLocalCwd, resumeNativeWorkspaceSync } from "./native-runtime/native-workspace-sync.js";
 import { classifyNativeWorkspaceFailure } from "./native-runtime/native-workspace-failure.js";
 
@@ -226,7 +226,8 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
   }
   if (!initial || initial.state === "complete" ||
       (initial.nextAttemptAt !== null && initial.nextAttemptAt > Date.now())) return;
-  const runAttempt = async (ownership: { token: string; assertHeld(): Promise<void> }) => {
+  // (target adaptation, adopt-drain/pl/lockloss: the ownership now also carries `lost` and `hostMutations`.)
+  const runAttempt = async (ownership: NativeWorkspaceFinalizationOwnership) => {
     let current = await loadSystemRecovery(db, input);
     if (!current) return;
     if (current.state === "exhausted") {
