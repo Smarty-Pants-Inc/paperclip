@@ -2634,26 +2634,16 @@ pub(crate) fn redact_sensitive_text_values(input: &str) -> String {
             |quote| quoted_value_end(value_start, quote),
         );
         let candidate = &input[value_start..end];
-        // A bare "bearer token" or "bearer authentication" is ordinary prose.
-        // Quoted values, opaque formats, and long values indicate credentials;
-        // explicit Authorization fields are independently redacted below.
-        let prose_term = matches!(
-            candidate
-                .trim_end_matches(['.', ',', ';', ':', '!', '?'])
-                .to_ascii_lowercase()
-                .as_str(),
-            "token"
-                | "tokens"
-                | "authentication"
-                | "authorization"
-                | "credential"
-                | "credentials"
-                | "scheme"
-                | "schemes"
-                | "flow"
-                | "flows"
-        );
-        if end > value_start && (quote.is_some() || !prose_term) {
+        // A bare bearer is also ordinary prose ("bearer of good news").
+        // Require a token-shaped run. Keep explicitly quoted/malformed quoted
+        // values private; Authorization fields are independently redacted below.
+        let token_shaped = candidate.len() >= 20
+            && candidate.bytes().all(|value| {
+                value.is_ascii_alphanumeric()
+                    || matches!(value, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+            });
+        let quoted = quote.is_some() || candidate.contains(['\'', '"']);
+        if end > value_start && (quoted || token_shaped) {
             ranges.push((value_start, end));
         }
     }
@@ -3115,7 +3105,11 @@ mod tests {
             URL_SAFE_NO_PAD.encode(br#" {"alg":"HS256","typ":"JWT"}"#)
         );
         assert_eq!(redact_text(&jwt), "[REDACTED]");
-        assert_eq!(redact_text("Bearer abcdefghijkl"), "Bearer [REDACTED]");
+        // Bare-Bearer fixtures use a token-shaped run (20+ bytes), not a prose word.
+        assert_eq!(
+            redact_text("Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD"),
+            "Bearer [REDACTED]"
+        );
         assert_eq!(
             redact_text("request failed token secret-value"),
             "request failed token [REDACTED]"
@@ -4056,7 +4050,7 @@ mod tests {
     fn protocol_authorization_boundary_is_not_redacted_as_a_credential() {
         let sanitized = sanitize_value(&json!({
             "authorizationBoundary": "active_task",
-            "nested": {"authorizationBoundary": "Bearer secret-value"},
+            "nested": {"authorizationBoundary": "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD"},
             "authorization": "Bearer secret-value",
         }));
         assert_eq!(sanitized["authorizationBoundary"], json!("active_task"));
@@ -4295,7 +4289,10 @@ mod tests {
             ("--token opaque-value", "--token [REDACTED]"),
             ("OPENAI_API_KEY opaque-value", "OPENAI_API_KEY [REDACTED]"),
             ("access_token opaque-value", "access_token [REDACTED]"),
-            ("Bearer opaque-value", "Bearer [REDACTED]"),
+            (
+                "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+                "Bearer [REDACTED]",
+            ),
             (
                 "Use a token system; ghp_abcdefghijklmnopqrstuvwxyz",
                 "Use a token system; [REDACTED]",
@@ -4334,7 +4331,10 @@ mod tests {
                 "token=\"[REDACTED]\" Next.",
             ),
             ("token='fixture-secret.' Next.", "token='[REDACTED]' Next."),
-            ("Bearer fixture-secret. Next.", "Bearer [REDACTED]. Next."),
+            (
+                "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD. Next.",
+                "Bearer [REDACTED]. Next.",
+            ),
             (
                 "Authorization: Bearer fixture-secret. Next.",
                 "Authorization: Bearer [REDACTED]. Next.",
@@ -4679,6 +4679,24 @@ mod tests {
     }
 
     #[test]
+    fn bearer_prose_is_not_a_credential() {
+        for text in [
+            "a bearer of good news",
+            "ern bearer lanterns",
+            "Bearer [REDACTED]",
+        ] {
+            assert_eq!(redact_sensitive_text_values(text), text);
+        }
+        let credential = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        for prefix in ["Bearer", "Authorization: Bearer"] {
+            assert!(
+                !redact_sensitive_text_values(&format!("{prefix} {credential}"))
+                    .contains(credential)
+            );
+        }
+    }
+
+    #[test]
     fn diagnostic_redaction_is_idempotent() {
         for input in [
             "Missing bearer secret-value",
@@ -4864,6 +4882,32 @@ mod tests {
         assert!(!shown.contains("truncat"));
     }
 
+    #[test]
+    fn pre_redaction_receipt_leaves_the_outbox_unchanged() {
+        let frame = config(PathBuf::from("unused"));
+        let mut state = DurableState::new(&frame);
+        let source = json!({"bytes": 47, "sha256": "ab".repeat(32)});
+        let events = crate::provider_events::normalize_pi_notification_in(
+            "item/agentMessage/delta",
+            &json!({"itemId": "answer", "delta": "Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD", "sourceText": source}),
+            None,
+        );
+        state
+            .enqueue_event(
+                &frame,
+                "item.delta",
+                EventPriority::P2,
+                events[0].payload.clone(),
+            )
+            .unwrap();
+        let stored = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload")
+            .unwrap();
+        assert_eq!(stored["text"], "Bearer [REDACTED]");
+        assert_eq!(stored["sourceText"], source);
+    }
+
     // Paul NOTE 5: a projector's agent-facing reference to an answer longer
     // than one record leaves the outbox exactly as sent.
     #[test]
@@ -4871,7 +4915,8 @@ mod tests {
         let frame = config(PathBuf::from("unused"));
         let mut state = DurableState::new(&frame);
         let full = json!({"path": "/runner/tmp/paperclip-pi-spill/0123.txt",
-            "sha256": "ab".repeat(32), "bytes": 800_000});
+            "sha256": "ab".repeat(32), "bytes": 800_000,
+            "sourceText": {"format": "sha256-segments-v1", "bytes": 800_010, "sha256": "cd".repeat(32), "segments": 42}});
         state
             .enqueue_event(
                 &frame,

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { redactSensitiveText } from "../redaction.js";
 import type {
   RunPresentationDecision,
   RunPresentationSource,
@@ -611,6 +612,26 @@ export function reassembleAgentMessageFromDeltas(
   return text.trim() ? text : null;
 }
 
+/** Verify pre-redaction segment receipts, not stored/redacted text against a spill file. */
+function matchesProjectedSourceText(rows: readonly { seq: number; payload: unknown }[], itemId: string, reference: unknown): boolean {
+  const expected = record(reference);
+  if (expected.format !== "sha256-segments-v1" || !Number.isSafeInteger(expected.segments) || Number(expected.segments) <= 0
+    || !Number.isSafeInteger(expected.bytes) || Number(expected.bytes) <= 0
+    || typeof expected.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(expected.sha256)) return false;
+  const hash = createHash("sha256");
+  let bytes = 0, segments = 0;
+  for (const row of [...rows].sort((a, b) => a.seq - b.seq)) {
+    const event = record(record(row.payload).prpEvent);
+    if (event.eventType !== "item.delta" || event.itemId !== itemId) continue;
+    const source = record(record(event.payload).sourceText);
+    if (!Number.isSafeInteger(source.bytes) || Number(source.bytes) < 0
+      || typeof source.sha256 !== "string" || !/^[a-f0-9]{64}$/u.test(source.sha256)) return false;
+    bytes += Number(source.bytes); segments++;
+    hash.update(source.sha256);
+  }
+  return bytes === expected.bytes && segments === expected.segments && hash.digest("hex") === expected.sha256;
+}
+
 /**
  * A final answer whose completed event was stored without text, rebuilt from
  * its deltas, so the semantic summary never wins over it (dl-n5-66k).
@@ -626,8 +647,16 @@ export function readTruncatedCompletedAssistantMessageCandidate(input: {
   const reference = projectedFullTextReference(record(record(input.prpEvent).payload));
   // A projected preview includes the whole text's receipt. Missing deltas must
   // not turn a successful partial rebuild into an apparently complete answer.
-  const whole = rebuilt !== null && (!reference || (Buffer.byteLength(rebuilt) === reference.bytes
-    && createHash("sha256").update(rebuilt).digest("hex") === reference.sha256)) ? rebuilt : null;
+  const sourceText = record(record(record(input.prpEvent).payload).fullText).sourceText;
+  const matches = sourceText !== undefined
+    ? matchesProjectedSourceText(input.deltaRows, itemId, sourceText)
+    : !reference || (rebuilt !== null && Buffer.byteLength(rebuilt) === reference.bytes
+      && createHash("sha256").update(rebuilt).digest("hex") === reference.sha256);
+  // Source integrity is not permission to expose a credential split across
+  // native deltas. Scan the joined text too, including a token tail immediately
+  // following an earlier redaction marker (the prefix was already removed).
+  const whole = rebuilt !== null && matches ? redactSensitiveText(rebuilt)
+    .replace(/((?:\*\*\*REDACTED\*\*\*|\[REDACTED\])\]?)[A-Za-z0-9._~+/=-]+/g, "$1") : null;
   // dl-n5-cont2 C1: a truncated final exists but cannot be rebuilt whole (a
   // stored delta is itself cut). The summary never stands in for it: the
   // person gets ONE plain, true line.

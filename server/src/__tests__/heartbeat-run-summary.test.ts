@@ -1326,6 +1326,86 @@ describe("dl-n5-66k a final answer stored without text is never replaced by the 
     expect(reassembleAgentMessageFromDeltas(rowsFor(answer).deltas, itemId)).toBe(answer);
   });
 
+  // KEEP: afa142ec lost a whole 300 KiB answer because a redacted delta no
+  // longer matched the projector's spill-file receipt. Use both real redactors.
+  it.each([
+    "a bearer of good news; ern bearer lanterns",
+    "Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    "API_KEY=abcdefghijklmnopqrstuvwxyz0123456789ABCD",
+    "\u001b[31m",
+  ])("a redacted 300 KiB projected answer is delivered whole in labelled parts: %s", async span => {
+    const { createPiEventProjector } = await import("../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js");
+    const { redactEventPayload } = await import("../redaction.js");
+    const answer = ("opening line\n".repeat(10_000) + span + "\n" + "ending line\n".repeat(16_000)).slice(0, 300 * 1024);
+    const projector = createPiEventProjector({ runId: "redactor", turnId: "turn-redactor" });
+    const projected = [];
+    for (const delta of [answer.slice(0, 130_000), span, answer.slice(130_000 + span.length)]) {
+      projected.push(...projector.project({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } }));
+    }
+    projected.push(...projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model",
+      responseId: "redactor-answer", stopReason: "stop", content: [{ type: "text", text: answer }] } }));
+    const rows = projected.map((event, seq) => ({ seq, payload: redactEventPayload({ prpEvent: event }) }));
+    const completion = rows.find(row => (row.payload?.prpEvent as { eventType: string }).eventType === "item.completed")!;
+    const final = completion.payload!.prpEvent as { itemId: string };
+    const stored = reassembleAgentMessageFromDeltas(rows, final.itemId)!;
+    const candidate = readTruncatedCompletedAssistantMessageCandidate({ seq: completion.seq, prpEvent: final, deltaRows: rows });
+    expect(candidate?.text).toBe(stored);
+    const parts = runSummary.splitFinalAnswerParts(candidate!.text);
+    expect(parts).toHaveLength(2);
+    expect(parts.map(part => part.body.slice(part.label.length + part.prefix.length, part.suffix ? -part.suffix.length : undefined)).join("")).toBe(stored);
+    expect(parts[0]!.label).toBe("part 1 of 2\n");
+    if (span.startsWith("a bearer")) expect(stored).toContain(span);
+    else expect(stored).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+    // The source receipt must still refuse missing, duplicate or reordered
+    // deltas; a redaction is not a license to trust an arbitrary partial body.
+    const deltas = rows.filter(row => (row.payload?.prpEvent as { eventType: string }).eventType === "item.delta");
+    const corruptReceipt = structuredClone(deltas);
+    const firstPayload = (corruptReceipt[0]!.payload!.prpEvent as { payload: { sourceText: { sha256: string } } }).payload;
+    firstPayload.sourceText.sha256 = "0".repeat(64);
+    for (const damaged of [deltas.slice(1), deltas.slice(0, -1), [...deltas, deltas[0]!], corruptReceipt,
+      deltas.map((row, i) => ({ ...row, seq: deltas.length - i }))]) {
+      expect(readTruncatedCompletedAssistantMessageCandidate({ seq: completion.seq, prpEvent: final, deltaRows: damaged })?.text)
+        .toBe(runSummary.TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+    }
+  });
+
+  it.each([0, 12])("does not expose a credential split %i bytes into its value", async prefixBytes => {
+    const { createPiEventProjector } = await import("../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js");
+    const { redactEventPayload } = await import("../redaction.js");
+    const credential = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const chunks = ["start\n".repeat(25_000), `Authorization: Bearer ${credential.slice(0, prefixBytes)}`,
+      credential.slice(prefixBytes), "\nend\n".repeat(40_000)];
+    const answer = chunks.join("");
+    const projector = createPiEventProjector({ runId: "split", turnId: "split" });
+    const projected = chunks.flatMap(delta => projector.project({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } }));
+    projected.push(...projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", responseId: "split",
+      stopReason: "stop", content: [{ type: "text", text: answer }] } }));
+    const rows = projected.map((event, seq) => ({ seq, payload: redactEventPayload({ prpEvent: event }) }));
+    const completion = projected.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")!;
+    const candidate = readTruncatedCompletedAssistantMessageCandidate({ seq: rows.length, prpEvent: completion, deltaRows: rows })!;
+    expect(candidate.text).not.toBe(runSummary.TRUNCATED_FINAL_UNDELIVERABLE_TEXT);
+    expect(candidate.text).not.toContain(credential.slice(prefixBytes));
+    expect(candidate.text).toContain("REDACTED");
+    expect(runSummary.splitFinalAnswerParts(candidate.text)).toHaveLength(2);
+  });
+
+  it("keeps a 300 KiB answer whole across the incident's 26,745 contiguous deltas", async () => {
+    const { createPiEventProjector } = await import("../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js");
+    const { redactEventPayload } = await import("../redaction.js");
+    const chunks = Array.from({ length: 26_745 }, (_, i) => i === 13_000 ? "ern bearer lanterns" : `R${String(i).padStart(5, "0")} abc\n`);
+    chunks[0] = chunks[0]! + "x".repeat(300 * 1024 - Buffer.byteLength(chunks.join("")));
+    const answer = chunks.join("");
+    const projector = createPiEventProjector({ runId: "dense", turnId: "dense" });
+    const projected = chunks.flatMap(delta => projector.project({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } }));
+    projected.push(...projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", responseId: "dense",
+      stopReason: "stop", content: [{ type: "text", text: answer }] } }));
+    const rows = projected.map((event, seq) => ({ seq, payload: redactEventPayload({ prpEvent: event }) }));
+    const completion = projected.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")!;
+    expect(projected.filter(event => event.eventType === "item.delta")).toHaveLength(26_745);
+    expect(Buffer.byteLength(answer)).toBe(300 * 1024);
+    expect(readTruncatedCompletedAssistantMessageCandidate({ seq: rows.length, prpEvent: completion, deltaRows: rows })?.text).toBe(answer);
+  });
+
   it("a projected fullText receipt whose deltas cannot rebuild the whole is undeliverable, never its excerpt", () => {
     const answer = "The stored text is incomplete.";
     const { deltas } = rowsFor(answer);

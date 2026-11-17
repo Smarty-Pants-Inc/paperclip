@@ -18,7 +18,7 @@ export interface PiProjectedEvent extends PiEventOrigin {
   payload: Record<string, unknown>;
   debug?: Record<string, unknown>;
 }
-interface Block { id: string; kind: string; text: string; terminal: boolean }
+interface Block { id: string; kind: string; text: string; terminal: boolean; sourceSegments: { chars: number; pages: number }[] }
 interface Tool { id: string; name: string; args?: unknown; input: string; terminal: boolean; started: boolean }
 /** Per-record frame safety bound. Never raised: larger text is spilled or paged, not cut. */
 const MAX_RECORD_BYTES = 256 * 1024;
@@ -66,7 +66,33 @@ export function spillText(value: string, label: "input" | "output" | "text" | "a
   return fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(reference))) + reference;
 }
 /** Where the whole of a final answer longer than one record is kept, for the agent (never shown to the person). */
-export interface PiFullTextReference { path: string; sha256: string; bytes: number }
+export interface PiFullTextReference { path: string; sha256: string; bytes: number; sourceText?: { format: "sha256-segments-v1"; bytes: number; sha256: string; segments: number } }
+/**
+ * Integrity before ANY redaction. Each raw native delta contributes one leaf
+ * per projected page. The completion independently rebuilds these leaves from
+ * its authoritative native text and the observed segment boundaries. Downstream
+ * redactors may change the displayed bytes, never these opaque receipts.
+ */
+function sourceTextLeaf(source: { bytes: number; sha256: string }, page: number, count: number): { bytes: number; sha256: string } {
+  return { bytes: page === 0 ? source.bytes : 0, sha256: digest(`${source.sha256}:${page}/${count}`) };
+}
+function sourceTextReference(raw: string, boundaries: Block["sourceSegments"]): PiFullTextReference["sourceText"] {
+  if (!boundaries.length) return undefined;
+  const hash = createHash("sha256");
+  let offset = 0, bytes = 0, segments = 0;
+  for (const boundary of boundaries) {
+    const part = raw.slice(offset, offset + boundary.chars);
+    offset += boundary.chars;
+    const source = { bytes: Buffer.byteLength(part), sha256: digest(part) };
+    for (let page = 0; page < boundary.pages; page++) {
+      const leaf = sourceTextLeaf(source, page, boundary.pages);
+      bytes += leaf.bytes; segments++;
+      hash.update(leaf.sha256);
+    }
+  }
+  // A different terminal snapshot must not attest to the streamed prefix.
+  return offset === raw.length ? { format: "sha256-segments-v1", bytes, sha256: hash.digest("hex"), segments } : undefined;
+}
 /**
  * A final answer that fits one record is returned whole. A longer one is kept
  * WHOLE (the same content-addressed spill file Pi's read tool can open; the
@@ -227,7 +253,7 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
   const blockFor = (index: number, kind: string): Block => {
     if (!Number.isSafeInteger(index) || index < 0 || index >= MAX_IDENTITIES) throw new Error("pi_projection_content_index_invalid");
     let block = blocks.get(index);
-    if (!block) { block = { id: `${ensureMessage()}:block:${index}`, kind, text: "", terminal: false }; blocks.set(index, block); }
+    if (!block) { block = { id: `${ensureMessage()}:block:${index}`, kind, text: "", terminal: false, sourceSegments: [] }; blocks.set(index, block); }
     if (block.kind !== kind) throw new Error("pi_projection_content_kind_changed");
     return block;
   };
@@ -462,7 +488,15 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
         if (type.endsWith("_delta")) {
           // Every streamed delta reaches the person whole; one too large for a
           // record is paged across consecutive deltas, never cut.
-          for (const page of pages(text(update.delta))) if (page) output.push(emit("item.delta", block.id, { ...payload, text: page }));
+          const raw = text(record(source.assistantMessageEvent).delta);
+          // Even an ANSI-only source delta needs a receipt if sanitization
+          // removes all its display bytes; an empty delta is not a cut.
+          const deltaPages = pages(text(update.delta)).filter(page => page.length > 0 || raw.length > 0);
+          const sourceReceipt = !thinking ? { bytes: Buffer.byteLength(raw), sha256: digest(raw) } : undefined;
+          if (!thinking && deltaPages.length) block.sourceSegments.push({ chars: raw.length, pages: deltaPages.length });
+          for (const [index, page] of deltaPages.entries()) output.push(emit("item.delta", block.id, { ...payload, text: page,
+            ...(sourceReceipt ? { sourceText: sourceTextLeaf(sourceReceipt, index, deltaPages.length) } : {}),
+          }));
         } else if (type.endsWith("_end")) {
           // The block-end snapshot is not a delta. message_end publishes its
           // authoritative final content/status without duplicating streamed text.
@@ -511,7 +545,11 @@ export function createPiEventProjector(options: PiEventOrigin & { includeThinkin
             // Read the native text: displayValue already replaced an oversized string with a spill reference.
             const answer = kind === "reasoning" ? undefined
               : finalAnswerText(redactProviderDiagnostic(text(record(nativeContent[index]).text)), MAX_ANSWER_BYTES, spillDirectory);
-            if (answer?.fullText) displayTruncated = true;
+            if (answer?.fullText) {
+              displayTruncated = true;
+              const sourceText = sourceTextReference(text(record(nativeContent[index]).text), block.sourceSegments);
+              if (sourceText) answer.fullText.sourceText = sourceText;
+            }
             block.text = answer ? answer.text : projectText(text(part.thinking), MAX_ANSWER_BYTES, "text"); block.terminal = true;
             output.push(emit(failed ? "item.failed" : "item.completed", block.id, { kind, channel: kind === "reasoning" ? "detail" : message.stopReason === "toolUse" ? "progress" : "final", text: block.text,
               ...(answer?.fullText ? { fullText: answer.fullText } : {}),

@@ -636,8 +636,31 @@ fn final_agent_message_text(value: &str) -> String {
     bounded
 }
 
+/// Opaque pre-redaction receipts. Text is still redacted at every display boundary.
+fn source_text_reference(value: Option<&Value>, complete: bool) -> Option<Value> {
+    let value = value?;
+    let bytes = value.get("bytes").and_then(Value::as_u64)?;
+    let sha256 = value.get("sha256").and_then(Value::as_str)?;
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    if complete {
+        let segments = value.get("segments").and_then(Value::as_u64)?;
+        if value.get("format").and_then(Value::as_str) != Some("sha256-segments-v1")
+            || segments == 0
+        {
+            return None;
+        }
+        Some(
+            json!({"format": "sha256-segments-v1", "bytes": bytes, "sha256": sha256, "segments": segments}),
+        )
+    } else {
+        Some(json!({"bytes": bytes, "sha256": sha256}))
+    }
+}
+
 /// The agent-facing reference to the whole text of an answer longer than one
-/// record: only a well-formed {path, sha256, bytes} is carried.
+/// record, plus an optional pre-redaction stream receipt.
 pub(crate) fn full_text_reference(value: Option<&Value>) -> Option<Value> {
     let value = value?;
     let path = value.get("path").and_then(Value::as_str)?;
@@ -647,7 +670,13 @@ pub(crate) fn full_text_reference(value: Option<&Value>) -> Option<Value> {
         && path.len() <= 4_096
         && sha256.len() == 64
         && sha256.bytes().all(|byte| byte.is_ascii_hexdigit()))
-    .then(|| json!({"path": path, "sha256": sha256, "bytes": bytes}))
+    .then(|| {
+        let mut full = json!({"path": path, "sha256": sha256, "bytes": bytes});
+        if let Some(source) = source_text_reference(value.get("sourceText"), true) {
+            full["sourceText"] = source;
+        }
+        full
+    })
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
@@ -1697,17 +1726,21 @@ pub(crate) fn normalize_pi_notification_in(
         _ => None,
     };
     if let Some((kind, channel, text)) = streamed {
+        let mut payload = json!({
+            "provider": "pi_rpc",
+            "itemId": stable_id(string(params.get("itemId").or_else(|| item(params).get("id"))), "pi-item"),
+            "kind": kind,
+            "channel": channel,
+            "providerMethod": method,
+            "text": redact_sensitive_text_values(string(text)),
+        });
+        if let Some(source) = source_text_reference(params.get("sourceText"), false) {
+            payload["sourceText"] = source;
+        }
         return vec![NormalizedProviderEvent {
             event_type: "item.delta".to_owned(),
             priority: EventPriority::P2,
-            payload: json!({
-                "provider": "pi_rpc",
-                "itemId": stable_id(string(params.get("itemId").or_else(|| item(params).get("id"))), "pi-item"),
-                "kind": kind,
-                "channel": channel,
-                "providerMethod": method,
-                "text": redact_sensitive_text_values(string(text)),
-            }),
+            payload,
         }];
     }
     // item/failed is a Pi compatibility notification, not a Codex terminal.
@@ -2684,10 +2717,11 @@ mod tests {
 
     fn assert_pi_delta_normalizes_whole(method: &str, kind: &str) {
         let text = "x".repeat(6_000);
+        let source = json!({"bytes": 6_000, "sha256": "ab".repeat(32)});
         let events = normalize_pi_notification_in(
             method,
             &json!({"threadId": "native", "turnId": "turn", "itemId": "stream",
-                "kind": kind, "text": text, "delta": text,
+                "kind": kind, "text": text, "delta": text, "sourceText": source,
                 "item": {"id": "stream", "type": kind, "text": text}}),
             None,
         );
@@ -2696,6 +2730,7 @@ mod tests {
         assert_eq!(events[0].payload["kind"], kind);
         assert_eq!(events[0].payload["text"].as_str().unwrap().len(), 6_000);
         assert_eq!(events[0].payload["text"], text);
+        assert_eq!(events[0].payload["sourceText"], source);
         assert!(!events[0].payload.to_string().contains("…[truncated]"));
     }
 
@@ -2732,7 +2767,8 @@ mod tests {
     #[test]
     fn pi_final_answer_carries_the_full_text_reference_for_the_agent() {
         let full = json!({"path": "/runner/tmp/paperclip-pi-spill/abc.txt",
-            "sha256": "0".repeat(64), "bytes": 800_000});
+            "sha256": "0".repeat(64), "bytes": 800_000,
+            "sourceText": {"format": "sha256-segments-v1", "bytes": 800_010, "sha256": "ab".repeat(32), "segments": 42}});
         let events = normalize_pi_notification_in(
             "item/completed",
             &json!({"threadId":"native", "turnId":"turn", "itemId":"turn:reply",

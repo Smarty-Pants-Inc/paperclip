@@ -716,6 +716,8 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
             channel,
             providerMethod: notification.method,
             text: page,
+            ...(state.driverKind === "pi_rpc" && params.sourceText !== undefined
+              ? { sourceText: record(params.sourceText) } : {}),
             update: params,
           }),
           { turnId, itemId: itemId || `${turnId}:${deltaKind}` },

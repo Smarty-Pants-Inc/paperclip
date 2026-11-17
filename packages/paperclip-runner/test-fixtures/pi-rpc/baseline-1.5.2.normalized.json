@@ -58,7 +58,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "Hello "
+      "text": "Hello ",
+      "sourceText": {
+        "bytes": 6,
+        "sha256": "08c14aba0c4ea41322c86152768eed2d06a08e06c3ef44731434567e310e84b9"
+      }
     }
   },
   {
@@ -69,7 +73,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "🌍 line"
+      "text": "🌍 line",
+      "sourceText": {
+        "bytes": 11,
+        "sha256": "2b5c9d1e550ddd070ed76ba6c8591c90c6d3e660a08875f0c82ce208c215b548"
+      }
     }
   },
   {
@@ -499,7 +507,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "Tool s"
+      "text": "Tool s",
+      "sourceText": {
+        "bytes": 6,
+        "sha256": "d53c1f718e3ed1602086e0a868a0828aa44124a3c1cf788aa12bc1507d293a0f"
+      }
     }
   },
   {
@@ -510,7 +522,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "ucceeded."
+      "text": "ucceeded.",
+      "sourceText": {
+        "bytes": 9,
+        "sha256": "e35a27b9dd31a7f5c5b1ca696ff458d12f55206847ea84314c2cd2ed07618b4f"
+      }
     }
   },
   {
@@ -941,7 +957,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "Tool f"
+      "text": "Tool f",
+      "sourceText": {
+        "bytes": 6,
+        "sha256": "9d67f92b6ef3774c483fdf0e0df95fd93694a6807a57f1ce2fee064f8397ffdf"
+      }
     }
   },
   {
@@ -952,7 +972,11 @@
     "payload": {
       "kind": "agentMessage",
       "channel": "unknown",
-      "text": "ailure was observed."
+      "text": "ailure was observed.",
+      "sourceText": {
+        "bytes": 20,
+        "sha256": "ff66c2dd1901fdca78d6750bb3a89b4175b8f6d6a9b631c8ba1154e1f23a32ab"
+      }
     }
   },
   {

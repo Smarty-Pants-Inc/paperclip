@@ -709,6 +709,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     { storage: "intact", name: "300 KiB intact", answer: h5Answer },
     { storage: "rebuilt", name: "300 KiB rebuilt", answer: h5Answer },
     { storage: "projected", name: "300 KiB projector preview", answer: h5Answer },
+    { storage: "projected-redacted", name: "300 KiB real redaction", answer: h5Answer.slice(0, 130_000)
+      + "\nAuthorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD\n" + h5Answer.slice(130_064) },
     { storage: "intact", name: "under limit unchanged", answer: "  A complete short answer.\n\n" },
     { storage: "intact", name: "exactly at limit", answer: "x".repeat(250 * 1024) },
     { storage: "intact", name: "multi-byte boundary", answer: "😀漢é".repeat(40_000) },
@@ -733,18 +735,38 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const base = { companyId: f.run.companyId, runId: f.run.id, agentId: f.agent.id, stream: "system", level: "info", message: "e" };
     const events: (typeof heartbeatRunEvents.$inferInsert)[] = [];
     let seq = 1;
-    for (let offset = 0; offset < answer.length;) {
-      let end = Math.min(answer.length, offset + 4_001);
-      if (end < answer.length && /[\uD800-\uDBFF]/u.test(answer[end - 1]!)) end--;
-      events.push({ ...base, seq: seq++, eventType: "item.delta",
-        payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: answer.slice(offset, end) } } } });
-      offset = end;
+    if (storage === "projected-redacted") {
+      const { createPiEventProjector } = await import("../../../../packages/paperclip-runner/src/drivers/pi/pi-event-projector.js");
+      const { redactEventPayload } = await import("../../redaction.js");
+      const projector = createPiEventProjector({ runId: f.run.id, turnId });
+      const projected = [];
+      // Keep the credential in one native delta; both production redactors run.
+      for (const delta of [answer.slice(0, 130_000), answer.slice(130_000, 130_064), answer.slice(130_064)]) {
+        projected.push(...projector.project({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta } }));
+      }
+      projected.push(...projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model",
+        responseId: "redaction-answer", stopReason: "stop", content: [{ type: "text", text: answer }] } }));
+      for (const event of projected.filter(event => ["item.delta", "item.completed"].includes(event.eventType) && event.payload.kind === "agentMessage")) {
+        events.push({ ...base, seq: seq++, eventType: event.eventType, payload: redactEventPayload({ prpEvent: event }) });
+      }
+      answer = events.filter(event => event.eventType === "item.delta")
+        .map(event => (event.payload as { prpEvent: { payload: { text: string } } }).prpEvent.payload.text).join("");
+      expect(answer).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789ABCD");
+      expect(answer).toContain("REDACTED");
+    } else {
+      for (let offset = 0; offset < answer.length;) {
+        let end = Math.min(answer.length, offset + 4_001);
+        if (end < answer.length && /[\uD800-\uDBFF]/u.test(answer[end - 1]!)) end--;
+        events.push({ ...base, seq: seq++, eventType: "item.delta",
+          payload: { prpEvent: { eventType: "item.delta", itemId, turnId, payload: { kind: "agentMessage", channel: "progress", text: answer.slice(offset, end) } } } });
+        offset = end;
+      }
+      events.push({ ...base, seq: seq++, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
+        payload: storage === "intact" ? { kind: "agentMessage", channel: "final", text: answer }
+          : storage === "projected" ? { kind: "agentMessage", channel: "final", text: `This answer is longer than one message (308 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${answer.slice(0, 16 * 1024)}`,
+            fullText: { path: "/runner-private/spill.txt", sha256: createHash("sha256").update(answer).digest("hex"), bytes: Buffer.byteLength(answer) } }
+          : { truncated: true, byteSize: Buffer.byteLength(answer) } } } });
     }
-    events.push({ ...base, seq: seq++, eventType: "item.completed", payload: { prpEvent: { eventType: "item.completed", itemId, turnId,
-      payload: storage === "intact" ? { kind: "agentMessage", channel: "final", text: answer }
-        : storage === "projected" ? { kind: "agentMessage", channel: "final", text: `This answer is longer than one message (308 KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n${answer.slice(0, 16 * 1024)}`,
-          fullText: { path: "/runner-private/spill.txt", sha256: createHash("sha256").update(answer).digest("hex"), bytes: Buffer.byteLength(answer) } }
-        : { truncated: true, byteSize: Buffer.byteLength(answer) } } } });
     events.push({ ...base, seq: seq++, eventType: "turn.completed", payload: { prpEvent: { eventType: "turn.completed", turnId, payload: {} } } });
     await db.insert(heartbeatRunEvents).values(events);
     await db.update(heartbeatRuns).set({ nextEventSeq: seq }).where(eq(heartbeatRuns.id, f.run.id));

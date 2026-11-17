@@ -125,6 +125,26 @@ async function facadeDelta(answer: string, kind = "agentMessage") {
 }
 
 describe("PACK retained streamed text across the Pi facade", () => {
+  it("retains pre-redaction integrity receipts on paged deltas and the long completion", async () => {
+    const projector = createPiEventProjector({ runId: "run", turnId: "turn-1" });
+    const credential = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+    const answer = "start\n".repeat(25_000) + `Authorization: Bearer ${credential}\n` + "end\n".repeat(40_000);
+    const projected = [
+      ...projector.project({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: answer } }),
+      ...projector.project({ type: "message_end", message: { role: "assistant", provider: "neutral", model: "model", responseId: "integrity",
+        stopReason: "stop", content: [{ type: "text", text: answer }] } }),
+    ].filter(event => ["item.delta", "item.completed"].includes(event.eventType) && event.payload.kind === "agentMessage");
+    const events = await emitNotifications(projected.map(event => openCodeProxyItemNotification({
+      eventType: event.eventType as "item.delta" | "item.completed", threadId: "thread-1", turnId: "turn-1", itemId: event.itemId,
+      payload: event.eventType === "item.completed" ? { ...event.payload, item: { phase: "final_answer" } } : event.payload,
+    })));
+    const deltas = events.filter(event => event.eventType === "item.delta");
+    expect(deltas.length).toBeGreaterThan(1);
+    expect(deltas.map(event => event.payload.sourceText)).toEqual(projected.filter(event => event.eventType === "item.delta").map(event => event.payload.sourceText));
+    const completion = events.find(event => event.eventType === "item.completed" && event.payload.kind === "agentMessage")!;
+    expect(completion.payload.fullText).toEqual(projected.at(-1)!.payload.fullText);
+    expect(JSON.stringify(events)).not.toContain(credential);
+  });
   it.each([
     { kind: "agentMessage", size: 96 * 1024 },
     { kind: "reasoning", size: 40_000 },

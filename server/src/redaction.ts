@@ -744,9 +744,10 @@ function redactStandaloneBearerCredentials(input: string): string {
     }
 
     const candidate = input.slice(credentialStart, end);
-    // Preserve known authentication terms after bearer, unless explicitly quoted.
-    // Named Authorization fields are already handled independently above.
-    if (/^(?:tokens?|authentication|authorization|credentials?|schemes?|flows?)[.,;:!?]?$/i.test(candidate)) continue;
+    // A bare bearer is also ordinary prose ("bearer of good news"). Require
+    // a token-shaped run; quotes still explicitly delimit private values,
+    // including malformed quoted credentials. Named headers are handled above.
+    if (!/["']/.test(candidate) && !/^[A-Za-z0-9._~+/=-]{20,}$/.test(candidate)) continue;
     if (credentialStart < copiedThrough) continue;
     parts.push(input.slice(copiedThrough, credentialStart), replacement);
     copiedThrough = end;

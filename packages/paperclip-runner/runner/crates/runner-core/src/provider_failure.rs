@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn codex_startup_keeps_provider_fields_without_response_bodies_or_credentials() {
         let error = json!({ "code": -32603, "message": json!({ "status": 429,
-            "error": { "code": "insufficient_quota", "message": "Allowance exhausted. Bearer fixture-credential" },
+            "error": { "code": "insufficient_quota", "message": "Allowance exhausted. Bearer fixture-credential-0123456789abcdef" },
             "request_id": "req_fixture", "responseBody": "private body marker" }).to_string() });
         let failure = codex_startup_failure(&error).unwrap();
         assert_eq!(failure["category"], "quota_exhausted");

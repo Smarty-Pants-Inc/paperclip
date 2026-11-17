@@ -2,7 +2,10 @@
 export function redactProviderDiagnostic(message: string): string {
   const sanitized = message
     .replaceAll(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/Bearer\s+[A-Za-z0-9._~+\/-]+/gi, "Bearer [REDACTED]")
+    // A named header is a credential even when its value is short. A bare
+    // bearer in prose is not: require an opaque token-shaped run.
+    .replace(/(\bAuthorization\s*[:=]?\s+Bearer\s+)[^\s"'`]+/gi, "$1[REDACTED]")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/gi, "Bearer [REDACTED]")
     .replace(/Basic\s+([A-Za-z0-9+/=]+)/gi, (match, encoded: string) => {
       try {
         // Only redact an actual RFC 7617 credential. Ordinary prose such as
