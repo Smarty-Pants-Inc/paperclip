@@ -835,6 +835,27 @@ function isSupersededCheckpointRefusal(error: unknown): boolean {
   return false;
 }
 
+/** Boat/remote checkpoint receipts (persistRemoteRunnerCheckpoint): the fence
+ * refused this owner BEFORE any remote state was inspected or copied, and the
+ * transport passed `settled`, which it does only for a Runner whose durable
+ * suspension it proved (runnerd-codex-transport close: runnerSettled implies
+ * runnerSuspended, never a Runner retained alive). The transport then
+ * force-stops in `finally` and rethrows this same ordinary error; a force-stop
+ * failure replaces it (releaseRunnerProcessOwnership). */
+const remoteCheckpointOwnerRefusals = new WeakMap<Error, { settlement: "settled" | "unsettled" }>();
+
+function isSuspendedRemoteCheckpointRefusal(error: unknown): boolean {
+  const pending: unknown[] = [error];
+  for (let seen = 0; pending.length > 0 && seen < 16; seen++) {
+    const current = pending.shift();
+    if (!(current instanceof Error)) continue;
+    if (remoteCheckpointOwnerRefusals.get(current)?.settlement === "settled") return true;
+    if (current instanceof AggregateError) pending.push(...current.errors);
+    if (current.cause !== undefined) pending.push(current.cause);
+  }
+  return false;
+}
+
 async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
   discardUnsettledSession?: boolean;
@@ -872,7 +893,12 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
           options?.onForcedStopFailed?.(stopError);
           return false;
         })
-        : error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true);
+        : (error instanceof NativeSessionCloseUnrecoverableError && error.settlement?.runnerSuspended === true)
+          // The Boat remote path (no task owner): the transport proved the
+          // Runner suspended, the fence refused before reading its state, and
+          // the force-stop that followed did not fail. Its saved bytes stay
+          // where they are (the box and the last durable backup).
+          || (options?.discardSupersededCheckpoint === true && isSuspendedRemoteCheckpointRefusal(error)));
       if (retiredWithoutCheckpoint) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
@@ -955,7 +981,10 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
   }
 }
 
-export const warmRetirementDirectoryWait = { timeoutMs: 300_000, pollMs: 1_000 };
+// chat-retire3 F2: a follow-up may first wait out its predecessor's release
+// (warmSessionReleaseWait, 30 s); with this directory wait the follow-up waits
+// at most 60 s in all before it proceeds or fails typed (was 300 s).
+export const warmRetirementDirectoryWait = { timeoutMs: 30_000, pollMs: 1_000 };
 
 /**
  * An owner whose retirement stayed unproven lives only in its own sandbox,
@@ -1069,6 +1098,24 @@ async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
   ]).finally(() => clearTimeout(timer));
 }
 
+/** Waits, within warmSessionReleaseWait, while the previous turn's owner is
+ * still releasing (busy without a successor's claim, settling or closing). A
+ * session still busy at the deadline fails its caller as before. */
+async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession): Promise<void> {
+  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+  while (Date.now() < deadline && (settlingNativeSessionScopes.has(scope)
+    || (warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
+    await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
+  }
+  const closing = closingWarmNativeSessions.get(scope);
+  if (!closing) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    closing.catch(() => undefined),
+    new Promise<void>(resolve => { timer = setTimeout(resolve, Math.max(0, deadline - Date.now())); }),
+  ]).finally(() => clearTimeout(timer));
+}
+
 /** Reserve the existing physical copy before heartbeat composes AGENT_HOME and
  * task guidance. The final execution/configuration fence still owns admission. */
 export async function claimWarmNativeInstructionCopy(input: {
@@ -1148,10 +1195,19 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
   canReuse: () => Promise<boolean>;
-}): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
+}, releaseWaited = false): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
+    // T9 (chat-retire3): a quick follow-up (no Stop) meets the previous turn's
+    // release still finishing: a Boat Runner is a release/resume pair owner,
+    // busy until its finishRelease in that run's final cleanup. Wait it out
+    // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
+    // Another run's claim (preparingRunId) is a real concurrent owner.
+    if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
+      await waitForWarmNativeSessionRelease(id, entry);
+      return reserveWarmNativeInstructionDirectory(input, true);
+    }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
@@ -19603,7 +19659,11 @@ async function createRunnerdBackendWithinSessionClaim(
     const currentAuthority = sessionToolAuthorityEpochs.get(sessionScopeId);
     const backupOwner = durableStorage && currentAuthority ? sessionHarnessBackupOwners.get(currentAuthority) : null;
     if (durableStorage && !backupOwner) throw new Error("native_harness_storage_owner_missing");
-    if (backupOwner) await assertNativeHarnessBackupOwner(input.db, backupOwner);
+    if (backupOwner) await assertNativeHarnessBackupOwner(input.db, backupOwner).catch((error: unknown) => {
+      // Nothing of this owner's remote state was read or copied yet.
+      if (error instanceof Error && isSupersededCheckpointRefusal(error)) remoteCheckpointOwnerRefusals.set(error, { settlement });
+      throw error;
+    });
     // Transport release also runs when provider bootstrap failed. In that case
     // runnerd has no durable provider identity (and may not have created the
     // provider persistence directory at all), so attempting a failover backup
