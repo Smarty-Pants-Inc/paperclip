@@ -11,28 +11,29 @@ const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
 const reply = (data: unknown, status = 200) => new Response(JSON.stringify(data), { status });
 function boat() {
   let deadline = Date.now() + config.ttlSeconds * 1000, expired = false, stopped = false, gone = false;
-  let sentinel: unknown, failures = 0;
+  let sentinel: unknown, failures = 0, failureStatus = 500, stateOverride: string | undefined;
   let pending: Promise<void> | undefined;
   const patches: Array<{ at: number; body: unknown; org: string | null }> = [];
   const starts: string[] = [];
-  const snapshot = () => ({ id, state: stopped || expired ? "archived" : "running", archiveAfter: new Date(deadline).toISOString(), team: { id: "team_run_ttl" } });
+  const snapshot = () => ({ id, state: stateOverride ?? (stopped || expired ? "archived" : "running"), archiveAfter: new Date(deadline).toISOString(), team: { id: "team_run_ttl" } });
   const expiry = setInterval(() => { if (!stopped && Date.now() >= deadline) expired = true; }, 1000);
   const network = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
     const path = String(url).replace("https://boat.dev/api/v1", ""), method = init?.method ?? "GET";
     const body = init?.body ? JSON.parse(String(init.body)) : {};
-    if (path === "/sandboxes" && method === "POST") { starts.push(path); return reply({ sandbox: snapshot() }); }
+    if (path === "/sandboxes" && method === "POST") { starts.push(path); deadline = Date.now() + body.ttlSeconds * 1000; return reply({ sandbox: snapshot() }); }
     if (path === `/sandboxes/${id}`) {
       if (method === "PATCH") {
         patches.push({ at: Date.now(), body, org: new Headers(init?.headers).get("X-Boat-Org") });
         if (pending) await pending;
         if (gone) return reply({ code: "not_found" }, 404);
-        if (failures-- > 0) return reply({ message: apiKey, cause: { message: apiKey } }, 500);
+        if (failures-- > 0) return new Response(JSON.stringify({ message: apiKey, code: apiKey, cause: { message: apiKey } }), { status: failureStatus, headers: { RateLimit: apiKey } });
         deadline = Date.now() + body.ttlSeconds * 1000;
       }
       return gone ? reply({ code: "not_found" }, 404) : reply({ sandbox: snapshot() });
     }
     if (path.endsWith("/resume")) { starts.push(path); stopped = false; deadline = Date.now() + body.ttlSeconds * 1000; return reply({ sandbox: snapshot() }); }
     if (path.endsWith("/stop")) { stopped = true; return reply({ sandbox: snapshot() }); }
+    if (path.endsWith("/host")) return reply({ url: "https://run-ttl-43127.on.boat.dev/?_token=fixture", port: 43127, isProtected: true, access: "private" });
     if (path.endsWith("/files") && method === "PUT") { sentinel = JSON.parse(body.content); return reply({ success: true }); }
     if (path.includes("/files?")) return reply({ content: JSON.stringify(sentinel), encoding: "utf8" });
     if (path.endsWith("/commands")) return reply({ exitCode: 0, timedOut: false, stdout: body.command?.includes("cat ") ? JSON.stringify(sentinel) : "", stderr: "" });
@@ -40,7 +41,7 @@ function boat() {
   });
   vi.stubGlobal("fetch", network);
   return { network, patches, starts, get expired() { return expired; }, get deadline() { return deadline; },
-    fail: (count = 1) => { failures = count; }, remove: () => { gone = true; },
+    fail: (count = 1, status = 500) => { failures = count; failureStatus = status; }, remove: () => { gone = true; }, state: (value: string) => { stateOverride = value; },
     block: (work?: Promise<void>) => { pending = work; }, cleanup: () => clearInterval(expiry) };
 }
 let fake: ReturnType<typeof boat>;
@@ -71,6 +72,7 @@ describe("Boat held RUN lease TTL", () => {
     await vi.advanceTimersByTimeAsync(900_000); expect(fake.patches).toHaveLength(count);
   });
   it.each(["release", "stop", "destroy", "shutdown", "gone"])("R2: %s ends refresh with zero further PATCHes", async end => {
+    const idleTimers = vi.getTimerCount();
     await acquire(); await vi.advanceTimersByTimeAsync(100_000); expect(fake.patches).toHaveLength(1);
     if (end === "release") await release();
     if (end === "stop") await plugin.definition.onEnvironmentStopLease!({ ...scope, config, providerLeaseId: id });
@@ -78,10 +80,12 @@ describe("Boat held RUN lease TTL", () => {
     if (end === "shutdown") await plugin.definition.onShutdown?.();
     if (end === "gone") { fake.remove(); await vi.advanceTimersByTimeAsync(100_000); }
     const count = fake.patches.length; await vi.advanceTimersByTimeAsync(900_000); expect(fake.patches).toHaveLength(count);
+    // Admission fencing is defense in depth, not an excuse to leak a RUN timer.
+    expect(vi.getTimerCount()).toBeLessThanOrEqual(idleTimers);
     expect(fake.starts).toEqual(["/sandboxes"]);
   });
-  it("R3: failed PATCH logs only closed fields and retries on the next tick, not immediately", async () => {
-    await acquire(); fake.fail(); await vi.advanceTimersByTimeAsync(100_000);
+  it.each([500, 429])("R3: failed PATCH %s logs only closed fields and retries on the next tick, not immediately", async status => {
+    await acquire(); fake.fail(1, status); await vi.advanceTimersByTimeAsync(100_000);
     expect(fake.patches).toHaveLength(1);
     expect(logger.warn).toHaveBeenCalledWith("Boat run lease TTL refresh", { providerLeaseId: id, status: "failed", category: "http_error" });
     expect(JSON.stringify(logger.warn.mock.calls)).not.toContain(apiKey);
@@ -102,6 +106,7 @@ describe("Boat held RUN lease TTL", () => {
     const lease = await acquire(); await release(); fake.patches.length = 0;
     await plugin.definition.onEnvironmentResumeLease!({ ...scope, config, providerLeaseId: id, runId: "run-ttl-2", leaseMetadata: lease.metadata });
     await plugin.definition.onEnvironmentResumeLease!({ ...scope, config, providerLeaseId: id, runId: "run-ttl-2", leaseMetadata: lease.metadata });
+    await plugin.definition.onEnvironmentRunnerIngressEndpoint!({ ...scope, config, lease, port: 43127, path: "/api/runner/v1/connect/run_ttl" });
     fake.patches.length = 0;
     await vi.advanceTimersByTimeAsync(900_000); expect(fake.expired).toBe(false); expect(fake.patches).toHaveLength(9);
   });
@@ -109,6 +114,22 @@ describe("Boat held RUN lease TTL", () => {
     await acquire({ ...config, runnerLifecycleMode: "warm", runnerIdleTimeoutMs: 600_000 } as any);
     await vi.advanceTimersByTimeAsync(299_999); expect(fake.patches).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1); expect(fake.patches[0].body).toEqual({ ttlSeconds: 900 });
+  });
+  it.each(["archived", "stopped", "cancelled"])("R2: terminal box state %s ends refresh without a start", async state => {
+    await acquire(); fake.state(state); await vi.advanceTimersByTimeAsync(100_000);
+    expect(fake.patches).toHaveLength(1); await vi.advanceTimersByTimeAsync(900_000);
+    expect(fake.patches).toHaveLength(1); expect(fake.starts).toEqual(["/sandboxes"]);
+  });
+  it("R2: inspect's terminal observation cancels renewal without waiting for its next tick", async () => {
+    await acquire(); fake.state("archived");
+    await plugin.definition.onEnvironmentInspectLease!({ ...scope, config, providerLeaseId: id });
+    await vi.advanceTimersByTimeAsync(900_000); expect(fake.patches).toHaveLength(0);
+  });
+  it("uses a 60-second minimum cadence for a short RUN TTL", async () => {
+    await acquire({ ...config, ttlSeconds: 120 });
+    await vi.advanceTimersByTimeAsync(59_999); expect(fake.patches).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1); expect(fake.patches[0].body).toEqual({ ttlSeconds: 120 });
+    await vi.advanceTimersByTimeAsync(300_000); expect(fake.expired).toBe(false);
   });
   it("never overlaps slow PATCHes, and release drains in-flight work before becoming quiet", async () => {
     await acquire(); let unblock!: () => void;

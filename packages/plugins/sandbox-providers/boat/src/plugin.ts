@@ -395,6 +395,8 @@ function requestError(config: Config, method: string, path: string, httpStatus: 
 }
 type RequestOptions = {
   onHeaders?: (headers: Headers) => void; requireJson?: boolean; strictMissing?: boolean;
+  /** A RUN renewal emits its own closed receipt, never provider diagnostic headers. */
+  closedLogs?: boolean;
   /** At most this many sends (never above BOAT_MAX_ATTEMPTS). */
   maxSends?: number;
   /** An enclosing call's budget end: no wait here crosses it. */
@@ -587,7 +589,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
         }
       }
       const isIpLimit = String(errorCode) === "IP_RATE_LIMIT_EXCEEDED";
-      if (!isIpLimit) duplexLogger?.warn("Boat API 429", {
+      if (!isIpLimit && !responseOptions.closedLogs) duplexLogger?.warn("Boat API 429", {
         method, route, attempt: `${attempt}/${maxSends}`, retryAfter: retryAfterText,
         rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
         ...(errorCode ? { code: errorCode } : {}),
@@ -597,7 +599,7 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (isIpLimit) {
         retryAfterMs = Math.min(retryAfterMs, 120_000);
         boatRateLimitPauseUntil = Math.max(boatRateLimitPauseUntil, Date.now() + retryAfterMs);
-        duplexLogger?.warn("Boat IP rate-limit pause", {
+        if (!responseOptions.closedLogs) duplexLogger?.warn("Boat IP rate-limit pause", {
           reason: "IP_RATE_LIMIT_EXCEEDED", pauseUntil: new Date(boatRateLimitPauseUntil).toISOString(),
           retryAfter: retryAfterText, method, route,
           rateLimit: response.headers.get("RateLimit"), rateLimitPolicy: response.headers.get("RateLimit-Policy"),
@@ -921,6 +923,7 @@ async function waitSetup(config: Config, id: string): Promise<any> {
   throw Object.assign(new Error(`Boat sandbox ${id} setup timed out after ${config.setupTimeoutSeconds} seconds`), { code: "ETIMEDOUT" });
 }
 async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseId: string; state: "stopped" }> {
+  const refreshWork = cancelRunLeaseTtlRefresh(activityKey(config, id))?.work;
   // Our stop ends "our resume": a later not-ready 409 must never wake this box.
   ourResumes.delete(activityKey(config, id));
   stoppedBoxes.add(activityKey(config, id));
@@ -928,6 +931,7 @@ async function stopSandbox(config: Config, id: string): Promise<{ providerLeaseI
   // no call bound to the old generation (an in-flight 409 recovery) sends again.
   endBoxLifecycle(activityKey(config, id));
   try {
+    await refreshWork;
     return await stopSandboxRequests(config, id);
   } finally { endBoxLifecycle(activityKey(config, id)); }
 }
@@ -1497,6 +1501,71 @@ async function finishAcquisition(
     workspaceSentinel, ...("allocationFiles" in workspaceSentinel ? { workspaceAllocationFiles: workspaceSentinel.allocationFiles } : {}) } };
 }
 
+// Boat extend SETS remaining time, it does not add time. Reuse the same
+// documented PATCH for warm handoffs and the concrete obligation of a held RUN.
+async function patchLeaseTtl(config: Config, id: string, headers: HeadersInit | undefined, options: RequestOptions = {}, signal?: AbortSignal): Promise<any> {
+  const path = `/sandboxes/${encodeURIComponent(id)}`;
+  const refreshed = await request(config, path, { method: "PATCH", headers, signal,
+    body: JSON.stringify({ ttlSeconds: effectiveTtlSeconds(config) }) }, options.strictMissing === true, { ...options, requireJson: true });
+  if (refreshed === null && options.strictMissing) return null;
+  const candidate = refreshed?.sandbox ?? refreshed;
+  if (candidate?.id !== id) throw requestError(config, "PATCH", path, 200, "parse_error");
+  return candidate;
+}
+type RunLeaseTtlRefresh = { timer: ReturnType<typeof setInterval>; controller: AbortController; work?: Promise<void> };
+const runLeaseTtlRefreshes = new Map<string, RunLeaseTtlRefresh>();
+const runLeaseTtlWork = new Set<Promise<void>>();
+function cancelRunLeaseTtlRefresh(key: string): RunLeaseTtlRefresh | undefined {
+  const held = runLeaseTtlRefreshes.get(key);
+  if (held) { runLeaseTtlRefreshes.delete(key); clearInterval(held.timer); held.controller.abort(); }
+  return held;
+}
+async function stopRunLeaseTtlRefresh(config: Config, id: string): Promise<void> {
+  await cancelRunLeaseTtlRefresh(activityKey(config, id))?.work;
+}
+function startRunLeaseTtlRefresh(params: PluginEnvironmentAcquireLeaseParams | PluginEnvironmentResumeLeaseParams, config: Config, lease: PluginEnvironmentLease): void {
+  const id = lease.providerLeaseId;
+  // runId is the host's authority: a legacy warm/idle handoff gets only its
+  // existing one-shot refresh. Never turn a retained idle box into a live RUN.
+  if (shuttingDown || !id || !params.runId || ("purpose" in params && params.purpose === "login")) return;
+  const key = activityKey(config, id);
+  if (runLeaseTtlRefreshes.has(key)) return;
+  const metadata = lease.metadata;
+  const personal = (metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
+  const org = personal ? undefined : metadata?.boatOrgId;
+  const headers = typeof org === "string" && org.trim() ? { "X-Boat-Org": org } : undefined;
+  const controller = new AbortController();
+  // Protocol-required renewal only while this RUN holds the resource. Lease
+  // acquire/resume is the producer; release/stop/destroy/shutdown makes it quiet.
+  const timer = setInterval(() => {
+    if (shuttingDown || held.work || runLeaseTtlRefreshes.get(key) !== held) return;
+    const work = idleActivity.track(() => withBoatLeaseActivity(leaseActivityKey(params, id), async () => {
+      if (runLeaseTtlRefreshes.get(key) !== held) return;
+      let status: "ok" | "unconfirmed" | "failed" | "gone" = "failed";
+      let category: RequestErrorCategory | "deadline_mismatch" | "box_gone" | null = null;
+      const requestedAt = Date.now();
+      try {
+        const sandbox = await patchLeaseTtl(config, id, headers, { maxSends: 1, strictMissing: true, closedLogs: true,
+          sendGuard: () => { if (runLeaseTtlRefreshes.get(key) !== held) throw new Error("Boat RUN lease ended"); },
+        }, AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]));
+        if (sandbox === null || ["archived", "stopped", "cancelled"].includes(sandbox.state)) {
+          status = "gone"; category = "box_gone"; cancelRunLeaseTtlRefresh(key);
+        } else {
+          const deadline = parseDeadline(sandbox.archiveAfter);
+          status = deadline !== null && Math.abs(Date.parse(deadline) - (requestedAt + effectiveTtlSeconds(config) * 1000)) <= 120_000 ? "ok" : "unconfirmed";
+          category = status === "ok" ? null : "deadline_mismatch";
+        }
+      } catch (error) { category = (error as ReturnType<typeof requestError>).category ?? "request_error"; }
+      const details = { providerLeaseId: redactKey(config, id), status, category };
+      if (status === "ok") duplexLogger?.info("Boat run lease TTL refresh", details);
+      else duplexLogger?.warn("Boat run lease TTL refresh", details);
+    })).catch(() => undefined).finally(() => { held.work = undefined; runLeaseTtlWork.delete(work); });
+    held.work = work; runLeaseTtlWork.add(work);
+  }, Math.max(60_000, effectiveTtlSeconds(config) * 1000 / 3));
+  const held: RunLeaseTtlRefresh = { timer, controller };
+  runLeaseTtlRefreshes.set(key, held); timer.unref?.();
+}
+
 const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   async setup(ctx) {
     shuttingDown = false;
@@ -1593,6 +1662,8 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
   },
   async onShutdown() {
     shuttingDown = true;
+    for (const key of runLeaseTtlRefreshes.keys()) cancelRunLeaseTtlRefresh(key);
+    await Promise.allSettled([...runLeaseTtlWork]);
     readySpares.stop();
     for (const unsubscribe of activityUnsubscribers) unsubscribe();
     activityUnsubscribers = [];
@@ -1801,7 +1872,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     }
     return await createOrdinaryLease();
     })();
-    const countedWork = work.finally(async () => {
+    const countedWork = work.then(lease => { startRunLeaseTtlRefresh(params, parse(params.config), lease); return lease; }).finally(async () => {
       if (!outcomeRecorded) await recordOutcomeOnce("cold", "config_mismatch");
     });
     inFlightAcquisitions.add(countedWork);
@@ -1835,11 +1906,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       if (personal) throw new Error("Boat personal lease absence is not proven; refusing to report it destroyed");
       if (typeof boatOrgId !== "string" || !boatOrgId.trim()) throw new Error("Boat lease absence is not proven: no recorded boatOrgId; refusing to report it destroyed");
       if (await soleBoatOrgId(c) !== boatOrgId) throw new Error("Boat lease absence is not proven: could not confirm the lease organization; inventory is not exclusively the recorded org");
+      await stopRunLeaseTtlRefresh(c, params.providerLeaseId);
       idleActivity.confirm(proof, true);
       return { providerLeaseId: params.providerLeaseId, state: "destroyed", stoppedAt: null, lastRebootAt: null, observedAt };
     }
     const sandbox = result.sandbox ?? result;
     if (sandbox.id !== params.providerLeaseId) throw new Error("Boat inspection returned a different allocation.");
+    if (["archived", "stopped", "cancelled"].includes(sandbox.state)) await stopRunLeaseTtlRefresh(c, params.providerLeaseId);
     if (sandbox.state === "archived") idleActivity.confirm(proof, true);
     // Boat documents terminal cancelled/404, the state enum, stoppedAt and lastReboot:
     // https://docs.boat.dev/api/reference/sandboxes/get-sandbox.md
@@ -1848,8 +1921,11 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { providerLeaseId: params.providerLeaseId, state, stoppedAt, lastRebootAt: sandbox.lastReboot?.at ?? null, observedAt };
   },
   async onEnvironmentResumeLease(params: PluginEnvironmentResumeLeaseParams): Promise<PluginEnvironmentLease> {
-    await recordCompanySpareActivity(params.companyId, true);
     const c = parse(params.config), id = params.providerLeaseId;
+    // End the prior binding before the handoff's own PATCH/resume. A slow RUN
+    // refresh must not overlap it, nor survive a refused/expired handoff.
+    await stopRunLeaseTtlRefresh(c, id);
+    await recordCompanySpareActivity(params.companyId, true);
     preparedEnvDirectories.delete(id);
     await duplexChannels.suspend({ ...params, providerLeaseId: id });
     await sshCarrier.invalidate({ ...params, providerLeaseId: id });
@@ -1889,16 +1965,13 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       // PATCH ttlSeconds sets the deadline to now + ttlSeconds:
       // https://docs.boat.dev/api/reference/sandboxes/update-sandbox.md:91-93.
       // Renew every authorized warm handoff, never with an idle timer.
-      const path = `/sandboxes/${encodeURIComponent(id)}`;
       const personal = (metadata?.boatOwner as { kind?: unknown } | undefined)?.kind === "personal";
       const boatOrgId = personal ? undefined : metadata?.boatOrgId;
       const orgHeaders = typeof boatOrgId === "string" && boatOrgId.trim() ? { "X-Boat-Org": boatOrgId } : undefined;
       const ttlSeconds = effectiveTtlSeconds(c), requestedAt = Date.now();
       const at = new Date(requestedAt).toISOString();
       try {
-        const refreshed = await request(c, path, { method: "PATCH", headers: orgHeaders, body: JSON.stringify({ ttlSeconds }) }, false, { requireJson: true });
-        const candidate = refreshed?.sandbox ?? refreshed;
-        if (candidate?.id !== id) throw requestError(c, "PATCH", path, 200, "parse_error");
+        const candidate = await patchLeaseTtl(c, id, orgHeaders);
         const archiveAfter = parseDeadline(candidate.archiveAfter);
         const expectedDeadline = requestedAt + ttlSeconds * 1000;
         const confirmed = archiveAfter !== null && Math.abs(Date.parse(archiveAfter) - expectedDeadline) <= 120_000;
@@ -1930,12 +2003,15 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
       boatOrgId: _previousOrg, boatOwner: _previousOwner, ttlRefresh: _previousTtlRefresh, ...retainedMetadata } = metadata ?? {};
     await bindDuplexLease(params, id, guardianPreflight);
     const ownership = boatOwnershipForLease(sandbox, id);
-    return { providerLeaseId: id, expiresAt: ttlRefresh && ttlRefresh.status !== "failed" ? refreshExpiresAt : sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
+    const lease = { providerLeaseId: id, expiresAt: ttlRefresh && ttlRefresh.status !== "failed" ? refreshExpiresAt : sandbox.archiveAfter ?? sandbox.expiresAt ?? sandbox.autoStopAt ?? null,
       metadata: { ...retainedMetadata, provider: c.provider, resumed: true, resumedLease: true, resumedFromState,
         ...ownership, ...(ttlRefresh ? { ttlRefresh } : {}),
         ...(guardianPreflight ? { guardianPreflight, runnerGuardianVersion: 1 } : {}), ...(workspaceSentinel ? { workspaceSentinel } : {}) } };
+    startRunLeaseTtlRefresh(params, c, lease);
+    return lease;
   },
   async onEnvironmentReleaseLease(params: PluginEnvironmentReleaseLeaseParams) {
+    if (params.providerLeaseId) await stopRunLeaseTtlRefresh(parse(params.config), params.providerLeaseId);
     unbindClaimedSpare(params.providerLeaseId);
     await recordCompanySpareActivity(params.companyId);
     if (!params.providerLeaseId) return;
@@ -1949,6 +2025,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
   },
   async onEnvironmentStopLease(params: PluginEnvironmentReleaseLeaseParams) {
+    if (params.providerLeaseId) await stopRunLeaseTtlRefresh(parse(params.config), params.providerLeaseId);
     unbindClaimedSpare(params.providerLeaseId);
     if (!params.providerLeaseId) throw new Error("Boat stop requires an exact providerLeaseId");
     const c = parse(params.config);
@@ -1960,6 +2037,7 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
     return { ...receipt, ...(warnings.length ? { warnings } : {}) };
   },
   async onEnvironmentDestroyLease(params: PluginEnvironmentDestroyLeaseParams) {
+    if (params.providerLeaseId) await stopRunLeaseTtlRefresh(parse(params.config), params.providerLeaseId);
     unbindClaimedSpare(params.providerLeaseId);
     if (!params.providerLeaseId) return;
     const c = parse(params.config);
