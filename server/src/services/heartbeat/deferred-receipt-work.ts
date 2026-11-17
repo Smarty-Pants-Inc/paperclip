@@ -29,9 +29,15 @@ export function registerDeferredReceiptWork(
 ) {
   // Outer columns are written fully qualified: inside a select list Drizzle
   // renders them bare, and the subquery's own tables would capture them.
+  // Only this press's own proof counts: the run it recorded as its target,
+  // stopped by its actor no earlier than the press (fixed-width ISO text).
   const interruptedNativeReleased = sql<boolean>`exists (select 1 from heartbeat_runs r
     join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
     where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
+      and r.id::text = agent_wakeup_requests.payload->'queuedCommentInterrupt'->>'targetRunId'
+      and r.result_json->>'interruptedByActorId' = agent_wakeup_requests.payload->'queuedCommentInterrupt'->>'actorId'
+      and to_char(r.finished_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+        >= agent_wakeup_requests.payload->'queuedCommentInterrupt'->>'requestedAt'
       and r.runtime_mode = 'native' and r.status = 'cancelled'
       and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
       and f.lease_owner is null and f.phase in ('terminal_failure', 'applied'))`;
@@ -78,9 +84,9 @@ export function registerDeferredReceiptWork(
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
             or ${agentWakeupRequests.payload}->'executionWait' is not null`,
           interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
-            where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId}
+            where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
               and r.runtime_mode = 'legacy' and r.status = 'cancelled'
-              and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
+              and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text)`,
           // Cheap hint only: the run's controller released its native session.
           // check() requires the full stop proof before skipping the age gate.
           interruptedNative: owner.interruptTargetStopped ? interruptedNativeReleased : sql<boolean>`false`,
@@ -143,10 +149,12 @@ export function registerDeferredReceiptWork(
         if (kind !== "task_chat") {
           const [current] = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload,
             updatedAt: agentWakeupRequests.updatedAt, claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
+            // Qualified like interruptedNativeReleased: bare outer columns
+            // would bind to the subquery's run.
             interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
-              where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId}
+              where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
                 and r.runtime_mode = 'legacy' and r.status = 'cancelled'
-                and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
+                and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text)`,
           }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
             eq(agentWakeupRequests.id, entry.id)));
           if (!current) return null;

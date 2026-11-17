@@ -38,6 +38,7 @@ import { initializeRunIdentity, reconcileSteeredIdentity } from "../services/run
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { claimFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { registerDeferredReceiptWork } from "../services/heartbeat/deferred-receipt-work.js";
 import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../services/deferred-execution-notifications.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -1076,6 +1077,170 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
         details: { reason: "nothing_waiting" } });
       expect(await successors()).toHaveLength(1);
     } finally { await work.stop(); }
+  });
+
+  // Independent judge: separate controller and process barriers on the real HTTP path.
+  it("JUDGE S8q holds each writer barrier and dispatches exactly once after both retire", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"]);
+    testProcesses.set(f.runId, child);
+    await new Promise<void>((resolve, reject) => { child.once("spawn", resolve); child.once("error", reject); });
+    await db.update(heartbeatRuns).set({ processPid: child.pid!, processGroupId: null, resultJson: { ...cancelled.resultJson,
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "judge-intent", acknowledgementAuditId: "judge-ack" } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: "judge-held-controller" }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const successors = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId && r.contextSnapshot?.issueId === f.issueId);
+    const service = heartbeatService(db);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    const work = service.registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].payload?.executionWait).toMatchObject({ reason: "controller_settling" });
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+      await service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId);
+      expect(await successors()).toEqual([]);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].payload?.executionWait).toMatchObject({ reason: "process_running" });
+      const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+      child.kill(); await exited; testProcesses.delete(f.runId);
+      await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId }));
+      await vi.waitFor(async () => expect(await successors()).toHaveLength(1), { timeout: 5000, interval: 50 });
+      await Promise.all(Array.from({ length: 4 }, () => service.resumeQueuedCommentInterrupt(f.companyId, f.wakeId)));
+      const runs = await successors(); expect(runs).toHaveLength(1); expect(runs[0].contextSnapshot?.wakeCommentIds).toEqual(f.commentIds);
+    } finally { await work.stop(); }
+  });
+
+  it.each(["different queue", "agent stop", "agent stop with stale marker", "later untargeted press"])("JUDGE S8q no early dispatch for %s", async scenario => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const result = { ...stopped.resultJson, nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "judge", acknowledgementAuditId: "judge" } } as Record<string, unknown>;
+    if (scenario === "agent stop") delete result.queuedCommentInterruptQueueId;
+    else if (scenario === "agent stop with stale marker") { result.cancelledByActorType = "agent"; delete result.cancelledByUserId; }
+    else if (scenario === "different queue") result.queuedCommentInterruptQueueId = randomUUID();
+    else {
+      const again = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+      await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: again.body.revision }).expect(200);
+      const [latest] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+      expect(latest.payload?.queuedCommentInterrupt).not.toHaveProperty("targetRunId");
+    }
+    await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: result }).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+    const work = heartbeatService(db).registerDeferredReceiptWork(coordinator, () => true);
+    try {
+      await work.ready;
+      await db.transaction(tx => notifyDeferredWakesForIssue(tx, { companyId: f.companyId, issueId: f.issueId }));
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].status).toBe("deferred_issue_execution");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(r => r.id !== f.runId && r.contextSnapshot?.issueId === f.issueId)).toEqual([]);
+    } finally { await work.stop(); }
+  });
+
+  // S8q delta: the early release is bound to THIS press's recorded target run,
+  // actor and time, in both the eligibility check and the worker's hint.
+  it("S8q releases an Interrupt early only on its own press's stopped target, in the check and the hint", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ nativeIssueId: f.issueId, responsibleUserId: "queue-owner" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "observed" });
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.agentId));
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running", contextSnapshot: { issueId: randomUUID() } });
+    const client = app(f.companyId);
+    const queue = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: f.runId, revision: queue.body.revision }).expect(200);
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const [pressA] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(pressA.payload?.queuedCommentInterrupt).toMatchObject({ targetRunId: f.runId });
+    // The stop proof, short of the controller's terminal phase until each read.
+    await db.update(heartbeatRuns).set({ processPid: 999999999, resultJson: { ...stopped.resultJson, nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId: f.runId, companyId: f.companyId, issueId: f.issueId, scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true, intentAuditId: "s8q", acknowledgementAuditId: "s8q" } } }).where(eq(heartbeatRuns.id, f.runId));
+    const phase = (value: "observed" | "terminal_failure") => db.update(nativeRunFinalizations).set({ phase: value, leaseOwner: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    const press = (payload: Record<string, unknown>) => db.update(agentWakeupRequests).set({ payload }).where(eq(agentWakeupRequests.id, f.wakeId));
+    const service = heartbeatService(db);
+    // The hint alone decides immediacy here: the stubbed check always agrees.
+    const hinted = async () => {
+      const resume = vi.fn(async (_scope: { requestId?: string }) => {});
+      const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { throw error; } });
+      const work = registerDeferredReceiptWork(db, coordinator, { resume, interruptTargetStopped: async () => true,
+        settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true);
+      try {
+        await work.ready;
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return resume.mock.calls.some(([scope]) => scope.requestId === f.wakeId);
+      } finally { await work.stop(); }
+    };
+    const released = async () => {
+      await phase("terminal_failure");
+      try { return [await service.queuedCommentInterruptTargetStopped(f.companyId, f.wakeId), await hinted()]; }
+      finally { await phase("observed"); }
+    };
+    await phase("observed");
+    expect(await service.queuedCommentInterruptTargetStopped(f.companyId, f.wakeId)).toBe(false);
+    expect(await released()).toEqual([true, true]);
+    // A later press that stopped nothing records no target of its own.
+    const again = await request(client).get(`/api/issues/${f.issueId}/queued-comments`).expect(200);
+    await request(client).post(`/api/issues/${f.issueId}/queued-comments/interrupt`).send({ queueId: f.wakeId, targetRunId: null, revision: again.body.revision }).expect(200);
+    const [pressB] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    expect(pressB.status).toBe("deferred_issue_execution");
+    expect(pressB.payload?.queuedCommentInterrupt).not.toHaveProperty("targetRunId");
+    expect(await released()).toEqual([false, false]);
+    const intentA = pressA.payload!.queuedCommentInterrupt as Record<string, unknown>;
+    const at = (offset: number) => new Date(stopped.finishedAt!.getTime() + offset).toISOString();
+    // A press that targeted this run but was recorded after its stop.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, requestedAt: at(60_000) } });
+    expect(await released()).toEqual([false, false]);
+    // A press before the stop that targeted a different run.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, targetRunId: randomUUID(), requestedAt: at(-60_000) } });
+    expect(await released()).toEqual([false, false]);
+    // A press by someone else.
+    await press({ ...pressB.payload, queuedCommentInterrupt: { ...intentA, actorId: "someone-else" } });
+    expect(await released()).toEqual([false, false]);
+    // Control: the first press's own record releases again.
+    await press({ ...pressB.payload, queuedCommentInterrupt: intentA });
+    expect(await released()).toEqual([true, true]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId)))[0].status).toBe("deferred_issue_execution");
+  });
+
+  it("JUDGE S8q queued-comment-interrupt key is not a database uniqueness fence", async () => {
+    const f = await seedQueue();
+    const key = `queued-comment-interrupt:${f.wakeId}`;
+    await db.insert(agentWakeupRequests).values([0, 1].map(() => ({ companyId: f.companyId, agentId: f.agentId, source: "on_demand", status: "queued", idempotencyKey: key })));
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey, key))).toHaveLength(2);
+  });
+
+  it("JUDGE S8q demonstrates the interruptedLegacy SQL binding on real Postgres", async () => {
+    const f = await seedQueue();
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "cancelled", resultJson: { queuedCommentInterruptQueueId: f.wakeId } }).where(eq(heartbeatRuns.id, f.runId));
+    const query = db.select({ broken: sql<boolean>`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId} and r.runtime_mode = 'legacy' and r.status = 'cancelled' and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
+      qualified: sql<boolean>`exists (select 1 from heartbeat_runs r where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id and r.runtime_mode = 'legacy' and r.status = 'cancelled' and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text)` }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    console.log("JUDGE SQL", query.toSQL().sql);
+    const rows = await query;
+    console.log("JUDGE SQL ROWS", JSON.stringify(rows));
+    expect(rows).toEqual([{ broken: false, qualified: true }]);
+    // The candidate's new native expression explicitly qualifies the outer table.
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issueId }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: f.runId, phase: "terminal_failure", leaseOwner: null });
+    const native = await db.select({ released: sql<boolean>`exists (select 1 from heartbeat_runs r
+      join native_run_finalizations f on f.company_id = r.company_id and f.run_id = r.id
+      where r.company_id = agent_wakeup_requests.company_id and r.agent_id = agent_wakeup_requests.agent_id
+        and r.runtime_mode = 'native' and r.status = 'cancelled'
+        and r.result_json->>'queuedCommentInterruptQueueId' = agent_wakeup_requests.id::text
+        and f.lease_owner is null and f.phase in ('terminal_failure', 'applied'))` }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wakeId));
+    console.log("JUDGE NEW NATIVE SQL ROWS", JSON.stringify(native));
+    expect(native).toEqual([{ released: true }]);
   });
 
   async function seedFirstTurnQueue(runtime: "preparing" | "native", queueStartedBy: "user" | "system" = "user") {
