@@ -952,6 +952,55 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     if(status==="pending_cleanup") expect(previous).toMatchObject({status:"pending_cleanup",cleanupStatus:"failed"});
   },120_000);
 
+  // fix12 item 3 (rf-3 F3): the custody row. The predecessor (the failed run a Retry replaces) acquired its box
+  // through production; its cleanup failed with no stop receipt. The fresh run (the Retry's run: no
+  // retryOfRunId, so no predecessor_cleanup_pending gate) acquires through production: which box it gets,
+  // who owns the failed-cleanup box after, and that the fresh run never writes to the old box.
+  it.each(["released", "retained"] as const)("fix12 custody: a fresh run after a %s lease whose cleanup failed gets a distinct box; the old box keeps a cleanup owner", async status => {
+    const seeded = await seedReusablePluginSandboxLease();
+    const freshRunId = randomUUID();
+    await db.update(environmentLeases).set({status:"expired",cleanupStatus:"success",releasedAt:new Date()}).where(eq(environmentLeases.id,seeded.reusableLease.id));
+    await db.insert(heartbeatRuns).values({id:freshRunId,companyId:seeded.companyId,agentId:seeded.agentId,status:"running",contextSnapshot:{replacedQueuedRunId:seeded.runId}});
+    const calls:Array<{method:string;providerLeaseId:unknown;runId:string}>=[];
+    let box=0,current=seeded.runId;
+    const runtime=environmentRuntimeService(db,{pluginWorkerManager:{
+      isRunning:()=>true,
+      getWorker:()=>({supportedMethods:["environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease"]}),
+      call:async (_plugin:string,method:string,params:Record<string,unknown>)=>{
+        calls.push({method,providerLeaseId:params?.providerLeaseId ?? null,runId:current});
+        if(method==="environmentAcquireLease") return {providerLeaseId:`fix12-box-${++box}`,metadata:{remoteCwd:"/workspace"}};
+        if(method==="environmentResumeLease") return {providerLeaseId:params.providerLeaseId,metadata:{remoteCwd:"/workspace"}};
+        if(method==="environmentStopLease"||method==="environmentDestroyLease") return {providerLeaseId:params.providerLeaseId,state:"stopped"};
+        if(method==="environmentInspectLease") return {providerLeaseId:params.providerLeaseId,state:"running"};
+        throw new Error(`Unexpected RPC ${method}`);
+      },
+    } as unknown as PluginWorkerManager});
+    const common={companyId:seeded.companyId,environment:seeded.environment,issueId:null,agentId:seeded.agentId,
+      persistedExecutionWorkspace:{id:seeded.executionWorkspaceId,mode:"shared_workspace" as const}};
+    const first=await runtime.acquireRunLease({...common,heartbeatRunId:seeded.runId});
+    const oldBox=first.lease.providerLeaseId!;
+    await db.update(heartbeatRuns).set({status:"failed",finishedAt:new Date(Date.now()-1_200_000)}).where(eq(heartbeatRuns.id,seeded.runId));
+    await db.update(environmentLeases).set({status,releasedAt:new Date(Date.now()-1_199_000),cleanupStatus:"failed"}).where(eq(environmentLeases.id,first.lease.id));
+    current=freshRunId;
+    const fresh=await runtime.acquireRunLease({...common,heartbeatRunId:freshRunId});
+    const [previous]=await db.select().from(environmentLeases).where(eq(environmentLeases.id,first.lease.id));
+    const freshCalls=calls.filter(c=>c.runId===freshRunId);
+    console.info(JSON.stringify({fix12Custody:{status,oldBox,freshBox:fresh.lease.providerLeaseId,freshCalls,
+      previous:{status:previous!.status,cleanupStatus:previous!.cleanupStatus,failureReason:previous!.failureReason,providerLeaseId:previous!.providerLeaseId,
+        heartbeatRunId:previous!.heartbeatRunId,stopOnly:previous!.metadata?.stopOnlyCleanup ?? previous!.metadata?.pendingCleanupStopOnly ?? null}}}));
+    // Which box: a distinct allocation, never a resume of the unproven old box.
+    expect(fresh.lease.providerLeaseId,"the fresh run gets a distinct box").not.toBe(oldBox);
+    expect(freshCalls.filter(c=>c.method==="environmentResumeLease"&&c.providerLeaseId===oldBox),"the fresh run never resumes the old box").toEqual([]);
+    // Who owns the old box: still its own row, still marked unsettled, never rewritten to a successful
+    // cleanup without a stop or destroy of that box.
+    expect(previous!.providerLeaseId).toBe(oldBox);
+    expect(previous!.heartbeatRunId,"the old lease row stays the predecessor's").toBe(seeded.runId);
+    const stoppedOld=freshCalls.some(c=>["environmentStopLease","environmentDestroyLease"].includes(c.method)&&c.providerLeaseId===oldBox);
+    if(!stoppedOld) expect(previous!.cleanupStatus,"no stop receipt: the old box keeps an unsettled cleanup owner").toBe("failed");
+    expect(["pending_cleanup","retained","released","expired"]).toContain(previous!.status);
+    expect(fresh.lease.id).not.toBe(previous!.id);
+  },120_000);
+
   // Regression: cold workspace/instructions sync must not inherit the 30 s plugin RPC default.
   it.each((["syncIn", "syncOut"] as const).flatMap(method => [
     { timeoutMs: null, expectedRpcTimeoutMs: 120_000 },
