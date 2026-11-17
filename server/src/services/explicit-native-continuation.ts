@@ -1,5 +1,6 @@
 import { notifyUnsafeWorkspaceExportRecovery } from "./unsafe-workspace-export-notifications.js";
 import { personStopPendingLine } from "./recovery/stop-pending.js";
+import { isAcknowledgedNativeStop } from "./acknowledged-native-stop.js";
 import { agentDirectoryPreparationWaitPredicate, isAgentDirectoryPreparationWait } from "./pre-dispatch-execution-evidence.js";
 import { assertDurableChatWakeupRequest, assertDurableChatWakeupReceipt, type DurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { notifyExecutionRunWork } from "./execution-control-notifications.js";
@@ -729,6 +730,13 @@ export async function admitExplicitNativeContinuation(input: {
     failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) || ${JSON.stringify({ replacementDenied: "explicit_user_continuation" })}::jsonb`,
     updatedAt: new Date(),
   }).where(and(eq(nativeRunFinalizations.companyId, companyId), inArray(nativeRunFinalizations.runId, nativeSources.map(run => run.id))));
+  const stoppedFilesNotice = readiness?.mode === "fresh_isolated_workspace" && freshCandidates.some(candidate => {
+    const recovery = readSystemRecovery(candidate.evidence);
+    return isAcknowledgedNativeStop(candidate.run) && candidate.leaseIds.length > 0 && recovery?.state === "exhausted"
+      && ["provider_unavailable", "export_interrupted"].includes(recovery.failure?.code ?? "");
+  })
+    ? "Couldn't restore the files from the stopped turn; they're kept on the previous machine. This reply runs without them."
+    : null;
   const unrecoverable = actions.map(action => freshSources.has(String(action.evidence.runId))
     ? unrecoverableSavedFilesFailure(readSystemRecovery(action.evidence)) : null).find(failure => failure !== null) ?? null;
   if (actions.length) await db.transaction(async tx => {
@@ -736,8 +744,8 @@ export async function admitExplicitNativeContinuation(input: {
   for (const action of actions) {
     await tx.update(issueRecoveryActions).set({
       status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(),
-      nextAction: unrecoverable ? unrecoverableSavedFilesNotice(unrecoverable)
-        : "The user started a fresh conversation turn. Prior action outcomes remain recorded.",
+      nextAction: stoppedFilesNotice ?? (unrecoverable ? unrecoverableSavedFilesNotice(unrecoverable)
+        : "The user started a fresh conversation turn. Prior action outcomes remain recorded."),
       resolutionNote: "The user continued after the prior execution stopped. No action outcomes were inferred.",
       wakePolicy: null, monitorPolicy: null,
       evidence: { ...action.evidence, explicitUserContinuation: authorization,
@@ -751,9 +759,11 @@ export async function admitExplicitNativeContinuation(input: {
       },
     }).where(eq(issueRecoveryActions.id, action.id));
   }
-  if (unrecoverable) {
+  if (stoppedFilesNotice || unrecoverable) {
+    // The same transcript-comment path as unrecoverable saved files. Commit it
+    // with admission, before preparation builds the successor's provider input.
     const { issueService } = await import("./issues.js");
-    await issueService(db).addComment(issueId, unrecoverableSavedFilesNotice(unrecoverable), {},
+    await issueService(db).addComment(issueId, stoppedFilesNotice ?? unrecoverableSavedFilesNotice(unrecoverable!), {},
       { authorType: "system" }, tx);
   }
   });

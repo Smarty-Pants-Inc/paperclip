@@ -88,7 +88,7 @@ async function recheckStoppedWorkspaceRecovery(db: Db, source: StopEvidenceSourc
     for (const action of actions) {
       const current = readSystemRecovery(action.evidence), workspace = readWorkspaceRecovery(action.evidence), now = Date.now();
       if (!current || current.sourceRunId !== source.runId || current.phase !== "verify_execution" ||
-          !workspace || workspace.runId !== source.runId || ["complete", "exhausted"].includes(current.state) || current.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES ||
+          !workspace || workspace.runId !== source.runId || ["complete", "exhausted"].includes(current.state) || current.retriesUsed >= (current.maxRetries ?? SYSTEM_RECOVERY_MAX_RETRIES) ||
           (current.deadlineAt !== null && now >= current.deadlineAt)) continue;
       const stopWait = current.failure?.retryClass === "recheck_evidence" &&
         ["agent_stop_unconfirmed", "copyback_stop_unconfirmed"].includes(current.failure.code);
@@ -203,6 +203,12 @@ export async function requestWorkspaceRecovery(input: Source & { db: Db; idempot
  * Neither preservation nor cleanup creates an agent turn. */
 export async function recoverRetainedWorkspace(input: Source & { db: Db; environmentRuntime: EnvironmentRuntimeService }) {
   const { db } = input;
+  // Policy belongs to this caller, not every infrastructure recovery: a person's
+  // Stop waits at most four saved backoffs (<= 9 min including jitter).
+  const [sourceRun] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId,
+    status: heartbeatRuns.status, nativeIssueId: heartbeatRuns.nativeIssueId, resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId)));
+  const retryCap = sourceRun && isAcknowledgedNativeStop(sourceRun) ? 4 : undefined;
   await adoptSystemRecovery(db, input);
   let initial = await loadSystemRecovery(db, input);
   // A hold whose files a sibling saved, or whose source is refused permanently
@@ -239,10 +245,12 @@ export async function recoverRetainedWorkspace(input: Source & { db: Db; environ
         return;
       }
     }
-    const reserved = reserveSystemRecoveryAttempt(current);
+    const maxRetries = retryCap ?? current.maxRetries ?? SYSTEM_RECOVERY_MAX_RETRIES;
+    const reserved = reserveSystemRecoveryAttempt(current, Date.now(), maxRetries);
     if (!reserved) {
-      if (current.state !== "exhausted" && current.deadlineAt !== null && Date.now() >= current.deadlineAt)
-        await updateSystemRecovery(db, input, current, { ...current, revision: current.revision + 1,
+      if (current.state !== "exhausted" && ((current.deadlineAt !== null && Date.now() >= current.deadlineAt)
+        || (current.attempts > 0 && current.retriesUsed >= maxRetries)))
+        await updateSystemRecovery(db, input, current, { ...current, maxRetries, revision: current.revision + 1,
           state: "exhausted", nextAttemptAt: null });
       return;
     }

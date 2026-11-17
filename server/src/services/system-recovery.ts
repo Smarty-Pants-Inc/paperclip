@@ -3,7 +3,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { agents, issues, heartbeatRuns, issueComments, issueRecoveryActions, type Db } from "@paperclipai/db";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { createSystemRecovery, exhaustedSystemRecoveryAction, readSystemRecovery, type SystemRecoveryState } from "./system-recovery-state.js";
+import { SYSTEM_RECOVERY_MAX_RETRIES, createSystemRecovery, exhaustedSystemRecoveryAction, readSystemRecovery, type SystemRecoveryState } from "./system-recovery-state.js";
 import { workspaceRecoverySourceEligible, type WorkspaceRecoverySourceIdentity } from "./workspace-recovery-source.js";
 import { capturePolicyRearmDueAt, capturePolicyRearmPendingCondition, retainedSourceFallbackDueAt,
   retainedSourceFallbackPendingCondition, stopProofRearmDueAt, stopProofRearmPendingCondition } from "./workspace-recovery-fallback-discovery.js";
@@ -64,7 +64,7 @@ export async function updateSystemRecovery(db: Db, source: WorkspaceRecoverySour
   const compatibility = {
     schema: "paperclip.workspace-recovery.v1", runId: source.runId, status,
     stage: next.phase === "verify_execution" ? "verifying_stop" : next.phase === "preserve_files" ? "restoring_files" : "saving_receipts",
-    attempt: next.attempts, attemptLimit: 6, retryable: true, retryAt: next.nextAttemptAt ?? undefined,
+    attempt: next.attempts, attemptLimit: (next.maxRetries ?? SYSTEM_RECOVERY_MAX_RETRIES) + 1, retryable: true, retryAt: next.nextAttemptAt ?? undefined,
     ...(handoff ? { message: handoff } : {}),
   };
   return writeExecutionControl(db, DELIVERY_QUEUES.workspaceRecovery, async tx => {

@@ -38,7 +38,7 @@ vi.mock("../services/environment-execution-target.js", async importOriginal => {
 });
 
 import { execFile } from "node:child_process";
-import type { EnvironmentLease } from "@paperclipai/shared";
+import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import type { AdapterSandboxExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { prepareNativeWorkspaceSync } from "../services/native-runtime/native-workspace-sync.js";
@@ -85,8 +85,10 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
   // rf-4's RED used a synthetic descriptor ("a"x64), which no export can prove.
   // The U-shape row (adopt-stopu r2) seeds the same crash boundary with the
   // run's REAL prepared v3 descriptor: the edit exists only on the box.
-  it.each([["U shape: real prepared v3 descriptor", true], ["GAP: rf-4 synthetic descriptor, no export provable", false]] as const)(
-    "the next person's comment runs within 10s, or offers an honest Retry; owed files are never destroyed (%s)", async (_label, realDescriptor) => {
+  it.each([["U shape: real prepared v3 descriptor", true, true],
+    ["person Stop: synthetic descriptor, no export provable", false, true],
+    ["non-person control: unchanged five-retry budget", false, false]] as const)(
+    "the next comment respects its recovery budget and keeps owed files (%s)", async (_label, realDescriptor, personStop) => {
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
     const environmentId = randomUUID(), leaseId = randomUUID(), workspaceId = randomUUID();
@@ -252,12 +254,10 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         expect(providerTurns.filter(id => id === messageRuns[0]?.id)).toHaveLength(1);
       }
       if (!realDescriptor) {
-        // GAP (adopt-stopu r2, reported, NOT fixed): with a descriptor no export
-        // can prove, the crash-recovered release is stop_and_retain (never
-        // destroy, files kept on the box), the U1 export is recorded unproven,
-        // and the existing preservation holds the message until the workspace
-        // recovery worker restores it. Same as U's ordinary Stop with an
-        // unproven export; rf-4's 10 s bound is not met on this path.
+        // An export no attempt can prove stays stop_and_retain. Exercise the
+        // real worker to exhaustion, not merely the initial held admission.
+        // The control changes only caller identity on this same retained hold;
+        // ordinary non-person stops do not use the person-only crash exporter.
         const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         expect(runAfter.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven" });
         expect(afterSweep.metadata?.sandboxStopAndRetainReceipt).toMatchObject({ providerLeaseId });
@@ -269,6 +269,9 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         const { reconcileRetainedWorkspaces } = await import("../services/workspace-recovery.js");
         const { environmentRuntimeService } = await import("../services/environment-runtime.js");
         const runtime = environmentRuntimeService(db);
+        if (!personStop) await db.update(heartbeatRuns).set({ resultJson: {
+          ...runAfter.resultJson, cancelledByActorType: "agent", cancelledByUserId: null,
+        } }).where(eq(heartbeatRuns.id, runId));
         const t0 = Date.now();
         const trail: Record<string, unknown>[] = [];
         vi.useFakeTimers({ toFake: ["Date"], now: t0 });
@@ -319,23 +322,39 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         // delays. Admission must be <= 10 min and must say the files are absent.
         const admitted = trail.find(row => (row.messageRuns as number) > 0);
         expect(admitted, JSON.stringify(trail)).toBeDefined();
-        expect.soft(admitted!.atMin as number).toBeLessThanOrEqual(10);
+        expect.soft(admitted!.atMin as number).toBeLessThanOrEqual(personStop ? 10 : 18.6);
+        const spent = (admitted!.actions as Array<{ systemRecovery: { attempts: number; retriesUsed: number } }>)[0].systemRecovery;
+        expect(spent).toMatchObject({ attempts: personStop ? 5 : 6, retriesUsed: personStop ? 4 : 5 });
         expect(admitted!.blocker).toBeNull();
         for (const row of trail) expect(JSON.stringify(row.blocker ?? "")).not.toContain("will start automatically");
+        expect(destroy.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
+        expect(await fs.readFile(owedFile).then(sha)).toBe(expectedSha);
+        // A later destructive sweep still cannot consume the unresolved source,
+        // even after admission resolved its hold. Exercise its real entry point.
+        const [keptLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        const [environment] = await db.select().from(environments).where(eq(environments.id, environmentId));
+        const laterDestroy = await runtime.destroyRunLease({ environment: environment as Environment,
+          lease: keptLease as EnvironmentLease });
+        expect(laterDestroy).toBeNull();
+        expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0]).toEqual(keptLease);
         expect(destroy.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
         expect(await fs.readFile(owedFile).then(sha)).toBe(expectedSha);
         const notices = await db.select().from(issueComments).where(and(eq(issueComments.companyId, companyId),
           eq(issueComments.issueId, issueId), eq(issueComments.authorType, "system")));
         const notice = "Couldn't restore the files from the stopped turn; they're kept on the previous machine. This reply runs without them.";
-        expect.soft(notices.map(row => row.body)).toContain(notice);
+        if (personStop) expect.soft(notices.map(row => row.body)).toContain(notice);
+        else expect(notices.map(row => row.body)).not.toContain(notice);
         expect(notices.map(row => row.body).join("\n")).not.toContain("Recovering saved work");
         const successor = [...providerInputs].find(([id]) => id !== runId && providerTurns.includes(id));
         expect(successor).toBeDefined();
         const providerInput = JSON.stringify(successor![1]);
         expect.soft(providerInput).not.toMatch(/\brestored\b/i);
-        console.log("CAP5_EXHAUSTED_EVIDENCE", JSON.stringify({ noticeBodies: notices.map(row => row.body),
+        const evidence = { personStop, trail, laterDestroy, destroyCalls: destroy.mock.calls, noticeBodies: notices.map(row => row.body),
           providerInput: successor![1], lease: (await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId)))[0],
-          sourceSha: await fs.readFile(owedFile).then(sha), expectedSha }));
+          sourceSha: await fs.readFile(owedFile).then(sha), expectedSha };
+        console.log("CAP5_EXHAUSTED_EVIDENCE", JSON.stringify(evidence));
+        if (process.env.CAP5_EVIDENCE_DIR) await fs.writeFile(path.join(process.env.CAP5_EVIDENCE_DIR,
+          personStop ? "person-stop.json" : "non-person.json"), JSON.stringify(evidence, null, 2));
         return;
       }
       expect(executed || actionable,

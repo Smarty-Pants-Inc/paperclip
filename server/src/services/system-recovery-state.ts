@@ -57,6 +57,8 @@ export const systemRecoverySchema = z.object({
   attemptId: z.string().uuid().nullable(),
   attempts: z.number().int().nonnegative(),
   retriesUsed: z.number().int().min(0).max(SYSTEM_RECOVERY_MAX_RETRIES),
+  /** A caller may shorten one hold; absent on older holds means the normal budget. */
+  maxRetries: z.number().int().min(0).max(SYSTEM_RECOVERY_MAX_RETRIES).optional(),
   firstFailureAt: z.number().nullable(),
   nextAttemptAt: z.number().nullable(),
   deadlineAt: z.number().nullable(),
@@ -94,15 +96,15 @@ export function createSystemRecovery(sourceRunId: string, intentId: string | nul
   };
 }
 
-export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = Date.now()): SystemRecoveryState | null {
+export function reserveSystemRecoveryAttempt(state: SystemRecoveryState, now = Date.now(), maxRetries = state.maxRetries ?? SYSTEM_RECOVERY_MAX_RETRIES): SystemRecoveryState | null {
   if (state.state === "complete" || state.state === "exhausted" ||
       (state.nextAttemptAt !== null && state.nextAttemptAt > now)) return null;
   // A reclaimed physical owner first reconciles the same interrupted attempt.
   // Starting another call is not evidence that the prior call failed.
-  if (state.state === "running" && state.attemptId) return { ...state, revision: state.revision + 1 };
+  if (state.state === "running" && state.attemptId) return { ...state, maxRetries, revision: state.revision + 1 };
   if ((state.deadlineAt !== null && now >= state.deadlineAt) ||
-      (state.attempts > 0 && state.retriesUsed >= SYSTEM_RECOVERY_MAX_RETRIES)) return null;
-  return { ...state, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
+      (state.attempts > 0 && state.retriesUsed >= maxRetries)) return null;
+  return { ...state, maxRetries, revision: state.revision + 1, state: "running", attemptId: randomUUID(),
     attempts: state.attempts + 1, retriesUsed: state.retriesUsed + (state.attempts > 0 ? 1 : 0), nextAttemptAt: null };
 }
 
@@ -119,7 +121,7 @@ export function failSystemRecovery(
   const delay = infrastructureRetryDelayMs(retryNumber, entropy);
   const nextAttemptAt = Math.max(now + delay, options.retryAfterAt ?? 0);
   const retryable = ["retry_transient", "recheck_evidence"].includes(failure.retryClass);
-  const retry = retryable && retryNumber <= SYSTEM_RECOVERY_MAX_RETRIES && nextAttemptAt < deadlineAt;
+  const retry = retryable && retryNumber <= (state.maxRetries ?? SYSTEM_RECOVERY_MAX_RETRIES) && nextAttemptAt < deadlineAt;
   const sourceVerification = workspaceSourceVerificationFailureSchema.safeParse(failure.sourceVerification);
   const cause = recoveryFailureCauseSchema.safeParse(options.cause);
   return { ...state, revision: state.revision + 1, firstFailureAt, deadlineAt,
