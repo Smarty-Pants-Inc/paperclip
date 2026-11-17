@@ -15,6 +15,9 @@ const proof = vi.hoisted(() => ({ exited: false }));
 vi.mock("./native-runtime/native-session-executor.js", async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
   handedOffWarmOwnerRunnerExited: async () => proof.exited,
+  // The same live controller holds the warm session, so its proof is
+  // obtainable (not sas3's restart case): consistent with the stand-in above.
+  handedOffWarmOwnerProofUnavailable: () => false,
 }));
 const { heartbeatService } = await import("./heartbeat.js");
 const { issueRoutes } = await import("../routes/issues.js");
@@ -112,7 +115,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(envelope.messages.filter(message => f.commentIds.includes(message.id)).map(message => message.body)).toEqual(["M2", "M3", "M4"]);
     const done = await wakeOf(f.queueId);
     expect(done.status).not.toBe("deferred_issue_execution");
-    expect(done.payload?.executionWait?.reason).not.toBe("execution_recovery");
+    expect((done.payload?.executionWait as { reason?: string } | undefined)?.reason).not.toBe("execution_recovery");
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
   }, 60_000);
 });
