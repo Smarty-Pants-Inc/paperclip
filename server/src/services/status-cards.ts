@@ -47,6 +47,16 @@ import {
   type StatusCardFingerprint,
 } from "./status-card-update-engine.js";
 
+export const STATUS_CARD_AGENT_MAX_CARDS_ENV = "PAPERCLIP_STATUS_CARD_AGENT_MAX_CARDS";
+
+/** Missing or invalid settings preserve the upstream lifetime author limit. */
+export function resolveStatusCardAgentMaxCards(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[STATUS_CARD_AGENT_MAX_CARDS_ENV]?.trim();
+  if (!raw || !/^\d+$/.test(raw)) return STATUS_CARD_AGENT_MAX_CARDS;
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 ? value : STATUS_CARD_AGENT_MAX_CARDS;
+}
+
 type StatusCardActor = { agentId: string | null; userId: string | null };
 type StatusCardWriter = { agentId: string | null; runId: string | null };
 type StatusCardRow = typeof statusCards.$inferSelect;
@@ -305,8 +315,9 @@ export function statusCardService(
         .from(statusCards)
         .where(and(eq(statusCards.companyId, companyId), eq(statusCards.createdByAgentId, agentId)))
         .then((rows) => rows[0]?.count ?? 0);
-      if (authoredCount >= STATUS_CARD_AGENT_MAX_CARDS) {
-        throw unprocessable(`Agents can author at most ${STATUS_CARD_AGENT_MAX_CARDS} status cards`);
+      const maxCards = resolveStatusCardAgentMaxCards();
+      if (authoredCount >= maxCards) {
+        throw unprocessable(`Agents can author at most ${maxCards} status cards`);
       }
 
       return tx.insert(statusCards).values(values).returning().then((rows) => rows[0]!);
