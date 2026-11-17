@@ -879,7 +879,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
 
   /** rf-4 row 22a/22b: before the Send's enqueue transaction, run the s3 fence's
    * runner-exit proof for the stopped native run's handed-off warm box OUTSIDE
-   * any transaction. The Send waits for it at most 1.5 s; past that the enqueue
+   * any transaction. The Send waits for it at most 1.0 s (rf-4 22b: keeps the
+   * <= 2 s POST bound under load); past that the enqueue
    * defers the wake ('interrupt_handoff') and commits, and the bounded proof
    * (handedOffWarmProofTimeout) re-dispatches this wake when it lands. */
   async function proveHandedOffWarmBeforeSend(companyId: string, issueId: string, agentId: string, queueId: string) {
@@ -896,7 +897,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       if (gaveUp && outcome === "proven") return resumeQueuedCommentInterrupt(companyId, queueId);
     }).catch(err => logger.warn({ err, runId: source.id, queueId }, "handed-off warm proof could not re-dispatch the saved Send"));
     const inline = await Promise.race([proof.then(() => true as const).catch(() => true as const),
-      new Promise<false>(resolve => setTimeout(() => resolve(false), 1_500))]);
+      new Promise<false>(resolve => setTimeout(() => resolve(false), 1_000))]);
     gaveUp = !inline;
     return true;
   }
