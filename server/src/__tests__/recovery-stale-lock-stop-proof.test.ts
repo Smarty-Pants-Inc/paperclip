@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
-import { agentExecutionStopBlocker, runExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { agentExecutionStopBlocker, runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } from "../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { claimCancellationRequest } from "../services/native-runtime/native-cancellation-request.js";
@@ -546,12 +546,17 @@ describe("stale-lock sweep requires execution Stop proof", () => {
 
   it("a proved warm-turn handoff Stop with no termination receipt raises no card and holds no owner", async () => {
     const f = await warmStopFixture("settled");
+    const before = await task(f.issueId);
     const { cards, held } = await onePass(f);
     // Base: an escalated execution_stop_pending card that holds the warm owner
     // (native refusal owner_recovery_action_pending, so a FRESH thread).
     expect(cards.map(card => card.cause)).toEqual([]);
     expect(held).toBe(false);
-    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(true);
+    // adopt-h6-narrow (rf-3): the handoff passes the CARD path only. The shared
+    // claim-release proof still refuses it, so both claims are kept.
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(true);
+    expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(await task(f.issueId)).toEqual(before);
     // The warm box stays as it was: no release, no termination.
     expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
     // Whole-agent lifecycle Stop is not broadened by the task-scoped proof.
@@ -562,6 +567,7 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     "settled-turn proof %s keeps the Stop-pending card", async proof => {
       const f = await warmStopFixture(proof);
       expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+      expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(false);
       const { cards, held } = await onePass(f);
       expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
       expect(held).toBe(true);
@@ -572,8 +578,105 @@ describe("stale-lock sweep requires execution Stop proof", () => {
     await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata, sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } })
       .where(eq(environmentLeases.id, f.lease.id));
     expect(await runExecutionsHaveStopped(db, f.companyId, [f.runId])).toBe(false);
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, f.companyId, [f.runId])).toBe(false);
     const { cards, held } = await onePass(f);
     expect(cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
     expect(held).toBe(true);
   });
+
+  // Keep reason: adopt-h6-defer (stack-lead s1 card 7ae251e4, written 1 s after
+  // a person's Stop). The sweep can run while the executor still owns the
+  // native_retry_cancelled settlement, before it writes the idle-checkpoint
+  // receipt. It defers to its own deferred deadline (the existing recheck);
+  // the card path (runExecutionsStoppedOrHandedOffWarm) then decides on the receipt.
+  async function awaitingReceiptFixture() {
+    const f = await warmStopFixture("missing");
+    // The executor still owns the coordinator: no receipt, no settlement yet.
+    await db.update(nativeRunFinalizations).set({ phase: "observed", failureCode: null, leaseOwner: "executor",
+      leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
+    return f;
+  }
+  async function landReceipt(f: { companyId: string; issueId: string; runId: string }) {
+    // retainCancelledSession's one transaction: settle the coordinator, write the receipt.
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", failureCode: "native_retry_cancelled",
+      leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, f.runId));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run!.runnerProfileJson,
+      nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId: f.companyId,
+        issueId: f.issueId, runId: f.runId, sessionId: run!.nativeSessionId, bootId: "boot-1", generation: 3 } } })
+      .where(eq(heartbeatRuns.id, f.runId));
+  }
+  async function sweepOnce(f: { companyId: string; issueId: string; runId: string }) {
+    const deadlines: number[] = [];
+    const swept = await recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId: f.companyId,
+      issueId: f.issueId, onDeferredDeadline: at => deadlines.push(at) });
+    return { swept, deadlines, cards: await stopActions(f.issueId),
+      held: await nativeUserStopRecoveryHeld(db, { companyId: f.companyId, issueId: f.issueId, runId: f.runId }) };
+  }
+
+  it("a sweep 1 s after a warm Stop, before the idle-checkpoint receipt, writes no card; the recheck admits the handoff", async () => {
+    const f = await awaitingReceiptFixture();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    const before = await task(f.issueId);
+    const first = await sweepOnce(f);
+    // Base: an escalated execution_stop_pending card holding the warm owner.
+    expect(first.cards).toEqual([]);
+    expect(first.held).toBe(false);
+    expect(first.swept.cleared).toBe(0);
+    expect(await task(f.issueId)).toEqual(before);
+    // The recheck is the sweep's own deferred deadline: one interval after the Stop.
+    expect(first.deadlines).toEqual([run!.finishedAt!.getTime() + 30_000 + 1]);
+    await landReceipt(f);
+    const recheck = await sweepOnce(f);
+    expect(recheck.cards).toEqual([]);
+    expect(recheck.held).toBe(false);
+    // adopt-h6-narrow (rf-3): the handoff suppresses the card only; the
+    // recheck clears nothing and both claims are kept.
+    expect(recheck.swept.cleared).toBe(0);
+    expect(await task(f.issueId)).toEqual(before);
+    // The warm box is untouched: it is the successor's retained box.
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.lease.id)))[0]).toEqual(f.lease);
+  });
+
+  it.each(["recheck_due", "executor_lease_expired"] as const)(
+    "a receipt that never lands raises the card at the recheck (%s)", async why => {
+      const f = await awaitingReceiptFixture();
+      expect((await sweepOnce(f)).cards).toEqual([]);
+      // Time reaches the recheck: either the deferred deadline after the Stop
+      // or the executor's own settlement lease, whichever comes first.
+      if (why === "recheck_due") {
+        await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 30_001) }).where(eq(heartbeatRuns.id, f.runId));
+      } else {
+        await db.update(nativeRunFinalizations).set({ leaseExpiresAt: new Date(Date.now() - 1) })
+          .where(eq(nativeRunFinalizations.runId, f.runId));
+      }
+      const recheck = await sweepOnce(f);
+      expect(recheck.deadlines).toEqual([]);
+      expect(recheck.cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+      expect(recheck.held).toBe(true);
+    });
+
+  it.each(["unacknowledged", "stop_and_retain", "non_warm", "uncertain"] as const)(
+    "%s Stop before the receipt raises the card on the first pass, as before", async guard => {
+      const f = await awaitingReceiptFixture();
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+      if (guard === "unacknowledged") {
+        await db.update(heartbeatRuns).set({ resultJson: { ...run!.resultJson, nativeCancellation: {
+          ...(run!.resultJson!.nativeCancellation as Record<string, unknown>), dispatched: false } } }).where(eq(heartbeatRuns.id, f.runId));
+      } else if (guard === "stop_and_retain") {
+        await db.update(environmentLeases).set({ metadata: { ...f.lease.metadata,
+          sandboxStopAndRetain: { requestedAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.lease.id));
+      } else if (guard === "non_warm") {
+        await db.update(environmentLeases).set({ leasePolicy: "ephemeral" }).where(eq(environmentLeases.id, f.lease.id));
+      } else {
+        await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.runId, seq: 900,
+          eventType: "harness.diagnostic", stream: "system", level: "info", payload: { prpEvent: {
+            schema: "paperclip.prp.event.v1", runId: f.runId, eventType: "harness.diagnostic",
+            payload: { code: "pi_abort_escalated" } } } });
+      }
+      const first = await sweepOnce(f);
+      expect(first.deadlines).toEqual([]);
+      expect(first.cards).toMatchObject([{ status: "escalated", cause: "execution_stop_pending" }]);
+      expect(first.held).toBe(true);
+    });
 });

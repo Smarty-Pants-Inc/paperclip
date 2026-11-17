@@ -29,10 +29,25 @@ export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Pro
  * writes here would invert native reacquisition's coordinator -> run order.
  * Expired coordinator settlement remains the agent lifecycle owner's duty. */
 export async function runExecutionsHaveStopped(db: Db, companyId: string, runIds: string[]) {
+  return taskScopedStopBlocker(db, companyId, runIds, false);
+}
+
+/** Stop-pending CARD path only (rf-3, adopt-h6-narrow): the card writers
+ * (stale-lock sweep, stranded escalation) and the card's own recheck raise no
+ * card, and clear one, when every owner is stopped OR is a proved warm-turn
+ * handoff (provedWarmTurnHandoff). It never releases a claim: a proved handoff
+ * keeps checkoutRunId and executionRunId, because the shared
+ * runExecutionsHaveStopped above, which gates claim release, does not accept it. */
+export async function runExecutionsStoppedOrHandedOffWarm(db: Db, companyId: string, runIds: string[]) {
+  return taskScopedStopBlocker(db, companyId, runIds, true);
+}
+
+async function taskScopedStopBlocker(db: Db, companyId: string, runIds: string[], acceptWarmHandoff: boolean) {
   const ids = [...new Set(runIds)];
   if (!ids.length) return true;
   return (await executionStopBlocker(db, and(eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.id, ids))!,
-    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false)) === null;
+    and(eq(environmentLeases.companyId, companyId), inArray(environmentLeases.heartbeatRunId, ids))!, ids.length, false,
+    acceptWarmHandoff)) === null;
 }
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -56,24 +71,33 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
     && !!coordinator && coordinator.runId === run.id && coordinator.phase === "terminal_failure"
     && coordinator.failureCode === "native_retry_cancelled" && !coordinator.leaseOwner && !coordinator.resultId
     && receipt.bootId === coordinator.controllerBootId && receipt.generation === coordinator.controllerGeneration
-    && runLeases.length > 0 && runLeases.every(lease => !!lease.provider && lease.provider !== "local"
-      && lease.status === "active" && lease.leasePolicy === "reuse_by_environment" && !lease.releasedAt
-      && !lease.cleanupStatus && lease.metadata?.pendingCleanupInFlight !== true
-      && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease));
+    && runLeases.length > 0 && runLeases.every(isRetainedWarmLease);
+}
+
+/** The retained warm box a keep_running Stop hands off: remote, active,
+ * reuse_by_environment, unreleased, no cleanup, no release deferral and no
+ * stop_and_retain. Shape only; it proves nothing about Stop by itself. */
+export function isRetainedWarmLease(lease: Lease): boolean {
+  return !!lease.provider && lease.provider !== "local"
+    && lease.status === "active" && lease.leasePolicy === "reuse_by_environment" && !lease.releasedAt
+    && !lease.cleanupStatus && lease.metadata?.pendingCleanupInFlight !== true
+    && !readLeaseReleaseDeferral(lease.metadata) && !hasStopOnlyCleanup(lease);
 }
 
 async function executionStopBlocker(db: Db, condition: SQL, leaseCondition: SQL,
-  expectedRunCount?: number, settleCoordinators = true): Promise<string | null> {
+  expectedRunCount?: number, settleCoordinators = true, acceptWarmHandoff = false): Promise<string | null> {
   const runs = await db.select().from(heartbeatRuns).where(condition);
   // A missing or cross-company binding cannot establish execution Stop.
   if (expectedRunCount !== undefined && runs.length !== expectedRunCount) return "run_binding_unproven";
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(condition);
   const allLeases = await db.select().from(environmentLeases).where(leaseCondition);
-  // Task-scoped proof only (never whole-agent lifecycle Stop): a proved warm
-  // handoff's still-active warm lease is the retained box, not live execution.
-  const coordinatorRows = settleCoordinators ? [] : await db.select().from(nativeRunFinalizations)
+  // Card path only (runExecutionsStoppedOrHandedOffWarm; never claim release
+  // or whole-agent lifecycle Stop): a proved warm handoff's still-active warm
+  // lease is the retained box, not live execution.
+  const acceptHandoff = acceptWarmHandoff && !settleCoordinators;
+  const coordinatorRows = !acceptHandoff ? [] : await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runs.map(run => run.id)));
-  const handedOff = new Set(settleCoordinators ? [] : runs.filter(run => provedWarmTurnHandoff(run,
+  const handedOff = new Set(!acceptHandoff ? [] : runs.filter(run => provedWarmTurnHandoff(run,
     allLeases.filter(lease => lease.heartbeatRunId === run.id),
     coordinatorRows.find(row => row.runId === run.id))).map(run => run.id));
   const leases = allLeases.filter(lease => !lease.heartbeatRunId || !handedOff.has(lease.heartbeatRunId));

@@ -201,7 +201,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
 
   /** Mirrors runtime selection: the follow-up inherits the selected source's
    * provider checkpoint before the executor admits its durable root. */
-  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, expectBareBarrier = false) {
+  async function admitFollowUp(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>, expectBareBarrier = false,
+    box?: { environmentId: string; providerLeaseId: string }) {
     const runId = randomUUID();
     const [row] = await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "running", runtimeMode: "native",
       nativeIssueId: prior.issueId, nativeSessionId: prior.native.normalizedSessionId, contextSnapshot: { issueId: prior.issueId } }).returning();
@@ -219,7 +220,8 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson, nativeExecutionInput: execution,
       nativeToolContractFingerprint: nativeToolContractFingerprintForTarget("remote", execution.provider.kind),
       sessionCheckpoint: admission.checkpoint } }).where(eq(heartbeatRuns.id, runId));
-    const logs: string[] = [], environmentId = randomUUID(), leaseId = randomUUID(), providerLeaseId = `sandbox-${runId}`;
+    const logs: string[] = [], environmentId = box?.environmentId ?? randomUUID(), leaseId = randomUUID(),
+      providerLeaseId = box?.providerLeaseId ?? `sandbox-${runId}`;
     const remoteExecute = vi.fn(async (_request: unknown): Promise<{ exitCode: number; timedOut: boolean; stdout: string; stderr: string }> => {
       throw new Error("admission must not reach the sandbox");
     });
@@ -1797,4 +1799,267 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await quarantined()).toHaveLength(scenario === "live controller lease" ? 0 : expectedQuarantine);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
+
+  // adopt-h6-defer (stack-lead s1 card 7ae251e4, 1 s after a person's Stop on
+  // a warm box): the real sweep runs once while the executor still owns the
+  // native_retry_cancelled settlement, before its idle-checkpoint receipt.
+  // That sweep defers to its recheck; no card is ever written, and the
+  // person's next message continues the same provider thread.
+  it("a sweep before a warm Stop's idle-checkpoint receipt writes no card and the successor keeps the thread", async () => {
+    const { recoveryService } = await import("../recovery/service.js");
+    const { nativeUserStopRecoveryHeld } = await import("./native-user-stop-settlement.js");
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, { leaseOwner: "stopping-controller", events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ] });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, prior.runId));
+    // The person's Stop handed the warm box off: its reusable lease stays active.
+    const environmentId = randomUUID();
+    await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
+    await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId, heartbeatRunId: prior.runId,
+      provider: "daytona", providerLeaseId: `sandbox-${prior.runId}`, status: "active", leasePolicy: "reuse_by_environment",
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace" } });
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId }).where(eq(issues.id, prior.issueId));
+    const sweep = () => recoveryService(db, { enqueueWakeup: vi.fn() }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId,
+      onDeferredDeadline: () => {} });
+    const cards = () => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
+    await sweep();
+    // Base: an escalated execution_stop_pending card that holds the owner.
+    expect(await cards()).toEqual([]);
+    expect(await nativeUserStopRecoveryHeld(db, { companyId, issueId: prior.issueId, runId: prior.runId })).toBe(false);
+    // The executor settles: coordinator released and receipt written together.
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.transaction(async tx => {
+      await tx.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null })
+        .where(eq(nativeRunFinalizations.runId, prior.runId));
+      await tx.update(heartbeatRuns).set({ runnerProfileJson: { ...stopped!.runnerProfileJson,
+        nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId,
+          runId: prior.runId, sessionId: stopped!.nativeSessionId, bootId: coordinator!.controllerBootId,
+          generation: coordinator!.controllerGeneration } } }).where(eq(heartbeatRuns.id, prior.runId));
+    });
+    // The person's next message reaches admission before the recheck.
+    const followUp = await admitFollowUp(prior);
+    expect(await followUp.start()).toBe(ADMITTED);
+    expect(followUp.selectedRunId).toBe(prior.runId);
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect(next!.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: prior.native.normalizedSessionId,
+      providerSessionId: "provider-session-before-recovery" });
+    // The recheck: still no card, in any status, ever.
+    await sweep();
+    expect(await cards()).toEqual([]);
+  }, 60_000);
+
+  // adopt-h6-narrow (rf-3 ruling, RFL 18:42Z): a PROVEN warm handoff only
+  // suppresses the Stop-pending CARD. It does not pass the shared Stop proof
+  // (runExecutionsHaveStopped) that gates claim release, so the real sweep
+  // clears NOTHING: both claims are kept exactly as before d4752b6b, no
+  // lock_released promotion fires, no card is raised and the warm lease is
+  // untouched. The next message continues the same session (keep-thread).
+  it("a proven warm handoff keeps both claims, raises no card and the next message keeps the thread", async () => {
+    const { recoveryService } = await import("../recovery/service.js");
+    const { nativeUserStopRecoveryHeld } = await import("./native-user-stop-settlement.js");
+    const { runExecutionsHaveStopped, runExecutionsStoppedOrHandedOffWarm } = await import("../agent-execution-stop.js");
+    const { agentWakeupRequests } = await import("@paperclipai/db");
+    const prior = await seedRecoveredPriorRun();
+    // The person's Stop, settled by the executor: coordinator released and the
+    // idle-checkpoint receipt written together (native-session-executor).
+    await stopSettledOwner(prior, { events: [
+      { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+    ] });
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(), runnerProfileJson: { ...stopped!.runnerProfileJson,
+      nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId,
+        runId: prior.runId, sessionId: stopped!.nativeSessionId, bootId: coordinator!.controllerBootId,
+        generation: coordinator!.controllerGeneration } } }).where(eq(heartbeatRuns.id, prior.runId));
+    // The warm box the Stop handed off: its reusable lease stays active.
+    const environmentId = randomUUID(), providerLeaseId = `sandbox-${prior.runId}`;
+    await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
+    const [warmLease] = await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId } }).returning();
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId }).where(eq(issues.id, prior.issueId));
+    // The person's next message, SENT after the Stop (adopt-h6-neg2: the
+    // explicit-Send marker, by that person, later than the Stop), saved behind
+    // the task lock. Input queued before the Stop is the Send-only row below.
+    const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const sentAt = new Date(stoppedRun!.finishedAt!.getTime() + 1_000);
+    const [saved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user",
+      requestedByActorId: "board-user", requestedAt: sentAt,
+      payload: { issueId: prior.issueId, executionWait: { runId: prior.runId },
+        queuedCommentInterrupt: { actorId: "board-user", targetRunId: null, requestedAt: sentAt.toISOString() } } }).returning();
+    const { queuedSendAfterStop, userStopBoundaryAt } = await import("../run-cancellation.js");
+    expect(queuedSendAfterStop(saved!.payload, { stoppedAt: userStopBoundaryAt(stoppedRun!)!, actorId: "board-user" }))
+      .toEqual({ actorId: "board-user", requestedAt: sentAt.toISOString() });
+    // Card path accepts the handoff; the shared claim-release proof does not.
+    expect(await runExecutionsStoppedOrHandedOffWarm(db, companyId, [prior.runId])).toBe(true);
+    expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(false);
+    const enqueueWakeup = vi.fn();
+    const sweep = () => recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId: prior.issueId,
+      onDeferredDeadline: () => {} });
+    const cards = () => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId));
+    const lease = async () => (await db.select().from(environmentLeases).where(eq(environmentLeases.id, warmLease!.id)))[0];
+    const [before] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    const claims = (row: typeof before) => ({ checkoutRunId: row!.checkoutRunId, executionRunId: row!.executionRunId,
+      executionAgentNameKey: row!.executionAgentNameKey, executionLockedAt: row!.executionLockedAt });
+    // Base d4752b6b..1be2feb5: cleared 1 and both claims released. Before
+    // d4752b6b: cleared 0 but an escalated execution_stop_pending card.
+    expect(await sweep()).toMatchObject({ cleared: 0, issueIds: [] });
+    const [kept] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect(claims(kept)).toEqual(claims(before));
+    expect(kept).toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+    expect(await cards()).toEqual([]);
+    expect(await nativeUserStopRecoveryHeld(db, { companyId, issueId: prior.issueId, runId: prior.runId })).toBe(false);
+    // No lock_released promotion: the saved message is untouched.
+    const [unpromoted] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved!.id));
+    expect(unpromoted).toMatchObject({ status: "deferred_issue_execution", updatedAt: saved!.updatedAt });
+    // The box: byte-identical, still active and owned by the stopped turn.
+    expect(await lease()).toEqual(warmLease);
+    // The next message continues the SAME native session and provider thread
+    // through the fence, on the same box.
+    const followUp = await admitFollowUp(prior, false, { environmentId, providerLeaseId });
+    expect(await followUp.start()).toBe(ADMITTED);
+    expect(followUp.selectedRunId).toBe(prior.runId);
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, followUp.runId));
+    expect(next!.runnerProfileJson?.sessionCheckpoint).toMatchObject({ sessionId: prior.native.normalizedSessionId,
+      providerSessionId: "provider-session-before-recovery" });
+    expect(followUp.logs.join("")).not.toContain(FRESH_THREAD_STARTED_NOTE);
+    expect(followUp.logs.join("")).not.toContain("retirement_refused");
+    // A later sweep still raises no card and leaves the warm lease alone.
+    await sweep();
+    expect(await cards()).toEqual([]);
+    expect(await lease()).toEqual(warmLease);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  }, 60_000);
+
+  /** adopt-h6-neg2: the positive test's Stop and warm box, with one fact
+   * changed so the Stop is UNPROVEN. Every fact is written through the same
+   * rows the positive test writes; nothing else is seeded. */
+  type WarmStop = "proven" | "no idle-checkpoint receipt" | "an unacknowledged Stop" | "a stop_and_retain lease"
+    | "a live runner (coordinator lease held)";
+  async function seedWarmStop(variant: WarmStop) {
+    const prior = await seedRecoveredPriorRun();
+    await stopSettledOwner(prior, { ack: variant === "an unacknowledged Stop" ? "none" : "own",
+      leaseOwner: variant === "a live runner (coordinator lease held)" ? "still-running-controller" : undefined, events: [
+        { eventType: "harness.diagnostic", payload: { code: "provider_interrupt_requested", pendingCallIds: [] } },
+      ] });
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, prior.runId));
+    const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, prior.runId));
+    const stoppedAt = new Date();
+    await db.update(heartbeatRuns).set({ finishedAt: stoppedAt, runnerProfileJson: variant === "no idle-checkpoint receipt"
+      ? stopped!.runnerProfileJson : { ...stopped!.runnerProfileJson,
+        nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1", companyId, issueId: prior.issueId,
+          runId: prior.runId, sessionId: stopped!.nativeSessionId, bootId: coordinator!.controllerBootId,
+          generation: coordinator!.controllerGeneration } } }).where(eq(heartbeatRuns.id, prior.runId));
+    const environmentId = randomUUID(), providerLeaseId = `sandbox-${prior.runId}`;
+    await db.insert(environments).values({ id: environmentId, name: `warm-${environmentId}`, driver: "sandbox" });
+    const [warmLease] = await db.insert(environmentLeases).values({ companyId, environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
+      expiresAt: new Date(Date.now() + 900_000), metadata: { remoteCwd: "/workspace", agentId,
+        ...(variant === "a stop_and_retain lease" ? { sandboxStopAndRetain: { requestedAt: stoppedAt.toISOString() } } : {}) } })
+      .returning();
+    await db.update(issues).set({ checkoutRunId: prior.runId, executionRunId: prior.runId, executionLockedAt: stoppedAt })
+      .where(eq(issues.id, prior.issueId));
+    return { prior, warmLease: warmLease!, environmentId, providerLeaseId, stoppedAt };
+  }
+  const sweepIssue = (issueId: string, enqueueWakeup = vi.fn()) =>
+    recoveryService(db, { enqueueWakeup }).sweepStaleIssueLocks({ companyId, issueId, onDeferredDeadline: () => {} });
+
+  // adopt-h6-neg2 (RFL 17:40Z): an UNPROVEN Stop keeps BOTH claims exactly as
+  // at base through the same real sweep, and lock_released never fires.
+  it.each([
+    "no idle-checkpoint receipt", "an unacknowledged Stop", "a stop_and_retain lease", "a live runner (coordinator lease held)",
+  ] as const)("an unproven warm Stop with %s keeps both claims and promotes nothing", async variant => {
+    const { runExecutionsHaveStopped } = await import("../agent-execution-stop.js");
+    const { agentWakeupRequests } = await import("@paperclipai/db");
+    const { prior, warmLease } = await seedWarmStop(variant);
+    const [saved] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+      reason: "issue_commented", status: "deferred_issue_execution",
+      payload: { issueId: prior.issueId, executionWait: { runId: prior.runId } } }).returning();
+    const [before] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect(before).toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+    expect(await runExecutionsHaveStopped(db, companyId, [prior.runId])).toBe(false);
+    const enqueueWakeup = vi.fn();
+    expect(await sweepIssue(prior.issueId, enqueueWakeup)).toMatchObject({ cleared: 0, issueIds: [] });
+    const [after] = await db.select().from(issues).where(eq(issues.id, prior.issueId));
+    expect({ checkoutRunId: after!.checkoutRunId, executionRunId: after!.executionRunId,
+      executionAgentNameKey: after!.executionAgentNameKey, executionLockedAt: after!.executionLockedAt }).toEqual({
+      checkoutRunId: before!.checkoutRunId, executionRunId: before!.executionRunId,
+      executionAgentNameKey: before!.executionAgentNameKey, executionLockedAt: before!.executionLockedAt });
+    // No lock_released promotion: the saved message keeps its 30 s backoff.
+    const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, saved!.id));
+    expect(held).toMatchObject({ status: "deferred_issue_execution", updatedAt: saved!.updatedAt });
+    expect((await db.select().from(environmentLeases).where(eq(environmentLeases.id, warmLease.id)))[0]).toEqual(warmLease);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  }, 60_000);
+
+  // adopt-h6-neg2 Send-only row (RFL 17:51Z, org 17:30Z): M2 and M3 were
+  // queued behind the running turn BEFORE the person's Stop and never Sent.
+  // A proven warm handoff then raises no card and keeps both claims
+  // (adopt-h6-narrow). The held messages stay deferred and nothing starts
+  // them; only the person's Send releases them, once, in order.
+  it.each(["plain", "with an execution wait"] as const)(
+    "messages held before a proven warm Stop stay deferred until the person's Send (%s)", async shape => {
+      const { agentWakeupRequests, issueComments } = await import("@paperclipai/db");
+      const { withQueuedCommentIdsInWakePayload, queuedCommentIdsFromWakePayload } = await import("../issue-queued-comment-queue.js");
+      const { heartbeatService } = await import("../heartbeat.js");
+      const { prior, stoppedAt } = await seedWarmStop("proven");
+      const queuedAt = new Date(stoppedAt.getTime() - 10_000);
+      const held: Array<{ commentId: string; wakeId: string; updatedAt: Date }> = [];
+      for (const body of ["M2", "M3"]) {
+        const [comment] = await db.insert(issueComments).values({ companyId, issueId: prior.issueId, authorUserId: "board-user",
+          body, createdAt: queuedAt }).returning();
+        const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation",
+          triggerDetail: "system", reason: "issue_commented", status: "deferred_issue_execution",
+          requestedByActorType: "user", requestedByActorId: "board-user", requestedAt: queuedAt,
+          payload: withQueuedCommentIdsInWakePayload({ issueId: prior.issueId, mutation: "comment", commentId: comment!.id,
+            ...(shape === "with an execution wait" ? { executionWait: { reason: "execution_recovery",
+              message: "Waiting for execution recovery. Your message is saved." } } : {}),
+            _paperclipWakeContext: { issueId: prior.issueId, taskId: prior.issueId, wakeReason: "issue_commented",
+              source: "issue.comment", wakeCommentIds: [comment!.id], wakeCommentId: comment!.id } }, [comment!.id]) }).returning();
+        held.push({ commentId: comment!.id, wakeId: wake!.id, updatedAt: wake!.updatedAt });
+      }
+      const issueRuns = async () => (await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status,
+        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
+        .where(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${prior.issueId} or ${heartbeatRuns.nativeIssueId} = ${prior.issueId}`))
+        .filter(run => run.id !== prior.runId);
+      const wakes = async () => db.select().from(agentWakeupRequests).where(inArray(agentWakeupRequests.id, held.map(row => row.wakeId)));
+      // The proven warm handoff: the real sweep keeps both claims and raises no card.
+      expect(await sweepIssue(prior.issueId)).toMatchObject({ cleared: 0, issueIds: [] });
+      expect((await db.select().from(issues).where(eq(issues.id, prior.issueId)))[0])
+        .toMatchObject({ checkoutRunId: prior.runId, executionRunId: prior.runId });
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, prior.issueId))).toEqual([]);
+      // No lock_released promotion: every held wake is untouched.
+      for (const wake of await wakes()) {
+        expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+        expect(wake.updatedAt.getTime()).toBe(held.find(row => row.wakeId === wake.id)!.updatedAt.getTime());
+      }
+      // 60 s pass (every 30 s age gate expires): the real admission passes
+      // that run on their own find nothing to start. A message queued before
+      // the Stop is not the person's Send.
+      await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 61_000) })
+        .where(inArray(agentWakeupRequests.id, held.map(row => row.wakeId)));
+      const hb = heartbeatService(db, { runtimeEnv: { PAPERCLIP_NATIVE_RUNTIME_ENABLED: "true" } });
+      await hb.resumeExecutionWaitComments({ companyId });
+      for (const row of held) await hb.resumeExecutionWaitComments({ companyId, requestId: row.wakeId });
+      expect(await issueRuns()).toEqual([]);
+      for (const wake of await wakes()) expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect((await wakes()).flatMap(wake => queuedCommentIdsFromWakePayload(wake.payload)).sort())
+        .toEqual(held.map(row => row.commentId).sort());
+      // The person's Send (the queue's explicit-Send marker, written after the
+      // Stop by that person) releases them: one turn, M2 then M3.
+      const [queue] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.wakeId));
+      await db.update(agentWakeupRequests).set({ payload: { ...withQueuedCommentIdsInWakePayload(queue!.payload,
+        held.map(row => row.commentId)), queuedCommentInterrupt: { actorId: "board-user", targetRunId: null,
+        requestedAt: new Date().toISOString() } }, coalescedCount: 1 }).where(eq(agentWakeupRequests.id, held[0]!.wakeId));
+      await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, held[1]!.wakeId));
+      await hb.resumeQueuedCommentInterrupt(companyId, held[0]!.wakeId).catch(() => undefined);
+      await hb.resumeQueuedCommentInterrupt(companyId, held[0]!.wakeId).catch(() => undefined);
+      const started = await issueRuns();
+      expect(started).toHaveLength(1);
+      expect((started[0]!.contextSnapshot as Record<string, unknown>).wakeCommentIds).toEqual(held.map(row => row.commentId));
+    }, 60_000);
 });

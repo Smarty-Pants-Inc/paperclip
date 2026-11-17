@@ -12,6 +12,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
+import { handedOffWarmLease, handedOffWarmLeaseSettled, handedOffWarmProofInFlight, requestHandedOffWarmLeaseStop } from "./native-runtime/handed-off-warm-lease.js";
 import { createHash } from "node:crypto";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { canContinueCancelledRun, QUEUED_SEND_AFTER_STOP_KEY, queuedSendAfterStop, userStopBoundaryAt } from "./run-cancellation.js";
@@ -191,6 +192,10 @@ export async function admitExplicitNativeContinuation(input: {
   durableChatRequest?: DurableChatWakeupRequest;
   interactionPayload?: unknown;
   dryRun?: boolean;
+  /** pl/send-after-stop3: the Send's own gate inside its enqueue transaction
+   * (queue.ts) runs as a dry run; it alone may request the handed-off box's
+   * stop. Other dry runs (previews) never do. */
+  requestHandedOffWarmStop?: boolean;
   onBlocked?: (reason: string, message: string) => void;
 }): Promise<{ previousRunId: string; commentId: string | null; failedRunId?: string; taskRetryRequestId?: string; queuedCommentInterruptId?: string; readiness?: ContinuationReadiness } | null> {
   const { db, companyId, issueId, agentId, actorId, commentId } = input;
@@ -570,7 +575,28 @@ export async function admitExplicitNativeContinuation(input: {
     const remote = leases.some(lease => lease.provider !== "local");
     if (remote) {
       // Never interpret remote PIDs using the control-plane host's process table.
-      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      // pl/send-after-stop: a person's Stop of a warm (keep_running) turn hands
+      // the still-running box off for the next message (nativeStopWorkspaceOutcome);
+      // no stop receipt ever comes for it. It is settled for this Send once the
+      // s3 fence's own proof says the stopped run's Runner exited, exactly as the
+      // successor's retirement on that box requires; no stop in flight on it.
+      const handedOff = new Set<string>();
+      for (const lease of leases) {
+        if (hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease)) continue;
+        if (!handedOffWarmLeaseSettled(run, lease)) break;
+        handedOff.add(lease.id);
+      }
+      const unsettled = leases.filter(lease => !handedOff.has(lease.id) && !hasRemoteTerminationReceipt(lease) && !hasRecoveredCleanupStopReceipt(lease));
+      if (unsettled.length) {
+        // pl/send-after-stop3: a handed-off box whose proof is unavailable here
+        // (a controller restart) is stopped and kept now, not at warm expiry.
+        // rf-4 row 22c: a DB-only intent write in the caller's transaction; no remote call.
+        for (const lease of unsettled) await requestHandedOffWarmLeaseStop(db, run, lease, { dryRun: input.dryRun === true && input.requestHandedOffWarmStop !== true });
+        // rf-4 row 22a: the runner-exit proof runs outside this transaction (proveHandedOffWarmLeases).
+        if (handedOffWarmProofInFlight(run.id) && unsettled.some(lease => handedOffWarmLease(run, lease)))
+          return blocked("interrupt_handoff", "Sending your messages.");
+        return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+      }
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return refused("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");

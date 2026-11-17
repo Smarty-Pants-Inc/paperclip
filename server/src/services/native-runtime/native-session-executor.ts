@@ -1422,6 +1422,35 @@ async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<bo
   return true;
 }
 
+/** pl/send-after-stop: the explicit-continuation gate asks the s3 fence's own
+ * proof (supersededOwnerRunnerExited, above) for a warm owner that a person's
+ * Stop handed off on a still-running box. True only when this run's warm
+ * session on this box is idle and its Runner is proven exited; false when no
+ * such session is held here, it is busy or preparing, or the proof fails. */
+export async function handedOffWarmOwnerRunnerExited(input: { runId: string; providerLeaseId: string | null }): Promise<boolean> {
+  for (const entry of warmNativeSessions.values()) {
+    if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
+    if (entry.busy || entry.preparingRunId) return false;
+    return supersededOwnerRunnerExited(entry);
+  }
+  return false;
+}
+
+/** pl/send-after-stop3: whether the s3 fence's proof (handedOffWarmOwnerRunnerExited)
+ * is unobtainable here for this run's handed-off warm owner on this box: true
+ * when this process holds NO warm session for it (a controller restart, or the
+ * entry already forgotten) or holds an idle one without a sandbox Runner or
+ * lease database to prove with. False when one is busy or preparing, and when
+ * the proof is obtainable (a Runner that did not prove exited still waits). */
+export function handedOffWarmOwnerProofUnavailable(input: { runId: string; providerLeaseId: string | null }): boolean {
+  for (const entry of warmNativeSessions.values()) {
+    if (entry.runId !== input.runId || (input.providerLeaseId && entry.providerLeaseId !== input.providerLeaseId)) continue;
+    if (entry.busy || entry.preparingRunId) return false;
+    return !entry.sandboxRunner || !entry.sandboxLeaseDb;
+  }
+  return true;
+}
+
 async function stopRetainedRunnerOfFinishedOwner(entry: WarmNativeSession, error: unknown, db: Db): Promise<boolean> {
   if (!entry.sandboxRunner || !(error instanceof NativeSessionCloseUnrecoverableError)
     || error.settlement?.runnerRetained !== true || error.settlement.runnerSuspended === true) return false;

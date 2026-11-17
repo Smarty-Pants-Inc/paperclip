@@ -4241,7 +4241,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             taskRetryRequestId: opts.taskRetryRequestId,
             ...(durableRequest?.resumeDeferred && !failedChatRetry ? { durableChatRequest: durableRequest } : {}),
             interactionPayload: payload,
-            dryRun: true,
+            dryRun: true, requestHandedOffWarmStop: true,
             onBlocked: (reason, message) => { continuationBlocked = true; continuationWait = { reason, message }; },
           })) && (executionBlocker || (continuationBlocked && !verifiedConversationReset))) {
             // A hold left by an unfinished run never refuses an ordinary
