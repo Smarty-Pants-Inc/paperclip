@@ -537,6 +537,7 @@ import {
   verifyNativeHarnessBackupStreamed,
   shouldRestoreNativeHarnessBackupIntoSandbox,
   remoteProviderStateNeverOpened,
+  setNativeRefreshRotationWaitBoundMsForTests,
 } from "./native-session-executor.js";
 import { onNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 
@@ -25658,6 +25659,216 @@ describe("runnerd provider runtime wiring", () => {
         await expect(open(fixture)).rejects.toMatchObject({ runnerCommandResult: expect.anything() });
         expect(fixture.openSession).toHaveBeenCalledTimes(2);
         expect(restoreUnavailableNotice).toHaveBeenCalledOnce();
+      });
+    });
+
+    // P0 chat continuity (fresh, 11-17; six-runs export 05:33Z). Paul's Smarty
+    // (native Pi via paperclip_runner, agent-files sync-back ON).
+    // S2: chat SMA-613's run succeeded; ANOTHER run of the SAME agent wrote
+    // agent.files_updated (agentRuntimeRevision bump, a file under the agent
+    // instruction root), so the chat's next run carries a new instruction
+    // bundle. It recovers the warm checkpoint (rebound shape, policy
+    // allow_replacement_after_resume_failure); the runner's run.prepare sees a
+    // config that differs ONLY in 'instructions' and refuses it with
+    // provider_refresh_required (provider_backend.rs refresh admission). The
+    // driver returns that as a not-recovered result with failureClass
+    // provider_refresh_required, and the runtime throws
+    // NativeRunnerRefreshRequiredError: run ed94e6f6 FAILED
+    // native_runner_refresh_required and only a later run answered, on a fresh
+    // thread with task_history. S1: after a person's Stop the warm session
+    // still showed the stopped turn (refresh_wait, provider_active_turn): run
+    // 17b3cb35 FAILED the same way; 40 s later the 3rd send answered on a fresh
+    // thread. The floor: the FIRST run answers, on a fresh provider thread that
+    // carries the saved history (the F20 / NSR replacement path), the old warm
+    // state set aside (never deleted) BEFORE the fresh session opens, the
+    // recovery not repeated, and the refusal logged with its code.
+    describe("chat refresh: a runner refresh refusal on the RECOVER path answers in the first run on a fresh thread", () => {
+      const SEEDED_FACTS = ["The launch moved to Thursday.", "Dana owns the Q3 budget.", "The code word is heron."];
+      const HANDOFF = `## Fresh session handoff\n\nThe saved conversation so far:\n- ${SEEDED_FACTS.join("\n- ")}`;
+      const refreshRefusal = (prepareRefusalCode: string, waitForTurn = false) => ({ recovered: false as const,
+        reason: "native_runner_refresh_required", failureClass: "provider_refresh_required", prepareRefusalCode,
+        ...(waitForTurn ? { refreshWaitForTurn: true as const } : {}) });
+      type ChatFixture = Awaited<ReturnType<typeof floorFixture>> & { boxState: (overrides?: Record<string, unknown>) => Promise<void>;
+        oldStateAtFreshOpen: boolean[] };
+      async function chatFixture(label: string, refusal: ReturnType<typeof refreshRefusal>,
+        box: Record<string, unknown> = {}): Promise<ChatFixture> {
+        // A created lease, as F20's runtime dress: this fixture has no live
+        // runnerd controller, so a resumed lease cannot prove the fresh
+        // session's unconnected bootstrap (claimUntouchedRemoteSession).
+        const fixture = await floorFixture(`refresh-${label}`, "none", "created");
+        // The warm session's state on the box (the conversation's provider thread).
+        const boxState = async (overrides: Record<string, unknown> = {}) => {
+          await mkdir(join(fixture.remoteSession, "runner"), { recursive: true });
+          await writeFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+            schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "retained-provider-thread",
+            providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" },
+            ...box, ...overrides }));
+        };
+        await boxState();
+        // The runner refuses the warm session's refresh (as the driver reports
+        // NativeRunnerRefreshRequiredError from run.prepare).
+        fixture.recoverSession.mockImplementationOnce(async () => { fixture.refusals.push(refusal); return refusal as never; });
+        // A fresh provider session opens only on a box whose old warm state is set aside.
+        const oldStateAtFreshOpen: boolean[] = [];
+        fixture.openSession.mockImplementation(async () => {
+          oldStateAtFreshOpen.push(existsSync(join(fixture.remoteSession, "runner/codex-provider-state.json")));
+          await fixture.options.prepareExternalRunnerState();
+          await mkdir(join(fixture.remoteSession, "runner"), { recursive: true });
+          await writeFile(join(fixture.remoteSession, "runner/codex-provider-state.json"), JSON.stringify({
+            schema: "paperclip.runner.codex-provider-state.v1", lifecycle: "prepared", threadId: "fresh-provider-thread",
+            providerSessionId: null, activeProviderTurnId: null, config: { provider: "codex", driver: "codex_app_server" } }));
+          return fixture.fresh as never;
+        });
+        return Object.assign(fixture, { boxState, oldStateAtFreshOpen });
+      }
+      // The chat's warm checkpoint, rebound to this run (loadWarmNativeCheckpoint's shape).
+      const warmCheckpoint = (fixture: ChatFixture, overrides: Record<string, unknown> = {}) => ({
+        ...(fixture.snapshot() as unknown as Record<string, unknown>),
+        identity: { runId: fixture.current.binding.runId, sessionId: fixture.current.session.normalizedSessionId,
+          companyId: fixture.current.binding.companyId, issueId: fixture.current.binding.issueId,
+          agentId: fixture.current.binding.agentId },
+        cursor: null, semanticResult: null, terminal: null, activeTurnId: null, terminalTurns: [], pendingRuntimeRequests: [],
+        dispositionOnlyRecoveryConsumed: false, dispositionOnlyRecoveryTurnId: null,
+        providerRecoveryPolicy: "allow_replacement_after_resume_failure", ...overrides }) as never;
+      // The person's message, through the real runtime (NSR) and the server's backend.
+      async function sendPersonMessage(fixture: ChatFixture) {
+        const ident = { runId: fixture.current.binding.runId, sessionId: fixture.current.session.normalizedSessionId! };
+        const startTurn = vi.fn(async (_turn: { message: { text: string } }) => ({ turnId: "turn-fresh" }));
+        Object.assign(fixture.fresh, {
+          identity: () => ident,
+          capabilities: async () => ({ resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true }),
+          async *events() {
+            yield { schema: "paperclip.prp.event.v1", sourceEventId: `refresh:${ident.runId}:1`, sourceSeq: 1, sourceInstanceId: "refresh",
+              sourceKind: "runner", runId: ident.runId, normalizedSessionId: ident.sessionId, turnId: "turn-fresh",
+              eventType: "turn.completed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(), payload: {} };
+          },
+          startTurn,
+          result: async () => ({ turnId: "turn-fresh",
+            result: { schema: "paperclip.run_result.v1", reportedWorkDisposition: "done", summary: "Answered in the first run.",
+              completionClaim: { contractRevision: "1", objectiveSatisfied: true,
+                criteria: [{ criterionId: "objective", status: "satisfied", evidenceRefs: [] }], remainingWork: [] },
+              evidence: [], verification: [{ commandOrCheck: "refresh", status: "passed" }], attentionRequests: [], artifacts: [] },
+            terminal: { schema: "paperclip.prp.terminal.v1", turnTerminalState: "completed", runTerminalState: "succeeded",
+              reportedWorkDisposition: "done" } }),
+          snapshot: async () => ({ backendKind: "runner", driverKind: "codex_app_server", sessionId: "fresh-provider-thread",
+            providerSessionId: "fresh-provider-thread", identity: ident, workingDirectory: fixture.current.workspace.cwd, cursor: "0",
+            activeTurnId: null, pendingRuntimeRequests: [], lineage: [] }),
+        });
+        Object.assign(state.createBackend.mock.results.at(-1)!.value as object, {
+          descriptor: async () => ({ kind: "test", name: "chat refresh", version: "1",
+            capabilities: { resume: true, typedEvents: true, steering: false, interruption: true, structuredResult: true } }) });
+        const events: unknown[] = [];
+        const continuityBreaks: Array<Record<string, unknown>> = [];
+        const controlPlane = {
+          openRun: async () => undefined, completeRun: async () => {}, checkpointSession: async () => {},
+          // The chat's warm checkpoint (the prior answered run, rebound): the runtime RECOVERS.
+          loadSessionCheckpoint: async () => warmCheckpoint(fixture),
+          appendEvent: async (event: unknown) => { events.push(event);
+            return { cursor: events.length, highestContiguousSourceSeq: events.length, disposition: "committed" }; },
+          replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }),
+        };
+        const getFreshSessionHandoff = vi.fn(async () => HANDOFF);
+        const outcome = await executeNativeSession({ input: fixture.current, backend: fixture.backend, controlPlane,
+          getFreshSessionHandoff, runnerInstanceId: "refresh-runner", controlPlaneInstanceId: "refresh-control",
+          onContinuityBreak: async (entry: Record<string, unknown>) => { continuityBreaks.push(entry); } } as never)
+          .catch((error: unknown) => error);
+        return { outcome, startTurn, getFreshSessionHandoff, continuityBreaks };
+      }
+      const expectAnsweredOnFreshThread = async (fixture: ChatFixture, sent: Awaited<ReturnType<typeof sendPersonMessage>>) => {
+        // ANSWERED in this run: no native_runner_refresh_required failure.
+        expect(sent.outcome).not.toBeInstanceOf(Error);
+        // The warm session was tried ONCE (no retry loop); one fresh provider session, one turn (no duplicate answer).
+        expect(fixture.recoverSession).toHaveBeenCalledOnce();
+        expect(fixture.openSession).toHaveBeenCalledOnce();
+        expect(sent.startTurn).toHaveBeenCalledOnce();
+        // The fresh thread recalls the conversation: the saved-history handoff carries all three facts.
+        const envelope = JSON.parse(sent.startTurn.mock.calls[0]![0].message.text) as { task: { prompt: string } };
+        expect(envelope.task.prompt.startsWith("## Fresh session handoff")).toBe(true);
+        for (const fact of SEEDED_FACTS) expect(envelope.task.prompt).toContain(fact);
+        // Never-OK: the old warm state was set aside (never deleted) BEFORE the fresh session opened.
+        expect(fixture.oldStateAtFreshOpen).toEqual([false]);
+        const archived = (await readdir(dirname(fixture.remoteSession))).filter(name => name.includes(".continuity-break-"));
+        expect(archived).toHaveLength(1);
+        expect(JSON.parse(await readFile(join(dirname(fixture.remoteSession), archived[0]!, "runner/codex-provider-state.json"),
+          "utf8")).threadId).toBe("retained-provider-thread");
+        expect(await readdir(join(fixture.root, "continuity-breaks"))).toHaveLength(1);
+        // The break is reported (old thread -> fresh thread), never a failure note or a "send again" note.
+        expect(sent.continuityBreaks).toEqual([expect.objectContaining({ previousProviderSessionId: "retained-provider-thread",
+          replacementProviderSessionId: "fresh-provider-thread" })]);
+        expect(restoreUnavailableNotice).not.toHaveBeenCalled();
+        expect(fixture.onLog).not.toHaveBeenCalledWith("stderr", expect.stringMatching(/send (it )?again|try again/i));
+      };
+
+      it("(S2) another run of the same agent updated its files; the person's next message is answered in the FIRST run on a fresh thread with its saved history", async () => {
+        const fixture = await chatFixture("s2", refreshRefusal("provider_contract_changed"));
+        const sent = await sendPersonMessage(fixture);
+        await expectAnsweredOnFreshThread(fixture, sent);
+        // The refusal is logged with its typed code (no secrets).
+        expect(fixture.onLog).toHaveBeenCalledWith("stderr",
+          expect.stringContaining("prepareRefusalCode=provider_contract_changed refreshWaitForTurn=false"));
+      });
+
+      it("(S1) after a person's Stop the warm session still shows the stopped turn: the run waits (bounded) for it to settle, then answers on a fresh thread", async () => {
+        const fixture = await chatFixture("s1", refreshRefusal("provider_active_turn", true), { activeProviderTurnId: "stopped-turn" });
+        const settledAt = Date.now() + 1_500;
+        const settle = setTimeout(() => { void fixture.boxState({ activeProviderTurnId: null }); }, 1_500);
+        try {
+          const sent = await sendPersonMessage(fixture);
+          await expectAnsweredOnFreshThread(fixture, sent);
+          // It waited for the stopped turn to settle, never rotated over it.
+          expect(Date.now()).toBeGreaterThanOrEqual(settledAt);
+          expect(fixture.onLog).toHaveBeenCalledWith("stderr",
+            expect.stringContaining("prepareRefusalCode=provider_active_turn refreshWaitForTurn=true"));
+        } finally { clearTimeout(settle); }
+      });
+
+      // Guards: the recover result is returned unchanged (today's named
+      // refusal, the run fails native_runner_refresh_required) and nothing is
+      // set aside whenever a fresh thread could lose or repeat work.
+      const recover = (fixture: ChatFixture, overrides: Record<string, unknown> = {}) =>
+        fixture.backend.recoverSession!(warmCheckpoint(fixture, overrides), { signal: new AbortController().signal });
+      const expectNamedRefusalKept = async (fixture: ChatFixture, result: unknown, code: string) => {
+        expect(result).toMatchObject({ recovered: false, failureClass: "provider_refresh_required", prepareRefusalCode: code });
+        expect(fixture.openSession).not.toHaveBeenCalled();
+        expect((await readdir(dirname(fixture.remoteSession))).some(name => name.includes(".continuity-break-"))).toBe(false);
+        expect(existsSync(join(fixture.root, "continuity-breaks"))).toBe(false);
+        expect(fixture.onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("fresh provider thread"));
+      };
+
+      it("guard: an ACTIVE turn that does not settle within the bound keeps the refusal (bounded wait, never rotates over a live turn)", async () => {
+        const previous = setNativeRefreshRotationWaitBoundMsForTests?.(1_500);
+        try {
+          const fixture = await chatFixture("bound", refreshRefusal("provider_active_turn", true), { activeProviderTurnId: "live-turn" });
+          const startedAt = Date.now();
+          const result = await recover(fixture);
+          expect(Date.now() - startedAt).toBeLessThan(10_000);
+          await expectNamedRefusalKept(fixture, result, "provider_active_turn");
+        } finally { if (previous !== undefined) setNativeRefreshRotationWaitBoundMsForTests?.(previous); }
+      });
+
+      it.each([
+        ["live descendant threads", "provider_live_descendants", { descendantThreadIds: ["child-thread"] }],
+        ["an active goal", "provider_active_goal", { goal: { status: "active", workingNow: false } }],
+        ["a pending tool call", "provider_contract_changed", { toolBridge: { pending: { "call-1": { callId: "call-1" } } } }],
+        ["a deferred Pi terminal", "provider_contract_changed", { piDeferredTerminal: { turnId: "turn-1" } }],
+        ["an ambiguous turn start", "provider_contract_changed", { ambiguousTurnStartPending: true }],
+      ])("guard: a warm box with %s keeps the refusal (nothing set aside)", async (_name, code, box) => {
+        const fixture = await chatFixture(`box-${code}-${Object.keys(box)[0]}`, refreshRefusal(code), box);
+        await expectNamedRefusalKept(fixture, await recover(fixture), code);
+      });
+
+      it.each([
+        ["a turn in flight", { activeTurnId: "turn-in-flight" }],
+        ["a pending runtime request", { pendingRuntimeRequests: [{ requestId: "request-1" }] }],
+        ["a semantic result", { semanticResult: { reportedWorkDisposition: "completed" } }],
+        ["terminal turns", { terminalTurns: [{ turnId: "turn-1", fingerprint: "f" }] }],
+        ["a governed wait", { governedWait: { sourceEvent: { turnId: "turn-1" } } }],
+        ["a goal", { goal: { status: "paused" } }],
+        ["a same-session-only policy", { providerRecoveryPolicy: "same_session_only" }],
+        ["a governed-wait replacement policy", { providerRecoveryPolicy: "allow_replacement_after_governed_wait" }],
+      ])("guard: a checkpoint with %s keeps the refusal (no run authority re-applied on a new thread)", async (_name, overrides) => {
+        const fixture = await chatFixture(`checkpoint-${Object.keys(overrides)[0]}`, refreshRefusal("provider_contract_changed"));
+        await expectNamedRefusalKept(fixture, await recover(fixture, overrides), "provider_contract_changed");
       });
     });
   });
