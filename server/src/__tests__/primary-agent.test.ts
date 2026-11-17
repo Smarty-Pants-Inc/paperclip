@@ -49,6 +49,33 @@ if (!support.supported) console.warn(`Primary agent database tests unavailable: 
   const get = (companyId: string, userId = "user-a") => primaryAgentService(db).get(companyId, userId);
   const url = (companyId: string) => `/api/companies/${companyId}/primary-agent/me`;
 
+  // Keep reason: trust boundary. This read must not disclose inactive users,
+  // other companies, or agents outside the viewer's authorization boundary.
+  it("lists only active company members' non-null primaries", async () => {
+    const c = await company(), elsewhere = await company();
+    const a = await create(c, "Paul's Smarty", "user-a");
+    await create(c, "Former member", "user-b");
+    await create(elsewhere, "Another company", "explicit");
+    await db.update(companyMemberships).set({ status: "suspended" }).where(and(
+      eq(companyMemberships.companyId, c), eq(companyMemberships.principalId, "user-b"),
+    ));
+    await db.insert(userCompanyPreferences).values({ companyId: c, userId: "not-a-member", primaryAgentId: a.id });
+    const response = await request(app(actor(c))).get(`/api/companies/${c}/primary-agents`).expect(200);
+    expect(response.body).toEqual([{ userId: "user-a", agentId: a.id }]);
+    expect(await primaryAgentService(db).get(c, "user-a")).toMatchObject({ primaryAgentId: a.id });
+  });
+
+  it("rejects primary directory reads from non-members, inactive members and agents", async () => {
+    const c = await company();
+    const path = `/api/companies/${c}/primary-agents`;
+    await request(app(actor(randomUUID()))).get(path).expect(403);
+    await request(app({ ...actor(c), memberships: [] })).get(path).expect(403);
+    await request(app({ ...actor(c), memberships: [{ companyId: c, status: "suspended", membershipRole: "admin" }] })).get(path).expect(403);
+    await request(app({ type: "agent", source: "agent_key", companyId: c, agentId: randomUUID() })).get(path).expect(403);
+    await request(app({ type: "board", source: "local_implicit", userId: "local-board", isInstanceAdmin: true }))
+      .get(`/api/companies/${randomUUID()}/primary-agents`).expect(404);
+  });
+
   it("automatically crowns the first human creation, ignoring provisioned and agent-authored creations", async () => {
     const c = await company();
     await create(c, "System"); await create(c, "Agent hire");
