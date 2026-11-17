@@ -2028,6 +2028,9 @@ export function createGovernedWaitEventObservation(
   resolvePending: () => Promise<PrpStructuredRunResult | null>,
 ) {
   const pendingTools = new Set<string>();
+  // The question's own tool item: open until (or past) the park by design,
+  // so it never blocks the wait it created.
+  const questionTools = new Set<string>();
   let providerLost = false;
   let generation = 0;
   let observation: {
@@ -2050,20 +2053,33 @@ export function createGovernedWaitEventObservation(
       // callback must not park the turn while a sibling still runs: that
       // sibling's callback would never get a result and the Runner's saved
       // state would keep it pending.
-      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution", "tool"].includes(String(kind));
-      if (event.itemId) {
-        if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
+      // Through runnerd (Boat), Codex-shaped tool items arrive only as
+      // tool.execution.* (runner-core provider_events.rs) and Pi tool items as
+      // item.* kind "tool_use"; both must count as open tools.
+      const execution = event.eventType.startsWith("tool.execution.");
+      const tool = execution || ["dynamicToolCall", "mcpToolCall", "commandExecution", "builtinToolCall", "tool", "tool_use"].includes(String(kind));
+      const itemId = event.itemId ?? (execution && typeof payload.executionId === "string" ? payload.executionId : undefined);
+      const item = record(payload.item);
+      const toolName = [payload.name, payload.toolName, payload.tool, item.name, item.tool].find(value => typeof value === "string");
+      if (itemId) {
+        if (tool && toolName === "request_human_input") {
+          questionTools.add(itemId);
+          pendingTools.delete(itemId);
+        } else if (tool && !questionTools.has(itemId) && (event.eventType === "item.started" || event.eventType === "tool.execution.started")) {
+          pendingTools.add(itemId);
+        }
         // Terminal error events can omit kind; the tracked ID owns cleanup.
-        if (event.eventType === "item.completed" || event.eventType === "item.failed") {
-          pendingTools.delete(event.itemId);
+        if (["item.completed", "item.failed", "tool.execution.completed"].includes(event.eventType)) {
+          pendingTools.delete(itemId);
         }
       }
-      // Usage/model messages can arrive while the tool creating the card is
-      // still awaiting its response. Parking then interrupts that in-flight
-      // response and cannot produce a durable suspension checkpoint.
-      if (event.eventType === "item.completed" && (
-        pendingTools.size > 0 || (!tool && !(kind === "agentMessage" && payload.channel === "final"))
-      )) return;
+      // Never park while a sibling tool is still open, whatever the trigger
+      // (a tool completion, a final message or a durable question fallback):
+      // the park cancels the provider and would cut that tool off. Usage/model
+      // messages can arrive while the tool creating the card is still awaiting
+      // its response; parking then cannot produce a durable checkpoint.
+      if (pendingTools.size > 0) return;
+      if (event.eventType === "item.completed" && !tool && !(kind === "agentMessage" && payload.channel === "final")) return;
       // A replacement question preserves human input after a provider crash;
       // it does not authorize a successful suspension of the failed execution.
       if (providerLost || !eligible) return;
@@ -12698,7 +12714,7 @@ async function executePaperclipNativeSessionAttempt(
         }
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         await controllerSteps.measure("plan_synchronization", () => recordPlanSynchronization(
@@ -12726,7 +12742,7 @@ async function executePaperclipNativeSessionAttempt(
         }));
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         const planSynchronization = await synchronizeCompletedProviderPlan({
