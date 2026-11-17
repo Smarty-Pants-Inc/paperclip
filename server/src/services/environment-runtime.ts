@@ -1180,6 +1180,18 @@ function reusableLeaseCanBeResumed(input: {
   return input.lease.status === "active" && input.heartbeatRunId !== null && input.lease.heartbeatRunId === input.heartbeatRunId;
 }
 
+/**
+ * A released or retained lease whose cleanup FAILED carries no stop or fence
+ * receipt: its box may still be live under its previous owner (the stop gate
+ * reads it as unreleased, agent-execution-stop.ts). A fresh run never resumes
+ * it: it stays a candidate only so obsolete-lease cleanup hands it to its
+ * custody-destroy or stop-only owner, and the fresh run gets a distinct box
+ * (rf-3 rf3-b135r6 F3: a fresh RUN must be a fresh BOX).
+ */
+function reusableLeaseCleanupUnsettled(lease: Pick<EnvironmentLease, "cleanupStatus">): boolean {
+  return lease.cleanupStatus === "failed";
+}
+
 const PREVIOUS_BOOT_TIP_TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 
 function reusableLeaseCanBeCleanedUp(lease: Pick<EnvironmentLease, "status" | "metadata">): boolean {
@@ -2110,7 +2122,7 @@ function createSandboxEnvironmentDriver(
             || await legacyShutdownWorkspaceResourceProtected(db, reusableCandidateLeases[index]!))
             reusableCandidateLeases.splice(index, 1);
         }
-        const reusableExistingLeases = reusableCandidateLeases.filter((lease) =>
+        const reusableExistingLeases = reusableCandidateLeases.filter((lease) => !reusableLeaseCleanupUnsettled(lease) &&
           reusableSandboxLeaseScopeMatches({
             lease,
             companyId: input.companyId,
@@ -2129,7 +2141,8 @@ function createSandboxEnvironmentDriver(
           }),
         );
         const compatible = await compatibleReusableSandboxLeases({
-          candidates: reusableCandidateLeases, exactMatches: reusableExistingLeases, fingerprints: leaseFingerprints,
+          candidates: reusableCandidateLeases.filter(lease => !reusableLeaseCleanupUnsettled(lease)),
+          exactMatches: reusableExistingLeases, fingerprints: leaseFingerprints,
           companyId: input.companyId, environmentId: input.environment.id, executionWorkspaceId: input.executionWorkspaceId,
           issueId: input.issueId, agentId: input.agentId, adapterType: input.adapterType, heartbeatRunId: input.heartbeatRunId,
           provider: parsed.config.provider, config: providerConfigForLease,

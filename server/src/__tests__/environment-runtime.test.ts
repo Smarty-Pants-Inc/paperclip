@@ -965,7 +965,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     let box=0,current=seeded.runId;
     const runtime=environmentRuntimeService(db,{pluginWorkerManager:{
       isRunning:()=>true,
-      getWorker:()=>({supportedMethods:["environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease"]}),
+      getWorker:()=>({supportedMethods:["environmentResumeLease","environmentReleaseLease","environmentStopLease","environmentDestroyLease","environmentInspectLease"]}),
       call:async (_plugin:string,method:string,params:Record<string,unknown>)=>{
         calls.push({method,providerLeaseId:params?.providerLeaseId ?? null,runId:current});
         if(method==="environmentAcquireLease") return {providerLeaseId:`fix12-box-${++box}`,metadata:{remoteCwd:"/workspace"}};
@@ -987,7 +987,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     const freshCalls=calls.filter(c=>c.runId===freshRunId);
     console.info(JSON.stringify({fix12Custody:{status,oldBox,freshBox:fresh.lease.providerLeaseId,freshCalls,
       previous:{status:previous!.status,cleanupStatus:previous!.cleanupStatus,failureReason:previous!.failureReason,providerLeaseId:previous!.providerLeaseId,
-        heartbeatRunId:previous!.heartbeatRunId,stopOnly:previous!.metadata?.stopOnlyCleanup ?? previous!.metadata?.pendingCleanupStopOnly ?? null}}}));
+        heartbeatRunId:previous!.heartbeatRunId,stopIntent:previous!.metadata?.sandboxStopAndRetain ?? null}}}));
     // Which box: a distinct allocation, never a resume of the unproven old box.
     expect(fresh.lease.providerLeaseId,"the fresh run gets a distinct box").not.toBe(oldBox);
     expect(freshCalls.filter(c=>c.method==="environmentResumeLease"&&c.providerLeaseId===oldBox),"the fresh run never resumes the old box").toEqual([]);
@@ -997,7 +997,10 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(previous!.heartbeatRunId,"the old lease row stays the predecessor's").toBe(seeded.runId);
     const stoppedOld=freshCalls.some(c=>["environmentStopLease","environmentDestroyLease"].includes(c.method)&&c.providerLeaseId===oldBox);
     if(!stoppedOld) expect(previous!.cleanupStatus,"no stop receipt: the old box keeps an unsettled cleanup owner").toBe("failed");
-    expect(["pending_cleanup","retained","released","expired"]).toContain(previous!.status);
+    // Its owner: the existing stop-only owner (sandbox-stop-and-retain.ts prepareStopAndRetain), whose
+    // pending-cleanup sweep stops exactly the old box until the provider confirms; never the fresh box.
+    expect(previous,"the old box is handed to the stop-only cleanup owner").toMatchObject({status:"pending_cleanup",failureReason:"sandbox_stop_pending"});
+    expect((previous!.metadata?.sandboxStopAndRetain as {providerLeaseId?:string}|undefined)?.providerLeaseId,"the stop targets only the old box").toBe(oldBox);
     expect(fresh.lease.id).not.toBe(previous!.id);
   },120_000);
 
