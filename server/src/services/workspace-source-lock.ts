@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { withDedicatedDbConnection, type Db } from "@paperclipai/db";
+import { runInDedicatedLockSession } from "@paperclipai/db/transaction-context";
 import { sql } from "drizzle-orm";
 import path from "node:path";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
@@ -127,7 +128,8 @@ export async function withWorkspaceSourceLocks<T>(db: Db,
     await acquire(held, !onlyProjectKeys || alreadyHasProject);
     return action(held.transaction);
   }
-  return withDedicatedDbConnection(db, connection => connection.transaction(async transaction => {
+  // The tx network guard's one exemption: this dedicated finalization-lock session (no row locks).
+  return withDedicatedDbConnection(db, connection => runInDedicatedLockSession(() => connection.transaction(async transaction => {
     const scope: SourceLockScope = { db, companyId: input.companyId, transaction, keys: new Set<string>(), active: true, wait };
     try {
       if (wait) {
@@ -140,7 +142,7 @@ export async function withWorkspaceSourceLocks<T>(db: Db,
     } finally {
       scope.active = false;
     }
-  }));
+  })));
 }
 
 export async function managedProjectSourceIdentity(companyId: string, cwd: string): Promise<string | null> {

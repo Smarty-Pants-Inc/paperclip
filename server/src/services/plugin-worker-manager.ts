@@ -1,3 +1,4 @@
+import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { isPluginWorkspaceReplay } from "./plugin-workspace-replay-context.js";
 import { withPluginInteractionOrigin } from "./plugin-interaction-context.js";
 import { pluginIdleManifestGeneration, type IdlePluginCatalogEntry } from "./plugin-idle-catalog.js";
@@ -4340,6 +4341,10 @@ export function createPluginWorkerManager(
       startupContextId?: string,
       observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
     ): Promise<HostToWorkerMethods[M][1]> {
+      // Provider client (every sandbox provider, Boat included): no provider RPC inside an open DB transaction.
+      if (method.startsWith("environment")) {
+        try { assertNoOpenTransaction(`provider:${method}`); } catch (error) { onWorkerSettled?.(); return Promise.reject(error); }
+      }
       const handle = workers.get(pluginId);
       if (!startupContextId && ["environmentReleaseLease", "environmentDestroyLease"].includes(method)) {
         const cleanup = (params as { leaseMetadata?: { runnerTaskStartupCleanup?: { contextId?: unknown; requiresPreparationStop?: unknown } } }).leaseMetadata?.runnerTaskStartupCleanup;

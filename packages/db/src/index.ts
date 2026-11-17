@@ -1,3 +1,4 @@
+export { assertNoOpenTransaction, holdsOpenTransaction } from "./transaction-context.js";
 export {
   createDb,
   withDedicatedDbConnection,

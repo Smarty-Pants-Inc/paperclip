@@ -1,3 +1,4 @@
+import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { environmentTaskOperationSchema } from "@paperclipai/plugin-sdk";
 import { and, eq } from "drizzle-orm";
 import { environmentLeases } from "@paperclipai/db";
@@ -546,6 +547,7 @@ export async function resolveEnvironmentExecutionTarget(input: {
             // provider never permits concurrent sync operations.
             allowConcurrentSyncOperations: effectiveCapabilities?.concurrentSyncOperations === true,
             execute: async (commandInput) => {
+              assertNoOpenTransaction("runner:execute");
               // Record true start and stop timestamps around the provider await,
               // so the exec span and the result carry a real wall time.
               const startedAtMs = Date.now();

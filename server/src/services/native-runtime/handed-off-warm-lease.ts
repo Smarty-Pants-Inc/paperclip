@@ -1,3 +1,4 @@
+import { assertNoOpenTransaction } from "@paperclipai/db/transaction-context";
 import { and, eq } from "drizzle-orm";
 import { environmentLeases, type Db, type heartbeatRuns } from "@paperclipai/db";
 import { admittedNativeResourceDisposition, nativeStopWorkspaceOutcome } from "./native-failed-workspace-recovery.js";
@@ -33,6 +34,8 @@ function handedOffWarmLease(run: Run, lease: typeof environmentLeases.$inferSele
  * (acknowledgedNativeStopExecutionHasStopped). */
 export async function handedOffWarmLeaseSettled(run: Run, lease: typeof environmentLeases.$inferSelect): Promise<boolean> {
   if (!handedOffWarmLease(run, lease)) return false;
+  // ad056b15's shape: the s3 fence's proof drives the Runner over the network.
+  assertNoOpenTransaction("runner:handedOffWarmOwnerRunnerExited");
   const { handedOffWarmOwnerRunnerExited } = await import("./native-session-executor.js");
   return handedOffWarmOwnerRunnerExited({ runId: run.id, providerLeaseId: lease.providerLeaseId });
 }
