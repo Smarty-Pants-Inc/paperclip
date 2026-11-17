@@ -2292,7 +2292,7 @@ function createSandboxEnvironmentDriver(
             // nothing lives solely on it; otherwise preserve it for the retry.
             replacementPlan = await reusableSandboxReplacementPlan({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
-              executionWorkspaceId: input.executionWorkspaceId, adapterType: input.adapterType, cause: error,
+              executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType, cause: error,
               providerCannotStart: idleStartWaitSpent,
             });
             if (!replacementPlan) {
