@@ -22,6 +22,8 @@ import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_COMPLETED_TURN_CLEANUP_MESSAGE,
 import { prepareCursorCloudRuntime } from "./cursor-cloud-runtime.js";
 import { LocalRuntimeApiListenerClosedError, resolveLocalRuntimeApiUrl } from "../../runtime-api.js";
 import { providerFailureFromError } from "../../vendor/paperclip-runner/index.js";
+import { runnerPrepareRefusalCode } from "../../vendor/paperclip-runner/index.js";
+import { deriveCommentId } from "../../modules/run-dispatch/domain/wake-context.js";
 import { readProviderFailure } from "@paperclipai/shared";
 import { nativeCancellationHasUnsettledOwner, notifyNativeCancellation, waitForNativeCancellation } from "./native-cancellation-delivery.js";
 import { readClaimedNativeStopRecovery } from "./native-cancellation-request.js";
@@ -16217,6 +16219,7 @@ export async function readRemoteRunnerStateFile(input: {
   missingExitCode?: number;
   recoveryDeadline?: number;
   stall?: RemoteRunnerPluginStall;
+  transferTimeoutMs?: number;
 }): Promise<Record<string, unknown>> {
   const { runner, remotePath } = input;
   const escapedPath = remotePath.replaceAll("'", "'\\''");
@@ -16293,7 +16296,11 @@ export async function readRemoteRunnerStateFile(input: {
     };
     let bytes: string;
     try {
-      bytes = (input.recoveryDeadline === undefined ? await transferAttempt()
+      bytes = (input.recoveryDeadline === undefined
+        ? await transferAttempt(input.transferTimeoutMs).then(attempt => {
+            if (attempt.timedOut) throw new Error(`runner_remote_state_unavailable: exit=null timedOut=true`);
+            return attempt;
+          })
         : await retryRemoteRunnerRecoveryAttempt({ stage: "runner_state", deadline: input.recoveryDeadline,
             readOnly: true, stall: input.stall, attempt: transferAttempt })).bytes;
     } catch (transferError) {
@@ -16355,11 +16362,14 @@ export async function readRemoteRunnerProviderState(input: {
   runner: CommandManagedRuntimeRunner;
   stateDirectory: string;
   execution: NativeExecutionInput;
+  /** Bounds the native sync-out transfer; unset keeps today's unbounded read. */
+  transferTimeoutMs?: number;
 }): Promise<Record<string, unknown>> {
   const statePath = posix.join(input.stateDirectory, runnerProviderStateFilename(input.execution));
   if (input.runner.syncOut) {
     try {
-      return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath, missingExitCode: 1 });
+      return await readRemoteRunnerStateFile({ runner: input.runner, remotePath: statePath, missingExitCode: 1,
+        transferTimeoutMs: input.transferTimeoutMs });
     } catch (error) {
       if (error instanceof Error && error.message.startsWith("runner_remote_state_unavailable:")) {
         throw new Error("runner_remote_provider_state_unavailable");
@@ -20115,8 +20125,27 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!["codex", "pi_rpc"].includes(input.execution.provider.kind) || remoteTarget?.transport !== "sandbox"
       || !remoteCommandRunner || !remoteStateDirectory || input.remoteWarmRecovery || input.restartRecovery
       || restoreUnavailableFreshThread || hasRetainedWarmTransitionEvidence(root)) return keep("not a fresh sandbox run");
+    // Paul's S2p (11-17): the turn parked on a question (request_human_input,
+    // a yielded response_wake), so the rebound checkpoint carries
+    // allow_replacement_after_governed_wait (nativeProviderRecoveryPolicy,
+    // native-session-resume.ts). This run consumes that wait: it carries the
+    // person's answer (interactionResponses) or the person's new message
+    // (its wake comment) that supersedes it. The predecessor is terminal: a
+    // checkpoint is rebound to this run only from a settled prior run (the
+    // durable rebind reads a completed run; the warm rebind only after the
+    // prior run settled). NSR replaces after a governed wait only through its
+    // governed-wait fresh start (provider_state_incompatible with the saved
+    // state unavailable to this run), which itself proves durably that this
+    // run did no provider work (never a replay) and requires the untouched
+    // rebind (cursor null/"0"); the old thread is set aside, never resumed.
+    const governedWaitConsumed = previous.providerRecoveryPolicy === "allow_replacement_after_governed_wait"
+      && previous.identity?.runId === input.execution.binding.runId
+      && (input.execution.interactionResponses.length > 0 || deriveCommentId(record(runContextSnapshot)) !== null);
+    if (governedWaitConsumed && !(previous.cursor == null || previous.cursor === "0")) {
+      return keep("the governed-wait checkpoint is not the untouched rebind (cursor progressed)");
+    }
     // NSR must take its own replacement for a plain not-recovered result.
-    if (previous.providerRecoveryPolicy !== "allow_replacement_after_resume_failure"
+    if ((previous.providerRecoveryPolicy !== "allow_replacement_after_resume_failure" && !governedWaitConsumed)
       || ("homeMode" in input.execution && input.execution.homeMode === "preconfigured")) return keep("checkpoint is not replaceable");
     if (previous.activeTurnId != null || (previous.pendingRuntimeRequests?.length ?? 0) > 0
       || previous.semanticResult != null || previous.terminal != null || (previous.terminalTurns?.length ?? 0) > 0
@@ -20127,9 +20156,18 @@ async function createRunnerdBackendWithinSessionClaim(
     const deadline = Date.now() + nativeRefreshRotationWaitBoundMs;
     for (;;) {
       let box: Record<string, unknown>;
+      // Every read is bounded by what is left of the wait bound, the native
+      // sync-out transfer included (an abandoned transfer is fenced).
+      const readBudget = deadline - Date.now();
+      if (readBudget <= 0 || signal?.aborted) return keep(`the warm session's state was not read within ${nativeRefreshRotationWaitBoundMs}ms`);
       try {
-        box = await readRemoteRunnerProviderState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory,
-          execution: input.execution });
+        let readTimer: ReturnType<typeof setTimeout> | undefined;
+        const read = readRemoteRunnerProviderState({ runner: remoteCommandRunner, stateDirectory: remoteStateDirectory,
+          execution: input.execution, transferTimeoutMs: readBudget });
+        read.catch(() => undefined);
+        box = await Promise.race([read, new Promise<never>((_resolve, reject) => {
+          readTimer = setTimeout(() => reject(new Error("runner_remote_provider_state_read_bound")), readBudget);
+        })]).finally(() => clearTimeout(readTimer));
       } catch { return keep("the warm session's state is unreadable"); }
       const goal = box.goal && typeof box.goal === "object" ? box.goal as Record<string, unknown> : null;
       const bridge = box.toolBridge && typeof box.toolBridge === "object" ? box.toolBridge as Record<string, unknown> : {};
@@ -20158,9 +20196,16 @@ async function createRunnerdBackendWithinSessionClaim(
     await input.trace?.record({ name: "provider.session.refresh_refusal_fresh_thread", startedAtMs: atMs, endedAtMs: atMs,
       attributes: { provider: remoteTarget.providerKey ?? "sandbox", harness: input.execution.session.driverKind,
         prepareRefusalCode: code, refreshWaitForTurn: waitForTurn } });
+    const { failureClass: _failureClass, prepareRefusalCode: _code, refreshWaitForTurn: _wait, ...rest } = refusal;
+    if (governedWaitConsumed) {
+      await input.onLog?.("stdout", "[paperclip-runner] continuing in a fresh provider thread: the warm session could not "
+        + `take this run (${code}). Continued on a fresh thread with your history.\n`);
+      // PROVIDER_STATE_INCOMPATIBLE (paperclip-runner contracts/harness-driver.ts).
+      return { ...rest, recovered: false, failureClass: "provider_state_incompatible", resumeStateUnavailable: true,
+        reason: `the warm session could not take this run (${code}); continued on a fresh thread with your history` } as unknown as T;
+    }
     await input.onLog?.("stdout", "[paperclip-runner] continuing in a fresh provider thread: the runner refused to refresh "
       + `the warm session (${code}); this run continues the conversation in a fresh provider thread with its saved history.\n`);
-    const { failureClass: _failureClass, prepareRefusalCode: _code, refreshWaitForTurn: _wait, ...rest } = refusal;
     return { ...rest, recovered: false, reason: `the runner refused to refresh the warm session (${code}); `
       + "the conversation continues in a fresh provider session with its saved history" } as unknown as T;
   };
@@ -20830,6 +20875,14 @@ async function createRunnerdBackendWithinSessionClaim(
         let session: NativeSession;
         try { session = await backend.openSession(sessionInput); }
         catch (error) {
+          const openRefusalCode = runnerPrepareRefusalCode(error);
+          if (openRefusalCode || (error as { code?: unknown } | null)?.code === "native_runner_refresh_required") {
+            const openWaitForTurn = (error as { waitForTurn?: unknown }).waitForTurn === true;
+            logger.warn({ runId: input.execution.binding.runId, prepareRefusalCode: openRefusalCode ?? "provider_prepare_refused",
+              refreshWaitForTurn: openWaitForTurn }, "native runner refused to open the session");
+            await input.onLog?.("stderr", "[paperclip-runner] the runner refused to open the session: "
+              + `prepareRefusalCode=${openRefusalCode ?? "provider_prepare_refused"} refreshWaitForTurn=${openWaitForTurn}\n`);
+          }
           // J3-22 member (a): a refused restore continues in this run on a
           // fresh thread. The runtime opens (not recovers) only when it loaded
           // no checkpoint of this run (NSR session === null), so no turn,
