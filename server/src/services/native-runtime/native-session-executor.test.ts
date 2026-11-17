@@ -8807,6 +8807,73 @@ describe("native governed waits", () => {
     // Once Pi reports the whole batch finished, the wait parks the turn.
     expect(await observe(event("item.completed", "pi-tool:sibling", piTool("read_task_files")))).toEqual(waitResult);
   });
+
+  it.each(["final message", "question fallback"] as const)(
+    "does not park a Boat Pi turn while a foreground sibling still runs (S2p-fg): %s",
+    async (trigger) => {
+      // Through runnerd (Boat), the Pi facade forwards tool items as Codex
+      // items: a tool's item.* carries kind "tool_use" and its execution
+      // arrives only as tool.execution.* (runner-core provider_events.rs).
+      const waitResult = nativeGovernedWaitResult({
+        interaction: { id: "interaction-boat", title: "Answer the question", summary: null },
+        completionContract: {
+          revision: "contract-v1",
+          objective: "Ask, then continue",
+          criteria: [{ id: "objective", requirement: "Get the answer" }],
+        },
+      });
+      const observation = createGovernedWaitEventObservation(async () => waitResult);
+      let seq = 0;
+      const event = (eventType: PrpEvent["eventType"], itemId: string, payload: Record<string, unknown>): PrpEvent => {
+        seq += 1;
+        return {
+          schema: "paperclip.prp.event.v1" as const, sourceInstanceId: "runnerd-boat", sourceEventId: `runnerd-boat:${seq}`,
+          sourceSeq: seq, sourceKind: "runner" as const, runId: "run-boat", normalizedSessionId: "session-boat",
+          turnId: "turn-boat", itemId, eventType, schemaVersion: 1, priority: 0 as const,
+          emittedAt: "2026-11-17T00:00:00.000Z", payload,
+        };
+      };
+      // The executor's eligibility (native-session-executor.ts observe call
+      // sites): a completion, or a materialized durable question fallback.
+      const observe = async (next: PrpEvent, fallback = false) => {
+        await observation.observe(next, ["item.completed", "tool.execution.completed"].includes(next.eventType) || fallback);
+        return observation.consume(next);
+      };
+      const item = (id: string, status: string) => ({ provider: "pi_rpc", itemId: id, kind: "tool_use", status, channel: "detail" });
+      const execution = (id: string, name: string, transport: string, status: string) => ({
+        schema: "paperclip.tool.execution.v1", executionId: id, transport, name, status });
+
+      expect(await observe(event("item.started", "pi-bash", item("pi-bash", "inProgress")))).toBeNull();
+      expect(await observe(event("item.started", "pi-question", item("pi-question", "inProgress")))).toBeNull();
+      expect(await observe(event("tool.execution.started", "pi-bash", execution("pi-bash", "sleep 120", "process", "running")))).toBeNull();
+      expect(await observe(event("tool.execution.started", "pi-question", execution("pi-question", "request_human_input", "dynamic", "running")))).toBeNull();
+      // The question card exists now (its Core callback ran); bash still runs.
+      const parkTrigger = trigger === "final message"
+        ? event("item.completed", "pi-message:block:0", { kind: "agentMessage", channel: "final", text: "I asked you." })
+        : event("runtime_request.expired", "pi-question", { reason: "durable_handoff", replayAllowed: false });
+      expect(await observe(parkTrigger, trigger === "question fallback")).toBeNull();
+      // (b) The person answers while the sibling still runs: still no park.
+      expect(await observe(event("tool.execution.completed", "pi-question", execution("pi-question", "request_human_input", "dynamic", "completed")))).toBeNull();
+      expect(await observe(event("item.completed", "pi-question", item("pi-question", "completed")))).toBeNull();
+      // The wait parks as soon as the last sibling completes.
+      expect(await observe(event("tool.execution.completed", "pi-bash", execution("pi-bash", "sleep 120", "process", "completed")))).toEqual(waitResult);
+
+      // Codex through runnerd reports tools only as tool.execution.*, and the
+      // question's own call can stay open until the park: it never blocks it.
+      const codex = createGovernedWaitEventObservation(async () => waitResult);
+      const codexObserve = async (next: PrpEvent, fallback = false) => {
+        await codex.observe(next, ["item.completed", "tool.execution.completed"].includes(next.eventType) || fallback);
+        return codex.consume(next);
+      };
+      expect(await codexObserve(event("tool.execution.started", "codex-bash", execution("codex-bash", "sleep 120", "process", "running")))).toBeNull();
+      expect(await codexObserve(event("tool.execution.started", "codex-question", execution("codex-question", "request_human_input", "dynamic", "running")))).toBeNull();
+      const codexTrigger = trigger === "final message"
+        ? event("item.completed", "codex-message", { kind: "agentMessage", channel: "final", text: "I asked you." })
+        : event("runtime_request.expired", "codex-question", { reason: "durable_handoff", replayAllowed: false });
+      expect(await codexObserve(codexTrigger, trigger === "question fallback")).toBeNull();
+      expect(await codexObserve(event("tool.execution.completed", "codex-bash", execution("codex-bash", "sleep 120", "process", "completed")))).toEqual(waitResult);
+    },
+  );
 });
 
 type LeaseCoordinator = {
