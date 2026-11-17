@@ -959,6 +959,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     // fam-retry2: an accept-held Retry is not a second Retry button; the card
     // keeps upstream's withheld Retry and says the hold's words.
     if (authority.canRetry && authority.admission !== "held") continue;
+    // fam-retry4: the card, the chat and the API render the authority's one
+    // accept-held state (no Retry button; the hold's words), before and after
+    // an accepted held click.
+    if (authority.admission === "held") presentation.retryAdmission = "held";
     // Judge R9: Paperclip is continuing by itself; the card says so in the
     // authority's words (the same words the transcript note carries).
     if (authority.reason === "automatic_recovery") {

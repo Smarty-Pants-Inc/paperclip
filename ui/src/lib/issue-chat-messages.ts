@@ -12,6 +12,7 @@ import type { Agent, IssueComment } from "@paperclipai/shared";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import { formatAssigneeUserLabel } from "./assignees";
 import { isOperatorInterruptedRun } from "./interrupt-handoff";
+import { heldConversationNoteBody } from "./held-conversation-note";
 import {
   buildIssueThreadInteractionSummary,
   shouldHideInteractionCard,
@@ -609,7 +610,8 @@ function createCommentMessage(args: {
     deletedByRunId: comment.deletedByRunId ?? null,
     sourceTrust: comment.sourceTrust ?? null,
   };
-  const contentText = comment.deletedAt ? "" : comment.body;
+  // A held-conversation note shows its condition; the live card gives the action.
+  const contentText = comment.deletedAt ? "" : heldConversationNoteBody(comment.body, comment.metadata);
 
   if (renderAsSystemNotice) {
     const message: ThreadSystemMessage = {

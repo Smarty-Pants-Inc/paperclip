@@ -36,8 +36,10 @@ const blockerAction: Record<string, string> = {
 };
 
 /** One ordinary interruption surface. Technical records remain in diagnostics. */
-export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, className, issueId, companyId, agentName, projectName, blockers }: {
+export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimistic, takingLonger, error, held, className, issueId, companyId, agentName, projectName, blockers }: {
   presentation: TaskInterruptionPresentation | null | undefined;
+  /** fam-retry4: the words of a Retry the server accepted and held. */
+  held?: string | null;
   companyId?: string;
   blockers?: IssueRelationIssueSummary[];
   canRetry: boolean;
@@ -58,7 +60,13 @@ export function ExecutionBlockerNotice({ presentation, canRetry, onRetry, optimi
   // (presentation.canRetry=false, e.g. a standing notice) as well as the
   // person's permission, and keeps the refusal's explanation visible: a
   // shown Retry on a connected task is accepted (doc/execution-semantics.md).
-  const retryShown = canRetry && presentation?.canRetry !== false;
+  // fam-retry4: the one Retry authority's accept-held state (a restore hold
+  // Paperclip can still release), before and after an accepted held click: the
+  // hold's words, no Retry button and no error; the chat renders the same.
+  const heldWords = held ?? (presentation?.retryAdmission === "held" ? presentation.retryWait?.message ?? null : null);
+  if (heldWords && !error && !optimistic && !takingLonger) return <div role="status" aria-label="Task status" data-testid="task-execution-held"
+    className={cn("text-sm text-muted-foreground", className)}>{heldWords}</div>;
+  const retryShown = canRetry && presentation?.canRetry !== false && presentation?.retryAdmission !== "held";
   const refusalNotice = presentation?.canRetry === false && presentation.notice
     ? <span data-testid="task-execution-notice">{presentation.notice.text}</span> : null;
   if (error && !optimistic && !takingLonger) return <div role="alert" className={cn("flex items-center justify-between gap-2 text-sm text-destructive", className)}><span className="min-w-0 flex-1">{describeError(error).body}{refusalNotice && <> {refusalNotice}</>}</span>{retryShown && <Button variant="outline" size="sm" onClick={onRetry} data-testid="task-execution-retry">Retry</Button>}</div>;

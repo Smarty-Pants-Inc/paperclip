@@ -109,6 +109,9 @@ const RECOVERING_TEXT = "Recovering your saved work; your message is kept and ru
     const card = await taskInterruptionPresentation(db, issue!);
     expect(card?.canRetry).toBe(false);
     expect(card?.retryWait?.message).toBe(RECOVERING_TEXT);
+    // fam-retry4: the card carries the one authority's accept-held state, which
+    // the card UI and the chat render alike (no Retry; the hold's words).
+    expect(card?.retryAdmission).toBe("held");
     expect(JSON.stringify(card)).not.toContain("could not be put back");
   }, 120_000);
 

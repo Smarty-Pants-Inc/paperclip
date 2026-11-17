@@ -167,6 +167,11 @@ export interface TaskInterruptionPresentation {
   state: "working" | "retry_scheduled" | "failed" | "waiting_for_user" | "resolved";
   nextRetryAt: string | null;
   canRetry: boolean;
+  /** fam-retry4: the one Retry authority's accept-held outcome (a restore hold
+   * Paperclip can still release). A Retry is accepted once and held; no Retry
+   * button is shown, only the hold's words (retryWait). The board card, the
+   * chat and the Retry API render this same state. */
+  retryAdmission?: "held";
   retryAction?: "move_forward";
   userAction: "approval" | "reconnect" | "assign_agent" | "choose_model" | "resume" | "budget" | "project_access"
     /** Board confirms that a previous server, which can no longer report, stopped its workspace copyback. */

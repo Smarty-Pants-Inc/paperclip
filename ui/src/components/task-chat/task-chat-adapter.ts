@@ -13,6 +13,7 @@ import { resolveCommentAttribution } from "@/lib/comment-attribution";
 import { resolveIssueChatHumanAuthor } from "@/lib/issue-chat-human-author";
 import type { CompanyUserProfile } from "@/lib/company-members";
 import type { TaskChatAuthorKind, TaskChatItem, TaskChatMessageItem } from "./task-chat-model";
+import { heldConversationNoteBody } from "@/lib/held-conversation-note";
 
 export interface TaskChatAdapterContext {
   agentMap?: Map<string, Agent>;
@@ -136,7 +137,8 @@ export function commentsToTaskChatItems(
         isCurrentUser: humanAuthor.isCurrentUser,
       } : {}),
       agent: effectiveAgentId(comment) ? ctx.agentMap?.get(effectiveAgentId(comment)!) ?? { id: effectiveAgentId(comment)! } : undefined,
-      text: comment.body,
+      // A held-conversation note shows its condition; the live card gives the action.
+      text: heldConversationNoteBody(comment.body, comment.metadata),
       origin: comment.origin ?? "comment",
       chatMessage: comment.metadata?.chatMessage,
       sourceChannel: kind === "human" ? comment.metadata?.sourceChannel : undefined,
