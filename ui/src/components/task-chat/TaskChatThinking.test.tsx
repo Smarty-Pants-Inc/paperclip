@@ -62,9 +62,12 @@ function chromeElements(block: HTMLElement) {
 }
 
 describe("inline reasoning is plain text in the turn", () => {
-  it.each([390, 1440])("renders all streamed thinking after a cut completion at a %spx host width", width => {
+  it.each([390, 1440].flatMap(width => [
+    { width, shape: "state.rs bytes", whole: "r".repeat(4354), body: "r".repeat(4096) },
+    { width, shape: "bounded_text ASCII", whole: "r".repeat(4354), body: "r".repeat(3988) },
+    { width, shape: "bounded_text multibyte", whole: "😀é" + "r".repeat(4348), body: "😀é" + "r".repeat(3986) },
+  ]))("renders all streamed thinking after a $shape completion at a $width px host width", ({ width, whole, body }) => {
     container.style.width = `${width}px`;
-    const whole = "r".repeat(4354);
     const parser = paperclipRunnerUIAdapter.createStdoutParser!();
     const parse = (eventType: string, text: string) => parser.parseLine(JSON.stringify({
       type: "paperclip.prp.event", event: { eventType, itemId: "r1", payload: {
@@ -72,7 +75,7 @@ describe("inline reasoning is plain text in the turn", () => {
       } },
     }), "2026-11-17T12:00:00.000Z");
     const entries = [...parse("item.delta", whole.slice(0, 2000)), ...parse("item.delta", whole.slice(2000)),
-      ...parse("item.completed", whole.slice(0, 4096) + "…[truncated]")];
+      ...parse("item.completed", body + "…[truncated]")];
     const item = transcriptToTaskChatItems(entries, { runId: "render-whole", running: false })
       .find(item => item.kind === "thinking")!;
     expect(item.kind).toBe("thinking");
