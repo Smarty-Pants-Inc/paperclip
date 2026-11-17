@@ -1,4 +1,5 @@
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
+import { readHttpErrorCode } from "../../../lib/http-error-code.js";
 import { readAiConnectionConfigurationFailure } from "../../../lib/ai-connection-configuration-failure.js";
 import type { LifecycleFailure } from "./ports.js";
 
@@ -36,6 +37,7 @@ const configurationFailures = new Set([
 export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error: unknown): boolean {
   const code = lifecycleFailureCode(error) ?? "";
   return ["verifying", "resuming"].includes(context.phase ?? "") && context.stage === "host"
+    && !isTransientLifecycleVerificationFailure(error)
     && (readAiConnectionConfigurationFailure(error) !== null || configurationFailures.has(code)
       || (context.verificationFailures ?? 0) >= 3);
 }
@@ -43,11 +45,19 @@ export function lifecycleVerificationNeedsRetry(context: LifecycleFailure, error
 export function lifecycleFailureCode(error: unknown): string | undefined {
   const selectionFailure = readAiConnectionConfigurationFailure(error);
   if (selectionFailure) return selectionFailure;
+  const detailCode = readHttpErrorCode(error);
+  if (detailCode === "native_probe_cleanup_pending") return detailCode;
   const candidate = error as { code?: unknown; cause?: { code?: unknown } } | null;
   const codes = [candidate?.code, candidate?.cause?.code];
   if (codes.includes(PLUGIN_RPC_ERROR_CODES.TIMEOUT)) return "PLUGIN_RPC_TIMEOUT";
   return codes.find((code): code is string =>
     typeof code === "string" && (Object.hasOwn(reasons, code) || transientCodes.has(code)));
+}
+
+/** Only positive environment evidence bypasses the fork's non-transient host fuse. */
+export function isTransientLifecycleVerificationFailure(error: unknown): boolean {
+  const code = lifecycleFailureCode(error);
+  return code === "test_environment_unavailable" || code === "native_probe_cleanup_pending";
 }
 
 export function lifecycleFailureMessage(context: LifecycleFailure, error: unknown): string {

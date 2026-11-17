@@ -90,6 +90,25 @@ describe("lifecycle failure diagnostics", () => {
     expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying" }, error)).toBe(false);
   });
 
+  it.each(["verifying", "resuming"] as const)("allowlists environment transients in %s even with an exhausted host budget", phase => {
+    const context = { stage: "host" as const, phase, verificationFailures: 3 };
+    for (const [error, code] of [
+      [{ code: "test_environment_unavailable" }, "test_environment_unavailable"],
+      [unprocessable("private detail", { code: "native_probe_cleanup_pending" }), "native_probe_cleanup_pending"],
+    ] as const) {
+      expect(lifecycleFailureCode(error)).toBe(code);
+      expect(lifecycleVerificationNeedsRetry(context, error)).toBe(false);
+      expect(lifecycleFailureMessage(context, error)).not.toMatch(/private|Automatic verification is paused/);
+    }
+    // Neither HTTP status nor provider message text proves a transient.
+    for (const error of [unprocessable("native_probe_cleanup_pending"),
+      unprocessable("private detail", { code: "other_failure" }),
+      { details: { code: "native_probe_cleanup_pending" } }, { code: "native_probe_cleanup_pending" },
+      new Error("test_environment_unavailable"), { code: "TEST_ENVIRONMENT_UNAVAILABLE" }]) {
+      expect(lifecycleVerificationNeedsRetry(context, error)).toBe(true);
+    }
+  });
+
   it.each(["ai_connection_required", "harness_auth_failed", "harness_model_unavailable", "harness_command_unavailable", "harness_cwd_invalid", "harness_probe_unexpected_output"])("waits for repair only for a host verification failure: %s", code => {
     const error = { code };
     expect(lifecycleVerificationNeedsRetry({ stage: "host", phase: "verifying" }, error)).toBe(true);

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, companyMemberships, createDb, applyPendingMigrations, closeRegisteredClients, type Db } from "@paperclipai/db";
+import { agents, companies, companyMemberships, environmentLeases, createDb, applyPendingMigrations, closeRegisteredClients, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../../__tests__/helpers/embedded-postgres.js";
@@ -13,6 +13,12 @@ import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 
 import { aiConnectionService } from "../../../services/ai-connections.js";
+import { unprocessable } from "../../../errors.js";
+import { agentHarnessVerificationService } from "../../../services/agent-harness-verification.js";
+import * as environmentTests from "../../../services/agent-environment-test.js";
+import * as aiConnections from "../../../services/ai-connections.js";
+import * as aiRuntime from "../../../services/ai-connection-runtime.js";
+import { reconcileRetainedAiCleanup, retainAiCredentialCleanup } from "../../../services/retained-ai-credential-cleanup.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_LIFECYCLE_VERIFICATION_RETRY_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -32,6 +38,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
   });
   afterEach(async () => {
     for (const worker of workers.splice(0)) await worker.stop();
+    vi.restoreAllMocks();
     // Retire only this test's synthetic records so later coordinator reads stay isolated.
     await db.update(agents).set({ lifecycleState: "terminated", status: "terminated" }).where(eq(agents.companyId, companyId));
   });
@@ -134,6 +141,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect(agent).toMatchObject({ lifecycleState: "verifying", status: "paused", lifecycleOperation: { retryRequired: true } });
     expect(agent.lifecycleOperation).not.toHaveProperty("retryAt");
     expect(agent.lifecycleOperation).not.toHaveProperty("leaseOwner");
+    expect(agent.lifecycleError).toContain("The execution test did not pass");
     expect(agent.lifecycleError).toContain("Automatic verification is paused");
     expect(agent.lifecycleError).not.toContain("private provider detail");
     await work.stop();
@@ -230,6 +238,170 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await due();
     expect(runHost).toHaveBeenCalledTimes(3);
     expect((await current(agent.id)).lifecycleOperation).toMatchObject({ verificationFailures: 3, retryRequired: true });
+  });
+
+  it.each(["verifying", "resuming"] as const)("automatically retries three transient %s failures without spending the host budget", async phase => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Transient verification", status: "paused",
+      lifecycleState: phase, lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const errors = [Object.assign(new Error("private environment detail"), { code: "test_environment_unavailable" }),
+      unprocessable("private cleanup detail", { code: "native_probe_cleanup_pending" }),
+      unprocessable("private cleanup detail", { code: "native_probe_cleanup_pending" })];
+    const runHost = vi.fn(async () => { throw errors.shift(); });
+    const work = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runHost, runPlugin: async () => "complete" });
+    workers.push(work);
+    const observations = [];
+    for (let failure = 0; failure < 3; failure++) {
+      const before = Date.now();
+      await work.process(agent.id);
+      const row = await current(agent.id);
+      observations.push({ before, after: Date.now(), operation: row.lifecycleOperation });
+      await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, agent.id));
+    }
+    // Preserve the base's actual third-failure park as evidence, before asserting GREEN.
+    console.info("TRANSIENT_RETRY_OBSERVATIONS", phase, JSON.stringify(observations));
+    expect(observations[2].operation).not.toHaveProperty("retryRequired");
+    for (const { before, after, operation } of observations) {
+      expect(operation?.verificationFailures ?? 0).toBe(0);
+      expect(Date.parse(operation!.retryAt!)).toBeGreaterThanOrEqual(before + 60_000);
+      expect(Date.parse(operation!.retryAt!)).toBeLessThanOrEqual(after + 60_000);
+    }
+    expect(runHost).toHaveBeenCalledTimes(3);
+  });
+
+  it("refuses a retained-cleanup retry before acquiring another probe box or lease", async () => {
+    const accountKey = randomUUID();
+    const scope = { companyId, accountKey };
+    const [agent] = await db.insert(agents).values({ companyId, name: "Cleanup-fenced verifier", adapterType: "opencode_local",
+      lifecycleState: "verifying", runtimeConfig: { aiConnection: { mode: "responsible_user", provider: "openrouter", method: "api_key" } },
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const [original] = await db.insert(environmentLeases).values({ companyId, provider: "fixture", providerLeaseId: "original-probe" }).returning();
+    let retire!: () => void, cleanupAllowed = false;
+    const retired = new Promise<void>(resolve => { retire = resolve; });
+    const cleanup = vi.fn(async () => {
+      if (!cleanupAllowed) throw new Error("Original cleanup still lacks proof");
+      await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date() })
+        .where(eq(environmentLeases.id, original.id));
+    });
+    retainAiCredentialCleanup({ scope, retired, cleanup });
+    const connectionService = aiConnections.aiConnectionService;
+    vi.spyOn(aiConnections, "aiConnectionService").mockImplementation(database => ({ ...connectionService(database),
+      select: async () => ({ connection: { credentialSecretRefs: [] }, grant: { id: accountKey, credentialSecretRefs: [] },
+        attribution: { grantId: accountKey, connectionId: accountKey } } as never),
+    }));
+    const allocate = vi.fn(async () => {
+      await db.insert(environmentLeases).values({ companyId, provider: "fixture", providerLeaseId: "next-probe" });
+      return { executionTarget: null, environmentName: null, fallbackChecks: [], release: async () => {} };
+    });
+    const tests = environmentTests.agentEnvironmentTestService;
+    vi.spyOn(environmentTests, "agentEnvironmentTestService").mockImplementation((database, manager) => ({ ...tests(database, manager),
+      resolveAdapterTestEnvironmentId: async () => null, resolveAdapterTestExecutionContext: allocate,
+      testManagedEnvironment: async () => ({ adapterType: "opencode_local", status: "pass", testedAt: new Date().toISOString(),
+        checks: [{ code: "opencode_hello_probe_passed", level: "info", message: "Fixture passed" }] }),
+    }));
+    // Outside this test's boundary: credentials and the remote provider. The
+    // verifier, retained owner/reconciliation and SQL lease observations are real.
+    vi.spyOn(aiRuntime, "withManagedAiProbe").mockImplementation(async (_db, input, probe) => probe({ config: input.config,
+      attribution: { grantId: accountKey, connectionId: accountKey } } as never));
+    const verify = () => agentHarnessVerificationService(db, {} as never).verify(agent);
+    try {
+      await expect(verify()).rejects.toMatchObject({ status: 422, details: { code: "native_probe_cleanup_pending" } });
+      expect(allocate).not.toHaveBeenCalled();
+      expect(await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId))).toHaveLength(1);
+      retire();
+      await reconcileRetainedAiCleanup(scope).catch(() => {});
+      await expect(verify()).rejects.toMatchObject({ status: 422, details: { code: "native_probe_cleanup_pending" } });
+      expect(allocate).not.toHaveBeenCalled();
+      expect((await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId))).map(row => row.id)).toEqual([original.id]);
+      cleanupAllowed = true;
+      await expect(verify()).resolves.toBe("complete");
+      expect(allocate).toHaveBeenCalledOnce();
+      const leases = await db.select().from(environmentLeases).where(eq(environmentLeases.companyId, companyId));
+      expect(leases).toHaveLength(2);
+      expect(leases.find(row => row.id === original.id)).toMatchObject({ status: "released", cleanupStatus: "success" });
+    } finally { cleanupAllowed = true; retire(); await reconcileRetainedAiCleanup(scope); }
+  });
+
+  it("does not park a transient when two earlier real failures already spent the budget", async () => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Mixed verification", status: "paused",
+      lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 2, verificationFailures: 2 } }).returning();
+    const work = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete",
+      runHost: async () => { throw unprocessable("private cleanup detail", { code: "native_probe_cleanup_pending" }); } });
+    workers.push(work);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleOperation).toMatchObject({ verificationFailures: 2, retryAt: expect.any(String) });
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("retryRequired");
+  });
+
+  it("shows one persistent-outage line only from ten minutes, survives restart and clears on ready", async () => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Persistent environment outage", status: "paused",
+      lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0 } }).returning();
+    const first = new Date();
+    let now = first;
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    const clockStore = { ...store,
+      claim: (id: string, owner: string) => store.claim(id, owner, now),
+      renew: (row: LifecycleAgent, owner: string) => store.renew(row, owner, now),
+      defer: (...args: Parameters<typeof store.defer>) => store.defer(args[0], args[1], args[2], now, args[4]),
+    };
+    const runHost = vi.fn(async (): Promise<"complete"> => { throw Object.assign(new Error("private environment detail"), { code: "test_environment_unavailable" }); });
+    const driver = { requiredPluginIds: async () => [], runPlugin: async () => "complete" as const, runHost };
+    let work = createLifecycleWorker(clockStore, driver, () => {}); workers.push(work);
+    for (let minute = 0; minute <= 11; minute++) {
+      if (minute === 4) {
+        await work.stop();
+        work = createLifecycleWorker(clockStore, driver, () => {}); workers.push(work);
+      }
+      now = new Date(first.getTime() + minute * 60_000);
+      await work.process(agent.id);
+      const row = await current(agent.id);
+      expect(row.lifecycleOperation).toMatchObject({ id: agent.lifecycleOperation!.id,
+        transientFailureSince: first.toISOString(), retryAt: new Date(now.getTime() + 60_000).toISOString() });
+      expect(row.lifecycleOperation).not.toHaveProperty("retryRequired");
+      expect(row.lifecycleError).toBe(minute < 10 ? null : "Waiting for its environment; retrying automatically");
+    }
+    runHost.mockResolvedValue("complete");
+    now = new Date(first.getTime() + 12 * 60_000);
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", lifecycleError: null });
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailureSince");
+  });
+
+  it.each([599_999, 600_000])("uses the first transient failure, not operation age, at the %s ms warning boundary", async elapsed => {
+    const store = createLifecycleStore(db, createAgentLifecycleEffects());
+    const now = new Date(), since = new Date(now.getTime() - elapsed).toISOString();
+    const [agent] = await db.insert(agents).values({ companyId, name: "Outage boundary", status: "paused",
+      lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 50,
+        transientFailureSince: since } }).returning();
+    const claimed = await store.claim(agent.id, "boundary", now);
+    expect(claimed).not.toBeNull();
+    await store.defer(claimed!, "boundary", "private environment detail", now, { transientFailure: true });
+    const row = await current(agent.id);
+    expect(row.lifecycleError).toBe(elapsed < 600_000 ? null : "Waiting for its environment; retrying automatically");
+    expect(row.lifecycleOperation).toMatchObject({ transientFailureSince: since, retryAt: new Date(now.getTime() + 60_000).toISOString() });
+  });
+
+  it("resets the continuous transient window on a non-transient failure and explicit Retry", async () => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "Interrupted outage", status: "paused",
+      lifecycleState: "verifying", lifecycleRequiredPluginIds: [],
+      lifecycleOperation: { id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 10,
+        transientFailureSince: new Date(Date.now() - 600_000).toISOString() } }).returning();
+    const runHost = vi.fn(async () => { throw Object.assign(new Error("private failure"), { code: "harness_test_failed" }); });
+    const work = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete", runHost }); workers.push(work);
+    await work.process(agent.id);
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailureSince");
+    expect((await current(agent.id)).lifecycleError).toContain("The execution test did not pass");
+    await createAgentLifecycle(db).retry(agent.id);
+    runHost.mockRejectedValue(Object.assign(new Error("private failure"), { code: "test_environment_unavailable" }));
+    await work.process(agent.id);
+    const failed = await current(agent.id);
+    expect(failed.lifecycleOperation?.transientFailureSince).toBeDefined();
+    expect(failed.lifecycleError).toBeNull();
+    await createAgentLifecycle(db).retry(agent.id);
+    expect((await current(agent.id)).lifecycleOperation).not.toHaveProperty("transientFailureSince");
   });
 
   // Keep reason: Image B-s4 905542b5 retried allocation errors without accounting.

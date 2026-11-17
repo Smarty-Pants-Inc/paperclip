@@ -451,9 +451,21 @@ The worker starts after a committed command.
 A periodic scan recovers work after a process stops.
 A database lease permits one active attempt for each agent.
 The worker renews that lease during external calls.
-Every host failure during verification or resume spends the operation's consecutive
+Host failures during verification or resume spend the operation's consecutive
 `verificationFailures` budget, including provider allocation failures before a test
-starts. Failed attempts use the shared bounded exponential backoff at the saved
+starts, except for positively identified transient environment failures:
+`test_environment_unavailable` and an HTTP error with detail code
+`native_probe_cleanup_pending`. These two failures preserve the counter and use the
+ordinary one-minute automatic retry. Lifecycle verification reconciles retained
+cleanup for the selected account before acquiring another test box or lease; no
+second probe starts until the original retirement and credential handoff complete.
+The operation records its first consecutive transient failure in
+`transientFailureSince`. Before ten minutes it shows no error line; from ten minutes
+it shows one line in `lifecycleError`: “Waiting for its environment; retrying
+automatically”. Retries continue. A non-transient result, successful host step,
+configuration repair or explicit Retry resets that timestamp, and readiness clears
+the line. This uses the existing retry deadline, not a new timer. Other failed attempts use
+the shared bounded exponential backoff at the saved
 `retryAt` (one minute, two minutes, four minutes, capped at five minutes); scans
 and direct claims both honor that deadline. Three consecutive failures park the
 operation with `retryRequired: true` and a fixed, secret-safe `lifecycleError`
