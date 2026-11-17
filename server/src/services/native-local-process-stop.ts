@@ -95,9 +95,10 @@ export async function recordNativeLocalProcessStopInTransaction(tx: Db, run: Par
   return recorded;
 }
 
-/** Only server-authored evidence counts. A later launch invalidates the receipt. */
-export async function hasNativeLocalProcessStop(db: Db, companyId: string, runId: string) {
-  const [event] = await db.select({ eventType: heartbeatRunEvents.eventType })
+/** Only server-authored evidence counts. A later launch invalidates the receipt.
+ * Admission can additionally require the stop to be newer than a failure. */
+export async function hasNativeLocalProcessStop(db: Db, companyId: string, runId: string, after?: Date) {
+  const [event] = await db.select({ eventType: heartbeatRunEvents.eventType, createdAt: heartbeatRunEvents.createdAt })
     .from(heartbeatRunEvents)
     .where(and(
       eq(heartbeatRunEvents.companyId, companyId),
@@ -107,7 +108,7 @@ export async function hasNativeLocalProcessStop(db: Db, companyId: string, runId
     ))
     .orderBy(desc(heartbeatRunEvents.seq))
     .limit(1);
-  return event?.eventType === LOCAL_PROCESS_STOPPED;
+  return event?.eventType === LOCAL_PROCESS_STOPPED && (!after || event.createdAt > after);
 }
 
 /**

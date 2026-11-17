@@ -4,7 +4,7 @@ import {
   issueComments, issueRecoveryActions, issueThreadInteractions, issues, nativeRunFinalizations, toolInvocations, type Db,
 } from "@paperclipai/db";
 import {
-  EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
+  EXECUTION_RECONCILIATION_CAUSES, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 import { readPositiveIntegerEnvironment } from "../cap-environment.js";
@@ -22,7 +22,7 @@ import { issueService } from "./issues.js";
 import { holdOwnsBlockedStatus } from "./recovery-hold-blocked-status.js";
 import { proveRunProcessGone } from "./run-process-owner.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
-import { abandonUnverifiedRemoteWorkspaceEpoch } from "./remote-workspace-epoch-abandonment.js";
+import { fenceSourceWorkspace } from "./remote-workspace-epoch-abandonment.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { readRunCancellation } from "./run-cancellation.js";
@@ -259,30 +259,6 @@ export function freshContinuationNote(input: { runId: string; unverified: string
 
 const USER_TEXT = "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work.";
 
-/** Abandons the source run's remote workspace epoch when it still owns it. */
-async function fenceSourceWorkspace(tx: Db, run: typeof heartbeatRuns.$inferSelect) {
-  const parsed = remoteWorkspaceRunReferenceSchema.safeParse(object(run.runnerProfileJson).remoteWorkspace);
-  if (!parsed.success || parsed.data.state !== "prepared") return null;
-  const reference = parsed.data;
-  const [workspace] = await tx.select({ metadata: executionWorkspaces.metadata }).from(executionWorkspaces).where(and(
-    eq(executionWorkspaces.companyId, run.companyId), eq(executionWorkspaces.id, reference.workspaceId)));
-  let authority;
-  try { authority = readRemoteWorkspaceAuthority(workspace?.metadata); } catch { return null; }
-  if (!authority?.location || authority.writerRunId !== run.id || authority.epoch !== reference.epoch) return null;
-  try {
-    const abandoned = await tx.transaction(savepoint => abandonUnverifiedRemoteWorkspaceEpoch(savepoint, {
-      companyId: run.companyId, workspaceId: reference.workspaceId, runId: run.id, epoch: authority.epoch,
-      snapshotId: authority.snapshotId, location: authority.location! }));
-    return { workspaceId: reference.workspaceId, abandonedEpoch: authority.epoch, epoch: abandoned.authority.epoch,
-      snapshotId: authority.snapshotId,
-      quarantine: { state: "retained_unapplied" as const, remoteCwd: authority.location.remoteCwd,
-        providerLeaseId: authority.location.providerLeaseId } };
-  } catch (error) {
-    if (error instanceof Error && error.message === "remote_workspace_authority_changed") return null;
-    throw error;
-  }
-}
-
 /**
  * The one distinction this module turns on: a real human gate versus system
  * uncertainty.
@@ -398,7 +374,11 @@ export async function readFreshContinuationSessionBoundary(db: Pick<Db, "select"
       eq(heartbeatRuns.runtimeMode, "native"),
       sql`${heartbeatRuns.id} <> ${run.id}`,
       sql`${heartbeatRuns.createdAt} < (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
-      sql`(${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})`,
+      // Fallback predates its successor; admission can also bind the decision
+      // to this already-created run. A later, unrelated settlement cannot rotate it.
+      sql`((${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}')::timestamptz <= (select created_at from ${heartbeatRuns} where id = ${run.id} and company_id = ${run.companyId})
+        or (${issueRecoveryActions.evidence}->>'continuationRunId' = ${run.id}
+          and ${issueRecoveryActions.evidence}#>>'{freshContinuation,trigger}' = 'successor_admission'))`,
     )).orderBy(desc(sql`${issueRecoveryActions.evidence}#>>'{freshContinuation,recordedAt}'`), desc(issueRecoveryActions.id)).limit(1);
   if (!record) return null;
   const { action, source } = record;

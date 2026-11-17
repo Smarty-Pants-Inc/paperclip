@@ -27,7 +27,8 @@ import { keyValueRow } from "./notice-format.js";
 import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
-import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
+import { isNativeContinuationRefusal, isRecoverableNativeSupervisionFailure } from "../native-continuation-refusal.js";
+import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -108,7 +109,7 @@ const SHOWN_CODES = new Set([
   "native_controller_recovery_missing_evidence", "native_controller_recovery_dependency_unavailable",
   "native_controller_recovery_unsupported", "native_controller_recovery_wait_authority_changed",
   "native_controller_recovery_metadata_too_large", "native_session_cleanup_quarantined",
-  "runner_process_termination_unconfirmed", "native_runner_warm_attachment_runner_exited",
+  "runner_process_termination_unconfirmed", REMOTE_RUNNER_SUPERVISION_EXHAUSTED, "native_runner_warm_attachment_runner_exited",
   "runner_state_identity_mismatch", "runner_harness_state_mismatch", "runner_state_directory_unsafe", "runner_state_too_large",
   "runner_durable_identity_too_large", "recovery_state_too_large", "unsafe_recovery_state",
   "native_runner_checkpoint_missing", "native_runner_checkpoint_binding_mismatch", "native_runner_checkpoint_invalid",
@@ -171,6 +172,11 @@ const NATIVE_PENDING_PHASES = ["result_persisted", "ready_for_assessment", "arbi
 /** The code for a run: the error's leading code token when it is a shown
  * code, else a specific errorCode, else the generic run code. */
 export function unansweredMessageCode(run: { status: string; error: string | null; errorCode: string | null }): string {
+  // Old releases saved the supervision outcome in either field, sometimes
+  // behind Notification's wrapper. Keep its named remedy at this consumer.
+  if ([run.error, run.errorCode].some(value => typeof value === "string" && isRecoverableNativeSupervisionFailure(value))) {
+    return REMOTE_RUNNER_SUPERVISION_EXHAUSTED;
+  }
   const token = /^(?:Error:\s*)?([a-z][a-z0-9_]{2,100})(?=$|[:;\s])/.exec(run.error?.trim() ?? "")?.[1];
   if (token && SHOWN_CODES.has(token)) return token;
   if (run.errorCode && !GENERIC_RUN_CODES.has(run.errorCode)) {
@@ -745,6 +751,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // its own (#20925): never the held-conversation "send a new message" note,
   // as isNativeContinuationRefusal already decides for its own patterns.
   const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
+  const supervisionUnconfirmed = code === REMOTE_RUNNER_SUPERVISION_EXHAUSTED && !held;
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
   const waiting = WAITING_KIND_CODES.has(code);
@@ -757,6 +764,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   const since = `${String(message.createdAt.getHours()).padStart(2, "0")}:${String(message.createdAt.getMinutes()).padStart(2, "0")}`;
   const body = settingUp ? `${pausedName} is still being set up (since ${since}). Your message is saved and will be answered as soon as it's ready.`
     : paused ? agentPausedText(pausedName) : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : supervisionUnconfirmed ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
     : code === UNANSWERED_MESSAGE_NO_RUN_CODE ? UNANSWERED_MESSAGE_NO_RUN_TEXT
@@ -769,6 +777,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
       nextAction: settingUp ? "No action is needed; your message is saved."
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : waiting ? "No action is needed; it will start by itself."
+        : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,

@@ -8,6 +8,7 @@ import {
   REMOTE_RUNNER_OBSERVATION_EXHAUSTED, REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION,
 } from "./native-session-executor.js";
 import { NativeProviderTerminalFailure } from "../../vendor/paperclip-runner/index.js";
+import { RemoteRunnerSupervisionExhaustedError, REMOTE_RUNNER_SUPERVISION_EXHAUSTED } from "./remote-runner-recovery-diagnostics.js";
 import { createSandboxRunnerSupervision, type SandboxRunnerSupervision } from "./sandbox-runner-retention.js";
 
 const ok = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: null, startedAt: "2026-11-17T00:00:00Z" };
@@ -61,6 +62,28 @@ afterEach(async () => {
 });
 
 describe("sandbox transition monitor", () => {
+  it.each(["direct", "cause", "saved", "serialized", "transport", "notification", "legacy_error_prefix"] as const)("row14 bounded supervision policy preserves the named terminal failure (%s)", form => {
+    const closed = new RemoteRunnerSupervisionExhaustedError(new Error("possibly ran"));
+    const transport = `runner_process_termination_unconfirmed: runnerd process supervision failed: ${closed.message}`;
+    const error = form === "direct" ? closed : form === "cause" ? new Error("transport closed", { cause: closed })
+      : form === "saved" ? new Error(closed.message) : form === "serialized" ? new Error(String(closed))
+        : form === "transport" ? new Error(transport) : form === "legacy_error_prefix" ? new Error(`Error: ${transport}`)
+        : new NativeProviderTerminalFailure("notification_transport_failed", false, `Notification transport failed closed: ${transport}`);
+    const code = nativeSessionFailureSourceCode(error);
+    expect(code).toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED);
+    expect(nativeSessionFailureDisposition(1, new Date(), code)).toEqual({ phase: "terminal_failure", failureCode: code, nextAttemptAt: null });
+  });
+
+  it("row14 persistent possibly-ran closes observation without confirming exit or launching another runner", async () => {
+    const raw = Object.assign(new Error("possibly ran"), { code: "boat_command_possibly_ran" });
+    const f = launch(() => { throw raw; });
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(f.outcome).toMatchObject({ kind: "rejected", error: { failureCode: REMOTE_RUNNER_SUPERVISION_EXHAUSTED } });
+    expect(f.handle.isExitConfirmed?.()).toBe(false);
+    expect(f.launches).toBe(1);
+    await f.completion;
+  });
+
   it.each([false, true])("preserves the one closed exhausted outcome through server failure policy (notification=%s)", notification => {
     const message = `${REMOTE_RUNNER_OBSERVATION_EXHAUSTED}: ${REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION}`;
     const error = notification
