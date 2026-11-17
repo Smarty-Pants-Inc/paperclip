@@ -579,6 +579,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   /**
+   * Retry on a person's queued run the dispatcher left untaken for the start
+   * bound (D157/D168). Every pass, the liveness redrive included
+   * (resumeQueuedRunsAfterDrain, retryRefused), already re-offered it to this
+   * same claim, so another re-poke changes nothing. Cancel exactly that run,
+   * only while it is still queued (the same compare-and-set a claim makes), so
+   * it can never start later; the caller then enqueues ONE fresh run for the
+   * person's message. Only the press whose cancel wins gets the run back.
+   */
+  async function cancelStuckQueuedRunForRetry(runId: string) {
+    const now = new Date();
+    const reason = "Replaced by Retry: this queued run never started";
+    const cancelled = await cancelRunIfStillQueued(runId, { finishedAt: now, error: reason,
+      errorCode: "person_queued_run_replaced" });
+    if (!cancelled) return null;
+    await setWakeupStatus(cancelled.wakeupRequestId, "cancelled", { finishedAt: now, error: reason });
+    await appendRunEvent(cancelled, { eventType: "lifecycle", stream: "system", level: "info", message: reason });
+    await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true });
+    return cancelled;
+  }
+
+  /**
    * A chat message accepted before the limit was reached must not be consumed
    * when dispatch then cancels its run at the limit. Releasing the outbox key
    * on its receipts (the run's own and any coalesced into it) makes the
@@ -6049,6 +6070,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     dispatchPendingNativeStatusWakeups,
     createNativeStatusWakeBatch,
     startNextQueuedRunForAgent,
+    cancelStuckQueuedRunForRetry,
     countRunningRunsForAgent,
     releaseClaimBackoffsForTask,
     releaseRunClaimedJustBeforeSuppression,

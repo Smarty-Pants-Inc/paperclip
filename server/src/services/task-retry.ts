@@ -724,3 +724,52 @@ export async function reconcileTaskChatRetryReceipts(db: Db, scope: { companyId?
     else await write(db);
   }
 }
+
+/**
+ * Retry on a person's queued run the card shows as a failed start (D157/D168).
+ * The dispatcher, re-poked by liveness on every pass with refused claims
+ * retried (queue.ts resumeQueuedRunsAfterDrain), already left that run untaken
+ * for the start bound, so a re-poke does nothing a Retry promises. Cancel the
+ * stuck run while it is still queued (it can never start later), then enqueue
+ * ONE fresh run carrying only the person's message(s) the stuck run carried:
+ * none of its retry ancestry or old wake context, so a hold bound to that run
+ * (its predecessor, its scheduled-retry reason) does not follow the message.
+ * Once: only the press whose cancel wins enqueues, and the fresh wake has a
+ * per-run idempotency key. A run that carried no person message is re-poked.
+ */
+export async function startPersonQueuedRunFresh(db: Db, heartbeat: {
+  cancelStuckQueuedRunForRetry(runId: string): Promise<typeof heartbeatRuns.$inferSelect | null>;
+  resumeQueuedRunsForAgent(companyId: string, agentId: string): Promise<unknown>;
+  wakeup(agentId: string, options: Record<string, unknown>): Promise<unknown>;
+}, input: { companyId: string; issueId: string; runId: string; actorId: string }) {
+  const [run] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.status, "queued")));
+  if (!run) return null;
+  const context = (run.contextSnapshot ?? {}) as Record<string, unknown>;
+  const carried = [...new Set([...(Array.isArray(context.wakeCommentIds) ? context.wakeCommentIds : []),
+    context.wakeCommentId, context.commentId].filter((id): id is string => typeof id === "string" && id.length > 0))];
+  const messages = carried.length ? await db.select({ id: issueComments.id, authorUserId: issueComments.authorUserId,
+    createdAt: issueComments.createdAt }).from(issueComments).where(and(eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId), inArray(issueComments.id, carried), isNull(issueComments.deletedAt),
+    isNull(issueComments.authorAgentId), sql`${issueComments.authorUserId} is not null`)).orderBy(issueComments.createdAt) : [];
+  if (!messages.length) {
+    await heartbeat.resumeQueuedRunsForAgent(input.companyId, run.agentId);
+    return null;
+  }
+  const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(run.id);
+  if (!cancelled) return null;
+  const ids = messages.map(message => message.id);
+  const latest = messages[messages.length - 1]!;
+  await heartbeat.wakeup(run.agentId, {
+    source: "on_demand",
+    triggerDetail: "manual",
+    reason: "issue_commented",
+    idempotencyKey: `task-retry-queued-start:${run.id}`,
+    requestedByActorType: "user",
+    requestedByActorId: latest.authorUserId ?? input.actorId,
+    payload: { issueId: input.issueId, commentId: latest.id, replacedQueuedRunId: run.id },
+    contextSnapshot: { issueId: input.issueId, taskKey: input.issueId, commentId: latest.id, wakeCommentId: latest.id,
+      wakeCommentIds: ids, source: "issue.comment", wakeReason: "issue_commented", replacedQueuedRunId: run.id },
+  });
+  return cancelled;
+}

@@ -4780,6 +4780,8 @@ export function heartbeatService(
 
     resumeFreshQueuedRunsAtStartup,
 
+    cancelStuckQueuedRunForRetry: (runId: string) => heartbeatQueue.cancelStuckQueuedRunForRetry(runId),
+
     resumeQueuedRunsForAgent: async (companyId: string, agentId: string) => {
       const agent = await getAgent(agentId);
       if (!agent || agent.companyId !== companyId) return [];

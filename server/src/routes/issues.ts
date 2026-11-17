@@ -10448,10 +10448,16 @@ export function issueRoutes(
         runId: scheduledRetry.scheduledRetry?.runId ?? scheduledRetryRunId ?? null,
         details: { outcome: scheduledRetry.outcome, message: scheduledRetry.message, source: "task_retry" } });
     }
-    // Retry on a person's queued run that never started starts it now (D157/D168).
+    // Retry on a person's queued run that never started (D157/D168). The
+    // dispatcher, re-poked by liveness every pass, already left it untaken, so a
+    // re-poke is no Retry. Cancel that run (never to start later) and enqueue ONE
+    // fresh run carrying only the person's message, nothing of the old run's work.
     const startQueuedRunId = "startQueuedRunId" in receipt ? receipt.startQueuedRunId : undefined;
-    if (startQueuedRunId && issue.assigneeAgentId)
-      await heartbeat.resumeQueuedRunsForAgent(issue.companyId, issue.assigneeAgentId);
+    if (startQueuedRunId) {
+      const { startPersonQueuedRunFresh } = await import("../services/task-retry.js");
+      await startPersonQueuedRunFresh(db, heartbeat, { companyId: issue.companyId, issueId: issue.id,
+        runId: startQueuedRunId, actorId: getActorInfo(req).actorId });
+    }
     const chatActionId = "chatActionId" in receipt ? receipt.chatActionId : undefined;
     const finalizeRunId = "finalizeRunId" in receipt ? receipt.finalizeRunId : undefined;
     // Admit a plain Retry before answering, so the answer never reports as
