@@ -3,6 +3,7 @@ import { agentFileHoldWriteCondition, pinLeaseForCollection, unpinLeaseForCollec
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { randomUUID } from "node:crypto";
 import { and, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import { agents, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies as copies, withDedicatedDbConnection, type Db } from "@paperclipai/db";
 import { syncDirectoryToSsh, restoreWorkspaceFromSshExecution } from "@paperclipai/adapter-utils/ssh";
@@ -47,6 +48,15 @@ export function agentFileSaveHeld(row: Pick<Copy, "state" | "receipt"> | null | 
 function settled(row: Copy): boolean {
   return completed.has(row.state) || row.state === "unavailable" && !agentFileSaveHeld(row);
 }
+/** Row 23i: bound of the one unchanged-content observation (the remote probe
+ * itself is 10 s; its program stops at 5 s). Far inside the retention window. */
+export const AGENT_FILE_UNCHANGED_OBSERVATION_TIMEOUT_MS = 15_000;
+/** The stopped-collection worker's awaitingStop text (agent-instruction-working-copies.ts). */
+const AWAITING_STOP_MESSAGE = "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.";
+/** Row 23l: why a worker-flipped copy was written back to warm_saved. */
+export const STOP_FLIP_RESTORE_REASON = "proven_unchanged_after_stop_unconfirmed_flip";
+export type AgentFileStopFlipRestore = { reason: typeof STOP_FLIP_RESTORE_REASON; proofId: string; baselineHash: string;
+  flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED"; observedDigest: string; materializationIdentity: string; provenAt: string };
 const SAVE_RETRY_MS = 30_000;
 const SAVE_MAX_RETRY_MS = 6 * 60 * 60_000;
 function saveRetryAt(since: Date, now = Date.now()) {
@@ -357,6 +367,51 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const unchanged = await patch(row, { state: "unchanged_turn", nextAttemptAt: null });
       return unchanged.state !== "unchanged_turn" || Boolean(unchanged.receipt?.retainedByRunId) || Boolean(unchanged.processStoppedAt);
     } catch { return true; }
+  }
+  /** Gate A (row 23): after a person's Stop, a warm checkpoint can fail to land
+   * only because the stopped-collection worker flipped this never-written copy
+   * (pending_collection / INSTRUCTION_STOP_UNCONFIRMED) first. Hash the copy's
+   * ACTUAL current content where it lives: equal to its baseline means nothing
+   * to collect, so it does not block retention. One bounded observation, outside
+   * any transaction (not under serial's lock session); any doubt, failure or
+   * timeout is CHANGED. Only the worker's own flip is restored, by CAS, to the
+   * unchanged warm receipt the checkpoint would have written, so the next turn
+   * can reuse the same warm directory. Never a save of changed bytes. */
+  async function unchangedSinceBaseline(row: Copy, target?: AdapterExecutionTarget | null, timeoutMs = AGENT_FILE_UNCHANGED_OBSERVATION_TIMEOUT_MS): Promise<Copy | null> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      if (row.receipt?.warm !== true || row.receipt?.retainedByRunId || row.receipt?.retirementRequired || agentFileSaveHeld(row)
+        || row.processStoppedAt || typeof row.receipt?.materializationIdentity !== "string") return null;
+      const workerFlip = row.state === "pending_collection" && row.errorCode === "INSTRUCTION_STOP_UNCONFIRMED"
+        && row.errorMessage === AWAITING_STOP_MESSAGE;
+      // Every other failed checkpoint (lost ownership, conflict refresh, rejected
+      // save, no collector) keeps today's refusal: only the worker's flip races.
+      if (!workerFlip || !await owns(row)) return null;
+      const expected = agentDirectoryBaselineDigest(baseline(row));
+      const observed = await Promise.race([
+        observe(row, target ?? transports.get(key(row))?.target),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Agent directory observation timed out")), timeoutMs); }),
+      ]);
+      if (observed.identity !== row.receipt.materializationIdentity || observed.digest !== expected) return null;
+      // 23k: ONE short CAS transaction (tryPatch), no network inside it, guarded
+      // on the worker's flip and on the SAME row the hash was proven against:
+      // its baseline (baseHash), its materialization, and its last write
+      // (updatedAt, as the worker's own claim). Anything else writes nothing.
+      // 23l: the restore carries its audit record; only our own proof counts.
+      const proof: AgentFileStopFlipRestore = { reason: STOP_FLIP_RESTORE_REASON, proofId: randomUUID(), baselineHash: row.baseHash,
+        flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED", observedDigest: observed.digest, materializationIdentity: observed.identity, provenAt: new Date().toISOString() };
+      const restored = await patch(row, { state: "warm_saved", errorCode: null, errorMessage: null, nextAttemptAt: null, attempts: 0,
+        receipt: { ...row.receipt, checkpointState: "unchanged", stopFlipRestore: proof } },
+      and(eq(copies.state, "pending_collection"), eq(copies.errorCode, "INSTRUCTION_STOP_UNCONFIRMED"), eq(copies.baseHash, row.baseHash),
+        isNull(copies.processStoppedAt), sql`NOT (coalesce(${copies.receipt}, '{}'::jsonb) ? 'savePending')`,
+        sql`${copies.receipt}->>'materializationIdentity' = ${row.receipt.materializationIdentity}`,
+        sql`date_trunc('milliseconds', ${copies.updatedAt}) = ${row.updatedAt.toISOString()}::timestamptz`));
+      const applied = (restored.receipt?.stopFlipRestore as AgentFileStopFlipRestore | undefined)?.proofId === proof.proofId;
+      return applied && restored.state === "warm_saved" && restored.errorCode === null && restored.baseHash === row.baseHash ? restored : null;
+    } catch (error) {
+      logger.warn({ err: error, runId: row.runId }, "Agent directory unchanged observation failed; counted as changed");
+      return null;
+    } finally { if (timer) clearTimeout(timer); }
   }
   /** Rebind one physical materialization; earlier runs lose collection authority. */
   async function adopt(input: { companyId: string; agentId: string; runId: string; previousRunId: string; target?: AdapterExecutionTarget | null; cwd: string; allowRetirementHandoff?: boolean }) {
@@ -844,7 +899,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       return text;
     }, "agent_directory_prepare");
   }
-  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, adopt, canReuse, recoverUnavailable, claimConflictNotice,
+  return { prepare: (input: Parameters<typeof prepareCopy>[0]) => prepareCopy(input), hasChanges, unchangedSinceBaseline, adopt, canReuse, recoverUnavailable, claimConflictNotice,
     /** Exact-allocation destruction proof (the only loss that ends a hold without a save). */
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),

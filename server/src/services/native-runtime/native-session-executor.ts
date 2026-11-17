@@ -754,6 +754,9 @@ export type NativeInstructionWorkingCopy = {
   preparationKey?: string;
   root?: string;
   checkpointWarm?: () => Promise<boolean>;
+  /** Row 23: true only when the copy's actual current content equals its
+   * baseline (one bounded observation; failure = changed). */
+  unchangedSinceBaseline?: () => Promise<boolean>;
   hasChanges: () => Promise<boolean>;
   collectStopped: () => Promise<void>;
   retirementFailed?: () => Promise<void>;
@@ -13582,7 +13585,12 @@ async function executePaperclipNativeSessionAttempt(
               const snapshot = await session.snapshot({ signal });
               signal.throwIfAborted();
               const copy = input.instructionWorkingCopy;
-              if (copy && (copy.checkpointWarm ? !await copy.checkpointWarm() : await copy.hasChanges())) return false;
+              // Gate A: a checkpoint lost to the stopped-collection worker's flip
+              // of an unwritten copy is not a change. Only an observed content
+              // hash equal to the baseline overrides it; anything else refuses.
+              if (copy && (copy.checkpointWarm
+                ? !await copy.checkpointWarm() && !await copy.unchangedSinceBaseline?.()
+                : await copy.hasChanges())) return false;
               signal.throwIfAborted();
               const owner = warmNativeSessions.get(warmSessionId);
               cancelledSessionRetained = snapshot.identity.runId === input.execution.binding.runId

@@ -36,6 +36,7 @@ import { createReusableLeaseHandoff } from "../services/environment-lease-handof
 import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
 import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "../services/agent-file-save-hold.js";
 import * as checkpointsModule from "../services/agent-file-checkpoints.js";
+import * as probeModule from "../services/agent-directory-probe.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { HttpError } from "../errors.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -1985,6 +1986,181 @@ describe("persistent agent directories", () => {
     expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(true);
     expect(lifecycle.getInstructionSave()).toMatchObject({ state: "unchanged", errorCode: null });
     expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+  });
+  describe("gate A (row 23): a person's Stop of a warm turn races the stopped-collection worker", () => {
+    // c2ebc3ab field by field: a warm 'prepared' copy (no checkpoint yet), the
+    // run row already 'cancelled' (58.274) before retention, no stop evidence
+    // (the warm provider is deliberately alive), and the worker's pass landing
+    // inside the retention checkpoint (59.679, 4 ms before the close).
+    async function stoppedTurnWithWorkerPass(write?: (localRoot: string) => Promise<void>) {
+      const copy = await run({ warm: true });
+      expect(copy).toMatchObject({ state: "prepared", errorCode: null, processStoppedAt: null });
+      expect(typeof copy.receipt?.materializationIdentity).toBe("string");
+      const events = vi.fn(async (..._args: unknown[]) => {});
+      const lifecycle = await heartbeatCopy(copy, events);
+      if (write) await write(copy.localRoot);
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), runtimeMode: "native" }).where(eq(heartbeatRuns.id, copy.runId));
+      const capture = checkpointsModule.captureAgentFileCheckpoint;
+      let workerFlip: unknown = null;
+      const spy = vi.spyOn(checkpointsModule, "captureAgentFileCheckpoint").mockImplementation(async (...args) => {
+        if (!workerFlip) {
+          await copies.recoverStopped();
+          workerFlip = await copies.get(companyId, copy.runId);
+        }
+        return capture(...args);
+      });
+      const native = lifecycle.nativeInstructionWorkingCopy()!;
+      let checkpointed: boolean;
+      try { checkpointed = await native.checkpointWarm!(); } finally { spy.mockRestore(); }
+      const saves = () => events.mock.calls.filter(call => (call[1] as { eventType?: string }).eventType === "instruction_save")
+        .map(call => (call[1] as { payload: Record<string, unknown> }).payload);
+      return { copy, lifecycle, native, checkpointed: checkpointed!, workerFlip, saves, events };
+    }
+    it("RED c2ebc3ab: a no-write turn's copy flipped to pending_collection does not refuse retention; the next turn reuses the same warm directory", async () => {
+      const f = await stoppedTurnWithWorkerPass();
+      // Base, field-matched to seq 260: the worker flipped the unwritten copy and
+      // the retention checkpoint returned it, so checkpointWarm said false.
+      expect(f.workerFlip).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED",
+        errorMessage: "The provider's stop has not been confirmed. Instruction collection is pending; no save is claimed.", processStoppedAt: null });
+      expect(f.checkpointed).toBe(false);
+      expect(f.saves()).toEqual([expect.objectContaining({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED", contract: "agent_files" })]);
+      // Head: the copy's actual content equals its baseline, so retention is not refused.
+      const started = performance.now();
+      expect(await f.native.unchangedSinceBaseline?.()).toBe(true);
+      const observedMs = Math.round(performance.now() - started);
+      expect(observedMs).toBeLessThan(15_000); // 23i: inside the stated bound
+      if (process.env.GATEA_MEASURE_FILE) await fs.appendFile(process.env.GATEA_MEASURE_FILE, `unchangedSinceBaseline_ms=${observedMs}\n`);
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "warm_saved", errorCode: null, errorMessage: null,
+        processStoppedAt: null, nextAttemptAt: null, baseHash: f.copy.baseHash, receipt: { checkpointState: "unchanged" } });
+      expect(f.saves().at(-1)).toMatchObject({ state: "unchanged", errorCode: null });
+      // 23l: the write-back is never silent. The row and the instruction_save event
+      // both say why, with the baseline the content was proven against.
+      const restoredRow = (await copies.get(companyId, f.copy.runId))!;
+      const proof = restoredRow.receipt?.stopFlipRestore as Record<string, unknown>;
+      expect(proof).toMatchObject({ reason: "proven_unchanged_after_stop_unconfirmed_flip", baselineHash: f.copy.baseHash,
+        flippedErrorCode: "INSTRUCTION_STOP_UNCONFIRMED", materializationIdentity: f.copy.receipt?.materializationIdentity });
+      expect(f.saves()).toHaveLength(2);
+      expect(f.saves()[1]).toMatchObject({ state: "unchanged", reason: "proven_unchanged_after_stop_unconfirmed_flip", baselineHash: f.copy.baseHash,
+        proofId: proof.proofId, restoredFrom: { state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED" } });
+      expect(f.events.mock.calls.at(-1)?.[1]).toMatchObject({ eventType: "instruction_save", level: "info",
+        message: expect.stringContaining(`proven unchanged against baseline ${f.copy.baseHash} after the stopped-collection worker's INSTRUCTION_STOP_UNCONFIRMED flip`) });
+      // Nothing was saved: no canonical change and no stopped collection.
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+      // 23n: the worker's later pass over the restored copy is a no-op: no flip
+      // back, no bytes, no duplicate event; a repeated check writes nothing.
+      const localBefore = await fs.readFile(path.join(f.copy.localRoot, entryFile), "utf8");
+      await copies.recoverStopped();
+      await copies.recoverStopped();
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "warm_saved", errorCode: null, errorMessage: null, processStoppedAt: null,
+        baseHash: f.copy.baseHash, candidateHash: restoredRow.candidateHash, attempts: 0, receipt: { checkpointState: "unchanged", stopFlipRestore: { proofId: proof.proofId } } });
+      expect(await f.native.unchangedSinceBaseline?.()).toBe(false);
+      expect((await copies.get(companyId, f.copy.runId))!.receipt?.stopFlipRestore).toEqual(proof);
+      expect(f.saves()).toHaveLength(2);
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+      expect(await fs.readFile(path.join(f.copy.localRoot, entryFile), "utf8")).toBe(localBefore);
+      // The next message reuses the same warm directory (same owner tree).
+      expect(await copies.canReuseWarm(companyId, agentId, f.copy.runId)).toBe(true);
+      const next = await run({ warm: true, reuseRunId: f.copy.runId });
+      expect(next.localRoot).toBe(f.copy.localRoot);
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: next.runId } });
+      // A later worker pass over the superseded predecessor is a no-op.
+      await copies.recoverStopped();
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "superseded" });
+      await copies.collectStopped({ companyId, runId: next.runId });
+    }, 60_000);
+    it("NEVER-OK 23c: a real unsaved edit under the same race still refuses retention and is saved by stopped collection", async () => {
+      const f = await stoppedTurnWithWorkerPass(localRoot => fs.writeFile(path.join(localRoot, "unsaved-edit.md"), "a real instruction edit"));
+      expect(f.workerFlip).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED" });
+      expect(f.checkpointed).toBe(false);
+      expect(await f.native.unchangedSinceBaseline?.()).toBe(false);
+      // Held exactly as at base: untouched by the unchanged check.
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED", processStoppedAt: null });
+      expect(f.saves()).toHaveLength(1);
+      // The refused retention closes the session; its stopped collection saves the edit.
+      await f.native.collectStopped();
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "saved" });
+      expect(await fs.readFile(path.join(root, "unsaved-edit.md"), "utf8")).toBe("a real instruction edit");
+    }, 60_000);
+    // 23m: the hash is proven outside the transaction; the write-back is a CAS on
+    // the row it was proven against. A change between the hash and the CAS writes nothing.
+    async function raceDuringObservation(f: Awaited<ReturnType<typeof stoppedTurnWithWorkerPass>>, between: () => Promise<void>) {
+      const observeReal = probeModule.observeLocalAgentDirectory;
+      const probe = vi.spyOn(probeModule, "observeLocalAgentDirectory").mockImplementationOnce(async (...args) => {
+        const observed = await observeReal(...args);
+        await between();
+        return observed;
+      });
+      try { return await f.native.unchangedSinceBaseline?.(); } finally { probe.mockRestore(); }
+    }
+    it("23m: an edit that lands (and is checkpointed) between the hash and the write-back gets no write-back; the check refuses", async () => {
+      const f = await stoppedTurnWithWorkerPass();
+      expect(await raceDuringObservation(f, async () => {
+        await fs.writeFile(path.join(f.copy.localRoot, "late-edit.md"), "landed after the hash");
+        await copies.checkpointWarm({ companyId, runId: f.copy.runId });
+      })).toBe(false);
+      const row = (await copies.get(companyId, f.copy.runId))!;
+      // The edit's own checkpoint advanced the baseline; the stale proof wrote nothing.
+      expect(row.baseHash).not.toBe(f.copy.baseHash);
+      expect(row.receipt?.checkpointState).toBe("saved");
+      expect(row.receipt?.stopFlipRestore).toBeUndefined();
+      expect(await fs.readFile(path.join(root, "late-edit.md"), "utf8")).toBe("landed after the hash");
+      expect(f.saves()).toHaveLength(1);
+      expect(f.saves().some(save => save.reason !== undefined)).toBe(false);
+    }, 60_000);
+    it("23m: a baseline change between the hash and the write-back gets no write-back", async () => {
+      const rebased = await stoppedTurnWithWorkerPass();
+      expect(await raceDuringObservation(rebased, async () => {
+        await db.update(agentInstructionWorkingCopies).set({ baseHash: "f".repeat(64), updatedAt: new Date() })
+          .where(eq(agentInstructionWorkingCopies.runId, rebased.copy.runId));
+      })).toBe(false);
+      expect(await copies.get(companyId, rebased.copy.runId)).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED", baseHash: "f".repeat(64) });
+      expect((await copies.get(companyId, rebased.copy.runId))!.receipt?.stopFlipRestore).toBeUndefined();
+      expect(rebased.saves()).toHaveLength(1);
+    }, 60_000);
+    it("23m: a newer write to the flipped row (same state, code and baseline) between the hash and the write-back gets no write-back", async () => {
+      // Here the worker's own deferral lands after the hash was proven.
+      const touched = await stoppedTurnWithWorkerPass();
+      const flipped = (await copies.get(companyId, touched.copy.runId))!;
+      expect(await raceDuringObservation(touched, async () => {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() + 60_000), updatedAt: new Date() })
+          .where(eq(agentInstructionWorkingCopies.runId, touched.copy.runId));
+      })).toBe(false);
+      expect(await copies.get(companyId, touched.copy.runId)).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED",
+        baseHash: flipped.baseHash, processStoppedAt: null });
+      expect((await copies.get(companyId, touched.copy.runId))!.receipt?.stopFlipRestore).toBeUndefined();
+      expect(await copies.canReuseWarm(companyId, agentId, touched.copy.runId)).toBe(false);
+      expect(touched.saves()).toHaveLength(1);
+    }, 60_000);
+    it("23j: a failed or timed-out observation counts as changed and leaves the flipped copy as at base", async () => {
+      const f = await stoppedTurnWithWorkerPass();
+      const probe = vi.spyOn(probeModule, "observeLocalAgentDirectory").mockRejectedValueOnce(new Error("probe failed"))
+        .mockImplementationOnce(() => new Promise(() => {}));
+      try {
+        expect(await f.native.unchangedSinceBaseline?.()).toBe(false);
+        const started = performance.now();
+        expect(await copies.unchangedSinceBaseline({ companyId, runId: f.copy.runId, timeoutMs: 50 })).toBeNull();
+        expect(performance.now() - started).toBeLessThan(5_000);
+      } finally { probe.mockRestore(); }
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "pending_collection", errorCode: "INSTRUCTION_STOP_UNCONFIRMED", processStoppedAt: null });
+      expect(await copies.canReuseWarm(companyId, agentId, f.copy.runId)).toBe(false);
+      await f.native.collectStopped();
+      expect(await copies.get(companyId, f.copy.runId)).toMatchObject({ state: "unchanged" });
+    }, 60_000);
+    it("control 25eaaef3: a with-file Stop checkpointed by its write is saved and retained, never flipped", async () => {
+      const copy = await run({ warm: true });
+      const events = vi.fn(async (..._args: unknown[]) => {});
+      const lifecycle = await heartbeatCopy(copy, events);
+      await fs.writeFile(path.join(copy.localRoot, "AGENTS-note.md"), "written by the turn");
+      expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(true);
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), runtimeMode: "native" }).where(eq(heartbeatRuns.id, copy.runId));
+      await copies.recoverStopped();
+      expect(await copies.get(companyId, copy.runId)).toMatchObject({ state: "warm_saved", errorCode: null });
+      expect(await lifecycle.nativeInstructionWorkingCopy()!.checkpointWarm!()).toBe(true);
+      expect(await fs.readFile(path.join(root, "AGENTS-note.md"), "utf8")).toBe("written by the turn");
+      expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+      await copies.collectStopped({ companyId, runId: copy.runId });
+    }, 60_000);
   });
   it("b13 KEEP: a low-trust warm run that changed an agent file is refused with the named reason and nothing is saved", async () => {
     await lowTrust();

@@ -17631,7 +17631,7 @@ describe("native session bounded recovery", () => {
 
   // Trust/data-safety boundary: cheap injection of escalated cleanup and
   // unresolved requests that the real same-PID board-Stop flow cannot force.
-  it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic"])("board Stop retains only the clean Pi warm owner: %s", async mode => {
+  it.each(["clean", "warm-checkpoint", "escalated", "uncertain", "failed", "codex", "instruction-edits", "diagnostic", "worker-flip-unchanged", "worker-flip-changed"])("board Stop retains only the clean Pi warm owner: %s", async mode => {
     const name = `pi-board-stop-${mode}`;
     const current = { ...execution, provider: mode === "codex" ? execution.provider : { kind: "pi_rpc", model: "provider/model" },
       binding: { ...execution.binding, runId: name, executionWorkspaceId: name },
@@ -17662,8 +17662,11 @@ describe("native session bounded recovery", () => {
       throw new Error("native_finalization_missing: session returned no semantic result");
     });
     const running = executePaperclipNativeSession({ db: leaseDb(current, {}, runResultJson, updates), execution: current,
-      runnerInstanceId: name, ...(["instruction-edits", "warm-checkpoint"].includes(mode) ? { instructionWorkingCopy: {
+      runnerInstanceId: name, ...(["instruction-edits", "warm-checkpoint", "worker-flip-unchanged", "worker-flip-changed"].includes(mode) ? { instructionWorkingCopy: {
         runId: name, root: `/tmp/${name}`, checkpointWarm: async () => mode === "warm-checkpoint", hasChanges: async () => true, collectStopped: async () => {},
+        // Gate A (c2ebc3ab): the checkpoint lost its CAS to the worker's flip;
+        // only the observed unchanged content may still admit retention.
+        ...(mode.startsWith("worker-flip") ? { unchangedSinceBaseline: async () => mode === "worker-flip-unchanged" } : {}),
       } } : {}) }).catch(error => error);
     const persistence = cancellationDb({ runId: current.binding.runId,
       resultJson: { cancelledByActorType: "user", cancelledByUserId: "board" } });
@@ -17675,8 +17678,8 @@ describe("native session bounded recovery", () => {
       end();
       const outcome = await running;
       if (!(outcome instanceof NativeCancellationPendingRecoveryError)) throw outcome;
-      expect(retained).toBe(["clean", "warm-checkpoint"].includes(mode));
-      expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint"].includes(mode) ? 0 : 1);
+      expect(retained).toBe(["clean", "warm-checkpoint", "worker-flip-unchanged"].includes(mode));
+      expect(close).toHaveBeenCalledTimes(["clean", "warm-checkpoint", "worker-flip-unchanged"].includes(mode) ? 0 : 1);
       expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
     } finally { end(); await running; await closeIdleWarmNativeSessionsForRestart(); }
   });
