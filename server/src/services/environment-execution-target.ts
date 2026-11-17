@@ -76,18 +76,9 @@ function toBoolean(value: unknown): boolean | undefined {
   return typeof value === "boolean" ? value : undefined;
 }
 
-// Provider-defined stopped states. A resume from one does NOT prove that the
-// machine restarted or that earlier processes ended: Boat usually resumes the
-// same machine with memory and processes alive within 10 minutes
-// (docs.boat.dev/snapshots/stop.md, "Resume within 10 minutes"; the API names
-// a stopped sandbox archived). `restarted` only triggers the proven-gone check
-// (remoteRunnerGenerationLost); it is never proof by itself.
-const STOPPED_SANDBOX_STATES = new Set(["stopped", "archiving", "archived"]);
-
 function sandboxLeaseAcquisitionFromMetadata(
   value: unknown,
   providerLeaseId: string | null | undefined,
-  resumedFromState?: unknown,
 ): SandboxLeaseAcquisition | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const candidate = value as Record<string, unknown>;
@@ -117,10 +108,6 @@ function sandboxLeaseAcquisitionFromMetadata(
       ? { previousProviderLeaseId: candidate.previousProviderLeaseId }
       : {}),
     ...(reason ? { reason } : {}),
-    ...(candidate.outcome === "resumed" && typeof resumedFromState === "string" ? { resumedFromState } : {}),
-    // A provider that did not report the prior state proves no restart.
-    ...(candidate.outcome === "resumed" && typeof resumedFromState === "string"
-      && STOPPED_SANDBOX_STATES.has(resumedFromState) ? { restarted: true as const } : {}),
   };
 }
 
@@ -494,7 +481,6 @@ export async function resolveEnvironmentExecutionTarget(input: {
       sandboxLeaseAcquisition: sandboxLeaseAcquisitionFromMetadata(
         input.lease?.metadata?.sandboxLeaseAcquisition,
         input.lease?.providerLeaseId,
-        input.lease?.metadata?.resumedFromState,
       ),
       // Attach the host duplex observability recorder next to the runner. The bridge
       // binds it to the fixed observability surface. Absent keeps the no-op

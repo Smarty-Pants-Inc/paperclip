@@ -8,7 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, completionContracts, createDb, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
-  nativeRunnerCheckpoints, nativeRunResults, toolInvocations, issueRecoveryActions, workspaceOperations,
+  nativeRunnerCheckpoints, nativeRunResults, toolInvocations,
 } from "@paperclipai/db";
 import { DurablePrpControlPlane, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { startRecoveryPostgres, recoveryPostgresSupport } from "../../__tests__/helpers/recovery-postgres.js";
@@ -24,9 +24,6 @@ import {
   buildNativeExecutionWithCheckpoint, findNativeSessionResumeRun, nativeToolContractFingerprintForTarget,
 } from "./native-session-resume.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
-import {
-  findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementUnprovenError,
-} from "./predecessor-retirement.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
@@ -42,7 +39,7 @@ vi.mock("./current-wake-comments.js", async importOriginal => ({
   resolveCurrentWakeCommentsBinding: async () => null,
   assertCurrentWakeCommentsRead: async () => undefined,
 }));
-import { buildNativeHarnessBackupManifest, createRunnerdBackend, inspectFinishedPerTurnRunnerdOwner, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
+import { buildNativeHarnessBackupManifest, createRunnerdBackend, quarantinedBootstrapOfOwnerHeldNoProviderWork, resolveNativeHarnessPersistenceProfile,
   scopedRunnerdStateRoot } from "./native-session-executor.js";
 
 // Durable-root admission is the boundary under test. Reaching the run's tool
@@ -221,13 +218,13 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     });
     const failures: unknown[] = [];
     const start = (outcome: "created" | "replacement" | "resumed" = "created",
-      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"], restarted = false) => createRunnerdBackend({
+      restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
       db, execution, runnerInstanceId: next.runnerInstanceId, onLog: async (_stream, chunk) => { logs.push(chunk); },
       ...(restartRecovery ? { restartRecovery } : {}),
       runnerExecutionTarget: { kind: "remote", transport: "sandbox", providerKey: "daytona", environmentId,
         leaseId, remoteCwd: "/workspace", reusableLeaseConfigured: true,
         runner: { execute: remoteExecute },
-        sandboxLeaseAcquisition: { outcome, providerLeaseId, ...(restarted ? { restarted: true } : {}) } } as never,
+        sandboxLeaseAcquisition: { outcome, providerLeaseId } } as never,
     }).then(() => "constructed", (error: Error) => { failures.push(error); return error.message; });
     // A local Runner keeps its controller root on this host between turns.
     const startLocal = (restartRecovery?: Parameters<typeof createRunnerdBackend>[0]["restartRecovery"]) => createRunnerdBackend({
@@ -235,55 +232,6 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       ...(restartRecovery ? { restartRecovery } : {}),
     }).then(() => "constructed", (error: Error) => error.message);
     return { runId, logs, start, startLocal, failures, native: next, environmentId, leaseId, providerLeaseId, remoteExecute, selectedRunId: selected?.id ?? null };
-  }
-
-  /** The prior run's released lease on this same allocation: the evidence a
-   * resumed sandbox's retained binding requires. */
-  async function recordPriorLeaseOnSameSandbox(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
-    followUp: Awaited<ReturnType<typeof admitFollowUp>>, generation: "lost" | "live" = "lost") {
-    await db.insert(environments).values({ id: followUp.environmentId, name: `restarted-${followUp.environmentId}`, driver: "sandbox" });
-    await db.insert(environmentLeases).values({ companyId, environmentId: followUp.environmentId, issueId: prior.issueId,
-      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: followUp.providerLeaseId,
-      status: "released", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
-    // The restarted box still holds the dead Runner's last, unsuspended state.
-    const deadRunnerState = Buffer.from(JSON.stringify({ schema: "paperclip.runner.durable.state.v1", lifecycle: "ready",
-      runId: prior.runId })).toString("base64");
-    // The box's launch marker names the prior Runner's process and start
-    // generation. "lost": that process is gone (probe exit 45); "live": the
-    // same machine came back with it still running (exit 0).
-    const marker = `nonce1\n4242\n2026-11-13T10:00:00.000Z\n${prior.native.runnerInstanceId}\nlinux:0b5e6c2a-1111-4222-8333-944455556666:12345\n`;
-    followUp.remoteExecute.mockImplementation(async (request: unknown) => {
-      const text = JSON.stringify(request);
-      if (text.includes("paperclip-runner-generation-marker")) return { exitCode: 0, timedOut: false, stdout: marker, stderr: "" };
-      if (text.includes("paperclip-runner-generation-check")) return { exitCode: generation === "lost" ? 45 : 0, timedOut: false, stdout: "", stderr: "" };
-      if (text.includes("runner-state.json")) return { exitCode: 0, timedOut: false, stdout: deadRunnerState, stderr: "" };
-      throw new Error("admission must not reach the sandbox");
-    });
-  }
-
-  const RESTARTED_OWNER_REFUSAL =
-    "runner_state_identity_mismatch: prior_owner_terminal_state_indeterminate; retirement_refused=restarted_sandbox_owner_unproven";
-
-  /**
-   * Upstream 566a97b88 (#20863): an unretirable owner on a resumed sandbox is a
-   * typed fresh-sandbox fallback, not a raw failure. The fork's exact refusal
-   * stays its cause, the fallback names this sandbox (the one to replace, never
-   * reuse), and nothing beyond the read-only generation proof reached it: the
-   * unproven owner is never retired by force and no Runner is launched there.
-   */
-  function expectFreshSandboxFallback(message: string, prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
-    followUp: Awaited<ReturnType<typeof admitFollowUp>>) {
-    expect(message).toBe(`The previous run's session on this sandbox could not be retired (${RESTARTED_OWNER_REFUSAL}).`);
-    const typed = findNativePredecessorRetirementUnproven(followUp.failures.at(-1));
-    expect(typed).toBeInstanceOf(NativePredecessorRetirementUnprovenError);
-    expect(typed!.code).toBe(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE);
-    expect(typed!.predecessorRunId).toBe(prior.runId);
-    expect(typed!.providerLeaseId).toBe(followUp.providerLeaseId);
-    expect(typed!.cause).toBeInstanceOf(Error);
-    expect((typed!.cause as Error).message).toBe(RESTARTED_OWNER_REFUSAL);
-    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
-      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
-    expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-launch"))).toBe(false);
   }
 
   async function quarantined() {
@@ -815,125 +763,6 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     expect(await followUp.start("resumed")).not.toBe(ADMITTED);
     expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
   }, 60_000);
-
-  // Marker-generation proof coverage lives in the shared P1/P2 gate suite.
-  // Part 1 intentionally leaves resumed-sandbox rotation to the separate
-  // adoption lane; a provider restart label alone never relaxes this fence.
-  // REG-26 (I-8h run 90a2d958): the provider stopped the box under the idle
-  // warm Runner. The resume alone proves nothing; here the box's generation
-  // probe proves that Runner's process gone, so the owner is lost, not live:
-  // admission keeps its journal in place for the backend's authority
-  // rotation, which archives its unsuspended state and resumes the same
-  // conversation (native-pi-rpc-restarted-sandbox.e2e).
-  it("admits a settled warm owner of a resumed sandbox whose provider restarted it, leaving its journal for rotation", async () => {
-    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
-    const followUp = await admitFollowUp(prior);
-    await recordPriorLeaseOnSameSandbox(prior, followUp);
-    expect(await followUp.start("resumed", undefined, true)).toBe(ADMITTED);
-    expect(await archivedOwners(await sessionRoot())).toEqual([]);
-    expect(await quarantined()).toEqual([]);
-    expect(followUp.logs.join("")).not.toContain("finished without a saved runner checkpoint");
-    expect(followUp.logs.join("")).not.toContain("not retired");
-    // Admission only read the box's Runner state and probed its process
-    // generation; it changed nothing there.
-    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
-      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
-    expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
-  }, 60_000);
-
-  it.each(["cancelled", "cancelled-code", "open recovery", "resolved without receipt", "settled recovery", "real failure", "failed run",
-    "unknown failure", "unacknowledged Stop", "lease held", "recovery state", "live generation", "committed"] as const)(
-    "REG-03 cancelled predecessor retirement: %s", async scenario => {
-      const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
-      const followUp = await admitFollowUp(prior);
-      await keepLocalRootWithoutPointer(prior, followUp);
-      followUp.logs.length = 0;
-      await recordPriorLeaseOnSameSandbox(prior, followUp, scenario === "live generation" ? "live" : "lost");
-      if (scenario !== "committed") {
-        await db.update(heartbeatRuns).set({ status: scenario === "failed run" ? "failed" : "cancelled", resultJson: {
-          cancelledByActorType: "user", cancelledByUserId: "board-user",
-          nativeCancellation: { schema: "paperclip.native-cancellation.v1", companyId, issueId: prior.issueId,
-            runId: prior.runId, scope: "run", reasonCode: "cancellation_run_only", dispatched: true,
-            dispatchState: scenario === "unacknowledged Stop" ? "pending" : "acknowledged",
-            intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() },
-        } }).where(eq(heartbeatRuns.id, prior.runId));
-        await db.update(nativeRunFinalizations).set({ phase: "terminal_failure", resultId: null,
-          failureCode: scenario === "unknown failure" ? "native_execution_indeterminate"
-            : scenario === "real failure" ? "adapter_failed" : scenario === "cancelled-code" ? "cancelled" : "native_retry_cancelled",
-          ...(scenario === "lease held" ? { leaseOwner: "active-controller", leaseExpiresAt: new Date(Date.now() + 60_000) } : {}),
-          ...(scenario === "recovery state" ? { recoveryState: "awaiting_evidence" } : {}),
-        }).where(eq(nativeRunFinalizations.runId, prior.runId));
-        await db.delete(nativeRunResults).where(eq(nativeRunResults.runId, prior.runId));
-      }
-      if (["open recovery", "resolved without receipt", "settled recovery"].includes(scenario)) {
-        const actionId = randomUUID(), savedId = randomUUID();
-        await db.insert(issueRecoveryActions).values({ id: actionId, companyId, sourceIssueId: prior.issueId,
-          kind: "active_run_watchdog", cause: "native_execution_requires_reconciliation", fingerprint: actionId,
-          nextAction: "Preserve the cancelled run's workspace", status: scenario === "open recovery" ? "active" : "resolved", evidence: {
-            runId: prior.runId, automaticRecovery: { policy: "preserve_without_replay_v1", replay: "blocked", runId: prior.runId },
-            systemRecovery: { schema: "paperclip.system-recovery.v1", policyVersion: 1, sourceRunId: prior.runId,
-              state: "complete", preservationOperationIds: [savedId] },
-            workspaceRecovery: { schema: "paperclip.workspace-recovery.v1", runId: prior.runId, status: "recovered" },
-          } });
-        if (scenario === "settled recovery") {
-          await db.insert(workspaceOperations).values([
-            { id: savedId, companyId, issueId: prior.issueId, heartbeatRunId: prior.runId, phase: "workspace_recovery_snapshot",
-              status: "succeeded", metadata: { recoveryActionId: actionId } },
-            { companyId, issueId: prior.issueId, heartbeatRunId: prior.runId, phase: "workspace_finalize", status: "succeeded",
-              metadata: { owningService: "workspace_recovery", preservationOperationIds: [savedId] } },
-          ]);
-        }
-      }
-      const admitted = ["cancelled", "settled recovery", "committed"].includes(scenario);
-      const outcome = await inspectFinishedPerTurnRunnerdOwner({ db, root: await sessionRoot(), identity: prior.identity,
-        execution: prior.executionFor(followUp.runId), runnerExecutionTarget: { kind: "remote", transport: "sandbox",
-          environmentId: followUp.environmentId, leaseId: followUp.leaseId, remoteCwd: "/workspace", runner: { execute: followUp.remoteExecute },
-          sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId: followUp.providerLeaseId, restarted: true } } as never });
-      expect(outcome.finished).toBe(admitted);
-      if (outcome.finished) expect(await outcome.recheck()).toBeNull();
-      else expect(outcome.refused).toBe(scenario === "live generation" ? "restarted_sandbox_runner_generation_not_lost"
-        : scenario === "lease held" ? "owner_lease_held" : scenario === "recovery state" ? "owner_recovery_awaiting_evidence"
-        : ["open recovery", "resolved without receipt"].includes(scenario) ? "owner_recovery_action_pending" : "owner_terminal_failure");
-      expect(followUp.remoteExecute.mock.calls.some(([request]) => JSON.stringify(request).includes("paperclip-runner-generation-check"))).toBe(true);
-      expect(followUp.remoteExecute.mock.calls.every(([request]) =>
-        /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
-    }, 60_000);
-
-  // RFL F1: Boat may resume the same machine with its programs running. The
-  // restarted label alone never retires an owner whose process is still live.
-  it("keeps a settled warm owner held on a restarted sandbox while its process generation is still live", async () => {
-    const prior = await seedRecoveredPriorRun("settled", { provider: "codex", lifecycle: "warm" });
-    const followUp = await admitFollowUp(prior);
-    await recordPriorLeaseOnSameSandbox(prior, followUp, "live");
-    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
-    expectFreshSandboxFallback(await followUp.start("resumed", undefined, true), prior, followUp);
-    expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: restarted_sandbox_runner_generation_not_lost/);
-    // As for every refused prior owner, the controller root is kept aside, not rotated.
-    expect(await quarantined()).toHaveLength(1);
-    expect(followUp.remoteExecute.mock.calls.every(([request]) =>
-      /base64 <|paperclip-runner-generation-(marker|check)/.test(JSON.stringify(request)))).toBe(true);
-  }, 60_000);
-
-  // The restart proves only that the process is gone. A journal with work
-  // still owed (a pending command, an unanswered tool or its undelivered
-  // answer) keeps the owner held.
-  it.each([
-    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
-    "pending-command",
-    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
-    "unanswered-tool",
-    // SUPERSEDED BY REPLACEMENT (RFL, 2026-11-16): 928c3f802 dropped "The next attempt starts on a fresh sandbox." on purpose, as upstream has it
-    "pending-tool-result",
-  ] as const)(
-    "keeps the owner of a restarted sandbox held when its journal is unsettled (%s)", async control => {
-      const prior = await seedRecoveredPriorRun(control, { provider: "codex", lifecycle: "warm" });
-      const followUp = await admitFollowUp(prior);
-      await recordPriorLeaseOnSameSandbox(prior, followUp);
-      expectFreshSandboxFallback(await followUp.start("resumed", undefined, true), prior, followUp);
-      expect(followUp.logs.join("")).toMatch(/restarted sandbox owner \S+ not retired: journal_/);
-      // As for every refused prior owner, the controller root is kept aside, not rotated.
-      expect(await quarantined()).toHaveLength(1);
-    }, 60_000);
 
   it.each(["pending-command", "unanswered-tool"] as const)(
     "keeps a warm owner held when its journal is unsettled (%s), even on a new sandbox", async control => {

@@ -3614,7 +3614,6 @@ export function heartbeatService(
         const runtimeSelection = await prepareAndSelectHeartbeatRuntime(db, {
           run,
           agent,
-          predecessorEnvironmentRuntime: environmentRuntime,
           nativeRuntimeResolution,
           task: {
             issueRef,
@@ -3693,7 +3692,6 @@ export function heartbeatService(
         const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
         const execution = await measureRunPhase("execution.runtime", () => executeHeartbeatRuntime(db, {
-          predecessorEnvironmentRuntime: environmentRuntime,
           run, agent, options,
           task: {
             issueRef,

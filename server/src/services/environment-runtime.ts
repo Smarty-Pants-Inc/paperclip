@@ -87,8 +87,6 @@ import { verifyRecoverableNativeHarnessBackup } from "./native-runtime/native-ha
 import { loadNativeHarnessBackupLeaseChain, loadNativeHarnessBackupLeaseRows, nativeHarnessBackupHasLaterProviderWork,
   nativeSessionOfLeaseRun, newestNativeHarnessBackupStampOnChain, sourceFilesHeld } from "./native-runtime/native-retired-backup-source.js";
 import { warmOwnerInThisProcessHoldsLease } from "./native-runtime/warm-owner-lease-holders.js";
-import type { PredecessorSandboxRecord } from "./native-runtime/native-session-executor.js";
-import { parseStrictIsoInstant } from "./native-runtime/strict-iso-instant.js";
 import {
   collectEnvironmentSecretRefs,
   parseEnvironmentDriverConfig,
@@ -4230,30 +4228,6 @@ function createPluginEnvironmentDriver(
   };
 }
 
-/**
- * Maps a provider's typed inspection of a predecessor's sandbox to the
- * predicate's record. destroyed -> gone; stopped -> present/stopped (the
- * long-stop branch needs its stoppedAt); active -> present/running (the marker
- * probe; lastRebootAt still counts). unknown, a missing answer or another
- * sandbox's answer throws: not proven. Absent optional fields prove nothing.
- */
-export function predecessorSandboxRecordFromObservation(
-  observation: PluginEnvironmentLeaseObservation | undefined,
-  providerLeaseId: string,
-): PredecessorSandboxRecord {
-  if (!observation || observation.providerLeaseId !== providerLeaseId) throw new Error("predecessor_sandbox_unobserved");
-  if (observation.state === "destroyed") return { kind: "gone" };
-  if (observation.state !== "stopped" && observation.state !== "active") throw new Error("predecessor_sandbox_state_unknown");
-  const instant = (value: unknown) => parseStrictIsoInstant(value) === null ? null : value as string;
-  return {
-    kind: "present",
-    state: observation.state === "stopped" ? "stopped" : "running",
-    stoppedAt: observation.state === "stopped" ? instant(observation.stoppedAt) : null,
-    lastRebootAt: instant(observation.lastRebootAt),
-    observedAt: instant(observation.observedAt),
-  };
-}
-
 export function environmentRuntimeService(
   db: Db,
   options: {
@@ -4772,22 +4746,6 @@ export function environmentRuntimeService(
     // record, so a deleted or foreign-bound environment never strands it. The
     // caller owns the lease release; this dispatcher only runs the provider
     // teardown and throws when the driver teardown throws.
-    /**
-     * A FRESH provider read of a predecessor run's sandbox, for the shared
-     * prior-owner-proven-gone predicate (remoteRunnerGenerationLost). Unlike
-     * inspectLeaseResource (cleanup/stop verification only), this reads any
-     * lease of the company through its provider's read-only inspection, never
-     * a cached or label state. It throws when the provider cannot answer for
-     * that exact sandbox, which the predicate treats as not proven.
-     */
-    async readPredecessorSandboxRecord(input: { companyId: string; leaseId: string }): Promise<PredecessorSandboxRecord> {
-      const lease = await environmentsSvc.getLeaseById(input.leaseId);
-      if (!lease || lease.companyId !== input.companyId || !lease.providerLeaseId) throw new Error("predecessor_sandbox_lease_unavailable");
-      const environment = lease.environmentId ? await environmentsSvc.getById(lease.environmentId) : null;
-      const observation = await getDriver(getLeaseDriverKey(lease, environment))?.inspectLeaseResource?.({ environment, lease });
-      return predecessorSandboxRecordFromObservation(observation, lease.providerLeaseId);
-    },
-
     async inspectLeaseResource(leaseId: string, options?: { freshThreadStop?: true }): Promise<PluginEnvironmentLeaseObservation | undefined> {
       const lease = await environmentsSvc.getLeaseById(leaseId);
       if (!lease || !lease.providerLeaseId) return undefined;
