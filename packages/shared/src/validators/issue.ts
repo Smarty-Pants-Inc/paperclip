@@ -1173,6 +1173,7 @@ export const issueCommentMetadataSchema = z
       contentHash: z.string().regex(/^[a-f0-9]{64}$/),
     }).strict().optional(),
     recoveryResponsibility: z.enum(["system", "user"]).optional(),
+    deliveryIntent: z.enum(["steer", "queue"]).optional(),
     attachmentPreparation: z.object({ attachmentId: z.uuid() }).strict().optional(),
     // A notice's wording is immutable. Later state appends a new notice and
     // points the previous one at it instead of rewriting conversation history.
@@ -1224,6 +1225,8 @@ export const addIssueCommentSchema = z.object({
   reopen: z.boolean().optional(),
   resume: z.boolean().optional(),
   interrupt: z.boolean().optional(),
+  /** While the agent works: Steer joins the running turn, Queue waits for its end (stored on the comment). */
+  deliveryIntent: z.enum(["steer", "queue"]).optional(),
 });
 
 export type AddIssueComment = z.infer<typeof addIssueCommentSchema>;
