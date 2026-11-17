@@ -23,8 +23,14 @@ vi.mock("../components/MarkdownBody", () => ({
   MarkdownBody: ({ children }: { children: string }) => <div>{children}</div>,
 }));
 
+const costPolicy = vi.hoisted(() => ({ hidden: true }));
+vi.mock("../lib/cost-visibility", () => ({
+  get COST_BUDGET_UI_HIDDEN() { return costPolicy.hidden; },
+}));
+
 describe("AgentOverview", () => {
-  it("leads with audit cards, then Profile, Skills and Recent tasks", () => {
+  it.each([true, false])("leads with audit cards, then Profile, Skills and Recent tasks (money hidden=%s)", (hidden) => {
+    costPolicy.hidden = hidden;
     const agent = {
       id: "agent-1",
       companyId: "company-1",
@@ -72,19 +78,27 @@ describe("AgentOverview", () => {
       </DialogProvider></QueryClientProvider>,
     );
 
-    for (const label of ["Activity", "Runs", "Costs", "Budget used", "Profile", "Skills", "Recent tasks"]) {
+    for (const label of ["Activity", "Runs", "Profile", "Skills", "Recent tasks"]) {
       expect(markup).toContain(label);
     }
-    for (const page of ["activity", "runs", "costs", "budgets"]) {
+    for (const page of ["activity", "runs"]) {
       expect(markup).toContain(`href="/agents/codexcoder/${page}"`);
     }
-    const rendered = document.createElement("div");
-    rendered.innerHTML = markup;
-    const budgetTile = rendered.querySelector('a[href="/agents/codexcoder/budgets"]');
-    expect(budgetTile?.textContent).toContain("Budget used");
-    expect(budgetTile?.textContent).toContain("—");
-    expect(budgetTile?.textContent).toContain("of $500.00 this month");
-    expect(budgetTile?.textContent).not.toContain("114%");
+    if (hidden) {
+      expect(markup).not.toContain("Costs");
+      expect(markup).not.toContain("Budget used");
+      expect(markup).not.toContain('/costs"');
+      expect(markup).not.toContain('/budgets"');
+    } else {
+      // Retain final5c3's unavailable spend/percentage behavior if money UI returns.
+      const rendered = document.createElement("div");
+      rendered.innerHTML = markup;
+      const budgetTile = rendered.querySelector('a[href="/agents/codexcoder/budgets"]');
+      expect(budgetTile?.textContent).toContain("Budget used");
+      expect(budgetTile?.textContent).toContain("—");
+      expect(budgetTile?.textContent).toContain("of $500.00 this month");
+      expect(budgetTile?.textContent).not.toContain("114%");
+    }
     expect(markup).toContain("2 enabled");
     expect(markup).toContain("Explore skills");
     expect(markup).toContain('href="/agents/codexcoder/skills"');

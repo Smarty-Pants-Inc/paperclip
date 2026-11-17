@@ -313,7 +313,7 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     expect(provisionMock).not.toHaveBeenCalled();
   });
 
-  it("sends the budget with provisioning so approval-gated setup preserves it", async () => {
+  it("hides the budget field while keeping approval-gated setup working", async () => {
     provisionMock.mockResolvedValue({
       ...makeState(),
       status: "pending_approval",
@@ -330,12 +330,8 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     });
     await flushReact();
 
-    const budgetInput = document.body.querySelector('input[type="number"]') as HTMLInputElement;
-    flushSync(() => {
-      setter.call(budgetInput, "50");
-      budgetInput.dispatchEvent(new Event("input", { bubbles: true }));
-    });
-    await flushReact();
+    expect(document.body.querySelector('input[type="number"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Monthly budget");
 
     flushSync(() => {
       findButton("Configure")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -346,7 +342,6 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
       adapterType: "codex_local",
       adapterConfig: { model: "gpt-5" },
-      budgetMonthlyCents: 5000,
     });
     expect(updateMock).not.toHaveBeenCalled();
   });

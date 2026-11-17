@@ -104,12 +104,12 @@ describe("AuditHub", () => {
     currentSearch = "mode=agents&agentId=agent-1&runId=run-1&action=tool_";
     render("activity");
 
-    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(6);
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(4);
     expect(container.textContent).toContain("Activity");
     expect(container.textContent).toContain("Runs");
     expect(container.textContent).toContain("Commentary");
-    expect(container.textContent).toContain("Costs");
-    expect(container.textContent).toContain("Budgets");
+    expect(container.textContent).not.toContain("Costs");
+    expect(container.textContent).not.toContain("Budgets");
     expect(container.textContent).toContain("Timeline");
     const feed = container.querySelector<HTMLElement>('[data-testid="audit-feed"]');
     expect(feed?.dataset.mode).toBe("agents");
@@ -189,7 +189,7 @@ describe("AuditHub", () => {
 
     const labels = Array.from(container.querySelectorAll<HTMLElement>('[role="tab"]'))
       .map((tab) => tab.textContent?.trim());
-    expect(labels).toEqual(["Activity", "Runs", "Commentary", "Costs", "Budgets", "Timeline"]);
+    expect(labels).toEqual(["Activity", "Runs", "Commentary", "Timeline"]);
     expect(container.querySelector<HTMLElement>('[data-testid="audit-timeline"]')?.dataset.embedded)
       .toBe("true");
   });
@@ -197,14 +197,12 @@ describe("AuditHub", () => {
   it("renders Costs and Budgets as intentional peer sections", () => {
     render("budgets");
     let costs = container.querySelector<HTMLElement>('[data-testid="audit-costs"]');
-    expect(costs?.dataset.initialTab).toBe("budgets");
-    expect(costs?.dataset.lockTab).toBe("true");
+    expect(costs).toBeNull();
 
     flushSync(() => root.unmount());
     render("costs");
     costs = container.querySelector<HTMLElement>('[data-testid="audit-costs"]');
-    expect(costs?.dataset.initialTab).toBe("overview");
-    expect(costs?.dataset.hideBudgets).toBe("true");
+    expect(costs).toBeNull();
   });
 
   it("keeps the current entity scope when moving between Audit sections", () => {

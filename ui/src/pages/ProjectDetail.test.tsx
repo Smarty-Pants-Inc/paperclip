@@ -226,6 +226,17 @@ describe("ProjectDetail", () => {
     vi.clearAllMocks();
   });
 
+  it.each(["issues", "budget"])("hides project budget tab/panel on %s", async tab => {
+    mockLocation.pathname = `/projects/project-1/${tab}`;
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(() => root!.render(<QueryClientProvider client={client}><ProjectDetail /></QueryClientProvider>));
+    await settle();
+    expect(container.querySelector('[data-testid="budget-policy-card"]')).toBeNull();
+    expect([...container.querySelectorAll("button")].map(el => el.textContent)).not.toContain("Budget");
+    client.clear();
+  });
+
   it.each(["alias", "other project", "other company"])("preserves a draft only for a same-project route alias (%s)", async target => {
     const loaded = project({ urlKey: "managed-project" });
     mockLocation.pathname = "/projects/project-1/configuration";

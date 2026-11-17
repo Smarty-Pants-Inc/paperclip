@@ -7,6 +7,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent, AttentionItem, AttentionReceipt, DecisionHistoryItem } from "@paperclipai/shared";
 import { CoordinatorNeedsYou } from "./CoordinatorNeedsYou";
 
+const costPolicy = vi.hoisted(() => ({ hidden: true }));
+vi.mock("@/lib/cost-visibility", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/cost-visibility")>();
+  return {
+    ...actual,
+    get COST_BUDGET_UI_HIDDEN() { return costPolicy.hidden; },
+    isHiddenMoneyAttentionItem: (item: AttentionItem) => costPolicy.hidden && actual.isHiddenMoneyAttentionItem(item),
+  };
+});
+
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const fixture = vi.hoisted(() => ({ pending: [] as AttentionItem[], byView: {} as Record<string, AttentionItem[]>, viewCounts: undefined as undefined | Record<string, number>, receipts: [] as AttentionReceipt[], listCalls: [] as unknown[], claim: vi.fn(async () => ({})), close: vi.fn(async (..._args: unknown[]) => ({ until: null })), retryTask: vi.fn(async (..._args: unknown[]) => ({ accepted: true, requestId: "r", stale: false, presentation: null })), history: [] as DecisionHistoryItem[], url: "/decisions", mobile: false, partial: false, historyFail: false, feedFail: false, openPanel: vi.fn(), closePanel: vi.fn(), setPanelVisible: vi.fn(), navigate: vi.fn(), breadcrumbs: vi.fn(), boardAccess: null as null | Record<string, unknown>, historyByScope: {} as Record<string, DecisionHistoryItem[]>, historyCalls: [] as Array<Record<string, unknown>>, resolveIncident: vi.fn(async (..._args: unknown[]) => ({})) }));
 const dismissals = vi.hoisted(() => ({ restore: vi.fn(async (..._args: unknown[]) => ({})), dismiss: vi.fn(async (..._args: unknown[]) => ({})) }));
@@ -66,6 +76,7 @@ function Location() { return <output data-location>{useLocation().search}</outpu
 let root: Root;
 let container: HTMLDivElement;
 beforeEach(() => {
+  costPolicy.hidden = true;
   fixture.pending = ["1", "2", "3"].map((id) => ({ id, sourceKind: "issue_thread_interaction", inlineResolvable: true, subject: { id, kind: "interaction", title: `Review ${id}`, metadata: { issueId: `task-${id}` } }, relatedIssue: { id: `task-${id}`, identifier: `PAP-${id}`, title: `Task ${id}`, href: `/PAP/issues/PAP-${id}` }, activityAt: new Date().toISOString() } as unknown as AttentionItem));
   agentFixture.rows = [{ id: "agent-cos", name: "Chief of Staff" }] as Agent[];
   fixture.history = []; fixture.url = "/decisions"; vi.clearAllMocks();
@@ -737,7 +748,8 @@ describe("Coordinator Needs You views (PAP-749 task 1b)", () => {
     client.clear();
   });
 
-  it("shows a budget hard stop and its override approval as one card with Increase limit and Keep paused (PAP-768)", async () => {
+  it.each([true, false])("budget hard stop and override approval follow money policy hidden=%s (PAP-768)", async (hidden) => {
+    costPolicy.hidden = hidden;
     const now = new Date().toISOString();
     const owner = { kind: "user", userId: "reviewer", reason: "budget_owner", alsoInCompany: true };
     const stop = { id: "stop", sourceKind: "budget_alert", inlineResolvable: true, whyNow: "Budget hard stop was reached.",
@@ -753,6 +765,8 @@ describe("Coordinator Needs You views (PAP-749 task 1b)", () => {
     fixture.viewCounts = { mine: 1, unassigned: 0, company: 1, archived: 0, all: 1 };
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await render(client);
+    if (!hidden) {
+    // Preserve final5c3's budget display and resolution path behind the policy.
     expect([...container.querySelectorAll("[data-attention-card]")].map((card) => card.getAttribute("data-attention-card"))).toEqual(["stop"]);
     const card = container.querySelector<HTMLElement>('[data-attention-card="stop"]')!;
     expect(card.querySelector('[data-attention-evidence="approval-b"]')?.textContent).toBe("Approval this answers: budget override required — Approval is pending a board decision.");
@@ -777,6 +791,12 @@ describe("Coordinator Needs You views (PAP-749 task 1b)", () => {
     // Keep paused answers the stop, which rejects its approval on the server.
     await click("Keep paused");
     expect(fixture.resolveIncident).toHaveBeenCalledWith("company", "incident-1", { action: "keep_paused" });
+    } else {
+    expect(container.querySelector('[data-attention-card="stop"]')).toBeNull();
+    expect(container.querySelector('[data-attention-card="approval-b"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/Spendy Agent|Increase limit|budget hard stop/i);
+    expect(fixture.resolveIncident).not.toHaveBeenCalled();
+    }
     client.clear();
   });
 

@@ -18,7 +18,7 @@ describe("run accounting provenance", () => {
   it("renders persisted unavailable accounting without zero usage or zero dollars", () => {
     const markup = renderToStaticMarkup(<RunAccountingMetrics run={run({ inputTokens: 0, outputTokens: 0, costUsd: 0 }, unavailable)} />);
     expect(markup.match(/Unavailable/g)).toHaveLength(3);
-    expect(markup).toContain("—");
+    expect(markup).not.toContain("Cost");
     expect(markup).not.toContain("$0");
     expect(markup).not.toContain(">0<");
   });
@@ -28,7 +28,8 @@ describe("run accounting provenance", () => {
     expect(markup).toContain("120");
     expect(markup).toContain("20");
     expect(markup).toContain("40");
-    expect(markup).toContain("—");
+    expect(markup).not.toContain("Cost");
+    for (const label of ["Input", "Output", "Cached"]) expect(markup).toContain(label);
     expect(markup).not.toContain("Unavailable");
   });
 

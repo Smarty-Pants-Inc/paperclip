@@ -103,6 +103,9 @@ vi.mock("./pages/audit/CompanyActivity.production", () => ({
   },
 }));
 
+vi.mock("./pages/Dashboard", () => ({ Dashboard: () => <div>DASHBOARD</div> }));
+vi.mock("./pages/AgentDetailPage", () => ({ AgentDetailPage: () => <div>AGENT_OVERVIEW</div> }));
+
 vi.mock("./pages/Costs", () => ({
   Costs: () => {
     const location = useLocation();
@@ -220,9 +223,9 @@ describe("App Activity routing (PAP-16302)", () => {
     flushSync(() => root.unmount());
   });
 
-  it("redirects legacy costs and preserves its deep-link filters", async () => {
+  it("redirects legacy costs to the dashboard", async () => {
     const root = renderAppAt(container, "/PAP/costs?range=30d#usage");
-    await waitForRoute(container, "AUDIT_COSTS@/PAP/activity/costs?range=30d");
+    await waitForRoute(container, "DASHBOARD");
     flushSync(() => root.unmount());
   });
 
@@ -230,7 +233,7 @@ describe("App Activity routing (PAP-16302)", () => {
     const root = renderAppAt(container, "/PAP/audit/budgets?projectId=project-1");
     await waitForRoute(
       container,
-      "AUDIT_BUDGETS@/PAP/activity/budgets?projectId=project-1",
+      "DASHBOARD",
     );
     flushSync(() => root.unmount());
   });
@@ -270,25 +273,43 @@ describe("App Activity routing (PAP-16302)", () => {
     flushSync(() => root.unmount());
   });
 
-  it("uses legacy Activity and the shared standalone Costs page when Streamlined UI is disabled", async () => {
+  it("uses legacy Activity but hides standalone Costs when Streamlined UI is disabled", async () => {
     streamlinedUiState.enabled = false;
     const activityRoot = renderAppAt(container, "/PAP/activity");
     await waitForRoute(container, "PRODUCTION_ACTIVITY@/PAP/activity");
     flushSync(() => activityRoot.unmount());
 
     const costsRoot = renderAppAt(container, "/PAP/costs?range=30d");
-    await waitForRoute(container, "SHARED_COSTS@/PAP/costs?range=30d");
+    await waitForRoute(container, "DASHBOARD");
     flushSync(() => costsRoot.unmount());
   });
 
-  it.each([true, false])("serves all Audit tab destinations with Streamlined UI set to %s", async (enabled) => {
+  it.each([true, false])("serves non-money Audit tab destinations with Streamlined UI set to %s", async (enabled) => {
     streamlinedUiState.enabled = enabled;
-    for (const section of ["runs", "costs", "budgets", "timeline", "commentary"]) {
+    for (const section of ["runs", "timeline", "commentary"]) {
       const path = `/PAP/activity/${section}?agentId=agent-1`;
       const root = renderAppAt(container, path);
       await waitForRoute(container, `AUDIT_${section.toUpperCase()}@${path}`);
       expect(container.textContent).not.toContain("NOT_FOUND");
       flushSync(() => root.unmount());
+    }
+  });
+
+  it.each([true, false])("hides all money deep links for the board with streamlined=%s", async (enabled) => {
+    streamlinedUiState.enabled = enabled;
+    for (const prefix of ["/PAP", ""]) {
+      for (const path of ["costs", "budgets", "activity/costs", "activity/budgets", "audit/costs", "audit/budgets"]) {
+        const root = renderAppAt(container, `${prefix}/${path}`);
+        await waitForRoute(container, "DASHBOARD");
+        expect(container.textContent).not.toMatch(/COSTS|BUDGETS/);
+        flushSync(() => root.unmount());
+      }
+      for (const tab of ["costs", "budgets", "cost", "budget"]) {
+        const root = renderAppAt(container, `${prefix}/agents/agent-1/${tab}`);
+        await waitForRoute(container, "AGENT_OVERVIEW");
+        expect(container.textContent).not.toMatch(/COSTS|BUDGETS/);
+        flushSync(() => root.unmount());
+      }
     }
   });
 

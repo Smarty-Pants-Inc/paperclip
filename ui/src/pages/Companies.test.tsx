@@ -13,6 +13,10 @@ const mockCompaniesApi = vi.hoisted(() => ({
   remove: vi.fn(),
 }));
 const mockOpenOnboarding = vi.hoisted(() => vi.fn());
+const costPolicy = vi.hoisted(() => ({ hidden: true }));
+vi.mock("../lib/cost-visibility", () => ({
+  get COST_BUDGET_UI_HIDDEN() { return costPolicy.hidden; },
+}));
 const creationPolicy = vi.hoisted(() => ({ hidden: false }));
 vi.mock("../lib/organization-creation", () => ({
   get ORGANIZATION_CREATION_HIDDEN() { return creationPolicy.hidden; },
@@ -78,6 +82,7 @@ describe("Companies page", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     creationPolicy.hidden = false;
+    costPolicy.hidden = true;
     mockCompaniesApi.stats.mockResolvedValue({});
   });
 
@@ -123,13 +128,22 @@ describe("Companies page", () => {
     }
   });
 
-  it("shows configured company budgets without the spend-derived percentage", async () => {
+  it("shows configured company budgets without the spend-derived percentage when money UI is enabled", async () => {
+    costPolicy.hidden = false;
     const root = await renderPage();
     try {
       expect(container.textContent).toContain("— / $500.00");
       expect(container.textContent).toContain("(—)");
       expect(container.textContent).not.toContain("114%");
       expect(container.textContent).not.toContain("$572.30");
+    } finally { act(() => root.unmount()); }
+  });
+
+  it("shows no organization spend or budget summary", async () => {
+    const root = await renderPage();
+    try {
+      expect(container.textContent).toContain("Acme Labs");
+      expect(container.textContent).not.toMatch(/spend|spent|budget/i);
     } finally { act(() => root.unmount()); }
   });
 
