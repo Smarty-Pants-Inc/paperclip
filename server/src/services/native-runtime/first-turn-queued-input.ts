@@ -9,6 +9,7 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
 import { sanitizeQuarantinedCommentForHigherTrust } from "../source-trust.js";
 import { PROVIDER_TURN_ACCEPTED_EVENT_TYPES } from "./provider-attempt-outcome.js";
+import { retryUnlessTransactionBound } from "../transaction-retry.js";
 
 /**
  * Queued input for a run's first provider turn.
@@ -182,7 +183,10 @@ export async function claimFirstTurnQueuedInput(
   db: Db,
   binding: { companyId: string; runId: string; issueId: string; agentId: string },
 ): Promise<string | null> {
-  return db.transaction(async (tx) => {
+  // A serialization failure or deadlock (40001/40P01) rolls the seal back whole,
+  // so it is retried here: the queued input then joins THIS turn instead of
+  // silently waiting. The body is database-only, so a retry starts clean.
+  return retryUnlessTransactionBound(db, () => db.transaction(async (tx) => {
     // Redact on this transaction's own connection: a second pool connection
     // while the seal holds its locks can wait forever on a one-connection pool.
     const render = async (messages: QueuedMessage[]) => messages.length === 0 ? null : renderFirstTurnQueuedInput(
@@ -245,7 +249,7 @@ export async function claimFirstTurnQueuedInput(
       updatedAt: new Date(),
     }).where(eq(heartbeatRuns.id, run.id));
     return text;
-  });
+  }));
 }
 
 /**

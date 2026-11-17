@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   agents, agentWakeupRequests, assets, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueAttachments,
@@ -83,6 +83,59 @@ describe.skipIf(!support.supported)("first-turn queued input", () => {
     expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).not.toContain("one more thing");
     expect(firstTurnClaimedCommentIds(await readRun(f.runId)).has(later)).toBe(false);
     expect(sealMs).toBeLessThan(1_000);
+  });
+
+  /** Fails this run's seal write with `code` on its first `times` attempts (a
+   * sequence is not rolled back with the aborted seal transaction). */
+  async function failSeal(runId: string, code: string, times: number) {
+    const tag = runId.replace(/-/g, "");
+    await db.execute(sql.raw(`create sequence seal_fail_${tag};
+      create function seal_fail_${tag}() returns trigger language plpgsql as $$ begin
+        if nextval('seal_fail_${tag}') <= ${times} then raise exception 'injected seal failure' using errcode = '${code}'; end if;
+        return new; end $$;
+      create trigger seal_fail_${tag} before update on heartbeat_runs for each row
+        when (new.id = '${runId}'::uuid) execute function seal_fail_${tag}();`));
+    return () => db.execute(sql.raw(`drop trigger seal_fail_${tag} on heartbeat_runs;
+      drop function seal_fail_${tag}(); drop sequence seal_fail_${tag};`));
+  }
+
+  // S061: a real serialization failure in the seal is retried, so the queued
+  // input still joins this turn exactly once instead of silently waiting.
+  it("retries a serialization failure in the seal and delivers the queued input to this turn once", async () => {
+    const f = await seed();
+    const message = await queueMessage(f, "also cover the March numbers");
+    const restore = await failSeal(f.runId, "40001", 1);
+    try {
+      const firstTurn = await claimFirstTurnQueuedInput(db, binding(f, f.runId));
+      expect(firstTurn).toContain("also cover the March numbers");
+    } finally { await restore(); }
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual([message]);
+    await accept(f, f.runId);
+    expect([...await deliveredQueuedCommentIds(db, { companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      commentIds: [message] })]).toEqual([message]);
+    // Exactly once: the next run's first turn takes nothing.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+    const nextRunId = await startRun(f.companyId, f.agentId, f.issueId);
+    await db.update(issues).set({ executionRunId: nextRunId }).where(eq(issues.id, f.issueId));
+    expect(await claimFirstTurnQueuedInput(db, binding(f, nextRunId))).toBeNull();
+  });
+
+  // S061: a failure that outlasts the retries writes no seal at all: no empty
+  // seal blocks later joining, and the message stays queued for a later turn.
+  it("leaves the queued input pending and unsealed when the seal keeps failing", async () => {
+    const f = await seed();
+    const message = await queueMessage(f, "and the April ones");
+    const restore = await failSeal(f.runId, "40001", 100);
+    try {
+      await expect(claimFirstTurnQueuedInput(db, binding(f, f.runId))).rejects.toThrow();
+    } finally { await restore(); }
+    const run = await readRun(f.runId);
+    expect(firstTurnClaimedCommentIds(run).size).toBe(0);
+    expect(await runAcceptsFirstTurnQueuedInput(db, run)).toBe(true);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    expect(wake!.status).toBe("deferred_issue_execution");
+    expect(await claimFirstTurnQueuedInput(db, binding(f, f.runId))).toContain("and the April ones");
+    expect([...firstTurnClaimedCommentIds(await readRun(f.runId))]).toEqual([message]);
   });
 
   it("delivers two messages from preparation in their queued order", async () => {

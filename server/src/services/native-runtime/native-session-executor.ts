@@ -13289,9 +13289,12 @@ async function executePaperclipNativeSessionAttempt(
             // turn boundary instead of failing this run before its turn.
             prepareWakeAttachmentPrompt: input.prepareAttachmentPrompt
               ? () => controllerSteps.measure("attachment_prompt", input.prepareAttachmentPrompt!) : undefined,
+            // The claim retries a serialization failure itself. Only a failure
+            // that outlasts those retries reaches here; it wrote no seal, so the
+            // messages stay deferred and this run's release delivers them.
             getFirstTurnQueuedInput: () => controllerSteps.measure("queued_input", () => claimFirstTurnQueuedInput(input.db, input.execution.binding)).catch((error) => {
-
-              logger.warn({ err: error, runId: input.execution.binding.runId }, "first-turn queued input was not sealed");
+              logger.error({ err: error, runId: input.execution.binding.runId, disposition: "pending_until_run_release" },
+                "first-turn queued input was not sealed; it stays queued for this run's release");
               return null;
             }),
             getUnreadSteeredMessages: () => controllerSteps.measure("steered_messages", () => readUnreadSteeredMessages(input.db, {
