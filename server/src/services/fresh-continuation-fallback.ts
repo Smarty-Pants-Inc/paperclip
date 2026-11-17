@@ -7,6 +7,7 @@ import {
   EXECUTION_RECONCILIATION_CAUSES, readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema, type ExecutionReconciliation,
 } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import { logActivity } from "./activity-log.js";
 import { taskHistoryReadsForRun } from "./queued-comment-delivery.js";
 import { undeliveredLegacyUserCommentIds } from "./explicit-native-continuation.js";
@@ -80,6 +81,12 @@ export const FRESH_CONTINUATION_CHECK_KEY = "freshContinuationCheck" as const;
 // import cycle); a test pins them to SERVER_RESTART_RETRY_MAX_ATTEMPTS/_WINDOW_MS.
 export const FRESH_CONTINUATIONS_PER_HOUR = 6;
 export const FRESH_CONTINUATIONS_PER_CHAIN = 2;
+export const FRESH_CONTINUATIONS_PER_CHAIN_ENV = "PAPERCLIP_FRESH_CONTINUATIONS_PER_CHAIN";
+
+/** Absence preserves the existing limit; malformed settings refuse startup. */
+export function resolveFreshContinuationsPerChain(env: NodeJS.ProcessEnv = process.env): number {
+  return readPositiveIntegerEnvironment(env, FRESH_CONTINUATIONS_PER_CHAIN_ENV, FRESH_CONTINUATIONS_PER_CHAIN);
+}
 export const FRESH_CONTINUATION_WINDOW_MS = 60 * 60_000;
 const PERSON_RECHECK_MS = 60 * 60_000;
 /** Consecutive pending checks (about 12 minutes) before the fallback stops waiting. */
@@ -690,7 +697,7 @@ export async function continueFreshInTransaction(tx: Db, input: Input): Promise<
     return { kind: "already_continued", recoveryActionId: prior.id };
   }
   const chain = await freshContinuationChain(tx, { companyId, issueId: issue.id, runId: run.id });
-  if (chain.attempts >= FRESH_CONTINUATIONS_PER_CHAIN)
+  if (chain.attempts >= resolveFreshContinuationsPerChain())
     return { kind: "not_applicable", reason: "fresh_continuation_chain_exhausted" };
 
   // The holds this decision owns: reconciliation holds that still block the

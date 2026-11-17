@@ -1,4 +1,5 @@
 import { and, count, eq } from "drizzle-orm";
+import { readPositiveIntegerEnvironment } from "../cap-environment.js";
 import type { Db } from "@paperclipai/db";
 import { activityLog, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
@@ -10,14 +11,11 @@ export const CROSS_ISSUE_INFLUENCE_LIMIT_ENV = "PAPERCLIP_CROSS_ISSUE_INFLUENCE_
 
 /**
  * Operators can raise or lower the per-run cap with a positive integer in
- * `PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT`. A missing, empty, or invalid value
- * keeps the default, so the backstop cannot be disabled by a bad setting.
+ * `PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT`. Only absence keeps the default;
+ * malformed values refuse startup and throw on subsequent reads.
  */
 export function resolveCrossIssueInfluenceLimit(env: NodeJS.ProcessEnv = process.env): number {
-  const raw = env[CROSS_ISSUE_INFLUENCE_LIMIT_ENV]?.trim();
-  if (!raw || !/^\d+$/.test(raw)) return CROSS_ISSUE_INFLUENCE_LIMIT;
-  const value = Number(raw);
-  return Number.isSafeInteger(value) && value > 0 ? value : CROSS_ISSUE_INFLUENCE_LIMIT;
+  return readPositiveIntegerEnvironment(env, CROSS_ISSUE_INFLUENCE_LIMIT_ENV, CROSS_ISSUE_INFLUENCE_LIMIT);
 }
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
 

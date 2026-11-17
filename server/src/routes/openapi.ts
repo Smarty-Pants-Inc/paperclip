@@ -1,6 +1,7 @@
 import { catalogTeamInstallSchema, catalogTeamPreviewSchema, updateWorkspacePreferenceSchema } from "@paperclipai/shared";
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
+import { createServerAcceptedPlanDecompositionSchema } from "../services/plan-decomposition-limit.js";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
 import { ATTENTION_SOURCE_KINDS } from "@paperclipai/shared";
 import { agentCaseHandoffSchema, caseWorkflowDocumentTextSchema, doneCaseHandoffSchema, createWorkflowSchema, updateWorkflowSchema, listWorkflowsSchema, readWorkflowQuerySchema } from "@paperclipai/shared";
@@ -268,7 +269,6 @@ import {
   createDocumentAnnotationThreadSchema,
   updateDocumentAnnotationThreadSchema,
   // Issue recovery and decomposition
-  createAcceptedPlanDecompositionSchema,
   resolveIssueRecoveryActionSchema,
   recoverWorkspaceSchema,
   taskRetrySchema,
@@ -11306,7 +11306,7 @@ registerCurrentRoute({
   path: "/api/issues/{id}/accepted-plan-decompositions",
   tags: ["issues"],
   summary: "Create accepted plan decomposition child issues",
-  body: createAcceptedPlanDecompositionSchema,
+  body: createServerAcceptedPlanDecompositionSchema(),
 });
 
 for (const route of [

@@ -1546,13 +1546,21 @@ describe("PaperclipRunnerToolAuthority", () => {
         arguments: { idempotencyKey: `depth-${childId}`, title: "Follow-up from the child", status: "backlog" },
       }) as { task: { id: string; parentId: string | null } };
       const [row] = await db.select({ originIssueId: issues.originIssueId }).from(issues).where(eq(issues.id, created.task.id));
-      return { childId, parentId: created.task.parentId, originIssueId: row?.originIssueId };
+      return { childId, parentId: created.task.parentId, originIssueId: row?.originIssueId, task: created.task };
     }
 
     const ordinary = await childRun(false);
-    expect(ordinary).toMatchObject({ parentId: rootId, originIssueId: ordinary.childId });
+    expect(ordinary).toMatchObject({ parentId: rootId, originIssueId: ordinary.childId,
+      task: { parentAdjusted: { reason: "max_agent_depth", applied: true,
+        requestedParent: { id: ordinary.childId }, effectiveParent: { id: rootId } },
+        parentAdjustmentWarning: expect.stringContaining("PAPERCLIP_AGENT_TASK_HIERARCHY_DEPTH") } });
+    const [adjustmentAudit] = await db.select().from(activityLog).where(and(
+      eq(activityLog.entityId, ordinary.task.id), eq(activityLog.action, "issue.parent_adjusted")));
+    expect(adjustmentAudit).toMatchObject({ actorType: "agent", actorId: agentId });
     const watchdog = await childRun(true);
     expect(watchdog).toMatchObject({ parentId: watchdog.childId, originIssueId: watchdog.childId });
+    expect(watchdog.task).not.toHaveProperty("parentAdjusted");
+    expect(watchdog.task).not.toHaveProperty("parentAdjustmentWarning");
     // A disabled watchdog no longer earns the exception.
     const disabled = await childRun(true, "disabled");
     expect(disabled).toMatchObject({ parentId: rootId, originIssueId: disabled.childId });
