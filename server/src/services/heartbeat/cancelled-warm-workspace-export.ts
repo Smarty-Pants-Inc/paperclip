@@ -77,6 +77,23 @@ async function hasSettledStopCoordinator(db: Db, run: Pick<typeof heartbeatRuns.
   return Boolean(coordinator);
 }
 
+const STOPPED_SESSION_CLOSE_SCHEMA = "paperclip.native-stopped-session-close.v1";
+const TOOLS_NOT_PROVEN_STOPPED = "tools_not_proven_stopped";
+const TOOLS_NOT_PROVEN_LINE = "Stopped, but the box's tools could not be proven stopped, so the workspace was not copied back. The box is kept.";
+
+/** pl/r4-work3 (rf-3): in the CLOSED case (no idle receipt) the coordinator
+ * settle alone does not prove the stopped turn's tools are gone. NSE records
+ * the close of that session (native-session-executor.ts releaseWarmNativeSession
+ * onStoppedSessionClose); clean = closeWarmNativeSession did not throw (Pi's
+ * transport ladder completed; on the Boat path the Runner's suspension proof was
+ * accepted). Without it, nothing is copied from the box. */
+function hasCleanStoppedSessionClose(run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "nativeIssueId" | "runnerProfileJson">): boolean {
+  const proof = record(record(run.runnerProfileJson).nativeStoppedSessionClose);
+  return proof.schema === STOPPED_SESSION_CLOSE_SCHEMA && proof.runId === run.id
+    && proof.companyId === run.companyId && proof.issueId === run.nativeIssueId && proof.clean === true;
+}
+
 /**
  * At the cancellation boundary of a person's Stop of a warm (keep_running)
  * turn, finish the run's own prepared native-workspace export under the run's
@@ -105,8 +122,19 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   )).limit(1);
   if (!run || run.runtimeMode !== "native"
     || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return { outcome: "not_applicable" };
-  if (!hasAcknowledgedNativeStopIntent(run)
-    || (!hasSettledCancellationReceipt(run) && !await hasSettledStopCoordinator(input.db, run))) return { outcome: "not_settled" };
+  if (!hasAcknowledgedNativeStopIntent(run)) return { outcome: "not_settled" };
+  if (!hasSettledCancellationReceipt(run)) {
+    if (!await hasSettledStopCoordinator(input.db, run)) return { outcome: "not_settled" };
+    if (!hasCleanStoppedSessionClose(run)) {
+      // No export, no box command: the descriptor stays `prepared`, so the box
+      // stays a protected export source, and the person reads the true line.
+      await recordCancelledWarmExportOutcome(input.db, run, {
+        reason: TOOLS_NOT_PROVEN_STOPPED, detail: null, timeoutMs: null, line: TOOLS_NOT_PROVEN_LINE });
+      logger.warn({ runId: input.runId, reason: TOOLS_NOT_PROVEN_STOPPED },
+        "Stopped warm turn's session close is not proven clean; its workspace is not exported and the box is kept");
+      return { outcome: "unproven", reason: TOOLS_NOT_PROVEN_STOPPED };
+    }
+  }
 
   const timeoutMs = input.timeoutMs ?? CANCELLED_WARM_EXPORT_TIMEOUT_MS;
   // pl/cancel-finalize2: ONE aggregate bound for the whole export. At the
@@ -167,6 +195,22 @@ export async function finishCancelledWarmWorkspaceExport(input: {
   // restoreWorkspace swaps the reference to the finalized one on success.
   if (!reason && (sync.reference as { state: string }).state !== "finalized") reason = "export_not_finalized";
 
+  await recordCancelledWarmExportOutcome(input.db, run, reason
+    ? { reason, detail, timeoutMs, line: deferredLine(reason) } : { reason: null, detail, timeoutMs, line: null });
+  if (reason) {
+    logger.warn({ runId: input.runId, reason, detail, timeoutMs },
+      "Stopped warm turn's workspace export unproven; the box stays a protected export source");
+    return { outcome: "unproven", reason };
+  }
+  return { outcome: "finalized" };
+}
+
+async function recordCancelledWarmExportOutcome(db: Db, run: typeof heartbeatRuns.$inferSelect, outcome: {
+  reason: string | null; detail: string | null; timeoutMs: number | null; line: string | null;
+}): Promise<void> {
+  const { reason, detail, timeoutMs } = outcome;
+  const line = outcome.line ?? "";
+  const input = { db, runId: run.id, companyId: run.companyId };
   const mark = reason
     ? { state: "unproven", reason, detail, timeoutMs, at: new Date().toISOString() }
     : { state: "finalized", at: new Date().toISOString() };
@@ -179,7 +223,7 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       eventType: reason ? "workspace_export_deferred" : "workspace_export_finalized",
       stream: "system", level: reason ? "warn" : "info",
       message: reason
-        ? deferredLine(reason)
+        ? line
         : "Stopped turn's workspace exported to the host; the warm box stays reusable for the next message.",
       payload: { reason, detail, timeoutMs },
     });
@@ -191,22 +235,16 @@ export async function finishCancelledWarmWorkspaceExport(input: {
       await appendHeartbeatRunEvent(input.db, {
         companyId: run.companyId, agentId: run.agentId, runId: run.id,
         eventType: "provider.notice.recorded", stream: "system", level: "warn",
-        message: deferredLine(reason),
+        message: line,
         payload: { prpEvent: {
           schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
           runId: run.id, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
           payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "workspace_export_deferred",
-            summary: deferredLine(reason), message: deferredLine(reason) },
+            summary: line, message: line },
         } },
       });
     }
   } catch (error) {
     logger.warn({ err: error, runId: input.runId }, "cancelled warm workspace export outcome could not be recorded");
   }
-  if (reason) {
-    logger.warn({ runId: input.runId, reason, detail, timeoutMs },
-      "Stopped warm turn's workspace export unproven; the box stays a protected export source");
-    return { outcome: "unproven", reason };
-  }
-  return { outcome: "finalized" };
 }

@@ -9639,6 +9639,15 @@ async function releaseWarmNativeSession(
   ownerToken: symbol,
   idleTimeoutMs: number,
   failed: boolean,
+  /** pl/r4-work3 (rf-3): ONLY the person-Stop closed-not-retained path passes
+   * this. It surfaces the close result that this release otherwise swallows
+   * (requireCleanClose is false there): clean = closeWarmNativeSession did not
+   * throw, i.e. Pi's transport shutdown ladder completed and, on the Boat path,
+   * the Runner's suspension proof (lifecycle suspended, no pending provider
+   * cleanup) was accepted, since runnerd's close throws
+   * NativeSessionCloseUnrecoverableError otherwise. A controller detached for a
+   * restart closes nothing, so it is never clean. Other callers are unchanged. */
+  onStoppedSessionClose?: (result: { clean: true } | { clean: false; failure: string }) => void,
 ): Promise<void> {
   const entry = warmNativeSessions.get(sessionId);
   // A late completion or cleanup callback from an older execution must never
@@ -9663,10 +9672,15 @@ async function releaseWarmNativeSession(
     const requireCleanClose = entry.closeOnReleaseReason !== undefined;
     entry.closeOnReleaseReason ??= "warm native session failed";
     entry.busy = true;
+    const detachedForRestart = entry.controllerDetachedForRestart === true;
     try {
       await closeWarmNativeSession(entry, entry.closeOnReleaseReason);
       forgetWarmNativeSession(sessionId, entry);
+      onStoppedSessionClose?.(detachedForRestart
+        ? { clean: false, failure: "controller_detached_for_restart" } : { clean: true });
     } catch (error) {
+      onStoppedSessionClose?.({ clean: false,
+        failure: (error instanceof Error ? error.message : String(error)).slice(0, 300) || "close_failed" });
       if (requireCleanClose) throw error;
     } finally { entry.busy = false; }
     return;
@@ -14326,8 +14340,30 @@ async function executePaperclipNativeSessionAttempt(
           if (settled) {
             await stoppedLeaseRenewal;
             if (warmSessionId !== null && lifecyclePolicy.mode === "warm") {
-              await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
-                lifecyclePolicy.idleTimeoutMs, !cancelledSessionRetained));
+              // pl/r4-work3 (rf-3): a CLOSED (not retained) session records its
+              // close result on the run, so the cancellation boundary exports
+              // only when no process of the stopped turn can still write. The
+              // close is the existing bounded ladder; nothing new waits here.
+              const closedSession = !cancelledSessionRetained;
+              const stoppedClose: { result: { clean: boolean; failure?: string } | null } = { result: null };
+              try {
+                await timeController("warm_release", () => releaseWarmNativeSession(warmSessionId, warmSessionOwnerToken,
+                  lifecyclePolicy.idleTimeoutMs, closedSession,
+                  closedSession ? result => { stoppedClose.result = result; } : undefined));
+              } finally {
+                if (closedSession && stoppedClose.result) {
+                  const closeRecord = { schema: "paperclip.native-stopped-session-close.v1",
+                    companyId: input.execution.binding.companyId, issueId: input.execution.binding.issueId,
+                    runId: input.execution.binding.runId, sessionId: nativeSessionKey(input.execution),
+                    ...stoppedClose.result, at: new Date().toISOString() };
+                  await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb)
+                    || ${JSON.stringify({ nativeStoppedSessionClose: closeRecord })}::jsonb` }).where(and(
+                    eq(heartbeatRuns.id, input.execution.binding.runId),
+                    eq(heartbeatRuns.companyId, input.execution.binding.companyId)))
+                    .catch(recordError => logger.warn({ err: recordError, runId: input.execution.binding.runId },
+                      "stopped warm session close result could not be recorded; its workspace will not be exported"));
+                }
+              }
             }
             error = new NativeCancellationPendingRecoveryError();
           }
