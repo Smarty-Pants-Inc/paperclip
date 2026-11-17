@@ -39,6 +39,9 @@ import { collectStoppedInstructionCopyWithRetries } from "../services/agent-inst
 import { HttpError } from "../errors.js";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
+import { agentFileRoots } from "@paperclipai/db";
+import * as storageModule from "../storage/index.js";
+import { Readable } from "node:stream";
 import { logger } from "../middleware/logger.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_DIRECTORY_TEST_DATABASE_URL");
@@ -930,6 +933,87 @@ describe("persistent agent directories", () => {
         .toBe(`Note: "memory/daily.md" was also saved by another run; that version was kept. Your earlier edit is saved as "${copyPath}".`);
     }, 60_000);
   });
+  // Ported from the RFL same-note judge (judge-lifecycle-addition.ts, fixture from judge-samefile.test.ts):
+  // the conflict-side bytes A are in the stopped run's copy, canonical has moved on to B, and the
+  // durable upload of A fails after a prefix (before any head commit). Production retirement
+  // (collectStopped, which retries and then gives up) must keep the only copy of A and a durable retry.
+  // These assertions use only the row and the filesystem, so the same block runs unchanged on N23c (RED).
+  describe("JUDGE same-note retirement variants: failed conflict upload", () => {
+    const objects = { bytes: new Map<string, Buffer>(), failHash: null as string | null, failedPrefix: 0 };
+    const judgeStorage = () => ({
+      provider: "s3" as const,
+      async putFile(input: { companyId: string; namespace: string; body: Readable; byteSize: number; sha256: string }) {
+        if (objects.failHash === input.sha256) {
+          for await (const chunk of input.body) {
+            objects.failedPrefix = Math.min(Buffer.from(chunk).length, Math.floor(input.byteSize / 2));
+            throw new Error("JUDGE interrupted A upload after prefix");
+          }
+        }
+        const chunks: Buffer[] = [];
+        for await (const chunk of input.body) chunks.push(Buffer.from(chunk));
+        const body = Buffer.concat(chunks);
+        expect(body.length).toBe(input.byteSize);
+        expect(fileHash(body)).toBe(input.sha256);
+        const objectKey = `${input.companyId}/${input.namespace}/${randomUUID()}`;
+        objects.bytes.set(objectKey, body);
+        return { objectKey };
+      },
+      async getObject(owner: string, objectKey: string) {
+        expect(objectKey.startsWith(`${owner}/`)).toBe(true);
+        const body = objects.bytes.get(objectKey);
+        if (!body) throw new Error("fixture object missing");
+        return { stream: Readable.from([body]) };
+      },
+      async headObject(_owner: string, key: string) { return { exists: objects.bytes.has(key), lastModified: new Date(0) }; },
+      async deleteObject(owner: string, key: string) { expect(key.startsWith(`${owner}/`)).toBe(true); objects.bytes.delete(key); },
+    });
+    beforeEach(() => {
+      objects.bytes.clear(); objects.failHash = null; objects.failedPrefix = 0;
+      vi.stubEnv("PAPERCLIP_DURABLE_AGENT_FILES", "true");
+      vi.spyOn(storageModule, "getStorageService").mockImplementation(() => judgeStorage() as unknown as ReturnType<typeof storageModule.getStorageService>);
+    });
+    afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
+
+    it.each([false, true])("JUDGE failed conflict upload must retain source through production retirement (warm=%s)", async warm => {
+      const store = agentFileStore(db);
+      await store.write({ ...target(), path: "daily.md", bytes: Buffer.from("C"), baseHash: null }, board());
+      const parked = await run({ warm });
+      expect(parked).toBeTruthy();
+      const A = Buffer.alloc(512 * 1024, 0x41);
+      await fs.writeFile(path.join(parked.localRoot, "daily.md"), A);
+      await store.write({ ...target(), path: "daily.md", bytes: Buffer.from("B"), baseHash: fileHash(Buffer.from("C")) }, board());
+      const [prior] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+      expect(prior).toBeTruthy();
+      objects.failHash = fileHash(A);
+      // Production retirement: the wrapper's collect-with-retries, then heartbeat teardown and the cleanup worker.
+      const saved = await collectStoppedInstructionCopyWithRetries(() => copies.collectStopped({ companyId, runId: parked.runId }));
+      await copies.release(companyId, parked.runId);
+      await copies.recoverCaptured();
+      const source = await fs.readFile(path.join(parked.localRoot, "daily.md")).catch(() => null);
+      const [after] = await db.select().from(agentFileRoots).where(eq(agentFileRoots.agentId, agentId));
+      const row = (await copies.get(companyId, parked.runId))!;
+      console.log("JUDGE failed production retirement", JSON.stringify({ warm, state: saved?.state, code: saved?.errorCode,
+        failedPrefix: objects.failedPrefix, receipt: row.receipt, nextAttemptAt: row.nextAttemptAt, sourceRetained: source !== null,
+        AInObjectStore: [...objects.bytes.values()].some(b => b.equals(A)) }));
+      expect(objects.failedPrefix).toBeGreaterThan(0);
+      expect(after).toEqual(prior);
+      expect(await store.read(companyId, agentId, "daily.md", board())).toEqual(Buffer.from("B"));
+      expect(source, "refused save must keep the only source A, not remove it on terminal cleanup").toEqual(A);
+      // A durable retry exists: the row is held (not completed), its baseline is kept, and a retry is scheduled.
+      expect(row.state).not.toBe("saved");
+      expect((row.receipt as { savePending?: unknown } | null)?.savePending).toBeTruthy();
+      expect(row.receipt?.baseline).toBeTruthy();
+      expect(row.nextAttemptAt).not.toBeNull();
+      // The retry, once storage recovers, durably records A; only then may the temporary tree go.
+      objects.failHash = null;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, parked.runId));
+      await db.update(agentInstructionWorkingCopies).set({ nextAttemptAt: new Date(Date.now() - 1000) }).where(eq(agentInstructionWorkingCopies.runId, parked.runId));
+      const restarted = agentInstructionWorkingCopyService(db);
+      await restarted.recoverStopped();
+      expect((await restarted.get(companyId, parked.runId))?.state).toBe("saved");
+      expect([...objects.bytes.values()].some(b => b.equals(A))).toBe(true);
+    }, 60_000);
+  });
   it("checks quota for a small editor save without reading unrelated file bytes", async () => {
     const asset = path.join(root, "large.bin");
     await sparseFile(asset, MAX_AGENT_FILE_BYTES);
@@ -941,10 +1025,10 @@ describe("persistent agent directories", () => {
     } finally { open.mockRestore(); }
   });
 
-  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the temporary copy was deleted
+  // supersedes (fail-closed): the old test asserted the temporary copy was deleted
   // (ENOENT + compacted baseline) after an over-quota save. That discarded the only
   // copy of "changed instructions". It now asserts retention under a held save.
-  it("SUPERSEDED-BY-FAIL-CLOSED: reports an oversized run file without a partial save and retains its unsaved source", async () => {
+  it("supersedes: reports an oversized run file without a partial save and removes its temporary copy → reports an oversized run file without a partial save and retains its unsaved source", async () => {
     const copy = await run();
     await sparseFile(path.join(copy.localRoot, "too-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     await fs.writeFile(path.join(copy.localRoot, entryFile), "changed instructions");
@@ -988,9 +1072,9 @@ describe("persistent agent directories", () => {
     expect(await fs.readFile(path.join(next.localRoot, "task-output.txt"), "utf8")).toBe("work continues");
   }, 30_000);
 
-  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted ENOENT for the first run's copy after its
+  // supersedes (fail-closed): the old test asserted ENOENT for the first run's copy after its
   // stopped save hit the limit. A failed stopped save now holds its source; later runs still start.
-  it("SUPERSEDED-BY-FAIL-CLOSED: starts successive runs with an already oversized saved file and lets the agent remove it", async () => {
+  it("supersedes: starts successive runs with an already oversized saved file and lets the agent remove it → the first run's unsaved copy is retained and successive runs still start", async () => {
     await sparseFile(path.join(root, "old-large.bin"), MAX_AGENT_FILE_BYTES + 1);
     const first = await run();
     expect(first.state).toBe("prepared");
@@ -1029,14 +1113,14 @@ describe("persistent agent directories", () => {
     } finally { sizes.mockRestore(); }
   });
 
-  it("rejects more than 2 GiB in aggregate before hashing or saving any file", async () => {
+  it("supersedes: rejects more than 2 GiB in aggregate before hashing or saving any file → the limit reason is kept in the held save receipt", async () => {
     expect(MAX_AGENT_DIRECTORY_BYTES).toBe(2 * 1024 * 1024 * 1024);
     const copy = await run();
     for (let index = 0; index < 8; index++) await sparseFile(path.join(copy.localRoot, `part-${index}.bin`), MAX_AGENT_FILE_BYTES);
     // The eight allowed files exactly fill the quota; the entry is additional.
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(result).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION });
-    // SUPERSEDED-BY-FAIL-CLOSED: the limit reason moved from errorMessage to the held save receipt.
+    // supersedes (fail-closed): the limit reason moved from errorMessage to the held save receipt.
     expect((result?.receipt?.savePending as { reason?: string }).reason).toContain("2 GiB total storage limit");
     expect(await fs.readdir(root)).toEqual(["policy"]);
   });
@@ -1053,9 +1137,9 @@ describe("persistent agent directories", () => {
     } finally { readdir.mockRestore(); }
   }, 30_000);
 
-  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the failed copy was deleted (ENOENT).
+  // supersedes (fail-closed): the old test asserted the failed copy was deleted (ENOENT).
   // The over-limit entry is the only copy of that edit; it is now retained under a held save.
-  it("SUPERSEDED-BY-FAIL-CLOSED: keeps the entry's 1 MiB limit and retains the unsaved source after failed synchronization", async () => {
+  it("supersedes: keeps the entry's 1 MiB limit and cleans up failed synchronization → keeps the entry's 1 MiB limit and retains the unsaved source after failed synchronization", async () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
@@ -1355,9 +1439,9 @@ describe("persistent agent directories", () => {
     await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted ENOENT for the copy holding "innocent.txt".
+  // supersedes (fail-closed): the old test asserted ENOENT for the copy holding "innocent.txt".
   // That valid unsaved file is now retained; the symlink is still never saved.
-  it.each([false, true])("SUPERSEDED-BY-FAIL-CLOSED: rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s", async (full) => {
+  it.each([false, true])("supersedes: rejects symlinks without saving any part of the tree, preserving an existing full-storage warning: %s → the valid unsaved file is retained", async (full) => {
     if (full) await sparseFile(path.join(root, "full.bin"), MAX_AGENT_FILE_BYTES);
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, "innocent.txt"), "changed");
@@ -1516,9 +1600,9 @@ describe("persistent agent directories", () => {
     await fs.rm(path.join(copy.localRoot, "escape"));
     expect((await copies.collectStopped({ companyId, runId: copy.runId }))?.state).toBe("unchanged");
   });
-  // SUPERSEDED-BY-FAIL-CLOSED: the old test asserted the warm directory was deleted
+  // supersedes (fail-closed): the old test asserted the warm directory was deleted
   // (ENOENT) after an over-quota stopped save. It now asserts the source is held.
-  it("SUPERSEDED-BY-FAIL-CLOSED: rejects over-quota warm changes without replacing saved bytes, retains them, then permits a clean future run", async () => {
+  it("supersedes: rejects over-quota warm changes without replacing saved bytes, then permits a clean future run → rejects over-quota warm changes without replacing saved bytes, retains them, then permits a clean future run", async () => {
     const copy = await run({ warm: true });
     const handle = await fs.open(path.join(copy.localRoot, "too-large.bin"), "w");
     await handle.truncate(MAX_AGENT_FILE_BYTES + 1); await handle.close();
