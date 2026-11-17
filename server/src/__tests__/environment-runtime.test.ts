@@ -30,6 +30,7 @@ import {
   secretAccessEvents,
   createDb,
   environmentLeases,
+  environmentCustomImageTemplates,
   sandboxCreationOperations,
   environments,
   executionWorkspaces,
@@ -5333,10 +5334,17 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
   // CR6: harness custody does not include a detached writer's workspace files.
   // KEEP: never-OK data loss. Exercise each obsolete destroy arm and the
   // already-stopped released population through real DB admission and cleanup.
-  it.each(["known non-native", "verified native backup", "previous-boot closed active tip", "already-stopped released", "already-stopped released without receipt"] as const)(
-    "CR6 source-change keeps workspace bytes: %s", async arm => {
+  it.each([
+    ...["known non-native", "verified native backup", "previous-boot closed active tip", "already-stopped released", "already-stopped released without receipt"].map(arm => ({ arm, change: "source" })),
+    ...["known non-native", "verified native backup", "previous-boot closed active tip"].map(arm => ({ arm, change: "pinned snapshot" })),
+    { arm: "verified native backup", change: "same-source fingerprint" },
+  ])("CR6 source-change cleanup: $arm / $change", async ({ arm, change }) => {
+    const pinnedSnapshot = change === "pinned snapshot";
+    const sameSource = change === "same-source fingerprint";
     const pluginId = randomUUID();
-    const providerConfig = { provider: "fake-plugin", from: "snapshot-a", reuseLease: true, timeoutMs: 1234 };
+    // The real sandbox envelope is flat: provider and boot fields are siblings.
+    const providerConfig = { provider: "fake-plugin", ...(pinnedSnapshot ? { image: "unchanged-image" } : { from: "snapshot-a" }),
+      cpu: 1, region: "eu", reuseLease: true, timeoutMs: 1234 };
     const { companyId, agentId, environment, runId } = await seedEnvironment({ driver: "sandbox", config: providerConfig });
     const issueId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Detached workspace writer", status: "in_progress", assigneeAgentId: agentId });
@@ -5372,7 +5380,7 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       }),
     } as unknown as PluginWorkerManager;
     const service = environmentRuntimeService(db, { pluginWorkerManager: workerManager });
-    const adapterType = arm === "known non-native" ? "codex_local" : "paperclip_runner";
+    let adapterType = arm === "known non-native" ? "codex_local" : "paperclip_runner";
     const acquire = (selected: Environment, selectedRunId: string) => service.acquireRunLease({
       companyId, environment: selected, issueId, agentId, adapterType, heartbeatRunId: selectedRunId, persistedExecutionWorkspace: null,
     });
@@ -5416,8 +5424,31 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       boxes.get(providerLeaseId)!.detachedFile = detachedFile;
       if (alreadyStopped) boxes.get(providerLeaseId)!.state = "stopped";
       const stoppedBefore = (await environmentService(db).getLeaseById(first.lease.id))!;
-      const changed = { ...environment, config: { ...providerConfig, from: "snapshot-b" } };
-      await environmentService(db).update(environment.id, { config: changed.config });
+      const changed = { ...environment, config: pinnedSnapshot ? { ...providerConfig }
+        : sameSource ? { ...providerConfig, region: "us" } : { ...providerConfig, from: "snapshot-b" } };
+      const snapshotId = "cr6-pinned-snapshot-b";
+      if (pinnedSnapshot) {
+        // A captured snapshot replaces the base image at runtime. Qualify the
+        // immutable ID through the real DB/template resolver, without mocks.
+        // Pinning is native-only, including a transition from a non-native lease.
+        adapterType = "paperclip_runner";
+        const templateId = randomUUID(), capturedAt = new Date();
+        await db.insert(environmentCustomImageTemplates).values({ id: templateId, environmentId: environment.id,
+          provider: providerConfig.provider, templateKind: "snapshot", templateRef: "captured-snapshot", capturedAt });
+        const runtimeConfig = await resolveEnvironmentDriverConfigForRuntime(db, companyId, changed, { issueId });
+        changed.metadata = { ...changed.metadata, paperclipSandboxPlatformProbes: { [companyId]: {
+          v: 2, companyId, snapshot: "captured-snapshot",
+          template: { id: templateId, capturedAt: capturedAt.toISOString(), templateKind: "snapshot", bindingField: "snapshot" },
+          baseConfigFingerprint: createHash("sha256").update(stableStringify(changed.config)).digest("hex"),
+          runtimeConfigFingerprint: createHash("sha256").update(stableStringify(runtimeConfig.config)).digest("hex"),
+          snapshotIdentity: { provider: providerConfig.provider, requestedRef: "captured-snapshot", id: snapshotId,
+            name: "captured-snapshot", organizationId: "provider-account", createdAt: capturedAt.toISOString() },
+        } } };
+        expect(changed.config).toEqual(environment.config);
+        expect(runtimeConfig.config).toMatchObject({ snapshot: "captured-snapshot" });
+        expect(runtimeConfig.config).not.toHaveProperty("image");
+      }
+      await environmentService(db).update(environment.id, { config: changed.config, metadata: changed.metadata });
       const nextRunId = randomUUID();
       await insertRunningManualRun(nextRunId, companyId, agentId);
       vi.mocked(workerManager.call).mockClear();
@@ -5425,6 +5456,20 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
       expect(next.lease.providerLeaseId).not.toBe(providerLeaseId);
       expect(next.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "created" });
       expect(acquisitions).toBe(2);
+      if (pinnedSnapshot) {
+        expect(next.lease.metadata).toMatchObject({ snapshot: snapshotId });
+        expect(next.lease.metadata).not.toHaveProperty("image");
+        expect((await environmentService(db).getById(environment.id))!.config).toEqual(environment.config);
+      }
+      if (sameSource) {
+        expect(workerManager.call).toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.objectContaining({ providerLeaseId }), expect.any(Number));
+        expect(boxes.has(providerLeaseId)).toBe(false);
+        await expect(environmentService(db).getLeaseById(first.lease.id)).resolves.toMatchObject({
+          status: "expired", cleanupStatus: "success", failureReason: "lease_fingerprint_mismatch",
+        });
+        expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentStopLease", expect.anything(), expect.anything());
+        return;
+      }
       expect(workerManager.call).not.toHaveBeenCalledWith(pluginId, "environmentDestroyLease", expect.anything(), expect.anything());
       const pending = (await environmentService(db).getLeaseById(first.lease.id))!;
       if (alreadyStopped) {
