@@ -4,7 +4,7 @@ import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restor
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
 import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
 import { isAgentDirectoryPreparationWait } from "../../../services/pre-dispatch-execution-evidence.js";
-import { isUserCommentContinuationReason } from "../../../services/explicit-native-continuation.js";
+import { admitExplicitNativeContinuation, isUserCommentContinuationReason } from "../../../services/explicit-native-continuation.js";
 import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
 import { notifyExternalAgentSettlement } from "../../external-agents/index.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-workspace-export-notifications.js";
@@ -140,6 +140,10 @@ type CancelSuppressedRetryInput = {
   details: Record<string, unknown>;
 };
 type CancelSuppressedRetryResult = { applied: true; run: HeartbeatRun } | { applied: false };
+
+/** One deadline from a person's Stop for a follow-up to wait out the stopped
+ * run's in-flight file restore before the claim falls back to its hold. */
+const SETTLING_RESTORE_WAIT_MS = 60_000;
 
 const NO_REVIEW_PARTICIPANT: ReviewParticipantFacts = {
   isInReview: false,
@@ -1432,6 +1436,56 @@ export function createPostgresRunDispatchAdapter(
     return { outcome: "deferred" as const, postCommitEffects: [statusEffect(waiting, run.status)] };
   }
 
+  /**
+   * A message sent seconds after a person's Stop can reach this claim while the
+   * stopped run's saved files are still being put back. That restore is in
+   * flight, not failed. The same unstarted follow-up waits for it, bounded by
+   * one deadline from the Stop, and is then admitted as that person's explicit
+   * continuation through the ordinary admission (which still applies every stop,
+   * writer and file check). Only a restore that ended blocked after its own
+   * retries, or a passed deadline, reaches the cancellation below.
+   */
+  async function admitAfterSettlingRestoreInTx(tx: Db, run: HeartbeatRun, issueId: string, now: Date,
+    blocker: Awaited<ReturnType<typeof getExecutionBlocker>>) {
+    const recovery = blocker?.workspaceRecovery;
+    if (!blocker?.runId || !blocker.recoveryActionId || !recovery || blocker.runId === run.id || !run.wakeupRequestId
+      || run.startedAt || run.processPid || run.processGroupId || run.retryOfRunId) return null;
+    const [source] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId),
+      eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.id, blocker.runId)));
+    const stoppedAt = source ? userStopBoundaryAt(source) : null;
+    if (!source?.finishedAt || source.status !== "cancelled" || !recordedUserStop(source) || !stoppedAt) return null;
+    const context = parseObject(run.contextSnapshot), commentId = deriveCommentId(context);
+    const reason = readNonEmptyString(context.wakeReason);
+    if (!commentId || !isUserCommentContinuationReason(reason)) return null;
+    const [wake] = await tx.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+      eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.runId, run.id),
+      inArray(agentWakeupRequests.status, ["queued", "claimed"])));
+    if (wake?.requestedByActorType !== "user" || !wake.requestedByActorId) return null;
+    const [comment] = await tx.select({ createdAt: issueComments.createdAt }).from(issueComments).where(and(
+      eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId), eq(issueComments.id, commentId),
+      eq(issueComments.authorType, "user"), eq(issueComments.authorUserId, wake.requestedByActorId),
+      isNull(issueComments.createdByRunId), sql`${issueComments.deletedAt} is null`));
+    if (!comment || comment.createdAt <= stoppedAt) return null;
+    // A conversation reset (/new) keeps its own saved-and-replayed path.
+    const carried = queuedCommentIdsFromRunContext(context);
+    const [reset] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, run.companyId), eq(issueComments.issueId, issueId),
+      inArray(issueComments.id, [...new Set([commentId, ...carried])]), sql`btrim(${issueComments.body}) = '/new'`)).limit(1);
+    if (reset) return null;
+    if (recovery.status === "queued" || recovery.status === "recovering")
+      return now.getTime() < source.finishedAt.getTime() + SETTLING_RESTORE_WAIT_MS
+        ? { outcome: "deferred" as const, postCommitEffects: [] } : null;
+    if (recovery.status !== "recovered") return null;
+    const admitted = await admitExplicitNativeContinuation({ db: tx, companyId: run.companyId, issueId,
+      agentId: run.agentId, actorType: "user", actorId: wake.requestedByActorId, reason, commentId, successorRunId: run.id });
+    if (!admitted) return null;
+    await tx.update(heartbeatRuns).set({ contextSnapshot: { ...context, forceFreshSession: true,
+      previousRunId: admitted.previousRunId, explicitUserContinuation: admitted }, updatedAt: now })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "queued")));
+    return { outcome: "not_stale" as const };
+  }
+
   async function settleOlderRunHold(tx: Db, run: HeartbeatRun, issueId: string,
     blocker: NonNullable<Awaited<ReturnType<typeof getExecutionBlocker>>>, now: Date) {
     if (!blocker.recoveryActionId || !blocker.runId || blocker.runId === run.id) return;
@@ -1466,6 +1520,8 @@ export function createPostgresRunDispatchAdapter(
         return { outcome: "not_stale" as const };
       }
       if (input.expectedStatus === "queued" && decision.errorCode === "execution_reconciliation_required") {
+        const settling = await admitAfterSettlingRestoreInTx(tx, run, issueId, input.now, executionBlocker);
+        if (settling) return settling;
         const deferred = await deferRetryForCleanupInTx(tx, run, issueId, input.now, executionBlocker);
         if (deferred) return deferred;
       }
