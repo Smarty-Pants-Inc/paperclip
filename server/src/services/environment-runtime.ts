@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { AGENT_FILE_DESTROY_CLAIM_KEY, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -3702,7 +3702,8 @@ function createSandboxEnvironmentDriver(
           // The row this destroy read, plus its own claim (nothing else may
           // write the lease while the claim is live).
           : { expectedSnapshot: { status: input.lease.status,
-            metadata: { ...(input.lease.metadata ?? {}), [AGENT_FILE_DESTROY_CLAIM_KEY]: input.claim } } }),
+            metadata: { ...(input.lease.metadata ?? {}), [AGENT_FILE_DESTROY_CLAIM_KEY]: input.claim,
+              [AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY]: input.lease.metadata?.pendingCleanupAttemptId ?? null } } }),
         destroyClaim: input.claim,
         failureReason: input.failureReason,
         cleanupStatus,

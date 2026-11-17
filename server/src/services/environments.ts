@@ -1,4 +1,4 @@
-import { AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY } from "./agent-file-save-hold.js";
 import { notifyEnvironmentConfigChange, withEnvironmentConfigChange } from "./environment-config-revision.js";
 import { carryReusableLeasePreparation, createReusableLeaseHandoff, preserveReusableLeaseHandoff, withoutReusableLeaseHandoff } from "./environment-lease-handoff.js";
 import { inheritWarmRetentionMetadata } from "./environment-warm-retention.js";
@@ -1766,7 +1766,7 @@ export function environmentService(db: Db) {
       // "destroyed" one, leaves a live claim alone.
       const baseMetadata = options?.destroyClaim
         ? sql`(case when ${environmentLeases.metadata}->>${AGENT_FILE_DESTROY_CLAIM_KEY}::text = ${options.destroyClaim}::text
-            then ${environmentLeases.metadata} - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text else ${environmentLeases.metadata} end)`
+            then ${environmentLeases.metadata} - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text - ${AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY}::text else ${environmentLeases.metadata} end)`
         : sql`${environmentLeases.metadata}`;
       const releaseMetadata = options?.remoteExecutionTermination
         ? sql`coalesce(${baseMetadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`

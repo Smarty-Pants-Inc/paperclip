@@ -28,7 +28,20 @@ export async function agentFileSaveHeldOnLease(db: Pick<Db, "execute">, lease: H
 export const AGENT_FILE_DESTROY_CLAIM_KEY = "agentFileDestroyClaim";
 /** Lease metadata map: collecting copy key -> pin token, set while a stopped collection is in flight. */
 export const AGENT_FILE_COLLECTION_PINS_KEY = "agentFileCollectionPins";
+/** The lease's pending-cleanup attempt the claim was taken under (JSON null when none). */
+export const AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY = "agentFileDestroyClaimAttempt";
 export const AGENT_FILE_DESTROY_REFUSED_MESSAGE = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
+
+/**
+ * A destroy claim is live unless the lease's fenced cleanup ownership moved
+ * on: a newer pending-cleanup attempt (the sweep proved the old owner dead or
+ * its in-flight deadline passed) supersedes a claim taken under another
+ * attempt, so a crashed destroy cannot block the retry forever. Any other
+ * destroy is refused while the claim is live.
+ */
+export const liveDestroyClaimSql = (metadata: SQL) => sql`(coalesce(${metadata}, '{}'::jsonb) ? ${AGENT_FILE_DESTROY_CLAIM_KEY}::text
+  and not coalesce(jsonb_typeof(${metadata}->'pendingCleanupAttemptId') = 'string'
+    and ${metadata}->'pendingCleanupAttemptId' is distinct from ${metadata}->${AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY}::text, false))`;
 
 /**
  * Every lease row of one provider ALLOCATION (the same company and provider
@@ -65,7 +78,7 @@ export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): 
   if (typeof (db as Db).transaction !== "function") return (await agentFileSaveHeldOnLease(db, lease)) ? null : randomUUID();
   return await db.transaction(async tx => {
     const locked = await (tx as unknown as Db).execute(sql`select alloc.id,
-        coalesce(alloc.metadata, '{}'::jsonb) ? ${AGENT_FILE_DESTROY_CLAIM_KEY}::text as claimed,
+        ${liveDestroyClaimSql(sql`alloc.metadata`)} as claimed,
         coalesce(alloc.metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text, '{}'::jsonb) <> '{}'::jsonb as pinned
       from (${allocationRows(sql`${lease.id}`)}) alloc`) as Array<{ id: string; claimed?: unknown; pinned?: unknown }>;
     if (!Array.isArray(locked) || !locked.some(row => row.id === lease.id)) return null;
@@ -73,7 +86,8 @@ export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): 
     if (await agentFileSaveHeldOnLease(tx as unknown as Db, lease)) return null;
     const token = randomUUID();
     await (tx as unknown as Db).execute(sql`update environment_leases set metadata = coalesce(metadata, '{}'::jsonb)
-      || jsonb_build_object(${AGENT_FILE_DESTROY_CLAIM_KEY}::text, ${token}::text) where id = ${lease.id}`);
+      || jsonb_build_object(${AGENT_FILE_DESTROY_CLAIM_KEY}::text, ${token}::text,
+        ${AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY}::text, coalesce(metadata->'pendingCleanupAttemptId', 'null'::jsonb)) where id = ${lease.id}`);
     return token;
   });
 }
@@ -88,7 +102,7 @@ export async function claimLeaseForDestroyUnlessHeld(db: Db, lease: HoldLease): 
  */
 export async function releaseLeaseDestroyClaim(db: Db, leaseId: string, token: string, readReceipt?: unknown): Promise<void> {
   if (typeof (db as Db).execute !== "function") return;
-  await (db as Db).execute(sql`update environment_leases set metadata = metadata - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text
+  await (db as Db).execute(sql`update environment_leases set metadata = metadata - ${AGENT_FILE_DESTROY_CLAIM_KEY}::text - ${AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY}::text
     where id = ${leaseId} and metadata->>${AGENT_FILE_DESTROY_CLAIM_KEY}::text = ${token}::text
       and metadata->'remoteExecutionTermination' is not distinct from ${readReceipt === undefined || readReceipt === null ? null : JSON.stringify(readReceipt)}::jsonb`);
 }
@@ -127,7 +141,7 @@ export async function pinLeaseForCollection(db: Db, leaseId: string, copyKey: st
       update environment_leases set metadata = jsonb_set(coalesce(metadata, '{}'::jsonb), array[${AGENT_FILE_COLLECTION_PINS_KEY}::text],
         coalesce(metadata->${AGENT_FILE_COLLECTION_PINS_KEY}::text, '{}'::jsonb) || jsonb_build_object(${copyKey}::text, ${token}::text))
       where id = ${leaseId} and (select count(*) from alloc) > 0
-        and not exists (select 1 from alloc where coalesce(alloc.metadata, '{}'::jsonb) ? ${AGENT_FILE_DESTROY_CLAIM_KEY}::text)
+        and not exists (select 1 from alloc where ${liveDestroyClaimSql(sql`alloc.metadata`)})
       returning id)
     select (select count(*) from pinned)::int as pinned, (select count(*) from alloc where alloc.id::text = ${leaseId})::int as present`) as Array<{ pinned: number; present: number }>;
   if (result?.pinned === 1) return token;
@@ -149,5 +163,5 @@ export async function unpinLeaseForCollection(db: Db, leaseId: string, copyKey: 
  * for an in-flight destroy claim to commit) and refuses the write when a
  * destroy is claimed on any of them. No bound lease: no condition.
  */
-export const agentFileHoldWriteCondition = sql`(select bool_or(coalesce(held_lock.metadata, '{}'::jsonb) ? ${AGENT_FILE_DESTROY_CLAIM_KEY}::text)
+export const agentFileHoldWriteCondition = sql`(select bool_or(${liveDestroyClaimSql(sql`held_lock.metadata`)})
     from (${allocationRows(sql`agent_instruction_working_copies.receipt->'cleanup'->>'leaseId'`)}) held_lock) is not true`;
