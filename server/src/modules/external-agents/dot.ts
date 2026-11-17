@@ -197,6 +197,17 @@ function createBroker(db: Db) {
         throw error;
       }
     },
+    /** Read only, for the task card: the hold `canStartNewWork` (the dispatcher's
+     * external-bot gate, heartbeat/queue.ts claimQueuedRun) refuses on, from the
+     * same rows `snapshot` reads. No reconciliation and no grant check: null when
+     * these read-only checks pass. */
+    async newWorkHold(companyId: string, agentId: string, bindingId: string): Promise<"external_agent_setup" | "external_agent_busy" | null> {
+      const state = await this.bindingForAgent(companyId, agentId);
+      if (!state || !await enabled(state.providerKind) || state.id !== bindingId || state.status !== "ready" || !state.wakeVerified
+        || (state.providerKind === "grok_bot" && await grokRoutineService(db).recoveryNeeded(companyId, agentId))) return "external_agent_setup";
+      const [active] = await db.select({ id: assignments.id }).from(assignments).where(and(eq(assignments.bindingId, bindingId), inArray(assignments.status, ["offered", "accepted"])));
+      return active ? "external_agent_busy" : null;
+    },
     async snapshot(companyId: string, agentId: string, bindingId: string): Promise<DotBindingSnapshot> {
       const state = await this.bindingForAgent(companyId, agentId);
       if (!state || !await enabled(state.providerKind)) throw fail("External provider is disabled for new work.");

@@ -4,6 +4,7 @@ import { boundSetupCommandFailure, readSetupCommandFailure } from "./workspace-s
 import { and, desc, eq, inArray, isNull, not, notInArray, sql, type SQL } from "drizzle-orm";
 import { unidentifiedLocalLaunchRefusals } from "./native-local-process-stop.js";
 import { nativeSessionCleanupBlock } from "../vendor/paperclip-runner/index.js";
+import { dotRunnerBroker, externalBotStartGateBindingId } from "./dot-runner-broker.js";
 import { agents, agentWakeupRequests, approvals, chatActions, companies, environmentLeases, heartbeatRuns, issueApprovals, issueRecoveryActions,
   caseHandoffs, issues, issueTreeHoldMembers, issueTreeHolds, nativeRunFinalizations, nativeRunResults, projects, type Db } from "@paperclipai/db";
 import { unionAll } from "drizzle-orm/pg-core";
@@ -140,7 +141,8 @@ type ProjectionState = {
 
 /** Task-level start holds and their true line (rf-3 / RFL 20:46Z). Not a failed
  * start, and no Retry: a fresh run would wait on the same hold. */
-type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "previous_session_cleanup" | "case_handoff" | "agent_setup";
+type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "previous_session_cleanup" | "case_handoff" | "agent_setup"
+  | "external_agent_setup" | "external_agent_busy";
 const taskStartHoldMessages: Record<TaskStartHold, string> = {
   previous_run_running: "Waiting: the previous run on this task is still finishing. Your message is saved and starts after it.",
   previous_run_cleanup: "Waiting: the previous run is still cleaning up. Your message is saved and starts when it finishes.",
@@ -148,6 +150,9 @@ const taskStartHoldMessages: Record<TaskStartHold, string> = {
   previous_session_cleanup: NATIVE_CLEANUP_SETTLING_MESSAGE,
   case_handoff: "Waiting: this task is being handed off. Your message is saved and starts when the handoff completes.",
   agent_setup: "Waiting: the agent is still being set up. Your message is saved and starts when setup finishes.",
+  // heartbeat/queue.ts claimQueuedRun external-bot gate (dot.ts canStartNewWork).
+  external_agent_setup: "Waiting: this external agent's connection is not ready for new work. Your message is saved and starts when it is reconnected.",
+  external_agent_busy: "Waiting: this external agent is finishing another assignment. Your message is saved and starts after it.",
 };
 
 // A task read reports the change that made a task fail, not every later read of
@@ -846,9 +851,33 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     const busy = new Set(agentRows.filter(agent => (running.get(agent.id) ?? 0) >= parseHeartbeatPolicy(agent).maxConcurrentRuns)
       .map(agent => agent.id));
     const endedAt = new Map(endRows.map(row => [row.runId, row.endedAt]));
+    // A task-level hold that CLEARED after this run was queued restarts the
+    // clock at the clear (RFL 20:46Z, rf-3 22:23Z), from existing fields only:
+    // - previous run of this task ending (any agent): heartbeat_runs.finished_at;
+    // - its sandbox cleanup settling: environment_leases.updated_at of a lease of
+    //   this task's runs now cleanup_status = 'success';
+    // - a case handoff leaving awaiting_release / pending_dispatch: case_handoffs.updated_at.
+    // Agent setup, the in-process native session cleanup, a budget pause and the
+    // external-bot gate store no clear time (named in the fix12 result).
+    const clearRows = await Promise.all(personQueued.map(async run => {
+      const created = run.createdAt!.toISOString();
+      const result = await db.execute<{ cleared_at: string | null }>(sql`select greatest(
+        (select max(prior.finished_at) from heartbeat_runs prior where prior.company_id = ${companyId}::uuid
+          and prior.issue_id = ${run.issueId}::uuid and prior.id <> ${run.id}::uuid and prior.finished_at > ${created}::timestamptz),
+        (select max(lease.updated_at) from environment_leases lease where lease.company_id = ${companyId}::uuid
+          and lease.cleanup_status = 'success' and lease.updated_at > ${created}::timestamptz
+          and lease.heartbeat_run_id in (select prior.id from heartbeat_runs prior where prior.company_id = ${companyId}::uuid
+            and prior.issue_id = ${run.issueId}::uuid and prior.id <> ${run.id}::uuid)),
+        (select max(handoff.updated_at) from case_handoffs handoff where handoff.company_id = ${companyId}::uuid
+          and handoff.issue_id = ${run.issueId}::uuid and handoff.state not in ('awaiting_release', 'pending_dispatch')
+          and handoff.updated_at > ${created}::timestamptz)) as cleared_at`);
+      const value = [...result][0]?.cleared_at ?? null;
+      return [run.id, value ? new Date(value).getTime() : 0] as const;
+    }));
+    const clearedAt = new Map(clearRows);
     for (const run of personQueued) {
       if (busy.has(run.agentId)) continue;
-      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0));
+      queuedRunStartableSince.set(run.id, Math.max(run.createdAt!.getTime(), endedAt.get(run.id) ?? 0, clearedAt.get(run.id) ?? 0));
     }
   }
   // Task-level start holds for those person runs, read from the same rows the
@@ -887,7 +916,13 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       if (agent?.adapterType === "paperclip_runner" && nativeSessionCleanupBlock({ companyId, issueId: run.issueId })) {
         taskStartHolds.set(run.id, "previous_session_cleanup"); continue;
       }
-      if (agent && isAgentAwaitingSetup(agent)) taskStartHolds.set(run.id, "agent_setup");
+      if (agent && isAgentAwaitingSetup(agent)) { taskStartHolds.set(run.id, "agent_setup"); continue; }
+      // heartbeat/queue.ts claimQueuedRun: the external-bot gate (canStartNewExternalBotWork).
+      const externalBindingId = agent ? externalBotStartGateBindingId(agent) : null;
+      if (agent && externalBindingId !== null) {
+        const hold = await dotRunnerBroker(db).newWorkHold(companyId, agent.id, externalBindingId).catch(() => null);
+        if (hold) taskStartHolds.set(run.id, hold);
+      }
     }
   }
   const waitingContinuationRunIds = new Set(continuationRows.map(row => row.runId));

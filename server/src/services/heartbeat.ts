@@ -43,7 +43,7 @@ import { heartbeatExternalProvider, nativeRuntimeHasInstructionFilesystem } from
 import { pendingCaseHandoffForRun, recordCaseHandoffExecutionReleased, recordLegacyCaseHandoffCleanupIntent, recordLegacyCaseHandoffCleanupVerified } from "./heartbeat/case-handoff-lifecycle.js";
 import { recordLegacyPreparationSettlement, recordLegacyProcessSettlement, recoverLegacyProcessSettlement } from "./heartbeat/legacy-process-settlement.js";
 import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } from "./heartbeat/process-settlement.js";
-import { dotRunnerBroker } from "./dot-runner-broker.js";
+import { dotRunnerBroker, externalBotStartGateBindingId } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
 import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
 import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
@@ -1339,11 +1339,9 @@ export function heartbeatService(
 
   const heartbeatQueue = createHeartbeatQueue(db, {
     canStartNewExternalBotWork: async agent => {
-      if (agent.adapterType !== "paperclip_runner" || agent.adapterConfig.provider !== "grok_bot") return true;
-      const aiConnection = aiRuntimeConnectionBindingSchema.safeParse(agent.runtimeConfig?.aiConnection);
-      if (aiConnection.success && aiConnection.data.mode === "router") return true;
-      return dotRunnerBroker(db).canStartNewWork(agent.companyId, agent.id,
-        readNonEmptyString(agent.adapterConfig.externalBindingId) ?? "");
+      const bindingId = externalBotStartGateBindingId(agent);
+      if (bindingId === null) return true;
+      return dotRunnerBroker(db).canStartNewWork(agent.companyId, agent.id, bindingId);
     },
     applyWakeQueuePostCommitEffects,
     setRunStatusFromLive,
