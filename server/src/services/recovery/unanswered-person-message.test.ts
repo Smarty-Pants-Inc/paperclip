@@ -761,7 +761,8 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // The sweep falsely said "no run started" while that attempt was pending.
   async function stoppedMessageWithWait(status: string, executionWait: unknown) {
     const f = await fixture();
-    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    const beforeStopId = await f.message("Before Stop");
+    await f.run({ commentId: beforeStopId, status: "cancelled", errorCode: "cancelled" });
     const commentId = await f.message("After Stop, please continue.");
     const now = new Date();
     const createdAt = new Date(now.getTime() - 120_000);
@@ -770,11 +771,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
       source: "on_demand", reason: "issue_execution_deferred", requestedByActorType: "user",
       requestedByActorId: f.userId, status, payload, createdAt, updatedAt: createdAt }).returning();
-    return { ...f, commentId, wakeId: wake!.id, now };
+    return { ...f, beforeStopId, commentId, wakeId: wake!.id, now };
   }
 
   it.each(["deferred", "deferred_issue_execution"])(
-    "waitnote S10-1: %s remote_cleanup after Stop stays pending, then its completed wake's run answers without a resend notice", async status => {
+    // Reason (R-ONCE): the reply's run carried only the After-Stop message, so the cancelled Before-Stop message
+    // is no longer settled by it; its one true notice remains. The After-Stop message still gets no resend notice.
+    "supersedes(R-ONCE carried, RFL 18:33Z): waitnote S10-1: %s remote_cleanup after Stop stays pending, then its completed wake's run answers without a resend notice", async status => {
       const f = await stoppedMessageWithWait(status, { reason: "remote_cleanup",
         message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null });
       // The production sweep entry, not just its decision helper, must be quiet
@@ -797,8 +800,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
       await f.reply(runId);
       await f.sweep();
-      expect(await f.visible()).toHaveLength(0);
-      const history = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+      expect((await f.visible()).map(note => note.metadata?.authorizationReason)).toEqual([`unanswered_message:${f.beforeStopId}`]);
+      const history = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId),
+        eq(issueComments.authorType, "system"), sql`${issueComments.metadata}->>'authorizationReason' = ${`unanswered_message:${f.commentId}`}`));
       expect(history.map(note => note.body)).toEqual([WAITING]);
       expect(history[0]!.deletedAt).not.toBeNull();
     });
@@ -1430,6 +1434,86 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     expect(await f.visible()).toHaveLength(0);
   });
 
+  // R-ONCE (RFL 18:19Z, rf5 18:36Z; live: c1 gate 4 S1 case 1, run f28f4309): a later input's answer counts
+  // for M ONLY if the answering run had M in its own PENDING input. M0014 sat in f28f4309's transcript
+  // history only; its wake named M0015 alone (wakeCommentIds null, automation) and it answered M0015 only.
+  describe("R-ONCE: an answer counts for M only from a run that had M as pending input", () => {
+    async function liveCase(pendingOfAnswer: (m14: string, m15: string) => Record<string, unknown>) {
+      const f = await fixture();
+      const m14 = await f.message("Case M0014. Answer this specific case ONCE.");
+      const carrying = await f.run({ commentId: m14, status: "failed", errorCode: "adapter_failed" });
+      const m15 = await f.message("Case M0015. Answer this specific case ONCE.");
+      const answering = await f.run({ status: "succeeded" });
+      await db.update(heartbeatRuns).set({ invocationSource: "automation",
+        contextSnapshot: { issueId: f.issueId, wakeReason: "issue_commented", ...pendingOfAnswer(m14, m15) } })
+        .where(eq(heartbeatRuns.id, answering));
+      await f.reply(answering);
+      const owed = async () => (await db.select({ id: issueComments.id }).from(issueComments)
+        .where(and(eq(issueComments.issueId, f.issueId), unansweredPersonMessageCommentCondition()))).map(row => row.id);
+      return { ...f, m14, m15, carrying, answering, owed };
+    }
+
+    it("RED f28f4309: M0014 history-only, the run's pending input is [M0015] -> M0014 is NOT answered: ONE true notice, carried on", async () => {
+      const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15, commentId: m15, wakeCommentIds: null }));
+      expect(await f.owed(), "discovery owes M0014 only").toEqual([f.m14]);
+      for (let pass = 0; pass < 2; pass++) {
+        expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: pass === 0 ? "noticed" : "noticed_before" });
+        const notices = await f.visible();
+        expect(notices, "exactly ONE notice").toHaveLength(1);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m14}`);
+      }
+      // The continuation selection uses the same SQL: M0014 rides into the next run's pending input.
+      expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toMatchObject({ wakeCommentIds: [f.m14] });
+      const next = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { wakeCommentIds: [f.m14, f.m15] } });
+      expect(next).toMatchObject({ wakeCommentIds: [f.m14], wakeCommentId: f.m14, commentId: f.m14 });
+    });
+
+    it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput",
+      "steer-acknowledged", "steer-restored"] as const)(
+      "R-ONCE guard: a reply from a run whose pending input carries M0014 (%s) answers it", async key => {
+        const f = await liveCase((m14, m15) => key === "wakeCommentIds" ? { wakeCommentId: m15, wakeCommentIds: [m14, m15] }
+          : key === "firstTurnQueuedInput" ? { wakeCommentId: m15, firstTurnQueuedInput: { commentIds: [m14] } }
+          : key.startsWith("steer") ? { wakeCommentId: m15 }
+          : { wakeCommentId: m15, [key]: m14, ...(key === "wakeCommentId" ? { wakeCommentIds: [m15] } : {}) });
+        if (key === "steer-acknowledged") {
+          await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: {
+            [f.m14]: { status: "acknowledged", queueId: randomUUID(), turnId: "turn-1", acknowledgedAt: new Date().toISOString() } } } })
+            .where(eq(heartbeatRuns.id, f.answering));
+        } else if (key === "steer-restored") {
+          // The run log's validated steering acknowledgement (what a restart restores), with no result_json record.
+          await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.answering, seq: 1,
+            eventType: "item.completed", sourceEventId: `src-${randomUUID()}`, payload: { prpEvent: { turnId: "turn-1",
+              itemId: `turn-1:steer:${f.m14}`, eventType: "item.completed", payload: { kind: "steering_acknowledgement" } } } });
+        }
+        if (key === "wakeCommentId") {
+          await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentId: f.m14, wakeCommentIds: [f.m15] } })
+            .where(eq(heartbeatRuns.id, f.answering));
+        }
+        expect(await f.owed()).toEqual([]);
+        expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+        expect(await f.visible()).toHaveLength(0);
+        expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toEqual({});
+      });
+
+    it("R-ONCE guard: an unvalidated or other-message steer record is not pending input", async () => {
+      const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15 }));
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.answering, seq: 1,
+        eventType: "item.completed", sourceEventId: null, payload: { prpEvent: { turnId: "turn-1",
+          itemId: `turn-1:steer:${f.m14}`, eventType: "item.completed", payload: { kind: "steering_acknowledgement" } } } });
+      await db.update(heartbeatRuns).set({ resultJson: { queuedSteeringAcknowledgements: { [f.m15]: { status: "acknowledged" } } } })
+        .where(eq(heartbeatRuns.id, f.answering));
+      expect(await f.owed()).toEqual([f.m14]);
+    });
+
+    it("R-ONCE chain guard: the retry successor of M0014's OWN carrying run answers it, though its wake names only M0015", async () => {
+      const f = await liveCase((_m14, m15) => ({ wakeCommentId: m15 }));
+      await db.update(heartbeatRuns).set({ retryOfRunId: f.carrying }).where(eq(heartbeatRuns.id, f.answering));
+      expect(await f.owed()).toEqual([]);
+      expect(await settleUnansweredPersonMessage(db, f)).toEqual({ kind: "answered" });
+      expect(await readContinuationCommentInput(db, { ...f, runId: f.carrying })).toEqual({});
+    });
+  });
+
   // RFL 20:42Z (b): a BLOCKED task the person is legitimately waiting on after
   // the agent answered stays quiet, and the new blocked visit skips it.
   // Loaded dynamically so this file also runs (RED) on a base without the module.
@@ -1705,7 +1789,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   });
 
   it.each(["wakeCommentId", "commentId", "conversationReplyBoundaryCommentId", "wakeCommentIds", "firstTurnQueuedInput"])(
-    "PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
+    // Reason (R-ONCE): the queued earlier message has no run and no answer, so the sweep now owes IT one true
+    // notice; the card still answers only the steered input (never a notice for it, discovery agrees).
+    "supersedes(R-ONCE carried, RFL 18:33Z): PV2 card-answer: open and answered cards answer only their own carried input through %s", async key => {
       const f = await fixture();
       const earlier = await f.message("Still waiting in the queue.");
       const messageId = await f.message("The steered input.");
@@ -1719,7 +1805,9 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
           payload: kind === "ask_user_questions" ? { version: 1, questions: [] } : { version: 1, prompt: "Proceed?" } }).returning();
         for (const status of kind === "ask_user_questions" ? ["pending", "answered"] : ["pending", "accepted", "rejected"]) {
           await db.update(issueThreadInteractions).set({ status }).where(eq(issueThreadInteractions.id, card!.id));
-          expect(await settleUnansweredPersonMessage(db, f), `${kind}/${status}`).toEqual({ kind: "answered" });
+          expect((await settleUnansweredPersonMessage(db, f)).kind, `${kind}/${status}`).toMatch(/^noticed(_before)?$/);
+          expect((await f.visible()).map(note => note.metadata?.authorizationReason), `${kind}/${status}`)
+            .toEqual([`unanswered_message:${earlier}`]);
           expect(await readContinuationCommentInput(db, { ...f, runId })).toEqual({});
           const pending = await pendingContinuationCommentInput(db, { ...f, contextSnapshot: { wakeCommentIds: [earlier] } });
           expect(pending.wakeCommentIds, "a card for the steered input must not consume earlier queued messages").toEqual([earlier]);

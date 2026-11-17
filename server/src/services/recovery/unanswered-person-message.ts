@@ -508,9 +508,28 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         eq(issueThreadInteractions.issueId, issue.id), gt(issueThreadInteractions.resolvedAt, latestMessage.createdAt),
         unansweredCardAnswerSql("issue_thread_interactions")))
       .orderBy(desc(issueThreadInteractions.resolvedAt)).limit(1);
-    if (!owed) return { kind: "answered" };
-    message = { id: owed.id, createdAt: new Date(owed.createdAt) };
-    cardAnswer = true;
+    if (owed) {
+      message = { id: owed.id, createdAt: new Date(owed.createdAt) };
+      cardAnswer = true;
+    } else {
+      // R-ONCE (RFL 18:19Z): a reply to a later input does not settle an earlier message its run never had
+      // as pending input. The owed earlier message (in discovery's scope, one without a notice first) decides.
+      const row = { id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}`, createdAt: sql`${issueComments.createdAt}` };
+      const [earlier] = await q.select({ id: issueComments.id, createdAt: issueComments.createdAt,
+        authorUserId: issueComments.authorUserId }).from(issueComments).where(and(
+        eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
+        eq(issueComments.authorType, "user"), isNull(issueComments.deletedAt),
+        inScopeSql(row, new Date(now.getTime() - UNANSWERED_MESSAGE_LOOKBACK_MS).toISOString()),
+        sql`not ${answeredSql(row)}`))
+        .orderBy(sql`exists (select 1 from ${issueComments} n where n.company_id = ${issueComments.companyId}
+          and n.issue_id = ${issueComments.issueId}
+          and n.metadata->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX} || ${issueComments.id}::text
+          and not coalesce(n.metadata->'sections' @> ${WAITING_ROW_JSON}::jsonb, false))`,
+          desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+      if (!earlier) return { kind: "answered" };
+      message = earlier;
+    }
   }
   const reason = `${UNANSWERED_MESSAGE_REASON_PREFIX}${message.id}`;
   const [noticed] = await q.select({ id: issueComments.id,

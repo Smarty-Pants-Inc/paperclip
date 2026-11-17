@@ -1,5 +1,5 @@
 import { sql, type SQL } from "drizzle-orm";
-import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
+import { activityLog, heartbeatRunEvents, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
@@ -12,13 +12,26 @@ type PersonMessageSql = { id: SQL; companyId: SQL; issueId: SQL; createdAt: SQL 
 // A person input is a typed message (a comment id) or a person's answer to an
 // agent's card (the interaction id): its answer-resume run carries it as
 // context.interactionId (routes/issues.ts wake contexts). Ids never collide.
+// R-ONCE (RFL 18:19Z): this is the run's PENDING input. A message steered into
+// the run is pending input too: the steer route records the provider's
+// acknowledgement on the run (result_json.queuedSteeringAcknowledgements,
+// routes/issues.ts) and the run log (a validated steering_acknowledgement item
+// '...:steer:<id>', which a restart restores: unread-steered-messages.ts).
+// Transcript history is never pending input.
 function carriesCommentSql(alias: string, commentId: SQL): SQL {
-  const context = sql`${sql.identifier(alias)}.context_snapshot`;
+  const run = sql.identifier(alias);
+  const context = sql`${run}.context_snapshot`;
   return sql`(${context}->>'wakeCommentId' = ${commentId}::text or ${context}->>'commentId' = ${commentId}::text
     or ${context}->>'conversationReplyBoundaryCommentId' = ${commentId}::text
     or ${context}->>'interactionId' = ${commentId}::text
     or coalesce(${context}->'wakeCommentIds', '[]'::jsonb) ? ${commentId}::text
-    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text)`;
+    or coalesce(${context}->'firstTurnQueuedInput'->'commentIds', '[]'::jsonb) ? ${commentId}::text
+    or (jsonb_typeof(${run}.result_json->'queuedSteeringAcknowledgements') = 'object'
+      and ${run}.result_json->'queuedSteeringAcknowledgements' ? ${commentId}::text)
+    or exists (select 1 from ${heartbeatRunEvents} steer where steer.company_id = ${run}.company_id
+      and steer.run_id = ${run}.id and steer.source_event_id is not null and steer.event_type = 'item.completed'
+      and steer.payload->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'
+      and steer.payload->'prpEvent'->>'itemId' like '%:steer:' || ${commentId}::text))`;
 }
 
 /** A reply/card can belong to a later run without copying the original input
@@ -38,8 +51,9 @@ function chainCarriesCommentSql(alias: string, commentId: SQL, m: PersonMessageS
 // delivery; cancelled cards need evidence of a human skip/withdraw/cancel reply.
 const PERSON_MESSAGE_ANSWER_CARD_STATUSES = ["pending", "answered", "accepted", "rejected"] as const;
 
-/** A person message is answered by a published agent reply attributed to it or to a later person input,
- * an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
+/** A person message is answered by a published agent reply from a run whose chain had THAT message as its
+ * pending input (R-ONCE, RFL 18:19Z: a reply to a later input answers M only when its run carried M too;
+ * transcript history never counts), an open or resolved interaction card on its run chain, or imported history. Answering the card is new input;
  * it never makes the original message unanswered again. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
  * - Provider acceptance/delivery alone is NOT an answer.
@@ -57,11 +71,16 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
       and a.created_at > ${m.createdAt}
       and (exists (select 1 from ${issueComments} b
         where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
-          and (b.id = ${m.id} or b.created_at > ${m.createdAt})
+          and b.id = ${m.id}
           and ${chainCarriesCommentSql("r", sql`b.id`, m)})
-        -- A card answer is an input with no comment row: its own chain carries it.
+        -- A card answer is an input with no comment row: its own chain carries it. Its rule is unchanged by
+        -- R-ONCE: a reply to a later person input still settles it (owedCardAnswerSql owes none after one).
         or (not exists (select 1 from ${issueComments} own where own.id::text = ${m.id}::text)
-          and ${chainCarriesCommentSql("r", m.id, m)})))
+          and (${chainCarriesCommentSql("r", m.id, m)}
+            or exists (select 1 from ${issueComments} b
+              where b.company_id = a.company_id and b.issue_id = a.issue_id and b.author_type = 'user'
+                and b.created_at > ${m.createdAt}
+                and ${chainCarriesCommentSql("r", sql`b.id`, m)})))))
     or exists (select 1 from ${issueThreadInteractions} q
       join ${heartbeatRuns} r on r.id = q.source_run_id and r.company_id = q.company_id
       where q.company_id = ${m.companyId} and q.issue_id = ${m.issueId}
