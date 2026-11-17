@@ -8,7 +8,7 @@ import { isNativeRestartInterruption, NativeSessionProtocolIntegrityError } from
 import { isPrpAuthCredentialsUpdated, validatePrpStructuredRunResult } from "../../protocol/replay-contract.js";
 import type { CodexRpcNotification, CodexTraceInterpretation } from "./app-server-transport.js";
 import { redactCodexDiagnostic } from "./app-server-transport.js";
-import { boundedCodexPayload as boundedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
+import { boundedCodexPayload as boundedPayload, boundedCodexCompletedPayload, boundedCodexValue, isRetainableCodexPayload } from "./codex-boundaries.js";
 import { runtimeRequestProtocolPayload, runtimeRequestResponse } from "./codex-question-adapter.js";
 import {
   isSupportedCodexNotificationMethod,
@@ -643,12 +643,14 @@ async function mapNotificationBody(state: CodexSessionState, notification: Codex
           : channelForStartedItem(state, item);
       state.emit(
         "item.completed",
-        boundedPayload({
+        boundedCodexCompletedPayload({
           kind: text(item.type, "unknown"),
           channel,
           providerPhase: text(item.phase) || undefined,
           text: itemText(item),
           item,
+          ...(state.driverKind === "pi_rpc" && params.fullText !== undefined
+            ? { fullText: record(params.fullText) } : {}),
         }),
         { turnId, itemId },
       );
