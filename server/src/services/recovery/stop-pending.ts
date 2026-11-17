@@ -3,7 +3,8 @@ import { heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclip
 import { runExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { readRunCancellation } from "../run-cancellation.js";
 import { readUnsupersededHeldConversationNotice } from "../native-runtime/pi-session-recovery-notice.js";
-import { STOP_PROVED_MESSAGE, STOPPED_TASK_NEW_TASK_MESSAGE, STOPPED_TASK_RETRY_MESSAGE } from "../native-runtime/held-predecessor-notice-text.js";
+import { STOP_PROVED_MESSAGE } from "../native-runtime/held-predecessor-notice-text.js";
+import { decideRetryAuthority } from "../task-retry-eligibility.js";
 import { logActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { notifyNativeRecoveryNotices } from "../native-recovery-notice-notifications.js";
@@ -159,14 +160,18 @@ export async function clearTaskStopPending(tx: Db, input: TaskBinding, publicati
         .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId)));
       // Match task Retry's source check: a stopped run is not a cancelled
       // task, and proving an old owner does not authorize replay of new work.
-      const [latest] = await tx.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId })
+      const [latest] = await tx.select()
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), or(
           eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
           sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
         ))).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       const retryTarget = task && !["done", "cancelled"].includes(task.status)
         && latest && task.assigneeAgentId === latest.agentId && input.runIds.includes(latest.id);
-      plainNote = !held && retryTarget ? STOPPED_TASK_RETRY_MESSAGE : STOPPED_TASK_NEW_TASK_MESSAGE;
+      // Retry fold: "Press Retry" only where task Retry's own source check
+      // (canRetryStoppedRun) accepts it; the one authority picks the words.
+      const { canRetryStoppedRun } = await import("../cancelled-native-startup.js");
+      const retrySource = Boolean(retryTarget && latest && await canRetryStoppedRun(tx as unknown as Db, latest));
+      plainNote = decideRetryAuthority({ heldConversation: Boolean(held), retrySource, stopKind: "manager" }).transcriptNotice!;
     }
   }
   if (pending.standalone && existing.cause === STOP_PENDING_CODE) {

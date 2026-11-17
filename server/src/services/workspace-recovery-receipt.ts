@@ -8,8 +8,8 @@ import { readSnapshot } from "./workspace-recovery-snapshot.js";
 import { exhaustedSystemRecoveryAction, isCapturePolicyRearmable, readSystemRecovery } from "./system-recovery-state.js";
 import { verifiedUnchangedRestoredSnapshot, verifiedWorkspaceSnapshotReuse } from "./remote-workspace-snapshot-reuse-receipt.js";
 import { isAbandonedPreparedRemoteWorkspace } from "./remote-workspace-abandoned-preparation.js";
-import { HELD_RECOVERED_WORK_MESSAGE, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_MESSAGE,
-  RECOVERED_WORK_CONTINUE_MESSAGE, RECOVERED_WORK_MESSAGE, RECOVERED_WORK_RETRY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
+import { RECOVERED_WORK_RETRY_MESSAGE } from "./native-runtime/held-predecessor-notice-text.js";
+import { decideRetryAuthority } from "./task-retry-eligibility.js";
 
 export const workspaceRecoverySchema = z.object({
   schema: z.literal("paperclip.workspace-recovery.v1"),
@@ -66,12 +66,10 @@ export function stoppedBeforeWorkWasSaved(runStatus: string | null | undefined, 
 }
 
 export function recoveredWorkMessage(runStatus: string | null | undefined, retryOffered: boolean, heldConversation = false,
-  stoppedBeforeWork = false) {
-  if (stoppedBeforeWork) return retryOffered && !heldConversation ? NO_SAVED_WORK_RETRY_MESSAGE : NO_SAVED_WORK_NEW_TASK_MESSAGE;
-  if (heldConversation) return HELD_RECOVERED_WORK_MESSAGE;
-  if (retryOffered) return RECOVERED_WORK_RETRY_MESSAGE;
-  return runStatus === "failed" || runStatus === "timed_out" ? RECOVERED_WORK_MESSAGE
-    : RECOVERED_WORK_CONTINUE_MESSAGE;
+  stoppedBeforeWork = false, agentPaused = false) {
+  // Retry fold: the one authority chooses the receipt text with the Retry decision.
+  return decideRetryAuthority({ savedWork: "recovered", runStatus, retrySource: retryOffered, heldConversation,
+    stoppedBeforeWork, agentPaused }).cardText!;
 }
 
 export function savedWorkOffersRetry(state: { status: string; canRetry: boolean } | undefined,
@@ -86,13 +84,13 @@ export function savedWorkOffersRetry(state: { status: string; canRetry: boolean 
 }
 
 export function workspaceRecoveryDisplay(evidence: Record<string, unknown>, runId: string | null,
-  run?: { status: string | null; retryOffered: boolean; heldConversation?: boolean }): ExecutionBlocker["workspaceRecovery"] {
+  run?: { status: string | null; retryOffered: boolean; heldConversation?: boolean; agentPaused?: boolean }): ExecutionBlocker["workspaceRecovery"] {
   const state = readWorkspaceRecovery(evidence);
   if (!state || state.runId !== runId) return undefined;
   return { status: state.status, stage: state.stage,
     canRetry: state.status === "blocked" && state.retryable === true,
     message: state.status === "queued" || state.status === "recovering" ? "Recovering saved work…"
-      : state.status === "recovered" ? recoveredWorkMessage(run?.status, run?.retryOffered ?? false, run?.heldConversation)
+      : state.status === "recovered" ? recoveredWorkMessage(run?.status, run?.retryOffered ?? false, run?.heldConversation, false, run?.agentPaused)
         : blockedWorkspaceRecoveryMessage(evidence) ?? state.message ?? "Recovery of this task's saved work has not finished.",
   };
 }
