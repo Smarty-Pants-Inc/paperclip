@@ -214,9 +214,14 @@ by its own RPCs and private exchanges, except that a facade `turn/start` with
 attach's budget is carried into that turn's validation, bind and `begin_turn`
 (one budget before the prompt, not two). Host-local broker revocation (own 5 s
 cap) and broker creation in a rebind are accounted inside the same wall-clock
-budget and cut at what remains, because the budget guards the facade's 30 s
-receive wait; a broker that arrives after the deadline is closed. Prompt acceptance and model/compaction
-execution retain their separate deadlines. Cold-process readiness also retains
+budget and cut at what remains; a broker that arrives after the deadline is
+closed. Instruction-file writes, company-skills synchronization and turn image
+staging are local filesystem preparation, not Pi exchanges: their awaited time
+is excluded without replenishing time already spent by exchanges or broker work.
+This also applies between attach and startTurn in the shared turn bracket. The
+admission budget therefore does not bound total filesystem preparation or the
+facade's entire receive wait. Prompt acceptance and model/compaction execution
+retain their separate deadlines. Cold-process readiness also retains
 its separate `processStartupTimeoutMs` budget; this is not a total cold-open
 wall-clock bound.
 

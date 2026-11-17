@@ -14,7 +14,21 @@ import type { PrpEvent } from "../../protocol/replay-contract.js";
 // the trust-boundary diagnostic. Exercise the real driver, real private socket
 // (with its own deadline) and the real span parser; only the external Pi
 // process (transport) and host broker latency are controlled.
-const knobs = vi.hoisted(() => ({ createDelayMs: 0, created: 0, closed: 0, writeDelayMs: 0 }));
+const knobs = vi.hoisted(() => ({ createDelayMs: 0, created: 0, closed: 0, writeDelayMs: 0, skillsDelayMs: 0, imageDelayMs: 0 }));
+vi.mock("./pi-company-skills.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./pi-company-skills.js")>();
+  return { ...actual, syncPiCompanySkills: async (...args: Parameters<typeof actual.syncPiCompanySkills>) => {
+    if (knobs.skillsDelayMs > 0) await new Promise(resolve => setTimeout(resolve, knobs.skillsDelayMs));
+    return actual.syncPiCompanySkills(...args);
+  } };
+});
+vi.mock("./pi-turn-images.js", async importOriginal => {
+  const actual = await importOriginal<typeof import("./pi-turn-images.js")>();
+  return { ...actual, piTurnImageInput: async (...args: Parameters<typeof actual.piTurnImageInput>) => {
+    if (knobs.imageDelayMs > 0) await new Promise(resolve => setTimeout(resolve, knobs.imageDelayMs));
+    return actual.piTurnImageInput(...args);
+  } };
+});
 vi.mock("../private-file.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../private-file.js")>();
   return { ...actual, writePrivateFile: async (path: string, value: string) => {
@@ -60,11 +74,12 @@ const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   knobs.createDelayMs = 0; knobs.created = 0; knobs.closed = 0; knobs.writeDelayMs = 0;
+  knobs.skillsDelayMs = 0; knobs.imageDelayMs = 0;
   vi.restoreAllMocks();
 });
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
 
-async function fixture() {
+async function fixture(options: Partial<ConstructorParameters<typeof PiRpcDriver>[0]> = {}) {
   const root = await mkdtemp(join(tmpdir(), "pi-admission-budget-"));
   const transport = new Transport();
   const commands: PiBindCommand[] = [];
@@ -94,6 +109,7 @@ async function fixture() {
       return transport as unknown as PiRpcTransport;
     },
     bindRequest: sendPiBindRequest,
+    ...options,
   });
   let session: PiRpcHarnessSession | undefined;
   let drained: Promise<void> | undefined;
@@ -132,7 +148,7 @@ function stderrSpans(spy: { mock: { calls: unknown[][] } }) {
 }
 
 
-// JUDGE PROBE (not part of the PR): host-local instruction-file write inside a shared turn admission.
+// Judge's original probe: host-local instruction-file write inside a shared turn admission.
 describe("JUDGE PROBE: unbudgeted host-local work spends the shared turn budget", () => {
   it("probe: a turn whose every exchange is fast fails when the attach's instruction write is slow", async () => {
     const f = await fixture(); const session = await f.released();
@@ -156,5 +172,43 @@ describe("JUDGE PROBE: unbudgeted host-local work spends the shared turn budget"
     knobs.writeDelayMs = BUDGET_MS + 100;
     await session.attachRun({ runId: "run-b" });
     await expect(session.startTurn({ message: { role: "user", text: "one" } })).resolves.toMatchObject({ turnId: expect.any(String) });
+  });
+});
+
+// Keep reason: all local preparation paths can otherwise blame/fence the next
+// healthy Pi exchange. Delays exceed the unchanged fixture budget on purpose.
+describe("local preparation does not spend Pi exchange time", () => {
+  it("cold-open instruction rewrite does not starve metadata discovery", async () => {
+    const f = await fixture({ dynamicTools: [{ name: "local_tool", description: "local", inputSchema: { type: "object", properties: {} } }] });
+    knobs.writeDelayMs = BUDGET_MS + 100;
+    await expect(f.open()).resolves.toBeDefined();
+    expect(f.commands.map(command => command.type)).toContain("bind");
+    expect(f.transport.commands).toContain("get_available_models");
+  });
+
+  it.each(["skills", "images"] as const)("slow %s preparation keeps a shared resident turn usable", async kind => {
+    const f = await fixture(); const session = await f.released();
+    if (kind === "skills") knobs.skillsDelayMs = BUDGET_MS + 100;
+    else knobs.imageDelayMs = BUDGET_MS + 100;
+    session.beginTurnAdmission();
+    try {
+      await session.attachRun({ runId: "run-b" });
+      await expect(session.startTurn({ message: { role: "user", text: "one" } })).resolves.toMatchObject({ turnId: expect.any(String) });
+    } finally { session.endTurnAdmission(); }
+    expect(f.transport.closed).toBe(false);
+    expect(f.transport.commands).toContain("prompt");
+    expect(f.spans().filter(span => span.outcome === "failed")).toEqual([]);
+  });
+
+  it("local write exclusion preserves earlier exchange spend across attach and turn", async () => {
+    const f = await fixture(); const session = await f.released();
+    knobs.writeDelayMs = BUDGET_MS + 100;
+    Object.assign(f.exchangeDelays, { tool_inventory: 300, bind: 300, begin_turn: 500 });
+    session.beginTurnAdmission();
+    try {
+      await session.attachRun({ runId: "run-b" });
+      await expect(session.startTurn({ message: { role: "user", text: "one" } })).rejects.toMatchObject({ code: "pi_admission_deadline_exceeded" });
+    } finally { session.endTurnAdmission(); }
+    expect(f.transport.commands).not.toContain("prompt");
   });
 });

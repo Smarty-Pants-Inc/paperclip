@@ -209,7 +209,7 @@ describe("resident Pi model binding", () => {
 
   // Keep reason: the production warm-turn latency regression needs per-RPC
   // evidence across real broker/IPC admission, not another aggregate timer.
-  it("records every warm second-turn RPC on the reused session with its new run (superseded by replacement: l3-span3; RFL record 13:38Z)", async () => {
+  it("records every warm second-turn RPC on the reused session with its new run (superseded by replacement: 13a1d691 / 43a0f9b1e; RFL record 13:38Z)", async () => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } });
     await finish(f);
@@ -262,7 +262,7 @@ describe("resident Pi model binding", () => {
   });
   // Keep reason: RFL's spanbatch review reproduced loss at the real driver /
   // diagnostic-reader boundary after repeated admissions, and unbounded idle retention.
-  it("keeps every repeated-admission span visible through the diagnostic reader (superseded by replacement: l3-span3; RFL record 13:38Z)", async () => {
+  it("keeps every repeated-admission span visible through the diagnostic reader (superseded by replacement: 13a1d691 / 43a0f9b1e; RFL record 13:38Z)", async () => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
@@ -288,7 +288,7 @@ describe("resident Pi model binding", () => {
     expect(diagnostics.filter(event => event.turnId === turn.turnId).every(event => f.events.indexOf(event) > started)).toBe(true);
   });
 
-  it("drains successful admissions without a turn and never accumulates a timing backlog (superseded by replacement: l3-span3; RFL record 13:38Z)", async () => {
+  it("drains successful admissions without a turn and never accumulates a timing backlog (superseded by replacement: 13a1d691 / 43a0f9b1e; RFL record 13:38Z)", async () => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
@@ -324,7 +324,7 @@ describe("resident Pi model binding", () => {
 
   // Keep reason: prompt rejection/handled input and failed admission can omit
   // native agent_start; diagnostics must survive these trust-boundary paths.
-  it.each(["handled", "rejected"])("flushes %s turn-owned timings once before its terminal without agent_start (superseded by replacement: l3-span3; RFL record 13:38Z)", async disposition => {
+  it.each(["handled", "rejected"])("flushes %s turn-owned timings once before its terminal without agent_start (superseded by replacement: 13a1d691 / 43a0f9b1e; RFL record 13:38Z)", async disposition => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });
@@ -352,7 +352,7 @@ describe("resident Pi model binding", () => {
     expect(f.events.filter(event => event.runId === "run-b" && event.payload.code === "provider_performance_spans")).toHaveLength(2);
   });
 
-  it("flushes an unused warm attachment immediately with its captured run and no invented turn (superseded by replacement: l3-span3; RFL record 13:38Z)", async () => {
+  it("flushes an unused warm attachment immediately with its captured run and no invented turn (superseded by replacement: 13a1d691 / 43a0f9b1e; RFL record 13:38Z)", async () => {
     const f = await fixture();
     await f.session.startTurn({ message: { role: "user", text: "one" } }); await finish(f);
     await f.session.attachRun({ runId: "run-b" });

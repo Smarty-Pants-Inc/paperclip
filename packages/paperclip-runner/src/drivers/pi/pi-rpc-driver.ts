@@ -381,7 +381,7 @@ export class PiRpcDriver implements HarnessDriver {
           resident.binding = { origin, close: resident.binding!.close, initial: true };
           await send({ schema: 1, type: "begin_turn", nonce: randomUUID(), sessionId: input.normalizedSessionId, ...origin });
           identity = await measure("runner.pi.open.admission", () => admitPiRpcSession(port, config, input.signal));
-          await writePrivateFile(instructionFile, piHostInstructionSegment(context.instructions, instructionBoundary));
+          await budget.localWork(() => writePrivateFile(instructionFile, piHostInstructionSegment(context.instructions, instructionBoundary)));
         }
         resident.context = initialContext = context;
       }
@@ -490,10 +490,20 @@ interface PiSessionState {
 
 const PI_PROCESS_STARTUP_TIMEOUT_MS = 60_000;
 
-/** Admission-local, never session-lifetime: no exchange can reset the clock. */
+/** Admission-local, never session-lifetime: no exchange can reset the clock.
+ * Filesystem preparation is not a Pi exchange and must not spend its budget. */
 class PiAdmissionBudget {
-  readonly #expiresAt: number;
+  #expiresAt: number;
   constructor(timeoutMs = 10_000) { this.#expiresAt = performance.now() + timeoutMs; }
+
+  /** Exclude only this awaited local operation, without resetting time already
+   * spent by exchanges (or the separately budgeted broker work). Admissions are
+   * serialized; no request on this budget runs inside a local-work callback. */
+  async localWork<T>(work: () => Promise<T>): Promise<T> {
+    const startedAt = performance.now();
+    try { return await work(); }
+    finally { this.#expiresAt += performance.now() - startedAt; }
+  }
 
   /** `timeoutCode` is the exchange's own timeout evidence (private bind
    * exchanges: pi_bind_timeout). A deadline error keeps it when that exchange
@@ -760,8 +770,10 @@ export class PiRpcHarnessSession implements HarnessSession {
           input.runtimeContext !== undefined ? input.runtimeContext : previous.runtimeContext, previous);
         if (JSON.stringify(context.tools) !== JSON.stringify(previous.tools)) throw new Error("Pi RPC tool refresh requires a provider bind receipt");
         await this.#admit(input.signal, input.runId, budget);
-        await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
-        await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
+        await budget.localWork(async () => {
+          await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
+          await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
+        });
         this.#initialContext = context;
       }
       this.#runId = input.runId;
@@ -964,8 +976,10 @@ export class PiRpcHarnessSession implements HarnessSession {
       await this.#sendBind(request, signal, budget);
       resident.epoch = origin.epoch;
       await this.#admit(signal, runId, budget);
-      await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
-      await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
+      await budget.localWork(async () => {
+        await syncPiCompanySkills(this.#agentHome, context.runtimeContext);
+        await writePrivateFile(this.#instructionFile, piHostInstructionSegment(context.instructions, this.#instructionBoundary));
+      });
       resident.context = context;
     } catch (error) {
       await this.#fenceFailure(error);
@@ -1034,7 +1048,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       this.#pendingInput++;
       let message: Awaited<ReturnType<typeof piTurnImageInput>>;
       try {
-        message = await piTurnImageInput(input.message, this.#workingDirectory);
+        const prepareImages = () => piTurnImageInput(input.message, this.#workingDirectory);
+        message = await (this.#turnAdmissionBudget ? this.#turnAdmissionBudget.localWork(prepareImages) : prepareImages());
         if (this.#closed) throw new Error("Pi RPC session closed while preparing image input");
         if (this.#failure) throw this.#failure;
       } finally { this.#pendingInput--; }
