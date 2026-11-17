@@ -33,6 +33,11 @@ export class AgentDirectoryReuseInvalidatedError extends Error {}
 export class AgentDirectoryOperationBusyError extends HttpError {
   constructor() { super(409, "Agent directory operation is already active"); }
 }
+/** pl/keepalive5: the agent-directory operation lock session died (failed keepalive ping); another owner may hold it. */
+export class AgentDirectoryOperationLockLostError extends Error {
+  override name = "AgentDirectoryOperationLockLostError";
+  constructor(cause?: unknown) { super("agent_directory_operation_lock_lost", { cause }); }
+}
 const completed = new Set(["saved", "unchanged", "resolved"]);
 /** The one instruction shown while a stopped agent-file save is unverified. */
 export const AGENT_FILES_SAVE_PENDING_INSTRUCTION = "Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.";
@@ -547,7 +552,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // Same lease row lock as every destroy claim; refused once a destroy is claimed.
       agentFileHoldWriteCondition);
   }
-  async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
     if (row.receipt?.retainedByRunId) return row;
     if (!await owns(row) || row.state === "superseded") return row;
     const held = agentFileSaveHeld(row);
@@ -556,11 +561,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (held && row.location !== "local" && !transports.has(key(row)) && target?.kind !== "remote"
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
     if (row.receipt?.warm === true && !settled(row)) {
+      signal?.throwIfAborted();
       row = await checkpoint(row, target, true);
-      await release(row, target);
+      await release(row, target, signal);
       return (await get(row.companyId, row.runId))!;
     }
-    if (settled(row)) { await release(row); return (await get(row.companyId, row.runId))!; }
+    if (settled(row)) { await release(row, undefined, signal); return (await get(row.companyId, row.runId))!; }
     // A held save whose exact tree was already retrieved into the controller
     // mirror retries from that verified mirror; no live collector is needed.
     const mirrorHash = held ? (row.receipt?.savePending as { mirrorHash?: unknown } | undefined)?.mirrorHash : undefined;
@@ -585,6 +591,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           if (directorySnapshotSha256(mirrored.snapshot) !== mirrorHash) throw new Error("Retained agent-file mirror changed; its source is kept for review");
           inspected = mirrored;
         }
+        // pl/keepalive5: no projection write (retrieve) or canonical save once the operation lock is lost.
+        signal?.throwIfAborted();
         inspected ??= await retrieve(row, target);
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
@@ -593,12 +601,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
+          signal?.throwIfAborted();
           ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
         row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
         break;
       } catch (error) {
+        if (signal?.aborted) throw signal.reason;
         const retryable = !(error instanceof HttpError) || error.status >= 500;
         if (retryable && row.attempts < 3) continue;
         // Fail closed: keep the stopped source, mirror, baseline, owner and
@@ -609,7 +619,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         break;
       }
     }
-    await release(row);
+    await release(row, undefined, signal);
     return (await get(row.companyId, row.runId))!;
   }
   /**
@@ -620,16 +630,16 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
    * returned (saved, unchanged or held); a thrown collection keeps it (its
    * outcome is unknown) until this copy's next collection replaces it.
    */
-  async function pinnedCollectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function pinnedCollectStopped(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
     const leaseId = (row.receipt?.cleanup as { leaseId?: unknown } | undefined)?.leaseId;
-    if (typeof leaseId !== "string" || !leaseId) return collectStopped(row, target);
+    if (typeof leaseId !== "string" || !leaseId) return collectStopped(row, target, signal);
     const copyKey = `${row.companyId}:${row.runId}:${row.agentId}`;
     const pin = await pinLeaseForCollection(db, leaseId, copyKey);
     if (pin === null) {
       logger.warn({ runId: row.runId, leaseId }, "Agent-file collection refused: a destroy holds the lease claim");
       return row;
     }
-    const collected = await collectStopped(row, target);
+    const collected = await collectStopped(row, target, signal);
     if (pin !== "unbound") await unpinLeaseForCollection(db, leaseId, copyKey, pin);
     return collected;
   }
@@ -644,7 +654,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     return row;
   }
-  async function release(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function release(row: Copy, target?: AdapterExecutionTarget | null, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     row = await settleCompletedCleanupRetry(row);
     // A held save keeps its collector, mirror, remote tree and baseline.
     if (agentFileSaveHeld(row)) return;
@@ -657,6 +668,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const runtime = transports.get(key(row));
     transports.delete(key(row));
     let cleanupPending = false;
+    // pl/keepalive5: no host or remote removal once the operation lock is lost.
+    signal?.throwIfAborted();
     await runtime?.cleanupWorkspaceSnapshot?.().catch(() => { cleanupPending = true; });
     const cleanupTarget = target ?? runtime?.target;
     const lease = row.location !== "local" ? await ownedRemoteLease(row) : null;
@@ -674,14 +687,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       if (row.executionRoot !== expected) throw new Error("Agent directory cleanup path changed");
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
       const quoted = paths.map(p => `'${p.replaceAll("'", `'"'"'`)}'`).join(" ");
+      signal?.throwIfAborted();
       const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
         { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
     } else if (!destroyed && row.processStoppedAt && settled(row) && row.location !== "local") {
       // Rebind only the current host-owned lease. Never acquire a replacement.
+      signal?.throwIfAborted();
       cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
     }
     if (settled(row) && row.processStoppedAt) {
+      signal?.throwIfAborted();
       try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
@@ -718,14 +734,14 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       current.state === "unavailable" && !current.processStoppedAt;
     // Do not wait for a directory lock when no cleanup can be authorized.
     if (!eligible(row) || !await destroyedRemoteCopy(row)) return;
-    await serial(row, async current => {
+    await serial(row, async (current, signal) => {
       if (!eligible(current) || !await destroyedRemoteCopy(current)) return;
       // The no-execute authority must survive a crash after this update. Every
       // later release, including one with a cached transport, honors it.
       const confirmed = await patch(current, { processStoppedAt: new Date(),
         receipt: { ...current.receipt, cleanupDestroyedOnly: true } });
       // A concurrent preparation can win the receipt CAS. Its bytes stay live.
-      if (confirmed.state === "unavailable" && confirmed.processStoppedAt) await release(confirmed);
+      if (confirmed.state === "unavailable" && confirmed.processStoppedAt) await release(confirmed, undefined, signal);
     }, "agent_directory_release");
   }
   async function ownedRemoteLease(row: Copy) {
@@ -778,11 +794,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       cwd: remoteCwd, env: {}, timeoutMs: 15_000, bypassSession: true });
     return result.exitCode === 0 && !result.timedOut;
   }
-  async function serial<T>(row: Copy, fn: (current: Copy) => Promise<T>, operation: DirectoryMergeLockOperation): Promise<T> {
-    const run = async () => {
+  async function serial<T>(row: Copy, fn: (current: Copy, signal?: AbortSignal) => Promise<T>, operation: DirectoryMergeLockOperation): Promise<T> {
+    const run = async (lost?: AbortSignal) => {
       const lockRoot = path.resolve(disposableRemoteCopy(row) ? projectionRoot(row) : row.localRoot, "../../..");
       if (disposableRemoteCopy(row)) await fs.mkdir(lockRoot, { recursive: true, mode: 0o700 });
       return withDirectoryMergeLock(lockRoot, async () => {
+        // pl/keepalive5: re-check after the merge-lock wait, before any projection write.
+        lost?.throwIfAborted();
         let current = await get(row.companyId, row.runId);
         if (!current) throw notFound("Agent directory copy not found");
         if (disposableRemoteCopy(current) && current.localRoot !== projectionRoot(current)) {
@@ -790,7 +808,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           if (current.localRoot !== projectionRoot(current)) throw conflict("Agent directory projection changed");
           transports.delete(key(current));
         }
-        return fn(current);
+        lost?.throwIfAborted();
+        return fn(current, lost);
       }, process.env, operation);
     };
     if (!disposableRemoteCopy(row)) return run();
@@ -802,7 +821,12 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
         (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      return withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), run);
+      // pl/keepalive5: a failed ping aborts the operation's signal; a lost lock is a failure, never a success.
+      const lost = new AbortController();
+      const result = await withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), () => run(lost.signal),
+        { onLost: cause => lost.abort(new AgentDirectoryOperationLockLostError(cause)) });
+      lost.signal.throwIfAborted();
+      return result;
     }));
   }
   async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
@@ -849,7 +873,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     destroyedRemote: (row: Copy) => destroyedRemoteCopy(row),
     recoverStoppedRemote: (row: Copy) => serial(row, current => current.receipt?.retainedByRunId ? Promise.resolve(current) : recoverStoppedRemote(current), "agent_directory_collect"),
     checkpointWarm: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => current.receipt?.warm === true ? checkpoint(current, target) : Promise.resolve(current), "agent_directory_checkpoint")),
-    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, current => pinnedCollectStopped(current, target), "agent_directory_collect")),
+    collectStopped: (row: Copy, target?: AdapterExecutionTarget | null) => trackAgentFileCheckpoint(serial(row, (current, signal) => pinnedCollectStopped(current, target, signal), "agent_directory_collect")),
     release: async (row: Copy) => {
       let current = await get(row.companyId, row.runId);
       if (!current) return;
@@ -857,7 +881,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       // This check changes no receipt or bytes. A concurrent stop merely leaves
       // cleanup to its owner or the recovery sweep; it grants no new authority.
       if (releaseIsNoop(current) || agentFileSaveHeld(current)) return;
-      await serial(current, release, "agent_directory_release");
+      await serial(current, (locked, signal) => release(locked, undefined, signal), "agent_directory_release");
     },
   };
 }
