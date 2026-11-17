@@ -13,6 +13,7 @@ import type { LifecycleDriver } from "../modules/agent-lifecycle/index.js";
 import { agentHarnessVerificationService } from "./agent-harness-verification.js";
 import { agentInstanceSecretService } from "./agent-instance-secrets.js";
 import { AGENT_LIFECYCLE_STOP_REASON, COMPANY_ARCHIVED_STOP_REASON } from "./governance-pause-stop.js";
+import type { CancelledWarmExportOutcome } from "./heartbeat/cancelled-warm-workspace-export.js";
 
 /** pl/pausing3: the pause's aggregate bound on failed runner-exit proofs:
  * 3 failed attempts or 2 minutes since the first, whichever comes first; the
@@ -20,6 +21,21 @@ import { AGENT_LIFECYCLE_STOP_REASON, COMPANY_ARCHIVED_STOP_REASON } from "./gov
 export const pauseProofBound = { attempts: 3, ms: 2 * 60_000 };
 const PAUSE_PROOF_KEY = "handedOffWarmPauseProof";
 export const PAUSE_STOP_UNCONFIRMED_ERROR = "Couldn't confirm the stopped turn's box has stopped. Your work is kept. Press Retry now to check again.";
+/** pl/pausing4: the export-before-stop guard kept the box (its 'prepared' turn's export was not finalized). */
+export const PAUSE_EXPORT_KEPT_ERROR = "The stopped turn's files are not confirmed on the host yet, so its box was kept and not stopped. Nothing on it is lost. Press Retry now to check again.";
+/** pl/pausing4 (rf-4 ruling 22:32Z): the export a 'prepared' turn needs before
+ * the bound's stop: the cancel-finalize export (finishCancelledWarmWorkspaceExport)
+ * under the run's finalization ownership. It needs the run's in-process
+ * workspace sync; this process has none for a stopped turn, so the default
+ * answers unproven and the box is KEPT with a true line. */
+export const pauseBoundExport = {
+  finish: async (_db: Db, _run: { id: string; companyId: string }): Promise<CancelledWarmExportOutcome> =>
+    ({ outcome: "unproven", reason: "no_export_owner_in_process" }),
+};
+function preparedDescriptor(profile: unknown): boolean {
+  const reference = (profile as { remoteWorkspace?: { state?: unknown } } | null)?.remoteWorkspace;
+  return reference?.state === "prepared";
+}
 type LifecycleAgentArg = Parameters<LifecycleDriver["runHost"]>[0];
 
 export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): LifecycleDriver {
@@ -53,11 +69,16 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
     return { proven, failed };
   }
 
-  /** pl/pausing3: the pause's aggregate proof bound. Failed (502/hang) proofs are
+  /** pl/pausing3/4: the pause's aggregate proof bound. Failed (502/hang) proofs are
    * counted in the operation's existing stopFailures; the first failure's time is
    * kept on the agent's lease (PAUSE_PROOF_KEY). At the bound the pause takes the
-   * Send's documented stop_and_retain fallback (box and files kept); if that stop's
-   * receipt also does not come within the bound, the agent shows lifecycleError. */
+   * Send's documented stop_and_retain fallback (box and files kept) through the
+   * export-before-stop guard (rf-4 ruling 22:32Z): a box holding a 'prepared'
+   * turn is exported first (pauseBoundExport, the cancel-finalize export under
+   * its finalization ownership) or KEPT with a true line; a busy owner is never
+   * stopped. If the stop's receipt does not come within the bound, the agent
+   * shows lifecycleError + retryRequired ("Retry now"). Retry clears stopFailures,
+   * and the first pass after it opens a NEW receipt window (stopRequestedAt reset). */
   async function boundPauseProof(agent: LifecycleAgentArg, failed: Awaited<ReturnType<typeof proveStoppedWarmHandoffs>>["failed"]) {
     const operationId = agent.lifecycleOperation?.id;
     if (!operationId) return;
@@ -67,34 +88,60 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
       .find(Boolean);
     const awaitingReceipt = leases.filter(lease => lease.metadata?.sandboxStopAndRetain && lease.metadata?.sandboxStopAndRetainReceipt == null);
     if (!failed.length && !awaitingReceipt.length) return;
+    // No stopFailures: the first pass of this operation, or the first after Retry now.
+    const fresh = agent.lifecycleOperation?.stopFailures == null;
     const failures = (agent.lifecycleOperation?.stopFailures ?? 0) + 1;
     const now = Date.now();
-    const firstFailedAt = failures === 1 || !record?.firstFailedAt ? new Date(now).toISOString() : record.firstFailedAt;
+    const nowIso = new Date(now).toISOString();
+    const firstFailedAt = fresh || !record?.firstFailedAt ? nowIso : record.firstFailedAt;
+    const same = and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
+      sql`${agents.lifecycleOperation}->>'id' = ${operationId}`);
     await db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ stopFailures: failures })}::jsonb` })
-      .where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
-        sql`${agents.lifecycleOperation}->>'id' = ${operationId}`));
+      .where(same);
     const stamp = async (runIds: string[], value: Record<string, unknown>) => runIds.length && db.update(environmentLeases).set({
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ [PAUSE_PROOF_KEY]: { operationId, firstFailedAt, ...value } })}::jsonb` })
       .where(and(eq(environmentLeases.companyId, agent.companyId), inArray(environmentLeases.heartbeatRunId, runIds)));
-    const atBound = failures >= pauseProofBound.attempts || now - Date.parse(firstFailedAt) >= pauseProofBound.ms;
+    // A true state the person can act on (AgentLifecycleStatus.tsx renders
+    // lifecycleError with "Retry now"); never 'pausing' forever.
+    const showError = (line: string) => db.update(agents).set({ lifecycleError: line,
+      lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt') || '{"retryRequired":true}'::jsonb`,
+      updatedAt: new Date() }).where(same);
     if (failed.length) {
-      await stamp(failed.map(run => run.id), record?.stopRequestedAt ? { stopRequestedAt: record.stopRequestedAt } : {});
+      const atBound = failures >= pauseProofBound.attempts || now - Date.parse(firstFailedAt) >= pauseProofBound.ms;
+      await stamp(failed.map(run => run.id), {});
       if (!atBound) return;
-      // The Send's own bounded proof with its stop_and_retain fallback (the box is
-      // stopped and KEPT, never destroyed); it never stops a busy owner.
-      for (const run of failed) await proveHandedOffWarmLeases(db, run).catch(() => "timed_out" as const);
-      await stamp(failed.map(run => run.id), { stopRequestedAt: new Date().toISOString() });
+      const { handedOffWarmOwnerBusy } = await import("./native-runtime/native-session-executor.js");
+      let kept = false;
+      for (const run of failed) {
+        const runLeases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId),
+          eq(environmentLeases.heartbeatRunId, run.id)));
+        // Never a busy owner: no stop; the agent stays 'pausing' (its true state).
+        if (runLeases.some(lease => handedOffWarmOwnerBusy({ runId: run.id, providerLeaseId: lease.providerLeaseId }))) continue;
+        // Export-before-stop guard: a 'prepared' turn is exported (finalized) first, or kept.
+        if (preparedDescriptor(run.runnerProfileJson)) {
+          const exported = await pauseBoundExport.finish(db, run).catch(() => ({ outcome: "unproven" as const, reason: "export_failed" }));
+          const [current] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.companyId, run.companyId)));
+          if (exported.outcome !== "finalized" || !current || preparedDescriptor(current.runnerProfileJson)) { kept = true; continue; }
+        }
+        // The Send's own bounded proof with its stop_and_retain fallback (the box is
+        // stopped and KEPT, never destroyed); it never stops a busy owner.
+        await proveHandedOffWarmLeases(db, run).catch(() => "timed_out" as const);
+      }
+      const intents = (await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, agent.companyId),
+        inArray(environmentLeases.heartbeatRunId, failed.map(run => run.id)))))
+        .filter(lease => lease.metadata?.sandboxStopAndRetain && lease.metadata?.sandboxStopAndRetainReceipt == null);
+      await stamp([...new Set(intents.map(lease => lease.heartbeatRunId!))], { stopRequestedAt: nowIso });
+      if (kept) await showError(PAUSE_EXPORT_KEPT_ERROR);
       return;
     }
-    const stopRequestedAt = record?.stopRequestedAt ? Date.parse(record.stopRequestedAt) : now;
-    if (failures < 2 * pauseProofBound.attempts && now - stopRequestedAt < pauseProofBound.ms) return;
-    // The stop's receipt never came: a true state the person can act on
-    // (AgentLifecycleStatus.tsx:61-65 renders lifecycleError with "Retry now").
-    await db.update(agents).set({ lifecycleError: PAUSE_STOP_UNCONFIRMED_ERROR,
-      lifecycleOperation: sql`(${agents.lifecycleOperation} - 'leaseOwner' - 'leaseUntil' - 'leaseHolder' - 'retryAt') || '{"retryRequired":true}'::jsonb`,
-      updatedAt: new Date() })
-      .where(and(eq(agents.id, agent.id), eq(agents.lifecycleVersion, agent.lifecycleVersion),
-        sql`${agents.lifecycleOperation}->>'id' = ${operationId}`));
+    if (fresh || !record?.stopRequestedAt) {
+      // A new receipt window (first pass after Retry now): stopRequestedAt is reset.
+      await stamp([...new Set(awaitingReceipt.map(lease => lease.heartbeatRunId!))], { stopRequestedAt: nowIso });
+      return;
+    }
+    if (now - Date.parse(record.stopRequestedAt) < pauseProofBound.ms) return;
+    await showError(PAUSE_STOP_UNCONFIRMED_ERROR);
   }
 
   return {
@@ -174,11 +221,16 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
         // (no box stop/destroy, no lease release, no stop-and-retain fallback),
         // never TERMs a busy owner, and persists the stamp agentExecutionStopBlocker
         // then accepts. A failed proof keeps 'pausing'; the driver retries.
-        if (blocker === "remote_stop_unconfirmed" && agent.lifecycleState === "pausing") {
-          const { proven, failed } = await proveStoppedWarmHandoffs(agent);
-          if (proven) blocker = await heartbeat.agentInvocationStopBlocker(ids, reason, options);
-          // pl/pausing3: a persistent proof failure (502 or hang) is bounded.
-          // Its own stop intent then awaits the receipt (environment_lease_unreleased).
+        if (blocker && agent.lifecycleState === "pausing") {
+          let failed: Awaited<ReturnType<typeof proveStoppedWarmHandoffs>>["failed"] = [];
+          if (blocker === "remote_stop_unconfirmed") {
+            const proof = await proveStoppedWarmHandoffs(agent);
+            failed = proof.failed;
+            if (proof.proven) blocker = await heartbeat.agentInvocationStopBlocker(ids, reason, options);
+          }
+          // pl/pausing3/4: a persistent proof failure (502 or hang) is bounded.
+          // Its own stop intent then awaits the receipt (environment_lease_unreleased),
+          // which gets the same bound (boundPauseProof acts only on this operation's leases).
           if (blocker) await boundPauseProof(agent, failed);
         }
         if (blocker) return { pending: blocker };
