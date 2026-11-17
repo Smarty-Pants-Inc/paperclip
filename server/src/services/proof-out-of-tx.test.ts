@@ -98,7 +98,7 @@ const support = await getEmbeddedPostgresTestSupport();
       // Committed and honest: deferred with the handoff wait, nothing admitted yet.
       expect(await receiptOf(f.queueId)).toMatchObject({ status: "deferred_issue_execution", runId: null,
         payload: { executionWait: { reason: "interrupt_handoff" } } });
-    } finally { proof.pending?.(true); }
+    } finally { (proof.pending as null | ((v: boolean) => void))?.(true); }
     // The proof lands outside any transaction; its persisted evidence admits ONE successor (bound: warm+60).
     const admitted = await until(async () => { const r = await receiptOf(f.queueId); return r.runId ? r : null; }, 60_000);
     expect(admitted).toMatchObject({ status: "coalesced" });
