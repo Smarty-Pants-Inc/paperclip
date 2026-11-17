@@ -66,10 +66,14 @@ function provedWarmTurnHandoff(run: Run, runLeases: Lease[], coordinator: Coordi
   // adopt-h6-xred3: the receipt binding (run/company/issue/session + the settled
   // coordinator's boot/generation) is the handoff marker of the shared
   // retainedWarmHandoffLease, which accepts the lease before AND after release.
+  // rf-3 must-fix 2: H6 accepts only the policy a warm Stop produces,
+  // reuse_by_environment (environment-runtime.ts acquisition and its keep_running
+  // release); reuse_by_execution_workspace has no warm-Stop producer.
   return run.status === "cancelled" && run.runtimeMode === "native" && hasAcknowledgedNativeStopIntent(run)
     && !!coordinator && coordinator.runId === run.id && coordinator.phase === "terminal_failure"
     && coordinator.failureCode === "native_retry_cancelled" && !coordinator.leaseOwner && !coordinator.resultId
-    && runLeases.length > 0 && runLeases.every(lease => retainedWarmHandoffLease(run, lease, { kind: "idle_receipt",
+    && runLeases.length > 0 && runLeases.every(lease => lease.leasePolicy === "reuse_by_environment"
+      && retainedWarmHandoffLease(run, lease, { kind: "idle_receipt",
       nativeSessionId: run.nativeSessionId, bootId: coordinator.controllerBootId, generation: coordinator.controllerGeneration }));
 }
 

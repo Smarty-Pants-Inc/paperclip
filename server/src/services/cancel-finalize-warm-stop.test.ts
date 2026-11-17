@@ -175,7 +175,9 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, issueId, runtimeMode: "native",
       status: "running", startedAt: new Date(), contextSnapshot: { issueId }, nativeSessionId: sessionId, nextEventSeq: 2,
       runnerProfileJson: { nativeExecutionInput: execution, nativeResourceDisposition: "keep_running" } });
-    await db.insert(environmentLeases).values({ id: leaseId, companyId, heartbeatRunId: runId, provider: "daytona", providerLeaseId,
+    // The lease carries the run's task issue, as the warm acquisition writes it
+    // (environment-runtime.ts acquireLease issueId: input.issueId).
+    await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, heartbeatRunId: runId, provider: "daytona", providerLeaseId,
       status: "active", leasePolicy: "reuse_by_environment", metadata: {} });
     // The turn started on the box (not a pre-launch cancellation).
     await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1, eventType: "turn.started", stream: "system" });

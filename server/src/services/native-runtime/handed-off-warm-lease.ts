@@ -57,7 +57,10 @@ function handoffMarkerNamesRun(run: Pick<Run, "id" | "companyId" | "nativeIssueI
  * same handed-off lease: active and uncleaned before the release, and
  * retained/success after it (environment-runtime.ts releaseLease("retained",
  * { cleanupStatus: "success" }), releasedAt stays null), only when it is THIS
- * run's lease and carries the caller's marker naming this run. It refuses a
+ * run's lease (company, run AND issue: lease.issueId must equal the run's
+ * nativeIssueId; a lease with no issue, or a run with none, is refused, since the
+ * only producer, the warm acquisition in environment-runtime.ts, writes the
+ * run's task issue) and carries the caller's marker naming this run. It refuses a
  * released/terminated lease, a stop receipt, a stop in flight, stop-only
  * cleanup (stop_and_retain / export resume), a release deferral, a failed
  * cleanup and a non-reusable or local lease. */
@@ -66,6 +69,7 @@ export function retainedWarmHandoffLease(run: Pick<Run, "id" | "companyId" | "na
   const state = (lease.status === "active" && !lease.cleanupStatus)
     || (lease.status === "retained" && lease.cleanupStatus === "success");
   return state && !lease.releasedAt && lease.companyId === run.companyId && lease.heartbeatRunId === run.id
+    && run.nativeIssueId !== null && lease.issueId === run.nativeIssueId
     && !!lease.provider && lease.provider !== "local" && reusableNativeLeasePolicies.includes(lease.leasePolicy)
     && lease.metadata?.pendingCleanupInFlight !== true && !readLeaseReleaseDeferral(lease.metadata)
     && !hasStopOnlyCleanup(lease) && lease.metadata?.sandboxStopAndRetainReceipt == null
