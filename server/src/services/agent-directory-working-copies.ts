@@ -19,7 +19,8 @@ import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 import { agentDirectoryBaselineDigest, agentDirectoryProbeProgram, observeLocalAgentDirectory } from "./agent-directory-probe.js";
 import { hasRemoteTerminationReceipt, resolveRemoteTerminationLease } from "./remote-execution-termination.js";
 import { cachedAgentFileManifest, captureAgentFileCheckpoint, checkpointBaseline, checkpointSnapshot, type AgentFileManifest } from "./agent-file-checkpoints.js";
-import { withWorkspaceLockKeepalive } from "./native-runtime/native-workspace-lock-keepalive.js";
+import { currentHostMutationDrain, withHeldLockHostDrain } from "./native-runtime/held-lock-host-drain.js";
+import { hostMutation } from "@paperclipai/adapter-utils/host-mutation-drain";
 import { logger } from "../middleware/logger.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
 
@@ -562,7 +563,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       && row.receipt?.warm === true) return recoverStoppedRemote(row);
     if (row.receipt?.warm === true && !settled(row)) {
       signal?.throwIfAborted();
-      row = await checkpoint(row, target, true);
+      row = await hostMutation(() => checkpoint(row, target, true));
       await release(row, target, signal);
       return (await get(row.companyId, row.runId))!;
     }
@@ -593,7 +594,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         }
         // pl/keepalive5: no projection write (retrieve) or canonical save once the operation lock is lost.
         signal?.throwIfAborted();
-        inspected ??= await retrieve(row, target);
+        // pl/keepalive6: the projection write and the canonical save go through the held lock's gate.
+        inspected ??= await hostMutation(() => retrieve(row, target));
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
@@ -602,7 +604,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
           signal?.throwIfAborted();
-          ({ storageWarning, conflicts } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, conflicts } = await hostMutation(() => store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row))));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
         row = await patch(row, { receipt: { ...withoutSaveHold(row.receipt), storageWarning, conflicts, pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
@@ -688,17 +690,17 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const paths = cleanupTarget.transport === "sandbox" ? [expected, sandboxTransferRoot(row, cleanupTarget.remoteCwd)] : [expected];
       const quoted = paths.map(p => `'${p.replaceAll("'", `'"'"'`)}'`).join(" ");
       signal?.throwIfAborted();
-      const remoteCleanupFailed = await runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
-        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 }).then(result => result.exitCode !== 0 || result.timedOut, () => true);
+      const remoteCleanupFailed = await hostMutation(() => runAdapterExecutionTargetShellCommand(row.runId, cleanupTarget, `rm -rf -- ${quoted}`,
+        { cwd: cleanupTarget.remoteCwd, env: {}, timeoutSec: 15 })).then(result => result.exitCode !== 0 || result.timedOut, () => true);
       cleanupPending ||= remoteCleanupFailed;
     } else if (!destroyed && row.processStoppedAt && settled(row) && row.location !== "local") {
       // Rebind only the current host-owned lease. Never acquire a replacement.
       signal?.throwIfAborted();
-      cleanupPending ||= !await cleanupRemoteAfterRestart(row).catch(() => false);
+      cleanupPending ||= !await hostMutation(() => cleanupRemoteAfterRestart(row)).catch(() => false);
     }
     if (settled(row) && row.processStoppedAt) {
       signal?.throwIfAborted();
-      try { await fs.rm(path.dirname(row.localRoot), { recursive: true, force: true }); }
+      try { await hostMutation(() => fs.rm(path.dirname(row.localRoot), { recursive: true, force: true })); }
       catch {
         // Leave the baseline marker so restart recovery retries failed cleanup.
         await patch(row, { receipt: { ...row.receipt, cleanupPending: true } });
@@ -795,6 +797,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return result.exitCode === 0 && !result.timedOut;
   }
   async function serial<T>(row: Copy, fn: (current: Copy, signal?: AbortSignal) => Promise<T>, operation: DirectoryMergeLockOperation): Promise<T> {
+    // pl/keepalive6: an enclosing held lock's gate, captured before the operation lock connection opens.
+    const parentGate = currentHostMutationDrain();
     const run = async (lost?: AbortSignal) => {
       const lockRoot = path.resolve(disposableRemoteCopy(row) ? projectionRoot(row) : row.localRoot, "../../..");
       if (disposableRemoteCopy(row)) await fs.mkdir(lockRoot, { recursive: true, mode: 0o700 });
@@ -821,12 +825,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       const [lock] = await tx.execute(sql`select pg_try_advisory_xact_lock(hashtextextended(${`agent-directory:${row.companyId}:${row.agentId}`}, 0)) as acquired,
         (select setting::bigint from pg_settings where name = 'idle_in_transaction_session_timeout') as idle_timeout_ms`);
       if (lock?.acquired !== true) throw new AgentDirectoryOperationBusyError();
-      // pl/keepalive5: a failed ping aborts the operation's signal; a lost lock is a failure, never a success.
-      const lost = new AbortController();
-      const result = await withWorkspaceLockKeepalive(tx as unknown as Db, Number(lock.idle_timeout_ms), () => run(lost.signal),
-        { onLost: cause => lost.abort(new AgentDirectoryOperationLockLostError(cause)) });
-      lost.signal.throwIfAborted();
-      return result;
+      // pl/keepalive6: a failed ping closes the operation's host-mutation gate (joined to any enclosing held lock's);
+      // its writes are refused after the loss and in-flight ones drain before the lock is released.
+      return withHeldLockHostDrain({ lock: tx as unknown as Db, idleTimeoutMs: Number(lock.idle_timeout_ms), parent: parentGate,
+        label: "agent directory operation lock", lostError: cause => new AgentDirectoryOperationLockLostError(cause) },
+      (signal) => run(signal));
     }));
   }
   async function claimConflictNotice(input: { companyId: string; agentId: string; runId: string; previousRunId?: string | null }): Promise<string | null> {
