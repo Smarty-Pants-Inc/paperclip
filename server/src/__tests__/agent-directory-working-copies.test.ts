@@ -3,6 +3,7 @@ import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
+import * as fileCheckpoints from "../services/agent-file-checkpoints.js";
 import * as instructionAuthorization from "../services/agent-instruction-authorization.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -18,7 +19,8 @@ const execFile = promisify(execFileCallback);
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { spawn } from "node:child_process";
 import { eq, sql } from "drizzle-orm";
 import { agentFileStore, fileHash, inspectAgentFile, inspectAgentDirectory, snapshotAgentFiles, MAX_AGENT_FILE_BYTES, MAX_AGENT_DIRECTORY_BYTES, MAX_AGENT_DIRECTORY_ENTRIES } from "../services/agent-file-store.js";
 import { agents, companies, issues, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, environmentLeases, environments, agentInstructionWorkingCopies, agentInstructionRevisions, agentInstructionHeads, createDb, fileStorageDb } from "@paperclipai/db";
@@ -30,8 +32,8 @@ import { buildNativeRuntimeContext } from "../services/native-runtime/runtime-co
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
-import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService } from "../services/agent-directory-working-copies.js";
-import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, applyWarmNotesProgram } from "../services/agent-directory-working-copies.js";
+import { directorySnapshotSha256, withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 
@@ -438,6 +440,566 @@ describe("persistent agent directories", () => {
       await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", responsibleUserId: userId });
       return runId;
     }
+    describe("Paul's managed bundle: notes do not retire a warm chat (notes-digest)", () => {
+      const instructionFiles = ["AGENTS.md", "RULES.md", "DECISIONS.md", "PREFERENCES.md", "MODELS.md", "LANDSCAPE.md"];
+      const note = "memory/2026-11-17-playful-handover-sma612.md";
+      async function paulBundle() {
+        // Exact mode: managed, entry AGENTS.md, top-level instruction files + memory/** archive/** templates/** work/**.
+        await db.update(agents).set({ adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } })
+          .where(eq(agents.id, agentId));
+        await fs.rm(path.join(root, "policy"), { recursive: true, force: true });
+        for (const name of instructionFiles) await fs.writeFile(path.join(root, name), `# ${name}\n`);
+        await fs.writeFile(path.join(root, "DECISIONS.md"), "# Decisions\nDECISION-FACT: the blue kettle is retired.\n");
+        for (const [name, body] of [["memory/README.md", "notes\n"], ["memory/2026-11-16-old.md", "old note\n"], ["archive/README.md", "archive\n"],
+          ["templates/project-lead.md", "template\n"], ["work/sma408_check.py", "print(1)\n"]]) {
+          await fs.mkdir(path.dirname(path.join(root, name)), { recursive: true });
+          await fs.writeFile(path.join(root, name), body);
+        }
+      }
+      async function siblingSaves(relative: string, body: string) {
+        const sibling = await run();
+        await fs.mkdir(path.dirname(path.join(sibling.localRoot, relative)), { recursive: true });
+        await fs.writeFile(path.join(sibling.localRoot, relative), body);
+        expect((await copies.collectStopped({ companyId, runId: sibling.runId }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(body);
+      }
+      async function onDisk(dir: string) {
+        const out: string[] = [];
+        const walk = async (rel: string) => {
+          for (const e of await fs.readdir(path.join(dir, rel), { withFileTypes: true })) {
+            const next = rel ? `${rel}/${e.name}` : e.name;
+            if (e.isDirectory()) await walk(next); else out.push(next);
+          }
+        };
+        await walk("");
+        return out.sort();
+      }
+
+      it("keeps chat A warm on its SAME directory after a sibling saves a memory note; a NEW chat sees the note and DECISIONS", async () => {
+        await paulBundle();
+        const chatA = await run({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
+        const before = await onDisk(root);
+        await siblingSaves(note, "NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // Warm chat A: its FIRST next turn reuses the same materialization (no retirement, no fresh restore).
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(true);
+        const turn2 = await run({ warm: true, reuseRunId: chatA.runId });
+        expect(turn2.localRoot).toBe(chatA.localRoot);
+        expect(turn2.executionRoot).toBe(chatA.executionRoot);
+        expect(await copies.get(companyId, chatA.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: turn2.runId } });
+        // The runner's 'instructions' for the warm turn are unchanged (no refresh_required).
+        const contextFor = async (copy: typeof chatA) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
+          adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
+          runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
+        const [contextA, context2] = [await contextFor(chatA), await contextFor(turn2)];
+        expect(context2.instructions).toEqual(contextA.instructions);
+        expect(context2.aggregateDigest).toBe(contextA.aggregateDigest);
+        // ...and still sees the sibling's note on disk.
+        expect(await fs.readFile(path.join(turn2.localRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // A NEW chat started after the note restores the whole folder: the note and DECISIONS.md facts.
+        const chatB = await run({ warm: true });
+        expect(chatB.localRoot).not.toBe(chatA.localRoot);
+        expect(await fs.readFile(path.join(chatB.localRoot, note), "utf8")).toContain("NOTE-FACT");
+        expect(await fs.readFile(path.join(chatB.localRoot, "DECISIONS.md"), "utf8")).toContain("DECISION-FACT");
+        expect(await onDisk(chatB.localRoot)).toEqual([...before, note].sort());
+
+        // Never-OK: chat A's own later save keeps every note (nothing dropped or moved).
+        await fs.writeFile(path.join(turn2.localRoot, "memory/2026-11-17-chat-a.md"), "chat A note\n");
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId }))?.state).toBe("warm_saved");
+        await copies.collectStopped({ companyId, runId: turn2.runId });
+        await copies.collectStopped({ companyId, runId: chatB.runId });
+        expect(await onDisk(root)).toEqual([...before, note, "memory/2026-11-17-chat-a.md"].sort());
+        expect(await fs.readFile(path.join(root, note), "utf8")).toContain("NOTE-FACT");
+      }, 20_000);
+
+      it.each(["AGENTS.md", "DECISIONS.md"])("still retires the warm chat when a sibling edits %s", async edited => {
+        await paulBundle();
+        const chatA = await run({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId }))?.state).toBe("warm_saved");
+        await siblingSaves(edited, `# ${edited} edited\n`);
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        await copies.collectStopped({ companyId, runId: chatA.runId });
+        const fresh = (await copies.prepare({ ...target(), runId, cwd: home, warm: true }))!;
+        expect(fresh.localRoot).not.toBe(chatA.localRoot);
+        expect(await fs.readFile(path.join(fresh.localRoot, edited), "utf8")).toBe(`# ${edited} edited\n`);
+      }, 20_000);
+
+      it("adopts a retained session after a sibling note without retirement; the note is on disk", async () => {
+        await paulBundle();
+        const first = await run();
+        expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
+        await siblingSaves(note, "NOTE-FACT adopt\n");
+        const secondId = await nextRun();
+        const second = await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home });
+        expect(second).toMatchObject({ runId: secondId, localRoot: first.localRoot });
+        expect(second?.receipt?.retirementRequired).toBeUndefined();
+        expect(await fs.readFile(path.join(first.localRoot, note), "utf8")).toBe("NOTE-FACT adopt\n");
+        expect(await copies.hasChanges({ companyId, runId: secondId })).toBe(false);
+        await copies.collectStopped({ companyId, runId: secondId });
+        expect(await fs.readFile(path.join(root, note), "utf8")).toBe("NOTE-FACT adopt\n");
+        await copies.release(companyId, first.runId);
+      }, 20_000);
+
+      it("adoption still refuses a retained session after a DECISIONS.md edit", async () => {
+        await paulBundle();
+        const first = await run();
+        expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
+        await siblingSaves("DECISIONS.md", "# changed\n");
+        const secondId = await nextRun();
+        expect(await copies.adopt({ companyId, agentId, runId: secondId, previousRunId: first.runId, cwd: home })).toBeNull();
+        await copies.collectStopped({ companyId, runId: first.runId });
+      }, 20_000);
+
+      // Paul's REAL shape: the chat runs on a REMOTE sandbox (Boat). AGENT_HOME is
+      // the remote executionRoot and is written into the runner's instruction text,
+      // so a fresh restore into a new per-run root forces native_runner_refresh_required.
+      async function sandbox() {
+        const remoteCwd = await fs.mkdtemp(path.join(home, "boat-sandbox-"));
+        const runner: import("@paperclipai/adapter-utils/command-managed-runtime").CommandManagedRuntimeRunner = {
+          execute: async input => {
+            const startedAt = new Date().toISOString();
+            const env = { ...process.env, ...input.env };
+            const args = [...(input.args ?? [])];
+            if (input.stdin != null && (args[0] === "-c" || args[0] === "-lc")) {
+              env.PAPERCLIP_TEST_STDIN = input.stdin;
+              args[1] = `printf '%s' "$PAPERCLIP_TEST_STDIN" | (${args[1]})`;
+            }
+            try {
+              const result = await execFile(input.command, args, { cwd: input.cwd, env, timeout: input.timeoutMs, maxBuffer: 32 * 1024 * 1024 });
+              return { exitCode: 0, signal: null, timedOut: false, stdout: result.stdout, stderr: result.stderr, pid: null, startedAt };
+            } catch (error) {
+              const e = error as { code?: number; signal?: NodeJS.Signals; stdout?: string; stderr?: string };
+              return { exitCode: typeof e.code === "number" ? e.code : 1, signal: e.signal ?? null, timedOut: false, stdout: e.stdout ?? "", stderr: e.stderr ?? "", pid: null, startedAt };
+            }
+          },
+        };
+        const executionTarget = { kind: "remote" as const, transport: "sandbox" as const, environmentId: randomUUID(), leaseId: "", remoteCwd, runner };
+        await db.insert(environments).values({ id: executionTarget.environmentId, name: `Boat sandbox ${executionTarget.environmentId}`, driver: "sandbox" });
+        // The parked chat on the box: a runnerd stand-in with ONE idle provider
+        // child. backgroundChild() adds a live tool/background job under it.
+        const runnerd = spawn(process.execPath, ["-e", `const { spawn } = require("node:child_process");
+          const children = [];
+          const start = () => { const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" }); children.push(child); process.stdout.write(child.pid + "\\n"); };
+          process.stdin.on("data", () => start()); process.on("SIGTERM", () => { for (const child of children) child.kill("SIGKILL"); process.exit(0); }); start();`], { stdio: ["pipe", "pipe", "inherit"] });
+        const childPids: number[] = [];
+        let waiting: ((pid: number) => void) | null = null;
+        runnerd.stdout!.setEncoding("utf8").on("data", (chunk: string) => { for (const line of chunk.split("\n").filter(Boolean)) { childPids.push(Number(line)); waiting?.(Number(line)); } });
+        onTestFinished(() => { runnerd.kill("SIGTERM"); });
+        const nextChild = () => new Promise<number>(resolve => { waiting = pid => { waiting = null; resolve(pid); }; });
+        const providerPid = childPids[0] ?? await nextChild();
+        void providerPid;
+        const backgroundChild = async () => { const next = nextChild(); runnerd.stdin!.write("x"); return next; };
+        const prepare = async (options: { warm?: boolean; reuseRunId?: string } = {}) => {
+          const runId = await nextRun();
+          executionTarget.leaseId = randomUUID();
+          await db.insert(environmentLeases).values({ id: executionTarget.leaseId, companyId, environmentId: executionTarget.environmentId,
+            heartbeatRunId: runId, provider: "daytona", providerLeaseId: "boat-fixture-allocation" });
+          return (await copies.prepare({ ...target(), runId, cwd: home, target: executionTarget, ...options }))!;
+        };
+        // A sibling task on the same sandbox saves through its own remote run.
+        const siblingSavesRemote = async (relative: string, body: string) => {
+          const sibling = await prepare();
+          await fs.mkdir(path.dirname(path.join(sibling.executionRoot, relative)), { recursive: true });
+          await fs.writeFile(path.join(sibling.executionRoot, relative), body);
+          expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: executionTarget }))?.state).toBe("saved");
+          expect(await fs.readFile(path.join(root, relative), "utf8")).toBe(body);
+        };
+        return { executionTarget, prepare, siblingSavesRemote, backgroundChild };
+      }
+      const contextFor = async (copy: { runId: string; executionRoot: string }) => buildNativeRuntimeContext({ db, agent: { id: agentId, companyId, name: "Target",
+        adapterConfig: { instructionsBundleMode: "managed", instructionsRootPath: root, instructionsEntryFile: "AGENTS.md" } },
+        runId: copy.runId, runtimeConfig: {}, runtimeSkillEntries: [], instructionWorkingCopy: { rootPath: copy.executionRoot, entryPath: "AGENTS.md", kind: "agent_files" } });
+
+      it("REMOTE sandbox: keeps chat A warm on its SAME AGENT_HOME after a sibling saves a memory note; a NEW chat sees the note and DECISIONS", async () => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect(chatA.location).toBe(`remote:${boat.executionTarget.environmentId}`);
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        const before = await onDisk(root);
+        await boat.siblingSavesRemote(note, "NOTE-FACT: Kate takes the SMA-612 handover.\n");
+
+        // Chat A's FIRST next turn reuses the same remote root: no retirement, no re-copy.
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(true);
+        const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+        expect(turn2.executionRoot).toBe(chatA.executionRoot);
+        expect(turn2.localRoot).toBe(chatA.localRoot);
+        expect(await copies.get(companyId, chatA.runId)).toMatchObject({ state: "superseded", receipt: { successorRunId: turn2.runId } });
+        // 'AGENT_HOME is <root>' and every other instruction byte the runner compares are unchanged.
+        const [contextA, context2] = [await contextFor(chatA), await contextFor(turn2)];
+        expect(context2.instructions).toEqual(contextA.instructions);
+        expect(context2.aggregateDigest).toBe(contextA.aggregateDigest);
+        // The sibling's note is readable in the remote folder chat A is using.
+        expect(await fs.readFile(path.join(turn2.executionRoot, note), "utf8")).toBe("NOTE-FACT: Kate takes the SMA-612 handover.\n");
+        expect(await onDisk(turn2.executionRoot).then(files => files.filter(name => !name.startsWith(".paperclip-runtime/")))).toEqual([...before, note].sort());
+        // No upload or capture scratch is left in the remote root or on the host.
+        expect((await fs.readdir(path.join(turn2.executionRoot, ".paperclip-runtime"))).filter(name => /^(notes|checkpoint)-/.test(name))).toEqual([]);
+        expect((await fs.readdir(path.dirname(turn2.localRoot))).filter(name => /^(notes|checkpoint)-/.test(name))).toEqual([]);
+        // The refreshed tree is the new checkpoint baseline: an idle turn saves nothing.
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "unchanged" } });
+
+        // A NEW chat restores the whole folder: the note and the DECISIONS.md fact.
+        const chatB = await boat.prepare({ warm: true });
+        expect(chatB.executionRoot).not.toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(chatB.executionRoot, note), "utf8")).toContain("NOTE-FACT");
+        expect(await fs.readFile(path.join(chatB.executionRoot, "DECISIONS.md"), "utf8")).toContain("DECISION-FACT");
+
+        // Never-OK: chat A's own later save keeps every note (nothing dropped or moved).
+        await fs.writeFile(path.join(turn2.executionRoot, "memory/2026-11-17-chat-a.md"), "chat A note\n");
+        expect((await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+        await copies.collectStopped({ companyId, runId: chatB.runId, target: boat.executionTarget });
+        expect(await onDisk(root)).toEqual([...before, note, "memory/2026-11-17-chat-a.md"].sort());
+        expect(await fs.readFile(path.join(root, note), "utf8")).toContain("NOTE-FACT");
+      }, 30_000);
+
+      // Data-safety guards: exercise the real remote capture, subset upload and
+      // rename program, not a mocked manifest or a source-text assertion.
+      it("REMOTE sandbox never-OK: delete propagation delivers A' and removes B before the canonical post-check", async () => {
+        await paulBundle();
+        const a = "memory/notes-a.md", b = "memory/notes-b.md";
+        await fs.writeFile(path.join(root, a), "A\n");
+        await fs.writeFile(path.join(root, b), "B\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        expect(await fs.readFile(path.join(chatA.executionRoot, a), "utf8")).toBe("A\n");
+        expect(await fs.readFile(path.join(chatA.executionRoot, b), "utf8")).toBe("B\n");
+        const sibling = await boat.prepare();
+        await fs.writeFile(path.join(sibling.executionRoot, a), "A'\n");
+        await fs.unlink(path.join(sibling.executionRoot, b));
+        expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, a), "utf8")).toBe("A'\n");
+        await expect(fs.stat(path.join(root, b))).rejects.toMatchObject({ code: "ENOENT" });
+
+        const capture = vi.spyOn(fileCheckpoints, "captureAgentFileCheckpoint");
+        const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+        const stagedPaths: string[][] = [];
+        const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+          if (input.adapterKey.startsWith("agent-notes-")) stagedPaths.push(await onDisk(input.assets![0]!.localDir));
+          return actualUpload(input);
+        });
+        try {
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          expect(turn2.executionRoot).toBe(chatA.executionRoot);
+          expect(await fs.readFile(path.join(turn2.executionRoot, a), "utf8")).toBe("A'\n");
+          await expect(fs.stat(path.join(turn2.executionRoot, b))).rejects.toMatchObject({ code: "ENOENT" });
+          const deliveries = upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"));
+          expect(deliveries).toHaveLength(1);
+          expect(stagedPaths).toEqual([[a]]);
+          const captures = capture.mock.calls.flatMap(([input], index) => input.runId === chatA.runId ? [capture.mock.results[index]!.value] : []);
+          expect(captures).toHaveLength(2);
+          const verified = await captures[1]!;
+          const canonical = fileCheckpoints.checkpointSnapshot(await fileCheckpoints.cachedAgentFileManifest(root));
+          expect(fileCheckpoints.checkpointSnapshot(verified.manifest)).toEqual(canonical);
+          expect(turn2.baseHash).toBe(directorySnapshotSha256(canonical));
+        } finally { capture.mockRestore(); upload.mockRestore(); }
+      }, 90_000);
+
+      it("REMOTE sandbox never-OK: two writers never touch one file; dirty and mid-delivery writes survive retirement", async () => {
+        await paulBundle();
+        const f = "memory/warm-writer.md";
+        const bytes = Buffer.concat([Buffer.from("warm writer\r\n☃\n"), Buffer.from([0, 255, 127])]);
+        for (const timing of ["after-checkpoint", "between-capture-and-rename", "same-file-between-capture-and-rename"] as const) {
+          await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+          const boat = await sandbox();
+          const chatA = await boat.prepare({ warm: true });
+          expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+          if (timing === "after-checkpoint") await fs.writeFile(path.join(chatA.executionRoot, f), bytes);
+          await boat.siblingSavesRemote(note, `sibling ${timing}\n`);
+          // Check both disjoint and overlapping writes. Only a disjoint-file
+          // race would miss a rename overwriting F before the post-capture.
+          if (timing !== "between-capture-and-rename") await boat.siblingSavesRemote(f, `sibling F ${timing}\n`);
+          const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+          const capture = vi.spyOn(fileCheckpoints, "captureAgentFileCheckpoint");
+          let raced = false;
+          const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+            if (input.adapterKey.startsWith("agent-notes-") && timing !== "after-checkpoint") {
+              expect(capture.mock.calls.filter(([input]) => input.runId === chatA.runId)).toHaveLength(1);
+              await fs.writeFile(path.join(chatA.executionRoot, f), bytes);
+              raced = true;
+            }
+            return actualUpload(input);
+          });
+          const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+          const runId = await nextRun();
+          try {
+            let handoffError: unknown;
+            await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId })
+              .catch(error => { handoffError = error; });
+            expect({ bytes: await fs.readFile(path.join(chatA.executionRoot, f)), refused: handoffError instanceof AgentDirectoryReuseInvalidatedError },
+              `${timing}: never overwrite the warm writer's bytes or accept a raced handoff`).toEqual({ bytes, refused: true });
+            expect(handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+            // A same-file write is caught IN placement (moved-aside bytes differ
+            // from the baseline) and put back; a disjoint write by the post-check.
+            expect((handoffError as Error).message).toBe(timing === "after-checkpoint" ? "Warm agent directory changed after its checkpoint"
+              : timing === "between-capture-and-rename" ? "Warm agent directory note refresh could not be verified" : "Warm agent directory note refresh failed");
+            const deliveries = upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"));
+            const renames = shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram));
+            expect(deliveries).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
+            expect(renames).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
+            expect(raced).toBe(timing !== "after-checkpoint");
+            const captures = capture.mock.calls.flatMap(([input], index) => input.runId === chatA.runId ? [capture.mock.results[index]!.value] : []);
+            expect(captures).toHaveLength(timing === "between-capture-and-rename" ? 2 : 1);
+            const observed = fileCheckpoints.checkpointSnapshot((await captures[0]!).manifest);
+            expect(directorySnapshotSha256(observed) === chatA.baseHash).toBe(timing !== "after-checkpoint");
+            if (timing === "between-capture-and-rename") {
+              const verified = fileCheckpoints.checkpointSnapshot((await captures[1]!).manifest);
+              const canonical = fileCheckpoints.checkpointSnapshot(await fileCheckpoints.cachedAgentFileManifest(root));
+              expect(directorySnapshotSha256(verified)).not.toBe(directorySnapshotSha256(canonical));
+            }
+            if (timing === "after-checkpoint") {
+              await expect(fs.stat(path.join(chatA.executionRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+            }
+            expect(await copies.get(companyId, runId)).toBeNull();
+            expect((await copies.get(companyId, chatA.runId))?.state).toBe("warm_saved");
+            // The existing retirement contract: save the old owner FIRST, then
+            // restore this same proposed run fresh, after the handoff releases its lock.
+            expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("saved");
+            expect(await fs.readFile(path.join(root, f))).toEqual(bytes);
+            const fresh = (await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true }))!;
+            expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
+            expect(await fs.readFile(path.join(fresh.executionRoot, f))).toEqual(bytes);
+            expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe(`sibling ${timing}\n`);
+            await copies.collectStopped({ companyId, runId, target: boat.executionTarget });
+          } finally { capture.mockRestore(); upload.mockRestore(); shell.mockRestore(); }
+        }
+      }, 90_000);
+
+      // RFL ruling (a)+(b): a race INSIDE delivery keeps the agent's change and
+      // takes the existing retirement + fresh restore. One helper per shape.
+      async function raceDuringDelivery(input: { baseline: Record<string, string>; sibling: (boat: Awaited<ReturnType<typeof sandbox>>) => Promise<void>;
+        race: (warmRoot: string) => Promise<void> }) {
+        await paulBundle();
+        for (const [name, body] of Object.entries(input.baseline)) await fs.writeFile(path.join(root, name), body);
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await input.sibling(boat);
+        const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+        let raced = false;
+        const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async uploadInput => {
+          if (uploadInput.adapterKey.startsWith("agent-notes-")) { await input.race(chatA.executionRoot); raced = true; }
+          return actualUpload(uploadInput);
+        });
+        const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+        const runId = await nextRun();
+        let handoffError: unknown;
+        try {
+          await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId })
+            .catch(error => { handoffError = error; });
+          return { boat, chatA, runId, raced, handoffError, applies: shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram)).length };
+        } finally { upload.mockRestore(); shell.mockRestore(); }
+      }
+
+      it("REMOTE sandbox never-OK: a delete that lands during delivery is not resurrected", async () => {
+        const f = "memory/warm-deleted.md";
+        const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+          sibling: boat => boat.siblingSavesRemote(f, "sibling F'\n"), race: async warm => fs.unlink(path.join(warm, f)) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        await expect(fs.stat(path.join(result.chatA.executionRoot, f))).rejects.toMatchObject({ code: "ENOENT" });
+        expect(await copies.get(companyId, result.runId)).toBeNull();
+        expect((await copies.get(companyId, result.chatA.runId))?.state).toBe("warm_saved");
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: a write to a file on the remove list that lands during delivery survives", async () => {
+        const b = "memory/warm-removed.md";
+        const bytes = Buffer.from("warm writer kept B\n");
+        const result = await raceDuringDelivery({ baseline: { [b]: "B\n" },
+          sibling: async boat => {
+            const sibling = await boat.prepare();
+            await fs.unlink(path.join(sibling.executionRoot, b));
+            await fs.writeFile(path.join(sibling.executionRoot, note), "sibling note\n");
+            expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: boat.executionTarget }))?.state).toBe("saved");
+            await expect(fs.stat(path.join(root, b))).rejects.toMatchObject({ code: "ENOENT" });
+          },
+          race: async warm => fs.writeFile(path.join(warm, b), bytes) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect(await fs.readFile(path.join(result.chatA.executionRoot, b))).toEqual(bytes);
+        // Retirement saves the agent's bytes first; the fresh restore has them.
+        expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, b))).toEqual(bytes);
+        const fresh = (await copies.prepare({ ...target(), runId: result.runId, cwd: home, target: result.boat.executionTarget, warm: true }))!;
+        expect(await fs.readFile(path.join(fresh.executionRoot, b))).toEqual(bytes);
+        await copies.collectStopped({ companyId, runId: result.runId, target: result.boat.executionTarget });
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: a live background child does not block delivery; delivery proceeds in place and the child's same-file write is kept", async () => {
+        // RFL ruling of record: no quiescence gate. A live child keeps the chat on the same thread.
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await boat.siblingSavesRemote(note, "sibling note\n");
+        await boat.backgroundChild();
+        const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+        expect(turn2.executionRoot).toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(turn2.executionRoot, note), "utf8")).toBe("sibling note\n");
+        await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+        // The child's concurrent same-file write mid-delivery: aborted, the child's bytes kept and saved.
+        const f = "memory/child-writer.md", bytes = Buffer.from("background child bytes\n");
+        const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+          sibling: async raced => { await raced.backgroundChild(); await raced.siblingSavesRemote(f, "sibling F'\n"); },
+          race: async warm => fs.writeFile(path.join(warm, f), bytes) });
+        expect(result.raced).toBe(true);
+        expect(result.applies).toBe(1);
+        expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect(await fs.readFile(path.join(result.chatA.executionRoot, f))).toEqual(bytes);
+        expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, f))).toEqual(bytes);
+      }, 90_000);
+
+      it("REMOTE sandbox never-OK: an fd write AFTER the swap lands in the retained aside copy and is surfaced at the next checkpoint", async () => {
+        await paulBundle();
+        const f = "memory/fd-writer.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        // A live writer holds an fd on F across delivery.
+        const handle = await fs.open(path.join(chatA.executionRoot, f), "a");
+        try {
+          await boat.siblingSavesRemote(f, "sibling F'\n");
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          expect(turn2.executionRoot).toBe(chatA.executionRoot);
+          expect(await fs.readFile(path.join(turn2.executionRoot, f), "utf8")).toBe("sibling F'\n");
+          // AFTER the swap (and after the green post-check) the fd write lands in the moved-aside inode.
+          await handle.write("FD-AFTER-SWAP\n");
+          await handle.sync();
+          const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect(await fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          // The next verified checkpoint surfaces the changed copy into the tree and collects it.
+          const saved = await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget });
+          expect(saved).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "saved", notesAside: false } });
+          const surfaced = `${f}.aside-${epoch}`;
+          expect(await fs.readFile(path.join(root, surfaced), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+          // Collected, then the aside is cleaned; nothing else retained.
+          await expect(fs.stat(asideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+          await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+          expect(await fs.readFile(path.join(root, surfaced), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+        } finally { await handle.close(); }
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: after a failed post-check the retained aside copy is surfaced by the stopped collection", async () => {
+        const f = "memory/fd-retired.md", disjoint = "memory/disjoint-racer.md";
+        let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+        try {
+          const result = await raceDuringDelivery({ baseline: { [f]: "checkpoint baseline\n" },
+            sibling: boat => boat.siblingSavesRemote(f, "sibling F'\n"),
+            // A disjoint write fails the post-check; a live fd on F is held across the swap.
+            race: async warm => { handle = await fs.open(path.join(warm, f), "a"); await fs.writeFile(path.join(warm, disjoint), "racer\n"); } });
+          expect(result.applies).toBe(1);
+          expect((result.handoffError as Error).message).toBe("Warm agent directory note refresh could not be verified");
+          await handle!.write("FD-AFTER-SWAP\n");
+          await handle!.sync();
+          expect(await copies.get(companyId, result.chatA.runId)).toMatchObject({ state: "warm_saved", receipt: { notesAside: true } });
+          const asideRoot = path.join(result.chatA.executionRoot, ".paperclip-runtime", "notes-aside");
+          const [epoch] = await fs.readdir(asideRoot);
+          expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
+          expect(await fs.readFile(path.join(root, `${f}.aside-${epoch}`), "utf8")).toBe("checkpoint baseline\nFD-AFTER-SWAP\n");
+          expect(await fs.readFile(path.join(root, disjoint), "utf8")).toBe("racer\n");
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+        } finally { await handle?.close(); }
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: an unchanged retained aside copy is removed only after the next verified checkpoint", async () => {
+        await paulBundle();
+        const f = "memory/retained.md";
+        await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await boat.siblingSavesRemote(f, "sibling F'\n");
+        const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+        const asideRoot = path.join(turn2.executionRoot, ".paperclip-runtime", "notes-aside");
+        const [epoch] = await fs.readdir(asideRoot);
+        expect(await fs.readFile(path.join(asideRoot, epoch!, "0"), "utf8")).toBe("checkpoint baseline\n");
+        expect(await copies.get(companyId, turn2.runId)).toMatchObject({ receipt: { notesAside: true } });
+        expect(await copies.checkpointWarm({ companyId, runId: turn2.runId, target: boat.executionTarget })).toMatchObject({ state: "warm_saved", receipt: { checkpointState: "unchanged", notesAside: false } });
+        await expect(fs.stat(asideRoot)).rejects.toMatchObject({ code: "ENOENT" });
+        expect((await onDisk(root)).filter(name => name.includes(".aside-"))).toEqual([]);
+        await copies.collectStopped({ companyId, runId: turn2.runId, target: boat.executionTarget });
+      }, 60_000);
+
+      it("REMOTE sandbox never-OK: EEXIST on no-replace placement keeps the agent's bytes", async () => {
+        // The path is recreated between the move-aside and link(2): a preload
+        // performs that write inside the real program's first linkSync call.
+        const boat = await sandbox();
+        const warmRoot = path.join(boat.executionTarget.remoteCwd, "warm-root"), source = path.join(warmRoot, ".paperclip-runtime", "notes-x", "files");
+        const f = "memory/eexist.md", baselineBytes = "baseline\n", agentBytes = "agent recreated\n", sibling = "sibling\n";
+        await fs.mkdir(path.join(warmRoot, "memory"), { recursive: true });
+        await fs.mkdir(path.join(source, "memory"), { recursive: true });
+        await fs.writeFile(path.join(warmRoot, f), baselineBytes);
+        await fs.writeFile(path.join(source, f), sibling);
+        const preload = path.join(boat.executionTarget.remoteCwd, "eexist-preload.cjs");
+        await fs.writeFile(preload, `const fs = require("node:fs"); const link = fs.linkSync; let once = false;
+          fs.linkSync = (from, to) => { if (!once) { once = true; fs.writeFileSync(to, ${JSON.stringify(agentBytes)}); } return link(from, to); };`);
+        const sha = (text: string) => createHash("sha256").update(text).digest("hex");
+        const plan = { root: warmRoot, source, aside: path.join(warmRoot, ".paperclip-runtime", "notes-x", "aside"),
+          remove: [], dirs: [], files: [[f, 0o600, { "": sha(baselineBytes) }, sha(sibling)]] };
+        const result = await execFile(process.execPath, ["-r", preload, "-e", applyWarmNotesProgram, JSON.stringify(plan)]).then(() => null, error => error as { code: number; stderr: string });
+        expect(result?.code).not.toBe(0);
+        expect(result?.stderr).toContain("EEXIST");
+        // The agent's recreated bytes stay in the tree; the moved-aside original is kept, never deleted.
+        expect(await fs.readFile(path.join(warmRoot, f), "utf8")).toBe(agentBytes);
+        expect(result?.stderr).toContain("agent bytes kept aside");
+        expect(await fs.readFile(path.join(plan.aside, "0"), "utf8")).toBe(baselineBytes);
+      }, 30_000);
+
+      it("REMOTE sandbox never-OK: chat A's unsynced write survives a sibling note (no refresh over a dirty tree)", async () => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        // Chat A writes after its last checkpoint (its idle tree no longer equals the baseline).
+        await fs.writeFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "A-UNSYNCED\n");
+        await boat.siblingSavesRemote(note, "NOTE-FACT sibling\n");
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        // The tree was not touched: A's write is still there and the sibling's note was not pushed over it.
+        expect(await fs.readFile(path.join(chatA.executionRoot, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        await expect(fs.stat(path.join(chatA.executionRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+        // Retirement collects A first; then the fresh copy has both A's write and the sibling's note.
+        expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        expect(await fs.readFile(path.join(root, note), "utf8")).toBe("NOTE-FACT sibling\n");
+        const fresh = await boat.prepare({ warm: true });
+        expect(await fs.readFile(path.join(fresh.executionRoot, "memory/2026-11-17-a-unsynced.md"), "utf8")).toBe("A-UNSYNCED\n");
+        expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe("NOTE-FACT sibling\n");
+        await copies.collectStopped({ companyId, runId: fresh.runId, target: boat.executionTarget });
+      }, 30_000);
+
+      it.each(["AGENTS.md", "DECISIONS.md"])("REMOTE sandbox: still retires the warm chat when a sibling edits %s", async edited => {
+        await paulBundle();
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        await boat.siblingSavesRemote(edited, `# ${edited} edited\n`);
+        expect(await copies.canReuseWarm(companyId, agentId, chatA.runId)).toBe(false);
+        const runId = await nextRun();
+        await expect(copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId }))
+          .rejects.toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+        expect(await fs.readFile(path.join(chatA.executionRoot, edited), "utf8")).not.toBe(`# ${edited} edited\n`);
+        await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget });
+        const fresh = await boat.prepare({ warm: true });
+        expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
+        expect(await fs.readFile(path.join(fresh.executionRoot, edited), "utf8")).toBe(`# ${edited} edited\n`);
+        await copies.collectStopped({ companyId, runId: fresh.runId, target: boat.executionTarget });
+      }, 30_000);
+    });
+
     it("adopts one physical root and fences stale cleanup through final save", async () => {
       const first = await run();
       expect(await copies.hasChanges({ companyId, runId: first.runId })).toBe(false);
