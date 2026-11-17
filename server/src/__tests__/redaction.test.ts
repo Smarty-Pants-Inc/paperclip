@@ -6,9 +6,23 @@ describe("explicit diagnostic credential forms", () => {
     expect(redactEventPayload({ authorizationHeader: "abcdefghijkl", apiKeyProduction: "sensitivevalue", credentialHandling: "harness", tokenPolicy: "least privilege" }))
       .toEqual({ authorizationHeader: "***REDACTED***", apiKeyProduction: "***REDACTED***", credentialHandling: "harness", tokenPolicy: "least privilege" });
   });
+  it.each(["a bearer of good news", "ern bearer lanterns", "the bearer bonds", "ern bearer [REDACTED]"])("preserves prose and upstream redaction markers: %s", input => {
+    expect(redactSensitiveText(input)).toBe(input);
+    expect(redactEventPayload({ text: input })?.text).toBe(input);
+  });
+  it.each([
+    ["Authorization: Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD", "Authorization: ***REDACTED***"],
+    ["Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD", "Bearer ***REDACTED***"],
+    ["Authorization: Bearer x", "Authorization: ***REDACTED***"],
+    ['bearer "x"', 'bearer "***REDACTED***"'],
+    ["bearer 'x'", "bearer '***REDACTED***'"],
+  ])("masks explicit bearer credentials: %s", (input, expected) => {
+    expect(redactSensitiveText(input)).toBe(expected);
+    expect(redactEventPayload({ text: input })?.text).toBe(expected);
+  });
   it("masks standalone bearer values and whitespace-prefixed JSON token headers", () => {
     const jwt = `${Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url")}.abcdefghijk.abcdefghijkl`;
-    expect(redactSensitiveText("provider said Bearer abcdefghijkl")).not.toContain("abcdefghijkl");
+    expect(redactSensitiveText("provider said Bearer abcdefghijklmnopqrstuvwxyz0123456789ABCD")).not.toContain("abcdefghijklmnopqrstuvwxyz0123456789ABCD");
     expect(redactEventPayload({ diagnostic: jwt })?.diagnostic).toBe("***REDACTED***");
     expect(redactSensitiveText("Use bearer authentication and bearer tokens.")).toBe("Use bearer authentication and bearer tokens.");
   });
@@ -469,12 +483,12 @@ describe("redaction", () => {
     const sanitized = redactEventPayload({
       message: "request failed with Authorization: Basic dXNlcjpwYXNz",
       diagnostic: {
-        reason: "upstream returned Bearer live-provider-token",
+        reason: "upstream returned Bearer live-provider-token-0123456789abcdef",
         details: [
           "safe context",
           "proxyAuthorization Basic nested-proxy-secret",
           "aaa.bbb.ccc",
-          ["Bearer nested-array-secret"],
+          ["Bearer nested-array-secret-0123456789abcdef"],
         ],
       },
     });
