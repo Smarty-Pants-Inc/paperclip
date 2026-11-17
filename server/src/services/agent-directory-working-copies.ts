@@ -335,22 +335,32 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     }
     const refreshed = new Set(names);
     const verified = await capture({ ...observed, entries: observed.entries.filter(([name]) => !refreshed.has(name)) }).catch(() => null);
-    if (!verified || directorySnapshotSha256(checkpointSnapshot(verified)) !== directorySnapshotSha256(canonical)) {
-      // The moved-aside copies stay in the excluded scratch: nothing is deleted
-      // before a green post-check. Retirement collects the tree itself.
-      throw new AgentDirectoryReuseInvalidatedError("Warm agent directory note refresh could not be verified");
-    }
     // (4) Retention: the moved-aside copies are NOT deleted. They move to
     // .paperclip-runtime/notes-aside/<epoch>-<id> and stay until the next
     // verified checkpoint (checkpoint() below) re-hashes them: an fd write
     // that landed after the swap is surfaced and collected, never dropped.
-    const retainAt = path.posix.join(row.executionRoot, ".paperclip-runtime", "notes-aside", `${Date.now()}-${id.slice(0, 8)}`);
-    const retained = await runAdapterExecutionTargetShellCommand(row.runId, target,
-      `node -e ${quote(retainWarmNotesAsideProgram)} ${quote(plan.aside)} ${quote(retainAt)} ${quote(remoteStaging)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 })
-      .catch(error => ({ exitCode: 1, timedOut: false, stderr: String(error) }));
-    if (retained.exitCode !== 0 || retained.timedOut) logger.warn({ runId: row.runId, stderr: retained.stderr?.trim().slice(0, 500) }, "Warm note aside copies kept in the delivery scratch");
+    const retainAside = async () => {
+      const retainAt = path.posix.join(row.executionRoot, ".paperclip-runtime", "notes-aside", `${Date.now()}-${id.slice(0, 8)}`);
+      const retained = await runAdapterExecutionTargetShellCommand(row.runId, target,
+        `node -e ${quote(retainWarmNotesAsideProgram)} ${quote(plan.aside)} ${quote(retainAt)} ${quote(remoteStaging)}`, { cwd: target.remoteCwd, env: {}, timeoutSec: 15 })
+        .catch(error => ({ exitCode: 1, timedOut: false, stderr: String(error) }));
+      if (retained.exitCode !== 0 || retained.timedOut) logger.warn({ runId: row.runId, stderr: retained.stderr?.trim().slice(0, 500) }, "Warm note aside copies kept in the delivery scratch");
+    };
+    const anyAside = plan.remove.length > 0 || plan.files.some(([, , expect]) => expect[""] !== "absent");
+    if (!verified || directorySnapshotSha256(checkpointSnapshot(verified)) !== directorySnapshotSha256(canonical)) {
+      // Nothing is deleted before a green post-check. The aside copies are
+      // retained for THIS owner's stopped collection (retirement), whose
+      // checkpoint surfaces any copy that changed after the swap.
+      if (anyAside) {
+        await retainAside();
+        await patch(row, { receipt: { ...row.receipt, notesAside: true } })
+          .catch(error => logger.warn({ err: error, runId: row.runId }, "Retained warm note aside copies not recorded; they stay on the box"));
+      }
+      throw new AgentDirectoryReuseInvalidatedError("Warm agent directory note refresh could not be verified");
+    }
+    await retainAside();
     return { baseHash: directorySnapshotSha256(canonical), baseline: serializeDirectorySnapshot(canonical), checkpointManifest: verified,
-      notesAside: plan.remove.length > 0 || plan.files.some(([, , expect]) => expect[""] !== "absent") };
+      notesAside: anyAside };
   }
   async function transport(row: Copy, target: AdapterExecutionTarget, recovering: boolean) {
     if (target.kind !== "remote" || row.location !== `remote:${target.environmentId ?? ""}`) throw new Error("Agent directory environment changed");
