@@ -1,4 +1,5 @@
 import type { RunLogChunk } from "../adapters";
+import { chunkOffset, evictHead, rangePageBytes, getRunPaging, utf8ByteLength, withChunkOffset, withRunPaging, type PagedChunk } from "./run-log-paging";
 
 /**
  * Chunk-merge / seq-dedupe primitives shared by the live run transcript view
@@ -10,7 +11,7 @@ import type { RunLogChunk } from "../adapters";
  * de-duplication rules so the two hooks cannot drift apart.
  */
 
-export type IncomingRunLogChunk = RunLogChunk & { dedupeKey: string };
+export type IncomingRunLogChunk = PagedChunk & { dedupeKey: string };
 
 /**
  * Per-consumer merge state. `seenChunkKeys` is shared across every run tracked
@@ -27,44 +28,20 @@ export interface ChunkMergeRefs {
 const SEEN_CHUNK_KEY_CAP = 12000;
 
 /**
- * Retention budget for a run's kept chunk window. Task views pass a byte budget
- * with `collapseTrimmed` so the just-rendered scrollback is retained and, when
- * the budget is genuinely exceeded, the oldest content collapses behind a
- * visible marker instead of silently vanishing midstream. Compact consumers
- * (dashboard tickers, summary draft) keep the historical chunk-count cap by
- * passing a bare number, which discards silently as before.
+ * Retention budget for a run's kept chunk window. Full task views pass a byte
+ * budget with `page: true`: older records leave memory only as recorded
+ * saved-log ranges that "Show earlier output" reads back (see
+ * `run-log-paging.ts`), so every line stays reachable. Compact consumers
+ * (dashboard tickers, summary draft) keep the chunk-count cap by passing a bare
+ * number; they are previews, never the place a person reads a full run.
  */
 export interface ChunkRetentionBudget {
-  /** Hard ceiling on retained chunk count. */
+  /** Hard ceiling on retained chunk count (compact previews only). */
   maxChunks?: number;
-  /** Soft ceiling on retained chunk payload size (UTF-16 code units ≈ bytes). */
+  /** Ceiling on retained chunk payload size (UTF-16 code units). */
   maxBytes?: number;
-  /**
-   * When true, trimming leaves a single visible "earlier output trimmed" marker
-   * at the head so collapsed content never disappears without a trace. When
-   * false (the default for count-only callers), trimming is silent.
-   */
-  collapseTrimmed?: boolean;
-}
-
-/**
- * Text of the synthetic system chunk that marks where older output was
- * collapsed out of the retained window. Rendered as an ordinary system line by
- * `buildTranscript`, so the affordance is adapter-agnostic.
- */
-export const TRIMMED_OUTPUT_MARKER_TEXT =
-  "⋯ earlier output trimmed to stay within the live transcript buffer ⋯";
-
-export function isTrimmedOutputMarkerChunk(chunk: RunLogChunk): boolean {
-  return (
-    chunk.stream === "system" &&
-    chunk.chunk === TRIMMED_OUTPUT_MARKER_TEXT &&
-    chunk.seq === undefined
-  );
-}
-
-function makeTrimmedOutputMarkerChunk(ts: string): RunLogChunk {
-  return { ts, stream: "system", chunk: TRIMMED_OUTPUT_MARKER_TEXT };
+  /** Page older records out to the saved log instead of discarding them. */
+  page?: boolean;
 }
 
 function chunkRetainedSize(chunk: RunLogChunk): number {
@@ -76,62 +53,36 @@ function normalizeRetentionBudget(budget: number | ChunkRetentionBudget): ChunkR
 }
 
 /**
- * Trim a run's retained window to its budget. Byte-budget trimming keeps the
- * newest chunks and (when `collapseTrimmed`) prepends one marker so the
- * scrollback shows earlier output was collapsed rather than silently dropped.
- * Returns the highest sequenced chunk actually removed so callers can raise the
- * trimmed-seq floor and drop re-delivered older records.
+ * Trim a compact preview window to its budget, keeping the newest chunks.
+ * Returns the highest sequenced chunk removed so callers can raise the
+ * seq floor and drop re-delivered older records.
  */
 export function applyRetentionBudget(
   chunks: RunLogChunk[],
   budget: ChunkRetentionBudget,
 ): { chunks: RunLogChunk[]; trimmedSeq: number | null } {
-  const { maxChunks, maxBytes, collapseTrimmed } = budget;
-
-  // Peel off any existing marker so it is never counted or duplicated; a single
-  // marker is re-added below if trimming is (still) in effect.
-  const hadMarker = chunks.length > 0 && isTrimmedOutputMarkerChunk(chunks[0]!);
-  const real = hadMarker ? chunks.slice(1) : chunks;
-
+  const { maxChunks, maxBytes } = budget;
   let removeCount = 0;
-  if (typeof maxChunks === "number" && real.length > maxChunks) {
-    removeCount = real.length - maxChunks;
+  if (typeof maxChunks === "number" && chunks.length > maxChunks) {
+    removeCount = chunks.length - maxChunks;
   }
   if (typeof maxBytes === "number") {
     let totalBytes = 0;
-    for (const chunk of real) totalBytes += chunkRetainedSize(chunk);
+    for (const chunk of chunks) totalBytes += chunkRetainedSize(chunk);
     let byteRemove = 0;
     // Always keep the newest chunk even if it alone exceeds the byte budget.
-    while (byteRemove < real.length - 1 && totalBytes > maxBytes) {
-      totalBytes -= chunkRetainedSize(real[byteRemove]!);
+    while (byteRemove < chunks.length - 1 && totalBytes > maxBytes) {
+      totalBytes -= chunkRetainedSize(chunks[byteRemove]!);
       byteRemove += 1;
     }
     if (byteRemove > removeCount) removeCount = byteRemove;
   }
-
-  if (removeCount <= 0) {
-    // Nothing new to trim. Preserve an existing marker so an earlier collapse
-    // keeps its trace; otherwise return the marker-stripped array only if we
-    // actually stripped one (we never had a real trim to justify keeping it).
-    if (hadMarker) return { chunks, trimmedSeq: null };
-    return { chunks: real, trimmedSeq: null };
-  }
-
-  const removed = real.slice(0, removeCount);
-  const kept = real.slice(removeCount);
-
+  if (removeCount <= 0) return { chunks, trimmedSeq: null };
   let trimmedSeq: number | null = null;
-  for (const item of removed) {
-    if (typeof item.seq === "number" && (trimmedSeq === null || item.seq > trimmedSeq)) {
-      trimmedSeq = item.seq;
-    }
+  for (const item of chunks.slice(0, removeCount)) {
+    if (typeof item.seq === "number" && (trimmedSeq === null || item.seq > trimmedSeq)) trimmedSeq = item.seq;
   }
-
-  if (collapseTrimmed || hadMarker) {
-    const markerTs = kept[0]?.ts ?? removed[removed.length - 1]!.ts;
-    return { chunks: [makeTrimmedOutputMarkerChunk(markerTs), ...kept], trimmedSeq };
-  }
-  return { chunks: kept, trimmedSeq };
+  return { chunks: chunks.slice(removeCount), trimmedSeq };
 }
 
 export function readChunkSeq(value: unknown): number | undefined {
@@ -151,37 +102,80 @@ export function parsePersistedLogContent(
   runId: string,
   content: string,
   pendingByRun: Map<string, string>,
+  /**
+   * Saved-log byte range `[start, end)` this content was read from. When given,
+   * records carry their saved-log offset so they can page out of memory.
+   */
+  contentRange?: { start: number; end: number },
 ): IncomingRunLogChunk[] {
   if (!content) return [];
 
   const pendingKey = `${runId}:records`;
-  const combined = `${pendingByRun.get(pendingKey) ?? ""}${content}`;
+  const pending = pendingByRun.get(pendingKey) ?? "";
+  const combined = `${pending}${content}`;
   const split = combined.split("\n");
-  pendingByRun.set(pendingKey, split.pop() ?? "");
+  const trailing = split.pop() ?? "";
+  pendingByRun.set(pendingKey, trailing);
+
+  // A read can start or stop inside a multi-byte character, which the server
+  // decodes as U+FFFD; anchor offsets on whichever page edge decoded cleanly.
+  const offsets = contentRange ? recordOffsets(split, pending, content, trailing, contentRange) : null;
 
   const parsed: IncomingRunLogChunk[] = [];
-  for (const line of split) {
+  split.forEach((line, index) => {
     const trimmed = line.trim();
-    if (!trimmed) continue;
+    if (!trimmed) return;
     try {
       const raw = JSON.parse(trimmed) as { ts?: unknown; stream?: unknown; chunk?: unknown; seq?: unknown };
       const stream = raw.stream === "stderr" || raw.stream === "system" ? raw.stream : "stdout";
       const chunk = typeof raw.chunk === "string" ? raw.chunk : "";
       const ts = typeof raw.ts === "string" ? raw.ts : new Date().toISOString();
-      if (!chunk) continue;
+      if (!chunk) return;
+      const offset = offsets?.[index];
       parsed.push({
         ts,
         stream,
         chunk,
         seq: readChunkSeq(raw.seq),
         dedupeKey: `log:${runId}:${ts}:${stream}:${chunk}`,
+        ...(offset !== undefined ? { offset } : {}),
       });
     } catch {
       // Ignore malformed log rows.
     }
-  }
+  });
 
   return parsed;
+}
+
+export function recordOffsets(
+  lines: readonly string[],
+  pending: string,
+  content: string,
+  trailing: string,
+  range: { start: number; end: number },
+): Array<number | undefined> {
+  const offsets: Array<number | undefined> = new Array(lines.length).fill(undefined);
+  if (lines.length === 0) return offsets;
+  const firstNewline = content.indexOf("\n");
+  const trustStart = !content.slice(0, firstNewline + 1).includes("\uFFFD") && (pending === "" || !pending.includes("\uFFFD"));
+  const trustEnd = !trailing.includes("\uFFFD");
+  if (trustStart) {
+    // Line 0 starts inside the previous page unless nothing was pending.
+    let cursor = range.start + utf8ByteLength(lines[0]!) + 1 - utf8ByteLength(pending);
+    if (pending === "") offsets[0] = range.start;
+    for (let index = 1; index < lines.length; index += 1) {
+      offsets[index] = cursor;
+      cursor += utf8ByteLength(lines[index]!) + 1;
+    }
+  } else if (trustEnd) {
+    let cursor = range.end - utf8ByteLength(trailing);
+    for (let index = lines.length - 1; index >= 1; index -= 1) {
+      cursor -= utf8ByteLength(lines[index]!) + 1;
+      offsets[index] = cursor;
+    }
+  }
+  return offsets;
 }
 
 /**
@@ -205,23 +199,50 @@ export function mergeRunLogChunks(
   incoming: IncomingRunLogChunk[],
   refs: ChunkMergeRefs,
   budget: number | ChunkRetentionBudget,
-): { chunks: RunLogChunk[]; changed: boolean } {
+): { chunks: RunLogChunk[]; changed: boolean; needsOffsets?: boolean } {
   if (incoming.length === 0) return { chunks: prevChunks, changed: false };
 
-  const existing = [...prevChunks];
+  const normalizedBudget = normalizeRetentionBudget(budget);
+  const paging = getRunPaging(prevChunks);
+  if (normalizedBudget.page && paging.laterFrom !== null) {
+    // The newest records are paged out to the saved log while the person reads
+    // earlier output; "Show later output" reads them back from there. Only
+    // lines that are not in the saved log are kept for that return trip.
+    const synthetic = incoming.filter((chunk) => typeof chunk.seq !== "number" && chunkOffset(chunk) === undefined
+      && (isStructuredStreamingTextDelta(chunk.chunk) || !refs.seenChunkKeys.has(chunk.dedupeKey)));
+    if (synthetic.length === 0) return { chunks: prevChunks, changed: false };
+    for (const chunk of synthetic) refs.seenChunkKeys.add(chunk.dedupeKey);
+    const next = withRunPaging([...prevChunks], {
+      ...paging,
+      laterExtras: [...paging.laterExtras, ...synthetic.map(({ ts, stream, chunk }) => ({ ts, stream, chunk }))],
+    });
+    return { chunks: next, changed: true };
+  }
+
+  const existing: PagedChunk[] = [...prevChunks];
   let changed = false;
 
   for (const chunk of incoming) {
+    const offset = chunkOffset(chunk);
+    if (normalizedBudget.page && offset !== undefined && offset < paging.windowStart) continue;
     if (typeof chunk.seq === "number") {
       const seqFloor = refs.trimmedSeqFloorByRun.get(runId) ?? 0;
       if (chunk.seq <= seqFloor) continue;
-      const duplicateAt = existing.findIndex((item) => item.seq === chunk.seq);
+      const duplicateAt = existing.findLastIndex((item) => item.seq === chunk.seq);
       if (duplicateAt !== -1) {
         // Same record arrived via the other delivery path. Prefer the longer
         // payload: websocket chunks may be tail-truncated while the persisted
-        // row is complete.
-        if (chunk.chunk.length > existing[duplicateAt]!.chunk.length) {
-          existing[duplicateAt] = { ts: chunk.ts, stream: chunk.stream, chunk: chunk.chunk, seq: chunk.seq };
+        // row is complete. The persisted copy also brings its saved-log offset.
+        const prior = existing[duplicateAt]!;
+        const longer = chunk.chunk.length > prior.chunk.length;
+        const addsOffset = offset !== undefined && chunkOffset(prior) === undefined;
+        if (longer || addsOffset) {
+          existing[duplicateAt] = withChunkOffset({
+            ts: longer ? chunk.ts : prior.ts,
+            stream: longer ? chunk.stream : prior.stream,
+            chunk: longer ? chunk.chunk : prior.chunk,
+            seq: chunk.seq,
+          }, offset ?? chunkOffset(prior));
           changed = true;
         }
         continue;
@@ -235,7 +256,7 @@ export function mergeRunLogChunks(
         if (typeof prior.seq !== "number" || prior.seq < chunk.seq) break;
         insertAt -= 1;
       }
-      existing.splice(insertAt, 0, { ts: chunk.ts, stream: chunk.stream, chunk: chunk.chunk, seq: chunk.seq });
+      existing.splice(insertAt, 0, withChunkOffset({ ts: chunk.ts, stream: chunk.stream, chunk: chunk.chunk, seq: chunk.seq }, offset));
       changed = true;
       continue;
     }
@@ -244,7 +265,7 @@ export function mergeRunLogChunks(
       if (refs.seenChunkKeys.has(chunk.dedupeKey)) continue;
       refs.seenChunkKeys.add(chunk.dedupeKey);
     }
-    existing.push({ ts: chunk.ts, stream: chunk.stream, chunk: chunk.chunk });
+    existing.push(withChunkOffset({ ts: chunk.ts, stream: chunk.stream, chunk: chunk.chunk }, offset));
     changed = true;
   }
 
@@ -253,11 +274,20 @@ export function mergeRunLogChunks(
     refs.seenChunkKeys.clear();
   }
 
-  const { chunks: retained, trimmedSeq } = applyRetentionBudget(existing, normalizeRetentionBudget(budget));
-  if (trimmedSeq !== null) {
+  const raiseFloor = (seq: number | null) => {
+    if (seq === null) return;
     const seqFloor = refs.trimmedSeqFloorByRun.get(runId) ?? 0;
-    if (trimmedSeq > seqFloor) refs.trimmedSeqFloorByRun.set(runId, trimmedSeq);
+    if (seq > seqFloor) refs.trimmedSeqFloorByRun.set(runId, seq);
+  };
+  if (normalizedBudget.page) {
+    const maxUnits = normalizedBudget.maxBytes ?? Number.POSITIVE_INFINITY;
+    const { chunks: windowed, needsOffsets, evictedSeq } = evictHead(
+      existing, maxUnits, paging, rangePageBytes(maxUnits), normalizedBudget.maxChunks ?? Number.POSITIVE_INFINITY,
+    );
+    raiseFloor(evictedSeq);
+    return { chunks: windowed, changed: true, needsOffsets };
   }
-
+  const { chunks: retained, trimmedSeq } = applyRetentionBudget(existing, normalizedBudget);
+  raiseFloor(trimmedSeq);
   return { chunks: retained, changed: true };
 }

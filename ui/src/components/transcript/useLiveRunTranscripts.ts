@@ -3,6 +3,7 @@ import { useTranscriptLiveStream } from "../../context/LiveUpdatesProvider";
 import { usePageVisibility } from "../../lib/page-visibility";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { readTranscriptRequest } from "./read-transcript-request";
+import type { OutputPageState } from "./OutputPageControls";
 import { useQuery } from "@tanstack/react-query";
 import type { LiveEvent } from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
@@ -16,14 +17,34 @@ import {
   readChunkSeq,
   type ChunkRetentionBudget,
 } from "../../lib/run-log-chunks";
+import {
+  TRANSCRIPT_WINDOW_UTF16_UNITS,
+  getRunPaging,
+  parseLogRecords,
+  rangePageBytes,
+  readLogRange,
+  restoreEarlier,
+  restoreLater,
+  utf8ByteLength,
+  type EvictedRange,
+} from "../../lib/run-log-paging";
 
 const LOG_POLL_INTERVAL_MS = 2000;
 const LOG_READ_LIMIT_BYTES = 256_000;
 const REALTIME_FALLBACK_POLL_INTERVAL_MS = 30_000;
 const EMPTY_RUN_LOG_CHUNKS: RunLogChunk[] = [];
-// Full task views retain every received chunk. Compact dashboard consumers may
-// still opt into a bounded preview; never discard full task scrollback.
-const TASK_VIEW_MAX_BYTES_PER_RUN = Number.POSITIVE_INFINITY;
+// Full task views keep a bounded WINDOW in memory and page older records back
+// in from the saved run log ("Show earlier output"); nothing is discarded.
+const TASK_VIEW_MAX_BYTES_PER_RUN = TRANSCRIPT_WINDOW_UTF16_UNITS;
+const MAX_LOG_READ_BYTES = 1024 * 1024;
+
+export type { OutputPageState };
+export interface RunOutputPaging {
+  hasEarlier: boolean;
+  hasLater: boolean;
+  earlier: OutputPageState;
+  later: OutputPageState;
+}
 // Grace period before an accumulated transcript buffer is pruned for a run that
 // has vanished from the `runs` list. The parent refetches runs on its own
 // interval, and a single transient empty/errored poll would otherwise wipe the
@@ -93,7 +114,7 @@ export function useLiveRunTranscripts({
     () =>
       typeof maxChunksPerRun === "number"
         ? { maxChunks: maxChunksPerRun }
-        : { maxBytes: maxBytesPerRun, collapseTrimmed: true },
+        : { maxBytes: maxBytesPerRun, page: true },
     [maxChunksPerRun, maxBytesPerRun],
   );
   const runsKey = useMemo(
@@ -110,6 +131,10 @@ export function useLiveRunTranscripts({
   );
   const normalizedRuns = useMemo(() => runs.map((run) => ({ ...run })), [runsKey]);
   const [chunksByRun, setChunksByRun] = useState<Map<string, RunLogChunk[]>>(new Map());
+  const chunksByRunRef = useRef(chunksByRun);
+  chunksByRunRef.current = chunksByRun;
+  const needsOffsetsRef = useRef(new Set<string>());
+  const [pageStateByRun, setPageStateByRun] = useState<ReadonlyMap<string, { earlier: OutputPageState; later: OutputPageState }>>(new Map());
   const [hydratedRunIds, setHydratedRunIds] = useState<Set<string>>(new Set());
   const [errorsByRun, setErrorsByRun] = useState<ReadonlyMap<string, Error>>(new Map());
   const [retryGeneration, setRetryGeneration] = useState(0);
@@ -217,7 +242,7 @@ export function useLiveRunTranscripts({
     if (chunks.length === 0) return;
     setChunksByRun((prev) => {
       const prevChunks = prev.get(runId) ?? [];
-      const { chunks: merged, changed } = mergeRunLogChunks(
+      const { chunks: merged, changed, needsOffsets } = mergeRunLogChunks(
         runId,
         prevChunks,
         chunks,
@@ -227,6 +252,7 @@ export function useLiveRunTranscripts({
         },
         retentionBudget,
       );
+      if (needsOffsets) needsOffsetsRef.current.add(runId);
       if (!changed) return prev;
       const next = new Map(prev);
       next.set(runId, merged);
@@ -439,6 +465,7 @@ export function useLiveRunTranscripts({
             }), controller.signal,
           );
           if (cancelled) return;
+          const alignedRead = alignStartToRecord && offset > 0;
           const binding = bindLog(run.id, result.store, result.logRef);
           if (binding === "stale") { failed = true; return; }
           if (binding === "changed" && offset !== 0) { offset = 0; continue; }
@@ -464,7 +491,11 @@ export function useLiveRunTranscripts({
             if (!previous.has(run.id)) return previous;
             const next = new Map(previous); next.delete(run.id); return next;
           });
-          const rows = parsePersistedLogContent(run.id, result.content, pendingLogRowsByRunRef.current);
+          const pageEnd = result.nextOffset ?? offset + utf8ByteLength(result.content);
+          const rows = parsePersistedLogContent(
+            run.id, result.content, pendingLogRowsByRunRef.current,
+            alignedRead ? undefined : { start: offset, end: pageEnd },
+          );
           appendChunks(run.id, rows);
           for (const row of rows) sequence(run.id).confirm(row.seq);
           const next = result.nextOffset ?? offset + new TextEncoder().encode(result.content).byteLength;
@@ -544,6 +575,117 @@ export function useLiveRunTranscripts({
   }, [visible, enableRealtimeUpdates, logPollIntervalMs, logReadLimitBytes, normalizedRuns, runIdsKey, retryGeneration, enabled, companyId, stream.healthy, stream.epoch]);
 
 
+  // A window over its bound whose oldest records arrived only over the
+  // websocket has no saved-log offsets yet; read the saved log once so they
+  // gain offsets and can page out.
+  useEffect(() => {
+    if (needsOffsetsRef.current.size === 0) return;
+    const ids = [...needsOffsetsRef.current];
+    needsOffsetsRef.current.clear();
+    for (const id of ids) refreshByRunRef.current.get(id)?.();
+  }, [chunksByRun]);
+
+  const setPageState = useCallback((runId: string, direction: "earlier" | "later", state: OutputPageState) => {
+    setPageStateByRun((previous) => {
+      const current = previous.get(runId) ?? { earlier: "idle" as const, later: "idle" as const };
+      if (current[direction] === state) return previous;
+      return new Map(previous).set(runId, { ...current, [direction]: state });
+    });
+  }, []);
+  const pagingInFlightRef = useRef(new Set<string>());
+  const windowBudget = typeof maxChunksPerRun === "number" ? Number.POSITIVE_INFINITY : maxBytesPerRun;
+
+  /** Read the most recently evicted earlier range back from the saved log and show it in place. */
+  const loadEarlierOutput = useCallback(async (runId: string) => {
+    const key = `${runId}:earlier`;
+    if (pagingInFlightRef.current.has(key)) return;
+    const window = chunksByRunRef.current.get(runId);
+    const range: EvictedRange | undefined = window ? getRunPaging(window).earlier.at(-1) : undefined;
+    if (!window || !range) return;
+    pagingInFlightRef.current.add(key);
+    setPageState(runId, "earlier", "loading");
+    try {
+      const rows = range.end > range.start
+        ? await readLogRange(
+          (offset, limitBytes) => heartbeatsApi.log(runId, offset, limitBytes),
+          range.start, range.end, MAX_LOG_READ_BYTES,
+        )
+        : [];
+      const inRange = rows.filter((row) => row.offset !== undefined && row.offset < range.end);
+      setChunksByRun((previous) => {
+        const current = previous.get(runId);
+        if (!current || getRunPaging(current).earlier.at(-1) !== range) return previous;
+        return new Map(previous).set(runId, restoreEarlier(current, inRange, windowBudget));
+      });
+      setPageState(runId, "earlier", "idle");
+    } catch {
+      setPageState(runId, "earlier", "error");
+    } finally {
+      pagingInFlightRef.current.delete(key);
+    }
+  }, [setPageState, windowBudget]);
+
+  /** Read the next page of newer output back from the saved log. */
+  const loadLaterOutput = useCallback(async (runId: string) => {
+    const key = `${runId}:later`;
+    if (pagingInFlightRef.current.has(key)) return;
+    const window = chunksByRunRef.current.get(runId);
+    const from = window ? getRunPaging(window).laterFrom : null;
+    if (!window || from === null) return;
+    pagingInFlightRef.current.add(key);
+    setPageState(runId, "later", "loading");
+    try {
+      let limit = Math.min(logReadLimitBytes, rangePageBytes(windowBudget));
+      let page: { rows: ReturnType<typeof parseLogRecords>["rows"]; consumedBytes: number; atEnd: boolean };
+      for (;;) {
+        const result = await heartbeatsApi.log(runId, from, limit);
+        const parsed = parseLogRecords(result.content, from);
+        const atEnd = utf8ByteLength(result.content) < limit;
+        page = { ...parsed, atEnd };
+        if (parsed.consumedBytes > 0 || atEnd || limit >= MAX_LOG_READ_BYTES) break;
+        limit = Math.min(MAX_LOG_READ_BYTES, limit * 4);
+      }
+      const next = from + page.consumedBytes;
+      setChunksByRun((previous) => {
+        const current = previous.get(runId);
+        if (!current || getRunPaging(current).laterFrom !== from) return previous;
+        const { chunks: restored, evictedSeq } = restoreLater(current, page.rows, page.atEnd ? null : next, windowBudget);
+        if (page.atEnd) {
+          // Back at the live end: resume normal reads from where this page stopped.
+          let highest = evictedSeq ?? 0;
+          for (const row of page.rows) if (typeof row.seq === "number" && row.seq > highest) highest = row.seq;
+          if (highest > (trimmedSeqFloorByRunRef.current.get(runId) ?? 0)) trimmedSeqFloorByRunRef.current.set(runId, highest);
+          logOffsetByRunRef.current.set(runId, next);
+          pendingLogRowsByRunRef.current.delete(`${runId}:records`);
+        } else if (evictedSeq !== null && evictedSeq > (trimmedSeqFloorByRunRef.current.get(runId) ?? 0)) {
+          trimmedSeqFloorByRunRef.current.set(runId, evictedSeq);
+        }
+        return new Map(previous).set(runId, restored);
+      });
+      setPageState(runId, "later", "idle");
+      if (page.atEnd) refreshByRunRef.current.get(runId)?.();
+    } catch {
+      setPageState(runId, "later", "error");
+    } finally {
+      pagingInFlightRef.current.delete(key);
+    }
+  }, [logReadLimitBytes, setPageState, windowBudget]);
+
+  const outputPagingByRun = useMemo(() => {
+    const next = new Map<string, RunOutputPaging>();
+    for (const [runId, chunks] of chunksByRun) {
+      const paging = getRunPaging(chunks);
+      const state = pageStateByRun.get(runId);
+      next.set(runId, {
+        hasEarlier: paging.earlier.length > 0,
+        hasLater: paging.laterFrom !== null,
+        earlier: state?.earlier ?? "idle",
+        later: state?.later ?? "idle",
+      });
+    }
+    return next;
+  }, [chunksByRun, pageStateByRun]);
+
   const transcriptByRun = useMemo(() => {
     const next = new Map<string, TranscriptEntry[]>();
     const censorUsernameInLogs = generalSettings?.censorUsernameInLogs === true;
@@ -588,6 +730,7 @@ export function useLiveRunTranscripts({
   return {
     transcriptByRun,
     hydratedRunIds, truncatedRunIds, errorsByRun, retry,
+    outputPagingByRun, loadEarlierOutput, loadLaterOutput,
     isInitialHydrating: normalizedRuns.some((run) => canReadPersistedLog(run) && !hydratedRunIds.has(run.id)),
     hasOutputForRun(runId: string) {
       return (chunksByRun.get(runId)?.length ?? 0) > 0 || runById.get(runId)?.hasStoredOutput === true;

@@ -1,6 +1,17 @@
-/** Keep full live history; rendering may fold blocks without discarding data. */
+/**
+ * `appendCapped` ceilings: nothing in a full view is cut, so both are
+ * unbounded. Memory is bounded by paging instead (below).
+ */
 export const MAX_LIVE_LOG_LINES = Number.POSITIVE_INFINITY;
 export const MAX_LIVE_EVENTS = Number.POSITIVE_INFINITY;
+
+/**
+ * Window bounds for the run log viewer. Older log lines leave browser memory
+ * only as recorded saved-log ranges that "Show earlier output" reads back
+ * (see run-log-paging.ts), so every line stays reachable.
+ */
+export const LOG_VIEWER_WINDOW_LINES = 5_000;
+export const LOG_VIEWER_WINDOW_UTF16_UNITS = 4_000_000;
 
 /**
  * Initial number of blocks mounted by the live nice view. RunTranscriptView's

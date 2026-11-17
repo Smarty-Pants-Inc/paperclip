@@ -6,7 +6,18 @@ import { TranscriptSequence } from "../../lib/transcript-sequence";
 import { readTranscriptRequest } from "../transcript/read-transcript-request";
 import { useTranscriptLiveStream } from "../../context/LiveUpdatesProvider";
 import { liveRunEvent, mergeRunEvents } from "../../lib/live-run-event";
-import { mergeRunLogChunks, readChunkSeq } from "../../lib/run-log-chunks";
+import { mergeRunLogChunks, readChunkSeq, recordOffsets } from "../../lib/run-log-chunks";
+import {
+  getRunPaging,
+  parseLogRecords,
+  rangePageBytes,
+  readLogRange,
+  restoreEarlier,
+  restoreLater,
+  utf8ByteLength,
+  withChunkOffset,
+} from "../../lib/run-log-paging";
+import type { OutputPage, OutputPageState } from "../transcript/OutputPageControls";
 import { usePageVisibility } from "../../lib/page-visibility";
 import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
@@ -19,7 +30,12 @@ import { getUIAdapter, buildTranscript, onAdapterChange } from "../../adapters";
 import { cn } from "../../lib/utils";
 import { Button } from "@/components/ui/button";
 import { RunTranscriptView, type TranscriptMode } from "../transcript/RunTranscriptView";
-import { LIVE_TRANSCRIPT_RENDER_LIMIT, MAX_LIVE_EVENTS, MAX_LIVE_LOG_LINES } from "../../lib/live-log-buffer";
+import {
+  LIVE_TRANSCRIPT_RENDER_LIMIT,
+  LOG_VIEWER_WINDOW_LINES,
+  LOG_VIEWER_WINDOW_UTF16_UNITS,
+  MAX_LIVE_EVENTS,
+} from "../../lib/live-log-buffer";
 import { type HeartbeatRun, type HeartbeatRunEvent } from "@paperclipai/shared";
 import {
   type RunLogChunk,
@@ -82,24 +98,31 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
     return err instanceof ApiError && err.status === 404;
   }
 
+  // Memory window: older lines page out to the saved run log and come back
+  // through "Show earlier output"; nothing is cut.
   function appendLogLines(incoming: RunLogChunk[]) {
-    setLogLines((previous) => mergeRunLogChunks(run.id, previous, incoming.map((line) => ({
+    setLogLines((previous) => mergeRunLogChunks(run.id, previous, incoming.map((line) => withChunkOffset({
       ...line, dedupeKey: `log:${run.id}:${line.ts}:${line.stream}:${line.chunk}`,
-    })), logMergeRefs.current, isLive ? MAX_LIVE_LOG_LINES : Number.POSITIVE_INFINITY).chunks);
+    }, logLineOffsets.get(line))), logMergeRefs.current, {
+      maxBytes: LOG_VIEWER_WINDOW_UTF16_UNITS, maxChunks: LOG_VIEWER_WINDOW_LINES, page: true,
+    }).chunks);
   }
 
-  function appendLogContent(content: string, finalize = false) {
+  function appendLogContent(content: string, finalize = false, range?: { start: number; end: number }) {
     if (!content && !finalize) return;
-    const combined = `${pendingLogLineRef.current}${content}`;
+    const pending = pendingLogLineRef.current;
+    const combined = `${pending}${content}`;
     const split = combined.split("\n");
-    pendingLogLineRef.current = split.pop() ?? "";
+    const trailing = split.pop() ?? "";
+    const offsets = range ? recordOffsets(split, pending, content, trailing, range) : [];
+    pendingLogLineRef.current = trailing;
     if (finalize && pendingLogLineRef.current) {
       split.push(pendingLogLineRef.current);
       pendingLogLineRef.current = "";
     }
 
     const parsed: RunLogChunk[] = [];
-    for (const line of split) {
+    for (const [index, line] of split.entries()) {
       const trimmed = line.trim();
       if (!trimmed) continue;
       try {
@@ -111,7 +134,10 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
         if (!chunk) continue;
         const seq = readChunkSeq(raw.seq);
         logSequenceRef.current.confirm(seq);
-        parsed.push({ ts, stream, chunk, seq });
+        const row: RunLogChunk = { ts, stream, chunk, seq };
+        const offset = offsets[index];
+        if (offset !== undefined) logLineOffsets.set(row, offset);
+        parsed.push(row);
       } catch {
         // ignore malformed lines
       }
@@ -123,6 +149,72 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
       appendLogLines(parsed);
     }
   }
+
+  const logLineOffsets = useRef(new WeakMap<RunLogChunk, number>()).current;
+  const [logPageState, setLogPageState] = useState<{ earlier: OutputPageState; later: OutputPageState }>({ earlier: "idle", later: "idle" });
+  const logLinesRef = useRef(logLines);
+  logLinesRef.current = logLines;
+  const logPagingInFlight = useRef(new Set<string>());
+  const loadEarlierLog = useCallback(async () => {
+    const window = logLinesRef.current;
+    const range = getRunPaging(window).earlier.at(-1);
+    if (!range || logPagingInFlight.current.has("earlier")) return;
+    logPagingInFlight.current.add("earlier");
+    setLogPageState((state) => ({ ...state, earlier: "loading" }));
+    try {
+      const rows = range.end > range.start
+        ? await readLogRange((offset, limitBytes) => heartbeatsApi.log(run.id, offset, limitBytes), range.start, range.end, 1024 * 1024)
+        : [];
+      const inRange = rows.filter((row) => row.offset !== undefined && row.offset < range.end);
+      setLogLines((current) => getRunPaging(current).earlier.at(-1) === range
+        ? restoreEarlier(current, inRange, LOG_VIEWER_WINDOW_UTF16_UNITS, LOG_VIEWER_WINDOW_LINES)
+        : current);
+      setLogPageState((state) => ({ ...state, earlier: "idle" }));
+    } catch {
+      setLogPageState((state) => ({ ...state, earlier: "error" }));
+    } finally {
+      logPagingInFlight.current.delete("earlier");
+    }
+  }, [run.id]);
+  const loadLaterLog = useCallback(async () => {
+    const from = getRunPaging(logLinesRef.current).laterFrom;
+    if (from === null || logPagingInFlight.current.has("later")) return;
+    logPagingInFlight.current.add("later");
+    setLogPageState((state) => ({ ...state, later: "loading" }));
+    try {
+      // Read forward only up to what this viewer has already read; past that
+      // the ordinary reader (live tail or "Load more log") takes over again.
+      const readThrough = logOffsetRef.current;
+      let limit = Math.min(rangePageBytes(LOG_VIEWER_WINDOW_UTF16_UNITS), Math.max(1, readThrough - from));
+      let parsed = parseLogRecords("", from);
+      for (;;) {
+        const result = await heartbeatsApi.log(run.id, from, limit);
+        parsed = parseLogRecords(result.content, from);
+        if (parsed.consumedBytes > 0 || from + limit >= readThrough || limit >= 1024 * 1024) break;
+        limit = Math.min(1024 * 1024, limit * 4);
+      }
+      const next = from + parsed.consumedBytes;
+      const atEnd = next >= readThrough || parsed.consumedBytes === 0;
+      setLogLines((current) => {
+        if (getRunPaging(current).laterFrom !== from) return current;
+        const { chunks, evictedSeq } = restoreLater(current, parsed.rows, atEnd ? null : next, LOG_VIEWER_WINDOW_UTF16_UNITS, LOG_VIEWER_WINDOW_LINES);
+        let highest = evictedSeq ?? 0;
+        if (atEnd) for (const row of parsed.rows) if (typeof row.seq === "number" && row.seq > highest) highest = row.seq;
+        const floors = logMergeRefs.current.trimmedSeqFloorByRun;
+        if (highest > (floors.get(run.id) ?? 0)) floors.set(run.id, highest);
+        return chunks;
+      });
+      setLogPageState((state) => ({ ...state, later: "idle" }));
+      if (atEnd && isLive) refreshLogRef.current?.();
+    } catch {
+      setLogPageState((state) => ({ ...state, later: "error" }));
+    } finally {
+      logPagingInFlight.current.delete("later");
+    }
+  }, [run.id, isLive]);
+  const logPaging = getRunPaging(logLines);
+  const earlierLogPage: OutputPage = { available: logPaging.earlier.length > 0, state: logPageState.earlier, load: () => void loadEarlierLog() };
+  const laterLogPage: OutputPage = { available: logPaging.laterFrom !== null, state: logPageState.later, load: () => void loadLaterLog() };
 
   const refreshEventsRef = useRef<((force?: boolean) => void) | null>(null);
   const refreshLogRef = useRef<((force?: boolean) => void) | null>(null);
@@ -381,8 +473,8 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
         queueMicrotask(() => persistedLog.refetch());
         return;
       }
-      appendLogContent(result.content, result.nextOffset === undefined);
-      const next = result.nextOffset ?? offset + new TextEncoder().encode(result.content).byteLength;
+      const next = result.nextOffset ?? offset + utf8ByteLength(result.content);
+      appendLogContent(result.content, result.nextOffset === undefined, { start: offset, end: next });
       setLogOffset(next);
       setHasMoreLog(!wasLiveRef.current && result.nextOffset !== undefined && !!result.content);
       if (pendingLogRefresh.current || (wasLiveRef.current && result.nextOffset !== undefined && !!result.content && next > offset)) {
@@ -528,6 +620,8 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
         <RunTranscriptView
           runLogHref={`/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.id)}`}
           entries={transcript}
+          earlierOutput={earlierLogPage}
+          laterOutput={laterLogPage}
           toolDecisions={toolDecisionLookup.data?.decisions ?? []}
           mode={transcriptMode}
           streaming={isLive}

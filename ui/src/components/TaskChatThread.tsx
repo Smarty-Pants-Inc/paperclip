@@ -43,6 +43,7 @@ import {
   useLiveRunTranscripts,
   type RunTranscriptSource,
 } from "@/components/transcript/useLiveRunTranscripts";
+import { OutputPageControl } from "@/components/transcript/OutputPageControls";
 import { useNativeRunTranscripts } from "@/components/transcript/useNativeRunTranscripts";
 import { TaskChatLiveTail } from "@/components/task-chat/TaskChatLiveTail";
 import { McpAppIssueProvider } from "@/components/mcp-app/McpAppIssueContext";
@@ -1117,6 +1118,9 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     truncatedRunIds,
     errorsByRun: logErrorsByRun,
     retry: retryLogs,
+    outputPagingByRun,
+    loadEarlierOutput,
+    loadLaterOutput,
   } = useLiveRunTranscripts({ runs: logRuns, companyId, ...(props.compactHistory ? { logReadLimitBytes: COMPACT_RUN_LOG_READ_LIMIT_BYTES } : {}) });
   const fallbackByRunRef = useRef(
     new Map<string, NonNullable<ReturnType<typeof logTranscriptByRun.get>>>(),
@@ -3155,11 +3159,26 @@ export function TaskChatThread(inputProps: TaskChatThreadProps) {
     setCompactRunHistory({ issueId, ids: EMPTY_RUN_IDS });
   }
   const revealedRunIds = revealedRunHistory?.issueId === issueId ? revealedRunHistory.ids : EMPTY_RUN_IDS;
-  const historyControl = props.historyControl ?? (
+  // Output that left browser memory reads back from each run's saved log.
+  const outputPagingControls = useMemo(() => {
+    const controls = logRuns.flatMap((run) => {
+      const paging = outputPagingByRun?.get(run.id);
+      if (!paging || (!paging.hasEarlier && !paging.hasLater)) return [];
+      return [
+        <div key={run.id} className="flex flex-wrap items-center gap-3" data-run-output-paging={run.id}>
+          <OutputPageControl direction="earlier" page={{ available: paging.hasEarlier, state: paging.earlier, load: () => void loadEarlierOutput(run.id) }} />
+          <OutputPageControl direction="later" page={{ available: paging.hasLater, state: paging.later, load: () => void loadLaterOutput(run.id) }} />
+        </div>,
+      ];
+    });
+    return controls.length > 0 ? <div className="space-y-1 px-1 py-1">{controls}</div> : null;
+  }, [logRuns, outputPagingByRun, loadEarlierOutput, loadLaterOutput]);
+  const baseHistoryControl = props.historyControl ?? (
     props.compactHistory && props.onExpandHistory && compactRunHistoryIds.size > 0
       ? <Button type="button" variant="ghost" size="sm" onClick={props.onExpandHistory}>More run output</Button>
       : null
   );
+  const historyControl = outputPagingControls ? <>{outputPagingControls}{baseHistoryControl}</> : baseHistoryControl;
   const renderBrief = useCallback(
     () => issueBrief ? <><TaskChatDescriptionBubble brief={issueBrief} />{historyControl}</> : null,
     [issueBrief, historyControl],

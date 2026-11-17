@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SavedOutputNotice } from "../task-chat/SavedOutputNotice";
+import { OutputPageControl, OutputPageEdge, useOutputPageAnchor, type OutputPage } from "./OutputPageControls";
 import type { TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "../MarkdownBody";
@@ -32,6 +33,9 @@ const RAW_INITIAL_ROWS = 180;
 
 interface RunTranscriptViewProps {
   entries: TranscriptEntry[];
+  /** Output that left browser memory and reads back from the saved run log. */
+  earlierOutput?: OutputPage;
+  laterOutput?: OutputPage;
   runLogHref?: string;
   toolDecisions?: readonly ToolRunDecision[];
   mode?: TranscriptMode;
@@ -1879,6 +1883,8 @@ function RawTranscriptView({
 
 export function RunTranscriptView({
   entries,
+  earlierOutput,
+  laterOutput,
   runLogHref,
   toolDecisions,
   mode = "nice",
@@ -1900,8 +1906,26 @@ export function RunTranscriptView({
   const hiddenBlocks = !showAllHistory && limit ? Math.max(0, blocks.length - limit) : 0;
   const visibleBlocks = hiddenBlocks > 0 ? blocks.slice(hiddenBlocks) : blocks;
   const keyedBlocks = useMemo(() => keyTranscriptBlocks(visibleBlocks), [visibleBlocks]);
+  const pagingRootRef = useRef<HTMLDivElement>(null);
+  const captureAnchor = useOutputPageAnchor(
+    pagingRootRef,
+    entries,
+    earlierOutput?.state === "loading" || laterOutput?.state === "loading",
+  );
+  const earlierControls = earlierOutput?.available ? (
+    <>
+      <OutputPageEdge page={earlierOutput} onBeforeLoad={captureAnchor} />
+      <OutputPageControl direction="earlier" page={earlierOutput} onBeforeLoad={captureAnchor} />
+    </>
+  ) : null;
+  const laterControls = laterOutput?.available ? (
+    <>
+      <OutputPageControl direction="later" page={laterOutput} onBeforeLoad={captureAnchor} />
+      <OutputPageEdge page={laterOutput} onBeforeLoad={captureAnchor} />
+    </>
+  ) : null;
 
-  if (entries.length === 0) {
+  if (entries.length === 0 && !earlierControls && !laterControls) {
     return (
       <div className={cn("rounded-2xl border border-dashed border-border/70 bg-background/40 p-4 text-sm text-muted-foreground", className)}>
         {emptyMessage}
@@ -1911,14 +1935,17 @@ export function RunTranscriptView({
 
   if (mode === "raw") {
     return (
-      <div className={className}>
+      <div ref={pagingRootRef} className={cn("space-y-3", className)}>
+        {earlierControls}
         <RawTranscriptView entries={entries} density={density} />
+        {laterControls}
       </div>
     );
   }
 
   return (
-    <div className={cn("space-y-3", className)}>
+    <div ref={pagingRootRef} className={cn("space-y-3", className)}>
+      {earlierControls}
       {hiddenBlocks > 0 ? (
         <button type="button" className="text-sm text-foreground underline underline-offset-4" onClick={() => setShowAllHistory(true)}>
           Show {hiddenBlocks} earlier {hiddenBlocks === 1 ? "block" : "blocks"}
@@ -1927,6 +1954,7 @@ export function RunTranscriptView({
       {keyedBlocks.map(({ block, key }, index) => (
         <div
           key={key}
+          data-output-anchor={key}
           className={cn(index === keyedBlocks.length - 1 && streaming && "tc-stream-block-enter")}
         >
           {block.type === "message" && (
@@ -1974,6 +2002,7 @@ export function RunTranscriptView({
           {block.type === "provider_activity" && <TranscriptProviderActivity block={block} density={density} runLogHref={runLogHref} />}
         </div>
       ))}
+      {laterControls}
     </div>
   );
 }
