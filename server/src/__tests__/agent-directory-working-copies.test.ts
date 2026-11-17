@@ -879,7 +879,14 @@ describe("persistent agent directories", () => {
       console.log("JUDGE_OVERLAPPING_DESTROYS", JSON.stringify(proof));
       await writeJudgeEvidence("overlapping-destroys-evidence.json", proof);
       expect.soft(heldBeforeFirstFinishes).toBe(false);
-      expect.soft(await fx.surviving()).toBe(fx.note);
+      // F2c port: the judge's `surviving === note` cannot hold in any run that
+      // reaches here: `entry` resolves only inside the first (authorized, no
+      // hold or pin at claim time) provider call, whose stub then deletes the
+      // tree. The route's invariant is that the second destroy neither reaches
+      // the provider nor replaces/releases the first one's claim.
+      expect.soft(proof.claimAfterSecond).toBe(claimA);
+      expect.soft(proof.providerCalls).toEqual(["environmentDestroyLease"]);
+      expect.soft((await fx.lease()).metadata).not.toHaveProperty("agentFileDestroyClaim");
     } finally { finish(); await first; }
   }, 60_000);
 

@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_KEY, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -2929,9 +2929,10 @@ function createSandboxEnvironmentDriver(
           },
           resolvePluginSandboxRpcTimeoutMs(workerConfig),
         );
-        return failedCreation
+        // The destroy authority, serialized with the save-hold write.
+        return await withLeaseDestroyClaim(db, input.lease, async () => failedCreation
           ? await destroyWithCreationObservation({ leaseId: input.lease.id, metadata: input.lease.metadata ?? {}, teardown })
-          : await teardown(input.lease.metadata ?? {});
+          : await teardown(input.lease.metadata ?? {}));
       }
 
       // Built-in provider path. Resolve the recorded config secrets through the
@@ -2956,10 +2957,11 @@ function createSandboxEnvironmentDriver(
         }
         return receipt;
       }
-      await destroySandboxProviderLease({
+      // The destroy authority, serialized with the save-hold write.
+      await withLeaseDestroyClaim(db, input.lease, () => destroySandboxProviderLease({
         config: cleanupConfig,
         providerLeaseId: input.lease.providerLeaseId,
-      });
+      }));
     },
 
     async isPendingCleanupWorkerReady(input) {
@@ -3618,7 +3620,9 @@ function createSandboxEnvironmentDriver(
     try {
       return await destroyReusableSandboxLeaseClaimed({ ...input, claim });
     } finally {
-      await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => {
+      // Fallback only: the settlement below clears the claim atomically. A
+      // lease another writer settled meanwhile keeps that writer's row.
+      await releaseLeaseDestroyClaim(db, input.lease.id, claim, input.lease.metadata?.remoteExecutionTermination).catch(() => {
         logger.warn({ leaseId: input.lease.id }, "agent-file destroy claim release failed");
       });
     }
@@ -3685,10 +3689,8 @@ function createSandboxEnvironmentDriver(
     } catch {
       cleanupStatus = "failed";
     }
-    // The provider call settled: drop the destroy claim so the lease snapshot
-    // the settlement CAS compares is the one this destroy read.
-    await releaseLeaseDestroyClaim(db, input.lease.id, input.claim);
-    // Only a destroy the provider confirmed reaches this gap.
+    // Only a destroy the provider confirmed reaches this gap. The claim stays
+    // until the settlement below clears it with this destroy's receipt.
     if (cleanupStatus === "success") crashPoint("environment.teardown.after_destroy_before_lease");
 
     return await environmentsSvc.releaseLease(
@@ -3697,7 +3699,11 @@ function createSandboxEnvironmentDriver(
       {
         ...(input.lease.status === "pending_cleanup" && typeof metadata.pendingCleanupAttemptId === "string"
           ? { expectedPendingCleanupAttemptId: metadata.pendingCleanupAttemptId }
-          : { expectedSnapshot: { status: input.lease.status, metadata: input.lease.metadata } }),
+          // The row this destroy read, plus its own claim (nothing else may
+          // write the lease while the claim is live).
+          : { expectedSnapshot: { status: input.lease.status,
+            metadata: { ...(input.lease.metadata ?? {}), [AGENT_FILE_DESTROY_CLAIM_KEY]: input.claim } } }),
+        destroyClaim: input.claim,
         failureReason: input.failureReason,
         cleanupStatus,
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
@@ -3896,7 +3902,7 @@ function createPluginEnvironmentDriver(
   }
 
   async function cleanupPluginRunLease(input: { environment: Environment | null; lease: EnvironmentLease },
-    executionStopObserved = false) {
+    executionStopObserved = false, claimDestroy = false) {
     const settled = await settleDispatchedEnvironmentTask(db, workerManager, input.lease, { executionStopObserved });
     const [current] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, input.lease.id),
       eq(environmentLeases.companyId, input.lease.companyId)));
@@ -3905,10 +3911,16 @@ function createPluginEnvironmentDriver(
     const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease({ ...input, lease });
     const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
     if (!environmentId) throw new Error("Plugin lease cleanup has no saved environment identity");
-    const receipt = await workerManager.call(plugin.id, lease.metadata?.pluginLeaseCleanupMethod === "destroy" ? "environmentDestroyLease" : "environmentReleaseLease", {
+    const destroying = lease.metadata?.pluginLeaseCleanupMethod === "destroy";
+    const call = () => workerManager.call(plugin.id, destroying ? "environmentDestroyLease" : "environmentReleaseLease", {
       driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
       config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
     });
+    // Every recorded plugin destroy (also with the environment gone) and every
+    // pending teardown retry takes the destroy claim: refused (throws) before
+    // provider IO while a save hold, a collection pin or another destroy
+    // protects the allocation.
+    const receipt = destroying || claimDestroy ? await withLeaseDestroyClaim(db, lease, call) : await call();
     const taskStopped = settled !== false ||
       (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
     return remoteTerminationReceipt(lease, receipt) ? receipt
@@ -4120,10 +4132,9 @@ function createPluginEnvironmentDriver(
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
-      } finally {
-        await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => undefined);
-      }
+      // The settlement of this destroy clears its own claim atomically.
       return await environmentsSvc.releaseLease(input.lease.id, "failed", {
+        destroyClaim: claim,
         failureReason: input.failureReason ?? "lease_destroyed",
         cleanupStatus: "success",
         ...(input.lease.status === "pending_cleanup" && typeof input.lease.metadata?.pendingCleanupAttemptId === "string"
@@ -4131,6 +4142,9 @@ function createPluginEnvironmentDriver(
         ...(taskStopped ? { remoteExecutionTermination: remoteTerminationReceipt(input.lease,
           { providerLeaseId: input.lease.providerLeaseId, state: "stopped" }) } : {}),
       });
+      } finally {
+        await releaseLeaseDestroyClaim(db, input.lease.id, claim, input.lease.metadata?.remoteExecutionTermination).catch(() => undefined);
+      }
     },
 
     async isPendingCleanupWorkerReady(input) {
@@ -4142,7 +4156,7 @@ function createPluginEnvironmentDriver(
       } catch { return false; }
     },
 
-    retryPendingSandboxTeardown: cleanupPluginRunLease,
+    retryPendingSandboxTeardown: input => cleanupPluginRunLease(input, false, !hasStopOnlyCleanup(input.lease)),
 
     async realizeWorkspace(input) {
       const { plugin, pluginKey, driverKey, driverConfig } = await resolvePluginDriverForRelease({
@@ -4863,17 +4877,10 @@ export function environmentRuntimeService(
           `Environment driver "${driver.driver}" does not support orphan sandbox teardown.`,
         );
       }
-      if (hasStopOnlyCleanup(input.lease)) return await driver.retryPendingSandboxTeardown(input);
-      // The destroy authority, serialized with the save-hold write (lease row lock).
-      const claim = await claimLeaseForDestroyUnlessHeld(db, input.lease);
-      if (!claim) {
-        throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
-      }
-      try {
-        return await driver.retryPendingSandboxTeardown(input);
-      } finally {
-        await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => undefined);
-      }
+      // Each driver's teardown takes the hold-serialized destroy claim right
+      // before its provider destroy (withLeaseDestroyClaim), so direct driver
+      // callers (environment-missing release, export recovery) are covered too.
+      return await driver.retryPendingSandboxTeardown(input);
     },
 
     // Report whether the provider worker can run an orphan teardown now. The
