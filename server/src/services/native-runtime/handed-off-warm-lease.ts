@@ -105,6 +105,10 @@ export function proveHandedOffWarmLeases(db: Db, run: Run): Promise<"none" | "pr
 export async function requestHandedOffWarmLeaseStop(db: Db, run: Run, lease: typeof environmentLeases.$inferSelect,
   options: { dryRun?: boolean } = {}): Promise<boolean> {
   if (options.dryRun || !handedOffWarmLease(run, lease)) return false;
+  // rf-4 row 22b: a proof running right now (proveHandedOffWarmLeases, outside
+  // any transaction) is the proof being obtained: it persists the evidence, or
+  // on its bound writes this same stop-and-retain intent itself. Never race it.
+  if (handedOffWarmProofInFlight(run.id)) return false;
   const { handedOffWarmOwnerProofUnavailable } = await import("./native-session-executor.js");
   if (!handedOffWarmOwnerProofUnavailable({ runId: run.id, providerLeaseId: lease.providerLeaseId })) return false;
   const [candidate] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
