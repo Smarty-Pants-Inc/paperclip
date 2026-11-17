@@ -666,7 +666,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   async function resumeRemoteStopComments(run: NonNullable<Awaited<ReturnType<typeof getRunExecutionWait>>>, requestId?: string) {
     // rf-4 row 22a: the deferred-execution work runs the bounded runner-exit
     // proof here, outside any transaction, and persists it before admission reads it.
-    if (run.runtimeMode === "native" && run.status === "cancelled") await proveHandedOffWarmLeases(db, run).catch(() => "unproven");
+    // The proof reads the run's runner profile (handedOffWarmLease), which the
+    // execution-wait projection (getRunExecutionWait) does not carry, so with the
+    // projection the proof never ran on this automatic path: prove with the full row.
+    if (run.runtimeMode === "native" && run.status === "cancelled") {
+      const [full] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+      if (full) await proveHandedOffWarmLeases(db, full).catch(() => "unproven");
+    }
     if (!isHeartbeatRunTerminalStatus(run.status) || adapterExecutionControls.has(run.id)) return;
     let interruptedPreparation = false;
     if (["interrupted", "failed"].includes(run.status) && run.runtimeMode === "legacy" &&

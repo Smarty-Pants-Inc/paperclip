@@ -20,6 +20,7 @@ vi.mock("./native-runtime/native-session-executor.js", async importOriginal => (
 }));
 const { heartbeatService } = await import("./heartbeat.js");
 const { buildExecutionContinuation } = await import("./execution-continuation.js");
+const { createHeartbeatRunState } = await import("./heartbeat/run-state.js");
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("pl/send-after-stop2: Stop with queued messages on a warm box, NO Send: the automatic remote-stop resume", () => {
@@ -86,6 +87,29 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(proof.calls).toContainEqual({ runId: f.sourceRunId, providerLeaseId: f.providerLeaseId });
     const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(lease).toMatchObject({ status: "retained", releasedAt: null, providerLeaseId: f.providerLeaseId });
+  });
+
+  // rf-4 (iii): the automatic callers (run-control's execution-wait passes) hand
+  // resumeRemoteStopComments the getRunExecutionWait projection, which has no
+  // nativeResourceDisposition. The out-of-tx proof must still run (with the full
+  // row) and admit: one successor, the messages once and in order.
+  it("automatic path: with the execution-wait projection the proof runs and admits ONE successor, once, in order", async () => {
+    proof.exited = true; proof.calls.length = 0;
+    const f = await seed("after_stop");
+    const projection = await createHeartbeatRunState(db).getRunExecutionWait(f.companyId, f.sourceRunId);
+    expect(projection?.runnerProfileJson?.nativeResourceDisposition).toBeUndefined();
+    await heartbeatService(db).resumeRemoteStopComments(projection!);
+    expect(proof.calls).toContainEqual({ runId: f.sourceRunId, providerLeaseId: f.providerLeaseId });
+    // A second automatic pass admits nothing more.
+    await heartbeatService(db).resumeRemoteStopComments((await createHeartbeatRunState(db).getRunExecutionWait(f.companyId, f.sourceRunId))!);
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.queueId));
+    const successors = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId))).filter(run => run.id !== f.sourceRunId);
+    expect(successors).toHaveLength(1);
+    expect(receipt.runId).toBe(successors[0]!.id);
+    expect(receipt.payload?.executionWait).toBeUndefined();
+    const envelope = await buildExecutionContinuation({ db, companyId: f.companyId, issueId: f.issueId, agentId: successors[0]!.agentId,
+      runId: successors[0]!.id, context: successors[0]!.contextSnapshot!, summary: null, exposeLowTrustRaw: false });
+    expect(envelope.messages.filter(message => f.commentIds.includes(message.id)).map(message => message.body)).toEqual(["A", "B", "C"]);
   });
 
   it("still waits when the stopped run's Runner is not proven exited", async () => {
