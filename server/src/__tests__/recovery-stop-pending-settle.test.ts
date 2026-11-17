@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { activityLog, environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
-import { asc, eq, sql } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
 import { describeEmbeddedPostgres, nativeRestartFixture } from "./helpers/native-restart.js";
 import { claimNativeRestartRecoveries } from "../services/native-runtime/native-restart-recovery.js";
-import { recordTaskStopPending } from "../services/recovery/stop-pending.js";
+import { recordTaskStopPending, withTaskStopPendingInstruction } from "../services/recovery/stop-pending.js";
 import { recoveryService } from "../services/recovery/service.js";
 
 // Keep reason: the real restart-recovery writer clears task claims without
@@ -36,7 +36,8 @@ describeEmbeddedPostgres("Stop-pending settles independently of the claim-releas
       await recordTaskStopPending(tx as unknown as Db, { companyId, issueId: f.issueId, runIds: [f.runId], source: "recovery.sweep_stale_issue_locks" }, []);
     });
     if (held) await f.db.insert(issueComments).values({ companyId, issueId: f.issueId, authorType: "system", body: "Held predecessor",
-      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${f.native.normalizedSessionId}` } });
+      metadata: { version: 1, authorizationReason: `native_prior_owner_held:${f.native.normalizedSessionId}`,
+        sections: [{ rows: [{ type: "run_link", runId: f.runId, agentId }] }] } });
     const [action] = await f.db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     const recovery = recoveryService(f.db, { enqueueWakeup: vi.fn() });
     const notes = () => f.db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))
@@ -67,7 +68,10 @@ describeEmbeddedPostgres("Stop-pending settles independently of the claim-releas
     expect(await f.recovery.reconcileActiveRecoveryActions({ companyId: f.companyId })).toMatchObject({ resolved: 1 });
     const [settled] = await f.db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
     expect(settled).toMatchObject({ status: "resolved", outcome: "restored", resolutionNote: "Stop proved under the task and bound-run locks." });
+    expect(settled.nextAction).toBe(retryNote);
+    expect(withTaskStopPendingInstruction(settled, settled.nextAction)).toBe(retryNote);
     expect(settled.nextAction).not.toContain("execution_stop_pending");
+    expect(settled.evidence.stopPendingOperatorText).toContain("execution_stop_pending");
     expect(settled.evidence.stopPending).toEqual(f.action.evidence.stopPending);
     expect(await f.notes()).toHaveLength(1);
     expect((await f.notes())[0].body).toBe(retryNote);
