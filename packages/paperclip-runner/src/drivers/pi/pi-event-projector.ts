@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { PrpEvent } from "../../protocol/replay-contract.js";
@@ -61,6 +61,7 @@ function spillText(value: string, label: "input" | "output" | "text" | "answer",
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const path = join(root, `${createHash("sha256").update(value).digest("hex").slice(0, 32)}.txt`);
   writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
   const reference = `\n\n[Full ${label}: ${path} (${Buffer.byteLength(value)} bytes; the excerpt above is its beginning; open the file to read all of it)]`;
   return fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(reference))) + reference;
 }
@@ -81,6 +82,7 @@ function finalAnswerText(value: string, budget = MAX_ANSWER_BYTES, directory?: s
   const sha256 = digest(value);
   const path = join(root, `${sha256.slice(0, 32)}.txt`);
   writeFileSync(path, value, { mode: 0o600 });
+  chmodSync(path, 0o600);
   const bytes = Buffer.byteLength(value);
   const notice = `This answer is longer than one message (${Math.ceil(bytes / 1000)} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n`;
   return { text: notice + fittingPrefix(value, Math.max(256, Math.min(SPILL_PREVIEW_BYTES, budget) - jsonBytes(notice))), fullText: { path, sha256, bytes } };
@@ -108,7 +110,10 @@ function pages(value: string, budget = PAGE_BYTES): string[] {
 /** Same sensitive-parent rule as codex-boundaries.ts:364-385, before flattening. */
 function displayValue(value: unknown, depth = 0, preview = (value: string) => value, previewStrings = false): unknown {
   if (depth > 32) throw new Error("pi_projection_depth_limit");
-  if (typeof value === "string") return redactProviderDiagnostic(previewStrings && Buffer.byteLength(value) > MAX_ANSWER_BYTES ? preview(value) : value);
+  if (typeof value === "string") {
+    const safe = redactProviderDiagnostic(value);
+    return previewStrings && Buffer.byteLength(safe) > MAX_ANSWER_BYTES ? preview(safe) : safe;
+  }
   if (Array.isArray(value)) return value.map(entry => displayValue(entry, depth + 1, preview, previewStrings));
   if (value !== null && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key,
     /token|secret|password|api.?key|authorization|credential|thinkingSignature|thoughtSignature/i.test(key) && !/^(?:totalTokens|inputTokens|outputTokens|cachedInputTokens|cacheWriteTokens|tokensBefore|estimatedTokensAfter)$/u.test(key) ? "[REDACTED]" : displayValue(entry, depth + 1, preview, previewStrings || /^(?:args|arguments|text|thinking|content|errorMessage)$/u.test(key)),
