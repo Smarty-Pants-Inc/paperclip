@@ -42,6 +42,7 @@ import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotic
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
   UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
+  UNANSWERED_CARD_ANSWER_TEXT,
   PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
@@ -1981,8 +1982,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const k = await answeredCardKilledResume(f);
       await db.update(issueRecoveryActions).set({ evidence: { runId: k.resume, originalFailureCode: "adapter_failed",
         nativeFailureBlock: { runId: randomUUID(), statusVersion: 1 } } }).where(eq(issueRecoveryActions.id, k.hold.id));
+      const [before] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
       await dispositionPass();
       expect(await successorsOf(f, k.resume)).toHaveLength(0);
+      // "Stays where it is": the disposition does not take (settle) the foreign hold at all.
+      const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
+      expect({ status: after!.status, outcome: after!.outcome, evidence: after!.evidence })
+        .toEqual({ status: before!.status, outcome: before!.outcome, evidence: before!.evidence });
     }, 60_000);
 
     it("RF5 supplementary chain: HTTP answer, failed answer-resume and failed successor, no final (brief 2d literal)", async () => {
@@ -2012,6 +2018,122 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
         if (cardAnswerDuty) expect(notices, "brief 2d asks exactly one true notice when answer-resume and successor fail").toHaveLength(1);
       } finally { answerDelivery.paused = false; }
     }, 60_000);
+
+    // h3-judge-items item 2: 'Retry is safe' must name a Retry that acts. The
+    // disposition successor fails for REAL: it runs (it holds the task's
+    // execution lock), the runner commits its failed result (accepted result,
+    // committed coordinator, no lease), and the wake queue's real release
+    // (createReleaseIssueExecution over the postgres adapter) settles it. No
+    // hand edit of the hold, the coordinator or the issue after that point.
+    it("h3-exact1: capped failed disposition chain posts exactly ONE card-answer notice before Retry runs one request-bound successor", async () => {
+      answerDelivery.paused = true;
+      try {
+        const f = await fixture({ status: "in_progress" });
+        const k = await answeredCardKilledResume(f, "http", false);
+        await dispositionPass();
+        // The real release of a failed run (wake queue, postgres adapter).
+        const { createReleaseIssueExecution } = await import("../../modules/wake-queue/application/use-cases.js");
+        const { createPostgresWakeQueueAdapter } = await import("../../modules/wake-queue/adapters/postgres.js");
+        const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+          resolveResponsibleUserId: async () => f.userId,
+          getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+          resolveSessionBeforeForWakeup: async () => null,
+        }), recovery: {
+          escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+          escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+        } });
+        // Each successor the disposition creates is dispatched (it takes the
+        // task's execution lock and runs natively), Pi fails during it, the
+        // runner commits its failed result in one transaction, and the real
+        // release settles it. The disposition pass and the sweep then run as
+        // the server runs them, until no new successor follows.
+        const failed: string[] = [];
+        let previous = k.resume;
+        for (let step = 0; step < 6; step += 1) {
+          const [successor] = (await successorsOf(f, previous)).filter(run => run.status === "queued");
+          if (!successor) break;
+          const startedAt = f.at();
+          // A real local runner process that has already exited (its pid is gone).
+          const { spawnSync } = await import("node:child_process");
+          const processPid = spawnSync("true").pid!;
+          await db.update(heartbeatRuns).set({ status: "running", startedAt, runtimeMode: "native", nativeIssueId: f.issueId,
+            nativePhase: "observed", processPid, processStartedAt: startedAt }).where(eq(heartbeatRuns.id, successor.id));
+          await db.update(issues).set({ executionRunId: successor.id, executionLockedAt: startedAt, status: "in_progress" })
+            .where(eq(issues.id, f.issueId));
+          const [contract] = await db.insert(completionContracts).values({ companyId: f.companyId, issueId: f.issueId, revision: 2 + step,
+            schemaVersion: "v1", policyVersion: "v1", risk: "low", completionAuthority: "agent", incompleteCriteriaPolicy: "block",
+            contractJson: {}, canonicalSha256: String(50 + step).repeat(32), createdByActorType: "system", createdByActorId: "fixture" }).returning();
+          await db.transaction(async tx => {
+            await tx.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "Native session failed",
+              finishedAt: f.at(), nativePhase: "committed", nativeSessionId: randomUUID(), completionContractId: contract!.id })
+              .where(eq(heartbeatRuns.id, successor.id));
+            const [result] = await tx.insert(nativeRunResults).values({ companyId: f.companyId, issueId: f.issueId, runId: successor.id,
+              completionContractId: contract!.id, serverFingerprint: "fixture", schemaStatus: "accepted", canonicalSha256: `fixture-${step}`,
+              resultJson: { stopReason: "adapter_failed", finalizationPhase: "committed", terminal: { runTerminalState: "failed" } } }).returning();
+            await tx.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId: successor.id,
+              phase: "committed", resultId: result!.id });
+          });
+          await release({ companyId: f.companyId, runId: successor.id, now: new Date(), suppressImmediateRecovery: true });
+          // Recovery's real stop proof for the exited local process (native-local-process-stop.ts).
+          const { recordNativeLocalProcessStop } = await import("../native-local-process-stop.js");
+          const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id));
+          expect(await db.transaction(tx => recordNativeLocalProcessStop(tx as unknown as typeof db, stopped!))).toBe(true);
+          failed.push(successor.id); previous = successor.id;
+          await dispositionPass();
+          await f.sweep(); await f.sweep();
+        }
+        expect(failed.length, "at least the one disposition successor ran and failed").toBeGreaterThanOrEqual(1);
+        const successor = { id: failed.at(-1)! };
+        const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+        const [settled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor!.id));
+        const [coordinator] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, successor!.id));
+        const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+        const state = { holds: holds.map(h => ({ id: h.id, status: h.status, cause: h.cause, runId: h.evidence.runId,
+          block: h.evidence.nativeFailureBlock, outcome: h.outcome, next: h.nextAction, disposition: h.evidence.executionDisposition ?? h.evidence.continuationDelivery })), successor: settled!.status, coordinator: { phase: coordinator?.phase,
+          leaseOwner: coordinator?.leaseOwner, resultId: coordinator?.resultId }, issue: { status: issue!.status,
+          executionRunId: issue!.executionRunId } };
+        const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId));
+        console.log("ITEM2_SETTLED", JSON.stringify({ failed, ...state,
+          comments: comments.map(c => ({ by: c.authorType, body: c.body.slice(0, 160), reason: c.metadata?.authorizationReason })),
+          runs: runs.map(r => ({ id: r.id, status: r.status, retryOf: r.retryOfRunId, mode: r.runtimeMode, err: r.errorCode })) }));
+        expect(coordinator).toMatchObject({ phase: expect.any(String), leaseOwner: null });
+        expect(issue!.executionRunId, "the real release freed the task's execution lock").toBeNull();
+        const cappedHold = holds.find(hold => hold.evidence.runId === successor.id);
+        expect(cappedHold, "the last failed successor's persisted hold is resolved at the recovery cap").toMatchObject({
+          status: "resolved", outcome: "blocked", nextAction: expect.stringContaining("Automatic recovery stopped"),
+        });
+        const notices = await allNotices(f);
+        console.log("ITEM2_NOTICES", JSON.stringify({ hold: { id: cappedHold!.id, status: cappedHold!.status,
+          outcome: cappedHold!.outcome, sourceRunId: cappedHold!.evidence.runId, text: cappedHold!.nextAction },
+          notices: notices.map(n => ({ id: n.id, sourceRunId: n.metadata?.sourceRunId, body: n.body })) }));
+        expect(notices, "exactly one sweep notice for the card answer after the chain caps, before the person's Retry").toHaveLength(1);
+        expect(notices[0]!.metadata?.sourceRunId).toBe(cappedHold!.evidence.runId);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${k.card.id}`);
+        expect(notices[0]!.body).toBe(UNANSWERED_CARD_ANSWER_TEXT);
+        expect(notices[0]!.body, "the notice explains the unanswered card, not just the resolved recovery hold").not.toBe(cappedHold!.nextAction);
+        // The person presses Retry on the notice.
+        const { requestTaskRetry } = await import("../task-retry.js");
+        const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: f.userId,
+          idempotencyKey: randomUUID(), observedRunId: successor!.id } as any);
+        expect(receipt.accepted).toBe(true);
+        await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+        const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
+        const retries = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId);
+        console.log("ITEM2_RETRY", JSON.stringify({ wake: { status: wake?.status, runId: wake?.runId,
+          executionWait: wake?.payload?.executionWait, taskRetry: wake?.payload?.taskRetry }, retries: retries.map(r => r.id) }));
+        expect(retries, JSON.stringify({ state, wake: wake?.status, wait: wake?.payload?.executionWait })).toHaveLength(1);
+        const answers = await materializeNativeInteractionResponses({ db, companyId: f.companyId, issueId: f.issueId,
+          runId: retries[0]!.id, agentId: f.agentId, interactionIds: retries[0]!.contextSnapshot!.interactionIds as string[],
+          wakeReason: "task_retry" });
+        expect(answers.map(answer => answer.interactionId), "the card answer, once").toEqual([k.card.id]);
+        // A second resume of the same Retry adds nothing.
+        await heartbeatService(db).resumeTaskRetry(f.companyId, receipt.requestId!);
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+          .filter(run => run.contextSnapshot?.taskRetryRequestId === receipt.requestId)).toHaveLength(1);
+      } finally { answerDelivery.paused = false; }
+    }, 90_000);
   });
 
   // Card-answer duty (org 15:22Z + RFL 15:20Z, option A): a person's answer to
