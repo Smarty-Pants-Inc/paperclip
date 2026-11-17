@@ -11,7 +11,8 @@ import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
+import { personStopKeptBoxForSuccessor } from "../heartbeat/person-stop-export-bound.js";
 import type { Db } from "@paperclipai/db";
 import { environmentLeases, heartbeatRuns } from "@paperclipai/db";
 import { retryUnlessTransactionBound } from "../transaction-retry.js";
@@ -1007,6 +1008,7 @@ export async function prepareNativeWorkspaceSync(input: {
   let descriptor: NativeWorkspaceSyncDescriptor;
   let mode: WorkspaceInboundMode = "host_current";
   let reuseReason: StartupReuseReason = "created";
+  let keptPersonStopBox: ReturnType<typeof personStopKeptBoxForSuccessor> = null;
   const seedPaths = durableSeedPaths(input.runId);
   await measureRunPhase("workspace_sync.descriptor_directory", () => ensureRunDirectory(input.runId));
 
@@ -1076,7 +1078,13 @@ export async function prepareNativeWorkspaceSync(input: {
       providerLeaseId,
       remoteCwd: target.remoteCwd,
     });
-    mode = classifyNativeWorkspaceInbound({
+    // adopt-stopu-compose4 (rf-4 22:53Z FIRST choice): the successor of a kept
+    // person-Stop box (same_box at the bound) adopts the box's files in place:
+    // the stopped turn's unexported edit is there; staging the host copy over it
+    // would lose it. Its own export later carries the edit to the host.
+    keptPersonStopBox = acquisition === "resumed"
+      ? personStopKeptBoxForSuccessor({ providerLeaseId, metadata: input.lease.metadata as Record<string, unknown> | null }) : null;
+    mode = keptPersonStopBox ? "adopt_remote" : classifyNativeWorkspaceInbound({
       kind: "new_run",
       acquisition,
       hasPriorStamp: priorStamp !== null,
@@ -1108,7 +1116,7 @@ export async function prepareNativeWorkspaceSync(input: {
     let gitArchiveSha256 = currentSnapshot.gitSnapshot || currentSnapshot.repositories?.length
       ? await sha256File(seedPaths.gitArchivePath)
       : null;
-    if (acquisition === "resumed" && priorStamp) {
+    if (acquisition === "resumed" && priorStamp && !keptPersonStopBox) {
       const currentHostSha256 = directorySnapshotSha256(
         currentSnapshot.baseline,
       );
@@ -1181,6 +1189,17 @@ export async function prepareNativeWorkspaceSync(input: {
   const preparedRuntime = runtime;
   let reference = await measureRunPhase("workspace_sync.descriptor_write", () => writeDescriptor(descriptor));
   await measureRunPhase("workspace_sync.reference_write", () => persistRunReference(input.db, input.runId, reference));
+  if (keptPersonStopBox && keptPersonStopBox.runId !== input.runId) {
+    // The stopped turn's files now belong to this run's workspace (adopted in
+    // place); its own prepared descriptor no longer names an owed export.
+    await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`(${heartbeatRuns.runnerProfileJson} - 'nativeWorkspaceSync')
+      || jsonb_build_object('nativeWorkspaceSyncAdoptedBySuccessor', ${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync',
+        'nativeCancelledWarmExport', jsonb_build_object('state', 'adopted_by_successor', 'successorRunId', ${input.runId}::text,
+          'at', ${new Date().toISOString()}::text))` })
+      .where(and(eq(heartbeatRuns.id, keptPersonStopBox.runId), eq(heartbeatRuns.companyId, input.companyId),
+        sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'state' = 'prepared'`,
+        sql`${heartbeatRuns.runnerProfileJson}->'nativeWorkspaceSync'->>'providerLeaseId' = ${keptPersonStopBox.providerLeaseId}::text`));
+  }
   await emitStartupReuse(input.onEvent, "workspace", {
     state: mode === "adopt_remote" ? "reused" : "fresh",
     reason: reuseReason,

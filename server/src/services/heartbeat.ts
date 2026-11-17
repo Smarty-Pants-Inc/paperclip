@@ -82,7 +82,8 @@ import {
 } from "./heartbeat/scheduling.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
 import { agentExecutionStopBlocker } from "./agent-execution-stop.js";
-import { exportPersonStoppedWarmWorkspaceBeforeRelease } from "./heartbeat/person-stop-release-export.js";
+import { decidePersonStopExportAtBound, exportPersonStoppedWarmWorkspaceBeforeRelease, PERSON_STOP_EXPORT_BOUND_MS,
+  personStopExportBoundAt } from "./heartbeat/person-stop-release-export.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -1518,6 +1519,14 @@ export function heartbeatService(
   const runControl = createHeartbeatRunControl(db, {
     scheduleBoundedRetry,
     exportPersonStoppedWarmWorkspace: run => exportPersonStoppedWarmWorkspaceBeforeRelease({ db, environmentRuntime, run }),
+    decidePersonStopExportAtBound: run => decidePersonStopExportAtBound({ db, environmentRuntime, run }),
+    personStopExportBoundAt: async (runId, companyId) => {
+      const leases = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(and(
+        eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId), eq(environmentLeases.status, "active")));
+      const bounds = leases.map(lease => personStopExportBoundAt(lease.metadata)).filter((at): at is number => at !== null);
+      // First unproven attempt: no deferral yet -> the bound starts now.
+      return bounds.length ? Math.min(...bounds) : Date.now() + PERSON_STOP_EXPORT_BOUND_MS;
+    },
     verifyStartupCleanup: async run => {
       await verifyNativeStartupCleanup(db, run, () => envOrchestrator.releaseForRun({
         heartbeatRunId: run.id, companyId: run.companyId, agentId: run.agentId, status: "expired",

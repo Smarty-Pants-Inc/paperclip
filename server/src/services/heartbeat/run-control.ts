@@ -203,6 +203,10 @@ export interface HeartbeatRunControlDependencies extends Pick<ReturnType<typeof 
   /** adopt-stopu-xpaths: the release-site export of a person-stopped warm turn
    * (person-stop-release-export.ts). Wired by heartbeat.ts. */
   exportPersonStoppedWarmWorkspace?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ outcome: string }>;
+  /** adopt-stopu-compose4: the bounded decision at PERSON_STOP_EXPORT_BOUND_MS
+   * (person-stop-release-export.ts decidePersonStopExportAtBound). Wired by heartbeat.ts. */
+  decidePersonStopExportAtBound?: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ decision: "same_box" | "without_files"; reason: string } | null>;
+  personStopExportBoundAt?: (runId: string, companyId: string) => Promise<number | null>;
   options: {
     closeWarmNativeSessionsForRun?: (input: {
       runId: string;
@@ -378,6 +382,8 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     startNextQueuedRunForAgent,
     setRunStatus,
     exportPersonStoppedWarmWorkspace,
+    decidePersonStopExportAtBound,
+    personStopExportBoundAt,
   } = dependencies;
 
   async function releaseEnvironmentLeasesForRun(input: {
@@ -426,15 +432,35 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     let personStopExported = false;
     if (cancelledRun && providerResourceDisposition !== "keep_running" && providerResourceDisposition !== "destroy"
       && exportPersonStoppedWarmWorkspace && !await runnerNeverLaunched()) {
-      const exported = await exportPersonStoppedWarmWorkspace(cancelledRun)
-        .catch(() => ({ outcome: "unproven" as const }));
-      if (exported.outcome === "unproven" || exported.outcome === "not_settled") {
-        logger.warn({ runId: input.runId, outcome: exported.outcome },
+      // adopt-stopu-compose4 (RFL 22:25Z, rf-4 22:53Z): the guard is BOUNDED.
+      // Before the bound: export, else keep the box + hold + the deferred line.
+      // At the bound: probe first (an unreachable box is not exported again),
+      // then one more export; still unproven -> the by-line decision.
+      const atBound = decidePersonStopExportAtBound ? await decidePersonStopExportAtBound(cancelledRun).catch(() => null) : null;
+      const exported = atBound?.decision === "without_files" ? { outcome: "unproven" as const }
+        : await exportPersonStoppedWarmWorkspace(cancelledRun).catch(() => ({ outcome: "unproven" as const }));
+      if ((exported.outcome === "unproven" || exported.outcome === "not_settled") && atBound?.decision === "same_box") {
+        // FIRST choice: the box is reachable and its stopped tools are proven
+        // gone; keep it RUNNING (no stop) and release it to its own successor,
+        // which resumes it and adopts its files in place (the edit is there).
+        logger.warn({ runId: input.runId, reason: atBound.reason },
+          "Person-stopped box export unproven at the bound: the successor resumes the same kept box");
+        providerResourceDisposition = "keep_running";
+        personStopExported = true;
+      } else if (exported.outcome === "unproven" || exported.outcome === "not_settled") {
+        logger.warn({ runId: input.runId, outcome: exported.outcome, bound: atBound?.decision ?? "holding" },
           "Kept the person-stopped box running: its workspace export is not proven");
-        return await defer("person_stop_export_unproven");
+        const boundAt = atBound ? null : await personStopExportBoundAt?.(input.runId, input.companyId).catch(() => null);
+        await deferEnvironmentLeaseRelease(input, "person_stop_export_unproven", providerResourceDisposition,
+          boundAt ?? undefined);
+        // ONLY if unreachable / tools not proven: the held message now runs
+        // once without the files (the hold reads the durable decision).
+        if (atBound?.decision === "without_files") await startNextQueuedRunForAgent(input.agentId).catch(() => undefined);
+        return;
+      } else {
+        if (exported.outcome === "finalized") cancelledRun = await getRun(input.runId) ?? cancelledRun;
+        personStopExported = exported.outcome === "finalized";
       }
-      if (exported.outcome === "finalized") cancelledRun = await getRun(input.runId) ?? cancelledRun;
-      personStopExported = exported.outcome === "finalized";
     }
     // A warm (keep_running) sandbox keeps a cancelled turn's prepared files in
     // place for the next turn, exactly like a succeeded turn; only a sandbox
@@ -590,7 +616,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }
 
   async function deferEnvironmentLeaseRelease(input: { runId: string; companyId: string; trigger?: string }, reason: string,
-    providerResourceDisposition: ProviderResourceDisposition | undefined) {
+    providerResourceDisposition: ProviderResourceDisposition | undefined, retryAtCap?: number) {
     const leases = await Promise.resolve().then(() => db.select({ id: environmentLeases.id, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
         eq(environmentLeases.heartbeatRunId, input.runId), eq(environmentLeases.status, "active"))))
@@ -601,8 +627,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     for (const lease of leases) {
       const previous = readLeaseReleaseDeferral(lease.metadata);
       const attempts = (previous?.attempts ?? 0) + 1;
+      const scheduledRetryAt = nextLeaseReleaseRetryAt(previous, attempts);
+      // adopt-stopu-compose4: a person-Stop deferral retries AT its bound at the latest.
+      const retryAt = retryAtCap !== undefined && Number.isFinite(retryAtCap) && Date.parse(scheduledRetryAt) > retryAtCap
+        ? new Date(Math.max(retryAtCap, Date.now())).toISOString() : scheduledRetryAt;
       const deferral: LeaseReleaseDeferral = { reason, attempts,
-        retryAt: nextLeaseReleaseRetryAt(previous, attempts),
+        retryAt,
         failingSince: previous?.failingSince ?? new Date().toISOString(),
         triggers: nextLeaseReleaseTriggers(previous, input.trigger), attemptedByBootIds: nextLeaseReleaseBootIds(previous),
         providerResourceDisposition: providerResourceDisposition ?? null };

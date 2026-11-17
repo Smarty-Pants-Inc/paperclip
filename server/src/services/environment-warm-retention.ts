@@ -2,6 +2,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { ProviderResourceDisposition } from "./environment-runtime.js";
 import { providerResourceDispositionForTerminalRun } from "./runner-environment-lifecycle.js";
+import { personStopKeptBoxForSuccessor } from "./heartbeat/person-stop-export-bound.js";
 
 const retentionKeys = ["warmFailureStreak", "warmFailureRunId", "warmRetentionReasonCode"] as const;
 const failureLimitReason = "warm_retention_failure_limit";
@@ -38,6 +39,11 @@ export async function settleWarmRetention(db: Db, lease: typeof environmentLease
     const [current] = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.id, lease.id),
       eq(environmentLeases.companyId, lease.companyId), eq(environmentLeases.heartbeatRunId, lease.heartbeatRunId!))).for("update");
     if (!current || !["active", "pending_cleanup"].includes(current.status)) return null;
+    // adopt-stopu-compose4 (rf-4 22:53Z FIRST choice): at the bound a kept
+    // person-Stop box (same_box) stays RUNNING for its own successor; U's
+    // cancelled -> stop_and_retain mapping would stop the box holding the edit.
+    if (desired === "keep_running" && run.status === "cancelled" && personStopKeptBoxForSuccessor(current))
+      return { lease: current, disposition: desired };
     let disposition = providerResourceDispositionForTerminalRun(desired, run.status, run.errorCode, run.providerWorkStarted);
     // Safety stops and explicit stop/destroy choices never become warm retention.
     if (run.status !== "succeeded" && disposition !== "keep_running") return { lease: current, disposition };

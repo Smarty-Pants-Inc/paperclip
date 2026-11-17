@@ -1,4 +1,4 @@
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { environmentLeases, environments, heartbeatRuns, type Db } from "@paperclipai/db";
 import { hasAcknowledgedNativeRunStopRequest } from "../acknowledged-native-stop.js";
 import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
@@ -6,7 +6,97 @@ import type { environmentRuntimeService } from "../environment-runtime.js";
 import { admittedNativeResourceDisposition } from "../native-runtime/native-failed-workspace-recovery.js";
 import { readNativeWorkspaceSyncReference, resumeNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
 import { nativeWorkspaceExportPendingForLease } from "../native-runtime/native-workspace-finalization-state.js";
-import { finishCancelledWarmWorkspaceExport, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { finishCancelledWarmWorkspaceExport, hasCleanStoppedSessionClose, type CancelledWarmExportOutcome } from "./cancelled-warm-workspace-export.js";
+import { PERSON_STOP_BOUND_KEY, PERSON_STOP_PROBE_TIMEOUT_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision, personStopExportBoundAt,
+  type PersonStopBoundDecision } from "./person-stop-export-bound.js";
+export { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, personStopExportBoundAt, personStopKeptBoxForSuccessor,
+  readPersonStopBoundDecision } from "./person-stop-export-bound.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
+
+async function withTimeout<T>(work: Promise<T>, ms: number): Promise<T | "timed_out"> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  work.catch(() => undefined);
+  try {
+    return await Promise.race([work, new Promise<"timed_out">(resolve => { timer = setTimeout(() => resolve("timed_out"), ms); timer.unref?.(); })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+/**
+ * At the bound (rf-4 22:53Z, binding ORDER), decide by line:
+ * - the kept box is REACHABLE (its target resolves, and a no-op command runs on
+ *   it within PERSON_STOP_PROBE_TIMEOUT_MS) AND the stopped turn's tools are
+ *   proven gone (NSE clean-close proof, hasCleanStoppedSessionClose) ->
+ *   `same_box`: the successor resumes THIS box, where the edit is;
+ * - otherwise -> `without_files`: the message runs once without the files, with
+ *   PERSON_STOP_WITHOUT_FILES_LINE; the box stays kept (lease active, deferral
+ *   still retrying the export; never stopped or destroyed here).
+ * Returns null before the bound (keep holding). Records the decision on the
+ * lease (durable; the queue hold reads it) and, for without_files, ONE line.
+ */
+export async function decidePersonStopExportAtBound(input: {
+  db: Db;
+  environmentRuntime: ReturnType<typeof environmentRuntimeService>;
+  run: typeof heartbeatRuns.$inferSelect;
+  now?: number;
+  probeTimeoutMs?: number;
+}): Promise<PersonStopBoundDecision | null> {
+  const { db, environmentRuntime, run } = input;
+  const prepared = readNativeWorkspaceSyncReference(run.runnerProfileJson?.nativeWorkspaceSync);
+  if (run.runtimeMode !== "native" || run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
+    || prepared?.state !== "prepared") return null;
+  const [lease] = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
+    eq(environmentLeases.id, prepared.leaseId), eq(environmentLeases.status, "active"))).limit(1);
+  if (!lease || !lease.provider || lease.provider === "local" || lease.providerLeaseId !== prepared.providerLeaseId) return null;
+  const existing = readPersonStopBoundDecision(lease.metadata);
+  if (existing) return existing;
+  const boundAt = personStopExportBoundAt(lease.metadata);
+  if (boundAt === null || (input.now ?? Date.now()) < boundAt) return null;
+  let reason = "box_reachable_tools_stopped";
+  if (!hasCleanStoppedSessionClose(run)) reason = "tools_not_proven_stopped";
+  else {
+    const [environment] = lease.environmentId ? await db.select().from(environments)
+      .where(eq(environments.id, lease.environmentId)).limit(1) : [];
+    const probe = async () => {
+      if (!environment) return "box_unreachable_target";
+      const target = await resolveEnvironmentExecutionTarget({ db, companyId: run.companyId, adapterType: "paperclip_runner",
+        environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease: lease as never, environmentRuntime })
+        .catch(() => null);
+      if (!target || target.kind !== "remote" || !("runner" in target) || !target.runner) return "box_unreachable_target";
+      const result = await target.runner.execute({ command: "true", args: [], cwd: target.remoteCwd, timeoutMs: input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS })
+        .catch(() => null);
+      return result && result.exitCode === 0 && !result.timedOut ? "box_reachable_tools_stopped" : "box_unreachable_probe";
+    };
+    const probed = await withTimeout(probe(), input.probeTimeoutMs ?? PERSON_STOP_PROBE_TIMEOUT_MS);
+    reason = probed === "timed_out" ? "box_unreachable_probe" : probed;
+  }
+  const decision: PersonStopBoundDecision = { schema: "paperclip.person-stop-export-bound.v1",
+    decision: reason === "box_reachable_tools_stopped" ? "same_box" : "without_files", reason,
+    runId: run.id, providerLeaseId: lease.providerLeaseId!, decidedAt: new Date(input.now ?? Date.now()).toISOString() };
+  const recorded = await db.update(environmentLeases).set({ metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+    || ${JSON.stringify({ [PERSON_STOP_BOUND_KEY]: decision })}::jsonb` })
+    .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.status, "active"),
+      sql`not (coalesce(${environmentLeases.metadata}, '{}'::jsonb) ? ${PERSON_STOP_BOUND_KEY})`)).returning({ id: environmentLeases.id });
+  if (recorded.length === 0) {
+    const [again] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    return readPersonStopBoundDecision(again?.metadata);
+  }
+  if (decision.decision === "without_files") {
+    // ONE true line in the chat (rf-4 22:30Z + RFL 22:31Z): no 'restored'
+    // claim, the box/lease unchanged (kept, not destroyed).
+    const line = PERSON_STOP_WITHOUT_FILES_LINE;
+    await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      eventType: "workspace_export_bound_reached", stream: "system", level: "warn", message: line,
+      payload: { decision: decision.decision, reason } }).catch(() => undefined);
+    await appendHeartbeatRunEvent(db, { companyId: run.companyId, agentId: run.agentId, runId: run.id,
+      eventType: "provider.notice.recorded", stream: "system", level: "warn", message: line,
+      payload: { prpEvent: { schema: "paperclip.prp.event.v1", schemaVersion: 1, sourceKind: "control_plane",
+        runId: run.id, eventType: "provider.notice.recorded", emittedAt: new Date().toISOString(),
+        payload: { schema: "paperclip.provider.notice.v1", severity: "warning", category: "person_stop_runs_without_files",
+          summary: line, message: line } } } }).catch(() => undefined);
+  }
+  return decision;
+}
 
 /**
  * adopt-stopu-xpaths: the ONE release-site guard for a person's Stop.
@@ -80,6 +170,9 @@ export async function personStopExportPendingHoldsAdmission(db: Db,
       eq(heartbeatRuns.nativeIssueId, input.issueId))).limit(5);
   for (const { run, lease } of rows) {
     if (!lease.provider || lease.provider === "local" || !hasAcknowledgedNativeRunStopRequest(run)) continue;
+    // adopt-stopu-compose4: at the bound the hold ends (rf-4 22:53Z); the
+    // decision is durable on the lease.
+    if (readPersonStopBoundDecision(lease.metadata)) continue;
     if (await nativeWorkspaceExportPendingForLease(db, lease, { destructive: false })) return run.id;
   }
   return null;
