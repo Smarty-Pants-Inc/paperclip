@@ -442,6 +442,7 @@ async function quarantineCleanupSettling(db: Db, companyId: string,
 export async function taskInterruptionPresentations(db: Db, companyId: string, input: ProjectionIssue[]) {
   const selected = input.filter(issue => issue.companyId === companyId);
   const result = new Map<string, TaskInterruptionPresentation | null>();
+  const continuingIssues = new Set<string>();
   if (!selected.length) return result;
   const ids = selected.map(issue => issue.id);
   const requested = sql`unnest(${sql.param([...new Set(ids)])}::text[]) as requested_interruption_issues(requested_issue_id)`;
@@ -675,6 +676,19 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
     .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, ids),
       inArray(sql`${issueRecoveryActions.evidence}->>'runId'`, runIds),
       sql`(${issueRecoveryActions.evidence} ? 'freshContinuationSettlement' or ${issueRecoveryActions.evidence} ? 'freshContinuationCheck')`)) : [];
+  // Judge R9 / rf-3 E: "No action is needed" is said only where something
+  // will answer: a continuation its delivery worker owns ('pending'), or one
+  // recorded with no delivery request ('not_requested') that has a queued,
+  // claimed or deferred wake for the task.
+  const notRequestedIssueIds = [...new Set(freshRows.filter(row => row.recorded && row.delivery === "not_requested").map(row => row.issueId))];
+  const liveSuccessorIssueIds = new Set(notRequestedIssueIds.length ? (await db.selectDistinct({
+    issueId: sql<string>`${agentWakeupRequests.payload}->>'issueId'` }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId),
+    inArray(agentWakeupRequests.status, ["queued", "claimed", "deferred_issue_execution"]),
+    inArray(sql`${agentWakeupRequests.payload}->>'issueId'`, notRequestedIssueIds)))).map(row => row.issueId) : []);
+  const continuationAnswers = (issueId: string, runId: string | undefined) => freshRows.some(row => row.issueId === issueId
+    && row.runId === runId && row.recorded && (row.delivery === "pending"
+      || (row.delivery === "not_requested" && liveSuccessorIssueIds.has(issueId))));
   const pendingSchema = freshRows.some(row => row.delivery === "pending")
     ? (await import("./fresh-continuation-fallback.js")).FRESH_CONTINUATION_SCHEMA : null;
   const freshContinuationFor = (issueId: string, runId: string | undefined): ProjectionState["freshContinuation"] => {
@@ -866,6 +880,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
       waitingOnOpenSubtasks: waitingOnOpenSubtasks.has(issue.id),
       cleanupSettling: cleanupSettling.has(issue.id),
     }, now);
+    if (freshContinuationFor(issue.id, facts.run?.id)?.state === "continuing" && continuationAnswers(issue.id, facts.run?.id))
+      continuingIssues.add(issue.id);
     result.set(issue.id, presentation);
     const run = facts.run;
     const runStatus = HEARTBEAT_RUN_STATUSES.find(status => status === run?.status);
@@ -904,21 +920,37 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         presentation.retryWait = { reason: "workspace_repair_required", message: retryWaitMessages.workspace_repair_required! };
     }
   }
-  // Retry fold: every card that still offers Retry asks the ONE authority
+  // Retry fold (rf-3 A): every card asks the ONE authority
   // (task-retry-eligibility.ts decideRetryAuthority) with the same facts the
-  // Retry API reads: a paused assignee, a standing held notice or the run's own
-  // prior-owner refusal, and a deferred Retry's recorded refusal.
-  const stillOffered = [...result].flatMap(([issueId, presentation]) => presentation?.canRetry ? [issueId] : []);
-  for (const issueId of stillOffered) {
-    const presentation = result.get(issueId)!;
+  // Retry API reads (a paused assignee, a standing held notice or the run's own
+  // prior-owner refusal, a deferred Retry's recorded refusal, the Stop gate),
+  // and takes canRetry, the resume action and its words from that decision.
+  // The card's own checks are the authority's retrySource fact; a card whose
+  // run is live (state 'working', not an automatic recovery) speaks for itself.
+  for (const [issueId, presentation] of result) {
+    if (!presentation || presentation.state === "resolved") continue;
+    const automaticRecovery = presentation.state === "working" && !presentation.canRetry
+      && continuingIssues.has(issueId) && !presentation.notice && !presentation.retryWait;
+    if (presentation.state === "working" && !presentation.canRetry && !automaticRecovery) continue;
     const run = runMap.get(issueId);
     const stopGate = run?.runtimeMode === "native" && run.finishedAt
       ? (await readRetryStopGate(db, { companyId, issueId, sourceRunId: run.id, now }))?.state ?? null : null;
     const authority = decideRetryAuthority({ ...await readRetryAuthorityFacts(db, { companyId, issueId }), stopGate,
-      retrySource: true });
+      automaticRecovery, retrySource: presentation.canRetry });
     if (authority.canRetry) continue;
+    // Judge R9: Paperclip is continuing by itself; the card says so in the
+    // authority's words (the same words the transcript note carries).
+    if (authority.reason === "automatic_recovery") {
+      presentation.notice = { code: authority.reason, text: authority.cardText! };
+      continue;
+    }
     presentation.canRetry = false;
     delete presentation.retryAction;
+    if (presentation.state === "working") continue;
+    if (authority.userAction === "resume" && !presentation.userAction) presentation.userAction = "resume";
+    // One instruction: a card that already asks the person for its own action
+    // (approval, reconnect, ...) keeps it; otherwise the authority's words.
+    if (presentation.userAction && presentation.userAction !== "resume") continue;
     if (!presentation.retryWait && !presentation.notice && authority.cardText)
       presentation.retryWait = { reason: authority.reason, message: authority.cardText };
   }
