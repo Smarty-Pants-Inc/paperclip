@@ -1,5 +1,5 @@
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { workspaceRestorePendingProjectionSql, workspaceRestoreRecoveredProjectionSql } from "./workspace-restore-recovery-state.js";
+import { workspaceRestoreDelayedProjectionSql, workspaceRestorePendingProjectionSql, workspaceRestoreRecoveredProjectionSql } from "./workspace-restore-recovery-state.js";
 import { skillAccessService } from "./skill-access.js";
 import { credentialAccessConnectionNameSql } from "./credential-access-visibility.js";
 import { executionProjectionsForRuns } from "./execution-projection.js";
@@ -161,6 +161,7 @@ export function activityService(db: Db) {
           then ${heartbeatRuns.resultJson} -> 'workspaceRestoreFailure' end,
         'workspaceRestorePending', ${workspaceRestorePendingProjectionSql},
         'workspaceRestoreRecovered', ${workspaceRestoreRecoveredProjectionSql},
+        'workspaceRestoreDelayed', ${workspaceRestoreDelayedProjectionSql},
         'workspaceRestorePath', case when length(${heartbeatRuns.resultJson} ->> 'workspaceRestorePath') <= 180
           then ${heartbeatRuns.resultJson} -> 'workspaceRestorePath' end,
         'finalResponseRecorded', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'finalResponseRecorded') = 'boolean'
