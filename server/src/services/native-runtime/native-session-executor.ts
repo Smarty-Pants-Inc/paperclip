@@ -2820,6 +2820,7 @@ async function retireSupersededWarmNativeSessions(
   runId: string,
   ingress?: { db: Db; claim: NativeWarmIngressClaim },
   target?: AdapterExecutionTarget | null,
+  releaseWaited = false,
 ): Promise<void> {
   for (const [scope, entry] of warmNativeSessions) {
     if (scope === nextSessionScope) continue;
@@ -2833,7 +2834,28 @@ async function retireSupersededWarmNativeSessions(
     // saved session reserves that directory, then must retire the old provider
     // while keeping the directory it adopted. Any other reservation is busy.
     const ownReservation = logicalOwner && entry.preparingRunId === runId;
-    if (entry.busy || (entry.preparingRunId && !ownReservation) || executingRunnerdSessionScopes.has(scope)) {
+    const foreignPreparation = Boolean(entry.preparingRunId) && !ownReservation;
+    // The superseded owner is still finishing its own release or idle close
+    // (a retained Boat close retries transient sandbox errors). After a /new
+    // the next message must wait that out, like the same-scope follow-up
+    // (warmSessionReleaseWait), instead of failing. Wait once, outside any
+    // transaction, then re-read every owner and recompute. Another run's
+    // claim or retirement (busy without a release) stays a real contention.
+    const releasing = !foreignPreparation
+      && (settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope));
+    if (releasing && !releaseWaited) {
+      await waitForWarmNativeSessionRelease(scope, entry);
+      return retireSupersededWarmNativeSessions(ownerScope, nextSessionScope, nextSessionId, runId, ingress, target, true);
+    }
+    if (entry.busy || foreignPreparation || executingRunnerdSessionScopes.has(scope)) {
+      // Bounded end: the predecessor's close is still running after the wait.
+      // This run has started no provider work; the typed retirement fallback
+      // retries it on a sandbox the old owner cannot reach (the old owner
+      // stays registered until its own close proves it gone).
+      if (releasing && warmNativeSessions.get(scope) === entry) {
+        throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId ?? null,
+          new Error("the previous session was still closing after the release wait"));
+      }
       throw new Error("native_session_supervisor_busy");
     }
     if (!logicalOwner) {
