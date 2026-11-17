@@ -162,7 +162,7 @@ export const TASK_CHAT_STATE_META: Record<TaskChatStateId, TaskChatStateMeta> = 
   },
   truncated: {
     id: "truncated",
-    label: "Output limit reached",
+    label: "Turn ended",
     tier: "tier-b",
     surface: "thread",
     protocol: 'StopReason "max_tokens" | "max_turn_requests"',

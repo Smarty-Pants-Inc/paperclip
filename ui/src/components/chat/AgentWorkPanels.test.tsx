@@ -109,6 +109,24 @@ describe("agent work panels", () => {
     expect(sortAgentTasks(tasks, "title", "asc").map((item) => item.id)).toEqual(["b", "a"]);
   });
 
+  it("can load artifacts beyond the former five-page ceiling", async () => {
+    api.artifactsList.mockImplementation(async (_companyId, options) => {
+      const index = Number(options.cursor ?? 0);
+      return { artifacts: [artifact({ id: `artifact-${index}`, title: `report-${index}.md` })], nextCursor: index < 6 ? String(index + 1) : null };
+    });
+    await render(<AgentArtifactsPanel companyId="company-1" agentId="agent-1" />);
+    for (let page = 0; page < 6; page++) {
+      const more = [...container.querySelectorAll("button")].find(button => button.textContent === "Load more artifacts");
+      expect(more).toBeDefined();
+      await act(async () => { more!.click(); await new Promise(resolve => setTimeout(resolve, 10)); });
+    }
+    expect(container.querySelectorAll("a")).toHaveLength(7);
+    expect(container.textContent).toContain("report-0.md");
+    expect(container.textContent).toContain("report-6.md");
+    expect(container.textContent).not.toContain("most recent artifacts");
+    expect([...container.querySelectorAll("button")].some(button => button.textContent === "Load more artifacts")).toBe(false);
+  });
+
   it("asks the server for the agent's artifacts and shows filename, date and task id", async () => {
     api.artifactsList.mockResolvedValue({
       artifacts: [artifact({ id: "mine", title: "plan.md" })],

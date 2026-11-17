@@ -78,7 +78,7 @@ describe("IssueFieldChangeReceipt", () => {
     expect(html).toContain("UXDesigner");
   });
 
-  it("marks server-truncated long text as a preview", () => {
+  it("uses the shared producer notice for a server-shortened value", () => {
     const html = renderToStaticMarkup(
       <IssueFieldChangeReceipt
         event={event({
@@ -90,7 +90,8 @@ describe("IssueFieldChangeReceipt", () => {
     );
 
     expect(html).toContain("Description");
-    expect(html).toContain("preview");
+    expect(html).toContain("The runner saved only part of this output.");
+    expect(html).not.toContain(">preview<");
   });
 
   it("renders a board edit's receipt the same way as an agent's", () => {

@@ -10,6 +10,7 @@ import {
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronDown, ChevronRight, Cloud, Download, FileCode2, FolderOpen, Loader2, RefreshCcw, Search } from "lucide-react";
 import { Input } from "@/components/ui/input";
+import { SavedOutputNotice } from "@/components/task-chat/SavedOutputNotice";
 import { Button } from "@/components/ui/button";
 import { cn, formatDateTime } from "@/lib/utils";
 import { fileResourcesApi } from "@/api/file-resources";
@@ -1168,7 +1169,7 @@ export function WorkspaceFileBrowser({
               Load more from this folder
             </button>
           ) : (
-            <>Showing first {items.length} — refine the search to narrow.</>
+            <><SavedOutputNotice />Refine the search or browse a folder.</>
           )}
         </div>
       ) : null}

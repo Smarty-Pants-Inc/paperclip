@@ -420,7 +420,7 @@ function ActivityDetailsBody({ item }: { item: Activity }) {
     );
   if (item.diff?.lines?.length)
     return (
-      <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} />
+      <TaskChatDiffView lines={item.diff.lines} truncated={item.diff.truncated} runLogHref={item.runLogHref} />
     );
   return (
     <>

@@ -968,6 +968,7 @@ export function transcriptToTaskChatItems(
           break;
         }
         if (entry.changeType === "truncation") {
+          if (target && entry.runLogHref && !target.runLogHref) target.runLogHref = entry.runLogHref;
           if (target?.diff) {
             target.diff.truncated = true;
             const file = target.diff.files?.at(-1);

@@ -194,7 +194,7 @@ export async function readZipArchive(source: ArrayBuffer | Uint8Array): Promise<
     }
 
     if (offset + 30 > bytes.length) {
-      throw new Error("Invalid zip archive: incomplete local file header.");
+      throw new Error("Invalid zip archive: truncated local file header.");
     }
 
     const generalPurposeFlag = readUint16(bytes, offset + 6);
@@ -211,7 +211,7 @@ export async function readZipArchive(source: ArrayBuffer | Uint8Array): Promise<
     const bodyOffset = nameOffset + fileNameLength + extraFieldLength;
     const bodyEnd = bodyOffset + compressedSize;
     if (bodyEnd > bytes.length) {
-      throw new Error("Invalid zip archive: incomplete file contents.");
+      throw new Error("Invalid zip archive: truncated file contents.");
     }
 
     const rawArchivePath = textDecoder.decode(bytes.slice(nameOffset, nameOffset + fileNameLength));

@@ -165,6 +165,7 @@ type TranscriptBlock =
       hunks: Array<{
         changeType: "add" | "remove" | "context" | "hunk" | "file_header" | "truncation";
         text: string;
+        runLogHref?: string;
       }>;
     };
 
@@ -175,10 +176,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 
 function compactWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
-}
-
-function truncate(value: string, max: number): string {
-  return value.length > max ? `${value.slice(0, Math.max(0, max - 1))}…` : value;
 }
 
 function humanizeLabel(value: string): string {
@@ -239,7 +236,7 @@ function summarizeRecord(record: Record<string, unknown>, keys: string[]): strin
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
-      return truncate(compactWhitespace(value), 120);
+      return compactWhitespace(value);
     }
   }
   return null;
@@ -261,15 +258,14 @@ function mergeToolInput(previous: unknown, incoming: unknown): unknown {
 }
 
 function summarizeToolInput(name: string, input: unknown, density: TranscriptDensity): string {
-  const compactMax = density === "compact" ? 72 : 120;
   if (typeof input === "string") {
     const normalized = isCommandTool(name, input) ? stripWrappedShell(input) : compactWhitespace(input);
-    return truncate(normalized, compactMax);
+    return normalized;
   }
   const record = asRecord(input);
   if (!record) {
     const serialized = compactWhitespace(formatUnknown(input));
-    return serialized ? truncate(serialized, compactMax) : `Inspect ${name} input`;
+    return serialized ? serialized : `Inspect ${name} input`;
   }
 
   const command = typeof record.command === "string"
@@ -278,26 +274,26 @@ function summarizeToolInput(name: string, input: unknown, density: TranscriptDen
       ? record.cmd
       : null;
   if (command && isCommandTool(name, record)) {
-    return truncate(stripWrappedShell(command), compactMax);
+    return stripWrappedShell(command);
   }
 
   const direct =
     summarizeRecord(record, ["command", "cmd", "path", "filePath", "file_path", "query", "url", "prompt", "message"])
     ?? summarizeRecord(record, ["pattern", "name", "title", "target", "tool", "text"])
     ?? null;
-  if (direct) return truncate(direct, compactMax);
+  if (direct) return direct;
 
   if (Array.isArray(record.paths) && record.paths.length > 0) {
     const first = record.paths.find((value): value is string => typeof value === "string" && value.trim().length > 0);
     if (first) {
-      return truncate(`${record.paths.length} paths, starting with ${first}`, compactMax);
+      return `${record.paths.length} paths, starting with ${first}`;
     }
   }
 
   const keys = Object.keys(record);
   if (keys.length === 0) return `No ${name} input`;
-  if (keys.length === 1) return truncate(`${keys[0]} payload`, compactMax);
-  return truncate(`${keys.length} fields: ${keys.slice(0, 3).join(", ")}`, compactMax);
+  if (keys.length === 1) return `${keys[0]} payload`;
+  return `${keys.length} fields: ${keys.join(", ")}`;
 }
 
 function parseStructuredToolResult(result: string | undefined) {
@@ -348,7 +344,7 @@ function summarizeToolResult(result: string | undefined, isError: boolean | unde
   const structured = parseStructuredToolResult(result);
   if (structured) {
     if (structured.body) {
-      return truncate(structured.body.split("\n")[0] ?? structured.body, density === "compact" ? 84 : 140);
+      return structured.body.split("\n")[0] ?? structured.body;
     }
     if (structured.status === "completed") return "Completed";
     if (structured.status === "failed" || structured.status === "error") {
@@ -360,7 +356,7 @@ function summarizeToolResult(result: string | undefined, isError: boolean | unde
     .map((line) => compactWhitespace(line))
     .filter(Boolean);
   const firstLine = lines[0] ?? result;
-  return truncate(firstLine, density === "compact" ? 84 : 140);
+  return firstLine;
 }
 
 type ToolDecisionRefs = {
@@ -821,7 +817,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           // New file in the same diff block — update filePath
           prev.filePath = entry.text;
         }
-        prev.hunks.push({ changeType: entry.changeType, text: entry.text });
+        prev.hunks.push({ changeType: entry.changeType, text: entry.text, ...(entry.runLogHref ? { runLogHref: entry.runLogHref } : {}) });
         prev.endTs = entry.ts;
       } else {
         blocks.push({
@@ -829,7 +825,7 @@ export function normalizeTranscript(entries: TranscriptEntry[], streaming: boole
           ts: entry.ts,
           endTs: entry.ts,
           filePath: entry.changeType === "file_header" ? entry.text : undefined,
-          hunks: [{ changeType: entry.changeType, text: entry.text }],
+          hunks: [{ changeType: entry.changeType, text: entry.text, ...(entry.runLogHref ? { runLogHref: entry.runLogHref } : {}) }],
         });
       }
       continue;
@@ -1092,7 +1088,7 @@ function TranscriptToolCard({
   const summary = block.status === "running"
     ? summarizeToolInput(block.name, block.input, density)
     : block.status === "completed" && parsedResult?.body
-      ? truncate(parsedResult.body.split("\n")[0] ?? parsedResult.body, compact ? 84 : 140)
+      ? parsedResult.body.split("\n")[0] ?? parsedResult.body
       : summarizeToolResult(block.result, block.isError, density);
 
   return (
@@ -1547,9 +1543,11 @@ function TranscriptEventRow({
 function TranscriptDiffGroup({
   block,
   density,
+  runLogHref,
 }: {
   block: Extract<TranscriptBlock, { type: "diff_group" }>;
   density: TranscriptDensity;
+  runLogHref?: string;
 }) {
   const [open, setOpen] = useState(false);
   const compact = density === "compact";
@@ -1618,12 +1616,7 @@ function TranscriptDiffGroup({
                   </span>
                 );
               case "truncation":
-                return (
-                  <span key={key} className="block text-muted-foreground italic mt-1">
-                    {hunk.text}
-                    {"\n"}
-                  </span>
-                );
+                return null; // The shared producer notice follows the patch, outside <pre>.
               case "context":
               default:
                 return (
@@ -1637,6 +1630,9 @@ function TranscriptDiffGroup({
           })}
         </pre>
       )}
+      {open && block.hunks.some((hunk) => hunk.changeType === "truncation") ? (
+        <SavedOutputNotice kind="patch" runLogHref={runLogHref ?? block.hunks.find(hunk => hunk.changeType === "truncation")?.runLogHref} />
+      ) : null}
     </div>
   );
 }
@@ -1957,7 +1953,7 @@ export function RunTranscriptView({
           {block.type === "tool_group" && (
             <TranscriptToolGroup block={block} density={density} toolDecisionMaps={toolDecisionMaps} />
           )}
-          {block.type === "diff_group" && <TranscriptDiffGroup block={block} density={density} />}
+          {block.type === "diff_group" && <TranscriptDiffGroup block={block} density={density} runLogHref={runLogHref} />}
           {block.type === "stderr_group" && <TranscriptStderrGroup block={block} density={density} />}
           {block.type === "system_group" && <TranscriptSystemGroup block={block} density={density} />}
           {block.type === "stdout" && (

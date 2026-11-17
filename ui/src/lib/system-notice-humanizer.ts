@@ -16,7 +16,6 @@ export interface HumanizedSystemNotice {
 }
 
 const FALLBACK_TITLE = "System update";
-const DETAIL_MAX_CHARS = 80;
 
 /** Failure code the recovery comments embed as "Latest retry failure: `code`". */
 function retryFailureCode(body: string): string | null {
@@ -39,8 +38,7 @@ function firstSentence(body: string): string | undefined {
   if (!firstLine) return undefined;
   const sentenceEnd = firstLine.search(/[.!?](\s|$)/);
   const sentence = sentenceEnd >= 0 ? firstLine.slice(0, sentenceEnd + 1) : firstLine;
-  if (sentence.length <= DETAIL_MAX_CHARS) return sentence;
-  return `${sentence.slice(0, DETAIL_MAX_CHARS - 1).trimEnd()}…`;
+  return sentence;
 }
 
 export function humanizeSystemNotice(input: {

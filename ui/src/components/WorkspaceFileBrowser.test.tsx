@@ -553,10 +553,11 @@ describe("WorkspaceFileBrowser", () => {
     expect(container.textContent).not.toContain("Recent changes / All");
   });
 
-  it("discloses truncation in the footer", () => {
+  it("uses the shared producer notice for a bounded server search", () => {
     useQueryMock.mockReturnValue(ok(availableResponse([createItem()], true)));
     renderBrowser();
-    expect(container.textContent).toContain("refine the search to narrow");
+    expect(container.textContent).toContain("The runner saved only part of this output.");
+    expect(container.textContent).toContain("Refine the search or browse a folder.");
   });
 
   it("renders newly loaded current-folder rows after Load more", () => {

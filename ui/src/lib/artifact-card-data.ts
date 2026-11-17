@@ -48,7 +48,6 @@ export function artifactFileSize(bytes: number | null): string {
 }
 
 export const CSV_PREVIEW_MAX_BYTES = 1024 * 1024;
-const CSV_PREVIEW_MAX_ROWS = 200;
 const CSV_PREVIEW_MAX_COLUMNS = 50;
 
 /** RFC 4180 quoting, CRLF, embedded newlines, and a UTF-8 BOM; bounded for the UI. */
@@ -89,7 +88,6 @@ export function parseArtifactCsv(text: string) {
       records.push(row);
       row = [];
       if (char === "\r" && input[i + 1] === "\n") i++;
-      if (records.length > CSV_PREVIEW_MAX_ROWS + 1) break;
     } else if (char === '"' && !field && !closedQuote) {
       quoted = true;
     } else {
@@ -110,8 +108,8 @@ export function parseArtifactCsv(text: string) {
   }
   return {
     columns: records[0] ?? [],
-    rows: records.slice(1, CSV_PREVIEW_MAX_ROWS + 1),
-    truncated: records.length > CSV_PREVIEW_MAX_ROWS + 1,
+    rows: records.slice(1),
+    truncated: false,
   };
 }
 

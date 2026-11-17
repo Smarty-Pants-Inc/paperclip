@@ -783,6 +783,7 @@ function fileChangeDiffEntries(
   value: readonly unknown[] | undefined,
   toolUseId: string,
   ts: string,
+  runLogHref: string,
 ): TranscriptEntry[] {
   if (!value) return [];
   const entries: TranscriptEntry[] = [];
@@ -804,7 +805,8 @@ function fileChangeDiffEntries(
       entries.push({ kind: "diff", ts, changeType: kind, text: value, toolUseId });
     }
     if (change.diffTruncated === true) {
-      entries.push({ kind: "diff", ts, changeType: "truncation", text: "The runner saved only part of this patch. Open the run log to inspect the saved output.", toolUseId });
+      // Metadata only: each renderer uses SavedOutputNotice with its saved-run href.
+      entries.push({ kind: "diff", ts, changeType: "truncation", text: "", toolUseId, runLogHref });
     }
   }
   return entries;
@@ -1339,7 +1341,7 @@ export function nativeRunEventsToTranscript(events: readonly HeartbeatRunEvent[]
           detail,
           ...(parentToolUseId ? { parentToolUseId } : {}),
         });
-        if (firstEmission) entries.push(...fileChangeDiffEntries(fileChanges, executionId, ts));
+        if (firstEmission) entries.push(...fileChangeDiffEntries(fileChanges, executionId, ts, `/agents/${encodeURIComponent(event.agentId)}/runs/${encodeURIComponent(event.runId)}`));
       }
       if (event.eventType === "tool.execution.completed" && !completedToolIds.has(executionId)) {
         completedToolIds.add(executionId);

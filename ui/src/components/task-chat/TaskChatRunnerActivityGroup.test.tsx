@@ -14,6 +14,7 @@ import type {
   TaskChatToolItem,
 } from "./task-chat-model";
 
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompany: { issuePrefix: "PAP" } }), useOptionalCompany: () => null }));
 const motion = vi.hoisted(() => ({ reduced: false }));
 vi.mock("motion/react", async (original) => ({
   ...(await original<typeof import("motion/react")>()),
@@ -89,6 +90,15 @@ describe("TaskChatRunnerActivityGroup", () => {
         </TaskChatExpansionState.Provider>,
       ),
     );
+  it("judge: grouped activity must preserve the saved-run link supplied by the adapter", () => {
+    act(() => root.render(<MemoryRouter><ThemeProvider>
+      <TaskChatRunnerActivityGroup defaultExpanded item={{ id: "phase", kind: "activity_phase", active: false, summary: "", items: [{ id: "edit", kind: "tool", name: "apply_patch", rawName: "apply_patch", target: "a.txt", status: "completed", runLogHref: "/agents/a/runs/r", diff: { path: "a.txt", added: 1, removed: 0, lines: [{ kind: "add", text: "hello" }], truncated: true } }] }} />
+    </ThemeProvider></MemoryRouter>));
+    act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="edit"] button')!.click());
+    expect(container.textContent).toContain("runner saved only part");
+    expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
+  });
+
   const toggle = () =>
     container.querySelector<HTMLButtonElement>(
       '[data-testid="task-chat-activity-phase-toggle"]',

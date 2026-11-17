@@ -62,12 +62,13 @@ describe("CSV artifact preview", () => {
       truncated: false,
     });
   });
-  it("bounds rows, columns and bytes and rejects malformed quoting", () => {
+  it("keeps every row, bounds columns and bytes and rejects malformed quoting", () => {
     const preview = parseArtifactCsv(
       "Name\n" + Array.from({ length: 202 }, (_, i) => `${i}`).join("\n"),
     );
-    expect(preview.rows).toHaveLength(200);
-    expect(preview.truncated).toBe(true);
+    expect(preview.rows).toHaveLength(202);
+    expect(preview.rows.at(-1)).toEqual(["201"]);
+    expect(preview.truncated).toBe(false);
     expect(() => parseArtifactCsv(Array(51).fill("x").join(","))).toThrow(
       "too many columns",
     );

@@ -19,6 +19,8 @@ import { IssueGalleryContext } from "@/context/IssueGalleryContext";
 import { RichWorkProductCard } from "./RichWorkProductCard";
 import { stateChipFor } from "./RichWorkProductCard";
 
+vi.mock("@/context/CompanyContext", () => ({ useCompany: () => ({ selectedCompany: { issuePrefix: "PAP" } }), useOptionalCompany: () => null }));
+
 function workProduct(overrides: Partial<IssueWorkProduct> = {}): IssueWorkProduct {
   return {
     id: "work-product-1",
@@ -107,6 +109,18 @@ function renderCard(
 describe("TaskChatProtocolCard", () => {
   let container: HTMLDivElement;
   let root: Root;
+
+  it("judge: Expand all must not fabricate a producer omission for an unflagged no-text change", () => {
+    renderCard(root, { id: "c", kind: "protocol", surface: "workspace_change", changeSetId: "c", revision: 1, source: "runner_verified", complete: true, runLogHref: "/agents/a/runs/r", files: [
+      { path: "mode.txt", previousPath: null, operation: "mode_change", additions: 0, deletions: 0, binary: false, diff: null, diffTruncated: false },
+      { path: "normal.txt", previousPath: null, operation: "modify", additions: 1, deletions: 0, binary: false, diff: "+hello", diffTruncated: false },
+    ], totals: { files: 2, additions: 1, deletions: 0 }, patchArtifactRef: null });
+    const expand = [...container.querySelectorAll("button")].find(button => button.textContent?.includes("Expand all"));
+    expect(expand).toBeDefined();
+    act(() => expand!.click());
+    expect(container.textContent).not.toContain("runner saved only part");
+    expect(container.textContent).toContain("hello");
+  });
 
   beforeEach(() => {
     container = document.createElement("div");

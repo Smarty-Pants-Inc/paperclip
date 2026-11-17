@@ -473,9 +473,9 @@ function WorkspaceChangeFileRow({
             lines={parsed.lines}
             truncated={parsed.truncated || file.diffTruncated === true}
           />
-        ) : (
+        ) : file.diffTruncated === true ? (
           <div className="ml-7 mt-1"><SavedOutputNotice kind="patch" runLogHref={runLogHref} /></div>
-        )
+        ) : null
       ) : null}
     </div>
   );

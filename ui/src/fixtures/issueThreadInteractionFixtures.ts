@@ -661,7 +661,7 @@ const longToolProposal = "The release note covers the agreed accessibility check
 export const pendingToolActionLongProposalInteraction = createToolActionConfirmationInteraction({
   id: "interaction-tool-action-long-proposal",
   toolAction: {
-    previewMarkdown: `Add the public launch note.\n\n**Text:** ${longToolProposal.slice(0, 137)}…`,
+    previewMarkdown: `Add the public launch note.\n\n**Text:** ${longToolProposal}`,
     argumentsSummaryJson: JSON.stringify({ text: longToolProposal, apiKey: "[redacted]" }, null, 2),
   },
 });

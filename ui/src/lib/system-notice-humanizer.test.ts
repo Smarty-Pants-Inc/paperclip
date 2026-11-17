@@ -85,7 +85,7 @@ describe("humanizeSystemNotice", () => {
     expect(result).toEqual({ title: "Task could not continue", tone: "warning" });
   });
 
-  it("falls back to System update plus a truncated first sentence", () => {
+  it("falls back to System update plus the complete first sentence", () => {
     const longFirstSentence =
       "The heartbeat scheduler observed an unusual condition while reconciling this issue's run ledger against the " +
       "control plane state and recorded the discrepancy for later review.";
@@ -93,8 +93,8 @@ describe("humanizeSystemNotice", () => {
     expect(result.title).toBe("System update");
     expect(result.tone).toBe("neutral");
     expect(result.detail).toBeDefined();
-    expect(result.detail!.length).toBeLessThanOrEqual(80);
-    expect(result.detail!.endsWith("…")).toBe(true);
+    expect(result.detail).toBe(longFirstSentence);
+    expect(result.detail!.endsWith("…")).toBe(false);
   });
 
   it("keeps a short first sentence untruncated in the fallback detail", () => {

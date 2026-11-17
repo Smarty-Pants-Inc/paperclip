@@ -258,11 +258,6 @@ function resolveUserName(
   return entry?.user?.name?.trim() || entry?.user?.email?.trim() || null;
 }
 
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return text.slice(0, max - 1) + "\u2026";
-}
-
 function resolveActorLabel(
   queryClient: QueryClient,
   companyId: string,
@@ -393,7 +388,7 @@ function resolveIssueToastContext(
   return {
     ref,
     title,
-    label: title ? `${ref} - ${truncate(title, 72)}` : ref,
+    label: title ? `${ref} - ${title}` : ref,
     href: `/issues/${identifier ?? issueId}`,
   };
 }
@@ -1228,7 +1223,7 @@ function buildActivityToast(
     return {
       actor: toastActor,
       title: `${actor} created ${issue.ref}`,
-      body: issue.title ? truncate(issue.title, 96) : undefined,
+      body: issue.title || undefined,
       tone: "success",
       action: { label: `View ${issue.ref}`, href: issue.href },
       dedupeKey: `activity:${action}:${entityId}`,
@@ -1243,15 +1238,15 @@ function buildActivityToast(
     const changeDesc = describeIssueUpdate(details);
     const body = changeDesc
       ? issue.title
-        ? `${truncate(issue.title, 64)} - ${changeDesc}`
+        ? `${issue.title} - ${changeDesc}`
         : changeDesc
       : issue.title
-        ? truncate(issue.title, 96)
+        ? issue.title
         : issue.label;
     return {
       actor: toastActor,
       title: `${actor} updated ${issue.ref}`,
-      body: truncate(body, 100),
+      body: body,
       tone: "info",
       action: { label: `View ${issue.ref}`, href: issue.href },
       dedupeKey: `activity:${action}:${entityId}`,
@@ -1285,7 +1280,7 @@ function buildActivityToast(
   return {
     actor: toastActor,
     title,
-    body: body ? truncate(body, 96) : undefined,
+    body: body ? body : undefined,
     tone: "info",
     action: { label: `View ${issue.ref}`, href: issue.href },
     dedupeKey: `activity:${action}:${entityId}:${commentId ?? "na"}`,
@@ -1397,7 +1392,7 @@ function buildRunStatusToast(
 
   let body: string | undefined;
   if (error) {
-    body = truncate(error, 100);
+    body = error;
   } else if (triggerDetail) {
     body = `Trigger: ${triggerDetail}`;
   }

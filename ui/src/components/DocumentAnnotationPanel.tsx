@@ -444,7 +444,7 @@ export function ThreadCard(props: {
             <span className="font-medium text-foreground">
               {thread.comments.length} comment{thread.comments.length === 1 ? "" : "s"}
             </span>
-            {latestComment ? <span className="ml-1">· {truncate(latestComment.body, 120)}</span> : null}
+            {latestComment ? <span className="ml-1">· {latestComment.body}</span> : null}
           </p>
         )}
       </article>
@@ -522,11 +522,6 @@ function resolveAuthor(
     };
   }
   return { name: comment.authorType === "agent" ? "Agent" : "Board", role: comment.authorType === "agent" ? "agent" : "board" };
-}
-
-export function truncate(value: string, limit: number) {
-  if (value.length <= limit) return value;
-  return `${value.slice(0, limit - 1)}…`;
 }
 
 /**

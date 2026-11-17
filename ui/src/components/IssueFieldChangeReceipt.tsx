@@ -5,6 +5,7 @@ import {
   readIssueChangeReceipt,
 } from "../lib/issue-change-receipt";
 import { cn } from "../lib/utils";
+import { SavedOutputNotice } from "./task-chat/SavedOutputNotice";
 
 /**
  * Field-level audit receipt under an `issue.updated` row in the activity stream
@@ -62,13 +63,7 @@ export function IssueFieldChangeReceipt({
                 </span>
                 <ArrowRight className="size-3 shrink-0 text-muted-foreground/70" aria-hidden="true" />
                 <span className="min-w-0 break-words font-medium text-foreground">{row.to}</span>
-                {/* Long text is stored as a preview, so the receipt says so
-                    rather than implying the whole value is shown. */}
-                {row.truncated ? (
-                  <span className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
-                    preview
-                  </span>
-                ) : null}
+                {row.truncated === true ? <SavedOutputNotice /> : null}
               </dd>
             </div>
           ))}

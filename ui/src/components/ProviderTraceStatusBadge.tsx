@@ -1,6 +1,7 @@
 import type { ProviderTraceMetadata } from "@paperclipai/shared";
 import { Bug, CircleOff } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { SavedOutputNotice } from "./task-chat/SavedOutputNotice";
 
 export function runRequestedProviderTrace(
   contextSnapshot: Record<string, unknown> | null | undefined,
@@ -30,6 +31,7 @@ export function ProviderTraceStatusBadge({
   const expired = trace
     ? new Date(trace.expiresAt).getTime() <= Date.now()
     : false;
+  if (status === "truncated" && !expired) return <SavedOutputNotice />;
   const label = expired
     ? "Trace expired"
     : status === "capturing"
@@ -38,9 +40,7 @@ export function ProviderTraceStatusBadge({
         ? "Trace captured"
         : status === "incomplete"
           ? "Trace incomplete"
-          : status === "truncated"
-            ? "Trace capture limit reached"
-            : status === "expired"
+          : status === "expired"
               ? "Trace expired"
               : status === "deleted"
                 ? "Trace deleted"

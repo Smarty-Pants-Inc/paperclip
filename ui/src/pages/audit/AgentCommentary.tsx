@@ -33,7 +33,7 @@ function CommentaryRow({ entry, onOpen }: { entry: AgentCommentaryEntry; onOpen:
         <div className="flex items-center justify-between gap-3 md:col-span-2"><AgentIdentity agent={entry.agent} size="sm" /><span className="md:hidden"><MessageKind kind={entry.kind} /></span></div>
         <div className="hidden md:col-span-2 md:block"><MessageKind kind={entry.kind} /></div>
         <div className="flex min-w-0 flex-col gap-2 md:col-span-6">
-          <p className="line-clamp-2 whitespace-pre-line break-words text-sm leading-relaxed text-foreground">{entry.preview.trim()}{entry.preview.length >= 280 ? "…" : ""}</p>
+          <p className="whitespace-pre-line break-words text-sm leading-relaxed text-foreground">{entry.preview.trim()}</p>
           {entry.task && <span className="truncate text-xs text-muted-foreground"><span className="font-mono">{entry.task.identifier ?? "Task"}</span> · {entry.task.title}</span>}
         </div>
         <time dateTime={entry.createdAt} title={new Date(entry.createdAt).toLocaleString()} className="font-mono text-xs text-muted-foreground md:col-span-2 md:text-right">{relativeTime(entry.createdAt)}</time>

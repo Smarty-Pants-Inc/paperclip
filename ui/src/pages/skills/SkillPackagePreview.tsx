@@ -9,6 +9,7 @@ import { QueryErrorState, useQueryView } from '@/components/QueryView';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Link } from '@/lib/router';
+import { SavedOutputNotice } from '@/components/task-chat/SavedOutputNotice';
 import type { SkillTreeCandidate } from './SkillSourceTree';
 
 export function SkillPackagePreview({ companyId, repository, commitSha, skill, initialFile, repositoryPackage, onClose }: {
@@ -72,7 +73,7 @@ export function SkillPackagePreview({ companyId, repository, commitSha, skill, i
             {skill.error && <p className="text-sm text-muted-foreground">Preview unavailable for a package that failed validation.</p>}
             {preview.data?.file.encoding === 'base64' && <div className="flex flex-col items-center gap-3 py-8 text-sm text-muted-foreground"><FileImage className="size-6" /><p>Binary asset · included without changes</p><p className="text-xs">Open on GitHub to preview or download this file.</p></div>}
             {preview.data?.content !== null && preview.data?.content !== undefined && <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed">{preview.data.content}</pre>}
-            {preview.data?.truncated && <p className="mt-3 text-xs text-muted-foreground">Showing the first 64 KB. The complete file is imported.</p>}
+            {preview.data?.truncated === true && <SavedOutputNotice kind="file preview" />}
           </div>
         </div>
       </div>}
