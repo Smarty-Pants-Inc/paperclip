@@ -2051,7 +2051,9 @@ fn preserve_bounded_display_content(
 /// A completed final answer is the reply the person receives. The generic
 /// diagnostic preview cap would turn it into a cut-off copy, so keep its
 /// complete redacted text when it fits comfortably inside one transport frame.
-/// Otherwise the bounded preview remains, still marked as truncated.
+/// Otherwise (paged delivery is not built yet) the whole redacted answer is
+/// saved to a file and the person's text says so plainly, with a labelled
+/// excerpt; a cut preview is never presented as the answer.
 fn preserve_final_agent_message_text(
     event_type: &str,
     original: &Value,
@@ -2074,10 +2076,8 @@ fn preserve_final_agent_message_text(
     let Some(object) = candidate.as_object_mut() else {
         return sanitized;
     };
-    object.insert(
-        "text".to_owned(),
-        Value::String(redact_sensitive_text_values(text)),
-    );
+    let whole = redact_sensitive_text_values(text);
+    object.insert("text".to_owned(), Value::String(whole.clone()));
     // Size the serialized payload, not the raw text: JSON escaping can double
     // the text, and the secure frame hex-encodes the encrypted envelope,
     // doubling it again. Keep the bounded preview unless the complete payload,
@@ -2086,10 +2086,68 @@ fn preserve_final_agent_message_text(
         return sanitized;
     };
     let budget = (max_frame_bytes / 2).saturating_sub(FINAL_AGENT_MESSAGE_FRAME_HEADROOM_BYTES);
-    if serialized_bytes > budget {
-        return sanitized;
+    if serialized_bytes <= budget {
+        return candidate;
     }
-    candidate
+    // Too large for one frame: keep the frame bound, never cut silently.
+    let Some(object) = sanitized.as_object_mut() else {
+        return sanitized;
+    };
+    let base_bytes = serialized_bytes.saturating_sub(
+        serde_json::to_vec(&whole)
+            .map(|bytes| bytes.len())
+            .unwrap_or(0),
+    );
+    object.insert(
+        "text".to_owned(),
+        Value::String(oversized_final_answer_notice(
+            &whole,
+            budget.saturating_sub(base_bytes),
+        )),
+    );
+    sanitized
+}
+
+/// The person's text for a final answer too large for one frame: a plain
+/// statement, where the whole answer is kept, and a clearly labelled excerpt
+/// that fits `budget` serialized bytes.
+fn oversized_final_answer_notice(whole: &str, budget: usize) -> String {
+    let digest = format!("{:x}", Sha256::digest(whole.as_bytes()));
+    let directory = std::env::temp_dir().join("paperclip-runner-final-answers");
+    let path = directory.join(format!("{}.txt", &digest[..32]));
+    let saved = fs::create_dir_all(&directory)
+        .and_then(|()| {
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            options.open(&path)
+        })
+        .and_then(|mut file| file.write_all(whole.as_bytes()));
+    let location = match saved {
+        Ok(()) => format!("The whole answer is saved at {} (sha256 {digest}).", path.display()),
+        Err(error) => format!("The whole answer could not be saved to a file ({error}); it remains in the agent's session (sha256 {digest})."),
+    };
+    let notice = format!(
+        "This answer is too large to deliver in one message ({} bytes), so it was not cut. {location}\n\nThe answer begins (an excerpt, not the whole answer):\n\n",
+        whole.len()
+    );
+    let mut used = serde_json::to_vec(&notice)
+        .map(|bytes| bytes.len())
+        .unwrap_or(notice.len());
+    let mut excerpt = notice;
+    for character in whole.chars() {
+        let mut buffer = [0_u8; 4];
+        let escaped = serde_json::to_vec(&*character.encode_utf8(&mut buffer))
+            .map(|bytes| bytes.len() - 2)
+            .unwrap_or(6);
+        if used + escaped > budget {
+            break;
+        }
+        used += escaped;
+        excerpt.push(character);
+    }
+    excerpt
 }
 
 /// Plaintext reserved for the event envelope fields around a final answer
