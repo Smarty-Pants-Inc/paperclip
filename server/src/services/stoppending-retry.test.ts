@@ -246,4 +246,31 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(conversation.id).not.toBe(sessionId);
     expect(conversation).toMatchObject({ previousId: sessionId, generation: 2, reason: expect.stringMatching(/^fresh_continuation:/) });
   }, 60_000);
+  it("M: after a person's Stop has settled (recovered hold), a NEW message from that person is admitted as the continuation, not refused", async () => {
+    const f = await seed("C");
+    const now = Date.now();
+    await db.update(issues).set({ executionRunId: null, executionLockedAt: null, status: "blocked" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ createdAt: new Date(now - 700_000), startedAt: new Date(now - 690_000),
+      finishedAt: new Date(now - 600_000) }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.sourceRunId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", attempt: 1 } as typeof nativeRunFinalizations.$inferInsert);
+    const [environment] = await db.insert(environments).values({ name: `box-m-${f.sourceRunId}`, driver: "sandbox" }).returning();
+    const identity = { id: randomUUID(), companyId: f.companyId, heartbeatRunId: f.sourceRunId, provider: "daytona", providerLeaseId: "sandbox-m" };
+    await db.insert(environmentLeases).values({ ...identity, environmentId: environment!.id,
+      issueId: f.issueId, status: "released", leasePolicy: "ephemeral", releasedAt: new Date(now - 590_000), cleanupStatus: "success",
+      metadata: { remoteExecutionTermination: remoteTerminationReceipt(identity, { providerLeaseId: "sandbox-m", state: "destroyed" }) } });
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_continuation_requires_reconciliation", fingerprint: `native-continuation:${f.sourceRunId}`,
+      evidence: { runId: f.sourceRunId, originalFailureCode: "cancelled" },
+      nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.", maxAttempts: 3 });
+    const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board", body: "Please continue." }).returning();
+    let blockedWith: string | null = null;
+    const admitted = await admitExplicitNativeContinuation({ db, companyId: f.companyId, issueId: f.issueId, agentId: f.agentId,
+      actorType: "user", actorId: "board", reason: "issue_commented", commentId: comment!.id, successorRunId: randomUUID(), dryRun: true,
+      onBlocked: (reason, message) => { blockedWith = `${reason}: ${message}`; } });
+    expect(blockedWith).toBeNull();
+    expect(admitted).toMatchObject({ previousRunId: f.sourceRunId, commentId: comment!.id });
+  }, 60_000);
 });
