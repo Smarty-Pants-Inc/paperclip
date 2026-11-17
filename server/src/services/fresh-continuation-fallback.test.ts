@@ -1040,6 +1040,163 @@ suite("fresh-continuation fallback", () => {
     }
   }, 120_000);
 
+  // Independent judge rows: deterministic ordering of the actual dispatcher/cancel CAS.
+  async function judgeQueued(personMessage = true) {
+    await instanceSettingsService(db).updateExperimental({enableAgentChat:true});
+    const t = new Date(Date.now() - 660_000), issueId = randomUUID();
+    await db.insert(issues).values({ id: issueId, companyId, title: "Judge Retry", status: "in_progress", assigneeAgentId: agentId,
+      conversationAgentId: agentId, conversationUserId: userId, conversationState: "active", createdAt: t });
+    const [source] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "failed", errorCode: "adapter_failed",
+      createdAt: new Date(t.getTime()-60_000), startedAt: new Date(t.getTime()-59_000), finishedAt: new Date(t.getTime()-1_000),
+      responsibleUserId: userId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: source!.id, issueId,
+      provider: "boat", providerLeaseId: `judge-${randomUUID()}`, status: "released", releasedAt: t, cleanupStatus: "failed" }).returning();
+    const [message] = personMessage ? await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: userId,
+      body: "Judge new question", clientRequestId: randomUUID(), createdAt: t }).returning() : [];
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "on_demand", reason: personMessage ? "issue_commented" : "issue_assigned",
+      status: "queued", requestedByActorType: "user", requestedByActorId: userId, payload: { issueId, ...(message ? { commentId: message.id } : {}) },
+      createdAt: t, requestedAt: t }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({ companyId, agentId, issueId, status: "queued", invocationSource: "on_demand",
+      createdAt: t, responsibleUserId: userId, wakeupRequestId: wake!.id, retryOfRunId: source!.id,
+      contextSnapshot: { issueId, wakeReason: personMessage ? "issue_commented" : "issue_assigned",
+        ...(message ? { wakeCommentId: message.id, wakeCommentIds: [message.id] } : {}) } }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, wake!.id));
+    return { issueId, queued: queued!, source: source!, lease: lease!, message };
+  }
+
+  it("JUDGE successful-cleanup control is taken by the first liveness pass", async () => {
+    const f=await judgeQueued(),heartbeat=heartbeatService(db);
+    await db.update(environmentLeases).set({cleanupStatus:"success"}).where(eq(environmentLeases.id,f.lease.id));
+    await heartbeat.resumeQueuedRunsAfterDrain({companyId});await heartbeat.drainActiveRunExecutions();
+    const row=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.queued.id)))[0]!;
+    console.info(JSON.stringify({judgeCleanupControl:{runId:row.id,status:row.status,startedAt:row.startedAt}}));
+    expect(row.startedAt).not.toBeNull();
+  },120_000);
+
+  async function judgeCleanupGate(f:Awaited<ReturnType<typeof judgeQueued>>) {
+    const {executeNativeSession,parseNativeExecutionInput,NativeSessionCloseUnrecoverableError,nativeSessionCleanupBlock}=await import("../vendor/paperclip-runner/index.js");
+    const identity={companyId,agentId,issueId:f.issueId,runId:f.source.id,sessionId:randomUUID()};
+    const capabilities={resume:true,typedEvents:true,steering:false,interruption:false,structuredResult:true};
+    const result={schema:"paperclip.run_result.v1",reportedWorkDisposition:"done",summary:"Saved work",
+      completionClaim:{contractRevision:"1",objectiveSatisfied:true,criteria:[{criterionId:"done",status:"satisfied",evidenceRefs:[]}],remainingWork:[]},
+      evidence:[],verification:[],attentionRequests:[],artifacts:[]};
+    const terminal={schema:"paperclip.prp.terminal.v1",turnTerminalState:"completed",runTerminalState:"succeeded",reportedWorkDisposition:"done"};
+    const session={identity:()=>identity,capabilities:async()=>capabilities,
+      async *events(){yield {schema:"paperclip.prp.event.v1",sourceEventId:"done",sourceSeq:1,sourceInstanceId:"runner",sourceKind:"runner",
+        runId:identity.runId,normalizedSessionId:identity.sessionId,turnId:"turn",eventType:"turn.completed",schemaVersion:1,priority:0,emittedAt:new Date().toISOString(),payload:{}};},
+      startTurn:async()=>({turnId:"turn"}),result:async()=>({result,terminal,turnId:"turn"}),
+      close:async()=>{throw new NativeSessionCloseUnrecoverableError({runnerSuspended:false,providerDrained:false});},
+      snapshot:async()=>({backendKind:"mock",sessionId:"driver",identity,providerSessionId:"provider",cursor:null,activeTurnId:null,pendingRuntimeRequests:[],lineage:[]})};
+    await db.update(heartbeatRuns).set({runtimeMode:"native",nativeIssueId:f.issueId,runnerInstanceId:randomUUID()}).where(eq(heartbeatRuns.id,f.source.id));
+    await executeNativeSession({input:parseNativeExecutionInput({schema:"paperclip.native-execution-input.v1",provider:{kind:"codex",model:null},
+      binding:{companyId,agentId,issueId:f.issueId,runId:f.source.id,executionWorkspaceId:f.source.id},
+      task:{identifier:"JUDGE",title:"Cleanup",description:null,prompt:"Continue",workMode:"standard"},workspace:{cwd:tmpdir(),repoUrl:null,repoRef:null,branchName:null},
+      session:{normalizedSessionId:identity.sessionId,driverKind:"codex_app_server",protocolVersion:1,lifecyclePolicy:{mode:"per_turn",idleTimeoutMs:null}},
+      completionContract:{id:"contract",sha256:"sha",schemaVersion:"paperclip.completion-contract.v1",contract:{revision:"1",objective:"Continue",criteria:[{id:"done",requirement:"Save work"}]}},
+      interactionResponses:[],credentialBindings:[]}),backend:{descriptor:async()=>({kind:"mock",name:"cleanup",version:"1",capabilities}),openSession:async()=>session},
+      controlPlane:{openRun:async()=>{},checkpointSession:async()=>{},appendEvent:async()=>({cursor:1,highestContiguousSourceSeq:1,disposition:"committed"}),
+        replayEvents:async()=>({events:[],highestContiguousSourceSeq:0}),completeRun:async()=>{}},runnerInstanceId:randomUUID(),controlPlaneInstanceId:"control",
+      remoteCleanupScope:JSON.stringify([f.lease.provider,f.lease.providerLeaseId])} as never);
+    expect(nativeSessionCleanupBlock({companyId,issueId:f.issueId})).toBe("operator_required");
+  }
+
+  it.each(["dispatcher_first", "retry_first"] as const)("JUDGE Retry CAS race %s never starts two runs or cancels a started run", async order => {
+    const f = await judgeQueued();
+    await db.update(environmentLeases).set({ cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const heartbeat = heartbeatService(db);
+    const receipt = await requestTaskRetry({ db, companyId, issueId: f.issueId, actorId: userId,
+      observedRunId: f.queued.id, idempotencyKey: randomUUID() });
+    expect(receipt).toMatchObject({ startQueuedRunId: f.queued.id });
+    const { startPersonQueuedRunFresh } = await import("./task-retry.js");
+    const cancel = async (id: string) => {
+      if (order === "dispatcher_first") {
+        await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+        await heartbeat.drainActiveRunExecutions();
+      }
+      const cancelled = await heartbeat.cancelStuckQueuedRunForRetry(id);
+      if (order === "retry_first") await heartbeat.resumeQueuedRunsForAgent(companyId, agentId);
+      return cancelled;
+    };
+    await startPersonQueuedRunFresh(db, { ...heartbeat, cancelStuckQueuedRunForRetry: cancel } as never,
+      { companyId, issueId: f.issueId, runId: f.queued.id, actorId: userId });
+    await heartbeat.drainActiveRunExecutions();
+    const runs = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId, f.issueId))).filter(r => r.id !== f.source.id);
+    const old = runs.find(r => r.id === f.queued.id)!;
+    console.info(JSON.stringify({ judgeRace: { order, runs: runs.map(r => ({ id:r.id,status:r.status,startedAt:r.startedAt })) } }));
+    expect(runs.filter(r => r.startedAt), "exactly one dispatched run in either CAS ordering").toHaveLength(1);
+    if (order === "dispatcher_first") {
+      expect(runs).toHaveLength(1);
+      expect(old.startedAt).not.toBeNull();
+      expect(old.errorCode).not.toBe("person_queued_run_replaced");
+    } else {
+      expect(old).toMatchObject({ status:"cancelled", startedAt:null });
+      expect(runs).toHaveLength(2);
+    }
+  }, 120_000);
+
+  it("JUDGE no person comment card Retry is not just a re-poke", async () => {
+    const f = await judgeQueued(false), heartbeat = heartbeatService(db);
+    const before = await taskInterruptionPresentation(db, await issue(f.issueId));
+    expect(before).toMatchObject({ state:"failed",canRetry:true,observedRunId:f.queued.id });
+    const response = await request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`).send({ observedRunId:f.queued.id,idempotencyKey:randomUUID() });
+    await heartbeat.drainActiveRunExecutions();
+    const after = await taskInterruptionPresentation(db, await issue(f.issueId));
+    const old = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.queued.id)))[0]!;
+    console.info(JSON.stringify({ judgeNoMessage:{ route:response.status,receipt:response.body,before,after,old:{id:old.id,status:old.status,startedAt:old.startedAt} } }));
+    expect(old.startedAt, "the reachable person-facing Retry must change the stalled path").not.toBeNull();
+  },120_000);
+
+  it.each(["issue_owner_cleanup", "issue_owner_running", "agent_setup", "budget_accounting", "budget_hard_stop", "case_handoff", "native_cleanup"] as const)("JUDGE named hold %s has its own truthful card, not a Retry requeue loop", async hold => {
+    const { budgetPolicies, cases, caseHandoffs } = await import("@paperclipai/db");
+    const f = await judgeQueued(), heartbeat = heartbeatService(db);
+    const [agentBefore] = await db.select().from(agents).where(eq(agents.id,agentId));
+    const [companyBefore] = await db.select().from(companies).where(eq(companies.id,companyId));
+    try {
+      if (hold === "native_cleanup") await judgeCleanupGate(f);
+      if (hold === "issue_owner_cleanup") await db.update(issues).set({executionRunId:f.source.id}).where(eq(issues.id,f.issueId));
+      if (hold === "issue_owner_running") {
+        const [previousAgent] = await db.insert(agents).values({companyId,name:"Previous task owner",status:"idle",adapterType:"paperclip_runner"}).returning();
+        await db.update(heartbeatRuns).set({agentId:previousAgent!.id,status:"running",finishedAt:null,errorCode:null}).where(eq(heartbeatRuns.id,f.source.id));
+        await db.update(issues).set({executionRunId:f.source.id}).where(eq(issues.id,f.issueId));
+      }
+      if (hold === "agent_setup") await db.update(agents).set({lifecycleState:"preparing",lifecycleHolds:[]}).where(eq(agents.id,agentId));
+      if (hold === "budget_accounting") {
+        await db.insert(budgetPolicies).values({companyId,scopeType:"company",scopeId:companyId,windowKind:"calendar_month_utc",amount:2000,hardStopEnabled:true,unpricedUsagePolicy:"allow"});
+        const [other] = await db.insert(agents).values({companyId,name:"Accounting owner",status:"idle",adapterType:"paperclip_runner"}).returning();
+        await db.insert(heartbeatRuns).values({companyId,agentId:other!.id,status:"succeeded",startedAt:new Date(Date.now()-60_000),finishedAt:new Date(),costAccountingPending:true,
+          usageJson:{costUsd:0.01,usageSource:"per_run",billingType:"metered_api",provider:"openai",model:"gpt"},contextSnapshot:{}});
+      }
+      if (hold === "budget_hard_stop") await db.update(companies).set({status:"paused",pauseReason:"budget"}).where(eq(companies.id,companyId));
+      if (hold === "case_handoff") {
+        const [record] = await db.insert(cases).values({companyId,caseNumber:1,identifier:`CASE-${randomUUID()}`,caseType:"work",title:"Judge pending handoff",workIssueId:f.issueId,handoffVersion:1,phase:"implementation"}).returning();
+        await db.insert(caseHandoffs).values({companyId,caseId:record!.id,issueId:f.issueId,version:1,toAgentId:agentId,phase:"implementation",instructions:"Wait for handoff",
+          actorType:"user",actorId:userId,responsibleUserId:userId,expectedIssueStatusVersion:0,appliedIssueStatusVersion:0,wakeupRequestId:randomUUID(),idempotencyKey:randomUUID(),inputFingerprint:"judge",state:"awaiting_release"});
+      }
+      const before = await taskInterruptionPresentation(db,await issue(f.issueId));
+      const response = await request(retryRouteApp()).post(`/api/issues/${f.issueId}/retry`).send({observedRunId:f.queued.id,idempotencyKey:randomUUID()});
+      await heartbeat.drainActiveRunExecutions();
+      const after = await taskInterruptionPresentation(db,await issue(f.issueId));
+      const pressTime=Date.now();
+      vi.useFakeTimers({toFake:["Date"]});vi.setSystemTime(pressTime+600_001);
+      await heartbeat.resumeQueuedRunsAfterDrain({companyId});await heartbeat.drainActiveRunExecutions();
+      const later=await taskInterruptionPresentation(db,await issue(f.issueId));
+      const runs=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.issueId,f.issueId))).map(r=>({id:r.id,status:r.status,startedAt:r.startedAt,createdAt:r.createdAt}));
+      const wakes=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,companyId),sql`${agentWakeupRequests.payload}->>'issueId' = ${f.issueId}`));
+      console.info(JSON.stringify({judgeHold:{hold,route:response.status,receipt:response.body,before,after,later,runs,wakes:wakes.map(w=>({id:w.id,reason:w.reason,status:w.status,runId:w.runId,payload:w.payload}))}}));
+      expect(later?.state==="waiting_for_user" || Boolean(later?.retryWait) || runs.some(r=>r.id!==f.queued.id&&r.id!==f.source.id&&r.startedAt),
+        "an enduring hold must name its own true state/action, not failed+Retry that only requeues").toBe(true);
+    } finally {
+      vi.useRealTimers();
+      await db.update(agents).set({lifecycleState:agentBefore!.lifecycleState,lifecycleHolds:agentBefore!.lifecycleHolds}).where(eq(agents.id,agentId));
+      await db.delete(budgetPolicies).where(eq(budgetPolicies.companyId,companyId));
+      await db.update(companies).set({status:companyBefore!.status,pauseReason:companyBefore!.pauseReason}).where(eq(companies.id,companyId));
+      if(hold === "native_cleanup") {
+        const {completeTerminatedRemoteNativeSessionCleanup}=await import("../vendor/paperclip-runner/index.js");
+        completeTerminatedRemoteNativeSessionCleanup({companyId,runId:f.source.id,remoteCleanupScope:JSON.stringify([f.lease.provider,f.lease.providerLeaseId])});
+      }
+    }
+  },120_000);
+
   // rf-3 (c) R-ONCE: a message queued behind a busy turn; the busy turn ends; exactly ONE run starts
   // and answers once. The card offers no Retry, and later sweeps/liveness passes start nothing.
   it("R-ONCE: a message queued behind a busy turn starts exactly one run when the turn ends and is answered once", async () => {
