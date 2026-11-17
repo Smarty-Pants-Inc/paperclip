@@ -2571,7 +2571,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   // Keep: rf5-famnotices-independent RF5_HELD_RESULT / RF5_LEGACY_HELD_RESULT:
   // the real Stop route leaves M2 in the held list, but the sweep invited a duplicate.
   describe("person-stopped held list (RF5)", () => {
-    async function heldChatCase(mode: "native" | "legacy") {
+    async function heldChatCase(mode: "native" | "legacy", opts: { assistantStarted?: boolean } = {}) {
       const f = await fixture();
       await db.insert(companyMemberships).values({ companyId: f.companyId, principalId: f.userId,
         principalType: "user", membershipRole: "owner", status: "active" });
@@ -2595,7 +2595,7 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
             claimedAt: startedAt.toISOString() } } }).where(eq(heartbeatRuns.id, runId));
       await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
       await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase: "observed" });
-      for (const [i, kind] of ["userMessage", "agentMessage"].entries()) {
+      for (const [i, kind] of (opts.assistantStarted === false ? ["userMessage"] : ["userMessage", "agentMessage"]).entries()) {
         await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId,
           seq: await allocateHeartbeatRunEventSeq(db, runId), eventType: "item.started", sourceEventId: `rf5-${randomUUID()}`, payload: { prpEvent: {
             eventType: "item.started", turnId: `turn-${runId}`, itemId: `item-${i}`, payload: { kind, item: { type: kind } } } } });
@@ -2671,6 +2671,42 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await deleted.notes()).toHaveLength(0);
       expect(await db.select({ id: issueComments.id }).from(issueComments).where(eq(issueComments.id, deleted.m2)))
         .toHaveLength(0);
+    });
+
+    // After Send, the successor answers M2 only; R-ONCE leaves M1 not answered. Which earlier message is owed
+    // applies the person-stop exclusion WHOLE (stoppedBySender AND runStartedAnswering).
+    async function sendAndAnswerM2(f: Awaited<ReturnType<typeof heldChatCase>>, mode: "native" | "legacy") {
+      const queue = await f.queue();
+      await request(f.client).post(`${f.path}/interrupt`).send({ queueId: queue.queueId,
+        revision: queue.revision, targetRunId: null }).expect(200);
+      const successor = await f.run({ commentId: f.m2, status: "succeeded" });
+      await db.update(heartbeatRuns).set({ runtimeMode: mode, wakeupRequestId: f.wakeId })
+        .where(eq(heartbeatRuns.id, successor));
+      await db.update(agentWakeupRequests).set({ status: "coalesced", runId: successor })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId,
+        authorType: "agent", authorAgentId: f.agentId, createdByRunId: successor, body: "Deployed; here is the receipt." });
+    }
+
+    it.each(["native", "legacy"] as const)("RF5 %s control: after the same sequence, an UNSTOPPED unanswered M1 keeps its ONE notice", async mode => {
+      const f = await heldChatCase(mode);
+      await sendAndAnswerM2(f, mode);
+      // M1's run ended without the sender's Stop (an adapter failure): M1 is owed.
+      await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", resultJson: null })
+        .where(eq(heartbeatRuns.id, f.runId));
+      await f.sweep(12); await f.sweep(13);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m1}`);
+    });
+
+    it.each(["native", "legacy"] as const)("RF5 %s control: the sender stopped M1's run BEFORE any assistant item, so M1 owes ONE notice", async mode => {
+      const f = await heldChatCase(mode, { assistantStarted: false });
+      await sendAndAnswerM2(f, mode);
+      await f.sweep(12); await f.sweep(13);
+      const notes = await f.notes();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.m1}`);
     });
 
     it.each(["native", "legacy"] as const)("RF5 %s: a sent message that fails is no longer silenced by the held list", async mode => {
