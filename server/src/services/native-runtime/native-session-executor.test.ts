@@ -15057,7 +15057,8 @@ describe("native warm session supervision", () => {
               expect(signals).toEqual([]);
               expect(retiredReceipts).toEqual([]);
               expect(collectStopped).not.toHaveBeenCalled();
-              expect(retirementFailed).toHaveBeenCalledTimes(1);
+              // The files are kept for later collection (the existing unproven receipt).
+              expect(retirementFailed).toHaveBeenCalled();
             }
             expect(backup).not.toHaveBeenCalled();
             expect(await sha()).toBe(unsyncedSha);

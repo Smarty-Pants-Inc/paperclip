@@ -4,6 +4,7 @@ import { heartbeatRuns, type Db } from "@paperclipai/db";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import { persistActivity } from "../activity-log.js";
 import { NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
+import { executeWithinHandoff, type RemoteHandoffBudget } from "./native-handoff-deadline.js";
 import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT } from "./remote-runner-recovery-diagnostics.js";
 
 export const SANDBOX_RUNNER_HOLDER_LIST_SCRIPT = [
@@ -69,33 +70,52 @@ export function parseSandboxRunnerHolders(stdout: string): SandboxRunnerHolder[]
 
 type HolderProbe = "alive" | "gone" | "unproven";
 
+type ExecuteRequest = Parameters<CommandManagedRuntimeRunner["execute"]>[0] & { signal?: AbortSignal };
+
+/** pl/s3-fence-deadline: the handoff budget was spent before or during a
+ * command. One typed outcome naming the deadline; nothing after it runs. */
+function assertWithinHandoff(handoff: RemoteHandoffBudget | undefined, holderRunId: string | null, providerLeaseId: string | null) {
+  if (handoff && (handoff.signal.aborted || Date.now() >= handoff.expiresAtMs)) {
+    throw new NativePredecessorRetirementUnprovenError(holderRunId, providerLeaseId, handoff.expiredError());
+  }
+}
+
 async function checkHolder(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, label: string,
-  signal?: "TERM" | "KILL"): Promise<number | null> {
-  const result = await runner.execute({
-    command: "sh",
-    args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT + (signal ? '; kill -"$6" "$pid"' : ""),
-      label, holder.identityPath, holder.nonce, holder.runnerInstanceId, String(holder.pid),
-      holder.processStartFingerprint ?? "", ...(signal ? [signal] : [])],
-    bypassSession: true,
-    timeoutMs: 10_000,
+  signal?: "TERM" | "KILL", handoff?: RemoteHandoffBudget): Promise<number | null> {
+  const result = await executeWithinHandoff(handoff, 10_000, bounded => {
+    const request: ExecuteRequest = {
+      command: "sh",
+      args: ["-c", REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT + (signal ? '; kill -"$6" "$pid"' : ""),
+        label, holder.identityPath, holder.nonce, holder.runnerInstanceId, String(holder.pid),
+        holder.processStartFingerprint ?? "", ...(signal ? [signal] : [])],
+      bypassSession: true,
+      ...bounded,
+    };
+    return runner.execute(request);
   }).catch(() => null);
+  // A result that lands after the deadline is not trusted (fenced).
+  if (handoff && (handoff.signal.aborted || Date.now() >= handoff.expiresAtMs)) return null;
   return !result || result.timedOut ? null : result.exitCode;
 }
 
 async function probeHolder(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder,
-  signal?: "TERM" | "KILL"): Promise<HolderProbe> {
-  const exitCode = await checkHolder(runner, holder, "paperclip-runner-port-holder-check", signal);
+  signal?: "TERM" | "KILL", handoff?: RemoteHandoffBudget): Promise<HolderProbe> {
+  const exitCode = await checkHolder(runner, holder, "paperclip-runner-port-holder-check", signal, handoff);
   if (exitCode === 0) return "alive";
   if (exitCode === 45 || exitCode === 47) return "gone";
   return "unproven";
 }
 
-async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string, ownSessionRoot: string) {
-  const listed = await runner.execute({
-    command: "sh",
-    args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot, ownSessionRoot],
-    bypassSession: true,
-    timeoutMs: 15_000,
+async function listSandboxRunnerHolders(runner: CommandManagedRuntimeRunner, runtimeRoot: string, ownSessionRoot: string,
+  handoff?: RemoteHandoffBudget) {
+  const listed = await executeWithinHandoff(handoff, 15_000, bounded => {
+    const request: ExecuteRequest = {
+      command: "sh",
+      args: ["-c", SANDBOX_RUNNER_HOLDER_LIST_SCRIPT, "paperclip-runner-port-holders", runtimeRoot, ownSessionRoot],
+      bypassSession: true,
+      ...bounded,
+    };
+    return runner.execute(request);
   }).catch(() => null);
   return { listed, holders: !listed || listed.exitCode !== 0 || listed.timedOut ? null : parseSandboxRunnerHolders(listed.stdout) };
 }
@@ -108,10 +128,12 @@ export async function sandboxSessionRunnerExited(input: {
   runner: CommandManagedRuntimeRunner;
   runtimeRoot: string;
   sessionDirectory: string;
+  handoff?: RemoteHandoffBudget;
 }): Promise<boolean> {
-  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, "");
+  const { holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, "", input.handoff);
   const holder = holders?.find(candidate => holderSessionDirectory(candidate) === input.sessionDirectory);
-  return holder !== undefined && await checkHolder(input.runner, holder, "paperclip-runner-exit-check") === 45;
+  return holder !== undefined && await checkHolder(input.runner, holder, "paperclip-runner-exit-check", undefined, input.handoff) === 45
+    && !(input.handoff && (input.handoff.signal.aborted || Date.now() >= input.handoff.expiresAtMs));
 }
 
 export const SANDBOX_SESSION_RUNNER_INSPECT_SCRIPT = [
@@ -165,14 +187,23 @@ export async function inspectSandboxSessionRunner(input: {
   } catch { return null; }
 }
 
-async function waitUntilGone(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, waitMs: number, pollMs: number) {
+async function waitUntilGone(runner: CommandManagedRuntimeRunner, holder: SandboxRunnerHolder, waitMs: number, pollMs: number,
+  handoff?: RemoteHandoffBudget) {
   const deadline = Date.now() + waitMs;
   for (;;) {
-    const probe = await probeHolder(runner, holder);
+    const probe = await probeHolder(runner, holder, undefined, handoff);
     if (probe !== "alive") return probe;
-    if (Date.now() >= deadline) return "alive" as const;
+    // With a handoff, a probe that would start at or past its expiry is not started.
+    if (Date.now() >= deadline || (handoff && Date.now() + pollMs >= handoff.expiresAtMs)) return "alive" as const;
     await new Promise(done => setTimeout(done, pollMs));
   }
+}
+
+/** The finished owner's status read, bounded by the handoff (it holds no lock). */
+async function withinHandoff<T>(handoff: RemoteHandoffBudget | undefined, work: Promise<T>): Promise<T | null> {
+  if (!handoff) return work;
+  work.catch(() => undefined);
+  return executeWithinHandoff(handoff, Number.MAX_SAFE_INTEGER, () => work);
 }
 
 export async function retireSandboxRunnerPortHolders(input: {
@@ -190,8 +221,14 @@ export async function retireSandboxRunnerPortHolders(input: {
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   waitMs?: number;
   pollMs?: number;
+  /** pl/s3-fence-deadline: the successor's remaining Stop-origin handoff budget. */
+  handoff?: RemoteHandoffBudget;
 }): Promise<string[]> {
-  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, input.ownSessionRoot);
+  const handoff = input.handoff;
+  const within = (holderRunId: string | null) => assertWithinHandoff(handoff, holderRunId, input.providerLeaseId);
+  within(null);
+  const { listed, holders } = await listSandboxRunnerHolders(input.runner, input.runtimeRoot, input.ownSessionRoot, handoff);
+  within(null);
   if (!holders) {
     throw new NativePredecessorRetirementUnprovenError(null, input.providerLeaseId,
       new Error(`runner_port_holder_inventory_unavailable: exit=${listed?.exitCode ?? "none"} timedOut=${listed?.timedOut ?? false}`));
@@ -200,32 +237,44 @@ export async function retireSandboxRunnerPortHolders(input: {
   for (const holder of holders) {
     if (input.only ? holderSessionDirectory(holder) !== input.only.sessionDirectory || holder.runId !== input.only.runId
       : holder.runId === input.runId || (holder.runId !== null && holder.runId === input.adoptedRunId)) continue;
-    const initial = await probeHolder(input.runner, holder);
+    within(holder.runId);
+    const initial = await probeHolder(input.runner, holder, undefined, handoff);
+    within(holder.runId);
     if (initial === "gone") continue;
     const unproven = (reason: string) => new NativePredecessorRetirementUnprovenError(holder.runId, input.providerLeaseId,
       new Error(`runner_port_holder_${reason}`));
     if (initial === "unproven") throw unproven("unverifiable");
     if (holder.runId && await input.retireInProcess(holder.runId)) {
-      if (await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500) !== "gone") throw unproven("still_running");
+      const gone = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500, handoff);
+      within(holder.runId);
+      if (gone !== "gone") throw unproven("still_running");
       retired.push(holder.runId);
       continue;
     }
     if (!holder.runId || !RUN_ID_PATTERN.test(holder.runId)) throw unproven("unknown_owner");
-    const [owner] = await input.db.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
-      .where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, holder.runId))).limit(1);
+    const ownerRows = await withinHandoff(handoff, Promise.resolve(input.db.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, holder.runId))).limit(1)));
+    within(holder.runId);
+    const [owner] = ownerRows ?? [];
     if (!owner) throw unproven("unknown_owner");
     if (!RETIRABLE_HOLDER_RUN_STATUSES.has(owner.status) || owner.agentId !== input.agentId || !holder.idle) {
       throw unproven("owner_not_settled");
     }
     let outcome: "stopped" | "killed" = "stopped";
-    let probe = await probeHolder(input.runner, holder, "TERM");
-    if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
+    let probe = await probeHolder(input.runner, holder, "TERM", handoff);
+    within(holder.runId);
+    if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500, handoff);
+    within(holder.runId);
     if (probe === "alive") {
       outcome = "killed";
-      probe = await probeHolder(input.runner, holder, "KILL");
-      if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500);
+      probe = await probeHolder(input.runner, holder, "KILL", handoff);
+      within(holder.runId);
+      if (probe === "alive") probe = await waitUntilGone(input.runner, holder, input.waitMs ?? 10_000, input.pollMs ?? 500, handoff);
+      within(holder.runId);
     }
     if (probe !== "gone") throw unproven("stop_unconfirmed");
+    // Fence: a stop proven only after the deadline publishes nothing.
+    within(holder.runId);
     await persistActivity(input.db, {
       companyId: input.companyId, actorType: "system", actorId: "native-runtime", agentId: input.agentId,
       action: "native.runner_port_holder_retired", entityType: "heartbeat_run", entityId: input.runId, runId: input.runId,

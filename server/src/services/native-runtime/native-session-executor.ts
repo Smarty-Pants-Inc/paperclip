@@ -75,6 +75,7 @@ import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from 
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
 import { findNativeFailedBeforeProviderTurn, NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE, NativeFailedBeforeProviderTurnError } from "./failed-before-provider-turn.js";
 import { findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementDirectoryBusyError, NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
+import { createNativeHandoffDeadline, isNativeHandoffDeadlineExpired, nativeHandoffDeadlineBudget, type NativeHandoffDeadline } from "./native-handoff-deadline.js";
 import {
   inspectSandboxSessionRunner, retireSandboxRunnerPortHolders, sandboxSessionRunnerExited, type SandboxSessionRunnerInspection,
 } from "./sandbox-runner-port-holders.js";
@@ -842,6 +843,35 @@ function isSupersededCheckpointRefusal(error: unknown): boolean {
  * runnerSuspended, never a Runner retained alive). The transport then
  * force-stops in `finally` and rethrows this same ordinary error; a force-stop
  * failure replaces it (releaseRunnerProcessOwnership). */
+/** pl/s3-fence-deadline: when the person's Stop of each run was requested
+ * (first Stop wins), so its successor's handoff deadline starts there. */
+const nativeStopRequestedAtMs = new Map<string, number>();
+function recordNativeStopRequested(runId: string) {
+  const now = Date.now();
+  for (const [stoppedRunId, at] of nativeStopRequestedAtMs) {
+    if (now - at > 10 * nativeHandoffDeadlineBudget.totalMs) nativeStopRequestedAtMs.delete(stoppedRunId);
+  }
+  if (!nativeStopRequestedAtMs.has(runId)) nativeStopRequestedAtMs.set(runId, now);
+}
+/** ONE handoff deadline per successor run, shared by every pre-provider site
+ * of that run (admission's release wait and retirement, the execution's
+ * configuration-changed retirement and its port-holder retirement). */
+const nativeHandoffDeadlines = new Map<string, NativeHandoffDeadline>();
+function nativeHandoffDeadlineFor(successorRunId: string, predecessorRunId: string | null): NativeHandoffDeadline {
+  const now = Date.now();
+  for (const [runId, deadline] of nativeHandoffDeadlines) {
+    if (now - deadline.expiresAtMs > 10 * deadline.totalMs) nativeHandoffDeadlines.delete(runId);
+  }
+  const existing = nativeHandoffDeadlines.get(successorRunId);
+  if (existing) return existing;
+  const deadline = createNativeHandoffDeadline({
+    stopRequestedAtMs: predecessorRunId ? nativeStopRequestedAtMs.get(predecessorRunId) : null, admissionStartedAtMs: now });
+  nativeHandoffDeadlines.set(successorRunId, deadline);
+  logger.info({ successorRunId, predecessorRunId, origin: deadline.origin, admissionReason: deadline.admissionReason,
+    remainingMs: deadline.remainingMs() }, "native successor handoff deadline started");
+  return deadline;
+}
+
 const remoteCheckpointOwnerRefusals = new WeakMap<Error, { settlement: "settled" | "unsettled" }>();
 
 function isSuspendedRemoteCheckpointRefusal(error: unknown): boolean {
@@ -863,8 +893,11 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
    * is discarded like an unsettled session, under the same stop proofs. */
   discardSupersededCheckpoint?: boolean;
   onForcedStopFailed?: (error: unknown) => void;
+  /** pl/s3-fence-deadline: the successor's remaining Stop-origin budget. */
+  handoff?: NativeHandoffDeadline;
 }) {
   if (entry.controllerDetachedForRestart) return detachReleasedWarmNativeSession(entry);
+  const handoff = options?.handoff;
   // Revoke before awaiting process retirement/checkpoint IO.
   const stopping = entry.githubAccess?.stop();
   try {
@@ -904,7 +937,7 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
           // when this exact session's Runner is proven exited: a finished, idle
           // holder is stopped first; a busy one stays refused.
           || (options?.discardSupersededCheckpoint === true && isSupersededCheckpointRefusal(error)
-            && await supersededOwnerRunnerExited(entry)));
+            && await supersededOwnerRunnerExited(entry, handoff)));
       if (retiredWithoutCheckpoint) {
         logger.warn({ runId: entry.runId, issueId: entry.issueId, environmentId: entry.environmentId,
           providerLeaseId: entry.providerLeaseId ?? null, reason, closeFailure: describeWarmCloseFailure(error) },
@@ -916,6 +949,9 @@ async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, 
         throw error;
       }
     }
+    // Fence: a close or proof that finished after the handoff deadline
+    // publishes nothing (no collection); the owner stays registered and kept.
+    if (handoff?.expired()) throw handoff.expiredError();
     await entry.instructionWorkingCopy?.collectStopped();
     if (entry.instructionCopy?.runId !== options?.preserveInstructionsForRunId) await entry.instructionCopy?.collectStopped();
   }
@@ -937,7 +973,8 @@ function sandboxProviderLeaseId(target?: AdapterExecutionTarget | null): string 
  * reports the typed pre-provider failure that sends the next attempt to a
  * fresh sandbox instead of failing the task.
  */
-async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId: string | null): Promise<boolean> {
+async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId: string | null,
+  handoff?: NativeHandoffDeadline): Promise<boolean> {
   for (const [scope, entry] of warmNativeSessions) {
     if (entry.runId !== runId || entry.released || (providerLeaseId && entry.providerLeaseId !== providerLeaseId)) continue;
     if (entry.busy || entry.preparingRunId) {
@@ -948,7 +985,7 @@ async function retireInProcessWarmOwnerOnSandbox(runId: string, providerLeaseId:
     entry.busy = true;
     entry.closeOnReleaseReason = "warm Runner held the sandbox Runner port for another session";
     try {
-      await retireWarmPredecessor(entry, entry.closeOnReleaseReason);
+      await retireWarmPredecessor(entry, entry.closeOnReleaseReason, handoff ? { handoff } : undefined);
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
     return true;
@@ -965,12 +1002,33 @@ async function retireWarmPredecessor(entry: WarmNativeSession, reason: string,
     throw new NativePredecessorRetirementUnprovenError(entry.runId, entry.providerLeaseId,
       new Error("warm Runner stop unconfirmed (injected test fault)"));
   }
-  const directoryWaitDeadline = Date.now() + warmRetirementDirectoryWait.timeoutMs;
+  const handoff = options?.handoff;
+  const directoryWaitDeadline = Math.min(Date.now() + warmRetirementDirectoryWait.timeoutMs, handoff?.expiresAtMs ?? Infinity);
   for (;;) {
     try {
-      await closeWarmNativeSession(entry, reason, { ...options, discardSupersededCheckpoint: true });
+      // pl/s3-fence-deadline: the close itself (with its proof, collection and
+      // credential stop) is bounded by the remaining budget, checked before it
+      // starts. At expiry the remote commands are aborted and the late close is
+      // fenced inside closeWarmNativeSession; its owner stays registered.
+      if (handoff?.expired()) throw handoff.expiredError();
+      const closing = closeWarmNativeSession(entry, reason, { ...options, discardSupersededCheckpoint: true });
+      await (handoff ? handoff.race(closing) : closing);
       return;
     } catch (error) {
+      if (handoff && (error === undefined || isNativeHandoffDeadlineExpired(error) || handoff.expired())) {
+        entry.retirementUnproven = true;
+        // A close cut short by the deadline never reached its own receipt:
+        // keep the predecessor's agent files for later collection (once).
+        if (isNativeHandoffDeadlineExpired(error)) {
+          void entry.instructionWorkingCopy?.retirementFailed?.().catch(receiptError => {
+            logger.warn({ err: receiptError, runId: entry.runId }, "could not keep the predecessor's agent files for later collection");
+          });
+        }
+        logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, origin: handoff.origin,
+          admissionReason: handoff.admissionReason, budgetMs: handoff.totalMs, closeFailure: describeWarmCloseFailure(error) },
+        "the successor's handoff deadline expired before the previous run's session was retired");
+        throw handoff.unproven(entry.runId, entry.providerLeaseId ?? null);
+      }
       if (error instanceof AgentDirectoryOperationBusyError) {
         if (Date.now() + warmRetirementDirectoryWait.pollMs <= directoryWaitDeadline) {
           await new Promise(resolve => setTimeout(resolve, warmRetirementDirectoryWait.pollMs));
@@ -1087,8 +1145,8 @@ subscribeRunStartHandoverChanges(() => {
  */
 export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
 
-async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+async function waitForWarmNativeSessionSettled(scope: string, handoff?: NativeHandoffDeadline): Promise<void> {
+  const deadline = Math.min(Date.now() + warmSessionReleaseWait.timeoutMs, handoff?.expiresAtMs ?? Infinity);
   // Wait while the owner's turn is over and it is releasing the session, until
   // it has handed every scope back (its execution's final cleanup), so the
   // follow-up's own admission does not meet the old owner's scopes either.
@@ -1107,8 +1165,8 @@ async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
 /** Waits, within warmSessionReleaseWait, while the previous turn's owner is
  * still releasing (busy without a successor's claim, settling or closing). A
  * session still busy at the deadline fails its caller as before. */
-async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession): Promise<void> {
-  const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
+async function waitForWarmNativeSessionRelease(scope: string, entry: WarmNativeSession, handoff?: NativeHandoffDeadline): Promise<void> {
+  const deadline = Math.min(Date.now() + warmSessionReleaseWait.timeoutMs, handoff?.expiresAtMs ?? Infinity);
   while (Date.now() < deadline && (settlingNativeSessionScopes.has(scope)
     || (warmNativeSessions.get(scope) === entry && entry.busy && !entry.preparingRunId))) {
     await new Promise(resolve => setTimeout(resolve, warmSessionReleaseWait.pollMs));
@@ -1146,7 +1204,11 @@ export async function claimWarmNativeInstructionCopy(input: {
     })) || prior.workspace.cwd !== input.workspace.cwd) return null;
   const scope = nativeSessionScopeKey(prior);
   const busyEntry = warmNativeSessions.get(scope);
-  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) await waitForWarmNativeSessionSettled(scope);
+  const handoff = nativeHandoffDeadlineFor(input.runId, busyEntry?.runId ?? prior.binding.runId);
+  if (busyEntry?.busy || settlingNativeSessionScopes.has(scope) || closingWarmNativeSessions.has(scope)) {
+    await waitForWarmNativeSessionSettled(scope, handoff);
+    if (handoff.expired()) throw handoff.unproven(busyEntry?.runId ?? null, busyEntry?.providerLeaseId ?? null);
+  }
   // Re-read after the wait: the release may have retired or replaced the session.
   const entry = warmNativeSessions.get(scope);
   if (!entry || !entry.instructionWorkingCopy?.runId || entry.environmentId !== input.environmentId) return null;
@@ -1155,11 +1217,13 @@ export async function claimWarmNativeInstructionCopy(input: {
   entry.busy = true;
   if (entry.idleTimer !== null) clearTimeout(entry.idleTimer);
   entry.idleTimer = null;
-  const retire = async (reason: string) => {
+  // Admission's retirements share the handoff deadline; the returned
+  // abandonment release runs at this run's end, outside the handoff.
+  const retire = async (reason: string, admission = true) => {
     if (warmNativeSessions.get(scope) !== entry) return;
     entry.closeOnReleaseReason = reason;
     try {
-      await retireWarmPredecessor(entry, reason);
+      await retireWarmPredecessor(entry, reason, admission ? { handoff } : undefined);
       forgetWarmNativeSession(scope, entry);
     } finally { entry.busy = false; }
   };
@@ -1180,7 +1244,7 @@ export async function claimWarmNativeInstructionCopy(input: {
       return null;
     }
     return async () => {
-      if (entry.instructionPreparationRunId === input.runId) await retire("warm instruction preparation abandoned");
+      if (entry.instructionPreparationRunId === input.runId) await retire("warm instruction preparation abandoned", false);
     };
   } catch (error) {
     if (entry.closeOnReleaseReason === undefined) await retire("warm instruction preparation failed");
@@ -1201,27 +1265,29 @@ export async function reserveWarmNativeInstructionDirectory(input: {
   companyId: string; agentId: string; previousRunId: string; runId: string; target?: AdapterExecutionTarget | null;
   observabilityCompatibilityKey?: string;
   canReuse: () => Promise<boolean>;
-}, releaseWaited = false): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
+}, releaseWaited = false, handoffDeadline?: NativeHandoffDeadline): Promise<{ reuseRunId: string; adopt: (root: string, collectStopped: () => Promise<void>) => void; release: () => Promise<void> } | null> {
   for (const [id, entry] of warmNativeSessions) {
     if (entry.companyId !== input.companyId || entry.agentId !== input.agentId || entry.instructionCopy?.runId !== input.previousRunId) continue;
     if (await forgetUnretiredOwnerOnOtherSandbox(id, entry, input.target)) return null;
+    const handoff = handoffDeadline ?? nativeHandoffDeadlineFor(input.runId, entry.runId);
     // T9 (chat-retire3): a quick follow-up (no Stop) meets the previous turn's
     // release still finishing: a Boat Runner is a release/resume pair owner,
     // busy until its finishRelease in that run's final cleanup. Wait it out
     // once, bounded like claimWarmNativeInstructionCopy's wait, then re-read.
     // Another run's claim (preparingRunId) is a real concurrent owner.
     if (!releaseWaited && !entry.preparingRunId && (entry.busy || settlingNativeSessionScopes.has(id) || closingWarmNativeSessions.has(id))) {
-      await waitForWarmNativeSessionRelease(id, entry);
-      return reserveWarmNativeInstructionDirectory(input, true);
+      await waitForWarmNativeSessionRelease(id, entry, handoff);
+      if (handoff.expired()) throw handoff.unproven(entry.runId, entry.providerLeaseId ?? null);
+      return reserveWarmNativeInstructionDirectory(input, true, handoff);
     }
     if (entry.busy || entry.preparingRunId) throw new Error("native_session_supervisor_busy");
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     entry.idleTimer = null;
     entry.preparingRunId = input.runId;
-    const retire = async (reason: string) => {
+    const retire = async (reason: string, admission = true) => {
       entry.closeOnReleaseReason = reason;
       try {
-        await retireWarmPredecessor(entry, reason);
+        await retireWarmPredecessor(entry, reason, admission ? { handoff } : undefined);
         forgetWarmNativeSession(id, entry);
       } finally {
         // Failed containment remains registered and cannot be adopted. The next
@@ -1242,7 +1308,7 @@ export async function reserveWarmNativeInstructionDirectory(input: {
       entry.instructionCopy = { runId: input.runId, root, targetIdentity: instructionTargetIdentity(input.target), collectStopped };
     }, release: async () => {
       if (warmNativeSessions.get(id) === entry && entry.preparingRunId === input.runId) {
-        await retire("managed warm turn preparation ended without attachment");
+        await retire("managed warm turn preparation ended without attachment", false);
       }
     } };
   }
@@ -1372,20 +1438,21 @@ export const warmRetainedRunnerStopWait = { waitMs: 10_000, pollMs: 500 };
  * (retireSandboxRunnerPortHolders: same company/agent/run, terminal run status,
  * idle state, else `owner_not_settled`), then require the exit proof. */
 async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
-  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>): Promise<boolean> {
+  sandboxRunner: NonNullable<WarmNativeSession["sandboxRunner"]>, handoff?: NativeHandoffDeadline): Promise<boolean> {
   const { runner, remoteCwd } = sandboxRunner;
   const runtimeRoot = posix.join(remoteCwd, ".paperclip-runtime", "paperclip-runner");
   const sessionDirectory = createHash("sha256").update(entry.normalizedSessionId).digest("hex");
   try {
     await retireSandboxRunnerPortHolders({ db, companyId: entry.companyId, agentId: entry.agentId, runId: entry.runId,
       runner, runtimeRoot, ownSessionRoot: "", providerLeaseId: entry.providerLeaseId ?? null,
-      only: { sessionDirectory, runId: entry.runId }, retireInProcess: async () => false, ...warmRetainedRunnerStopWait });
+      only: { sessionDirectory, runId: entry.runId }, retireInProcess: async () => false, ...warmRetainedRunnerStopWait,
+      ...(handoff ? { handoff } : {}) });
   } catch (stopError) {
     logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, stopFailure: describeWarmCloseFailure(stopError) },
       "could not stop the retained Runner of a finished warm session");
     return false;
   }
-  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory });
+  return sandboxSessionRunnerExited({ runner, runtimeRoot, sessionDirectory, ...(handoff ? { handoff } : {}) });
 }
 
 /** pl/s3-fence: a successor's retirement met the s3 fence's superseded refusal
@@ -1394,10 +1461,12 @@ async function stopSessionRunnerAndProveExit(entry: WarmNativeSession, db: Db,
  * decides: true only when this session's Runner is proven exited. False when
  * the sandbox runner or lease database is missing, on any throw, and for a
  * Runner that is not idle (its stop is refused, owner_not_settled). */
-async function supersededOwnerRunnerExited(entry: WarmNativeSession): Promise<boolean> {
+async function supersededOwnerRunnerExited(entry: WarmNativeSession, handoff?: NativeHandoffDeadline): Promise<boolean> {
   if (!entry.sandboxRunner || !entry.sandboxLeaseDb) return false;
   try {
-    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner)) return false;
+    if (!await stopSessionRunnerAndProveExit(entry, entry.sandboxLeaseDb, entry.sandboxRunner, handoff)) return false;
+    // An exit proven only after the deadline is not accepted (fenced).
+    if (handoff?.expired()) return false;
   } catch (proofError) {
     logger.warn({ runId: entry.runId, providerLeaseId: entry.providerLeaseId ?? null, proofFailure: describeWarmCloseFailure(proofError) },
       "could not prove the superseded warm owner's Runner exited");
@@ -2774,6 +2843,7 @@ async function retireSupersededWarmNativeSessions(
     entry.closeOnReleaseReason = logicalOwner ? "warm native session identity changed" : "warm native ingress requires another session";
     try {
       await retireWarmPredecessor(entry, entry.closeOnReleaseReason, {
+        handoff: nativeHandoffDeadlineFor(runId, entry.runId),
         discardUnsettledSession: logicalOwner && entry.normalizedSessionId !== nextSessionId,
         ...(ownReservation ? { preserveInstructionsForRunId: runId } : {}),
       });
@@ -10433,6 +10503,7 @@ export async function cancelNativeSession(
   // HTTP and the overlap command worker can observe the same durable intent.
   // Join the entire cleanup/ACK lifetime before re-reading that intent, rather
   // than treating cancelRequested as proof that provider cleanup has finished.
+  recordNativeStopRequested(runId);
   while (nativeCancellationsInFlight.has(runId)) {
     await nativeCancellationsInFlight.get(runId)!.catch(() => undefined);
   }
@@ -12944,7 +13015,8 @@ async function executePaperclipNativeSessionAttempt(
         entry.busy = true;
         entry.closeOnReleaseReason = "warm native session configuration changed";
         try {
-          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId });
+          await retireWarmPredecessor(entry, entry.closeOnReleaseReason, { preserveInstructionsForRunId: input.execution.binding.runId,
+            handoff: nativeHandoffDeadlineFor(input.execution.binding.runId, entry.runId) });
           forgetWarmNativeSession(warmSessionId, entry);
         } catch (error) {
           // This late preparation step is outside the earlier task-prepare
@@ -13314,12 +13386,16 @@ async function executePaperclipNativeSessionAttempt(
       && input.restartRecovery?.kind !== "reattach_existing_runner") {
       const runtimeRoot = posix.join(portTarget.remoteCwd, ".paperclip-runtime", "paperclip-runner");
       const providerLeaseId = portTarget.sandboxLeaseAcquisition?.providerLeaseId ?? null;
+      // pl/s3-fence-deadline: the same successor deadline (the holder's run
+      // is unknown until listed; a Stop already started this run's deadline).
+      const portHandoff = nativeHandoffDeadlineFor(input.execution.binding.runId, remoteWarmRecovery?.identity.runId ?? null);
       const retirePortHolders = () => retireSandboxRunnerPortHolders({
         db: input.db, companyId: input.execution.binding.companyId, agentId: input.execution.binding.agentId,
         runId: input.execution.binding.runId, runner: portTarget.runner!, runtimeRoot,
         ownSessionRoot: posix.join(runtimeRoot, "sessions", createHash("sha256").update(nativeSessionKey(input.execution)).digest("hex")),
         providerLeaseId, adoptedRunId: remoteWarmRecovery?.identity.runId ?? null,
-        retireInProcess: holderRunId => retireInProcessWarmOwnerOnSandbox(holderRunId, providerLeaseId), onLog: input.onLog,
+        retireInProcess: holderRunId => retireInProcessWarmOwnerOnSandbox(holderRunId, providerLeaseId, portHandoff), onLog: input.onLog,
+        handoff: portHandoff,
       });
       await trace.measure("runner.port_holders.retire", () => executionContext ? executionContext.wait(retirePortHolders) : retirePortHolders());
     }
