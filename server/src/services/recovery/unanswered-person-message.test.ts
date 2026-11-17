@@ -2895,6 +2895,102 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     });
   });
 
+  // Keep: independent held-writer judge caught false waiting/resend copy past the failed run's END bound.
+  // These rows exercise only the sweep; executor-writer removal belongs to its separate repair.
+  describe("held END-bound notice selection", () => {
+    const AUTO_CODE = "native_continuation_requires_reconciliation";
+    const REFUSAL = "runner_state_identity_mismatch: prior_owner_scope_mismatch";
+    const RESEND_ADVICE = /send a new message|send it again|sending it again|try again/i;
+
+    async function conversation(held = true) {
+      const f = await fixture({ chat: false, status: "in_progress" });
+      const end = Date.now();
+      const sessionId = randomUUID();
+      const prior = await f.run({ status: "failed" });
+      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: new Date(end - 14_000),
+        startedAt: new Date(end - 14_000), finishedAt: new Date(end - 13_000) }).where(eq(heartbeatRuns.id, prior));
+      const messageId = await f.message("Continue from the saved conversation; do not repeat stopped work.");
+      await db.update(issueComments).set({ createdAt: new Date(end - 12_000) }).where(eq(issueComments.id, messageId));
+      const refused = await f.run({ commentId: messageId, status: "failed", errorCode: AUTO_CODE,
+        error: held ? REFUSAL : "native_session_supervisor_busy" });
+      await db.update(heartbeatRuns).set({ nativeSessionId: sessionId, createdAt: new Date(end - 11_000),
+        startedAt: new Date(end - 10_000), finishedAt: new Date(end) }).where(eq(heartbeatRuns.id, refused));
+      await db.insert(nativeRunFinalizations).values([prior, refused].map(runId => ({ companyId: f.companyId,
+        issueId: f.issueId, runId, phase: "terminal_failure", failureCode: AUTO_CODE, resultId: null, leaseOwner: null })));
+      return { ...f, messageId, refused, end };
+    }
+    type Conversation = Awaited<ReturnType<typeof conversation>>;
+    const sweep = (f: Conversation, elapsed: number) => settleUnansweredPersonMessage(db,
+      { companyId: f.companyId, issueId: f.issueId, now: new Date(f.end + elapsed) });
+    async function pendingRecovery(f: Conversation) {
+      const now = new Date(f.end + 66);
+      const [action] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "workspace_recovery", status: "resolved", outcome: "restored", ownerType: "system", returnOwnerAgentId: f.agentId,
+        cause: AUTO_CODE, fingerprint: `native-continuation:${f.refused}`, createdAt: now, resolvedAt: new Date(f.end + 115),
+        nextAction: "Continuing automatically from saved work. No action needed.",
+        evidence: { runId: f.refused, continuationDelivery: "pending", executionReconciliation: { runId: f.refused,
+          providerStopped: true, actionOutcome: "mixed", outcomeEvidence: "Saved history retained; unknown actions will not be replayed.",
+          workspaceRepairEvidence: "Continuation starts from saved work in a fresh workspace.",
+          actorId: "execution-recovery", recordedAt: now.toISOString() } } }).returning();
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
+        triggerDetail: "system", reason: "issue_recovery_action_restored", status: "deferred_issue_execution",
+        requestedByActorType: "system", requestedByActorId: "execution-recovery", idempotencyKey: `execution-reconciliation:${action!.id}`,
+        payload: { issueId: f.issueId, recoveryActionId: action!.id, commentId: f.messageId,
+          executionWait: { recoveryActionId: action!.id, reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." },
+          _paperclipWakeContext: { issueId: f.issueId, taskId: f.issueId, recoveryActionId: action!.id,
+            commentId: f.messageId, wakeCommentId: f.messageId, wakeCommentIds: [f.messageId], previousRunId: f.refused,
+            retryOfRunId: f.refused, forceFreshSession: true, wakeReason: "issue_recovery_action_restored", source: "execution.reconciled" } } });
+    }
+    async function oneSweepNotice(f: Conversation) {
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${f.messageId}`);
+      return notes[0]!;
+    }
+
+    it("deferred continuation never starts: at END+10 min the same waiting note becomes the true held notice", async () => {
+      const f = await conversation();
+      await pendingRecovery(f);
+      await sweep(f, 20_000);
+      await db.update(activityLog).set({ createdAt: new Date(f.end + 20_000) }).where(and(
+        eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION)));
+      for (const elapsed of [60_000, 9 * 60_000]) {
+        await sweep(f, elapsed);
+        expect((await f.visible()).map(n => n.body).join("\n")).not.toMatch(RESEND_ADVICE);
+      }
+      const waiting = await oneSweepNotice(f);
+      expect(waiting.body).toBe(WAITING);
+      await sweep(f, PENDING_WAIT_START_BOUND_MS);
+      await sweep(f, PENDING_WAIT_START_BOUND_MS + 1_000);
+      const note = await oneSweepNotice(f);
+      expect(note.id).toBe(waiting.id);
+      expect(note.body).toBe(HELD);
+      expect(codeOf(note)).toBe("runner_state_identity_mismatch");
+      expect(JSON.stringify(note.metadata)).not.toContain("No action is needed; it will start by itself.");
+    });
+
+    it("a first sweep at END+11 min cannot restart the automatic recovery clock or advise resending held input", async () => {
+      const f = await conversation();
+      await pendingRecovery(f);
+      await sweep(f, 11 * 60_000);
+      const first = await oneSweepNotice(f);
+      expect(first.body).toBe(HELD);
+      await sweep(f, 12 * 60_000);
+      expect((await oneSweepNotice(f)).id).toBe(first.id);
+      expect(codeOf(first)).toBe("runner_state_identity_mismatch");
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId),
+        eq(activityLog.action, PENDING_WAIT_ACTION)))).toHaveLength(0);
+    });
+
+    it("guard: a NON-held message past END keeps today's no-run notice", async () => {
+      const f = await conversation(false);
+      await pendingRecovery(f);
+      await sweep(f, 11 * 60_000);
+      await sweep(f, 12 * 60_000);
+      expect((await oneSweepNotice(f)).body).toBe(NO_RUN);
+    });
+  });
+
   // Keep: gate 1 'without' 951a0225 card row C (cardC/DB-ROWS.md): message bcd63196 at 17:02:55.240; run
   // 116e7f2f failed native_continuation_requires_reconciliation / native_session_supervisor_busy at 17:03:01.125;
   // the sweep said "send it again" (34c2eae7) at 17:03:18.616 (+23.4 s) while the system's own automatic

@@ -636,6 +636,43 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // failed. A chain that ended otherwise is outside this rule.
   if (cardAnswer && run && run.status === "succeeded") return { kind: "answered" };
 
+  // Classify the refusal from its run, before a waiting/no-run state can replace its code.
+  // Fresh-thread refusals belong to their own continuation fallback, not the held class.
+  const runCode = run ? unansweredMessageCode(run) : null;
+  const held = (isNativeContinuationRefusal(run) || (runCode !== null && HELD_CODES.has(runCode)))
+    && !(run && isFreshThreadRefusal(run));
+  // The system's own automatic recovery of the message's failed run
+  // (automaticRecoveryPending) is bounded from that run's END: its finishedAt,
+  // or its coordinator's terminal failure when that came earlier. Never from
+  // the first sweep, so a late first sweep cannot start a new wait.
+  let recoveryDeadline: number | null | undefined;
+  const automaticRecoveryDeadline = async (): Promise<number | null> => {
+    if (recoveryDeadline !== undefined) return recoveryDeadline;
+    recoveryDeadline = null;
+    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded"
+      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
+      // The shared predicate scopes automatic recovery to THIS run. An older
+      // predecessor's board stop must not veto it, but a real stop on this run
+      // still wins, even when another action has pending restored delivery.
+      const [runBoardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+        eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+        eq(issueRecoveryActions.ownerType, "board"), inArray(issueRecoveryActions.status, ["active", "escalated"]),
+        or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`,
+          sql`${issueRecoveryActions.evidence}->'freshContinuation'->>'sourceRunId' = ${run.id}`,
+          sql`${run.id} = any(string_to_array(${issueRecoveryActions.fingerprint}, ':'))`))).limit(1);
+      if (runBoardHold) return recoveryDeadline;
+      const [terminal] = await q.select({ at: nativeRunFinalizations.updatedAt }).from(nativeRunFinalizations).where(and(
+        eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
+        eq(nativeRunFinalizations.phase, "terminal_failure"), isNotNull(nativeRunFinalizations.failureCode)));
+      const end = Math.min((run.finishedAt ?? run.updatedAt).getTime(), terminal?.at?.getTime() ?? Number.POSITIVE_INFINITY);
+      recoveryDeadline = end + PENDING_WAIT_START_BOUND_MS;
+    }
+    return recoveryDeadline;
+  };
+  const heldRecoveryDeadline = held ? await automaticRecoveryDeadline() : null;
+  const heldAtEndBound = heldRecoveryDeadline !== null && heldRecoveryDeadline <= now.getTime();
+
   // Every wait for a further attempt is BOUNDED, except a turn in progress:
   // T0 is recorded ONCE (durably, PENDING_WAIT_ACTION, keyed by the message
   // and its carrying run, messageRun; a refused successor below never
@@ -651,6 +688,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
   // + PENDING_WAIT_START_BOUND_MS for the system's own automatic recovery).
   // Past it, never start or continue a wait.
   const bounded = async (recheckAt: number, setup = false, deadline: number | null = null): Promise<Decision | null> => {
+    // Every pending path for a held recovery shares its failed-run END cap,
+    // including well-formed execution waits and a delayed first sweep.
+    if (!setup && heldRecoveryDeadline !== null) deadline = Math.min(deadline ?? Number.POSITIVE_INFINITY, heldRecoveryDeadline);
     if (deadline !== null && deadline <= now.getTime()) return null;
     if (waitT0 === undefined) {
       const [wait] = await q.select({ at: sql<Date>`min(${activityLog.createdAt})` }).from(activityLog).where(and(
@@ -755,35 +795,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     inArray(issueRecoveryActions.status, ["active", "escalated"])))
     .orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   const boardHold = activeRecovery?.ownerType === "board" ? activeRecovery : null;
-  // The system's own automatic recovery of the message's failed run
-  // (automaticRecoveryPending) is bounded from that run's END: its finishedAt,
-  // or its coordinator's terminal failure when that came earlier. Never from
-  // the first sweep, so a late first sweep cannot start a new wait.
-  let recoveryDeadline: number | null | undefined;
-  const automaticRecoveryDeadline = async (): Promise<number | null> => {
-    if (recoveryDeadline !== undefined) return recoveryDeadline;
-    recoveryDeadline = null;
-    if (run && TERMINAL.includes(run.status) && run.status !== "succeeded"
-      && await automaticRecoveryPending(q, { companyId: issue.companyId, issueId: issue.id, runId: run.id })) {
-      // The shared predicate scopes automatic recovery to THIS run. An older
-      // predecessor's board stop must not veto it, but a real stop on this run
-      // still wins, even when another action has pending restored delivery.
-      const [runBoardHold] = await q.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
-        eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-        eq(issueRecoveryActions.ownerType, "board"), inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        or(sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
-          sql`${issueRecoveryActions.evidence}->>'sourceRunId' = ${run.id}`,
-          sql`${issueRecoveryActions.evidence}->'freshContinuation'->>'sourceRunId' = ${run.id}`,
-          sql`${run.id} = any(string_to_array(${issueRecoveryActions.fingerprint}, ':'))`))).limit(1);
-      if (runBoardHold) return recoveryDeadline;
-      const [terminal] = await q.select({ at: nativeRunFinalizations.updatedAt }).from(nativeRunFinalizations).where(and(
-        eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.runId, run.id),
-        eq(nativeRunFinalizations.phase, "terminal_failure"), isNotNull(nativeRunFinalizations.failureCode)));
-      const end = Math.min((run.finishedAt ?? run.updatedAt).getTime(), terminal?.at?.getTime() ?? Number.POSITIVE_INFINITY);
-      recoveryDeadline = end + PENDING_WAIT_START_BOUND_MS;
-    }
-    return recoveryDeadline;
-  };
   // Read the no-run terminal evidence before pending wakes so a NEW carrying
   // queued wake can supersede it, without an older queue masking a later stop.
   const terminalWakes = !run && !agentPaused && !settingUp ? await q.select({ payload: agentWakeupRequests.payload,
@@ -831,6 +842,10 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     code = UNANSWERED_MESSAGE_AGENT_SETUP_CODE;
   } else if (agentPaused) {
     code = UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
+  } else if (heldAtEndBound) {
+    // Automatic continuation did not start within its bound. Preserve the
+    // held refusal and its remedy, never waiting or safe-resend advice.
+    code = runCode!;
   } else if (waitingToStart) {
     // The ordinary carrying-run start bound is unchanged. A known queued
     // continuation keeps the waiting note until it starts or terminates;
@@ -980,10 +995,6 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     sql`not starts_with(coalesce(${issueComments.metadata}->>'authorizationReason', ''), ${UNANSWERED_MESSAGE_REASON_PREFIX})`)).limit(1);
   if (explained) return { kind: "explained" };
 
-  // A fresh-thread refusal is continued by the fresh-continuation fallback on
-  // its own (#20925): never the held-conversation "send a new message" note,
-  // as isNativeContinuationRefusal already decides for its own patterns.
-  const held = (isNativeContinuationRefusal(run) || HELD_CODES.has(code)) && !(run && isFreshThreadRefusal(run));
   const paused = code === UNANSWERED_MESSAGE_AGENT_PAUSED_CODE;
   const pauseStopped = code === PAUSE_STOPPED_CODE;
   const pausedName = agentRow?.name?.trim() || "This agent";
@@ -1000,6 +1011,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     : pauseStopped ? `${pausedName} was paused before it answered your message. Send it again to continue.`
     : code === UNANSWERED_MESSAGE_RECOVERING_CODE ? UNANSWERED_MESSAGE_RECOVERING_TEXT
     : waiting ? UNANSWERED_MESSAGE_WAITING_TEXT
+    : heldAtEndBound ? HELD_PREDECESSOR_NOTICE
     : cardAnswer ? UNANSWERED_CARD_ANSWER_TEXT
     : boundReached ? UNANSWERED_MESSAGE_BOUND_REACHED_TEXT
     : code === UNANSWERED_MESSAGE_NO_REPLY_CODE ? UNANSWERED_MESSAGE_NO_REPLY_TEXT
@@ -1018,6 +1030,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : paused ? `Ask a board user or ${pausedName}'s manager to resume ${pausedName}.`
         : pauseStopped ? "Send it again to continue."
         : waiting ? "No action is needed; it will start by itself."
+        : heldAtEndBound ? "Send a new message to try again."
         : cardAnswer ? "Retry; if it fails again, assign this agent a new task."
         : held || boundReached ? "Send a new message to try again." : "Send the message again; if it fails again, assign this agent a new task.",
     },
