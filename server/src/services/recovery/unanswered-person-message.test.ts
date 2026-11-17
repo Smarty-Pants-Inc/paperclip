@@ -2900,6 +2900,51 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       expect(await pending(g, g.runId)).toBe(false); // 79822d12 started: it, not the predicate, owns the answer now
     });
 
+    // Keep: gate 3 s1's 7ae251e4 predecessor stop must not veto adca2f56's recovery.
+    it("veto3b RED: an older predecessor's escalated board stop does not veto the current run's bounded automatic recovery", async () => {
+      const g = await gate1(60_000);
+      const predecessor = await g.run({ status: "cancelled", errorCode: "cancelled" });
+      await db.update(heartbeatRuns).set({ createdAt: new Date(g.base - 10_000), finishedAt: new Date(g.base - 5_000) })
+        .where(eq(heartbeatRuns.id, predecessor));
+      await db.insert(issueRecoveryActions).values({ companyId: g.companyId, sourceIssueId: g.issueId,
+        kind: "active_run_watchdog", status: "escalated", ownerType: "board", cause: "execution_stop_pending",
+        fingerprint: `execution_stop_pending:${predecessor}`, attemptCount: 1, maxAttempts: 1,
+        nextAction: "Stop pending: inspect the previous execution.",
+        evidence: { runId: predecessor, stopPending: { code: "execution_stop_pending", escalation: "board",
+          automaticAttemptsExhausted: true, runIds: [predecessor], schema: "paperclip.task-stop-pending.v1" } } });
+      expect(await pending(g, predecessor)).toBe(false);
+      expect(await pending(g, g.runId)).toBe(true);
+      expect(await at(g, 60_000)).toMatchObject({ kind: "pending" });
+      expect(await systemNotesOf(g)).toHaveLength(0);
+      await at(g, 60_000 + PENDING_WAIT_BOUND_MS + 1_000);
+      const [waiting] = await systemNotesOf(g);
+      expect(waiting?.body).toBe(recoveringText());
+      expect(codeOf(waiting!)).toBeUndefined();
+      expect(await at(g, END + 9 * 60_000)).toMatchObject({ kind: "pending" });
+      expect((await systemNotesOf(g)).map(note => note.body)).toEqual([recoveringText()]);
+      expect(await at(g, END + PENDING_WAIT_START_BOUND_MS)).toMatchObject({ kind: "noticed" });
+      expect((await systemNotesOf(g)).map(note => ({ id: note.id, body: note.body })))
+        .toEqual([{ id: waiting!.id, body: NOT_ANSWERED }]);
+    });
+
+    // A separate restored action makes the shared predicate true: removing all
+    // board vetoes would hide the real current-run stop (rf5's required NEGATIVE).
+    it.each(["runId", "sourceRunId", "fingerprint"] as const)(
+      "veto3b NEGATIVE: a current-run board stop identified by %s vetoes even pending restored delivery", async identity => {
+        const g = await gate1(60_000);
+        await restoredNoDelivery(g);
+        await db.insert(issueRecoveryActions).values({ companyId: g.companyId, sourceIssueId: g.issueId,
+          kind: "active_run_watchdog", status: "escalated", ownerType: "board", cause: "execution_stop_pending",
+          fingerprint: `execution_stop_pending:${identity === "fingerprint" ? g.runId : randomUUID()}`,
+          nextAction: "Stop pending: inspect the bound runs.",
+          evidence: identity === "fingerprint" ? {} : { [identity]: g.runId }, updatedAt: new Date(g.base + 59_000) });
+        expect(await pending(g, g.runId)).toBe(true);
+        expect(await at(g, 60_000)).toMatchObject({ kind: "noticed" });
+        expect((await systemNotesOf(g)).map(note => note.body)).toEqual([NOT_ANSWERED]);
+        expect(await at(g, 60_000 + PENDING_WAIT_BOUND_MS + 1_000)).toEqual({ kind: "noticed_before" });
+        expect(await systemNotesOf(g)).toHaveLength(1);
+      });
+
     it("RED B-live (gate 3, writer moment): the failing run is not terminal yet but its coordinator recorded the auto-reconciled code, no action -> pending", async () => {
       const g = await gate1(60_000);
       await db.update(heartbeatRuns).set({ status: "running", errorCode: null, error: null, finishedAt: null }).where(eq(heartbeatRuns.id, g.runId));
