@@ -140,10 +140,12 @@ type ProjectionState = {
 
 /** Task-level start holds and their true line (rf-3 / RFL 20:46Z). Not a failed
  * start, and no Retry: a fresh run would wait on the same hold. */
-type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "case_handoff" | "agent_setup";
+type TaskStartHold = "previous_run_running" | "previous_run_cleanup" | "previous_session_cleanup" | "case_handoff" | "agent_setup";
 const taskStartHoldMessages: Record<TaskStartHold, string> = {
   previous_run_running: "Waiting: the previous run on this task is still finishing. Your message is saved and starts after it.",
   previous_run_cleanup: "Waiting: the previous run is still cleaning up. Your message is saved and starts when it finishes.",
+  // The existing line for this hold (heartbeat/queue.ts native_session_cleanup_settling).
+  previous_session_cleanup: NATIVE_CLEANUP_SETTLING_MESSAGE,
   case_handoff: "Waiting: this task is being handed off. Your message is saved and starts when the handoff completes.",
   agent_setup: "Waiting: the agent is still being set up. Your message is saved and starts when setup finishes.",
 };
@@ -881,6 +883,10 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
         sql`(${caseHandoffs.state} = 'awaiting_release' or ${caseHandoffs.wakeupRequestId} is distinct from ${task.wakeupRequestId}::uuid)`)).limit(1);
       if (handoff) { taskStartHolds.set(run.id, "case_handoff"); continue; }
       const agent = agentRowsForHolds.get(run.agentId);
+      // heartbeat/queue.ts native_session_cleanup_settling: this process's gate on the task's previous session.
+      if (agent?.adapterType === "paperclip_runner" && nativeSessionCleanupBlock({ companyId, issueId: run.issueId })) {
+        taskStartHolds.set(run.id, "previous_session_cleanup"); continue;
+      }
       if (agent && isAgentAwaitingSetup(agent)) taskStartHolds.set(run.id, "agent_setup");
     }
   }
