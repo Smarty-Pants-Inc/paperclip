@@ -67,6 +67,23 @@ vi.mock("../services/native-runtime/native-session-executor.js", async importOri
   };
 });
 
+// adopt-stopu: cancel-finalize finishes the stopped warm turn's export before the
+// stop_and_retain release (real export: cancel-finalize-warm-stop.test.ts). This
+// fixture has no live box, so the edge writes only what a finalized export leaves:
+// the run's descriptor reference moves prepared -> finalized.
+vi.mock("../services/heartbeat/cancelled-warm-workspace-export.js", async importOriginal => ({
+  ...await importOriginal<typeof import("../services/heartbeat/cancelled-warm-workspace-export.js")>(),
+  finishCancelledWarmWorkspaceExport: async (input: { db: any; runId: string }) => {
+    if (!fixture.warm) return { outcome: "not_applicable" };
+    const { heartbeatRuns } = await import("@paperclipai/db");
+    const { eq, sql } = await import("drizzle-orm");
+    await input.db.update(heartbeatRuns).set({ runnerProfileJson: sql`jsonb_set(jsonb_set(${heartbeatRuns.runnerProfileJson},
+      '{nativeWorkspaceSync,state}', '"finalized"'::jsonb), '{nativeWorkspaceSync,finalHostSha256}', ${JSON.stringify("c".repeat(64))}::jsonb)` })
+      .where(eq(heartbeatRuns.id, input.runId));
+    return { outcome: "finalized" };
+  },
+}));
+
 import * as environmentOrchestrator from "../services/environment-run-orchestrator.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
