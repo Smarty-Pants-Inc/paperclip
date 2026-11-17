@@ -83,7 +83,7 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
   // rf-4's RED used a synthetic descriptor ("a"x64), which no export can prove.
   // The U-shape row (adopt-stopu r2) seeds the same crash boundary with the
   // run's REAL prepared v3 descriptor: the edit exists only on the box.
-  it.each([["U shape: real prepared v3 descriptor", true], ["GAP: rf-4 synthetic descriptor, no export provable", false]] as const)(
+  it.each([["U shape: real prepared v3 descriptor", true], ["(superseded by replacement: kept + held with the true line up to the 5 min bound, then the successor resumes the SAME kept box with the edit (reachable, tools proven stopped), RFL record SUPERSEDE-U-UNPROVABLE-1117) GAP: rf-4 synthetic descriptor, no export provable", false]] as const)(
     "the next person's comment runs within 10s, or offers an honest Retry; owed files are never destroyed (%s)", async (_label, realDescriptor) => {
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
@@ -155,6 +155,10 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
     // Prevent the startup/never-launched exception from disguising a mid-turn Stop.
     await db.insert(heartbeatRunEvents).values({ companyId, runId, agentId, seq: 1,
       eventType: "tool.execution.started", stream: "system" });
+    // adopt-stopu-compose4: the synthetic-descriptor box is REACHABLE (its target
+    // resolves and runs commands); only its export cannot be proven.
+    if (!realDescriptor) boxTargets.set(leaseId, { kind: "remote", transport: "sandbox", providerKey: "fake", leaseId,
+      remoteCwd, runner: boxRunner, timeoutMs: 30_000, sandboxLeaseAcquisition: { outcome: "created", providerLeaseId } });
     if (!realDescriptor) await db.insert(environmentLeases).values({ id: leaseId, companyId, issueId, environmentId,
       heartbeatRunId: runId, provider: "fake", providerLeaseId, status: "active", leasePolicy: "reuse_by_environment",
       metadata: { driver: "sandbox", provider: "fake", image: "fixture:test", reuseLease: true,
@@ -254,66 +258,75 @@ describe.skipIf(!support.supported)("rf-4 row 20: crash after durable cancel bef
         expect(providerTurns.filter(id => id === messageRuns[0]?.id)).toHaveLength(1);
       }
       if (!realDescriptor) {
-        // GAP (adopt-stopu r2, reported, NOT fixed): with a descriptor no export
-        // can prove, the crash-recovered release is stop_and_retain (never
-        // destroy, files kept on the box), the U1 export is recorded unproven,
-        // and the existing preservation holds the message until the workspace
-        // recovery worker restores it. Same as U's ordinary Stop with an
-        // unproven export; rf-4's 10 s bound is not met on this path.
+        // adopt-stopu-compose4 (RFL SUPERSEDE-U-UNPROVABLE-1117): replaces the
+        // bound2 Item-B expectation (stop_and_retain + a 'Recovering saved
+        // work…' hold exhausted at 15.0 min) and d2eaff8a's (kept forever, no
+        // successor). ONE behaviour: the release-site guard keeps the box and
+        // holds the message with the true line, only up to the bound; at the
+        // bound the box is reachable and its stopped tools are proven gone
+        // (NSE's clean-close proof), so the successor resumes the SAME kept box
+        // and adopts its files in place (the edit is there).
         const [runAfter] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         expect(runAfter.runnerProfileJson?.nativeCancelledWarmExport).toMatchObject({ state: "unproven" });
-        expect(afterSweep.metadata?.sandboxStopAndRetainReceipt).toMatchObject({ providerLeaseId });
-        expect(blocker).toMatchObject({ runId, canRetry: false, workspaceRepairRequired: true, savedMessageCount: 1 });
-        // adopt-stopu-bound2 (Item B): the unprovable-export hold, driven by the
-        // REAL workspace-recovery worker pass (workspace-recovery-work.ts ->
-        // reconcileRetainedWorkspaces, onRecovered = resumeRemoteStopComments)
-        // at a fake clock over its whole retry window (system-recovery-state.ts:8-12).
-        const { reconcileRetainedWorkspaces } = await import("../services/workspace-recovery.js");
-        const { environmentRuntimeService } = await import("../services/environment-runtime.js");
-        const runtime = environmentRuntimeService(db);
-        const t0 = Date.now();
-        const trail: Record<string, unknown>[] = [];
-        vi.useFakeTimers({ toFake: ["Date"], now: t0 });
-        try {
-          // Each pass runs when the worker would: at the hold, then at the saved nextAttemptAt.
-          let at = t0;
-          for (let pass = 0; pass < 12; pass += 1) {
-            vi.setSystemTime(at);
-            const atMin = (at - t0) / 60_000;
-            const work = await reconcileRetainedWorkspaces(db, runtime as never, run => heartbeat.resumeRemoteStopComments(run));
-            await Promise.all(work ?? []);
-            await heartbeat.resumeQueuedRuns();
-            const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
-            const current = await getExecutionBlocker(db, companyId, issueId);
-            const runs = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
-              sql`${heartbeatRuns.contextSnapshot}->'wakeCommentIds' @> ${JSON.stringify([comment.id])}::jsonb
-                OR ${heartbeatRuns.contextSnapshot}->>'commentId' = ${comment.id} OR ${heartbeatRuns.contextSnapshot}->>'wakeCommentId' = ${comment.id}`));
-            trail.push({ atMin, actions: actions.map(action => {
-              const sr = (action.evidence as Record<string, any>).systemRecovery;
-              return { cause: action.cause, status: action.status, workspaceRecovery: (action.evidence as Record<string, any>).workspaceRecovery?.status ?? null,
-                systemRecovery: sr ? { state: sr.state, attempts: sr.attempts, retriesUsed: sr.retriesUsed, failure: sr.failure?.code ?? null,
-                  retryClass: sr.failure?.retryClass ?? null, nextAttemptInMin: sr.nextAttemptAt ? (sr.nextAttemptAt - t0) / 60_000 : null,
-                  deadlineInMin: sr.deadlineAt ? (sr.deadlineAt - t0) / 60_000 : null } : null };
-            }), blocker: current ? { nextAction: current.nextAction, canRetry: current.canRetry,
-              workspaceRepairRequired: current.workspaceRepairRequired } : null, messageRuns: runs.length });
-            const next = actions.map(action => (action.evidence as Record<string, any>).systemRecovery?.nextAttemptAt)
-              .find((value): value is number => typeof value === "number");
-            if (runs.length > 0 || next === undefined) break;
-            at = Math.max(at + 1, next);
-          }
-        } finally { vi.useRealTimers(); }
-        await heartbeat.drainActiveRunExecutions();
-        console.log("ITEMB_TRAIL", JSON.stringify(trail));
-        if (process.env.ITEMB_EVIDENCE_FILE) await fs.appendFile(process.env.ITEMB_EVIDENCE_FILE, `${JSON.stringify(trail)}\n`);
-        // The BOUND (system-recovery-state.ts:8-12, :117-122): 1 attempt + at most
-        // 5 retries 30 s * 2^(n-1) * [0.8, 1.2] apart = <= 18.6 min, inside the 30 min
-        // window; then the exhausted hold admits the message (workspace-recovery.ts
-        // recoverRunAction -> onRecovered). While held, the line promises nothing.
-        const admitted = trail.find(row => (row.messageRuns as number) > 0);
-        expect(admitted, JSON.stringify(trail)).toBeDefined();
-        expect(admitted!.atMin as number).toBeLessThanOrEqual(18.6);
-        expect(admitted!.blocker).toBeNull();
-        for (const row of trail) expect(JSON.stringify(row.blocker ?? "")).not.toContain("will start automatically");
+        expect(afterSweep.status).toBe("active");
+        expect(stop.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
+        expect(readLeaseReleaseDeferral(afterSweep.metadata)).toMatchObject({ reason: "person_stop_export_unproven" });
+        expect(holds).toEqual([]);
+        expect(messageRuns.filter(run => providerTurns.includes(run.id))).toEqual([]);
+        const { PERSON_STOP_EXPORT_BOUND_MS, readPersonStopBoundDecision } = await import("../services/heartbeat/person-stop-export-bound.js");
+        const deferral = readLeaseReleaseDeferral(afterSweep.metadata)!;
+        const boundAt = Date.parse(deferral.failingSince) + PERSON_STOP_EXPORT_BOUND_MS;
+        expect(Date.parse(deferral.retryAt)).toBeLessThanOrEqual(boundAt);
+        // The worker's retry at the bound is the same sweep (fake Date only).
+        vi.useFakeTimers({ toFake: ["Date"], now: boundAt });
+        try { await heartbeat.sweepOrphanedActiveLeases({ companyId, leaseId, backoffMs: 0 }); }
+        finally { vi.useRealTimers(); }
+        // The decision, by line, and the release it made: the box is NOT stopped,
+        // it is retained for its own successor (keep_running), the hold is over.
+        const [kept] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        const stopsAtBound = stop.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId).length;
+        const { personStopKeptBoxForSuccessor } = await import("../services/heartbeat/person-stop-export-bound.js");
+        const { nativeWorkspaceExportPendingForResource } = await import("../services/native-runtime/native-workspace-finalization-state.js");
+        const successorRunId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: successorRunId, companyId, agentId, nativeIssueId: issueId, issueId,
+          runtimeMode: "native", status: "running", contextSnapshot: { issueId } });
+        // The reuse filter (environment-runtime.ts, both acquisition paths): the
+        // 'prepared' descriptor still marks the box an export source, and the
+        // kept-box admission lets its own successor take it anyway.
+        const pendingSource = await nativeWorkspaceExportPendingForResource(db, kept as never, successorRunId);
+        const admitted = Boolean(personStopKeptBoxForSuccessor(kept as never));
+        // The successor's prepare on the SAME box (acquisition resumed; the fake
+        // provider has no resumable leases, so the acquisition is driven here as
+        // cancel-finalize-warm-stop.test.ts successorOnSameBox does).
+        await db.update(environmentLeases).set({ heartbeatRunId: successorRunId, status: "active" }).where(eq(environmentLeases.id, leaseId));
+        const [resumedLease] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        const hostCwd2 = path.join(home, `host2-${runId}`);
+        await fs.mkdir(hostCwd2, { recursive: true });
+        await fs.writeFile(path.join(hostCwd2, "notes.md"), "host base\n");
+        const successor = (await prepareNativeWorkspaceSync({ db, runId: successorRunId, companyId, workspaceId: randomUUID(),
+          workspaceLocalDir: hostCwd2, lease: resumedLease as unknown as EnvironmentLease,
+          target: { kind: "remote", transport: "sandbox", providerKey: "fake", leaseId, remoteCwd, runner: boxRunner, timeoutMs: 30_000,
+            sandboxLeaseAcquisition: { outcome: "resumed", providerLeaseId } } as AdapterSandboxExecutionTarget }))!;
+        const boxShaAtSuccessor = await fs.readFile(owedFile).then(sha, () => null);
+        await successor.cleanup();
+        const [stoppedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const sameBox = { decision: readPersonStopBoundDecision(kept.metadata), keptStatus: kept.status, stopsAtBound,
+          pendingSource, admitted, successorMode: successor.mode, boxShaAtSuccessor, expectedSha,
+          stoppedExport: stoppedRun.runnerProfileJson?.nativeCancelledWarmExport,
+          stoppedDescriptor: readNativeWorkspaceSyncReference(stoppedRun.runnerProfileJson?.nativeWorkspaceSync)?.state ?? null };
+        console.log("ROW20_SAME_BOX", JSON.stringify(sameBox));
+        if (process.env.ROW20_EVIDENCE_FILE) await fs.appendFile(process.env.ROW20_EVIDENCE_FILE, `${JSON.stringify(sameBox)}\n`);
+        expect(sameBox.decision).toMatchObject({ decision: "same_box", reason: "box_reachable_tools_stopped" });
+        expect(kept.status).toBe("retained");
+        expect(stopsAtBound).toBe(0);
+        expect(pendingSource).toBe(true);
+        expect(admitted).toBe(true);
+        // The successor adopts the box's files in place: the edit is there, sha-equal.
+        expect(successor.mode).toBe("adopt_remote");
+        expect(boxShaAtSuccessor).toBe(expectedSha);
+        // The stopped turn's descriptor is retired to its successor (no longer an owed export).
+        expect(sameBox.stoppedDescriptor).toBeNull();
+        expect(sameBox.stoppedExport).toMatchObject({ state: "adopted_by_successor", successorRunId });
         expect(destroy.mock.calls.filter(([input]) => input.providerLeaseId === providerLeaseId)).toHaveLength(0);
         return;
       }

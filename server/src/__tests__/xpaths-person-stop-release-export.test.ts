@@ -17,10 +17,12 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 // recovery, cancellation preservation, execution blocker nor wake admission is
 // mocked. Only the provider turn is scripted, as in heartbeat-warm-stop-hold.
 const providerTurns = vi.hoisted(() => [] as string[]);
+const providerInputs = vi.hoisted(() => new Map<string, string>());
 vi.mock("../services/native-runtime/native-session-executor.js", async importOriginal => {
   const actual = await importOriginal<typeof import("../services/native-runtime/native-session-executor.js")>();
   return { ...actual, executePaperclipNativeSession: (async input => {
     providerTurns.push(input.execution.binding.runId);
+    providerInputs.set(input.execution.binding.runId, JSON.stringify(input.execution));
     throw new Error("row20_successor_provider_turn_reached");
   }) as typeof actual.executePaperclipNativeSession };
 });
@@ -53,6 +55,7 @@ import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { getSandboxProvider } from "../services/sandbox-provider-runtime.js";
 import { nativeRunNeverLaunchedRunner, readLeaseReleaseDeferral } from "../services/environment-lease-release-deferral.js";
 import { readNativeWorkspaceSyncReference } from "../services/native-runtime/native-workspace-sync.js";
+import { PERSON_STOP_EXPORT_BOUND_MS, PERSON_STOP_WITHOUT_FILES_LINE, readPersonStopBoundDecision } from "../services/heartbeat/person-stop-export-bound.js";
 
 const support = await getEmbeddedPostgresTestSupport();
 const sha = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
@@ -90,7 +93,7 @@ describe.skipIf(!support.supported)("adopt-stopu-xpaths: a person's Stop never s
 
 
   const kases = [["r4/F10 shape: export finalizes 10 s after the Stop; a Send at +0.1 s", 10_000],
-    ["export never finishes (forced timeout): box kept, no stop", Infinity]] as const;
+    ["(superseded by replacement: kept + held + the true line only up to the 5 min bound; the box is unreachable, so the message then runs once without the files with the true line, the box still kept, RFL record SUPERSEDE-U-UNPROVABLE-1117) export never finishes (forced timeout): box kept, no stop", Infinity]] as const;
   it.each(kases)("%s", async (_label, exportDelayMs) => {
     providerTurns.length = 0;
     const companyId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
@@ -256,7 +259,7 @@ describe.skipIf(!support.supported)("adopt-stopu-xpaths: a person's Stop never s
       // the edit is never lost from it.
       expect(evidence.destroyCalls).toBe(0);
       expect(boxSha).toBe(expectedSha);
-      // No successor ever starts on the spare (which lacks the edit).
+      // No successor starts on the spare (which lacks the edit) before the bound.
       expect(successorLeases.filter(l => l.providerLeaseId === spareProviderLeaseId && l.status === "active")).toEqual([]);
       if (exportDelayMs !== Infinity) {
         // The export ran and FINISHED before the box's stop, at the release.
@@ -278,10 +281,58 @@ describe.skipIf(!support.supported)("adopt-stopu-xpaths: a person's Stop never s
         expect(evidence.cancelledWarmExport).toMatchObject({ state: "unproven", reason: "timed_out" });
         expect(evidence.lines.some(line => /could not be confirmed in time.*The box is kept/.test(line ?? ""))).toBe(true);
         expect(providerTurns).toEqual([]);
+        // adopt-stopu-compose4 (RFL 22:25Z, rf-4 22:53Z): the hold is BOUNDED.
+        // The deferral retry lands AT the bound (retryAt capped); the worker's
+        // retry is the same release call. Fake Date only: the clock jumps to it.
+        const deferral = readLeaseReleaseDeferral(leaseAfter.metadata)!;
+        const boundAt = Date.parse(deferral.failingSince) + PERSON_STOP_EXPORT_BOUND_MS;
+        expect(Date.parse(deferral.retryAt)).toBeLessThanOrEqual(boundAt);
+        // Just before the bound: still held, no decision.
+        vi.useFakeTimers({ toFake: ["Date"], now: boundAt - 1_000 });
+        try {
+          await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "cancelled",
+            providerResourceDisposition: "keep_running", trigger: "release_retry" }).catch(() => undefined);
+        } finally { vi.useRealTimers(); }
+        await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+        expect(providerTurns).toEqual([]);
+        const [beforeBound] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        expect(readPersonStopBoundDecision(beforeBound.metadata)).toBeNull();
+        // At the bound: the box is UNREACHABLE by line (its target never resolves:
+        // the probe times out) -> run once WITHOUT the files, ONE true line.
+        vi.useFakeTimers({ toFake: ["Date"], now: boundAt });
+        try {
+          await heartbeat.releaseEnvironmentLeasesForRun({ runId, companyId, agentId, status: "cancelled",
+            providerResourceDisposition: "keep_running", trigger: "release_retry" }).catch(() => undefined);
+        } finally { vi.useRealTimers(); }
+        const boundDeadline = Date.now() + 20_000;
+        while (providerTurns.length === 0 && Date.now() < boundDeadline) {
+          await heartbeat.resumeQueuedRuns(); await heartbeat.drainActiveRunExecutions();
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        const [atBound] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+        const boundEvents = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+        const boundEvidence = { decision: readPersonStopBoundDecision(atBound.metadata), leaseStatus: atBound.status,
+          stopAtMs: stopAt.map(at => at - stopReceiptAt), providerTurns: [...providerTurns],
+          stopToBoundMin: (boundAt - stopReceiptAt) / 60_000,
+          withoutFilesLines: boundEvents.filter(e => e.message === PERSON_STOP_WITHOUT_FILES_LINE).map(e => e.eventType) };
+        console.log("XPATHS_BOUND_EVIDENCE", JSON.stringify(boundEvidence));
+        if (process.env.XPATHS_EVIDENCE_FILE) await fs.appendFile(process.env.XPATHS_EVIDENCE_FILE, `${JSON.stringify(boundEvidence)}\n`);
+        expect(boundEvidence.decision).toMatchObject({ decision: "without_files", reason: "box_unreachable_probe" });
+        expect(boundEvidence.stopToBoundMin).toBeLessThanOrEqual(10);
+        // The message ran ONCE, without the files; ONE true line in the chat (one
+        // transcript notice + its system event); no 'restored' claim in its input.
+        expect(providerTurns).toHaveLength(1);
+        expect(boundEvidence.withoutFilesLines.sort()).toEqual(["provider.notice.recorded", "workspace_export_bound_reached"]);
+        expect(providerInputs.get(providerTurns[0]!) ?? "").not.toMatch(/restored/i);
+        // The box is still KEPT: lease active, never stopped, never destroyed, edit on it.
+        expect(atBound.status).toBe("active");
+        expect(stopAt).toEqual([]);
+        expect(destroy.mock.calls.filter(([i]) => i.providerLeaseId === providerLeaseId)).toHaveLength(0);
+        expect(await fs.readFile(owedFile).then(sha)).toBe(expectedSha);
       }
     } finally {
       await heartbeat.drainActiveRunExecutions();
       destroy.mockRestore(); stop.mockRestore();
     }
-  }, 90_000);
+  }, 150_000);
 });
