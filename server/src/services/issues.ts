@@ -13786,6 +13786,15 @@ export function issueService(db: Db) {
       if (options?.metadata?.chatMessage && !options.proactiveChatMessage) {
         throw forbidden("Chat message provenance is server-owned");
       }
+      // Internal adapters publish ordinary task comments here too, without an
+      // HTTP auth read. Serialize their write authority with admission's fence,
+      // not only with the persistent-chat generation check below.
+      if (actor.agentId && actor.runId) {
+        const [run] = await dbOrTx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+          .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, actor.runId), eq(heartbeatRuns.companyId, issue.companyId),
+            eq(heartbeatRuns.agentId, actor.agentId))).for("share");
+        if (agentRunWritesRevoked(run)) throw conflict("This run was cancelled or superseded; it cannot post a reply");
+      }
       if (issue.conversationAgentId && actor.agentId && issue.conversationAgentId !== actor.agentId) {
         throw forbidden("Only this conversation's agent can post agent messages");
       }

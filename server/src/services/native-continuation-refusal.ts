@@ -5,7 +5,7 @@
 // that notice existed.
 import { HELD_PREDECESSOR_NOTICE } from "./native-runtime/held-predecessor-notice-text.js";
 import { isFreshThreadRefusal } from "./native-runtime/runner-reconciliation-refusal.js";
-import { isRemoteRunnerSupervisionExhausted } from "./native-runtime/remote-runner-recovery-diagnostics.js";
+import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "./native-runtime/remote-runner-recovery-diagnostics.js";
 
 /** The action shown for a refused conversation: the held notice's one wording. */
 export const NATIVE_CONTINUATION_REFUSED_ACTION = HELD_PREDECESSOR_NOTICE;
@@ -49,11 +49,15 @@ export function isNativeContinuationRefusal(
 }
 
 /** Old persisted supervision loss is not permanent identity incompatibility.
- * This only admits recovery, never the old process: fresh-continuation-fallback
+ * This only admits recovery, never the old process: heartbeat admission
  * fences API writes and abandons the workspace epoch before a new root runs.
  * Check each field independently so a separate prior-owner refusal still wins.
  */
 export function isRecoverableNativeSupervisionFailure(value: string): boolean {
-  if (isRemoteRunnerSupervisionExhausted(new Error(value))) return true;
-  return /^(?:Error: )?(?:Notification transport failed closed: )?runner_process_termination_unconfirmed: runnerd process supervision failed: (?:boat_command_possibly_ran: |Boat POST \/sandboxes\/\{sandboxId\}\/commands failed \(unavailable\): result_unconfirmed, evidence=unknown \(possibly ran\)$)/.test(value);
+  const unwrapped = value.replace(/^(?:Error: |RemoteRunnerSupervisionExhaustedError: )?(?:Notification transport failed closed: )?(?:runner_process_termination_unconfirmed: runnerd process supervision failed: )?/, "");
+  if (unwrapped === REMOTE_RUNNER_SUPERVISION_EXHAUSTED
+    || unwrapped === `${REMOTE_RUNNER_SUPERVISION_EXHAUSTED}: ${REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION}`) return true;
+  // Every alternative ends at the token's end, not just at its prefix. An
+  // independent ownership refusal in this SAME field must still refuse.
+  return /^(?:Error: )?(?:Notification transport failed closed: )?runner_process_termination_unconfirmed: runnerd process supervision failed: (?:boat_command_possibly_ran: unavailable|Boat POST \/sandboxes\/\{sandboxId\}\/commands failed \(unavailable\): result_unconfirmed, evidence=unknown \(possibly ran\))$/.test(value);
 }

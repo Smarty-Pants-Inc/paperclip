@@ -29,6 +29,8 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
+import { taskInterruptionPresentation } from "../task-interruption-presentation.js";
+import { REMOTE_RUNNER_SUPERVISION_EXHAUSTED, REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION } from "../native-runtime/remote-runner-recovery-diagnostics.js";
 import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
@@ -141,6 +143,35 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
     const sections = ((comment.metadata as Record<string, unknown>)?.sections ?? []) as Array<{ rows: Array<{ label?: string; value?: string }> }>;
     return sections.flatMap(section => section.rows).find(row => row.label === "Failure code")?.value;
   };
+
+  // KEEP: row14 F2 caught the real notice consumer discarding the named code
+  // and claiming resend was safe while a predecessor's stop was unconfirmed.
+  it.each(["raw", "notification", "saved_code", "named", "wrapped_named"] as const)(
+    "row14 unconfirmed supervision has one truthful notice and Retry (%s)", async shape => {
+      const f = await fixture({ status: "blocked" });
+      const messageId = await f.message();
+      const failure = "runner_process_termination_unconfirmed: runnerd process supervision failed: "
+        + "Boat POST /sandboxes/{sandboxId}/commands failed (unavailable): result_unconfirmed, evidence=unknown (possibly ran)";
+      const named = `${REMOTE_RUNNER_SUPERVISION_EXHAUSTED}: ${REMOTE_RUNNER_SUPERVISION_EXHAUSTED_ACTION}`;
+      const runId = await f.run({ commentId: messageId, status: "failed",
+        error: shape === "named" ? named : shape === "wrapped_named" ? `Notification transport failed closed: runner_process_termination_unconfirmed: runnerd process supervision failed: ${named}`
+          : shape === "saved_code" ? "Saved supervision failure" : shape === "notification" ? `Notification transport failed closed: ${failure}` : failure,
+        errorCode: shape === "named" ? REMOTE_RUNNER_SUPERVISION_EXHAUSTED : shape === "saved_code" ? failure : "notification_transport_failed" });
+      await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId,
+        phase: "terminal_failure", failureCode: "notification_transport_failed", recoveryState: "blocked" });
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed", code: REMOTE_RUNNER_SUPERVISION_EXHAUSTED });
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain("Its termination is not confirmed.");
+      expect(notes[0]!.body).toContain("Retry or send a new message");
+      expect(notes[0]!.body).not.toMatch(/\bsafe\b/i);
+      expect(codeOf(notes[0]!)).toBe(REMOTE_RUNNER_SUPERVISION_EXHAUSTED);
+      const [task] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+      expect(task!.executionRunId).toBeNull();
+      expect(await taskInterruptionPresentation(db, task!)).toMatchObject({ state: "failed", canRetry: true, observedRunId: runId });
+      expect(await settleUnansweredPersonMessage(db, f)).toMatchObject({ kind: "noticed_before" });
+      expect(await f.visible()).toHaveLength(1);
+    });
 
   // Keep: recorded gate-1 catch: one setup_failed run had a Retry notice, then a contradictory resend note.
   async function setupFailureWithRetryNotice(input: { attempts?: number; actionStatus?: string; deleted?: boolean;
