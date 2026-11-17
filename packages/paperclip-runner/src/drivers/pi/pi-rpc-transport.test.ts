@@ -74,7 +74,12 @@ describe("PiRpcTransport large tool output and lagging consumers", () => {
       const records = await queuedRecords(child);
       const projector = createPiEventProjector({ runId: "run", turnId: "turn" });
       const projected = projector.project(records[0]);
-      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringContaining("[Pi projection truncated]") }, debug: { piProjection: { truncated: true } } });
+      // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was input: stringContaining("[Pi projection truncated]").
+      // The oversized input is spilled whole to a referenced file, not cut.
+      expect(projected[0]).toMatchObject({ eventType: "item.started", payload: { input: expect.stringMatching(/\[Full (?:input|text): \//u) }, debug: { piProjection: { truncated: true } } });
+      const spillPath = /\[Full (?:input|text): (\/[^\s\]]+)/u.exec(String(projected[0].payload.input))![1]!;
+      expect((await import("node:fs")).readFileSync(spillPath, "utf8")).toContain("x".repeat(300000));
+      expect(JSON.stringify(projected)).not.toContain("truncated]");
       expect(projector.project(records[1]).some(event => event.payload.output === "second")).toBe(true);
       expect(records.slice(0, 2).map(record => ((record.partialResult as PiRpcRecord).content as Array<{ text: string }>)[0].text)).toEqual(["first", "second"]);
       expect(records[1]).toMatchObject({ args: { input: "safe" } });
