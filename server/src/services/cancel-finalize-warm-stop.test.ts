@@ -21,8 +21,10 @@ import { fileURLToPath } from "node:url";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations,
+  agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
+import { recoveryService } from "./recovery/service.js";
 import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { captureDirectorySnapshot, directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -348,6 +350,35 @@ const support = await getEmbeddedPostgresTestSupport();
       boxSha: sha(await readFile(join(f.box, "task.txt"), "utf8")) };
     expect(record).toEqual({ box: f.providerLeaseId, sameBox: true, hostSha: sha(expected), boxSha: sha(expected) });
     console.info(`[adopt-stopu U3 ${_label}] ${JSON.stringify(record)}`);
+  }, 60_000);
+
+  // adopt-stopu step 6/7 (H6 decision): a stale-lock sweep BETWEEN the person's
+  // Stop and the stop receipt (export in progress, lease still active), then
+  // after the stop_and_retain release. Records whether a Stop-pending card appears.
+  // Finding (decides step 6): a Stop-pending card CAN appear in this window under U
+  // (onlyUnreleasedLeasesWithinBoundBlockStop refuses a recorded Stop request), and
+  // h6-narrow cannot suppress it: its card path keys off provedWarmTurnHandoff
+  // (agent-execution-stop.ts), which needs nativeRetainedIdleCheckpoint, never written
+  // under stop_and_retain. Recorded here; h6-narrow is dropped.
+  it("H6 window: a sweep between the Stop and the stop receipt raises a Stop-pending card; after the release the next sweep retires it", async () => {
+    const f = await stopMidTurn({ edit: true, settled: true, exportFails: false });
+    const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
+    // Rewind to the window: the lease not yet released, no receipt yet; both claims held by the stopped run.
+    await db.update(environmentLeases).set({ status: "active", cleanupStatus: null, releasedAt: null, metadata: {} })
+      .where(eq(environmentLeases.id, f.leaseId));
+    await db.update(issues).set({ checkoutRunId: f.runId, executionRunId: f.runId, executionLockedAt: new Date(),
+      conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "active" }).where(eq(issues.id, f.issueId));
+    const sweep = async () => {
+      await recoveryService(db, { enqueueWakeup: vi.fn() } as never).sweepStaleIssueLocks({ companyId: f.companyId, issueId: f.issueId });
+      return (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId)))
+        .map(card => `${card.cause}:${card.status}`);
+    };
+    const during = await sweep();
+    await db.update(environmentLeases).set({ status: released.status, cleanupStatus: released.cleanupStatus,
+      releasedAt: released.releasedAt, metadata: released.metadata }).where(eq(environmentLeases.id, f.leaseId));
+    const after = await sweep();
+    console.info(`[adopt-stopu H6 window] ${JSON.stringify({ during, after })}`);
+    expect({ during, after }).toEqual({ during: ["execution_stop_pending:escalated"], after: ["execution_stop_pending:resolved"] });
   }, 60_000);
 
   it("a Stop whose cancellation is NOT settled runs no export", async () => {
