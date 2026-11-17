@@ -15475,11 +15475,15 @@ export function assertRemoteRunnerBuildMetadata(
   }
 }
 
+// Runtime bundles are sealed (0o555 directories, 0o444 files), and a warm box
+// reuses the instructions destination. removeTree must unseal each directory
+// before unlinking its entries, or replacing a changed bundle fails with EACCES
+// after the switch and leaves the old copy beside the new one.
 const REMOTE_RUNTIME_ASSET_INSTALL_SCRIPT = `
 const fs=require("node:fs"),path=require("node:path");
 const root=path.resolve(process.argv[1]), assets=JSON.parse(process.argv[2]), nonce=process.argv[3];
 function regularTree(file){const s=fs.lstatSync(file);if(s.isSymbolicLink()||(!s.isDirectory()&&!s.isFile()))throw Error("runtime_asset_not_regular");if(s.isDirectory())for(const name of fs.readdirSync(file))regularTree(path.join(file,name));}
-function removeTree(file){const s=fs.lstatSync(file,{throwIfNoEntry:false});if(s?.isDirectory()&&!s.isSymbolicLink()){for(const name of fs.readdirSync(file))removeTree(path.join(file,name));fs.chmodSync(file,(s.mode&0o777)|0o700);}fs.rmSync(file,{recursive:true,force:true});}
+function removeTree(file){const s=fs.lstatSync(file,{throwIfNoEntry:false});if(s?.isDirectory()&&!s.isSymbolicLink()){fs.chmodSync(file,(s.mode&0o777)|0o700);for(const name of fs.readdirSync(file))removeTree(path.join(file,name));}fs.rmSync(file,{recursive:true,force:true});}
 function ensureParents(file){const parts=path.resolve(path.dirname(file)).split(path.sep).filter(Boolean);let current=path.parse(file).root;for(const part of parts){current=path.join(current,part);try{const s=fs.lstatSync(current);if(!s.isDirectory()||s.isSymbolicLink())throw Error("unsafe_runtime_asset_parent");}catch(e){if(e.code!=="ENOENT")throw e;fs.mkdirSync(current,{mode:0o700});}}}
 for(const [index,a] of assets.entries()){
  const source=path.join(root,String(index));regularTree(source);const target=path.resolve(a.targetPath);if(!path.isAbsolute(a.targetPath))throw Error("runner_remote_staging_target_invalid");ensureParents(target);
