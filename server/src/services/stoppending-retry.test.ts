@@ -273,4 +273,18 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(blockedWith).toBeNull();
     expect(admitted).toMatchObject({ previousRunId: f.sourceRunId, commentId: comment!.id });
   }, 60_000);
+  it("B: with a real hold beside the stop-pending record (gate 1's answering B shape), Retry keeps its full admission and is not refused by the stop gate", async () => {
+    const f = await seed("A");
+    await age(f);
+    await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: f.agentId,
+      cause: "native_restart_recovery_blocked", fingerprint: `restart:${f.sourceRunId}`,
+      evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+      nextAction: "Recovery stopped.", maxAttempts: 3 });
+    const receipt = await press(f);
+    expect(receipt.accepted).toBe(true);
+    const { blockedWith } = await admit(f, receipt.requestId!);
+    expect(blockedWith?.reason).not.toBe("execution_stop_unproven");
+    expect(blockedWith?.reason).not.toBe("execution_settling");
+  });
 });
