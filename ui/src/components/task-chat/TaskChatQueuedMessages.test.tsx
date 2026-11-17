@@ -581,7 +581,7 @@ describe("TaskChatQueuedMessages", () => {
     expect(container.textContent).toContain("First queued message");
     expect(container.textContent).toContain("Second queued message");
   });
-  it.each([true, false])("shows a neutral queue update, not a delivery error, when Send has no current target (empty=%s)", async empty => {
+  it.each([true, false])("supersedes(0f78249c): upstream copy: shows a neutral queue update, not a delivery error, when Send has no current target (empty=%s)", async empty => {
     const latest = { ...queue, targetRunId: null, entries: empty ? [] : queue.entries.slice(1) };
     const onInterrupt = vi.fn().mockRejectedValue(new QueuedMessagesChangedError(latest));
     render({ queue: { ...queue, targetRunId: null }, onInterrupt });
