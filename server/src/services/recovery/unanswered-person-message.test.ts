@@ -1980,8 +1980,13 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       const k = await answeredCardKilledResume(f);
       await db.update(issueRecoveryActions).set({ evidence: { runId: k.resume, originalFailureCode: "adapter_failed",
         nativeFailureBlock: { runId: randomUUID(), statusVersion: 1 } } }).where(eq(issueRecoveryActions.id, k.hold.id));
+      const [before] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
       await dispositionPass();
       expect(await successorsOf(f, k.resume)).toHaveLength(0);
+      // "Stays where it is": the disposition does not take (settle) the foreign hold at all.
+      const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, k.hold.id));
+      expect({ status: after!.status, outcome: after!.outcome, evidence: after!.evidence })
+        .toEqual({ status: before!.status, outcome: before!.outcome, evidence: before!.evidence });
     }, 60_000);
 
     it("RF5 supplementary chain: HTTP answer, failed answer-resume and failed successor, no final (brief 2d literal)", async () => {
