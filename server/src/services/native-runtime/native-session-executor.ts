@@ -490,6 +490,16 @@ type NativeSessionStartup = {
   settle: () => void;
 };
 const nativeSessionStartups = new Map<string, NativeSessionStartup>();
+/**
+ * Tools still open in a native run's governed-wait observation, by run id.
+ * An early answer on an external chat must not cancel the source run while one
+ * of the person's tools (a foreground command) is still running; the turn parks
+ * on its own once the last sibling has closed, and the answer is delivered then.
+ */
+const nativeGovernedWaitOpenTools = new Map<string, number>();
+export function nativeRunHasOpenGovernedWaitTool(runId: string): boolean {
+  return (nativeGovernedWaitOpenTools.get(runId) ?? 0) > 0;
+}
 
 function detachActiveNativeSessionForRestart(active: ActiveNativeSession) {
   active.restartDetach ??= active.session.detachControllerForRestart!();
@@ -2153,8 +2163,23 @@ export function nativeConversationReplyResult(input: {
  */
 export function createGovernedWaitEventObservation(
   resolvePending: () => Promise<PrpStructuredRunResult | null>,
+  runId?: string,
 ) {
+  // Open tools, keyed by the tool's OWN identity: payload.executionId whenever
+  // present, envelope itemId only as a fallback, because runnerd shares one
+  // attachment itemId across every tool execution of a turn (runner-core
+  // durable state). A runnerd tool reported both as an item and as an
+  // execution record stays open until both have closed, so it closes (and can
+  // park) exactly once.
   const pendingTools = new Set<string>();
+  // The question's own tool identities: open until (or past) the park by
+  // design, so they never block the wait they created.
+  const questionTools = new Set<string>();
+  const publishOpenTools = () => {
+    if (!runId) return;
+    if (pendingTools.size > 0) nativeGovernedWaitOpenTools.set(runId, pendingTools.size);
+    else nativeGovernedWaitOpenTools.delete(runId);
+  };
   let providerLost = false;
   let generation = 0;
   let observation: {
@@ -2171,20 +2196,49 @@ export function createGovernedWaitEventObservation(
       const payload = record(event.payload);
       providerLost ||= event.eventType === "runtime_request.expired" && payload.reason === "provider_process_lost";
       const kind = payload.kind;
-      const tool = ["dynamicToolCall", "mcpToolCall", "commandExecution"].includes(String(kind));
-      if (event.itemId) {
-        if (tool && event.eventType === "item.started") pendingTools.add(event.itemId);
-        // Terminal error events can omit kind; the tracked ID owns cleanup.
-        if (event.eventType === "item.completed" || event.eventType === "item.failed") {
-          pendingTools.delete(event.itemId);
+      // Pi and Cursor Cloud report every tool execution as kind "tool" (bash
+      // stays commandExecution). Pi starts a whole batch before its host
+      // callbacks reach the Runner one at a time, so a question's answered
+      // callback must not park the turn while a sibling still runs: that
+      // sibling's callback would never get a result and the Runner's saved
+      // state would keep it pending.
+      // Through runnerd (Boat), Codex-shaped tool items arrive only as
+      // tool.execution.* (runner-core provider_events.rs) and Pi tool items as
+      // item.* kind "tool_use"; both must count as open tools.
+      const execution = event.eventType.startsWith("tool.execution.");
+      const tool = execution || ["dynamicToolCall", "mcpToolCall", "commandExecution", "builtinToolCall", "tool", "tool_use"].includes(String(kind));
+      const toolId = typeof payload.executionId === "string" && payload.executionId
+        ? payload.executionId
+        : event.itemId;
+      const item = record(payload.item);
+      const toolName = [payload.name, payload.toolName, payload.tool, item.name, item.tool].find(value => typeof value === "string");
+      if (toolId) {
+        // An execution reported under its own item's id (in-process providers)
+        // is that item; one reported under a different, shared envelope id
+        // (runnerd) is a separate record that closes on its own.
+        const key = `${execution && event.itemId !== toolId ? "execution" : "item"}:${toolId}`;
+        if (tool && toolName === "request_human_input") {
+          // Exclude only the question's own identity, in both shapes; never a
+          // shared envelope key that a running sibling also maps to.
+          questionTools.add(toolId);
+          pendingTools.delete(`item:${toolId}`);
+          pendingTools.delete(`execution:${toolId}`);
+        } else if (tool && !questionTools.has(toolId) && (event.eventType === "item.started" || event.eventType === "tool.execution.started")) {
+          pendingTools.add(key);
         }
+        // Terminal error events can omit kind; the tracked ID owns cleanup.
+        if (["item.completed", "item.failed", "tool.execution.completed"].includes(event.eventType)) {
+          pendingTools.delete(key);
+        }
+        publishOpenTools();
       }
-      // Usage/model messages can arrive while the tool creating the card is
-      // still awaiting its response. Parking then interrupts that in-flight
-      // response and cannot produce a durable suspension checkpoint.
-      if (event.eventType === "item.completed" && (
-        pendingTools.size > 0 || (!tool && !(kind === "agentMessage" && payload.channel === "final"))
-      )) return;
+      // Never park while a sibling tool is still open, whatever the trigger
+      // (a tool completion, a final message or a durable question fallback):
+      // the park cancels the provider and would cut that tool off. Usage/model
+      // messages can arrive while the tool creating the card is still awaiting
+      // its response; parking then cannot produce a durable checkpoint.
+      if (pendingTools.size > 0) return;
+      if (event.eventType === "item.completed" && !tool && !(kind === "agentMessage" && payload.channel === "final")) return;
       // A replacement question preserves human input after a provider crash;
       // it does not authorize a successful suspension of the failed execution.
       if (providerLost || !eligible) return;
@@ -12380,8 +12434,10 @@ async function executePaperclipNativeSessionAttempt(
   let runnerSessionStartupScope: NativeRunSpanScope | null = null;
   let agentTurnScope: NativeRunSpanScope | null = null;
   let taskSettleScope: NativeRunSpanScope | null = null;
+  nativeGovernedWaitOpenTools.delete(input.execution.binding.runId);
   const governedWaitObservation = createGovernedWaitEventObservation(
     resolvePendingGovernedWait,
+    input.execution.binding.runId,
   );
   const projectSessionGoalEvent = (event: PrpEvent) =>
     applyRunnerGoalPrpEvent(
@@ -12840,7 +12896,7 @@ async function executePaperclipNativeSessionAttempt(
         }
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         await controllerSteps.measure("plan_synchronization", () => recordPlanSynchronization(
@@ -12868,7 +12924,7 @@ async function executePaperclipNativeSessionAttempt(
         }));
         await controllerSteps.measure("governed_wait", () => governedWaitObservation.observe(
           event,
-          event.eventType === "item.completed" || questionFallback !== null,
+          ["item.completed", "tool.execution.completed"].includes(event.eventType) || questionFallback !== null,
         ));
         await controllerSteps.measure("rate_limits", () => recordRateLimits(event));
         const planSynchronization = await synchronizeCompletedProviderPlan({
