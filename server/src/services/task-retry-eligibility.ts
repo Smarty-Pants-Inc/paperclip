@@ -342,7 +342,12 @@ export function retryRefusedBeforeAdmissionReason(reason: string) { return REFUS
 export async function retryRefusedBeforeAdmission(db: Db, input: { companyId: string; issueId: string;
   sourceRunId?: string | null }): Promise<RetryAuthority | null> {
   const authority = await readRetryAdmissionAuthority(db, input);
-  return !authority.canRetry && REFUSED_BEFORE_ADMISSION.has(authority.reason) ? authority : null;
+  // fam-retry5: the CHAT Retry still denies a paused agent before scheduling
+  // (upstream chat-channels "reauthorizes a failed chat retry and denies
+  // agent_paused before scheduling"), with the card's paused words + Resume.
+  // The task Retry API accepts it for preservation only; neither runs a turn.
+  return !authority.canRetry && (REFUSED_BEFORE_ADMISSION.has(authority.reason) || authority.reason === "agent_paused")
+    ? authority : null;
 }
 /** fam-retry2: the accept-held outcome of the one authority, or null. */
 export async function retryHeldBehindRestore(db: Db, input: { companyId: string; issueId: string; sourceRunId?: string | null }) {
