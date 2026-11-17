@@ -1,6 +1,7 @@
 import { sql, type SQL } from "drizzle-orm";
 import { activityLog, heartbeatRuns, issueComments, issueQuestionResponseDeliveries, issueThreadInteractions, issues } from "@paperclipai/db";
 import { freshContinuationSourceChainSql } from "./fresh-continuation-chain.js";
+import { FRESH_CONTINUATIONS_PER_CHAIN } from "./fresh-continuation-fallback.js";
 
 /** The import's per-task arrival record: one activity row per issue a company import creates (issues.importIssues). */
 export const ISSUE_IMPORTED_ACTION = "issue.imported";
@@ -91,7 +92,9 @@ const CARD_ANSWER_STATUSES = ["answered", "accepted", "rejected"] as const;
  * its answer time. It is an owed person input like a typed message.
  * A response delivery still pending or delivering is a further attempt only
  * within PENDING_WAIT_START_BOUND_MS of the answer (resolvedAt): a dead
- * delivery worker never leaves the answer silent. */
+ * delivery worker never leaves the answer silent. It is never one once the
+ * answer's chain ENDED because automatic recovery stopped
+ * (automaticRecoveryStoppedOnCardChainSql). */
 export function unansweredCardAnswerSql(alias: string, now: Date = new Date()): SQL {
   const q = sql.identifier(alias);
   const deliveryCutoff = new Date(now.getTime() - PENDING_WAIT_START_BOUND_MS).toISOString();
@@ -102,11 +105,40 @@ export function unansweredCardAnswerSql(alias: string, now: Date = new Date()): 
       and resume.context_snapshot->>'interactionId' = ${q}.id::text)
     -- An answer still being delivered to the agent is a pending attempt, not a
     -- silent one, until the bound from its answer time.
-    and (${q}.resolved_at <= ${deliveryCutoff}::timestamptz or not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
+    and (${q}.resolved_at <= ${deliveryCutoff}::timestamptz or ${automaticRecoveryStoppedOnCardChainSql(alias)}
+      or not exists (select 1 from ${issueQuestionResponseDeliveries} delivery
       where delivery.company_id = ${q}.company_id and delivery.interaction_id = ${q}.id
         and delivery.status in ('pending', 'delivering')))
     and not ${answeredPersonMessageSql({ id: sql`${q}.id`, companyId: sql`${q}.company_id`,
       issueId: sql`${q}.issue_id`, createdAt: sql`${q}.resolved_at` })})`;
+}
+
+/** SQL over an issue_thread_interactions alias: the card answer's chain ENDED
+ * because AUTOMATIC RECOVERY STOPPED (rf5 20:09Z). A run on the answer's
+ * chain (its answer-resume run or an automatic successor of it) has its hold
+ * resolved "blocked" with no replay (execution-recovery-resolution.ts:903-962,
+ * automaticRecovery.replay blocked, nextAction "Automatic recovery
+ * stopped...") and that run's chain already used FRESH_CONTINUATIONS_PER_CHAIN
+ * fresh continuations, so the fallback never continues it
+ * (continueFreshInTransaction: not_applicable, fresh_continuation_chain_exhausted).
+ * Nothing further runs by itself: the chain ended, not still running. */
+export function automaticRecoveryStoppedOnCardChainSql(alias: string): SQL {
+  const q = sql.identifier(alias);
+  const chainInput = { companyId: sql`${q}.company_id`, issueId: sql`${q}.issue_id`, runId: sql`ended.id` };
+  return sql`exists (select 1 from issue_recovery_actions stop
+    join ${heartbeatRuns} ended on ended.company_id = stop.company_id
+      and ended.id::text = stop.evidence#>>'{automaticRecovery,runId}'
+    where stop.company_id = ${q}.company_id and stop.source_issue_id = ${q}.issue_id
+      and stop.status = 'resolved' and stop.outcome = 'blocked'
+      and stop.evidence#>>'{automaticRecovery,replay}' = 'blocked'
+      and ended.status in ('failed', 'timed_out', 'interrupted', 'cancelled')
+      and exists (${freshContinuationSourceChainSql(chainInput)}
+        select 1 from source_chain link join ${heartbeatRuns} resume on resume.id = link.id and resume.company_id = ${q}.company_id
+        where resume.context_snapshot->>'interactionId' = ${q}.id::text
+          and (select count(*) from issue_recovery_actions attempt where attempt.company_id = ${q}.company_id
+            and attempt.source_issue_id = ${q}.issue_id
+            and attempt.evidence#>>'{freshContinuation,sourceRunId}' in (select id::text from source_chain))
+            >= ${FRESH_CONTINUATIONS_PER_CHAIN}))`;
 }
 
 /** SQL: message m is a PERSON comment that arrived by a company import (see answeredPersonMessageSql). */

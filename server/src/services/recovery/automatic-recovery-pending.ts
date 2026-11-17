@@ -1,6 +1,8 @@
 import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueRecoveryActions, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { NATIVE_NO_REPLAY_HOLD_CAUSE } from "../workspace-recovery-fallback-discovery.js";
+import { freshContinuationChain } from "../fresh-continuation-chain.js";
+import { FRESH_CONTINUATIONS_PER_CHAIN } from "../fresh-continuation-fallback.js";
 
 /**
  * ONE shared answer to "is the system's own AUTOMATIC recovery for this run
@@ -39,7 +41,11 @@ import { NATIVE_NO_REPLAY_HOLD_CAUSE } from "../workspace-recovery-fallback-disc
  * (c) a restored/continuation wake for the run's action is queued or deferred.
  * FALSE when reconciliation concluded without continuing (blocked by a person
  * gate, cancelled, delivery invalidated, saved-work recovery exhausted, the
- * fallback found it person-owned) or the restored run already ended: the
+ * fallback found it person-owned, or AUTOMATIC RECOVERY STOPPED: the hold
+ * resolved blocked at the fresh-continuation chain cap, where
+ * continueFreshInTransaction returns not_applicable
+ * fresh_continuation_chain_exhausted and execution-recovery-resolution.ts:887-962
+ * writes "Automatic recovery stopped...") or the restored run already ended: the
  * callers then post their one true notice. Board-owned active/escalated
  * actions are manual: false, today's behaviour.
  */
@@ -123,6 +129,13 @@ export async function automaticRecoveryPending(db: Db,
     const savedWork = object(evidence.systemRecovery);
     if (SAVED_WORK_IN_FLIGHT.includes(String(savedWork.state))) return true;
     const noReplay = object(evidence.automaticRecovery);
+    // Automatic recovery STOPPED: the run's chain already used its fresh
+    // continuations, so the fallback can never continue this hold (it
+    // returns not_applicable, fresh_continuation_chain_exhausted). A resolved
+    // blocked hold at the cap is the chain's end, never pending forever.
+    if (action.status === "resolved" && action.outcome === "blocked"
+      && (await freshContinuationChain(db, { companyId: input.companyId, issueId: input.issueId, runId: run.id })).attempts
+        >= FRESH_CONTINUATIONS_PER_CHAIN) continue;
     if (action.status === "resolved" && action.outcome === "blocked" && noReplay.runId === run.id
       && noReplay.policy === "preserve_without_replay_v1" && noReplay.replay === "blocked"
       && savedWork.state !== "exhausted"

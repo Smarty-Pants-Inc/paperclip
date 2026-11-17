@@ -40,7 +40,7 @@ import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { questionResponseDeliveryService } from "../question-response-delivery.js";
 import { freshContinuationDescendsFrom } from "../fresh-continuation-chain.js";
 import { pendingContinuationCommentInput, readContinuationCommentInput } from "../continuation-comment-input.js";
-import { settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
+import { executionRecoverySettlementNote, settleUnrecoverableExecutions } from "../execution-recovery-resolution.js";
 import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from "../native-runtime/native-session-executor.js";
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
@@ -2258,6 +2258,144 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
       // The original message keeps its existing behaviour; the card itself owes nothing.
       expect(notices.filter(n => n.metadata?.authorizationReason === `unanswered_message:${card.id}`)).toHaveLength(0);
       expect(notices.length).toBeLessThanOrEqual(1);
+    });
+
+    // rf5 20:09Z (R-ONCE): the answer's chain ends because AUTOMATIC RECOVERY
+    // STOPPED. Rows as production records them, by line: each failed native run
+    // gets the wake queue's native terminal hold (wake-queue/adapters/postgres.ts
+    // recordNativeTerminalRecoveryIfNeeded: active_run_watchdog, board, cause
+    // native_continuation_requires_reconciliation, fingerprint native-continuation:<run>;
+    // its coordinator terminal_failure with that failure code); the fresh
+    // continuation turns the first two into restored/system holds with
+    // freshContinuation {sourceRunId, chainAttempt} and delivers the successor
+    // (fresh-continuation-fallback.ts); at FRESH_CONTINUATIONS_PER_CHAIN the
+    // disposition settles the last hold resolved/blocked with
+    // executionRecoverySettlementNote's "Automatic recovery stopped..." and
+    // automaticRecovery {preserve_without_replay_v1, replay blocked}
+    // (execution-recovery-resolution.ts:903-962), and blocks the task.
+    describe("the answer's chain ends because automatic recovery STOPPED (rf5 20:09Z)", () => {
+      const CAUSE = "native_continuation_requires_reconciliation";
+      const STOPPED = executionRecoverySettlementNote({ current: true, cause: CAUSE, workspaceRestoreFailed: false });
+      const CARD_TEXT = "Your answer wasn't acted on: the run that picked it up failed. Retry is safe; if it fails again, assign this agent a new task.";
+      async function failedNative(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
+        await db.update(heartbeatRuns).set({ errorCode: "adapter_failed", error: "Native session failed" }).where(eq(heartbeatRuns.id, runId));
+        await db.insert(nativeRunFinalizations).values({ companyId: f.companyId, issueId: f.issueId, runId, phase: "terminal_failure",
+          recoveryState: "blocked", failureCode: CAUSE });
+      }
+      async function terminalHold(f: Awaited<ReturnType<typeof fixture>>, runId: string) {
+        const [row] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+          kind: "active_run_watchdog", status: "active", ownerType: "board", returnOwnerAgentId: f.agentId, cause: CAUSE,
+          fingerprint: `native-continuation:${runId}`, maxAttempts: 3, wakePolicy: null,
+          nextAction: "The run stopped before it finished. Paperclip continues the task from its last saved work.",
+          evidence: { runId, originalFailureCode: "adapter_failed", nativeFailureBlock: { runId, statusVersion: 1 } } }).returning();
+        return row!;
+      }
+      /** fresh-continuation-fallback.ts: the hold becomes the restored record of the delivered successor. */
+      async function continued(f: Awaited<ReturnType<typeof fixture>>, holdId: string, sourceRunId: string, rootRunId: string,
+        chainAttempt: number, successor: string) {
+        const recordedAt = f.at().toISOString();
+        await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", ownerType: "system", resolvedAt: new Date(recordedAt),
+          resolutionNote: "continued_fresh_from_last_saved",
+          nextAction: "The previous run was cut off. Paperclip continues the task in a fresh run from its last saved work.",
+          evidence: { runId: sourceRunId, originalFailureCode: "adapter_failed",
+            executionReconciliation: { runId: sourceRunId, actorId: "fresh-continuation", recordedAt, actionOutcome: "mixed", providerStopped: true },
+            freshContinuation: { schema: "paperclip.fresh-continuation.v1", trigger: "recovery_refused", delivery: "recorded",
+              isolation: "writer_ended", recordedAt, failureCode: CAUSE, sourceRunId, chainAttempt, chainRootRunId: rootRunId },
+            continuationDelivery: "delivered", continuationRunId: successor } }).where(eq(issueRecoveryActions.id, holdId));
+      }
+      /** The whole real chain up to the stopped hold; returns the rows. */
+      async function stoppedChain(opts: { stop?: boolean; lastStatus?: string } = {}) {
+        const f = await fixture({ status: "in_progress" });
+        const m = await f.message(); const root = await f.run({ commentId: m, status: "succeeded" });
+        const card = await answeredCard(f, root);
+        const resumeRun = await resume(f, card.id, "failed");
+        await failedNative(f, resumeRun);
+        let previous = resumeRun;
+        const runs = [resumeRun];
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+          const hold = await terminalHold(f, previous);
+          const status = attempt === 2 && opts.lastStatus ? opts.lastStatus : "failed";
+          const successor = await f.run({ status, errorCode: status === "failed" ? "adapter_failed" : null, retryOfRunId: previous,
+            wakeReason: "issue_recovery_action_restored" });
+          await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeReason: "issue_recovery_action_restored",
+            recoveryActionId: hold.id, retryOfRunId: previous } }).where(eq(heartbeatRuns.id, successor));
+          await continued(f, hold.id, previous, resumeRun, attempt, successor);
+          if (status === "failed") await failedNative(f, successor);
+          previous = successor; runs.push(successor);
+        }
+        if (opts.lastStatus) {
+          const [running] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previous));
+          return { ...f, card, runs, last: previous, lastRun: running!, holdId: null };
+        }
+        const last = await terminalHold(f, previous);
+        const stopAt = f.at();
+        if (opts.stop !== false) {
+          await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "blocked", resolvedAt: stopAt, updatedAt: stopAt,
+            nextAction: STOPPED, resolutionNote: STOPPED, wakePolicy: null, monitorPolicy: null,
+            evidence: { ...last.evidence, automaticRecovery: { policy: "preserve_without_replay_v1", runId: previous, replay: "blocked",
+              actionOutcome: "unknown", recordedAt: stopAt.toISOString() } } }).where(eq(issueRecoveryActions.id, last.id));
+        }
+        await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issueId));
+        const [lastRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, previous));
+        return { ...f, card, runs, last: previous, lastRun: lastRun!, holdId: last.id };
+      }
+
+      // delivery "pending": the answer's response delivery never settled (the
+      // real path with the delivery worker paused, f5c7d624): the chain's end,
+      // not the delivery, decides. "fallback_queued": delivered by wake fallback.
+      it.each(["pending", "fallback_queued"])("RED: answered card (delivery %s), answer-resume fails, 2 automatic successors fail, the last hold resolves blocked 'Automatic recovery stopped': EXACTLY ONE card-answer notice with Retry, later sweeps still one", async delivery => {
+        const c = await stoppedChain();
+        await db.update(issueQuestionResponseDeliveries).set({ status: delivery })
+          .where(eq(issueQuestionResponseDeliveries.interactionId, c.card.id));
+        const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, c.holdId!));
+        expect({ status: hold!.status, outcome: hold!.outcome, nextAction: hold!.nextAction })
+          .toEqual({ status: "resolved", outcome: "blocked", nextAction: STOPPED });
+        expect(STOPPED.startsWith("Automatic recovery stopped")).toBe(true);
+        // Swept 1 minute after the last run ended: well inside the run-end bound.
+        const end = c.lastRun.finishedAt!.getTime();
+        const outcome = await settleUnansweredPersonMessage(db, { companyId: c.companyId, issueId: c.issueId, now: new Date(end + 60_000) });
+        const notices = await cardNotices(c);
+        console.log("CARDSTOP_RED", JSON.stringify({ outcome, runs: c.runs, last: c.last, notices: notices.map(n => ({
+          reason: n.metadata?.authorizationReason, sourceRunId: n.metadata?.sourceRunId, body: n.body, title: n.presentation?.title })) }));
+        expect(notices, JSON.stringify({ outcome, delivery })).toHaveLength(1);
+        expect(notices[0]!.metadata?.authorizationReason).toBe(`unanswered_message:${c.card.id}`);
+        expect(notices[0]!.metadata?.sourceRunId).toBe(c.last);
+        expect(await pendingModule.automaticRecoveryPending(db, { companyId: c.companyId, issueId: c.issueId, runId: c.last }),
+          "a resolved-blocked stopped hold is NOT pending").toBe(false);
+        expect(notices[0]!.body).toBe(CARD_TEXT);
+        expect(notices[0]!.presentation?.title).toBe("Your answer wasn't acted on");
+        // Retry is offered on the stopped run (task-interruption-presentation canRetry).
+        const { taskInterruptionPresentation } = await import("../task-interruption-presentation.js");
+        const [task] = await db.select().from(issues).where(eq(issues.id, c.issueId));
+        const presentation = await taskInterruptionPresentation(db, task!);
+        console.log("CARDSTOP_RETRY", JSON.stringify(presentation));
+        expect(presentation?.canRetry, "the existing Retry control is offered").toBe(true);
+        for (const ms of [2 * 60_000, 11 * 60_000, 60 * 60_000]) {
+          await settleUnansweredPersonMessage(db, { companyId: c.companyId, issueId: c.issueId, now: new Date(end + ms) });
+        }
+        await c.sweep(); await c.sweep();
+        expect(await cardNotices(c), "later sweeps: still one").toHaveLength(1);
+        expect(await c.visible()).toHaveLength(1);
+      });
+
+      it.each(["running", "queued"])("guard: automatic recovery still running (its last successor %s): no card-answer notice", async lastStatus => {
+        const c = await stoppedChain({ lastStatus });
+        const now = new Date(c.lastRun.createdAt.getTime() + 60_000);
+        expect((await settleUnansweredPersonMessage(db, { companyId: c.companyId, issueId: c.issueId, now })).kind).toBe("pending");
+        await c.sweep(); await c.sweep();
+        expect(await cardNotices(c)).toHaveLength(0);
+      });
+
+      it("guard: a later reply on the chain supersedes the stopped chain's notice", async () => {
+        const c = await stoppedChain();
+        const end = c.lastRun.finishedAt!.getTime();
+        await settleUnansweredPersonMessage(db, { companyId: c.companyId, issueId: c.issueId, now: new Date(end + 60_000) });
+        expect(await c.visible()).toHaveLength(1);
+        await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, c.last));
+        await c.reply(c.last); await c.sweep(); await c.sweep();
+        expect(await c.visible()).toHaveLength(0);
+        expect(await cardNotices(c)).toHaveLength(1);
+      });
     });
 
     it("guard: a newer typed message after the answer is the owed input, not the answer", async () => {
