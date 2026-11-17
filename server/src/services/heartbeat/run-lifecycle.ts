@@ -130,6 +130,8 @@ import {
   hasAcceptedSemanticResult,
   completedPlanProposalIds,
   readCompletedAssistantMessageCandidate,
+  readTruncatedCompletedAgentMessageItemId,
+  readTruncatedCompletedAssistantMessageCandidate,
   selectHeartbeatRunFinalAgentMessage,
   type RunPresentationDecision,
 } from "../heartbeat-run-summary.js";
@@ -2482,7 +2484,29 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         prpEvent,
         proposedItemIds,
       });
-      if (candidate) candidates.push(candidate);
+      if (candidate) {
+        candidates.push(candidate);
+        continue;
+      }
+      // dl-n5-66k: a completed answer stored as {truncated, byteSize} keeps
+      // its text in the item's stored deltas; rebuild it there so the
+      // semantic summary never replaces the answer.
+      const truncatedItemId = readTruncatedCompletedAgentMessageItemId(prpEvent);
+      if (!truncatedItemId) continue;
+      const deltaRows = await db
+        .select({ seq: heartbeatRunEvents.seq, payload: heartbeatRunEvents.payload })
+        .from(heartbeatRunEvents)
+        .where(
+          and(
+            eq(heartbeatRunEvents.companyId, companyId),
+            eq(heartbeatRunEvents.runId, runId),
+            eq(heartbeatRunEvents.eventType, "item.delta"),
+            sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' = ${truncatedItemId}`,
+          ),
+        )
+        .orderBy(heartbeatRunEvents.seq);
+      const rebuilt = readTruncatedCompletedAssistantMessageCandidate({ seq: row.seq, prpEvent, deltaRows });
+      if (rebuilt) candidates.push(rebuilt);
     }
     const recoveryBoundary = await db
       .select({
