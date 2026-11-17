@@ -644,7 +644,17 @@ export interface PreparedSandboxManagedRuntime {
     repositories?: NonNullable<GitWorkspaceSnapshot["repositories"]>;
   } | null;
   cleanupWorkspaceSnapshot(): Promise<void>;
-  restoreWorkspace(onProgress?: RuntimeProgressSink): Promise<void>;
+  /**
+   * `options.signal`: the owner's abort signal. Once aborted, the restore
+   * throws before its next host mutation (extract, write, rename, delete, git
+   * import, merge); it is checked after every local lock wait. Nothing already
+   * written is undone. Omitted: unchanged behaviour.
+   */
+  restoreWorkspace(onProgress?: RuntimeProgressSink, options?: WorkspaceRestoreOptions): Promise<void>;
+}
+
+export interface WorkspaceRestoreOptions {
+  signal?: AbortSignal;
 }
 
 export type WorkspaceInboundMode =
@@ -2036,9 +2046,13 @@ export async function prepareSandboxManagedRuntime(input: {
         ? { baseline: baselineSnapshot, gitSnapshot, ...(!gitSnapshot && repositories.length ? { repositories } : {}) }
         : null,
     cleanupWorkspaceSnapshot,
-    restoreWorkspace: async (onProgress?: RuntimeProgressSink) => {
+    restoreWorkspace: async (onProgress?: RuntimeProgressSink, restoreOptions?: WorkspaceRestoreOptions) => {
       try {
       const restoreSink = onProgress ?? input.onProgress;
+      const restoreSignal = restoreOptions?.signal;
+      // Before every host mutation: an aborted owner writes nothing more.
+      const beforeHostWrite = () => restoreSignal?.throwIfAborted();
+      beforeHostWrite();
 
       // Build the ordered outbound restore task list. Each task runs one
       // restore from start to end: the workspace restore, or one asset restore.
@@ -2097,7 +2111,7 @@ export async function prepareSandboxManagedRuntime(input: {
                 onRuntimeProgress: input.onRuntimeProgress,
                 workspaceRestoreRetryDelaysMs: input.workspaceRestoreRetryDelaysMs,
               });
-              await nested.restoreWorkspace(restoreSink);
+              await nested.restoreWorkspace(restoreSink, restoreOptions);
             }
             await retryWorkspaceRestoreBeforeHostWrite(
               input.workspaceRestoreRetryDelaysMs ?? WORKSPACE_RESTORE_RETRY_DELAYS_MS,
@@ -2175,6 +2189,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         sourceRoots: [runtimeRootDir],
                         targetRoots: [tempDir],
                       });
+                      beforeHostWrite();
                       const syncResult = await input.client.syncOut!(operations);
                       const transferredBytes = sumSyncResultBytes(syncResult);
                       await gitExport.finish(transferredBytes, transferredBytes);
@@ -2182,6 +2197,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       const bundleBytes = await input.client.readFile(remoteGitBundle, gitExport.options);
                       const bundleBuffer = toBuffer(bundleBytes);
                       await gitExport.finish(bundleBuffer.byteLength, bundleBuffer.byteLength);
+                      beforeHostWrite();
                       await fs.writeFile(localBundlePath, bundleBuffer);
                     }
                     await input.client.remove(remoteGitBundle).catch(() => undefined);
@@ -2194,6 +2210,7 @@ export async function prepareSandboxManagedRuntime(input: {
                         },
                       }));
                       if (shallow.byteLength > GIT_SHALLOW_MAX_BYTES) throw new GitShallowMetadataError(`Git shallow metadata exceeds its byte limit (${shallow.byteLength} > ${GIT_SHALLOW_MAX_BYTES})`);
+                      beforeHostWrite();
                       await fs.writeFile(localShallowPath, shallow);
                       await input.client.remove(remoteShallowPath).catch(() => undefined);
                     }
@@ -2204,6 +2221,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       remoteWorkspaceStatus = remoteWorkspaceStatus === "clean" ? "clean" : "dirty";
                       await input.client.remove(remoteWorkspaceStatusPath).catch(() => undefined);
                     }
+                    beforeHostWrite();
                     return withWorkspaceRestoreStep("git_import", () => fetchGitBundleIntoLocalRef({
                       localDir: input.workspaceLocalDir,
                       bundlePath: localBundlePath,
@@ -2267,8 +2285,10 @@ export async function prepareSandboxManagedRuntime(input: {
                           { sourcePath: remoteOutput, targetPath: output, kind: "directory", preserveSourceEntries: true },
                         ] }];
                         assertSyncOperationsConfined(outbound, { sourceRoots: [runtimeRootDir], targetRoots: [tempDir] });
+                        beforeHostWrite();
                         await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(outbound));
                         checkpointSnapshot = readCheckpointSnapshot(path.join(output, "manifest.sqlite"), checkpointBaseline);
+                        beforeHostWrite();
                         await fs.rename(path.join(output, "payload"), extractedDir);
                         const metrics = await validateCheckpointPayload({ baseline: checkpointBaseline, snapshot: checkpointSnapshot, payload: extractedDir });
                         await input.onWorkspaceCheckpoint?.(metrics).catch(() => undefined);
@@ -2300,6 +2320,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     sourceRoots: [workspaceRemoteDir],
                     targetRoots: [extractedDir],
                   });
+                  beforeHostWrite();
                   await fs.mkdir(extractedDir, { recursive: true });
                   const workspaceRestore = makeTransferProgress(
                     restoreSink,
@@ -2308,6 +2329,7 @@ export async function prepareSandboxManagedRuntime(input: {
                     "workspace",
                     { sink: input.onRuntimeProgress, phase: "restore" },
                   );
+                  beforeHostWrite();
                   const syncResult = await withWorkspaceRestoreStep("workspace_transfer", () => input.client.syncOut!(operations));
                   const transferredBytes = sumSyncResultBytes(syncResult);
                   await workspaceRestore.finish(transferredBytes, transferredBytes);
@@ -2334,7 +2356,9 @@ export async function prepareSandboxManagedRuntime(input: {
                   await input.client.remove(remoteWorkspaceTar).catch(() => undefined);
                   const localArchivePath = path.join(tempDir, "workspace.tar");
                   await withWorkspaceRestoreStep("workspace_extract", async () => {
+                    beforeHostWrite();
                     await fs.writeFile(localArchivePath, archiveBuffer);
+                    beforeHostWrite();
                     await extractTarballToDirectory({
                       archivePath: localArchivePath,
                       localDir: extractedDir,
@@ -2354,8 +2378,10 @@ export async function prepareSandboxManagedRuntime(input: {
                       sourceDir: extractedDir,
                       ...(checkpointSnapshot ? { snapshots: { source: checkpointSnapshot } } : {}),
                       targetDir: input.workspaceLocalDir,
+                      signal: restoreSignal,
                       // Runs under the merge lock, before the first host write.
                       beforeApply: async () => {
+                        beforeHostWrite();
                         markHostWriteStarted();
                         if (!gitHeadToIntegrate) return;
                         await withWorkspaceRestoreStep("git_integration", () => integrateImportedGitHead({
@@ -2366,6 +2392,7 @@ export async function prepareSandboxManagedRuntime(input: {
                       },
                       afterApply: gitSnapshot
                         ? async () => {
+                            beforeHostWrite();
                             await withWorkspaceRestoreStep("index_reset", () => resetLocalGitIndexToHead({
                               localDir: input.workspaceLocalDir,
                               checkWorkingTreeClean: remoteWorkspaceStatus === "clean",
@@ -2378,7 +2405,9 @@ export async function prepareSandboxManagedRuntime(input: {
               } finally {
                 await disposeDirectorySnapshot(checkpointSnapshot ?? null);
                 await emitRuntimeStatus(input.onRuntimeProgress, "finalize", "Finalizing workspace");
-                if (importedRef) {
+                // An aborted owner leaves its uniquely named import ref rather
+                // than mutate the host repository after the abort.
+                if (importedRef && !restoreSignal?.aborted) {
                   await withWorkspaceRestoreStep("git_ref_cleanup", () => deleteLocalGitRef({ localDir: input.workspaceLocalDir, ref: importedRef! }));
                 }
               }
