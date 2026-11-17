@@ -5,8 +5,25 @@ import { answeredPersonMessageSql } from "./person-message-answer.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
+/** THE continuation seam every successor seed uses (wake-queue port, first-turn
+ * input, readContinuationCommentInput): the predecessor's still-pending person
+ * input. A person's resolution of a question the predecessor's agent asked on
+ * this task IS that input, so it comes first (answer-first, 4c1eea8e): the
+ * successor seeds from the answer, never the asking turn's comment.
+ * `agentId` is the predecessor run's agent, from trusted run state. */
 export async function pendingContinuationCommentInput(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+}): Promise<Record<string, unknown>> {
+  const answered = await pendingContinuationInteractionInput(db, input);
+  // An interaction-respond wake also names the asking turn's origin comment;
+  // carrying it makes the successor's contract re-request that turn and cuts its
+  // fresh history before the answer (upstream's seed carries no comment ids at all).
+  if (answered.interactionIds) return answered;
+  return pendingPersonCommentInput(db, input);
+}
+
+/** Rebind the parent's wake comments and first-turn input ids, not its receipt. */
+async function pendingPersonCommentInput(db: Pick<Db, "select">, input: {
   companyId: string; issueId: string; contextSnapshot: unknown;
 }): Promise<Record<string, unknown>> {
   const carried = carryContinuationCommentInput(input.contextSnapshot);
@@ -61,11 +78,6 @@ export async function readContinuationCommentInput(db: Pick<Db, "select">, input
   if (!source) return {};
   // A person's answer to the predecessor's question is pending input exactly as
   // a pending comment is: an automatic successor that drops it re-asks (RFL 09:35Z).
-  const answered = await pendingContinuationInteractionInput(db, { ...input, agentId: source.agentId, contextSnapshot: source.contextSnapshot });
-  // The current state is the answer. An interaction-respond wake also names the
-  // asking turn's origin comment; carrying it makes the successor's contract
-  // re-request that turn and cuts its fresh history before the answer (upstream's
-  // seed carries no comment ids at all).
-  if (answered.interactionIds) return answered;
-  return pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot });
+  return pendingContinuationCommentInput(db, { companyId: input.companyId, issueId: input.issueId,
+    agentId: source.agentId, contextSnapshot: source.contextSnapshot });
 }

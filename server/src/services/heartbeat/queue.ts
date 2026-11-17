@@ -1,3 +1,4 @@
+import { readContinuationCommentInput } from "../continuation-comment-input.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
@@ -2778,6 +2779,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
+      // H3 R-ONCE: a person's Retry of a run that held their answer takes that answer
+      // as input, through the one continuation seam (scope from the source run's own
+      // row, never this payload). Saved board messages keep their own Retry carry.
+      const answered = await readContinuationCommentInput(db, { companyId: receipt.companyId, issueId: issueId!,
+        runId: retry.sourceRunId });
+      if (answered.interactionIds) Object.assign(enrichedContextSnapshot, answered);
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
     }
 
