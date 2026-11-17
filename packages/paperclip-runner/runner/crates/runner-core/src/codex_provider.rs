@@ -5799,6 +5799,131 @@ done
         provider
     }
 
+    /// S2p shape (2) RED. Drives the production path run.prepare(different run)
+    /// -> rebind -> attach_run_with_provider_refresh -> attach_run_in_place
+    /// (provider_backend.rs prepare_with_legacy_attachment), then the run.attach
+    /// command -> attach_run -> attach_run_in_place again, against a real child
+    /// process speaking the pi_rpc app-server proxy frames. Pi's driver flushes
+    /// the idle `runner.pi.attach` timing span (pi-rpc-driver.ts #measure with
+    /// flushIdle) as `paperclip/providerPerformance` (proxy pumpEvents) before
+    /// the run.attach response, so request() buffers it (pending_messages), and
+    /// the first attach clears completed_turn_authority. The second attach then
+    /// skipped its tail drain and refused with `pending_messages`.
+    #[cfg(unix)]
+    fn pi_attach_with_buffered_tail_provider(extra_before_ack: &str) -> CodexProvider {
+        let script = r#"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"reader-tail-thread"}}}' ;;
+    *'"method":"run.attach"'*)
+      id=${line#*\"id\":}; id=${id%%,*}
+      printf '%s\n' '{"method":"paperclip/providerPerformance","params":{"threadId":"reader-tail-thread","spans":[{"name":"runner.pi.attach","outcome":"ok"}]}}'
+      __EXTRA__
+      printf '{"id":%s,"result":true}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"reader-tail-1"}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"turn":{"id":"reader-tail-1","status":"completed"}}}' ;;
+  esac
+done
+"#;
+        let config = CodexProviderConfig {
+            profile: None,
+            provider: "codex".to_owned(),
+            driver: "codex_app_server".to_owned(),
+            provider_version: "reader-tail-fixture".to_owned(),
+            command: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                script.replace("__EXTRA__", extra_before_ack),
+            ],
+            cwd: std::env::current_dir()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            model: None,
+            provider_session_id: None,
+            instructions: "Test only.".to_owned(),
+            approval_policy: "never".to_owned(),
+            externally_sandboxed: false,
+            read_only: false,
+            include_skill_instructions: None,
+            conversation_mode: None,
+        };
+        let mut provider = CodexProvider::start(&config, None).unwrap();
+        provider.start_turn("First turn", &config.cwd).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline);
+            if matches!(provider.poll().unwrap(), Some(CodexProviderEvent::Notification { method, .. }) if method == "turn/completed")
+            {
+                break;
+            }
+        }
+        provider.config.provider = "pi_rpc".to_owned();
+        provider
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_after_prepare_rebind_drains_the_settled_attach_tail() {
+        let mut provider = pi_attach_with_buffered_tail_provider(":");
+        let context = json!({"runId": "answer-run"});
+        // run.prepare for the person's answer run rebinds in place.
+        assert!(provider
+            .attach_run_in_place([], None, Some(("Answer run", &context, "answer-run")), &mut Vec::new())
+            .unwrap());
+        // Exactly this frame sits in pending_messages, buffered by request().
+        let buffered = provider
+            .pending_messages
+            .iter()
+            .map(|message| message.value["method"].as_str().unwrap_or("").to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(buffered, ["paperclip/providerPerformance"]);
+        assert!(provider.completed_turn_authority.is_none());
+        // The run.attach command for the same answer run must not refuse.
+        let mut accounting = Vec::new();
+        let attached = provider.attach_run_in_place(
+            [],
+            None,
+            Some(("Answer run", &context, "answer-run")),
+            &mut accounting,
+        );
+        assert!(
+            attached.as_ref().is_ok_and(|kept| *kept),
+            "settled attach tail must not refuse the answer run: {attached:?}"
+        );
+        assert!(accounting.is_empty());
+        provider.shutdown().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pi_run_attach_still_refuses_buffered_live_work_after_prepare_rebind() {
+        // Negative controls: a new turn or a provider request buffered during
+        // the rebind is live work, never history. Attachment stays fail-closed.
+        for extra in [
+            r#"printf '%s\n' '{"method":"turn/started","params":{"threadId":"reader-tail-thread","turn":{"id":"live-turn-2"}}}'"#,
+            r#"printf '%s\n' '{"method":"item/started","params":{"threadId":"reader-tail-thread","turnId":"live-turn-2","item":{"id":"i"}}}'"#,
+            r#"printf '%s\n' '{"id":77,"method":"item/tool/call","params":{"threadId":"reader-tail-thread","turnId":"reader-tail-1","callId":"c","tool":"t","arguments":{}}}'"#,
+        ] {
+            let mut provider = pi_attach_with_buffered_tail_provider(extra);
+            let context = json!({"runId": "answer-run"});
+            assert!(provider
+                .attach_run_in_place([], None, Some(("Answer run", &context, "answer-run")), &mut Vec::new())
+                .unwrap());
+            assert_eq!(provider.pending_messages.len(), 2, "{extra}");
+            let attached = provider.attach_run_in_place(
+                [],
+                None,
+                Some(("Answer run", &context, "answer-run")),
+                &mut Vec::new(),
+            );
+            assert!(attached.is_err(), "{extra}: live work must refuse: {attached:?}");
+            provider.shutdown().unwrap();
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn malformed_tool_call_refusals_preserve_pending_calls_and_capacity() {
