@@ -26,6 +26,8 @@ import {
   undeliveredConversationComments,
 } from "../services/agent-conversations.js";
 import { answeredPersonMessageSql } from "../services/person-message-answer.js";
+import { createWakeQueue } from "../modules/wake-queue/index.js";
+import { settleUnansweredPersonMessage, UNANSWERED_MESSAGE_REASON_PREFIX } from "../services/recovery/unanswered-person-message.js";
 import { runningProcesses } from "../adapters/index.js";
 import {
   getEmbeddedPostgresTestSupport,
@@ -177,17 +179,47 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       .send({ queueId, targetRunId: chat.runId, revision: queue.body.revision });
   }
 
-  /** The turn publishes its reply, succeeds and settles. */
-  async function finishTurn(chat: Chat) {
+  /** The run log of a turn that read each steered message and replied to it in text before anything else. */
+  async function answeredLog(chat: Chat) {
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const steered = ((run!.contextSnapshot as any).steeredCommentIds ?? []) as string[];
+    if (steered.length === 0) return;
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      ...steered.flatMap((id, index) => [
+        { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${id}` },
+        { eventType: "item.started", kind: "userMessage", itemId: `turn-1:steered-${index}` },
+        { eventType: "item.started", kind: "agentMessage", itemId: `turn-1:reply-${index}`, text: "" },
+        { eventType: "item.completed", kind: "agentMessage", itemId: `turn-1:reply-${index}`, text: `Reply ${index}` },
+      ]),
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+  }
+
+  const releaseDeps = {
+    resolveResponsibleUserId: async () => owner,
+    getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+    resolveSessionBeforeForWakeup: async () => null,
+  };
+  /** The run end's real release (run-completion.ts: settle, then releaseIssueExecutionAndPromote). */
+  async function releaseRun(chat: Chat) {
+    return createWakeQueue(db, releaseDeps as never).releaseIssueExecution({
+      companyId: chat.companyId, runId: chat.runId, now: new Date() });
+  }
+
+  /** The turn publishes its reply, ends (succeeded by default), settles and is released. */
+  async function finishTurn(chat: Chat, options: { status?: "succeeded" | "failed"; log?: boolean } = {}) {
+    if (options.log !== false) await answeredLog(chat);
     await db.insert(issueComments).values({
       companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent", authorAgentId: chat.agentId,
       createdByRunId: chat.runId, body: "Agent reply",
     });
-    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+    await db.update(heartbeatRuns).set({ status: options.status ?? "succeeded", finishedAt: new Date() })
       .where(eq(heartbeatRuns.id, chat.runId));
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     await settleConversationTurn(db, run!);
     const [issue] = await db.select().from(issues).where(eq(issues.id, chat.issue.id));
+    await releaseRun(chat);
     return issue!;
   }
 
@@ -307,8 +339,9 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     expect(issue).toMatchObject({ status: "in_progress", conversationState: "active" });
     expect(await answered(head!.id)).toBe(true);
     expect(await answered(next!.id)).toBe(false);
-    const [remaining] = await deferredWakes(chat);
-    expect(wakeCommentIds(remaining!)).toEqual([next!.id]);
+    // The run end promotes it: it waits for the next turn once (a deferred wake, or the run it became).
+    const carriers = await carriersOf(chat, next!.id);
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
   });
 
   // RFL (3): merged messages are each answered once, none lost, none doubled.
@@ -581,7 +614,7 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   });
 
   /** The runner's durable run log for the live turn (validated PRP events, in order). */
-  async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string }>) {
+  async function runLog(chat: Chat, events: Array<{ eventType: string; kind?: string; itemId: string; text?: string }>) {
     // Allocate sequences as run-event ingestion does (heartbeat_runs.next_event_seq).
     const [allocated] = await db.update(heartbeatRuns)
       .set({ nextEventSeq: sql`${heartbeatRuns.nextEventSeq} + ${events.length}` })
@@ -590,7 +623,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     await db.insert(heartbeatRunEvents).values(events.map((event, index) => ({
       companyId: chat.companyId, runId: chat.runId, agentId: chat.agentId, seq: first + index,
       eventType: event.eventType, sourceEventId: randomUUID(),
-      payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId, payload: event.kind ? { kind: event.kind } : {} } },
+      payload: { prpEvent: { turnId: "turn-1", itemId: event.itemId,
+        payload: event.kind ? { kind: event.kind, ...(event.text === undefined ? {} : { text: event.text }) } : {} } },
     })));
   }
 
@@ -617,7 +651,8 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
   // had not read yet is dropped by Stop's clear_queue. After a person's Stop it
   // waits again, at its place, and one Send delivers it once. A steer the model
   // read (Pi's userMessage receipt) stays with the stopped turn: no double answer.
-  it.each(["unread", "read"] as const)("after a person's Stop, a steered message the model had not read waits again and one Send delivers it once (%s)", async (variant) => {
+  // The answered rule: read is not answered. Only text after the read, before the next tool or the end, answers it.
+  it.each(["unread", "read-no-reply", "read-answered"] as const)("after a person's Stop, a steered message the model had not read waits again and one Send delivers it once (%s)", async (variant) => {
     const chat = await seedChat();
     const [b, c] = await send(chat, ["B, steered", "C, waiting"]);
     const [wake] = await deferredWakes(chat);
@@ -627,16 +662,17 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
       { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
       { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b!.id}` },
       // Pi put B into the conversation: the model read it.
-      ...(variant === "read" ? [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }] : []),
+      ...(variant !== "unread" ? [{ eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" }] : []),
+      ...(variant === "read-answered" ? [{ eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:reply", text: "B: yes" }] : []),
     ]);
     await personStop(chat);
-    const expected = variant === "unread" ? [b!.id, c!.id] : [c!.id];
+    const expected = variant === "read-answered" ? [c!.id] : [b!.id, c!.id];
     const queue = await request(app(chat.companyId)).get(`/api/issues/${chat.issue.id}/queued-comments`).expect(200);
     expect(queue.body.entries.map((entry: any) => entry.comment.id)).toEqual(expected);
     expect(queue.body.executionWait).toEqual({ reason: "stopped_by_person", message: STOPPED_LINE });
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
     expect((stopped!.contextSnapshot as any).wakeCommentIds)
-      .toEqual(variant === "unread" ? [chat.first.id] : [chat.first.id, b!.id]);
+      .toEqual(variant === "read-answered" ? [chat.first.id, b!.id] : [chat.first.id]);
     expect(await answered(b!.id)).toBe(false);
 
     // The owner's Send: one turn with the waiting messages, each once, in order.
@@ -676,5 +712,125 @@ describeEmbeddedPostgres("agent chat steering and queue shape", () => {
     const wakes = await deferredWakes(chat);
     expect(queue.body.queueId).toBe(wakes[0]!.id);
     expect(queue.body.entries.slice(1).map((entry: any) => entry.queueId)).toEqual([wakes[1]!.id, wakes[2]!.id]);
+  });
+
+  // NEVER-OK (PV2 s3, run 0bf8d84e): a steered message the run did not answer is
+  // never counted answered at a normal run end, and is never lost. The busy run has
+  // a tool chain; B is steered mid-turn and its ack recorded; the run replies to A
+  // and ends. The answered rule decides from the run log, for EVERY run end.
+  const SHAPES = {
+    // Pi never emits B's userMessage.
+    unread: (b: string) => [
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-1" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b}` },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-1" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:final", text: "" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:final", text: "A: done." },
+    ],
+    // THE LIVE SHAPE: Pi reads B at the tool boundary (seq 283), the model reasons
+    // (seq 290) and starts the next shell call (seq 294) with no reply text, then
+    // its final reply falsely claims B was answered.
+    "read-no-reply": (b: string) => [
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-1" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-1" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b}` },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-1" },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" },
+      { eventType: "item.completed", kind: "userMessage", itemId: "turn-1:steered" },
+      { eventType: "item.started", kind: "reasoning", itemId: "turn-1:thinking" },
+      { eventType: "item.completed", kind: "reasoning", itemId: "turn-1:thinking", text: "I'll reply to it first, with no tools" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-2" },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-2" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-2" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:final", text: "" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:final", text: "A done; M0006 was answered at the boundary." },
+    ],
+    // Positive: B is read and reply text follows before the next tool. Pi streams the
+    // tool call's start before the message ends, so the text block STARTS first.
+    "read-answered": (b: string) => [
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-1" },
+      { eventType: "item.completed", kind: "steering_acknowledgement", itemId: `turn-1:steer:${b}` },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-1" },
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:steered" },
+      { eventType: "item.started", kind: "agentMessage", itemId: "turn-1:b-reply", text: "" },
+      { eventType: "item.started", kind: "commandExecution", itemId: "turn-1:tool-2" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:b-reply", text: "B: yes, after this." },
+      { eventType: "tool.execution.started", itemId: "turn-1:tool-2" },
+      { eventType: "tool.execution.completed", itemId: "turn-1:tool-2" },
+      { eventType: "item.completed", kind: "agentMessage", itemId: "turn-1:final", text: "A: done." },
+    ],
+  };
+
+  /** Every place B can wait for its delivery: deferred/queued wakes and runs other than the steered one. */
+  async function carriersOf(chat: Chat, id: string) {
+    const wakes = (await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, chat.companyId),
+      sql`${agentWakeupRequests.status} in ('deferred_issue_execution', 'queued')`,
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${chat.issue.id}`,
+    ))).filter((wake) => !wake.runId).filter((wake) => wakeCommentIds(wake).includes(id) || ((wake.payload as any).queuedCommentIds ?? []).includes(id));
+    const runs = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, chat.companyId),
+      sql`${heartbeatRuns.id} <> ${chat.runId}`))).filter((run) => {
+      const context = run.contextSnapshot as any;
+      return [...(context.wakeCommentIds ?? []), ...(context.firstTurnQueuedInput?.commentIds ?? [])].includes(id);
+    });
+    return { wakes, runs };
+  }
+
+  it.each([
+    ["unread", "succeeded"], ["unread", "failed"],
+    ["read-no-reply", "succeeded"], ["read-no-reply", "failed"],
+    ["read-answered", "succeeded"], ["read-answered", "failed"],
+  ] as const)("at a run end, a steered message is answered only by reply text after its read (%s, %s)", async (shape, status) => {
+    const chat = await seedChat();
+    const [b] = await send(chat, ["B, steered mid-turn"]);
+    const [wake] = await deferredWakes(chat);
+    mocks.steer.mockResolvedValueOnce({ turnId: "turn-1" });
+    expect((await steer(chat, b!.id, wake!.id)).status).toBe(200);
+    await runLog(chat, [
+      { eventType: "item.started", kind: "userMessage", itemId: "turn-1:input" },
+      ...SHAPES[shape](b!.id),
+      { eventType: "turn.completed", itemId: "turn-1:end" },
+    ]);
+    await finishTurn(chat, { status, log: false });
+    const [ended] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, chat.runId));
+    const carriers = await carriersOf(chat, b!.id);
+    if (shape === "read-answered") {
+      expect(await answered(b!.id)).toBe(true);
+      expect((ended!.contextSnapshot as any).answeredSteeredCommentIds).toEqual([b!.id]);
+      // No second delivery.
+      expect(carriers.wakes.length + carriers.runs.length).toBe(0);
+      return;
+    }
+    // B is NOT answered: the run that never replied to it no longer carries it.
+    expect(await answered(b!.id)).toBe(false);
+    expect((ended!.contextSnapshot as any).wakeCommentIds).toEqual([chat.first.id]);
+    expect((ended!.contextSnapshot as any).steeredCommentIds).toEqual([]);
+    expect((ended!.resultJson as any).restoredSteeredCommentIds).toEqual([b!.id]);
+    // B waits for the next turn, delivered ONCE: one wake or one successor run carries it.
+    expect(carriers.wakes.length + carriers.runs.length).toBe(1);
+    // A repeated release (a stranded-queue retry) neither doubles nor drops it.
+    await releaseRun(chat);
+    const again = await carriersOf(chat, b!.id);
+    expect(again.wakes.length + again.runs.length).toBe(1);
+    // The sweep's pending path explains it: NO "not answered / send it again" notice for B.
+    const outcome = await settleUnansweredPersonMessage(db, { companyId: chat.companyId, issueId: chat.issue.id });
+    expect(outcome.kind).not.toBe("noticed");
+    const notices = await db.select().from(issueComments).where(and(eq(issueComments.issueId, chat.issue.id),
+      sql`${issueComments.metadata}->>'authorizationReason' = ${UNANSWERED_MESSAGE_REASON_PREFIX + b!.id}`));
+    expect(notices).toHaveLength(0);
+    // The successor answers it: B is answered exactly once (R-ONCE).
+    const [successor] = again.runs.length ? again.runs : await db.insert(heartbeatRuns).values({
+      companyId: chat.companyId, agentId: chat.agentId, status: "running", runtimeMode: "native",
+      contextSnapshot: (again.wakes[0]!.payload as any)._paperclipWakeContext,
+    }).returning();
+    expect((successor!.contextSnapshot as any).wakeCommentIds).toContain(b!.id);
+    await db.insert(issueComments).values({
+      companyId: chat.companyId, issueId: chat.issue.id, authorType: "agent", authorAgentId: chat.agentId,
+      createdByRunId: successor!.id, body: "B: answered by the next turn",
+    });
+    expect(await answered(b!.id)).toBe(true);
+    const answeringRuns = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, chat.companyId)))
+      .filter((run) => ((run.contextSnapshot as any).wakeCommentIds ?? []).includes(b!.id));
+    expect(answeringRuns.map((run) => run.id)).toEqual([successor!.id]);
   });
 });

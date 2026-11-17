@@ -9,7 +9,8 @@ export const COMPANY_IMPORTED_ACTION = "company.imported";
 /** A person message is answered by a published agent reply attributed to it or to a later person input, or it is
  * imported history. Shared by recovery input selection (continuation-comment-input.ts) and the
  * unanswered-person-message notice, so the carry and the notice never disagree on a message.
- * - Provider acceptance/delivery alone is NOT an answer.
+ * - Provider acceptance/delivery alone is NOT an answer. A steered message (r.steeredCommentIds) counts for its
+ *   run r only when r's end recorded it answered (r.answeredSteeredCommentIds; the answered rule).
  * - A run-less agent comment NEVER answers (RFL 20:22Z): the Muse external agent's task.comment and agent chat
  *   messages outside a run post them.
  * - Imported history: a PERSON comment marked origin='import' at insertion, regardless of its source timestamp.
@@ -27,6 +28,11 @@ export function answeredPersonMessageSql(m: { id: SQL; companyId: SQL; issueId: 
           and (b.id = ${m.id} or (b.created_at > ${m.createdAt}
             -- A steered message can overtake earlier queued ones; it answers only itself.
             and not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text))
+          -- A message steered into run r is answered by r only under the answered rule, recorded at r's end
+          -- (wake-queue release, steered-message-answers.ts): read is not answered, and an unrecorded
+          -- acknowledgement is unread. Until then, and when the rule fails, r's replies never answer it.
+          and (not coalesce(r.context_snapshot->'steeredCommentIds', '[]'::jsonb) ? b.id::text
+            or coalesce(r.context_snapshot->'answeredSteeredCommentIds', '[]'::jsonb) ? b.id::text)
           and (r.context_snapshot->>'wakeCommentId' = b.id::text or r.context_snapshot->>'commentId' = b.id::text
             or r.context_snapshot->>'conversationReplyBoundaryCommentId' = b.id::text
             or coalesce(r.context_snapshot->'wakeCommentIds', '[]'::jsonb) ? b.id::text
