@@ -190,3 +190,30 @@ export async function clearLeaseCollectionPin(db: Db, input: {
  */
 export const agentFileHoldWriteCondition = sql`(select bool_or(${liveDestroyClaimSql(sql`held_lock.metadata`)})
     from (${allocationRows(sql`agent_instruction_working_copies.receipt->'cleanup'->>'leaseId'`)}) held_lock) is not true`;
+
+/** A copy needs no retirement collection: verified save/unchanged, handed off,
+ * or settled without a held save after recorded stop (proven loss/prepare failure). */
+export function agentFileCopyRetirementSettled(row: { state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null }): boolean {
+  if (["saved", "unchanged", "resolved"].includes(row.state)) return true;
+  if (row.receipt?.savePending != null) return false;
+  return row.state === "superseded" || Boolean(row.receipt?.retainedByRunId)
+    || row.state === "unavailable" && row.processStoppedAt != null;
+}
+
+/**
+ * Agent-file copies whose only unsaved bytes may be on this box: the lease's
+ * own run's copy, or any copy bound to this lease, without a settled receipt
+ * (agentFileCopyRetirementSettled). A retirement (CR6) collects these through
+ * the Stop collector before it stops or destroys the box.
+ */
+export async function agentFileCopiesToCollectOnLease(db: Pick<Db, "execute">, lease: HoldLease & { heartbeatRunId?: string | null }): Promise<string[]> {
+  if (typeof (db as Db).execute !== "function") return [];
+  const rows = await (db as Db).execute(sql`select run_id::text as run_id from agent_instruction_working_copies
+    where company_id = ${lease.companyId}
+      and receipt->>'schema' = 'paperclip.agent-files.v1'
+      and (run_id::text = ${lease.heartbeatRunId ?? null}::text or receipt->'cleanup'->>'leaseId' = ${lease.id}::text)
+      and not (state in ('saved', 'unchanged', 'resolved')
+        or (not (receipt ? 'savePending') and (state = 'superseded' or coalesce(receipt->>'retainedByRunId', '') <> ''
+          or (state = 'unavailable' and process_stopped_at is not null))))`);
+  return Array.isArray(rows) ? rows.map(row => String((row as { run_id: unknown }).run_id)) : [];
+}
