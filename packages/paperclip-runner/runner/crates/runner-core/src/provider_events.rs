@@ -1722,6 +1722,34 @@ pub(crate) fn normalize_pi_notification_in(
             }
         }
     }
+    // Pi tool results arrive already bounded by the Pi projector's record
+    // budget and are exactly what Pi returned to the model (including Pi's own
+    // page footer and spill path). Keep them whole (redacted) in run events
+    // instead of the 4,096-byte diagnostic preview; the durable outbox keeps
+    // its schema/frame bounds.
+    if matches!(method, "item/updated" | "item/completed")
+        && matches!(
+            string(item(params).get("type")),
+            "commandExecution" | "mcpToolCall" | "dynamicToolCall" | "builtinToolCall"
+        )
+    {
+        let raw = string(
+            item(params)
+                .get("aggregatedOutput")
+                .or_else(|| item(params).get("output")),
+        );
+        let redacted = redact_sensitive_text_values(raw);
+        for event in &mut events {
+            if matches!(
+                event.event_type.as_str(),
+                "tool.execution.progressed" | "tool.execution.completed"
+            ) && event.payload.get("output").is_some()
+            {
+                event.payload["outputTruncated"] = json!(redacted != raw);
+                event.payload["output"] = json!(redacted.clone());
+            }
+        }
+    }
     events
 }
 
