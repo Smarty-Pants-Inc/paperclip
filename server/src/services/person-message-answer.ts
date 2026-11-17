@@ -100,6 +100,26 @@ export function answeredPersonMessageSql(m: PersonMessageSql): SQL {
     or ${importedPersonHistorySql(m)})`;
 }
 
+/** Whether ALL person inputs carried by a run's durable chain are answered.
+ * No input is not proof of an answer. Transcript history never enters this
+ * set, and an unanswered sibling input keeps Retry available. */
+export function runPersonInputAnsweredSql(input: { companyId: SQL; issueId: SQL; runId: SQL }): SQL<boolean> {
+  const carries = (id: SQL) => sql`exists (select 1 from source_chain link
+    join ${heartbeatRuns} carrying on carrying.id = link.id and carrying.company_id = ${input.companyId}
+    where ${carriesCommentSql("carrying", id)})`;
+  return sql<boolean>`(${freshContinuationSourceChainSql(input, true)}, carried_person_input as (
+    select m.id, m.company_id, m.issue_id, m.created_at from ${issueComments} m
+      where m.company_id = ${input.companyId} and m.issue_id = ${input.issueId}
+        and m.author_type = 'user' and m.deleted_at is null and ${carries(sql`m.id`)}
+    union all
+    select q.id, q.company_id, q.issue_id, q.resolved_at from ${issueThreadInteractions} q
+      where q.company_id = ${input.companyId} and q.issue_id = ${input.issueId}
+        and q.resolved_by_user_id is not null and q.resolved_at is not null
+        and q.status in ('answered', 'accepted', 'rejected') and ${carries(sql`q.id`)}
+    ) select coalesce(bool_and(${answeredPersonMessageSql({ id: sql`pending.id`, companyId: sql`pending.company_id`,
+      issueId: sql`pending.issue_id`, createdAt: sql`pending.created_at` })}), false) from carried_person_input pending)`;
+}
+
 /** Card statuses a person's own answer leaves; administrative ends (withdraw,
  * cancel, expiry) are not an answer and create no duty. */
 const CARD_ANSWER_STATUSES = ["answered", "accepted", "rejected"] as const;

@@ -38,6 +38,14 @@ describe("ordinary task interruption", () => {
     expect(container.querySelector("a, details, input, textarea")).toBeNull();
     expect(container.textContent).not.toMatch(/service attention|process|receipt|workspace/i);
   });
+  it("removes Retry when the failed message is answered on a later run", async () => {
+    await render();
+    expect(container.querySelector('[data-testid="task-execution-retry"]')).not.toBeNull();
+    await render({ ...failed, state: "resolved", canRetry: false });
+    expect(container.querySelector('[data-testid="task-execution-retry"]')).toBeNull();
+    expect(container.textContent).toBe("");
+    expect(retry).not.toHaveBeenCalled();
+  });
   it("keeps the failure visible and names the gate while a saved Retry waits on the budget", async () => {
     await render({ ...failed, responsibility: "user", state: "waiting_for_user", userAction: "budget", canRetry: false });
     const notice = container.querySelector('[data-testid="task-execution-waiting"]');

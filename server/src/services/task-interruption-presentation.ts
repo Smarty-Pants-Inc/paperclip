@@ -24,6 +24,7 @@ import { chatActionDeadline } from "./chat-action-work.js";
 import { NATIVE_CLEANUP_SETTLING_MESSAGE, NATIVE_SESSION_CLEANUP_QUARANTINED } from "./native-runtime/completed-turn-cleanup.js";
 import { isAcknowledgedLegacyUserStop, isQueuedDependencyWait, runStopPresentationJson } from "./run-cancellation.js";
 import { heldRetryOffersRetry } from "./task-retry-eligibility.js";
+import { runPersonInputAnsweredSql } from "./person-message-answer.js";
 import { exhaustedNativeFinalizationCondition, savedResultRetryPendingCondition } from "./native-runtime/exhausted-finalization-retry.js";
 import { AI_CONNECTION_BUSY_RETRY_REASON, AI_CONNECTION_POOL_WAIT_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON } from "../modules/run-dispatch/index.js";
@@ -71,6 +72,8 @@ type ProjectionRun = Pick<typeof heartbeatRuns.$inferSelect,
   nativeFinalizationRetryPending?: boolean;
   /** The configured model id the provider rejected (native_provider_model_rejected only). */
   rejectedModel?: string | null;
+  /** Every person input on this failed run's chain is already answered. */
+  personInputAnswered?: boolean;
   /** A cleanup-gate refusal after this run's own provider turn completed; its work is saved. */
   completedTurnCleanup?: boolean;
 };
@@ -247,6 +250,9 @@ function projectTaskInterruptionState(issue: ProjectionIssue, input: ProjectionS
     state: "resolved", nextRetryAt: null, canRetry: false, userAction: null,
     sourceRunIds: [run.id], observedRunId: run.id };
   if (["done", "cancelled"].includes(issue.status)) return base;
+  // A later run already answered this attempt's carried input. Its historical
+  // failure is not a reason to offer another Retry (R-ONCE).
+  if (run.personInputAnswered) return base;
   // Retry took effect: the saved result is being applied again.
   if (run.status === "succeeded" && run.nativeFinalizationRetryPending)
     return { ...base, state: "working", recoveryStep: "finishing_recovery" };
@@ -467,6 +473,9 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and ${heartbeatRuns.error} ~ '^(Execution workspace provision|Workspace seed|Runtime provision) command "'
         then ${heartbeatRuns.error} else null end`,
       errorCode: heartbeatRuns.errorCode, livenessState: heartbeatRuns.livenessState, scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+      personInputAnswered: sql<boolean>`case when ${heartbeatRuns.status} in ('failed', 'timed_out', 'interrupted', 'cancelled')
+        then ${runPersonInputAnsweredSql({ companyId: sql`${heartbeatRuns.companyId}`, issueId: requestedUuid,
+          runId: sql`${heartbeatRuns.id}` })} else false end`,
       // The model this run asked the provider for; configuration, not provider text.
       // Saved fields only, so quarantines written by earlier releases read the same.
       completedTurnCleanup: sql<boolean>`coalesce(${heartbeatRuns.runtimeMode} = 'native' and ${heartbeatRuns.status} = 'failed'
