@@ -1679,6 +1679,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     if (run.status !== "cancelled" || !hasAcknowledgedNativeRunStopRequest(run)
       || !["reuse_by_environment", "reuse_by_execution_workspace"].includes(lease.leasePolicy)
       || admittedNativeResourceDisposition(run.runnerProfileJson) !== "keep_running") return "destroy";
+    // adopt-stopu-xpaths: the export runs at the ONE release-site guard
+    // (run-control releaseEnvironmentLeasesForRun -> person-stop-release-export.ts).
     return nativeStopWorkspaceOutcome({ admittedDisposition: "keep_running", stopped: true, source: lease }) === "handoff"
       ? "keep_running" : "stop_and_retain";
   }
