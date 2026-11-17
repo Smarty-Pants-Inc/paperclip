@@ -548,7 +548,7 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     }
   }, 90_000);
 
-  it("backs off a lasting pre-turn failure and stops at the shared lane cap without hammering", async () => {
+  it("(superseded by replacement: retry_scheduled before due, RFL record SUPERSEDE-SETTLE-BACKOFF-WORKING-1117) backs off a lasting pre-turn failure and stops at the shared lane cap without hammering", async () => {
     const { companyId } = fixture.current;
     const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
     const [environment] = await db.insert(environments).values({ name: `capture-${randomUUID()}`, driver: "sandbox" }).returning();
