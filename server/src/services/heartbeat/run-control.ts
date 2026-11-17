@@ -3,7 +3,7 @@ import { withAccountingTransaction } from "../accounting-transaction.js";
 import { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 export { providerResourceDispositionForTerminalRun } from "../runner-environment-lifecycle.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
+import { isWellFormedExecutionWait, wellFormedExecutionWaitSql, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { observeStoppedWorkspaceRecovery } from "../workspace-recovery.js";
 import { notifyScheduledRetryCancellation } from "../scheduled-retry-cancellation-notifications.js";
@@ -816,12 +816,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, requestId),
       eq(agentWakeupRequests.status, "deferred_issue_execution"),
       eq(agentWakeupRequests.requestedByActorType, "user"),
-      sql`${agentWakeupRequests.payload}->'executionWait' is not null`,
+      // The executor's own wait shape (deferred-execution-wait.ts), not just
+      // "some JSON": JSON null, false, a string, an array or {} never qualify.
+      wellFormedExecutionWaitSql(agentWakeupRequests.payload),
       sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
       sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
     ));
     const issueId = readNonEmptyString(wake?.payload?.issueId);
-    if (!wake || !issueId || !isUuidLike(issueId)) return null;
+    if (!wake || !isWellFormedExecutionWait(wake.payload?.executionWait) || !issueId || !isUuidLike(issueId)) return null;
     const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, wake.agentId),
       or(sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`, eq(heartbeatRuns.nativeIssueId, issueId)),
