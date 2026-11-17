@@ -5,7 +5,7 @@ export function SavedOutputNotice({ kind = "output", runLogHref, fullTextKept = 
   return (
     <p className="text-xs text-muted-foreground">
       {fullTextKept ? "The full output is kept on the agent's machine while it runs." : `The runner saved only part of this ${kind}.`}
-      {runLogHref ? <> <Link className="underline underline-offset-4" to={runLogHref}>Open the run log</Link> for the saved output.</> : null}
+      {runLogHref ? <> <Link className="underline underline-offset-4" to={runLogHref}>Open the run log</Link>{fullTextKept ? "." : " for the saved output."}</> : null}
     </p>
   );
 }

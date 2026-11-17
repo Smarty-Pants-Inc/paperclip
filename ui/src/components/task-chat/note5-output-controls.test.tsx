@@ -36,6 +36,7 @@ describe("NOTE 5: full output controls and honest producer-limit copy", () => {
     expect(container.textContent).not.toMatch(/truncated|saved only part|\bcut\b/i);
     expect(container.textContent).toContain("The full output is kept on the agent's machine while it runs.");
     expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.textContent).toContain("run log");
+    expect(container.querySelector('a[href="/PAP/agents/agent-1/runs/run-1"]')?.closest("p")?.textContent).toBe("The full output is kept on the agent's machine while it runs. Open the run log.");
     expect(container.querySelector("pre")?.textContent).toBe(text);
   });
   // RFL's four qualified production-component regressions (round 2).
