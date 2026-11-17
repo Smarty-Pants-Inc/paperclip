@@ -76,12 +76,12 @@ describe("cross-issue influence limit configuration", () => {
     });
   });
 
-  it("defaults to the built-in limit and ignores invalid values", () => {
+  it("defaults only when absent and refuses malformed values", () => {
     expect(resolveCrossIssueInfluenceLimit({})).toBe(CROSS_ISSUE_INFLUENCE_LIMIT);
     for (const bad of ["", " ", "0", "-5", "1.5", "abc", "1e3"]) {
-      expect(
+      expect(() =>
         resolveCrossIssueInfluenceLimit({ PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT: bad }),
-      ).toBe(CROSS_ISSUE_INFLUENCE_LIMIT);
+      ).toThrow("Invalid PAPERCLIP_CROSS_ISSUE_INFLUENCE_LIMIT: expected a positive safe integer.");
     }
   });
 
