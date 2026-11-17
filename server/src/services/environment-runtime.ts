@@ -8,6 +8,7 @@ import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, readReplaceBeforeReuseMarker } from "./native-runtime/predecessor-retirement.js";
+import { awaitWarmOwnerSandboxCloses, ownPredecessorSettleDeadline } from "./native-runtime/warm-owner-sandbox-closes.js";
 import {
   REUSABLE_SANDBOX_IDLE_RESUME_BUDGET_MS,
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -4649,6 +4650,12 @@ export function environmentRuntimeService(
               eq(environmentLeases.id, leaseRow.id), eq(environmentLeases.companyId, leaseRow.companyId),
             )))[0] ?? leaseRow;
           }
+          // release-order: a warm owner still closing on this sandbox (its
+          // checkpoint copies the harness out through the provider) finishes
+          // before any release, stop or destroy of the sandbox, which would
+          // revoke that copy mid-flight. Bounded by this run's one
+          // predecessor-settle deadline; past it the lease is left for retry.
+          await awaitWarmOwnerSandboxCloses(leaseRow.providerLeaseId, ownPredecessorSettleDeadline(heartbeatRunId));
           const warmRetention = await settleWarmRetention(db, leaseRow, providerResourceDisposition);
           if (!warmRetention) continue; // Another release or handoff already settled this owner.
           leaseRow = warmRetention.lease;
