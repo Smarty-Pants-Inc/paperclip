@@ -24,15 +24,59 @@ import { isSupersededWorkspaceExport, markSupersededWorkspaceExportHold } from "
 
 const reusableLeasePolicies = ["reuse_by_environment", "reuse_by_execution_workspace"];
 
+/** What a Stop leaves behind in a prepared native workspace. */
+export type NativeStopWorkspaceOutcome = "handoff" | "preserve";
+
+/** The resource disposition admitted for the run (runtime-selection's
+ * keep_running / stop_and_retain / destroy), as persisted with the run. */
+export function admittedNativeResourceDisposition(profile: Record<string, unknown> | null | undefined) {
+  return readNativeWorkspaceSyncReference(profile?.nativeWorkspaceSync)?.resourceDisposition
+    ?? profile?.nativeResourceDisposition ?? null;
+}
+
+/** The ONE Stop policy shared by every producer of the native-workspace:<run>
+ * hold: the heartbeat's cancellation-pending-recovery handler, the event-driven
+ * cancelled-workspace worker and the cancelled-workspace sweep. An ordinary
+ * Stop of a turn admitted on a warm (keep_running) box is a handoff: the box
+ * keeps running with the turn's prepared files in place for the next message
+ * (heartbeat/run-control.ts warm rule), so no failed workspace is recorded.
+ * Anything else keeps the existing preservation, including a warm box that
+ * later really stopped (its lease released with stop receipts). */
+export function nativeStopWorkspaceOutcome(input: {
+  admittedDisposition: unknown;
+  /** The Stop evidence: an acknowledged run-only Stop of a cancelled run, or the
+   * executor's cancellation-pending-recovery signal after one. */
+  stopped: boolean;
+  /** The run's source lease when known; it must still be the running box. */
+  source?: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata"> | null;
+}): NativeStopWorkspaceOutcome {
+  if (input.admittedDisposition !== "keep_running" || !input.stopped) return "preserve";
+  const source = input.source;
+  if (source && (!["active", "retained"].includes(source.status)
+    || (source.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined)?.state === "stopped"
+    || source.metadata?.sandboxStopAndRetainReceipt != null)) return "preserve";
+  return "handoff";
+}
+
+function cancelledNativeRunWorkspaceOutcome(run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "status" | "nativeIssueId" | "resultJson" | "runnerProfileJson">,
+  source: Pick<typeof environmentLeases.$inferSelect, "status" | "metadata">) {
+  return nativeStopWorkspaceOutcome({ admittedDisposition: admittedNativeResourceDisposition(run.runnerProfileJson),
+    stopped: run.status === "cancelled" && hasAcknowledgedNativeRunStopRequest(run), source });
+}
+
 /** The exact source the restore recorder can retain. A released reusable lease
  * qualifies only with a confirmed stop-and-retain receipt and the remote
  * workspace binding proof. Native-sync descriptors have no such proof here. */
-async function cancelledWorkspaceSource(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "runnerProfileJson">) {
+async function cancelledWorkspaceSource(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "status" | "nativeIssueId" | "resultJson" | "runnerProfileJson">) {
   const leases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
     cancelledWorkspaceSourceLease(),
   ));
   for (const lease of leases) {
+    // A still-running warm box after an ordinary Stop is a handoff, not a source.
+    if (cancelledNativeRunWorkspaceOutcome(run, lease) === "handoff") continue;
     if (lease.status !== "released" || lease.leasePolicy === "ephemeral") return lease;
     if (run.runnerProfileJson?.nativeWorkspaceSync == null && hasConfirmedSandboxStopAndRetain(lease)
       && await preparedRemoteWorkspaceSource(db, lease)) return lease;
