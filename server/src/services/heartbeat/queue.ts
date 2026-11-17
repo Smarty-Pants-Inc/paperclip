@@ -1,4 +1,4 @@
-import { anchorParkedWakePayloadSql, parkedWakeExpiredSql } from "./parked-wake-deadline.js";
+import { anchorParkedWakePayloadSql, parkedWakeExpiredSql, personControlledWait, personSend, personSendSql } from "./parked-wake-deadline.js";
 import { lockAgentForRunAdmission } from "../heartbeat-run-admission-lock.js";
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
@@ -2311,7 +2311,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
         or(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.nativeIssueId}::text = ${String(wake.payload?.issueId)}`),
       )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-      if (!wake.idempotencyKey?.startsWith("chat-inbound:")) await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+      // S124d: this rewrite moves updatedAt; a person's Send deferred in a
+      // non-person executionWait keeps its FIRST deferral in firstParkedAt.
+      if (!wake.idempotencyKey?.startsWith("chat-inbound:")) await db.update(agentWakeupRequests).set({ updatedAt: new Date(),
+        payload: anchorParkedWakePayloadSql(agentWakeupRequests.payload, agentWakeupRequests.updatedAt,
+          personSendSql()) }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
       if (!latest || !latest.finishedAt || !isHeartbeatRunTerminalStatus(latest.status)) continue;
@@ -4260,6 +4264,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   issueId: issue.id,
                   [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
                   executionWait: condition,
+                  // S124d: a person's saved Send deferred here is anchored at
+                  // this first deferral (set once; later rewrites keep it).
+                  ...(personSend(opts.requestedByActorType, reason) && !personControlledWait({ executionWait: condition })
+                    ? { firstParkedAt: new Date().toISOString() } : {}),
                 }, [...new Set([
                   ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
                   ...(wakeCommentId ? [wakeCommentId] : []),
