@@ -26,7 +26,8 @@ import {
   sandboxResumeRefusedForGood,
   sandboxStateTransitionFailure,
 } from "./reusable-sandbox-resume-replacement.js";
-import { assertSandboxNotKeptAfterReplacement, KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY } from "./reusable-sandbox-kept-marker.js";
+import { assertSandboxNotKeptAfterReplacement, fenceReusableSandboxAtRestoreCapture, KEPT_SANDBOX_CLEARED_BY_OPERATOR_KEY,
+  liftRestoreCaptureFence } from "./reusable-sandbox-kept-marker.js";
 import { admittedSandboxLeaseConfig, sandboxLeaseIdentityConfig, sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import { HttpError } from "../errors.js";
@@ -2366,6 +2367,23 @@ function createSandboxEnvironmentDriver(
             }
           }
         }
+        // Retire case: the plan just captured the old box's state for the restore
+        // (committed snapshot + verified harness backup, carried by the
+        // replacement below). From here until the executor acknowledges the
+        // restore and retires it, the old box is fenced like a kept box
+        // (assertSandboxNotKeptAfterReplacement). Any failure before the
+        // replacement is recorded lifts the fence, so the old box stays usable.
+        const restoreCaptureFenced = replacementReason === "resume_failed" && replacementPlan === "retire"
+          && reusableLease && input.heartbeatRunId
+          ? await fenceReusableSandboxAtRestoreCapture(db, { lease: reusableLease, heartbeatRunId: input.heartbeatRunId })
+          : false;
+        const liftCaptureFenceAndRethrow = async (error: unknown): Promise<never> => {
+          if (restoreCaptureFenced && reusableLease && input.heartbeatRunId) {
+            await liftRestoreCaptureFence(db, { companyId: input.companyId, leaseId: reusableLease.id,
+              heartbeatRunId: input.heartbeatRunId }).catch(() => false);
+          }
+          throw error;
+        };
         const acquiredLease = providerLease ?? await createOwnedSandbox(db, {
           companyId: input.companyId, environmentId: input.environment.id,
           heartbeatRunId: input.heartbeatRunId, issueId: input.issueId, executionWorkspaceId: input.executionWorkspaceId,
@@ -2419,7 +2437,7 @@ function createSandboxEnvironmentDriver(
             }, diagnostic);
             throw error;
           }
-        });
+        }).catch(liftCaptureFenceAndRethrow);
 
         // Ad-hoc test leases are never publishable for reuse: storing them
         // as `reuse_by_environment` would let a concurrent heartbeat resume
@@ -2514,7 +2532,7 @@ function createSandboxEnvironmentDriver(
             reusableLease?.heartbeatRunId !== input.heartbeatRunId
               ? reusableLease?.id
               : null,
-        });
+        }).catch(liftCaptureFenceAndRethrow);
         // Retire the unresumable sandbox only once its replacement, which
         // carries the harness backup, is recorded. A failed creation or a
         // restart before this point leaves it eligible for the next attempt.

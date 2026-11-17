@@ -1,5 +1,5 @@
-import { and, eq, sql } from "drizzle-orm";
-import { environmentLeases, type Db } from "@paperclipai/db";
+import { and, eq, inArray, sql } from "drizzle-orm";
+import { environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 
@@ -51,20 +51,101 @@ export function reusableSandboxNotKeptAfterReplacementSql() {
   return sql`not coalesce(${environmentLeases.metadata} ? ${REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY}, false)`;
 }
 
+/**
+ * The retire case's fence: a workspace chat's old box whose state the run
+ * captured for the restore on a new box (the replacement plan pinned its
+ * committed snapshot and verified harness backup, and the replacement carries
+ * that backup). From the capture until the old box is retired, the same
+ * channel fence as a kept box refuses it, so nothing it writes after the
+ * capture can land where the restore would not carry it.
+ *
+ * The fence holds while the capturing run is live, and after the retire
+ * (the lease leaves released/retained). A failed restore lifts it at once
+ * (`liftRestoreCaptureFence`), so the old box stays usable for the next
+ * attempt; a crash before that lifts it when the run ends.
+ */
+export const REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY = "reusableSandboxRestoreCaptureFence";
+
+export type ReusableSandboxRestoreCaptureFence = {
+  runId: string;
+  capturedAt: string;
+  fenceRefusals?: number;
+  lastFenceRefusal?: { channel: KeptSandboxFenceChannel; at: string };
+};
+
+function restoreCaptureFenceActiveSql() {
+  const key = REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY;
+  return sql`(jsonb_typeof(${environmentLeases.metadata}->${key}::text) = 'object' AND (
+    ${environmentLeases.status} NOT IN ('released', 'retained')
+    OR EXISTS (SELECT 1 FROM ${heartbeatRuns}
+      WHERE ${heartbeatRuns.id}::text = ${environmentLeases.metadata}->${key}::text->>'runId'
+        AND ${heartbeatRuns.status} IN ('queued', 'scheduled_retry', 'running'))))`;
+}
+
+/** Fence the old box at capture. Only a released or retained lease is fenced. */
+export async function fenceReusableSandboxAtRestoreCapture(db: Db, input: {
+  lease: Pick<EnvironmentLease, "id" | "companyId" | "providerLeaseId">;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  if (!input.lease.providerLeaseId) return false;
+  const fence: ReusableSandboxRestoreCaptureFence = { runId: input.heartbeatRunId, capturedAt: new Date().toISOString() };
+  const [fenced] = await db.update(environmentLeases).set({
+    metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb)
+      || ${JSON.stringify({ [REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY]: fence })}::jsonb`,
+  }).where(and(
+    eq(environmentLeases.id, input.lease.id),
+    eq(environmentLeases.companyId, input.lease.companyId),
+    eq(environmentLeases.providerLeaseId, input.lease.providerLeaseId),
+    inArray(environmentLeases.status, ["released", "retained"]),
+  )).returning({ id: environmentLeases.id });
+  return Boolean(fenced);
+}
+
+/** Lift the capture fence this run set, while the old box is not retired. */
+export async function liftRestoreCaptureFence(db: Db, input: {
+  companyId: string;
+  leaseId: string;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  const key = REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY;
+  const [lifted] = await db.update(environmentLeases).set({
+    metadata: sql`${environmentLeases.metadata} - ${key}::text`,
+  }).where(and(
+    eq(environmentLeases.id, input.leaseId),
+    eq(environmentLeases.companyId, input.companyId),
+    inArray(environmentLeases.status, ["released", "retained"]),
+    sql`${environmentLeases.metadata}->${key}::text->>'runId' = ${input.heartbeatRunId}`,
+  )).returning({ id: environmentLeases.id });
+  return Boolean(lifted);
+}
+
 /** Every channel through which bytes from a box reach Paperclip, or Paperclip wakes it. */
 export type KeptSandboxFenceChannel =
   | "runner_ingress" | "duplex_channel" | "execute" | "sync_out" | "resume";
 
 export const REUSABLE_SANDBOX_KEPT_FENCED_CODE = "reusable_sandbox_kept_fenced";
 
-/** A channel to a box that was kept after its chat moved to a new box. */
+/** A channel to a box that was kept after its chat moved to a new box, or
+ * whose state was captured for a restore on a new box. */
 export class ReusableSandboxKeptFencedError extends Error {
   readonly code = REUSABLE_SANDBOX_KEPT_FENCED_CODE;
-  constructor(readonly providerLeaseId: string, readonly channel: KeptSandboxFenceChannel) {
-    super(`${REUSABLE_SANDBOX_KEPT_FENCED_CODE}: the box ${providerLeaseId} was kept after its chat moved to a new box; `
-      + `Paperclip accepts nothing from it (${channel}).`);
+  constructor(readonly providerLeaseId: string, readonly channel: KeptSandboxFenceChannel,
+    readonly fence: "kept" | "restore_capture" = "kept") {
+    super(fence === "kept"
+      ? `${REUSABLE_SANDBOX_KEPT_FENCED_CODE}: the box ${providerLeaseId} was kept after its chat moved to a new box; `
+        + `Paperclip accepts nothing from it (${channel}).`
+      : `${REUSABLE_SANDBOX_KEPT_FENCED_CODE}: the box ${providerLeaseId} is being replaced from its captured state; `
+        + `Paperclip accepts nothing from it (${channel}).`);
     this.name = "ReusableSandboxKeptFencedError";
   }
+}
+
+function countRefusalSql(key: string, channel: KeptSandboxFenceChannel, at: string) {
+  return sql`jsonb_set(${environmentLeases.metadata}, array[${key}::text],
+      (${environmentLeases.metadata}->${key}::text)
+      || jsonb_build_object('fenceRefusals',
+        coalesce((${environmentLeases.metadata}->${key}::text->>'fenceRefusals')::int, 0) + 1,
+        'lastFenceRefusal', jsonb_build_object('channel', ${channel}::text, 'at', ${at}::text)))`;
 }
 
 /**
@@ -78,6 +159,9 @@ export class ReusableSandboxKeptFencedError extends Error {
  * and programs) can never write to this chat again. The fresh row read means a
  * stale lease object held by an older controller cannot bypass it. Each
  * refusal is counted on the kept lease and logged.
+ *
+ * The same fence refuses a box under the retire case's capture fence
+ * (`REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY`), counted on that marker.
  */
 export async function assertSandboxNotKeptAfterReplacement(db: Db, input: {
   lease: Pick<EnvironmentLease, "companyId" | "providerLeaseId">;
@@ -88,18 +172,26 @@ export async function assertSandboxNotKeptAfterReplacement(db: Db, input: {
   const at = new Date().toISOString();
   const key = REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY;
   const refused = await db.update(environmentLeases).set({
-    metadata: sql`jsonb_set(${environmentLeases.metadata}, array[${key}::text],
-      (${environmentLeases.metadata}->${key}::text)
-      || jsonb_build_object('fenceRefusals',
-        coalesce((${environmentLeases.metadata}->${key}::text->>'fenceRefusals')::int, 0) + 1,
-        'lastFenceRefusal', jsonb_build_object('channel', ${input.channel}::text, 'at', ${at}::text)))`,
+    metadata: countRefusalSql(key, input.channel, at),
   }).where(and(
     eq(environmentLeases.companyId, input.lease.companyId),
     eq(environmentLeases.providerLeaseId, providerLeaseId),
     sql`jsonb_typeof(${environmentLeases.metadata}->${key}::text) = 'object'`,
   )).returning({ id: environmentLeases.id });
-  if (refused.length === 0) return;
+  if (refused.length > 0) {
+    logger.warn({ companyId: input.lease.companyId, providerLeaseId, channel: input.channel,
+      keptLeaseIds: refused.map(row => row.id) }, "refused a channel to a box kept after its chat moved to a new box");
+    throw new ReusableSandboxKeptFencedError(providerLeaseId, input.channel);
+  }
+  const captured = await db.update(environmentLeases).set({
+    metadata: countRefusalSql(REUSABLE_SANDBOX_RESTORE_CAPTURE_FENCE_KEY, input.channel, at),
+  }).where(and(
+    eq(environmentLeases.companyId, input.lease.companyId),
+    eq(environmentLeases.providerLeaseId, providerLeaseId),
+    restoreCaptureFenceActiveSql(),
+  )).returning({ id: environmentLeases.id });
+  if (captured.length === 0) return;
   logger.warn({ companyId: input.lease.companyId, providerLeaseId, channel: input.channel,
-    keptLeaseIds: refused.map(row => row.id) }, "refused a channel to a box kept after its chat moved to a new box");
-  throw new ReusableSandboxKeptFencedError(providerLeaseId, input.channel);
+    fencedLeaseIds: captured.map(row => row.id) }, "refused a channel to a box whose state was captured for a restore on a new box");
+  throw new ReusableSandboxKeptFencedError(providerLeaseId, input.channel, "restore_capture");
 }

@@ -31,7 +31,7 @@ import { restartRecoveryMeasurementFor, speedBudgetAdapter } from "./native-spee
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
 import { assertNativeHarnessBackupOwner, durableNativeHarnessStorage, NATIVE_HARNESS_DOWNLOAD_IDLE_TIMEOUT_MS, nativeHarnessBackupOwner, persistNativeHarnessBackup,
   restoreDurableNativeHarnessBackup } from "./native-harness-backup-storage.js";
-import { retireReplacedReusableSandboxLeaseAfterRestore } from "../reusable-sandbox-resume-replacement.js";
+import { liftRestoreCaptureFenceAfterFailedRestore, retireReplacedReusableSandboxLeaseAfterRestore } from "../reusable-sandbox-resume-replacement.js";
 import { restoreNativeProviderArtifacts, retainNativeProviderArtifacts, retainExistingNativeProviderArtifacts,
   retainReadyNativeProviderArtifacts, NativeProviderArtifactTransferTimeoutError, nativeProviderArtifactTransferBounds,
   type NativeProviderArtifactReceipt } from "./native-provider-artifacts.js";
@@ -19108,8 +19108,19 @@ async function createRunnerdBackendWithinSessionClaim(
                       input.trace,
                       "sandbox.lease.replacement",
                       async () => {
-                        if (!freshReplacement) await restoreVerifiedHarnessBackup();
-                        else await noteFreshProviderSessionOnNewBox();
+                        try {
+                          if (!freshReplacement) await restoreVerifiedHarnessBackup();
+                          else await noteFreshProviderSessionOnNewBox();
+                        } catch (error) {
+                          // The restore failed: lift the capture fence on the
+                          // preserved box so it stays usable for the next attempt.
+                          if (remoteTarget.leaseId) {
+                            await liftRestoreCaptureFenceAfterFailedRestore({ db: input.db,
+                              companyId: input.execution.binding.companyId, replacementLeaseId: remoteTarget.leaseId,
+                              heartbeatRunId: input.execution.binding.runId }).catch(() => false);
+                          }
+                          throw error;
+                        }
                         // The restore on the new box is acknowledged: only now
                         // may the preserved box it replaced be marked for cleanup.
                         if (remoteTarget.leaseId) {

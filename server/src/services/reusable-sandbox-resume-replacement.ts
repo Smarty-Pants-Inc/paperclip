@@ -12,7 +12,7 @@ import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-backup-stamp.js";
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
-import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY, type ReusableSandboxKeptMarker,
+import { liftRestoreCaptureFence, REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY, type ReusableSandboxKeptMarker,
   type ReusableSandboxKeptReason } from "./reusable-sandbox-kept-marker.js";
 import { nativeHarnessBackupFailureReason, ReusableSandboxBackupUnrestorableError,
   type ReusableSandboxBackupFailure } from "./reusable-sandbox-resume-error.js";
@@ -378,4 +378,25 @@ export async function retireReplacedReusableSandboxLeaseAfterRestore(input: {
   if (!previous || previous.providerLeaseId !== acquisition?.previousProviderLeaseId) return false;
   return retireReplacedReusableSandboxLease({ db, lease: previous as unknown as EnvironmentLease,
     companyId: input.companyId, heartbeatRunId: input.heartbeatRunId });
+}
+
+/**
+ * The restore on the new box failed: lift the capture fence the acquisition
+ * put on the preserved box it names (`RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY`),
+ * so that box stays usable for the next attempt. Only this run's fence on a
+ * still released or retained lease is lifted.
+ */
+export async function liftRestoreCaptureFenceAfterFailedRestore(input: {
+  db: Db;
+  companyId: string;
+  replacementLeaseId: string;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  const { db } = input;
+  const [replacement] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, input.replacementLeaseId)));
+  const acquisition = replacement?.metadata?.sandboxLeaseAcquisition as Record<string, unknown> | undefined;
+  const previousLeaseId = acquisition?.outcome === "replacement" ? acquisition[RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY] : undefined;
+  if (typeof previousLeaseId !== "string" || previousLeaseId === input.replacementLeaseId) return false;
+  return liftRestoreCaptureFence(db, { companyId: input.companyId, leaseId: previousLeaseId, heartbeatRunId: input.heartbeatRunId });
 }

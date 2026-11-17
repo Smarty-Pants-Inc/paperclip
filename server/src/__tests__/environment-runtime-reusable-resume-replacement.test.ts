@@ -20,7 +20,8 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { environmentRuntimeService } from "../services/environment-runtime.ts";
 import { environmentService } from "../services/environments.ts";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.ts";
-import { retireReplacedReusableSandboxLeaseAfterRestore } from "../services/reusable-sandbox-resume-replacement.ts";
+import { liftRestoreCaptureFenceAfterFailedRestore, retireReplacedReusableSandboxLeaseAfterRestore } from "../services/reusable-sandbox-resume-replacement.ts";
+import { ReusableSandboxKeptFencedError } from "../services/reusable-sandbox-kept-marker.ts";
 
 // Durable harness-backup verification has its own tests. Here it is a boundary:
 // a lease-bound stamp verifies, a missing stamp (an older release's lease) does not.
@@ -229,6 +230,8 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     await expect(environmentService(db).getLeaseById(seeded.lease.id)).resolves.toMatchObject({
       status: "retained", providerLeaseId: seeded.providerLeaseId,
     });
+    // The capture fence set for this replacement is lifted with the failed creation.
+    expect((await environmentService(db).getLeaseById(seeded.lease.id))?.metadata?.reusableSandboxRestoreCaptureFence).toBeUndefined();
 
     // The bounded retry runs as a new run that reserves the same clean workspace.
     const retryRunId = randomUUID();
@@ -307,6 +310,86 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
     expect(acquired.lease.providerLeaseId).toBe(seeded.providerLeaseId);
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+  });
+
+  // RFL 11:21Z (2): the retire case is capture -> fence -> restore -> ack -> retire.
+  // From the capture (the plan pins the committed snapshot and verified backup the
+  // replacement carries) the old box, whose Runner may still be alive, is fenced
+  // on every channel until it is retired; a failed restore lifts the fence.
+  it("fences the old box from the capture until the restore is acknowledged, and nothing captured is lost", async () => {
+    const seeded = await seed();
+    await markReplaceBeforeReuse(seeded);
+    const { call, runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId,
+      metadata: { remoteCwd: "/home/daytona/paperclip-workspace" } }));
+    const acquired = await acquire(seeded, runtime);
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toMatchObject({ outcome: "replacement",
+      retirePreviousLeaseAfterRestore: seeded.lease.id });
+    const captured = (await environmentService(db).getLeaseById(seeded.lease.id))!;
+    expect(captured.metadata?.reusableSandboxRestoreCaptureFence).toMatchObject({ runId: seeded.runId });
+
+    // After capture, before the ack: a write from the old box (its surviving
+    // Runner's ingress, through a lease object read before the switch) is refused
+    // and recorded, before the provider is called.
+    const afterCapture = call.mock.calls.length;
+    const channels: Array<[string, () => Promise<unknown>]> = [
+      ["runner_ingress", () => runtime.getRunnerIngressEndpoint({ environment: seeded.environment, lease: seeded.lease,
+        port: 7777, path: "/api/runner/v1/connect/x" })],
+      ["sync_out", () => runtime.syncOut({ environment: seeded.environment, lease: seeded.lease, operations: [] })],
+      ["execute", () => runtime.execute({ environment: seeded.environment, lease: seeded.lease, command: "true" })],
+    ];
+    for (const [channel, open] of channels) {
+      const refusal = await open().then(() => null, (error: unknown) => error);
+      expect(refusal).toBeInstanceOf(ReusableSandboxKeptFencedError);
+      expect(refusal).toMatchObject({ code: "reusable_sandbox_kept_fenced", providerLeaseId: seeded.providerLeaseId,
+        channel, fence: "restore_capture" });
+    }
+    expect(call.mock.calls.slice(afterCapture)).toEqual([]);
+    const fenced = (await environmentService(db).getLeaseById(seeded.lease.id))!;
+    expect(fenced.metadata?.reusableSandboxRestoreCaptureFence).toMatchObject({ runId: seeded.runId,
+      fenceRefusals: channels.length, lastFenceRefusal: { channel: "execute" } });
+    // Nothing captured is lost: the old box's saved state is untouched and the
+    // replacement still restores from exactly the captured backup.
+    expect(fenced.metadata?.nativeHarnessBackup).toEqual(captured.metadata?.nativeHarnessBackup);
+    expect(acquired.lease.metadata?.nativeHarnessBackup).toEqual(captured.metadata?.nativeHarnessBackup);
+    // The new box is not fenced.
+    const own = await runtime.getRunnerIngressEndpoint({ environment: seeded.environment, lease: acquired.lease,
+      port: 7777, path: "/api/runner/v1/connect/x" }).then(() => null, (error: unknown) => error);
+    expect(own).not.toBeInstanceOf(ReusableSandboxKeptFencedError);
+
+    // Ack -> retire: the retired box stays fenced until the sweep destroys it.
+    await retireReplacedReusableSandboxLeaseAfterRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: seeded.runId });
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, seeded.runId));
+    await expect(runtime.syncOut({ environment: seeded.environment, lease: seeded.lease, operations: [] }))
+      .rejects.toBeInstanceOf(ReusableSandboxKeptFencedError);
+    expect((await environmentService(db).getLeaseById(seeded.lease.id))?.status).toBe("pending_cleanup");
+  });
+
+  it("lifts the capture fence when the restore on the new box fails, so the old box stays usable", async () => {
+    const seeded = await seed();
+    await markReplaceBeforeReuse(seeded);
+    const { runtime } = worker(seeded, async () => ({ providerLeaseId: seeded.providerLeaseId,
+      metadata: { remoteCwd: "/home/daytona/paperclip-workspace" } }));
+    const acquired = await acquire(seeded, runtime);
+    const syncOutOld = () => runtime.syncOut({ environment: seeded.environment, lease: seeded.lease, operations: [] })
+      .then(() => null, (error: unknown) => error);
+    expect(await syncOutOld()).toBeInstanceOf(ReusableSandboxKeptFencedError);
+    // A crash before the lift: the fence lapses once the capturing run has ended.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(await syncOutOld()).not.toBeInstanceOf(ReusableSandboxKeptFencedError);
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, seeded.runId));
+    expect(await syncOutOld()).toBeInstanceOf(ReusableSandboxKeptFencedError);
+    // Another run cannot lift this run's fence.
+    await expect(liftRestoreCaptureFenceAfterFailedRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: randomUUID() })).resolves.toBe(false);
+
+    // The executor's failed-restore path (native-session-executor.ts, replacement branch).
+    await expect(liftRestoreCaptureFenceAfterFailedRestore({ db, companyId: seeded.companyId,
+      replacementLeaseId: acquired.lease.id, heartbeatRunId: seeded.runId })).resolves.toBe(true);
+    const unfenced = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(unfenced).toMatchObject({ status: "retained", providerLeaseId: seeded.providerLeaseId });
+    expect(unfenced?.metadata?.reusableSandboxRestoreCaptureFence).toBeUndefined();
+    expect(await syncOutOld()).not.toBeInstanceOf(ReusableSandboxKeptFencedError);
   });
 
   it("retries a sandbox state change inside the run and resumes the same sandbox", async () => {
