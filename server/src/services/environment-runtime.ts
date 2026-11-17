@@ -4,7 +4,7 @@ import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
 import { RetainedSandboxAbsentError, SandboxLeaseStartDeniedError, resumeReplyConfirmsAbsence } from "./retained-sandbox-absent-error.js";
 import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-migration.js";
-import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
+import { ReusableSandboxBackupUnrestorableError, ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, readReplaceBeforeReuseMarker } from "./native-runtime/predecessor-retirement.js";
 import {
@@ -12,7 +12,10 @@ import {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
   REUSABLE_SANDBOX_RESUME_BUDGET_MS,
   keepReplacedReusableSandboxLease,
+  nativeHarnessBackupCustody,
+  RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY,
   retireReplacedReusableSandboxLease,
+  typedNativeHarnessBackupFailure,
   reusableSandboxConfigurationChangeIsSafe,
   reusableSandboxKeptAfterReplacement,
   reusableSandboxLeaseIsIdle,
@@ -2228,7 +2231,7 @@ function createSandboxEnvironmentDriver(
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
               executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType,
               cause: new Error(NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE),
-            }) : null;
+            }).catch(error => { throw typedNativeHarnessBackupFailure(error, reusableLease.providerLeaseId!); }) : null;
           replacingUnretiredOwner = unretiredOwnerPlan !== null;
           let idleStartWaitSpent = false;
           if (unretiredOwnerPlan) {
@@ -2321,8 +2324,15 @@ function createSandboxEnvironmentDriver(
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
               executionWorkspaceId: input.executionWorkspaceId, issueId: input.issueId, adapterType: input.adapterType, cause: error,
               providerCannotStart: idleStartWaitSpent,
-            });
+            }).catch(planError => { throw typedNativeHarnessBackupFailure(planError, reusableLease.providerLeaseId!); });
             if (!replacementPlan) {
+              // A broken saved backup is the true reason, not the provider's
+              // refusal: say so with one instruction. Nothing was destroyed.
+              const custody = input.adapterType === "paperclip_runner"
+                ? await nativeHarnessBackupCustody({ db, lease: reusableLease }) : "absent";
+              if (custody !== "absent" && custody !== "verified") {
+                throw new ReusableSandboxBackupUnrestorableError({ providerLeaseId: reusableLease.providerLeaseId, reason: custody, cause: error });
+              }
               throw new ReusableSandboxResumeError({
                 provider: parsed.config.provider,
                 providerLeaseId: reusableLease.providerLeaseId,
@@ -2332,23 +2342,27 @@ function createSandboxEnvironmentDriver(
             replacementReason = "resume_failed";
           }
           if (!providerLease && replacementReason !== "resume_failed") {
-            if (
-              input.adapterType === "paperclip_runner" &&
-              !await verifyRecoverableNativeHarnessBackup({ db, companyId: reusableLease.companyId,
-                stamp: reusableLease.metadata?.nativeHarnessBackup, providerLeaseId: reusableLease.providerLeaseId })
-            ) {
+            const custody = input.adapterType === "paperclip_runner"
+              ? await nativeHarnessBackupCustody({ db, lease: reusableLease }) : "verified";
+            if (custody === "absent") {
               throw new RunnerHarnessBackupUnavailableError(
                 reusableLease.providerLeaseId,
               );
             }
-            // The verified, lease-bound backup authorizes destructive
-            // replacement. Keep the existing sandbox intact when validation
-            // fails so the only recoverable provider state is not lost.
-            await destroyReusableSandboxLease({
-              environment: input.environment,
-              lease: reusableLease,
-              failureReason: replacementReason ?? "resume_failed",
-            });
+            if (custody !== "verified") {
+              throw new ReusableSandboxBackupUnrestorableError({ providerLeaseId: reusableLease.providerLeaseId, reason: custody });
+            }
+            // Destroy only a box the provider says is already gone (expired or
+            // not found). An identity mismatch means a box still exists at
+            // that id: keep it, never destroy it, and fence it from selection
+            // once its replacement is recorded (below).
+            if (replacementReason !== "identity_mismatch") {
+              await destroyReusableSandboxLease({
+                environment: input.environment,
+                lease: reusableLease,
+                failureReason: replacementReason ?? "resume_failed",
+              });
+            }
           }
         }
         const acquiredLease = providerLease ?? await createOwnedSandbox(db, {
@@ -2454,6 +2468,10 @@ function createSandboxEnvironmentDriver(
                   reason: replacementReason ?? "resume_failed",
                   ...((replacementReason ?? "resume_failed") === "resume_failed" ? { previousProviderLeaseId: reusableLease.providerLeaseId } : {}),
                   ...(replacingUnretiredOwner ? { cause: NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE } : {}),
+                  // A native run retires the preserved box only after its
+                  // executor acknowledges the restore on this one.
+                  ...(replacementReason === "resume_failed" && replacementPlan === "retire" && input.adapterType === "paperclip_runner"
+                    ? { [RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY]: reusableLease.id } : {}),
                 }
               : {
                   outcome: "created",
@@ -2502,17 +2520,25 @@ function createSandboxEnvironmentDriver(
         if (rolloverLease && input.heartbeatRunId) {
           await retireCompatibleConfigurationSource(rolloverLease, recordedLease, input.heartbeatRunId);
         }
+        if (replacementReason === "identity_mismatch" && reusableLease && input.heartbeatRunId) {
+          await keepReplacedReusableSandboxLease({
+            db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
+            replacementLeaseId: recordedLease.id,
+          });
+        }
         if (replacementReason === "resume_failed" && reusableLease && input.heartbeatRunId) {
           if (replacementPlan === "keep") {
             await keepReplacedReusableSandboxLease({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
               replacementLeaseId: recordedLease.id,
             });
-          } else {
+          } else if (input.adapterType !== "paperclip_runner") {
             await retireReplacedReusableSandboxLease({
               db, lease: reusableLease, companyId: input.companyId, heartbeatRunId: input.heartbeatRunId,
             });
           }
+          // paperclip_runner: retired by retireReplacedReusableSandboxLeaseAfterRestore
+          // once the executor has restored and verified the session on the new box.
         }
         return recordedLease;
       }

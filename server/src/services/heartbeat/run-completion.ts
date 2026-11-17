@@ -21,7 +21,7 @@ import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode } from "./retries.js";
 import { RemoteWorkspacePreparationTimeoutError, REMOTE_WORKSPACE_RESTORE_FAILED_CODE, findRemoteWorkspaceRestoreError } from "../remote-workspace-transport.js";
 import { escalateRemoteWorkspaceRestoreFailure } from "../remote-workspace-restore-recovery.js";
-import { findReusableSandboxResumeError } from "../reusable-sandbox-resume-error.js";
+import { findReusableSandboxBackupUnrestorableError, findReusableSandboxResumeError } from "../reusable-sandbox-resume-error.js";
 import { findPluginWorkerUnavailableError, PLUGIN_WORKER_UNAVAILABLE_CODE } from "../plugin-worker-unavailable-error.js";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE, findEnvironmentProviderUnavailableError } from "../environment-provider-unavailable-error.js";
 import { REPOSITORY_CATALOG_UNAVAILABLE_CODE, findRepositoryCatalogUnavailableError } from "../repository-catalog-unavailable-error.js";
@@ -1678,6 +1678,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // same recorded lease; it never creates a replacement or a second executor.
     const reusableSandboxResumeFailure = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null ? findReusableSandboxResumeError(outerErr) : null;
+    // A chat whose saved backup failed verification refused before provider
+    // dispatch, destroyed nothing and kept its box: one typed code, one true
+    // instruction, no automatic retry (retrying cannot repair the backup).
+    const reusableSandboxBackupUnrestorable = !providerDispatchStarted && run.runtimeMode === "legacy"
+      && run.nativeSessionId === null && run.runnerInstanceId === null ? findReusableSandboxBackupUnrestorableError(outerErr) : null;
     // A saved workspace that could not be restored before provider dispatch
     // keeps its saved version. Retry it within the bootstrap budget only when
     // the owner proved the same clean writer and saved version; otherwise, and
@@ -1707,6 +1712,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??
       reusableSandboxResumeFailure?.code ??
+      reusableSandboxBackupUnrestorable?.code ??
       remoteWorkspaceRestoreFailure?.code ??
       pluginWorkerUnavailableFailure?.code ??
       environmentProviderUnavailable?.code ??

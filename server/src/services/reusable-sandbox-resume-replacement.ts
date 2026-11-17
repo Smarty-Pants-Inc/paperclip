@@ -13,6 +13,8 @@ import { readNativeHarnessBackupStamp } from "./native-runtime/native-harness-ba
 import { nativeHarnessBackupHasLaterProviderWork } from "./native-runtime/native-retired-backup-source.js";
 import { sandboxLeaseSourceMatches } from "./sandbox-lease-config-compatibility.js";
 import { REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY } from "./reusable-sandbox-kept-marker.js";
+import { nativeHarnessBackupFailureReason, ReusableSandboxBackupUnrestorableError,
+  type ReusableSandboxBackupFailure } from "./reusable-sandbox-resume-error.js";
 
 export {
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -307,4 +309,62 @@ export async function keepReplacedReusableSandboxLease(input: {
     )`,
   )).returning({ id: environmentLeases.id });
   return Boolean(kept);
+}
+
+/**
+ * Custody of a lease's harness backup, read with the real verifier:
+ * `absent` when the lease carries no lease-bound stamp, `verified` when the
+ * durable copy verifies, else the closed reason it failed. Any other error
+ * (database, storage outage) propagates unchanged.
+ */
+export async function nativeHarnessBackupCustody(input: {
+  db: Db;
+  lease: EnvironmentLease;
+}): Promise<"absent" | "verified" | ReusableSandboxBackupFailure> {
+  const { lease } = input;
+  if (!lease.providerLeaseId || !readNativeHarnessBackupStamp(lease.metadata?.nativeHarnessBackup, lease.providerLeaseId)) return "absent";
+  try {
+    return await verifyRecoverableNativeHarnessBackup({ db: input.db, companyId: lease.companyId,
+      stamp: lease.metadata?.nativeHarnessBackup, providerLeaseId: lease.providerLeaseId }) ? "verified" : "backup_missing";
+  } catch (error) {
+    const reason = nativeHarnessBackupFailureReason(error);
+    if (reason) return reason;
+    throw error;
+  }
+}
+
+/** Type a real verifier failure raised while planning a replacement. */
+export function typedNativeHarnessBackupFailure(error: unknown, providerLeaseId: string): unknown {
+  const reason = nativeHarnessBackupFailureReason(error);
+  return reason ? new ReusableSandboxBackupUnrestorableError({ providerLeaseId, reason, cause: error }) : error;
+}
+
+/** Acquisition-metadata key on a native replacement lease naming the preserved
+ * lease to retire once the executor has acknowledged the restore on the new box. */
+export const RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY = "retirePreviousLeaseAfterRestore";
+
+/**
+ * Retire the preserved lease that a native replacement named at acquisition,
+ * only after the executor restored and verified the chat's harness state on
+ * the new box. Before that acknowledgement the preserved lease stays released
+ * or retained, so a failed restore or a restart leaves it intact and eligible.
+ * Idempotent: the retire write is guarded by the preserved lease's status.
+ */
+export async function retireReplacedReusableSandboxLeaseAfterRestore(input: {
+  db: Db;
+  companyId: string;
+  replacementLeaseId: string;
+  heartbeatRunId: string;
+}): Promise<boolean> {
+  const { db } = input;
+  const [replacement] = await db.select({ metadata: environmentLeases.metadata }).from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, input.replacementLeaseId)));
+  const acquisition = replacement?.metadata?.sandboxLeaseAcquisition as Record<string, unknown> | undefined;
+  const previousLeaseId = acquisition?.outcome === "replacement" ? acquisition[RETIRE_PREVIOUS_LEASE_AFTER_RESTORE_KEY] : undefined;
+  if (typeof previousLeaseId !== "string" || previousLeaseId === input.replacementLeaseId) return false;
+  const [previous] = await db.select().from(environmentLeases)
+    .where(and(eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.id, previousLeaseId)));
+  if (!previous || previous.providerLeaseId !== acquisition?.previousProviderLeaseId) return false;
+  return retireReplacedReusableSandboxLease({ db, lease: previous as unknown as EnvironmentLease,
+    companyId: input.companyId, heartbeatRunId: input.heartbeatRunId });
 }

@@ -25,7 +25,7 @@ import { remoteExecutionHasReleased } from "./remote-execution-termination.js";
 import { remoteRecoveryLeaseMismatch, type RemoteRecoveryLeaseMismatchField } from "./native-runtime/remote-recovery-lease-mismatch.js";
 import { EnvironmentProviderUnavailableError, readTransientLeaseAcquisitionFailure } from "./environment-provider-unavailable-error.js";
 import { injectLeaseAcquisitionFault } from "./environment-lease-fault-injection.js";
-import { findReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
+import { findReusableSandboxBackupUnrestorableError, findReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { findPluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 import type {
   Environment,
@@ -250,7 +250,7 @@ export function environmentRunOrchestrator(
       // deadline, unfinished creation, database error) is retried by the setup
       // path with its bounded bootstrap budget. Saved-sandbox resume and
       // stopped-worker refusals keep their own, more specific classifications.
-      const transient = findReusableSandboxResumeError(err) || findPluginWorkerUnavailableError(err)
+      const transient = findReusableSandboxResumeError(err) || findReusableSandboxBackupUnrestorableError(err) || findPluginWorkerUnavailableError(err)
         ? null : readTransientLeaseAcquisitionFailure(err, { id: input.heartbeatRunId, companyId: input.companyId });
       throw new EnvironmentRunError(
         "lease_acquire_failed",

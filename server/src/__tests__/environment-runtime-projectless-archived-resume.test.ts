@@ -35,6 +35,8 @@ import * as config from "../config.js";
 import * as storage from "../storage/index.js";
 import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { createStorageService } from "../storage/service.js";
+import { findReusableSandboxResumeError, REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+  ReusableSandboxBackupUnrestorableError } from "../services/reusable-sandbox-resume-error.js";
 
 // The original resume-policy cases stub this boundary in beforeEach. The
 // never-OK cases below restore the real verifier and exercise durable storage.
@@ -308,7 +310,15 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
 
   // Data-safety/trust-boundary regression: a syntactically lease-bound stamp
   // alone must never authorize rotation away from the only copy of history.
-  it.each(["CORRUPT", "PARTIAL"] as const)("never rotates the archived box with a %s durable harness backup (real verifier)", async failure => {
+  // B fix (i): each real verifier failure is typed and reaches the person as
+  // ONE true instruction, never the generic "did not start in time".
+  it.each([
+    ["CORRUPT", "backup_missing"],
+    ["PARTIAL", "backup_missing"],
+    ["OBJECT_CORRUPT", "hash_mismatch"],
+    ["OBJECT_MISSING", "object_missing"],
+    ["ROW_MISSING", "backup_missing"],
+  ] as const)("never rotates the archived box with a %s durable harness backup (real verifier)", async (failure, reason) => {
     vi.mocked(backupStorage.verifyRecoverableNativeHarnessBackup).mockRestore();
     expect(vi.isMockFunction(backupStorage.verifyRecoverableNativeHarnessBackup)).toBe(false);
     const seeded = await seed();
@@ -341,6 +351,13 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     if (failure === "CORRUPT") {
       await environmentService(db).updateLeaseMetadata(seeded.lease.id, { ...seeded.lease.metadata,
         nativeHarnessBackup: { ...stamp, manifestSha256: `sha256:${"c".repeat(64)}` } });
+    } else if (failure === "OBJECT_CORRUPT") {
+      await store.putFile({ companyId: seeded.companyId, namespace: "native-harness-backups", objectKey,
+        originalFilename: null, contentType: "application/octet-stream", body: Buffer.from("saved provider-session histor!") });
+    } else if (failure === "OBJECT_MISSING") {
+      await store.deleteObject(seeded.companyId, objectKey);
+    } else if (failure === "ROW_MISSING") {
+      await db.delete(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, backupId));
     } else {
       // A valid stamp survived, but its durable publication/copy did not.
       await db.delete(nativeHarnessBackups).where(eq(nativeHarnessBackups.id, backupId));
@@ -348,10 +365,13 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     }
     const { call, runtime } = worker(seeded, async () => { throw boatRefusal(410, "snapshot_data_expired"); });
 
-    // Match the head's missing-stamp behavior exactly: one strict refusal,
-    // not a promise of automatic recovery or permission to discard history.
-    await expect(acquire(seeded, runtime)).rejects.toThrow(
-      /the lease was preserved and no replacement was created\.$/);
+    // One strict, typed refusal with one true instruction: not a promise of
+    // automatic recovery, not "did not start in time", no history discarded.
+    const refusal = await acquire(seeded, runtime).then(() => null, (error: unknown) => error);
+    expect(refusal).toBeInstanceOf(ReusableSandboxBackupUnrestorableError);
+    expect(refusal).toMatchObject({ code: "reusable_sandbox_backup_unrestorable", reason, providerLeaseId: BOX });
+    expect((refusal as Error).message.endsWith(REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION)).toBe(true);
+    expect(findReusableSandboxResumeError(refusal)).toBeNull();
     expect(call.mock.calls.filter(([, method]) => method === "environmentResumeLease")).toHaveLength(1);
     expect(call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(0);
     expect(destroyCalls(call)).toHaveLength(0);
@@ -359,6 +379,57 @@ describeEmbeddedPostgres("archived projectless chat: the first run resumes or ro
     expect(leases).toHaveLength(1);
     expect(leases[0]).toMatchObject({ id: seeded.lease.id, status: "retained", providerLeaseId: BOX, cleanupStatus: null });
     expect(leases[0].metadata?.reusableSandboxKeptAfterReplacement).toBeUndefined();
+  });
+
+  // B fix (ii): Boat resumed a box at that id whose workspace sentinel does not
+  // match. The box exists, so it is never destroyed: kept and fenced, and the
+  // chat continues on a new box with its verified history.
+  it("never destroys a box whose identity does not match; keeps it and continues on a new box with history", async () => {
+    const seeded = await seed();
+    const { call, runtime } = worker(seeded, async () => ({ providerLeaseId: null,
+      metadata: { workspaceSentinel: { result: "mismatched" } } }));
+
+    const acquired = await acquire(seeded, runtime);
+
+    expect(acquired.lease.providerLeaseId).toBe("bx_new");
+    expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "identity_mismatch" });
+    expect(acquired.lease.metadata?.nativeHarnessBackup).toMatchObject({ authorizedProviderLeaseId: BOX });
+    expect(destroyCalls(call)).toHaveLength(0);
+    const kept = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(kept).toMatchObject({ status: "retained", providerLeaseId: BOX, cleanupStatus: null, failureReason: null });
+    expect(kept?.metadata?.reusableSandboxKeptAfterReplacement).toMatchObject({ runId: seeded.runId, replacementLeaseId: acquired.lease.id });
+  });
+
+  // B fix (iv): the kept old box has a selection fence. Its runnerd is not
+  // trusted to be gone (Boat: detached processes do not continue after a stop
+  // or resume, background-commands.md:222; but a resume within 10 minutes
+  // usually keeps memory and programs, snapshots.md:15), so Paperclip must never
+  // select, resume, release, stop or destroy it again after the rotation.
+  it("never selects or writes the kept old box after the rotation (negative)", async () => {
+    const seeded = await seed();
+    const first = worker(seeded, async () => { throw boatRefusal(410, "snapshot_data_expired"); });
+    const rotated = await acquire(seeded, first.runtime);
+    expect(rotated.lease.providerLeaseId).toBe("bx_new");
+
+    // The rotated run ends; its new box is retained for the next message.
+    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, rotated.lease.id));
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, seeded.runId));
+    const nextRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: nextRunId, companyId: seeded.companyId, agentId: seeded.agentId,
+      invocationSource: "assignment", status: "running" });
+    const next = worker(seeded, async () => ({ providerLeaseId: "bx_new", metadata: { remoteCwd: "/home/boat/paperclip-workspace" } }));
+    const resumed = await next.runtime.acquireRunLease({ companyId: seeded.companyId, environment: seeded.environment,
+      issueId: seeded.issueId, agentId: seeded.agentId, adapterType: "paperclip_runner", heartbeatRunId: nextRunId,
+      persistedExecutionWorkspace: null });
+
+    expect(resumed.lease.providerLeaseId).toBe("bx_new");
+    expect(resumed.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "resumed" });
+    // No provider call after the rotation names the kept box.
+    const namesKeptBox = (params: unknown) => JSON.stringify(params ?? null).includes(`"providerLeaseId":"${BOX}"`);
+    expect(next.call.mock.calls.filter(([, , params]) => namesKeptBox(params))).toEqual([]);
+    expect(next.call.mock.calls.filter(([, method]) => method === "environmentAcquireLease")).toHaveLength(0);
+    const kept = await environmentService(db).getLeaseById(seeded.lease.id);
+    expect(kept).toMatchObject({ status: "retained", providerLeaseId: BOX, cleanupStatus: null, heartbeatRunId: seeded.previousRunId });
   });
 
   it("leaves the archived box eligible for the next attempt when the new box cannot be created", async () => {

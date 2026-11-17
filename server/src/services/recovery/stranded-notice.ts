@@ -1,5 +1,6 @@
 import type { IssueCommentMetadata, IssueCommentPresentation } from "@paperclipai/shared";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "../environment-provider-unavailable-error.js";
+import { REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE, REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION } from "../reusable-sandbox-resume-error.js";
 import {
   agentLinkRow,
   keyValueRow,
@@ -85,6 +86,13 @@ const WORKSPACE_SCAN_NOTICES: Record<string, { title: string; nextAction: string
 };
 
 const SETUP_FAILURE_NOTICES: Record<string, StrandedRecoveryNoticeSeed> = {
+  // One true instruction: the body and the next action say the same thing.
+  [REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_CODE]: {
+    title: "Saved chat could not be restored",
+    body: REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+    nextAction: REUSABLE_SANDBOX_BACKUP_UNRESTORABLE_INSTRUCTION,
+    tone: "danger",
+  },
   runner_revision_mismatch: {
     title: "Remote Runner is out of date",
     body: "The remote Runner does not match this Paperclip version, which is expected for a few minutes while a release updates the Runner. "
