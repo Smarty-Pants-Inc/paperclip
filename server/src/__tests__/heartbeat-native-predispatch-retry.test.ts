@@ -44,7 +44,8 @@ type AdmissionFailure = { remaining: number; turnNeverIssued: boolean; environme
   sessionRoots: string[] };
 
 function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescriptorOnce?: { failed: boolean };
-  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"]; taskBlocked?: boolean; repeat?: string[] }; turnMessages?: Map<string, string>;
+  unretiredPredecessorOnce?: { failed: boolean; environmentId: string; leasePolicy?: AdmissionFailure["leasePolicy"]; taskBlocked?: boolean; repeat?: string[];
+    workspaceSync?: boolean }; turnMessages?: Map<string, string>;
   admissionFailure?: AdmissionFailure } = {}):
   NonNullable<HeartbeatServiceOptions["nativeSessionBackendFactory"]> {
   return execution => {
@@ -94,6 +95,14 @@ function nativeBackend(db: ReturnType<typeof createDb>, options: { failDescripto
           // provider work. The executor reports that after its coordinator claim.
           unretired.failed = true;
           if (unretired.taskBlocked) await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, execution.binding.issueId));
+          if (unretired.workspaceSync) {
+            // The run's prepared remote workspace sync: the fallback cannot
+            // prove the workspace unchanged, so it schedules no continuation.
+            const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
+            await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current!.runnerProfileJson,
+              nativeWorkspaceSync: { schema: "paperclip.native-workspace-sync/v3", state: "prepared" } } })
+              .where(eq(heartbeatRuns.id, execution.binding.runId));
+          }
           const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, execution.binding.runId));
           await db.insert(environmentLeases).values({ companyId: run!.companyId, environmentId: unretired.environmentId,
             issueId: execution.binding.issueId, heartbeatRunId: run!.id, provider: "daytona", providerLeaseId: "sandbox-reused",
@@ -240,6 +249,49 @@ describe.skipIf(!support.supported)("heartbeat native pre-dispatch failure retry
     } finally {
       await heartbeat.drainActiveRunExecutions();
       await closeIdleWarmNativeSessionsForRestart();
+      await db.$client.end();
+    }
+  }, 90_000);
+
+  /** RFL 19:51Z guard (supbusy 30 s bound): a run written failed
+   * native_predecessor_retirement_unproven must project either a real
+   * continuation (working, a scheduled retry exists) or the failed attempt
+   * with Retry at once; never "working" with no Retry and no continuation. */
+  it.each([
+    { name: "the fallback schedules the continuation", workspaceSync: false },
+    { name: "the fallback refuses (prepared remote workspace sync)", workspaceSync: true },
+  ])("projects a run failed native_predecessor_retirement_unproven truthfully when $name", async ({ workspaceSync }) => {
+    const { companyId } = fixture.current;
+    const db = createDb(fixture.current.temporary.connectionString, { maxConnections: 4 });
+    const [environment] = await db.insert(environments).values({ name: `reused-${randomUUID()}`, driver: "sandbox" }).returning();
+    const heartbeat = heartbeatService(db, { nativeSessionBackendFactory: nativeBackend(db,
+      { unretiredPredecessorOnce: { failed: false, environmentId: environment!.id, workspaceSync } }) });
+    try {
+      const { issueId, runId } = await startTask(db, heartbeat);
+      const [failed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(failed).toMatchObject({ status: "failed", resultJson: expect.objectContaining({
+        failureCause: "native_predecessor_retirement_unproven" }) });
+      const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.retryOfRunId, runId)));
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      const presentation = await taskInterruptionPresentation(db, issue!);
+      if (!workspaceSync) {
+        expect(successors).toEqual([expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "interrupted_preparation" })]);
+        expect(presentation).toMatchObject({ state: "working", canRetry: false });
+      } else {
+        expect(successors).toEqual([]);
+        // preparePredecessorRetirementFallback refused: no fallback record.
+        expect(failed!.resultJson).not.toHaveProperty("predecessorRetirementFallback");
+        expect({ errorCode: failed!.errorCode, continuationScheduling: failed!.resultJson?.continuationScheduling ?? null })
+          .toEqual({ errorCode: "adapter_failed", continuationScheduling: null });
+        // No continuation is coming: the failed attempt and its Retry, now.
+        expect(presentation).toMatchObject({ state: "failed", canRetry: true });
+      }
+    } finally {
+      await heartbeat.drainActiveRunExecutions();
+      await closeIdleWarmNativeSessionsForRestart();
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(and(
+        eq(heartbeatRuns.companyId, companyId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
       await db.$client.end();
     }
   }, 90_000);
