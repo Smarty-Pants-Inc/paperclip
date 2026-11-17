@@ -11408,7 +11408,10 @@ describe("native session cancellation", () => {
       resultJson: { ...persistence.getResultJson(), cancelledByActorType: "user", cancelledByUserId: "operator" } };
     const lease = { provider: "daytona", providerLeaseId: "unconfirmed-provider-resource", status: "active",
       releasedAt: null, cleanupStatus: null, metadata: {} };
-    const leaseDb = { select: () => ({ from: () => ({ where: async () => [lease] }) }) } as unknown as Db;
+    // The stop check reads the leases (awaited where) and then the run's owner row
+    // (where(...).limit(1), acknowledged-native-stop.ts owner lookup).
+    const leaseDb = { select: () => ({ from: () => ({ where: () => Object.assign(Promise.resolve([lease]),
+      { limit: async () => [{ ...stopped, runtimeMode: "native", runnerProfileJson: null }] }) }) }) } as unknown as Db;
     expect(isAcknowledgedNativeStop(stopped)).toBe(true);
     await expect(acknowledgedNativeStopExecutionHasStopped(leaseDb, stopped)).resolves.toBe(false);
   });
