@@ -2440,6 +2440,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
           eq(issueComments.companyId, companyId),
           eq(issueComments.issueId, issueId),
           eq(issueComments.createdByRunId, runId),
+          isNull(issueComments.deletedAt),
         ),
       )
       .orderBy(desc(issueComments.createdAt), desc(issueComments.id));
