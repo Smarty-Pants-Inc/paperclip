@@ -2,7 +2,7 @@ import { createReadStream, createWriteStream, existsSync, mkdirSync, readdirSync
 import { basename, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { spawn } from "node:child_process";
-import { open as openFile } from "node:fs/promises";
+import { open as openFile, writeFile } from "node:fs/promises";
 import { pipeline } from "node:stream/promises";
 import { createGunzip, createGzip } from "node:zlib";
 import postgres from "postgres";
@@ -43,7 +43,90 @@ export type RunDatabaseRestoreOptions = {
   connectionString: string;
   backupFile: string;
   connectTimeoutSeconds?: number;
+  violationReportFile?: string;
 };
+
+export type RestoreConstraintViolation = {
+  schema: string;
+  table: string;
+  constraint: string;
+  definition: string;
+  action: "not_valid" | "skipped";
+  count: number;
+  samplePrimaryKeys: Record<string, unknown>[];
+};
+
+export type RunDatabaseRestoreResult = {
+  constraintViolations: RestoreConstraintViolation[];
+  violationReportFile: string | null;
+  summary: string;
+};
+
+type TableConstraintDefinition = {
+  constraint_name: string;
+  schema_name: string;
+  tablename: string;
+  constraint_type: string;
+  definition: string;
+  check_expression: string | null;
+  key_expressions: string[];
+  exclusion_operators: string[];
+  index_predicate: string | null;
+  primary_key_columns: string[];
+  violation_predicate?: string;
+};
+
+const CONSTRAINT_VIOLATION_PREFIX = "PAPERCLIP_CONSTRAINT_VIOLATION ";
+
+function guardedConstraintStatement(constraint: TableConstraintDefinition): string {
+  const table = quoteQualifiedName(constraint.schema_name, constraint.tablename);
+  const add = `ALTER TABLE ${table} ADD CONSTRAINT ${quoteIdentifier(constraint.constraint_name)} ${constraint.definition}`;
+  if (/\bNOT VALID$/.test(constraint.definition) && constraint.constraint_type !== "f") return `${add};`;
+
+  const canRemainNotValid = constraint.constraint_type === "c" || constraint.constraint_type === "f";
+  let candidates = "";
+  let predicate = constraint.violation_predicate ?? `(${constraint.check_expression}) IS FALSE`;
+  if (constraint.constraint_type === "u" || constraint.constraint_type === "x") {
+    const keys = constraint.key_expressions.map((expression, index) => `${expression} AS key_${index}`).join(", ");
+    candidates = `candidates AS (SELECT tableoid AS relation_id, ctid AS row_id, ${keys} FROM ${table}${constraint.index_predicate ? ` WHERE ${constraint.index_predicate}` : ""}), `;
+    const comparisons = constraint.key_expressions.map((_, index) => {
+      const left = `a.key_${index}`;
+      const right = `b.key_${index}`;
+      if (constraint.constraint_type === "x") return `${left} ${constraint.exclusion_operators[index]} ${right}`;
+      return constraint.definition.startsWith("UNIQUE NULLS NOT DISTINCT")
+        ? `${left} IS NOT DISTINCT FROM ${right}` : `${left} = ${right}`;
+    }).join(" AND ");
+    predicate = `EXISTS (SELECT 1 FROM candidates a JOIN candidates b ON
+      (a.relation_id, a.row_id) <> (b.relation_id, b.row_id) AND ${comparisons}
+      WHERE a.relation_id = restored_row.tableoid AND a.row_id = restored_row.ctid)`;
+  }
+  const primaryKeys = constraint.primary_key_columns;
+  const sample = primaryKeys.length === 0 ? "'[]'::json" : `(
+    SELECT coalesce(json_agg(sample.key), '[]'::json) FROM (
+      SELECT json_build_object(${primaryKeys.map(column => `${formatSqlLiteral(column)}, ${quoteIdentifier(column)}`).join(", ")}) AS key
+      FROM violations ORDER BY ${primaryKeys.map(column => `violations.${quoteIdentifier(column)}`).join(", ")} LIMIT 5
+    ) sample)`;
+  const body = `DECLARE violation json; violation_action text := '${canRemainNotValid ? "not_valid" : "skipped"}';
+BEGIN
+  BEGIN
+    ${add};
+  EXCEPTION WHEN ${constraint.constraint_type === "c" ? "check_violation" : constraint.constraint_type === "x" ? "exclusion_violation" : constraint.constraint_type === "f" ? "foreign_key_violation OR invalid_foreign_key" : "unique_violation"} THEN
+    ${canRemainNotValid ? `IF SQLSTATE = '42830' THEN violation_action := 'skipped'; ELSE ${add}${/\bNOT VALID$/.test(constraint.definition) ? "" : " NOT VALID"}; END IF;` : ""}
+    WITH ${candidates}violations AS (SELECT restored_row.* FROM ${table} restored_row WHERE ${predicate})
+    SELECT json_build_object(
+      'schema', ${formatSqlLiteral(constraint.schema_name)},
+      'table', ${formatSqlLiteral(constraint.tablename)},
+      'constraint', ${formatSqlLiteral(constraint.constraint_name)},
+      'definition', ${formatSqlLiteral(constraint.definition)},
+      'action', violation_action,
+      'count', (SELECT count(*) FROM violations),
+      'samplePrimaryKeys', ${sample}
+    ) INTO violation;
+    RAISE WARNING '${CONSTRAINT_VIOLATION_PREFIX}%', violation;
+  END;
+END;`;
+  return `DO ${formatSqlLiteral(body)};`;
+}
 
 type SequenceDefinition = {
   is_identity: boolean;
@@ -359,7 +442,7 @@ async function runPgDumpBackup(opts: {
   ]);
 }
 
-async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number): Promise<void> {
+async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: number, onWarning: (message: string) => void): Promise<void> {
   const psqlBin = process.env.PAPERCLIP_PSQL_PATH || "psql";
   const child = spawn(
     psqlBin,
@@ -382,6 +465,10 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
     throw new Error("psql did not expose stdin");
   }
 
+  const warningLines = createInterface({ input: child.stderr!, crlfDelay: Infinity });
+  const warningsClosed = new Promise<void>(resolve => warningLines.once("close", resolve));
+  warningLines.on("line", onWarning);
+
   const input = opts.backupFile.endsWith(".gz")
     ? createReadStream(opts.backupFile).pipe(createGunzip())
     : createReadStream(opts.backupFile);
@@ -389,6 +476,7 @@ async function restoreWithPsql(opts: RunDatabaseRestoreOptions, connectTimeout: 
   await Promise.all([
     pipeline(input, child.stdin),
     waitForChildExit(child, psqlBin),
+    warningsClosed,
   ]);
 }
 
@@ -820,19 +908,25 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    // Unique constraints must exist before foreign keys that reference them.
-    const allTableConstraints = await sql<{
-      constraint_name: string;
-      schema_name: string;
-      tablename: string;
-      constraint_type: string;
-      definition: string;
-    }[]>`
+    const allTableConstraints = await sql<TableConstraintDefinition[]>`
       SELECT c.conname AS constraint_name,
              n.nspname AS schema_name,
              t.relname AS tablename,
              c.contype AS constraint_type,
-             pg_get_constraintdef(c.oid) AS definition
+             pg_get_constraintdef(c.oid) AS definition,
+             pg_get_expr(c.conbin, c.conrelid) AS check_expression,
+             ARRAY(SELECT pg_get_indexdef(c.conindid, position, false)
+               FROM generate_series(1, (SELECT indnkeyatts FROM pg_index WHERE indexrelid = c.conindid)) position
+               ORDER BY position) AS key_expressions,
+             ARRAY(SELECT format('OPERATOR(%I.%s)', ns.nspname, operator.oprname)
+               FROM unnest(c.conexclop) WITH ORDINALITY excluded(oid, position)
+               JOIN pg_operator operator ON operator.oid = excluded.oid
+               JOIN pg_namespace ns ON ns.oid = operator.oprnamespace ORDER BY excluded.position) AS exclusion_operators,
+             (SELECT pg_get_expr(indpred, indrelid) FROM pg_index WHERE indexrelid = c.conindid) AS index_predicate,
+             ARRAY(SELECT attribute.attname FROM pg_constraint pk
+               CROSS JOIN LATERAL unnest(pk.conkey) WITH ORDINALITY key(attnum, position)
+               JOIN pg_attribute attribute ON attribute.attrelid = pk.conrelid AND attribute.attnum = key.attnum
+               WHERE pk.conrelid = c.conrelid AND pk.contype = 'p' ORDER BY key.position) AS primary_key_columns
       FROM pg_constraint c
       JOIN pg_class t ON t.oid = c.conrelid
       JOIN pg_namespace n ON n.oid = t.relnamespace
@@ -841,16 +935,6 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       ORDER BY n.nspname, t.relname, c.conname
     `;
     const tableConstraints = allTableConstraints.filter((entry) => includedTableNames.has(tableKey(entry.schema_name, entry.tablename)));
-    const uniques = tableConstraints.filter((entry) => entry.constraint_type === "u");
-
-    if (uniques.length > 0) {
-      emit("-- Unique constraints");
-      for (const u of uniques) {
-        emitStatement(`ALTER TABLE ${quoteQualifiedName(u.schema_name, u.tablename)} ADD CONSTRAINT ${quoteIdentifier(u.constraint_name)} ${u.definition};`);
-      }
-      emit("");
-    }
-
     // Collect foreign keys now. Emit them after routines and standalone indexes
     // because PostgreSQL permits a non-constraint unique index to be the target
     // of a foreign key.
@@ -861,6 +945,11 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       target_schema: string;
       target_table: string;
       definition: string;
+      source_columns: string[];
+      target_columns: string[];
+      equality_operators: string[];
+      primary_key_columns: string[];
+      match_full: boolean;
     }[]>`
       SELECT
         c.conname AS constraint_name,
@@ -868,7 +957,20 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         src.relname AS source_table,
         tgtn.nspname AS target_schema,
         tgt.relname AS target_table,
-        pg_get_constraintdef(c.oid) AS definition
+        pg_get_constraintdef(c.oid) AS definition,
+        c.confmatchtype = 'f' AS match_full,
+        ARRAY(SELECT a.attname FROM unnest(c.conkey) WITH ORDINALITY k(attnum, position)
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum ORDER BY k.position) AS source_columns,
+        ARRAY(SELECT a.attname FROM unnest(c.confkey) WITH ORDINALITY k(attnum, position)
+          JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum ORDER BY k.position) AS target_columns,
+        ARRAY(SELECT format('OPERATOR(%I.%s)', ns.nspname, op.oprname)
+          FROM unnest(c.conpfeqop) WITH ORDINALITY equality(oid, position)
+          JOIN pg_operator op ON op.oid = equality.oid
+          JOIN pg_namespace ns ON ns.oid = op.oprnamespace ORDER BY equality.position) AS equality_operators,
+        ARRAY(SELECT a.attname FROM pg_constraint pk
+          CROSS JOIN LATERAL unnest(pk.conkey) WITH ORDINALITY k(attnum, position)
+          JOIN pg_attribute a ON a.attrelid = pk.conrelid AND a.attnum = k.attnum
+          WHERE pk.conrelid = c.conrelid AND pk.contype = 'p' ORDER BY k.position) AS primary_key_columns
       FROM pg_constraint c
       JOIN pg_class src ON src.oid = c.conrelid
       JOIN pg_namespace srcn ON srcn.oid = src.relnamespace
@@ -928,16 +1030,6 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("-- Indexes");
       for (const idx of indexes) {
         emitStatement(`${idx.indexdef};`);
-      }
-      emit("");
-    }
-
-    if (fks.length > 0) {
-      emit("-- Foreign keys");
-      for (const fk of fks) {
-        emitStatement(
-          `ALTER TABLE ${quoteQualifiedName(fk.source_schema, fk.source_table)} ADD CONSTRAINT ${quoteIdentifier(fk.constraint_name)} ${fk.definition};`,
-        );
       }
       emit("");
     }
@@ -1003,11 +1095,30 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
       emit("");
     }
 
-    const postDataConstraints = tableConstraints.filter((entry) => entry.constraint_type !== "u");
-    if (postDataConstraints.length > 0) {
-      emit("-- Check and exclusion constraints");
-      for (const constraint of postDataConstraints) {
-        emitStatement(`ALTER TABLE ${quoteQualifiedName(constraint.schema_name, constraint.tablename)} ADD CONSTRAINT ${quoteIdentifier(constraint.constraint_name)} ${constraint.definition};`);
+    if (tableConstraints.length > 0) {
+      emit("-- Check, unique and exclusion constraints");
+      for (const constraint of tableConstraints) {
+        emitStatement(guardedConstraintStatement(constraint));
+      }
+      emit("");
+    }
+
+    if (fks.length > 0) {
+      emit("-- Foreign keys");
+      for (const fk of fks) {
+        const allNull = fk.source_columns.map(column => `restored_row.${quoteIdentifier(column)} IS NULL`).join(" AND ");
+        const allNotNull = fk.source_columns.map(column => `restored_row.${quoteIdentifier(column)} IS NOT NULL`).join(" AND ");
+        const equality = fk.source_columns.map((column, index) =>
+          `referenced_row.${quoteIdentifier(fk.target_columns[index]!)} ${fk.equality_operators[index]} restored_row.${quoteIdentifier(column)}`).join(" AND ");
+        const noMatch = `NOT EXISTS (SELECT 1 FROM ${quoteQualifiedName(fk.target_schema, fk.target_table)} referenced_row WHERE ${equality})`;
+        const violationPredicate = fk.match_full
+          ? `NOT (${allNull}) AND (NOT (${allNotNull}) OR ${noMatch})` : `(${allNotNull}) AND ${noMatch}`;
+        emitStatement(guardedConstraintStatement({
+          constraint_name: fk.constraint_name, schema_name: fk.source_schema, tablename: fk.source_table,
+          constraint_type: "f", definition: fk.definition, check_expression: null,
+          key_expressions: [], exclusion_operators: [], index_predicate: null,
+          primary_key_columns: fk.primary_key_columns, violation_predicate: violationPredicate,
+        }));
       }
       emit("");
     }
@@ -1127,12 +1238,30 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
   }
 }
 
-export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<void> {
+export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promise<RunDatabaseRestoreResult> {
   const connectTimeout = Math.max(1, Math.trunc(opts.connectTimeoutSeconds ?? 5));
+  const constraintViolations: RestoreConstraintViolation[] = [];
+  const collectWarning = (message: string) => {
+    const prefixIndex = message.indexOf(CONSTRAINT_VIOLATION_PREFIX);
+    if (prefixIndex < 0) return;
+    const violation = JSON.parse(message.slice(prefixIndex + CONSTRAINT_VIOLATION_PREFIX.length)) as RestoreConstraintViolation;
+    constraintViolations.push(violation);
+    console.warn(`Restore constraint violation: ${JSON.stringify(violation)}`);
+  };
+  const finish = async (): Promise<RunDatabaseRestoreResult> => {
+    const violationReportFile = constraintViolations.length > 0
+      ? resolve(opts.violationReportFile ?? `${opts.backupFile}.restore-violations-${randomUUID()}.json`) : null;
+    const summary = `restored with ${constraintViolations.length} constraint violations${violationReportFile ? `: see ${violationReportFile}` : ""}`;
+    const result = { constraintViolations, violationReportFile, summary };
+    if (violationReportFile) {
+      await writeFile(violationReportFile, `${JSON.stringify(result, null, 2)}\n`, { mode: 0o600 });
+      console.warn(summary);
+    }
+    return result;
+  };
   let psqlRestoreError: unknown = null;
   try {
-    await restoreWithPsql(opts, connectTimeout);
-    return;
+    await restoreWithPsql(opts, connectTimeout, collectWarning);
   } catch (error) {
     psqlRestoreError = error;
     if (!(await hasStatementBreakpoints(opts.backupFile))) {
@@ -1142,13 +1271,16 @@ export async function runDatabaseRestore(opts: RunDatabaseRestoreOptions): Promi
     }
   }
 
-  const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
+  if (psqlRestoreError === null) return finish();
+  constraintViolations.length = 0;
+  const sql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout, onnotice: notice => collectWarning(notice.message ?? "") });
 
   try {
     await sql`SELECT 1`;
     for await (const statement of readRestoreStatements(opts.backupFile)) {
       await sql.unsafe(statement).execute();
     }
+    return await finish();
   } catch (error) {
     const statementPreview = typeof error === "object" && error !== null && typeof (error as Record<string, unknown>).query === "string"
       ? String((error as Record<string, unknown>).query)
