@@ -251,7 +251,9 @@ describeEmbeddedPostgres("reusable sandbox resume failure replacement", () => {
     const acquired = await acquire(seeded, runtime);
     expect(acquired.lease.metadata?.sandboxLeaseAcquisition).toEqual({ outcome: "replacement", reason: "resume_failed",
       previousProviderLeaseId: seeded.providerLeaseId });
-  });
+    // A 409 reports the idle sandbox busy, so the run waits up to the idle
+    // resume budget (real retry delays) before it replaces it.
+  }, 60_000);
 
   // Staging: a run could not retire its predecessor's warm
   // Runner on this sandbox, did no provider work, and asked for a fresh one.
