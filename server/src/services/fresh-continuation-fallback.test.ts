@@ -549,7 +549,8 @@ suite("fresh-continuation fallback", () => {
     | "D117_scalar_commentId" | "D118_soft_deleted_later_message" | "D128_old_approval_before_failed_message"
     | "D181_old_question_before_failed_message" | "D182_board_confirmation_for_someone_else" | "D152_first_turn_input_failed"
     | "D139_no_wake_no_run" | "D136_board_hold_no_run" | "D138_wake_failed_no_run" | "D137_coalesced_execution_wait_failed"
-    | "D180_old_approval_board_hold" | "D157_queued_wake_never_runs" | "D160_workspace_pending" | "D168_carrying_queued_run_never_starts";
+    | "D180_old_approval_board_hold" | "D157_queued_wake_never_runs" | "D160_workspace_pending" | "D168_carrying_queued_run_never_starts"
+    | "D128_approval_after_run_before_message" | "D138_wake_failed_no_run_blocked" | "D137_coalesced_execution_wait_failed_blocked";
   it.each([
     "D008_failed_first_message", "D110_first_turn_input_silent", "D110_first_turn_input_failed_then_timer",
     "D114_two_messages_first_answered", "D115_earlier_runs_card_after_message", "D116_three_messages_before_prose",
@@ -557,6 +558,7 @@ suite("fresh-continuation fallback", () => {
     "D181_old_question_before_failed_message", "D182_board_confirmation_for_someone_else", "D152_first_turn_input_failed",
     "D139_no_wake_no_run", "D136_board_hold_no_run", "D138_wake_failed_no_run", "D137_coalesced_execution_wait_failed",
     "D180_old_approval_board_hold", "D157_queued_wake_never_runs", "D160_workspace_pending", "D168_carrying_queued_run_never_starts",
+    "D128_approval_after_run_before_message", "D138_wake_failed_no_run_blocked", "D137_coalesced_execution_wait_failed_blocked",
   ] satisfies PinShape[])("F3 pin re-home %s: the latest person message has exactly one truthful outcome by 120 s", async shape => {
     const t = new Date(Date.now() - 600_000);
     const at = (offset: number) => new Date(t.getTime() + offset);
@@ -650,6 +652,26 @@ suite("fresh-continuation fallback", () => {
         latest = await message("Never mind the deploy. What is the current version?", -60_000);
         await run(0, "failed", { wakeCommentId: latest.id }); break;
       }
+      // rf-3 (REMOVED-REOFFER-REGRESSION): the run carrying "Deploy when approved." was queued at t-100 s,
+      // the approval asked at t-80 s, and the person's different instruction at t-60 s folded into that
+      // queued run in production's coalesced format (older scalar commentId/wakeCommentId, then
+      // wakeCommentIds: [older, latest]; the latest wake `coalesced` into the run). The approval predates
+      // the MESSAGE but not the run row: the failed attempt's card is the one outcome, not the approval wait.
+      case "D128_approval_after_run_before_message": {
+        const prior = await message("Deploy when approved.", -140_000);
+        const [approval] = await db.insert(approvals).values({ companyId, type: "deploy", requestedByAgentId: agentId, status: "pending",
+          payload: { summary: "Deploy" }, createdAt: at(-80_000) } as typeof approvals.$inferInsert).returning();
+        await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id, linkedByAgentId: agentId, createdAt: at(-80_000) } as typeof issueApprovals.$inferInsert);
+        latest = await message("Never mind the deploy. What is the current version?", -60_000);
+        const carrying = await run(0, "failed", { commentId: prior.id, wakeCommentId: prior.id, wakeCommentIds: [prior.id, latest.id] },
+          { createdAt: at(-100_000), startedAt: at(-29_000), updatedAt: at(0) });
+        const [primary] = await db.update(agentWakeupRequests).set({ runId: carrying.id, requestedAt: at(-139_000), finishedAt: at(0), updatedAt: at(0) })
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${prior.id}`))).returning();
+        await db.update(heartbeatRuns).set({ wakeupRequestId: primary!.id }).where(eq(heartbeatRuns.id, carrying.id));
+        await db.update(agentWakeupRequests).set({ status: "coalesced", runId: carrying.id, requestedAt: at(-59_000), finishedAt: at(-59_000), updatedAt: at(-59_000) })
+          .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.idempotencyKey, `conversation-comment:${latest.id}`)));
+        break;
+      }
       case "D181_old_question_before_failed_message": {
         const prior = await message("Deploy it.", -200_000);
         const priorRun = await run(-150_000, "succeeded", { wakeCommentId: prior.id });
@@ -671,11 +693,13 @@ suite("fresh-continuation fallback", () => {
         await boardHeldNativeRun(issueId, at(-300_000));
         latest = await message("Please answer this accepted request.", -60_000); break;
       }
+      case "D138_wake_failed_no_run_blocked":
       case "D138_wake_failed_no_run": {
         // The original outbox wake ended FAILED with no run. (REG-21's "blocked" half has no writer at head:
         // its error text "provider or completion contract changed" is not produced anywhere in server/src.)
         latest = await message("Please answer this accepted request.", -60_000, "failed"); break;
       }
+      case "D137_coalesced_execution_wait_failed_blocked":
       case "D137_coalesced_execution_wait_failed": {
         latest = await message("Please answer this accepted request.", -60_000, "coalesced");
         await db.insert(agentWakeupRequests).values({ companyId, agentId, source: "automation", reason: "execution_wait", status: "failed",
@@ -722,6 +746,8 @@ suite("fresh-continuation fallback", () => {
         busyTurnId = (await run(-120_000, "running", {}, { finishedAt: null, startedAt: at(-120_000), createdAt: at(-121_000) })).id; break;
       }
     }
+    // rf-3 R-SILENT: the same failed delivery while the task is BLOCKED (the person's message never ran).
+    if (shape.endsWith("_blocked")) await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
     // D168 waits behind its own busy turn (one slot); every other shape behind other work.
     if (!busyTurnId) await occupySlot();
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -770,6 +796,8 @@ suite("fresh-continuation fallback", () => {
       };
       for (const elapsed of [90_001, 119_999, 120_000]) await tick(elapsed);
       const first = await observe();
+      if (shape === "D128_approval_after_run_before_message")
+        expect(first.card, "the failed attempt for the later message owns the card, not the older approval").toMatchObject({ state: "failed", canRetry: true });
       if (shape === "D160_workspace_pending") expect(first.redeliveries, "the finishing turn is not re-offered (D160)").toBe(0);
       if (shape === "D157_queued_wake_never_runs" || shape === "D168_carrying_queued_run_never_starts") {
         expect(first.card, "inside the start bound the person's queued run is working").toMatchObject({ state: "working" });
