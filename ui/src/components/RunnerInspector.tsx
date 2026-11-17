@@ -155,7 +155,7 @@ function statusVariant(status: string | undefined) {
 function traceBadgeLabel(status: string, expiresAt: string | Date) {
   if (status === "capturing") return "Raw trace enabled";
   if (status === "incomplete") return "Incomplete";
-  if (status === "truncated") return "Truncated";
+  if (status === "truncated") return "Capture limit reached";
   if (status === "deleted") return "Deleted";
   if (status === "expired") return "Expired";
   const remainingMs = new Date(expiresAt).getTime() - Date.now();

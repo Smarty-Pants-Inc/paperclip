@@ -272,8 +272,7 @@ function runtimeRequestEntry(input: {
       const key = text(choice?.key);
       const label = text(choice?.label);
       return key && label ? [{ key, label }] : [];
-    })
-    .slice(0, 32);
+    });
   const details = record(request.details);
   const fields = (Array.isArray(details?.fields) ? details.fields : [])
     .map(record)
@@ -281,10 +280,9 @@ function runtimeRequestEntry(input: {
       const name = text(field?.name) ?? `answer_${index + 1}`;
       const label = text(field?.label) ?? text(field?.name) ?? `Answer ${index + 1}`;
       return name && label
-        ? [{ name: name.slice(0, 160), label: label.slice(0, 240), placeholder: text(field?.placeholder)?.slice(0, 500) ?? null }]
+        ? [{ name: name.slice(0, 160), label, placeholder: text(field?.placeholder) ?? null }]
         : [];
-    })
-    .slice(0, 16);
+    });
   return {
     kind: "runtime_request",
     ts: input.ts,
@@ -339,15 +337,13 @@ function runResultEntry(
         status: verificationStatus(item.status),
         ...(text(item.detail) ? { detail: text(item.detail)! } : {}),
         ...(text(item.artifactRef) ? { artifactRef: text(item.artifactRef)! } : {}),
-      }] : [])
-      .slice(0, 64),
+      }] : []),
     remainingWork: (Array.isArray(completion.remainingWork) ? completion.remainingWork : [])
       .map(record)
       .flatMap((item) => item && text(item.description) ? [{
         description: text(item.description)!,
         blocksCompletion: item.blocksCompletion === true,
-      }] : [])
-      .slice(0, 64),
+      }] : []),
     blocker: blocker ? {
       reasonCode: text(blocker.reasonCode) ?? "blocked",
       unblockAction: text(blocker.unblockAction) ?? "Resolve the blocker to continue.",
@@ -359,8 +355,7 @@ function runResultEntry(
         kind: text(item.kind) ?? "artifact",
         ref: text(item.ref)!,
         ...(text(item.title) ? { title: text(item.title)! } : {}),
-      }] : [])
-      .slice(0, 64),
+      }] : []),
   };
 }
 
@@ -791,7 +786,7 @@ function fileChangeDiffEntries(
 ): TranscriptEntry[] {
   if (!value) return [];
   const entries: TranscriptEntry[] = [];
-  for (const raw of value.slice(0, 32)) {
+  for (const raw of value) {
     const change = record(raw);
     const path = text(change?.path);
     if (!change || !path) continue;
@@ -809,7 +804,7 @@ function fileChangeDiffEntries(
       entries.push({ kind: "diff", ts, changeType: kind, text: value, toolUseId });
     }
     if (change.diffTruncated === true) {
-      entries.push({ kind: "diff", ts, changeType: "truncation", text: "Diff shortened for display.", toolUseId });
+      entries.push({ kind: "diff", ts, changeType: "truncation", text: "The runner saved only part of this patch. Open the run log to inspect the saved output.", toolUseId });
     }
   }
   return entries;

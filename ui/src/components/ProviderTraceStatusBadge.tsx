@@ -39,7 +39,7 @@ export function ProviderTraceStatusBadge({
         : status === "incomplete"
           ? "Trace incomplete"
           : status === "truncated"
-            ? "Trace truncated"
+            ? "Trace capture limit reached"
             : status === "expired"
               ? "Trace expired"
               : status === "deleted"

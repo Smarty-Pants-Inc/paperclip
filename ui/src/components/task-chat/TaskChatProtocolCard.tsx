@@ -55,6 +55,7 @@ import { RichWorkProductCard } from "./RichWorkProductCard";
 import { planPreviewContent, TaskChatPlanPreviewCard } from "./TaskChatPlanPreviewCard";
 import { TaskChatDiffCounts, TaskChatDiffView } from "./TaskChatDiffView";
 import { parseUnifiedDiffLines } from "./diff-lines";
+import { SavedOutputNotice } from "./SavedOutputNotice";
 import { useArtifactsV1Enabled } from "@/hooks/useArtifactsV1Enabled";
 import { ArtifactFileRow, ArtifactRow, fileRowSourceFromAttachment, fileRowSourceFromWorkProduct, subjectFromAttachment, subjectFromDocumentSummary, subjectFromWorkProduct, workProductStateBadge } from "@/components/artifacts/v1";
 
@@ -405,9 +406,7 @@ function ProviderActivityCard({
             </pre>
           ) : null}
           {item.outputTruncated ? (
-            <p className="mt-1 text-xs text-muted-foreground">
-              Output truncated to 8 KiB.
-            </p>
+            <SavedOutputNotice runLogHref={item.runLogHref} />
           ) : null}
         </details>
       ) : null}
@@ -419,7 +418,9 @@ function WorkspaceChangeFileRow({
   file,
   open,
   onToggle,
+  runLogHref,
 }: {
+  runLogHref?: string;
   file: TaskChatWorkspaceChangeItem["files"][number];
   open: boolean;
   onToggle: () => void;
@@ -468,11 +469,12 @@ function WorkspaceChangeFileRow({
         ) : parsed?.lines.length ? (
           <TaskChatDiffView
             className="ml-7 mt-1"
+            runLogHref={runLogHref}
             lines={parsed.lines}
             truncated={parsed.truncated || file.diffTruncated === true}
           />
         ) : (
-          <p className="ml-7 mt-1 text-xs text-muted-foreground">This patch is too large to show here.</p>
+          <div className="ml-7 mt-1"><SavedOutputNotice kind="patch" runLogHref={runLogHref} /></div>
         )
       ) : null}
     </div>
@@ -529,6 +531,7 @@ function WorkspaceChangeCard({ item }: { item: TaskChatWorkspaceChangeItem }) {
           <WorkspaceChangeFileRow
             key={`${file.operation}:${file.path}`}
             file={file}
+            runLogHref={item.runLogHref}
             open={openPaths.has(file.path)}
             onToggle={() => toggle(file.path)}
           />
@@ -546,10 +549,10 @@ function WorkspaceChangeCard({ item }: { item: TaskChatWorkspaceChangeItem }) {
         </Button>
       ) : null}
       {fileCount > item.files.length ? (
-        <p className="mt-1 px-2 text-xs text-muted-foreground" data-testid="task-chat-workspace-change-omitted">
-          {fileCount - item.files.length} more {fileCount - item.files.length === 1 ? "file" : "files"} changed.
-          This change set is too large to list them here.
-        </p>
+        <div className="mt-1 px-2 text-xs text-muted-foreground" data-testid="task-chat-workspace-change-omitted">
+          <p>The runner reported {fileCount - item.files.length} additional {fileCount - item.files.length === 1 ? "file" : "files"} without file details.</p>
+          <SavedOutputNotice kind="patch" runLogHref={item.runLogHref} />
+        </div>
       ) : null}
     </CardShell>
   );
@@ -628,9 +631,7 @@ function WorkspaceFileCard({ item }: { item: TaskChatWorkspaceFileItem }) {
             </pre>
           )}
           {item.previewTruncated ? (
-            <p className="text-xs text-muted-foreground">
-              Preview truncated by the runner.
-            </p>
+            <SavedOutputNotice kind="file preview" runLogHref={item.runLogHref} />
           ) : null}
         </DialogContent>
       </Dialog>

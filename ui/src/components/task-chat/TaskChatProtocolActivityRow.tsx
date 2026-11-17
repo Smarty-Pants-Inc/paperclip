@@ -29,6 +29,8 @@ import {
   providerNoticeSeverity,
 } from "./task-chat-activity-presentation";
 
+import { SavedOutputNotice } from "./SavedOutputNotice";
+
 const COMPACT_RESEARCH_RESULT_LIMIT = 5;
 const COMPACT_WORKSPACE_FILE_LIMIT = 8;
 const RESEARCH_SOURCE_PREVIEW_LIMIT = 3;
@@ -94,12 +96,12 @@ function ResearchDetails({ item }: { item: TaskChatProviderActivityItem }) {
             {visibleLinks.map((link, index) => (
               <li className="min-w-0 py-1.5 first:pt-0 last:pb-0" key={`${link.href}:${index}`}>
                 <a className="flex min-w-0 items-center gap-1 font-medium text-foreground hover:underline" href={link.href} target="_blank" rel="noreferrer">
-                  <span className="truncate">{link.label}</span>
+                  <span className="min-w-0 break-words">{link.label}</span>
                   <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
                 </a>
                 <p className="mt-0.5 flex min-w-0 gap-2 text-muted-foreground">
                   <span className="shrink-0">{sourceHostname(link.href)}</span>
-                  {link.description ? <span className="min-w-0 truncate">{link.description}</span> : null}
+                  {link.description ? <span className="min-w-0 whitespace-pre-wrap break-words">{link.description}</span> : null}
                 </p>
               </li>
             ))}
@@ -124,9 +126,8 @@ function ResearchDetails({ item }: { item: TaskChatProviderActivityItem }) {
         </div>
       ) : null}
       <DetailList details={additionalDetails} />
-      {item.output || item.outputTruncated ? (
-        <p className="text-muted-foreground">Additional provider output is available in Runner Inspector.</p>
-      ) : null}
+      {item.output ? <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre> : null}
+      {item.outputTruncated ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }
@@ -150,7 +151,7 @@ function ProviderDetails({ item, neutral = false }: { item: TaskChatProviderActi
           {item.links.map((link) => (
             <li key={link.href}>
               <a className="inline-flex min-w-0 items-center gap-1 font-medium text-primary hover:underline" href={link.href} target="_blank" rel="noreferrer">
-                <span className="truncate">{link.label}</span>
+                <span className="min-w-0 break-words">{link.label}</span>
                 <ExternalLink className="h-3 w-3 shrink-0" aria-hidden />
               </a>
               {link.description ? <p className="mt-0.5 text-muted-foreground">{link.description}</p> : null}
@@ -165,7 +166,7 @@ function ProviderDetails({ item, neutral = false }: { item: TaskChatProviderActi
               <span className="flex min-w-0 items-center gap-2">
                 <span className="font-medium text-foreground">{child.title}</span>
                 <span className="capitalize text-muted-foreground">{child.status}</span>
-                {child.metadata ? <span className="min-w-0 truncate font-mono text-(length:--text-micro)">{child.metadata}</span> : null}
+                {child.metadata ? <span className="min-w-0 whitespace-pre-wrap break-words font-mono text-(length:--text-micro)">{child.metadata}</span> : null}
               </span>
               {child.summary ? <span className="text-muted-foreground">{child.summary}</span> : null}
             </li>
@@ -178,14 +179,15 @@ function ProviderDetails({ item, neutral = false }: { item: TaskChatProviderActi
       {item.output ? (
         <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.output}</pre>
       ) : null}
-      {item.outputTruncated ? <p className="text-muted-foreground">Output truncated to 8 KiB.</p> : null}
+      {item.outputTruncated ? <SavedOutputNotice runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }
 
 function WorkspaceChangeDetails({ item }: { item: TaskChatWorkspaceChangeItem }) {
+  const [showAllFiles, setShowAllFiles] = useState(false);
   if (item.files.length === 0) return <p className="text-muted-foreground">No changed-file details were reported.</p>;
-  const visibleFiles = item.files.slice(0, COMPACT_WORKSPACE_FILE_LIMIT);
+  const visibleFiles = showAllFiles ? item.files : item.files.slice(0, COMPACT_WORKSPACE_FILE_LIMIT);
   const hiddenFileCount = item.files.length - visibleFiles.length;
   return (
     <div className="min-w-0" data-testid="task-chat-workspace-change-details">
@@ -204,7 +206,8 @@ function WorkspaceChangeDetails({ item }: { item: TaskChatWorkspaceChangeItem })
           </li>
         ))}
       </ul>
-      {hiddenFileCount > 0 ? <p className="mt-1.5 text-muted-foreground">{hiddenFileCount} more {hiddenFileCount === 1 ? "file" : "files"} not shown</p> : null}
+      {hiddenFileCount > 0 ? <button type="button" className="mt-1.5 text-muted-foreground hover:text-foreground" onClick={() => setShowAllFiles(true)}>Show {hiddenFileCount} more {hiddenFileCount === 1 ? "file" : "files"}</button> : null}
+      {item.totals.files > item.files.length ? <SavedOutputNotice kind="patch" runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }
@@ -227,7 +230,7 @@ function WorkspaceFileDetails({ item }: { item: TaskChatWorkspaceFileItem }) {
           <pre className="max-h-(--sz-64) overflow-auto whitespace-pre-wrap rounded-sm bg-muted/50 p-2 font-mono text-(length:--text-micro) text-foreground">{item.preview}</pre>
         )
       ) : <p className="text-muted-foreground">Preview unavailable.</p>}
-      {item.previewTruncated ? <p className="text-muted-foreground">Preview truncated by the runner.</p> : null}
+      {item.previewTruncated ? <SavedOutputNotice kind="file preview" runLogHref={item.runLogHref} /> : null}
     </div>
   );
 }

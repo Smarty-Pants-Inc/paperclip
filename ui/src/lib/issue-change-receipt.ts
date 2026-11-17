@@ -54,8 +54,6 @@ export function issueChangeFieldLabel(field: string): string {
   return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
-const VALUE_PREVIEW_BUDGET = 72;
-
 /**
  * Render one side of a change for display. Never returns an empty string, so a
  * receipt row always reads as "from → to" rather than trailing into nothing.
@@ -97,18 +95,12 @@ export function formatIssueChangeValue(
     if (isIsoTimestamp(trimmed)) return new Date(trimmed).toLocaleString();
     if (looksLikeId(trimmed)) return shortenId(trimmed);
     const humanized = trimmed.includes(" ") ? trimmed : trimmed.replace(/_/g, " ");
-    return truncate(humanized);
+    return humanized;
   }
 
   // Objects (execution policy, workspace settings) are structural — the receipt
   // records that they moved, and the audit log holds the full value.
   return "updated";
-}
-
-function truncate(value: string): string {
-  const chars = Array.from(value);
-  if (chars.length <= VALUE_PREVIEW_BUDGET) return value;
-  return `${chars.slice(0, VALUE_PREVIEW_BUDGET).join("")}…`;
 }
 
 function isIsoTimestamp(value: string): boolean {
@@ -120,7 +112,7 @@ function looksLikeId(value: string): boolean {
 }
 
 function shortenId(value: string): string {
-  return looksLikeId(value) ? value.slice(0, 8) : truncate(value);
+  return looksLikeId(value) ? value.slice(0, 8) : value;
 }
 
 export interface IssueChangeReceiptRow {

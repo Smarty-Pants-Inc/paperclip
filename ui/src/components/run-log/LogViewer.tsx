@@ -526,6 +526,7 @@ export function LogViewer({ run, adapterType }: { run: HeartbeatRun; adapterType
       </div>
       <div className="max-h-(--sz-38rem) overflow-y-auto rounded-2xl border border-border/70 bg-background/40 p-3 sm:p-4">
         <RunTranscriptView
+          runLogHref={`/agents/${encodeURIComponent(run.agentId)}/runs/${encodeURIComponent(run.id)}`}
           entries={transcript}
           toolDecisions={toolDecisionLookup.data?.decisions ?? []}
           mode={transcriptMode}

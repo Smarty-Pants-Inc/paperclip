@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { SavedOutputNotice } from "../task-chat/SavedOutputNotice";
 import type { TranscriptEntry } from "../../adapters";
 import type { ToolRunDecision } from "@paperclipai/shared";
 import { MarkdownBody, type MarkdownExternalReferenceMap } from "../MarkdownBody";
@@ -31,6 +32,7 @@ const RAW_INITIAL_ROWS = 180;
 
 interface RunTranscriptViewProps {
   entries: TranscriptEntry[];
+  runLogHref?: string;
   toolDecisions?: readonly ToolRunDecision[];
   mode?: TranscriptMode;
   density?: TranscriptDensity;
@@ -885,12 +887,12 @@ function transcriptBlockIdentity(block: TranscriptBlock): string {
   }
 }
 
-function TranscriptProviderActivity({ block, density }: { block: Extract<TranscriptBlock, { type: "provider_activity" }>; density: TranscriptDensity }) {
+function TranscriptProviderActivity({ block, density, runLogHref }: { block: Extract<TranscriptBlock, { type: "provider_activity" }>; density: TranscriptDensity; runLogHref?: string }) {
   const [open, setOpen] = useState(block.status === "running");
   const steps = Array.isArray(block.payload.steps) ? block.payload.steps.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
   const children = Array.isArray(block.payload.children) ? block.payload.children.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
   const sources = Array.isArray(block.payload.sources) ? block.payload.sources.map(asRecord).filter((value): value is Record<string, unknown> => value !== null) : [];
-  const output = typeof block.payload.output === "string" ? block.payload.output.slice(-(8 * 1024)) : "";
+  const output = typeof block.payload.output === "string" ? block.payload.output : "";
   return <div className={cn("rounded-xl border p-2", block.status === "failed" ? "border-red-500/30 bg-red-500/[0.05]" : "border-border/70 bg-muted/20")} data-provider-family={block.family}>
     <button type="button" className="flex min-h-8 w-full items-center gap-2 text-left" onClick={() => setOpen((value) => !value)} aria-expanded={open}>
       <span aria-hidden="true">{block.status === "running" ? "⏳" : block.status === "failed" ? "✕" : block.status === "interrupted" ? "■" : "✓"}</span>
@@ -899,11 +901,13 @@ function TranscriptProviderActivity({ block, density }: { block: Extract<Transcr
       {open ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
     </button>
     {open ? <div className="mt-2 space-y-2 border-l border-border pl-5 text-xs">
+      {block.summary ? <p className="whitespace-pre-wrap break-words">{block.summary}</p> : null}
       {steps.length > 0 ? <ol className="space-y-1">{steps.map((step, index) => <li key={String(step.stepId ?? index)}><span className="mr-2" aria-hidden="true">{step.status === "completed" ? "✓" : step.status === "blocked" ? "!" : "○"}</span>{String(step.body ?? "")}</li>)}</ol> : null}
       {children.length > 0 ? <ul className="space-y-1">{children.map((child, index) => <li key={String(child.childId ?? index)}><strong>{String(child.role ?? "Child agent")}</strong> · {String(child.status ?? "unknown")}<div className="text-muted-foreground">{String(child.summary ?? "")}</div></li>)}</ul> : null}
       {sources.length > 0 ? <ul className="space-y-1">{sources.map((source, index) => { const url = typeof source.url === "string" && /^https?:\/\//.test(source.url) ? source.url : null; return <li key={String(source.sourceId ?? index)}>{url ? <a className="underline" href={url} target="_blank" rel="noreferrer">{String(source.title ?? url)}</a> : String(source.title ?? "Unavailable source")} <span className="text-muted-foreground">Provider-reported</span></li>; })}</ul> : null}
       {output ? <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded bg-background p-2 font-mono">{output}</pre> : null}
-      {block.family === "provider_notice" && Array.isArray(block.payload.details) ? <dl className="space-y-1">{block.payload.details.slice(0, 64).map((value, index) => { const detail = asRecord(value); return detail && typeof detail.name === "string" && typeof detail.value === "string" ? <div key={index}><dt className="text-muted-foreground">{detail.name}</dt><dd className="whitespace-pre-wrap break-words">{detail.value}</dd></div> : null; })}</dl> : null}
+      {block.payload.outputTruncated === true ? <SavedOutputNotice runLogHref={runLogHref} /> : null}
+      {block.family === "provider_notice" && Array.isArray(block.payload.details) ? <dl className="space-y-1">{block.payload.details.map((value, index) => { const detail = asRecord(value); return detail && typeof detail.name === "string" && typeof detail.value === "string" ? <div key={index}><dt className="text-muted-foreground">{detail.name}</dt><dd className="whitespace-pre-wrap break-words">{detail.value}</dd></div> : null; })}</dl> : null}
       {block.family === "model_identity" ? <div><span className="text-muted-foreground">Requested</span> {String(block.payload.requestedModel ?? "—")} · <span className="text-muted-foreground">Effective</span> {String(block.payload.effectiveModel ?? "—")}</div> : null}
     </div> : null}
   </div>;
@@ -1875,6 +1879,7 @@ function RawTranscriptView({
 
 export function RunTranscriptView({
   entries,
+  runLogHref,
   toolDecisions,
   mode = "nice",
   density = "comfortable",
@@ -1891,9 +1896,10 @@ export function RunTranscriptView({
     () => (mode === "raw" ? [] : normalizeTranscript(entries, streaming)),
     [entries, mode, streaming],
   );
-  const visibleBlocks = limit ? blocks.slice(-limit) : blocks;
+  const [showAllHistory, setShowAllHistory] = useState(false);
+  const hiddenBlocks = !showAllHistory && limit ? Math.max(0, blocks.length - limit) : 0;
+  const visibleBlocks = hiddenBlocks > 0 ? blocks.slice(hiddenBlocks) : blocks;
   const keyedBlocks = useMemo(() => keyTranscriptBlocks(visibleBlocks), [visibleBlocks]);
-  const visibleEntries = limit ? entries.slice(-limit) : entries;
 
   if (entries.length === 0) {
     return (
@@ -1906,13 +1912,18 @@ export function RunTranscriptView({
   if (mode === "raw") {
     return (
       <div className={className}>
-        <RawTranscriptView entries={visibleEntries} density={density} />
+        <RawTranscriptView entries={entries} density={density} />
       </div>
     );
   }
 
   return (
     <div className={cn("space-y-3", className)}>
+      {hiddenBlocks > 0 ? (
+        <button type="button" className="text-sm text-foreground underline underline-offset-4" onClick={() => setShowAllHistory(true)}>
+          Show {hiddenBlocks} earlier {hiddenBlocks === 1 ? "block" : "blocks"}
+        </button>
+      ) : null}
       {keyedBlocks.map(({ block, key }, index) => (
         <div
           key={key}
@@ -1960,7 +1971,7 @@ export function RunTranscriptView({
               externalReferences={externalReferences}
             />
           )}
-          {block.type === "provider_activity" && <TranscriptProviderActivity block={block} density={density} />}
+          {block.type === "provider_activity" && <TranscriptProviderActivity block={block} density={density} runLogHref={runLogHref} />}
         </div>
       ))}
     </div>

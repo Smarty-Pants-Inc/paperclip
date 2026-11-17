@@ -182,7 +182,7 @@ const TARGET_KEYS = [
   "subject",
 ] as const;
 
-const TARGET_MAX = 96;
+
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -208,26 +208,26 @@ export function toolInputTaskRef(input: unknown): string | undefined {
   return undefined;
 }
 
-function clip(text: string, max: number): string {
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+// Keep authored text intact; collapsed rows handle their own visual preview.
+function fullText(text: string): string {
+  return text;
 }
 
 /**
  * Summarize a tool call's input into the v7 toolrow target: the most
- * identifying parameter when the input is a keyed object, else a clipped
+ * identifying parameter when the input is a keyed object, else the complete
  * rendering of the raw input. Returns undefined when there is nothing useful.
  */
 export function summarizeToolInput(input: unknown): string | undefined {
   if (input == null) return undefined;
   if (typeof input === "string")
-    return input.trim() && !isOpaqueId(input) ? clip(input, TARGET_MAX) : undefined;
-  if (typeof input !== "object") return clip(String(input), TARGET_MAX);
+    return input.trim() && !isOpaqueId(input) ? fullText(input) : undefined;
+  if (typeof input !== "object") return fullText(String(input));
   const record = input as Record<string, unknown>;
   for (const key of TARGET_KEYS) {
     const value = record[key];
     if (typeof value === "string" && value.trim() && !isOpaqueId(value))
-      return clip(value, TARGET_MAX);
+      return fullText(value);
   }
   // The acpx log parser synthesizes { text, status } onto tool inputs from the
   // event's summary line — presentation noise, not call parameters. Raw ids
@@ -242,10 +242,7 @@ export function summarizeToolInput(input: unknown): string | undefined {
       k !== "status",
   );
   if (entries.length === 0) return undefined;
-  return clip(
-    entries.map(([k, v]) => `${k}: ${String(v)}`).join(", "),
-    TARGET_MAX,
-  );
+  return fullText(entries.map(([k, v]) => `${k}: ${String(v)}`).join(", "));
 }
 
 /**
@@ -290,8 +287,7 @@ function appendThinkingText(
   lines.push(...fragments.slice(1));
 }
 
-const DETAIL_MAX = 600;
-const PROTOCOL_OUTPUT_MAX = 8 * 1024;
+
 
 function objectRecord(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -445,23 +441,16 @@ function providerActivityItem(
       continue;
     details.push({
       label: titleCaseKey(key),
-      value: clip(
-        value,
-        (entry.family === "provider_notice" && (key === "summary" || key === "message")) ||
-          (entry.family === "verification" && key === "detail")
-          ? 4000
-          : key === "message" || key === "summary" || key === "reason" ? 320
-            : entry.family === "safety" && key === "action" ? 1000 : 160,
-      ),
+      value,
       mono: /(?:id|model|target|reference|url|code|bytes)$/i.test(key),
     });
   }
 
   if (entry.family === "provider_notice" && Array.isArray(entry.payload.details)) {
-    for (const raw of entry.payload.details.slice(0, 64)) {
+    for (const raw of entry.payload.details) {
       const detail = objectRecord(raw);
       if (typeof detail.name === "string" && typeof detail.value === "string") {
-        details.push({ label: clip(detail.name, 160), value: clip(detail.value, 4000), mono: false });
+        details.push({ label: detail.name, value: detail.value, mono: false });
       }
     }
   }
@@ -470,7 +459,6 @@ function providerActivityItem(
     entry.family === "plan" && Array.isArray(entry.payload.steps)
       ? entry.payload.steps
           .map(objectRecord)
-          .slice(0, 256)
           .map((step, stepIndex) => {
             const rawStatus = stringValue(step.status);
             const status: TaskChatProtocolStep["status"] =
@@ -492,7 +480,6 @@ function providerActivityItem(
     entry.family === "research" && Array.isArray(entry.payload.sources)
       ? entry.payload.sources
           .map(objectRecord)
-          .slice(0, 64)
           .flatMap((source) => {
             const href = safeHttpHref(source.url);
             return href
@@ -511,7 +498,6 @@ function providerActivityItem(
     entry.family === "delegation" && Array.isArray(entry.payload.children)
       ? entry.payload.children
           .map(objectRecord)
-          .slice(0, 64)
           .map((child, childIndex) => ({
             id:
               stringValue(child.childId) ?? `${runId}:delegation:${childIndex}`,
@@ -530,15 +516,9 @@ function providerActivityItem(
           }))
       : [];
 
-  const rawOutput =
-    entry.family === "tool_execution"
-      ? stringValue(entry.payload.output)
-      : entry.family === "plan_proposal"
-        ? stringValue(entry.payload.markdown)
-        : undefined;
-  const outputTruncated =
-    entry.payload.outputTruncated === true ||
-    Boolean(rawOutput && entry.family !== "plan_proposal" && rawOutput.length > PROTOCOL_OUTPUT_MAX);
+  const outputValue = entry.family === "plan_proposal" ? entry.payload.markdown : entry.payload.output;
+  const rawOutput = typeof outputValue === "string" ? outputValue : undefined;
+  const outputTruncated = entry.payload.outputTruncated === true;
   const summary =
     entry.summary && entry.summary !== entry.eventType
       ? entry.summary
@@ -560,10 +540,7 @@ function providerActivityItem(
     steps,
     links,
     children,
-    // A proposed plan is a document, bounded by its own 60k event schema.
-    output: rawOutput
-      ? rawOutput.slice(0, entry.family === "plan_proposal" ? 60_000 : PROTOCOL_OUTPUT_MAX)
-      : undefined,
+    output: rawOutput,
     outputTruncated,
     transcriptIndex: index,
     startedAt: entry.ts,
@@ -659,20 +636,17 @@ function mergeProviderActivityItem(
   };
 }
 
-/** Result content → the expandable mono detail block (clipped, trimmed). */
+/** Complete result content for the expandable mono detail block. */
 function formatToolResultDetail(content: unknown): string | undefined {
   if (content == null) return undefined;
   const text = typeof content === "string" ? content : String(content);
-  const trimmed = text.trim();
-  if (!trimmed) return undefined;
-  return trimmed.length > DETAIL_MAX
-    ? `${trimmed.slice(0, DETAIL_MAX)}\n…`
-    : trimmed;
+  return text.trim() ? text : undefined;
 }
 
 interface TranscriptAdapterOptions {
   runId: string;
   agentName?: string;
+  runLogHref?: string;
   /** True while the run is still in flight (drives streaming cursors). */
   running: boolean;
 }
@@ -739,7 +713,7 @@ function applyToolDetail(tool: TaskChatToolItem, detail: NonNullable<Extract<Tra
     ? detail.target ?? detail.subject
     : detail.subject ?? detail.target;
   // Older runs carry no subject; keep the input summary they already had.
-  if (subject) tool.target = clip(subject, 400);
+  if (subject) tool.target = fullText(subject);
   if (detail.description) tool.description = detail.description;
   if (detail.exitCode !== undefined) tool.exitCode = detail.exitCode;
   if (detail.durationMs !== undefined) tool.durationMs = detail.durationMs;
@@ -748,7 +722,7 @@ function applyToolDetail(tool: TaskChatToolItem, detail: NonNullable<Extract<Tra
 
 export function transcriptToTaskChatItems(
   entries: readonly TranscriptEntry[],
-  { runId, agentName, running }: TranscriptAdapterOptions,
+  { runId, agentName, running, runLogHref }: TranscriptAdapterOptions,
 ): TaskChatItem[] {
   const items: TaskChatItem[] = [];
   const toolIndexById = new Map<string, number>();
@@ -908,7 +882,7 @@ export function transcriptToTaskChatItems(
               existing.name = toolDisplayName(entry.name);
               existing.rawName = entry.name ?? undefined;
             } else if (!existing.target && entry.name !== existing.rawName) {
-              existing.target = clip(entry.name!, TARGET_MAX);
+              existing.target = fullText(entry.name!);
             }
           }
           const target = summarizeToolInput(entry.input);
@@ -1056,7 +1030,7 @@ export function transcriptToTaskChatItems(
         const key = entry.family === "provider_notice" && entry.payload.category === "provider_retry"
           ? `provider:${providerActivityKey(entry)}:${i}`
           : `provider:${providerActivityKey(entry)}`;
-        const item = providerActivityItem(entry, runId, i);
+        const item = { ...providerActivityItem(entry, runId, i), runLogHref };
         const existingIndex = protocolIndexByKey.get(key);
         const previous = existingIndex == null ? undefined : items[existingIndex];
         // A harness can reuse one hook id for two calls (for example two
@@ -1087,16 +1061,12 @@ export function transcriptToTaskChatItems(
           id: `${runId}:workspace:${entry.changeSetId}`,
           kind: "protocol",
           surface: "workspace_change",
+          runLogHref,
           changeSetId: entry.changeSetId,
           revision: entry.revision,
           source: entry.source,
           complete: entry.complete,
-          files: entry.files.map((file) => {
-            if (file.diff == null || file.diff.length <= PROTOCOL_OUTPUT_MAX) return { ...file };
-            // Keep whole lines so the preview still parses as a patch.
-            const cut = file.diff.lastIndexOf("\n", PROTOCOL_OUTPUT_MAX);
-            return { ...file, diff: file.diff.slice(0, cut > 0 ? cut + 1 : PROTOCOL_OUTPUT_MAX), diffTruncated: true };
-          }),
+          files: entry.files.map((file) => ({ ...file })),
           totals: entry.totals,
           patchArtifactRef: entry.patchArtifactRef,
         };
@@ -1116,6 +1086,7 @@ export function transcriptToTaskChatItems(
           id: `${runId}:workspace-file:${entry.referenceId}`,
           kind: "protocol",
           surface: "workspace_file",
+          runLogHref,
           referenceId: entry.referenceId,
           source: entry.source,
           path: entry.path,
@@ -1123,15 +1094,8 @@ export function transcriptToTaskChatItems(
           mediaType: entry.mediaType,
           presentation: entry.presentation,
           line: entry.line,
-          preview:
-            entry.preview == null
-              ? null
-              : entry.preview.slice(0, PROTOCOL_OUTPUT_MAX),
-          previewTruncated:
-            entry.previewTruncated ||
-            Boolean(
-              entry.preview && entry.preview.length > PROTOCOL_OUTPUT_MAX,
-            ),
+          preview: entry.preview,
+          previewTruncated: entry.previewTruncated,
         };
         const existingIndex = protocolIndexByKey.get(key);
         if (existingIndex == null) {
@@ -1299,11 +1263,17 @@ export function transcriptToTaskChatItems(
   // final answer. A harness that reports only per-edit patches gets the card
   // assembled from its edit rows.
   const folded = foldApprovedAutoReviews(items, runId);
+  if (runLogHref) {
+    for (const item of folded) {
+      if (item.kind === "tool") item.runLogHref = runLogHref;
+    }
+  }
   const changeIndex = folded.findIndex((item) => item.kind === "protocol" && item.surface === "workspace_change");
   const changes = changeIndex >= 0
     ? folded.splice(changeIndex, 1)[0]
     : turnChangesFromEditRows(folded, runId ?? "run", !running);
   if (changes) {
+    if (changes.kind === "protocol" && changes.surface === "workspace_change") changes.runLogHref = runLogHref;
     const last = folded.at(-1);
     const beforeFinal = last?.kind === "message" && last.channel === "final";
     folded.splice(beforeFinal ? folded.length - 1 : folded.length, 0, changes);
@@ -2638,7 +2608,7 @@ export function deriveRunStatusLabel(entries: readonly TranscriptEntry[]): {
       }
       const target =
         summarizeToolInput(entry.input) ??
-        (invocation ? clip(invocation, TARGET_MAX) : undefined);
+        (invocation ? fullText(invocation) : undefined);
       const display = toolDisplayName(name);
       return {
         label: toolTaxonomy(name).verbLabel,
