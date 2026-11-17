@@ -65373,6 +65373,44 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       },
     );
 
+    it("retry-fold4 (rf-3 B): refuses a prepared chat Retry once the conversation is held, as the task Retry API does (one authority)", async () => {
+      const context = await fixture(true);
+      try {
+        await context.resolve().expect(200);
+        const [retry] = await db
+          .select()
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, context.endpoint.id),
+              eq(chatActions.kind, "failed_run_retry"),
+            ),
+          );
+        expect(retry).toMatchObject({ status: "issued" });
+        expect(retry!.payload.sourceAuthorizationPending).not.toBe(true);
+        // The executor's durable HELD notice: the same thread meets the same
+        // prior-owner fence on every Retry; the card offers no Retry.
+        await db.insert(issueComments).values({
+          companyId: context.fixture.companyId,
+          issueId: context.issue.id,
+          authorType: "system",
+          body: "Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.",
+          metadata: {
+            version: 1,
+            authorizationReason: `native_prior_owner_held:${randomUUID()}`,
+            sections: [{ rows: [{ type: "run_link", runId: context.runId, agentId: context.fixture.assignedAgentId }] }],
+          },
+        });
+        await context.service.processFailedChatRunRetry(retry!.id).catch(() => undefined);
+        await deliverReconciledExecutions(db, context.genericWake);
+        expect(context.wakeup).not.toHaveBeenCalled();
+        expect(context.genericWake).not.toHaveBeenCalled();
+        expect(await readAgentWakeupRequestsById(retry!.id)).toEqual([]);
+      } finally {
+        await context.cleanup();
+      }
+    });
+
     it.each([
       "revoked_principal",
       "closed_conversation",
