@@ -39,93 +39,6 @@ describe("bounded lifecycle Stop recovery", () => {
   });
   const due = (id: string) => db.update(agents).set({ lifecycleOperation: sql`${agents.lifecycleOperation} - 'retryAt'` }).where(eq(agents.id, id));
 
-  it.each(["pausing", "terminating", "cleaning_up"] as const)("backs off %s pending Stop then parks across restart until explicit Retry", async phase => {
-    const agent = await fixture(phase);
-    const store = createLifecycleStore(db, createAgentLifecycleEffects());
-    const driver = makeDriver();
-    const worker = createLifecycleWorker(store, driver, () => {});
-    let previousDelay = 0;
-    try {
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        const before = Date.now();
-        await worker.process(agent.id);
-        const row = await current(agent.id);
-        expect(row.lifecycleOperation).toMatchObject({ attempts: attempt, stopFailures: attempt });
-        if (attempt < 5) {
-          const deadline = Date.parse(row.lifecycleOperation!.retryAt!);
-          const delay = deadline - before;
-          expect(delay).toBeGreaterThan(previousDelay);
-          const expectedDelay = [60_000, 120_000, 240_000, 300_000][attempt - 1];
-          expect(deadline).toBeGreaterThanOrEqual(before + expectedDelay);
-          expect(deadline).toBeLessThanOrEqual(Date.now() + expectedDelay);
-          previousDelay = delay;
-          expect(await store.pending(100, new Date(deadline - 1))).not.toContain(agent.id);
-          expect(await store.claim(agent.id, "too-early", new Date(deadline - 1))).toBeNull();
-          expect(await store.pending(100, new Date(deadline))).toContain(agent.id);
-          await worker.sweep(); await worker.process(agent.id);
-          expect(driver.runHost).toHaveBeenCalledTimes(attempt);
-          await due(agent.id);
-        }
-      }
-      const parked = await current(agent.id);
-      expect(parked.lifecycleState).toBe(phase);
-      expect(parked.lifecycleOperation).toMatchObject({ retryRequired: true, attempts: 5 });
-      expect(parked.lifecycleOperation).not.toHaveProperty("retryAt");
-      expect(parked.lifecycleOperation).not.toHaveProperty("leaseOwner");
-      expect(parked.lifecycleError).toContain("Automatic stop work is paused");
-      expect(parked.lifecycleError).toContain(parked.lifecycleOperation!.id);
-      expect(parked.lifecycleError).toContain("Retry");
-      expect(parked.lifecycleError).toContain("lifecycle_stop_retry_required");
-      await worker.stop();
-      const restarted = startAgentLifecycle(db, createAgentLifecycleEffects(), driver, () => true);
-      try {
-        expect(await restarted.hasPending()).toBe(false);
-        expect(restarted.nextRunAt()).toBeNull();
-        await restarted.sweep();
-        const tomorrow = new Date(Date.now() + 86_400_000);
-        expect(await store.pending(100, tomorrow)).not.toContain(agent.id);
-        expect(await store.claim(agent.id, "tomorrow", tomorrow)).toBeNull();
-        expect(driver.runHost).toHaveBeenCalledTimes(5);
-        await createAgentLifecycle(db).retry(agent.id);
-        const retried = await current(agent.id);
-        expect(retried.lifecycleOperation).not.toHaveProperty("retryRequired");
-        expect(retried.lifecycleOperation).not.toHaveProperty("stopFailures");
-        expect(retried.lifecycleError).toBeNull();
-        driver.runHost.mockResolvedValue("complete");
-        await restarted.sweep();
-        expect((await current(agent.id)).lifecycleState).toBe(phase === "pausing" ? "paused" : "terminated");
-      } finally { await restarted.stop(); }
-    } finally { await worker.stop(); }
-  });
-  it.each([
-    { phase: "pausing", attempts: 235 },
-    { phase: "terminating", attempts: 42 },
-  ] as const)("bounds a legacy $phase loop with $attempts prior claims even without a saved Stop budget", async ({ phase, attempts }) => {
-    const agent = await fixture(phase, { attempts });
-    // The reported pause had already lost its manual hold through Resume.
-    if (phase === "pausing") await db.update(agents).set({ lifecycleHolds: [], pauseReason: null }).where(eq(agents.id, agent.id));
-    const store = createLifecycleStore(db, createAgentLifecycleEffects());
-    const driver = makeDriver();
-    const worker = createLifecycleWorker(store, driver, () => {});
-    try {
-      for (let attempt = 1; attempt <= 5; attempt++) {
-        await due(agent.id);
-        await worker.process(agent.id);
-        expect((await current(agent.id)).lifecycleOperation).toMatchObject({ attempts: attempts + attempt, stopFailures: attempt });
-      }
-      const parked = await current(agent.id);
-      expect(parked.lifecycleState).toBe(phase);
-      expect(parked.lifecycleOperation?.retryRequired).toBe(true);
-      expect(parked.lifecycleError).toContain("Automatic stop work is paused after 5 incomplete attempts");
-      expect(await store.claim(agent.id, "legacy-loop-parked", new Date(Date.now() + 86_400_000))).toBeNull();
-      await worker.process(agent.id);
-      expect(driver.runHost).toHaveBeenCalledTimes(5);
-      await createAgentLifecycle(db).retry(agent.id);
-      driver.runHost.mockResolvedValue("complete");
-      await worker.process(agent.id);
-      expect((await current(agent.id)).lifecycleState).toBe(phase === "pausing" ? "ready" : "terminated");
-    } finally { await worker.stop(); }
-  });
   it.each(["pausing", "terminating", "cleaning_up"] as const)("honors an operator's already-set retryRequired on %s", async phase => {
     const agent = await fixture(phase, { retryRequired: true });
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
@@ -211,32 +124,7 @@ describe("bounded lifecycle Stop recovery", () => {
     expect(await repair(changed)).toBe(false);
     expect((await current(changed.id)).lifecycleError).toBeNull();
   });
-  it("names the real blocking invocation in a parked Stop error, without treating cancellation as proof", async () => {
-    const agent = await fixture("pausing");
-    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
-      invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "dispatching",
-      startedAt: new Date("2000-01-01T00:00:00Z"), finishedAt: new Date("2000-01-01T00:00:01Z"),
-      runnerProfileJson: { adapterDispatch: { adapterType: "http" } }, resultJson: {} }).returning();
-    const store = createLifecycleStore(db, createAgentLifecycleEffects());
-    const worker = createLifecycleWorker(store, { ...makeDriver(), runHost: createLifecycleDriver(db, {} as never).runHost }, () => {});
-    try {
-      for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
-      const row = await current(agent.id);
-      expect(row.lifecycleState).toBe("pausing");
-      expect(row.lifecycleOperation?.retryRequired).toBe(true);
-      expect(row.lifecycleError).toContain(`invocation ${run.id}`);
-      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("cancelled");
-      expect(await store.claim(agent.id, "parked-real-stop", new Date(Date.now() + 86_400_000))).toBeNull();
-      // The operator rechecks after a real stop acknowledgement arrives.
-      await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, run.id));
-      await store.change(agent.id, "retry");
-      await worker.process(agent.id);
-      expect((await current(agent.id)).lifecycleState).toBe("paused");
-    } finally { await worker.stop(); }
-  });
-  // Keep reason: #20807 (c), failure path spanning the real Stop worker,
-  // durable task ownership, the public lifecycle read/Retry and Resume commands.
-  it("makes exhausted unconfirmed Stop actionable without releasing its task until proof arrives", async () => {
+  it("keeps an unconfirmed Stop retrying without releasing its task until proof arrives", async () => {
     const agent = await fixture("pausing");
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
       invocationSource: "on_demand", runtimeMode: "legacy", executionStage: "dispatching",
@@ -252,15 +140,12 @@ describe("bounded lifecycle Stop recovery", () => {
     const currentTask = async () => (await db.select().from(issues).where(eq(issues.id, task.id)))[0]!;
     try {
       for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
-      // This is the public lifecycle read used by the existing Retry surface,
-      // not just an internal log or worker counter.
-      expect((await commands.get(agent.id))?.lifecycleError).toContain("lifecycle_stop_retry_required");
-      expect((await commands.get(agent.id))?.lifecycleError).toContain(`invocation ${run.id}`);
-      expect((await current(agent.id)).lifecycleOperation?.retryRequired).toBe(true);
+      // Upstream #21788: an unconfirmed Stop keeps retrying with its recorded
+      // blocker; it never parks itself and never invents Stop proof.
+      expect((await current(agent.id)).lifecycleOperation?.retryRequired).toBeUndefined();
+      expect((await current(agent.id)).lifecycleOperation).toMatchObject({ pendingReason: "legacy_stop_unproven", pendingPasses: 5 });
       expect((await recovery.reconcileStrandedAssignedIssues()).escalated).toBe(0);
       expect(await currentTask()).toEqual(task);
-      // Retry is not permission to invent Stop proof, or remove a manual hold.
-      await commands.retry(agent.id); await worker.process(agent.id);
       expect((await current(agent.id)).lifecycleState).toBe("pausing");
       expect((await current(agent.id)).lifecycleHolds).toEqual(["manual"]);
       expect(await currentTask()).toEqual(task);
@@ -276,7 +161,7 @@ describe("bounded lifecycle Stop recovery", () => {
     } finally { await worker.stop(); }
   });
 
-  it.each(["pausing", "terminating", "cleaning_up"] as const)("also bounds thrown %s Stop failures with secret-safe errors", async phase => {
+  it.each(["pausing", "terminating", "cleaning_up"] as const)("keeps retrying thrown %s Stop failures with secret-safe errors", async phase => {
     const agent = await fixture(phase);
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
     const runHost = vi.fn(async () => { throw new Error("private provider detail"); });
@@ -284,13 +169,14 @@ describe("bounded lifecycle Stop recovery", () => {
     try {
       for (let attempt = 0; attempt < 5; attempt++) { await due(agent.id); await worker.process(agent.id); }
       const row = await current(agent.id);
-      expect(row.lifecycleOperation?.retryRequired).toBe(true);
-      expect(row.lifecycleError).toContain("Automatic stop work is paused");
+      expect(runHost).toHaveBeenCalledTimes(5);
+      expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
+      expect(row.lifecycleOperation?.retryAt).toBeTruthy();
       expect(row.lifecycleError).not.toContain("private provider detail");
-      expect(await store.claim(agent.id, "parked-error", new Date(Date.now() + 86_400_000))).toBeNull();
+      expect(await store.claim(agent.id, "retry-error", new Date(Date.now() + 86_400_000))).not.toBeNull();
     } finally { await worker.stop(); }
   });
-  it("bounds a required cleanup plugin without replaying a completed host stop", async () => {
+  it("retries a pending required cleanup plugin without replaying a completed host stop", async () => {
     const agent = await fixture("cleaning_up");
     await db.update(agents).set({ lifecycleRequiredPluginIds: ["cleanup-plugin"] }).where(eq(agents.id, agent.id));
     const store = createLifecycleStore(db, createAgentLifecycleEffects());
@@ -302,9 +188,9 @@ describe("bounded lifecycle Stop recovery", () => {
       expect(runHost).toHaveBeenCalledOnce();
       expect(runPlugin).toHaveBeenCalledTimes(5);
       const row = await current(agent.id);
-      expect(row.lifecycleOperation).toMatchObject({ hostComplete: true, retryRequired: true });
-      expect(row.lifecycleError).toContain("cleanup-plugin");
-      expect(await store.claim(agent.id, "parked-plugin", new Date(Date.now() + 86_400_000))).toBeNull();
+      expect(row.lifecycleOperation).toMatchObject({ hostComplete: true, pendingReason: "plugin_step_pending", pendingPasses: 5 });
+      expect(row.lifecycleOperation?.retryRequired).toBeUndefined();
+      expect(await store.claim(agent.id, "retry-plugin", new Date(Date.now() + 86_400_000))).not.toBeNull();
     } finally { await worker.stop(); }
   });
   it("does not spend a Stop budget when work is deferred before any external step", async () => {
