@@ -60,6 +60,10 @@ import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from ".
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse, type QueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, heldConversationComments, isConversation, isConversationReset } from "../services/agent-conversations.js";
+import {
+  assertStoredIntentAllowsSteer, changeQueuedCommentDeliveryIntent, chatQueueTail, DELIVERY_INTENTS,
+  sendQueuedCommentFirst, storeDeliveryIntent,
+} from "../services/queued-comment-delivery-intent.js";
 import { assertOnboardingFirstTaskDependenciesAllowed } from "../services/onboarding-first-task-admission.js";
 import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
@@ -460,7 +464,10 @@ const queuedCommentSteeringTargetSchema =
   });
 const queuedCommentInterruptTargetSchema = queuedCommentMutationTargetSchema.extend({
   targetRunId: z.string().min(1).nullable(),
+  /** Interrupt now for ONE message: it goes first; the rest stay queued, in order. */
+  commentId: z.string().uuid().optional(),
 });
+const queuedCommentIntentSchema = z.object({ intent: z.enum(DELIVERY_INTENTS) }).strict();
 const editQueuedCommentSchema = queuedCommentMutationTargetSchema.extend({
   body: z
     .string()
@@ -7891,6 +7898,11 @@ export function issueRoutes(
         companyId: input.issue.companyId, issueId: input.issue.id, runId: input.activeRun.id, wake,
       });
       if (firstTurnCommentIds.length > 0) queue.firstTurnCommentIds = firstTurnCommentIds;
+    }
+    // Agent Chat lists every waiting message, also behind a /new (its own wake).
+    if (input.issue.conversationAgentId && wake && !queuedInteractionId(wake.payload)) {
+      queue.entries = await chatQueueTail(input.executor as Db, { issue: input.issue, headQueueId: wake.id,
+        headEntries: queue.entries, actorType: input.actor.actorType, actorId: input.actor.actorId });
     }
     return queue;
   }
@@ -17968,6 +17980,29 @@ export function issueRoutes(
     },
   );
 
+  // A waiting message's mode (Steer or Queue), stored on the comment so a
+  // reload and a second tab agree. Owner only; the message must still wait.
+  router.patch(
+    "/issues/:id/queued-comments/:commentId/intent",
+    validate(queuedCommentIntentSchema),
+    async (req, res) => {
+      assertBoard(req);
+      if (!req.actor.userId) throw forbidden("Board user context required");
+      const issue = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Issue not found");
+      if (!issue) return;
+      if (issue.conversationAgentId && !(await instanceSettings.getExperimental()).enableAgentChat) {
+        throw notFound("Agent Chat is disabled");
+      }
+      const decision = await decideIssueAccess(req, issue, "issue:comment");
+      if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
+      await changeQueuedCommentDeliveryIntent(db, { issue, actorUserId: req.actor.userId,
+        commentId: req.params.commentId as string, intent: req.body.intent });
+      const queue = await buildQueuedCommentQueue({ executor: db, issue,
+        activeRun: await resolveActiveIssueRun(issue, { queueStateOnly: true }), actor: getActorInfo(req) });
+      res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, queue));
+    },
+  );
+
   router.put(
     "/issues/:id/queued-comments/order",
     validate(reorderQueuedCommentsSchema),
@@ -18031,6 +18066,11 @@ export function issueRoutes(
         }
         if (locked.activeRun?.status === "running" && locked.activeRun.id !== req.body.targetRunId) {
           throw conflict("The queued message targets a stale run", { code: "queued_comment_stale_target" });
+        }
+        if (req.body.commentId) {
+          locked.wake.payload = await sendQueuedCommentFirst(tx as unknown as Db, {
+            issue, wake: locked.wake, commentId: req.body.commentId,
+          });
         }
         // A run that has not started its first provider turn takes these
         // messages into that turn. Stopping it would only discard its setup.
@@ -18292,6 +18332,7 @@ export function issueRoutes(
               });
             }
           }
+          await assertStoredIntentAllowsSteer(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id, commentId });
           assertQueueMutationTarget({
             queue: locked.queue,
             queueId: req.body.queueId,
@@ -20101,6 +20142,8 @@ export function issueRoutes(
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
           }, tx);
+          if (!existing && req.body.deliveryIntent) await storeDeliveryIntent(tx as unknown as Db, {
+            companyId: issue.companyId, issueId: issue.id, commentId: saved.id, intent: req.body.deliveryIntent });
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
             action: "issue.comment_added", entityType: "issue", entityId: issue.id,
@@ -20669,6 +20712,8 @@ export function issueRoutes(
         }) : await add();
       }
 
+      if (req.body.deliveryIntent && actor.actorType === "user") await storeDeliveryIntent(db, {
+        companyId: currentIssue.companyId, issueId: currentIssue.id, commentId: comment.id, intent: req.body.deliveryIntent });
       if (!fastResponseEnqueued && actor.actorType === "user" && currentIssue.assigneeAgentId && !["done", "cancelled", "backlog"].includes(currentIssue.status)) {
         await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
           responsibleUserId: actor.actorId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`, acceptedAt: new Date(comment.createdAt) }))
