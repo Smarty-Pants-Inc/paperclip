@@ -1029,7 +1029,12 @@ export function IssueRecoveryActionCard({
   const divergence = useMemo(() => readWorkspaceDivergence(action), [action]);
   const lineage = useMemo(() => readRecoveryRetryLineage(action, liveness), [action, liveness]);
 
+  // adopt-stopu-card2 (rf-4 F12): a person's Stop card is retired by the server once the
+  // stop is confirmed (recovery/stop-pending.ts clearTaskStopPending), so its chrome must not
+  // promise a board escalation or an explicit decision.
+  const personStopPending = cardState !== "resolved" && asRecord(asRecord(action.evidence)?.stopPending)?.personStop === true;
   const headline = useMemo(() => {
+    if (personStopPending) return "Your Stop is not confirmed yet.";
     if (cardState === "resolved" && action.outcome) {
       return `Recovery resolved as ${OUTCOME_LABEL[action.outcome] ?? action.outcome}.`;
     }
@@ -1042,7 +1047,7 @@ export function IssueRecoveryActionCard({
     }
     if (lineage) return lineageHeadline(lineage);
     return KIND_HEADLINE[action.kind] ?? KIND_HEADLINE.missing_disposition;
-  }, [action.kind, action.outcome, action.ownerType, cardState, lineage]);
+  }, [action.kind, action.outcome, action.ownerType, cardState, lineage, personStopPending]);
 
   // A lane with no path left must not keep advertising a retry that will never run — whether
   // the budget ran out or the scheduled attempt simply never fired.
@@ -1146,7 +1151,7 @@ export function IssueRecoveryActionCard({
   return (
     <section
       role="status"
-      aria-label={`Recovery action: ${ariaState}`}
+      aria-label={`Recovery action: ${personStopPending ? "stop pending" : ariaState}`}
       data-recovery-state={cardState}
       data-recovery-kind={action.kind}
       data-recovery-lane={lineage?.lane}
@@ -1168,7 +1173,7 @@ export function IssueRecoveryActionCard({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-(length:--text-micro) font-semibold uppercase tracking-(--tracking-eyebrow)">
-            <span className={tone.labelClass}>{tone.label}</span>
+            <span className={tone.labelClass}>{personStopPending ? "STOP PENDING" : tone.label}</span>
             <span className="text-muted-foreground/60" aria-hidden>·</span>
             <code className="rounded bg-background/70 px-1.5 py-0.5 font-mono text-(length:--text-micro) tracking-normal text-muted-foreground">
               {KIND_LABEL[action.kind] ?? action.kind}
@@ -1523,6 +1528,10 @@ export function IssueRecoveryActionCard({
             cardState === "observe_only" ? (
               <span className="text-(length:--text-micro) text-muted-foreground">
                 Recovery is observing without interrupting the live run.
+              </span>
+            ) : personStopPending ? (
+              <span className="text-(length:--text-micro) text-muted-foreground">
+                This card closes by itself once the stop is confirmed.
               </span>
             ) : (
               <span className="text-(length:--text-micro) text-muted-foreground">
