@@ -7136,12 +7136,9 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
 }
 
 /** The posted body is the accepted summary, or the whole answer that the
- * schema-capped (12,000-character) summary previews. An answer over the cap
- * can never be its own summary; its summary is its verbatim opening, which
- * the chat contract keeps under the cap (dl-finish-cap, H5). */
-export function presentsAcceptedSummary(summary: unknown, body: string): boolean {
-  return typeof summary === "string" && (summary === body
-    || (summary.length > 0 && body.length > 12_000 && body.startsWith(summary)));
+ * schema-capped (12,000-character) summary previews. */
+function presentsAcceptedSummary(summary: unknown, body: string): boolean {
+  return typeof summary === "string" && (summary === body || (summary.length >= 12_000 && body.startsWith(summary)));
 }
 
 export function issueService(db: Db) {

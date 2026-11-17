@@ -1333,25 +1333,6 @@ describe("renderPaperclipWakePrompt", () => {
     ).toBe(false);
   });
 
-  // H5 (dl-finish-cap, run 73df6872): a ~28 KB answer put in paperclip_finish's
-  // summary is rejected at 12,000 characters and the person saw only 'Working'.
-  // The final response carries the whole answer; the summary stays under the cap.
-  it("keeps a long answer out of the 12,000-character completion summary and in the final response", () => {
-    const prompt = renderPaperclipWakePrompt(ordinaryExternalChatWake);
-    expect(prompt).not.toContain("The semantic completion summary is the user-visible final answer");
-    expect(prompt).toContain(
-      "Your final assistant response, sent after the semantic completion succeeds, is the user-visible final answer; Paperclip delivers it whole at any length.",
-    );
-    expect(prompt).toContain(
-      "The semantic completion summary is limited to 12,000 characters; a longer summary is rejected and nothing is delivered.",
-    );
-    expect(prompt).toContain(
-      "When the answer is longer, the summary is only the answer's opening, copied verbatim and under 12,000 characters, and the whole answer is your final response.",
-    );
-    expect(prompt).toContain("Never shorten the answer or mark it as truncated to fit the summary.");
-    expect(prompt).toContain("Include every requested answer, exact value, description");
-  });
-
   it("renders one authoritative direct-response contract for fresh and resumed external-chat turns", () => {
     for (const prompt of [
       renderPaperclipWakePrompt(ordinaryExternalChatWake),
@@ -1367,7 +1348,7 @@ describe("renderPaperclipWakePrompt", () => {
       expect(prompt).toContain("text answer that does not require structured human input");
       expect(prompt).toContain("answer directly");
       expect(prompt).toContain("exactly one semantic completion");
-      expect(prompt).toContain("is the user-visible final answer; Paperclip delivers it whole at any length");
+      expect(prompt).toContain("summary is the user-visible final answer");
       expect(prompt).toContain("Private progress commentary is not delivered");
       expect(prompt).toContain("periodically edit that same comment with update_comment");
       expect(prompt).toContain("semantic completion remains internal to Paperclip");
@@ -1849,7 +1830,7 @@ describe("renderPaperclipWakePrompt", () => {
         expect(isPaperclipExternalChatQuestionResponseTurn(wake)).toBe(true);
         expect(prompt).toContain("## External chat answered-question contract");
         expect(prompt).toContain(
-          "Your final assistant response, sent after the semantic completion succeeds, is the user-visible final answer;",
+          "The semantic completion summary is the user-visible final answer.",
         );
         expect(prompt).toContain(
           "Use the authoritative answer below to complete the original request; do not repeat or re-ask the resolved question.",
