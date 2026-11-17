@@ -9,6 +9,25 @@ export const NATIVE_PROVIDER_OVERLOADED_MESSAGE =
   "Selected model is at capacity. Please try a different model.";
 export const NATIVE_PROVIDER_OVERLOADED_CODE = "native_provider_overloaded";
 export const NATIVE_PROVIDER_CAPACITY_MAX_RETRIES = 2;
+export const PROVIDER_POLICY_REFUSAL_CODE = "provider_policy_refusal";
+export const PROVIDER_POLICY_REFUSAL_MESSAGE =
+  "The model provider refused this request under its usage policy; it won't be retried automatically.";
+
+/** Pi forwards the provider's errorMessage on its failed terminal. This is
+ * provider error evidence, never assistant prose, tools or notice text. Pi's
+ * Anthropic adapter maps stop_reason=refusal to the default below, or the
+ * provider's stop_details.explanation. Gate policy text on an actual rejection
+ * so an ordinary invalid request mentioning a policy field is not a refusal. */
+function isPiPolicyRefusal(error: Record<string, unknown>): boolean {
+  // New packs preserve the native refusal before its explanation is lost.
+  // The text path keeps the pinned Pi 1.5.2 pack compatible.
+  if (error.code === PROVIDER_POLICY_REFUSAL_CODE) return true;
+  if (error.code !== "pi_provider_error" || typeof error.message !== "string") return false;
+  const message = error.message;
+  return message.trim() === "The model refused to complete the request"
+    || (/\b(?:usage|acceptable[ -]use|safety|content)[ -]polic(?:y|ies)\b/i.test(message)
+      && /\b(?:refus\w*|block\w*|flag\w*|violat\w*|reject\w*|disallow\w*|not allowed)\b/i.test(message));
+}
 export const NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC = {
   provider: "codex",
   category: "server_overloaded",
@@ -225,6 +244,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
   /** A Codex API-key turn whose configured model the Responses API does not serve (404). */
   let missingModelTurnId: string | null = null;
   let overloadedTurnId: string | null = null;
+  const policyRefusedTurns = new Set<string>();
   const failedTurns = new Map<string, NativeTurnFailureDiagnostic>();
   const providerFailures = new Map<string, ProviderFailure>();
   /** A driver-classified, action-required model rejection; `forTerminal` classifies it, so it is not "unclassified". */
@@ -236,7 +256,9 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     observe(event: PrpEvent) {
       if (event.sourceKind === "runner" && event.eventType === "turn.failed" && event.turnId
         && event.payload.status === "failed") {
-        const failure = readProviderFailure(record(event.payload.error).providerFailure);
+        const error = record(event.payload.error);
+        if (provider.kind === "pi_rpc" && isPiPolicyRefusal(error)) policyRefusedTurns.add(event.turnId);
+        const failure = readProviderFailure(error.providerFailure);
         if (failure && !providerFailures.has(event.turnId)) providerFailures.set(event.turnId, failure);
       }
       if ((provider.kind !== "codex" && provider.kind !== "opencode") ||
@@ -288,6 +310,11 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     },
     forTerminal(turnId: string | null | undefined, terminal: PrpTerminalState) {
       if (!turnId || terminal.turnTerminalState !== "failed" || terminal.runTerminalState !== "failed") return null;
+      if (policyRefusedTurns.has(turnId)) return {
+        errorCode: PROVIDER_POLICY_REFUSAL_CODE,
+        errorMessage: PROVIDER_POLICY_REFUSAL_MESSAGE,
+        diagnostic: { provider: "pi_rpc", category: "policy_refusal" } as const,
+      };
       if (turnId === overloadedTurnId) return {
         errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
         errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE,
@@ -308,7 +335,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
     /** Diagnostics only: the failed turn that `forTerminal` did not classify. */
     unclassifiedTurnFailure(turnId: string | null | undefined, terminal: PrpTerminalState) {
       if (!turnId || terminal.turnTerminalState !== "failed" || terminal.runTerminalState !== "failed" ||
-          turnId === overloadedTurnId || turnId === rejectedTurnId || turnId === missingModelTurnId ||
+          policyRefusedTurns.has(turnId) || turnId === overloadedTurnId || turnId === rejectedTurnId || turnId === missingModelTurnId ||
           modelUnavailableTurn(turnId)) return null;
       const diagnostic = failedTurns.get(turnId);
       return diagnostic ? { ...diagnostic } : null;
