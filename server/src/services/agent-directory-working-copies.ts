@@ -1,4 +1,5 @@
 import { notifyInstructionCollection } from "./instruction-collection-notifications.js";
+import { agentFileHoldWriteCondition } from "./agent-file-save-hold.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -513,7 +514,9 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     return patch(row, { state: "unavailable", processStoppedAt: stoppedAt, errorCode, errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
       nextAttemptAt: saveRetryAt(since),
       receipt: { ...row.receipt, storageWarning, savePending: { since: since.toISOString(), code: errorCode, reason: reason.slice(0, 500),
-        failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) } } });
+        failures: (previous?.failures ?? 0) + 1, ...(mirrorHash ? { mirrorHash } : {}) } } },
+      // Same lease row lock as every destroy claim; refused once a destroy is claimed.
+      agentFileHoldWriteCondition);
   }
   async function collectStopped(row: Copy, target?: AdapterExecutionTarget | null) {
     if (row.receipt?.retainedByRunId) return row;
