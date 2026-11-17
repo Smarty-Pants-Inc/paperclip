@@ -443,6 +443,62 @@ describeEmbeddedPostgres("question response delivery", () => {
     },
   );
 
+  it("holds an early external-chat answer while the source run's command still runs, then delivers it once (S2p-fg)", async () => {
+    // The person answers while a foreground command beside the question still
+    // runs. Cancelling the source run here would kill that command.
+    const seeded = await seed({ runtimeMode: "native", sourceStatus: "running" });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId: seeded.issueId, source: "chat:slack" } })
+      .where(eq(heartbeatRuns.id, seeded.sourceRunId));
+    const continuationRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: continuationRunId,
+      companyId: seeded.companyId,
+      agentId: seeded.agentId,
+      invocationSource: "automation",
+      status: "queued",
+      runtimeMode: "native",
+      driverKind: "pi_rpc",
+      contextSnapshot: {
+        issueId: seeded.issueId,
+        interactionId: seeded.interaction.id,
+        sourceRunId: seeded.sourceRunId,
+        source: "issue.interaction.respond",
+      },
+    });
+    const wakeup = vi.fn().mockResolvedValue({ id: continuationRunId, driverKind: "pi_rpc", status: "queued" });
+    const cancelRun = vi.fn().mockResolvedValue({ id: seeded.sourceRunId, status: "cancelled" });
+    let commandOpen = true;
+    const sourceRunHasOpenTool = vi.fn((runId: string) => runId === seeded.sourceRunId && commandOpen);
+    const service = questionResponseDeliveryService(db, {
+      heartbeat: { wakeup, cancelRun } as never,
+      sourceRunHasOpenTool,
+    });
+
+    expect(await service.deliver(seeded.interaction.id)).toBeNull();
+    expect(sourceRunHasOpenTool).toHaveBeenCalledWith(seeded.sourceRunId);
+    expect(cancelRun).not.toHaveBeenCalled();
+    expect(wakeup).not.toHaveBeenCalled();
+    const [held] = await db.select().from(issueQuestionResponseDeliveries);
+    expect(held).toMatchObject({ status: "pending", errorCount: 0, lastErrorCode: "external_chat_source_tool_open" });
+
+    // The command finishes with its real output; the source turn parks/ends.
+    commandOpen = false;
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, seeded.sourceRunId));
+    const delivered = await service.deliver(seeded.interaction.id);
+    const again = await service.deliver(seeded.interaction.id);
+
+    expect(cancelRun).not.toHaveBeenCalled();
+    expect(wakeup).toHaveBeenCalledTimes(1);
+    expect(wakeup).toHaveBeenCalledWith(seeded.agentId, expect.objectContaining({
+      idempotencyKey: `question-response:${seeded.interaction.id}`,
+      payload: expect.objectContaining({ interactionId: seeded.interaction.id, externalChatContinuation: true }),
+    }));
+    expect(delivered).toMatchObject({ status: "fallback_queued", mode: "wake_fallback", targetRunId: continuationRunId });
+    expect(again).toMatchObject({ mode: "wake_fallback", duplicate: true });
+  });
+
   it("does not promote a source-run wake comment from another issue", async () => {
     const seeded = await seed();
     const goalId = await db
