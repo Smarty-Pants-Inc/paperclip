@@ -60,6 +60,17 @@ export async function runStartedAnswering(db: Db, input: { companyId: string; ru
     && row.kind && row.kind !== "userMessage"));
 }
 
+/** The ONE whole person-stop exclusion (heldfix 94e2cc4b): the message's SENDER stopped this run AND the run
+ * had STARTED answering the message. Never one half alone: the sweep and any carry read this helper, not
+ * stoppedBySender or personStoppedCarrierSql (discovery only) by themselves. */
+export async function senderStoppedWhileAnswering(q: Db, companyId: string,
+  run: { id: string; status: string; errorCode: string | null; resultJson: Record<string, unknown> | null;
+    contextSnapshot: unknown } | undefined,
+  message: { id: string; authorUserId?: string | null }): Promise<boolean> {
+  if (!run || !message.authorUserId || !stoppedBySender(run, message.authorUserId)) return false;
+  return runStartedAnswering(q, { companyId, runId: run.id, messageId: message.id, contextSnapshot: run.contextSnapshot });
+}
+
 /** The durable held-list state (routes/issues.ts buildQueuedCommentQueue):
  * a chat's last turn was stopped by a person, there is no active turn, and
  * its plain-message queue head is deferred without a different execution wait.

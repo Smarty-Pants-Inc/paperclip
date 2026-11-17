@@ -122,6 +122,48 @@ describe.skipIf(!support.supported)("continuation pending person input", () => {
     expect(await state()).toEqual({ delivered: true, answered: true });
   });
 
+  // RFL F2 (22:41Z): ANSWERED is attributed through the answering run's OWN pending input only (comment ids AND card
+  // interaction ids). Continuation ancestry collects candidates; it never attributes an answer.
+  it("RFL F2: a completed successor whose own input is only M2 answers neither the comment nor the card its failed ancestors carried", async () => {
+    const f = await fixture();
+    const t0 = f.message.createdAt.getTime();
+    // The card's asking run carries no person input, so the presented card answers nothing here (card point 1 stays).
+    const [asker] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", contextSnapshot: { issueId: f.issueId } }).returning();
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
+      kind: "ask_user_questions", status: "answered", createdByAgentId: f.agentId, sourceRunId: asker.id,
+      resolvedByUserId: "board", resolvedAt: new Date(t0 + 1_000), idempotencyKey: randomUUID(),
+      payload: { version: 1, questions: [{ id: "q", prompt: "Continue?", selectionMode: "single", options: [{ id: "yes", label: "YES" }] }] },
+      result: { version: 1, answers: [{ questionId: "q", optionIds: ["yes"] }] } } as never).returning();
+    const [resume] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "failed", retryOfRunId: f.run.id, contextSnapshot: { issueId: f.issueId, interactionId: card.id } }).returning();
+    const [m2] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "user",
+      authorUserId: "board", body: "M2 is different work", createdAt: new Date(t0 + 2_000) }).returning();
+    const [successor] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, nativeIssueId: f.issueId,
+      status: "succeeded", retryOfRunId: resume.id, contextSnapshot: { issueId: f.issueId, wakeCommentId: m2.id } }).returning();
+    const [reply] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.issueId, authorType: "agent",
+      authorAgentId: f.agentId, createdByRunId: successor.id, body: "Done with M2.", createdAt: new Date(t0 + 3_000) }).returning();
+    await db.update(heartbeatRuns).set({ resultJson: { presentationDecision: { commentAction: "create", commentId: reply.id } } })
+      .where(eq(heartbeatRuns.id, successor.id));
+    const answered = async (id: string, createdAt: Date) => {
+      const m = { id: sql`${id}::uuid`, companyId: sql`${f.companyId}::uuid`, issueId: sql`${f.issueId}::uuid`,
+        createdAt: sql`${createdAt.toISOString()}::timestamptz` };
+      const [row] = await db.select({ delivered: answeredPersonMessageSql(m), answered: completedPersonMessageAnswerSql(m) })
+        .from(issues).where(eq(issues.id, f.issueId));
+      return row;
+    };
+    expect(await answered(m2.id, m2.createdAt), "M2 is the successor's own input").toEqual({ delivered: true, answered: true });
+    expect(await answered(f.message.id, f.message.createdAt), "M1 only through ancestry").toEqual({ delivered: false, answered: false });
+    expect(await answered(card.id, card.resolvedAt!), "card only through ancestry").toEqual({ delivered: false, answered: false });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id }), "M1 still rides").toMatchObject({ wakeCommentIds: [f.message.id] });
+    // Control: once the completed run's OWN pending input holds M1 and the card, its final answer answers both.
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId, wakeCommentIds: [f.message.id, m2.id],
+      wakeCommentId: m2.id, interactionId: card.id } }).where(eq(heartbeatRuns.id, successor.id));
+    expect(await answered(f.message.id, f.message.createdAt)).toEqual({ delivered: true, answered: true });
+    expect(await answered(card.id, card.resolvedAt!)).toEqual({ delivered: true, answered: true });
+    expect(await readContinuationCommentInput(db, { ...f, runId: f.run.id })).toEqual({});
+  });
+
   it("keeps all live comment authors within the source company and task", async () => {
     const f = await fixture(), foreign = await fixture();
     const [deleted, agentComment] = await db.insert(issueComments).values([
