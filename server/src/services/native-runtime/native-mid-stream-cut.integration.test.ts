@@ -236,7 +236,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     return { heartbeat, generic, promoted, successors: await successorsOf(issueId, cutRunId) };
   }
 
-  it("RED gate 3 r2 (0641e970 -> fab92601): a cap stop with no text has ONE successor, fresh at 'high', and no generic wake; a second cap stop ends in one true note with a real Retry", async () => {
+  it("RED gate 3 r2 (0641e970 -> fab92601): a cap stop with no text has ONE successor, a new process on the SAME conversation at 'high'; the cut turn is not sent, and no generic wake; a second cap stop ends in one true note with a real Retry", async () => {
     const issueId = await task();
     const first = await cutTurn(issueId, "cap_no_text");
     expect(first.decision.reasonCode).toBe("run_failed_partial_evidence_preserved");
@@ -257,11 +257,12 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     expect(successor.contextSnapshot).not.toHaveProperty("nativeStatusWakeIntentId");
     expect(successor.contextSnapshot).not.toHaveProperty("statusDecisionSource");
     expect(await genericWakes(issueId)).toEqual([]);
-    // FRESH session at 'high' for exactly this run; the agent's stored level is unchanged.
+    // A new process on the SAME conversation; the cut turn is not sent.
+    // 'high' applies to exactly this run; the agent's stored level is unchanged.
     expect(await nativeInputLevel(first.runId)).toBe("xhigh");
     expect(await nativeInputLevel(successor.id)).toBe("high");
     expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]!.adapterConfig).toEqual(STORED);
-    // The fresh session has no history: its opening carries the ask verbatim.
+    // The new process's opening carries the ask verbatim; the cut turn is not sent.
     const opened = await opening(successor, issueId);
     expect(opened.livenessContinuationInstruction).toContain("Write the answer now; keep further thinking short.");
     expect(opened.livenessContinuationInstruction).toContain(ASK);
@@ -348,7 +349,7 @@ describe("native mid-stream cut: one successor, through recovery", () => {
     const successor = successors[0]!;
     expect(successor).toMatchObject({ retryOfRunId: cut.runId, scheduledRetryReason: "native_mid_stream_cut",
       contextSnapshot: { source: "native_mid_stream_cut", wakeReason: "native_mid_stream_cut", nativeMidStreamCut: "provider_error" } });
-    // It MAY resume the same session: no forced fresh start, and so the stored level.
+    // It MAY resume the same live process: no forced process restart, so the stored level.
     expect(successor.contextSnapshot).not.toHaveProperty("forceFreshSession");
     expect(await nativeInputLevel(successor.id)).toBe("xhigh");
     expect((await opening(successor, issueId)).livenessContinuationInstruction).toBeUndefined();

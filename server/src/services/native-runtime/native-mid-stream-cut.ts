@@ -41,7 +41,7 @@ export async function readNativeMidStreamCut(db: Pick<Db, "select">, input: { co
   return classifyNativeMidStreamCut(await readRunAnswerEvents(db, input.companyId, input.runId));
 }
 
-/** A cap stop with no answer text is the one cut that must not resume its session. */
+/** A cap stop with no text needs a new process on the SAME conversation; the cut turn is not sent. */
 export function nativeMidStreamCutStartsFresh(cut: NativeMidStreamCut | null): boolean {
   return cut === "output_cap_no_text";
 }
@@ -96,7 +96,8 @@ export function isNativeFailedTurnRetryReason(reason: string | null | undefined)
  * The recovery successor's opening, read when the successor STARTS (the cut
  * run has posted its reply by then, so the opening says truthfully what the
  * person was shown): cont3's opening after a thinking-only cap stop (the ask,
- * verbatim, for the fresh session), cont/cont4's "continue from exactly this
+ * verbatim, for a new process on the SAME conversation; the cut turn is not
+ * sent), cont/cont4's "continue from exactly this
  * point" after a cut answer. Nothing when the cut left no answer text.
  */
 export async function applyNativeMidStreamCutOpening(db: Pick<Db, "select">, input: {

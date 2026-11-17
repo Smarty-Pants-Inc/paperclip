@@ -66,9 +66,10 @@ export async function materializeNativeEnvironmentBlockerRetry(input: NativeRetr
 
 /**
  * dl famlong-u1: the ONE recovery successor of a turn the provider cut
- * mid-stream. A cap stop with no answer text starts a FRESH session (the
- * thinking-cap recovery level, 'high', applies to exactly that run: see
- * isThinkingCapStopRecoveryRun); an EOF or other provider error, and a cap
+ * mid-stream. A cap stop with no answer text starts a new process on the SAME
+ * conversation; the cut turn is not sent. The thinking-cap recovery level,
+ * 'high', applies to exactly that run (see isThinkingCapStopRecoveryRun).
+ * An EOF or other provider error, and a cap
  * stop that had started its answer, resume the session. A second cut is
  * bounded by the arbiter (failedTurnContinuationUsed), not by this lane.
  */

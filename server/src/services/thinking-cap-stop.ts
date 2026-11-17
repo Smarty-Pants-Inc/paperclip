@@ -97,9 +97,10 @@ const LEVELS_ABOVE_RECOVERY = new Set(["xhigh", "max"]);
 
 /**
  * dl-n5-cont3: this run is the automatic recovery run of a thinking-only
- * output-cap stop that starts a FRESH session (`forceFreshSession`, as the
- * fresh continuation's wake sets it). A same-session retry is not: pi_rpc
- * refuses a per-turn level change in a live session (pi-rpc-driver.ts :954-955).
+ * output-cap stop that starts a new process on the SAME conversation; the cut
+ * turn is not sent (`forceFreshSession` is the internal flag). A retry in the
+ * live process is not: pi_rpc refuses a per-turn level change there
+ * (pi-rpc-driver.ts :954-955).
  */
 export async function isThinkingCapStopRecoveryRun(tx: Pick<Db, "select">, input: { companyId: string; runId: string }): Promise<boolean> {
   const [run] = await tx.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns)
@@ -112,7 +113,8 @@ export async function isThinkingCapStopRecoveryRun(tx: Pick<Db, "select">, input
 /**
  * dl-n5-cont3: the run's adapter overrides with the recovery thinking level,
  * through the existing task-override path (projectPaperclipRunnerTaskConfig
- * -> the native input's piRpcThinkingLevel, a FRESH pi_rpc session admits it).
+ * -> the native input's piRpcThinkingLevel). A new process on the SAME
+ * conversation admits it; the cut turn is not sent.
  * Only a pi_rpc agent whose effective level is above it is lowered; nothing
  * is raised. Returns the overrides unchanged otherwise.
  */

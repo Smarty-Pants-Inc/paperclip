@@ -448,8 +448,8 @@ export function arbitrateNativeStatus(input: {
     }
     if (input.midStreamCut) {
       // A mid-stream cut has ONE automatic successor, and it is the recovery
-      // run (fresh at 'high' after a cap stop with no text), never the
-      // generic same-session wake below.
+      // run (at 'high' after a cap stop with no text: a new process on the
+      // SAME conversation; the cut turn is not sent), never the generic wake below.
       return {
         policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
         statusAction: "preserve",
@@ -460,7 +460,7 @@ export function arbitrateNativeStatus(input: {
           kind: "schedule_retry",
           cause: NATIVE_MID_STREAM_CUT_CODE,
           summary: input.midStreamCut === "output_cap_no_text"
-            ? "Recover the output-cap stop once, in a fresh provider session."
+            ? "Recover the output-cap stop once: a new process on the SAME conversation; the cut turn is not sent."
             : "Recover the cut turn once.",
           agentId: input.agentId,
         }],

@@ -2477,10 +2477,11 @@ export function heartbeatService(
       }
       const wakeCommentId = deriveCommentId(context, null);
       // dl-n5-cont3: the task's assignee overrides; the ONE automatic recovery
-      // run after a thinking-only output-cap stop also runs at 'high' in its
-      // fresh session (a run-level override; the agent's stored level is unchanged).
+      // run after a thinking-only output-cap stop also runs at 'high': a new
+      // process on the SAME conversation; the cut turn is not sent. This is a
+      // run-level override; the agent's stored level is unchanged.
       // dl famlong-u1: the ONE recovery successor of a mid-stream cut opens
-      // with the cut's own instruction (cont3's ask for the fresh session after
+      // with the cut's own instruction (cont3's ask for the new process after
       // a cap stop with no text; cont4's "continue from exactly this point").
       await applyNativeMidStreamCutOpening(db, { run, issueId: issueId ?? null, context });
       let issueAssigneeOverrides = await resolveRunAssigneeAdapterOverrides(db, {
