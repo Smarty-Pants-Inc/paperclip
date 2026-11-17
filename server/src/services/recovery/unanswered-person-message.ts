@@ -30,6 +30,7 @@ import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
 import { personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { AGENT_LIFECYCLE_STOP_REASON } from "../governance-pause-stop.js";
 
 /**
  * The person's last message on an agent-owned task is a valid wait only when
@@ -77,7 +78,7 @@ const WAITING_ROW_JSON = JSON.stringify([{ rows: [{ label: WAITING_ROW_LABEL }] 
 /** The agent that answers the conversation is paused (or held) and will not
  * run until it is resumed. Not a failure: a waiting-kind note. */
 export const UNANSWERED_MESSAGE_AGENT_PAUSED_CODE = "agent_paused";
-/** A resumed agent's own pause stopped this message's attempt, not a failure. */
+/** A resumed agent's own pause stopped this message's run or wake, not a failure. */
 const PAUSE_STOPPED_CODE = "agent_pause_stopped";
 /** Setup completes by itself; a stalled setup gets one factual waiting note. */
 export const UNANSWERED_MESSAGE_AGENT_SETUP_CODE = "agent_setup";
@@ -728,15 +729,25 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     // Paperclip records a deferred or coalesced wake that could not start as
     // FAILED: that is the trigger. The grace covers a wake that threw before
     // any wake row existed (the comment route logs and returns 201).
-    const failedWakes = await q.select({ payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    const terminalWakes = await q.select({ payload: agentWakeupRequests.payload, status: agentWakeupRequests.status,
+      error: agentWakeupRequests.error, runId: agentWakeupRequests.runId }).from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-      eq(agentWakeupRequests.status, "failed"), gt(agentWakeupRequests.updatedAt, message.createdAt)));
+      inArray(agentWakeupRequests.status, ["failed", "cancelled"]), gt(agentWakeupRequests.updatedAt, message.createdAt)))
+      .orderBy(desc(agentWakeupRequests.updatedAt), desc(agentWakeupRequests.createdAt));
     // Only THIS message's own wake (Paperclip's queued-comment attribution) is
-    // evidence; an unrelated failed wake on the issue is not.
-    const wakeFailed = failedWakes.some(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    // evidence; a later terminal attempt wins over an older pause cancellation.
+    const ownWakes = terminalWakes.filter(wake => wakeCarriesIssue(wake.payload, issue.id) && wakeCarriesMessage(wake.payload, message.id));
+    const wakeFailed = ownWakes.some(wake => wake.status === "failed");
     const due = message.createdAt.getTime() + UNANSWERED_MESSAGE_NO_RUN_GRACE_MS;
     if (!wakeFailed && due > now.getTime()) return { kind: "pending", recheckAt: due };
-    code = UNANSWERED_MESSAGE_NO_RUN_CODE;
+    // The lifecycle driver's pausing stop cancels unbound queued/deferred wakes
+    // with this exact error, preserving their reason and message payload
+    // (heartbeat/run-control.ts cancelPendingWakeupsForAgentsInternal). Resume
+    // does not replay them. Do not apply this while setup, a hold or live work
+    // takes precedence above, or to a stopped/terminating agent.
+    const latestWake = ownWakes[0];
+    code = agentRow?.lifecycleState === "ready" && latestWake?.status === "cancelled" && latestWake.runId === null
+      && latestWake.error === AGENT_LIFECYCLE_STOP_REASON ? PAUSE_STOPPED_CODE : UNANSWERED_MESSAGE_NO_RUN_CODE;
   } else {
     if (!TERMINAL.includes(run.status)) return { kind: "pending", recheckAt: now.getTime() + 30_000 };
     const due = (run.finishedAt ?? run.updatedAt).getTime() + UNANSWERED_MESSAGE_SETTLE_MS;
@@ -886,7 +897,7 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     recoveryResponsibility: "user",
     sourceRun: run && !waiting ? { id: run.id, agentId: run.agentId, status: run.status, errorCode: pauseStopped ? null : code } : null,
     // A waiting note is not a failure: no "Failure code" row, a marker row instead.
-    failureCode: waiting ? undefined : run ? undefined : code,
+    failureCode: waiting || pauseStopped ? undefined : run ? undefined : code,
   });
   if (waiting) notice.metadata.sections.push({ title: "Status", rows: [keyValueRow(WAITING_ROW_LABEL, code)] });
   return { kind: "notice", reason, code, notice, ...(setupWaitRecord ? { recordWait: setupWaitRecord } : {}),
