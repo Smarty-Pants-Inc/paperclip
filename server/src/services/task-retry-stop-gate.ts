@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueComments, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { STOP_PENDING_SCHEMA } from "./recovery/stop-pending.js";
+import { executionBlockerPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
 
 /**
  * One predicate for a person's task Retry while the previous run's Stop is
@@ -25,6 +26,14 @@ export async function readRetryStopGate(db: Db, input: {
 }): Promise<RetryStopGate | null> {
   const now = input.now ?? Date.now();
   const state = (since: Date): RetryStopGate["state"] => now - since.getTime() >= RETRY_STOP_PROOF_BOUND_MS ? "expired" : "waiting";
+  // With a hold, Retry goes through the full admission, which applies its own
+  // Stop proofs (coordinator, termination receipts) and, when it starts, a
+  // failure leaves that hold to the automatic follow-up. This gate covers only
+  // the case where no hold exists and admission's refusal would be swallowed.
+  const [hold] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    executionBlockerPredicate(), sql`not ${restoreHoldReleasedForCurrentOwnerPredicate()}`)).limit(1);
+  if (hold) return null;
   // A Retry already retired for this exact source keeps the same answer.
   const [retired] = await db.select({ finishedAt: agentWakeupRequests.finishedAt }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.status, "failed"),
