@@ -110,7 +110,8 @@ describe("TaskChatQueuedMessages", () => {
     );
     expect(pane?.classList).toContain("mx-3");
     expect(pane?.classList).toContain("rounded-b-none");
-    expect(pane?.classList).toContain("border-b-0");
+    // smarty-design: no one-sided borders; the composer overlaps the bar's bottom edge.
+    expect(pane?.classList).not.toContain("border-b-0");
     expect(pane?.classList).toContain("-mb-px");
     expect(
       container.querySelectorAll('[data-testid^="task-chat-queued-message-"]'),
