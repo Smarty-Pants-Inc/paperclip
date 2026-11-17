@@ -302,6 +302,34 @@ describe("PiRpcDriver", () => {
       expect(f.transport.closed).toBe(false);
     } finally { await f.close(); }
   });
+  // KEEP: never-OK guard. Anthropic's explicit refusal must not be reduced to
+  // arbitrary explanation prose (which need not contain the word "policy").
+  it.each(["message-end", "stream-error", "agent-end", "later-empty", "recovered"])("preserves the structured Anthropic refusal through %s", async shape => {
+    const f = await failureFixture();
+    try {
+      const turn = await f.session.startTurn({ message: { role: "user", text: "Summarize my notes." } });
+      f.transport.send({ type: "agent_start" });
+      const message = { role: "assistant", api: "anthropic-messages", provider: "anthropic", model: "fixture-model", timestamp: 1,
+        content: [], usage: {}, stopReason: "error", rawStopReason: "refusal", errorMessage: "The request was declined." };
+      f.transport.send({ type: "message_start", message });
+      if (shape === "agent-end") f.transport.send({ type: "agent_end", messages: [message], willRetry: false });
+      else if (shape === "stream-error") f.transport.send({ type: "message_update", assistantMessageEvent: { type: "error", reason: "error", error: message } });
+      else f.transport.send({ type: "message_end", message });
+      if (shape === "later-empty" || shape === "recovered") {
+        const next = { ...message, timestamp: 2, rawStopReason: "end_turn", stopReason: "stop",
+          content: shape === "recovered" ? [{ type: "text", text: "The provider served the request." }] : [], errorMessage: undefined };
+        f.transport.send({ type: "message_start", message: next });
+        f.transport.send({ type: "message_end", message: next });
+      }
+      f.transport.send({ type: "agent_settled", aborted: false });
+      await vi.waitFor(() => expect(f.events.some(e => e.turnId === turn.turnId && ["turn.failed", "turn.completed"].includes(e.eventType))).toBe(true));
+      if (shape === "recovered") {
+        expect(f.events.find(e => e.eventType === "turn.completed")).toMatchObject({ turnId: turn.turnId });
+        expect(f.events.find(e => e.eventType === "turn.failed")).toBeUndefined();
+      } else expect(f.events.find(e => e.eventType === "turn.failed")).toMatchObject({ turnId: turn.turnId,
+        payload: { error: { code: "provider_policy_refusal", message: "The request was declined.", recoverable: false } } });
+    } finally { await f.close(); }
+  });
   it("forwards Pi provider error items and the last errorMessage on turn/failed", async () => {
     const f = await failureFixture(false); const frames: string[] = [];
     const proxy = createPiRpcAppServerProxy({ stdout: { write(frame) { frames.push(frame); return true; }, once() {} },

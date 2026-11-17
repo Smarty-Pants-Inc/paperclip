@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, mkdtemp, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open as openFile, realpath, rmdir, stat, unlink, writeFile } from "node:fs/promises";
+import { constants as fsConstants } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { bindAcpxAgentFiles } from "../acpx/agent-files-binding.js";
 import { nodeCompileCacheEnvironment } from "../../node-compile-cache-environment.js";
@@ -219,7 +220,9 @@ export class PiRpcDriver implements HarnessDriver {
     });
     if (config.piRpcThinkingLevel === undefined) throw new PiNativeAdmissionError("pi_thinking_required", "Pi RPC requires an explicit thinking effort before admission.");
     const instructionFile = join(directory, `${safeSessionName(input.normalizedSessionId)}-${randomUUID()}.instructions.md`);
-    const instructionBoundary = `paperclip-host-${randomUUID()}`;
+    // One random boundary per native SESSION, not per launch: it sits inside the system
+    // prompt, so a new one on a cold relaunch missed the provider prompt cache from there on.
+    const instructionBoundary = await piSessionInstructionBoundary(directory, input.normalizedSessionId);
     // Only a started Pi can report its complete native/add-on inventory. Chat
     // bootstraps without dynamic tools, then registers ONLY the measured selection.
     let initialContext = bindingContext(this.#options.systemInstructions ?? "", this.#options.dynamicTools ?? [], this.#options.runtimeContext);
@@ -498,6 +501,8 @@ interface PiTurnState extends PiEventOrigin {
   projector: ReturnType<typeof createPiEventProjector>;
   lastText: string;
   lastErrorMessage?: string;
+  /** Provider-native Anthropic refusal, independent of its explanation text. */
+  policyRefused?: boolean;
   toolLimitFailure?: { code: string; message: string };
   hasToolCalls: boolean;
   /** Low-level agent_end is a continuation boundary, not prompt settlement. */
@@ -1661,6 +1666,7 @@ export class PiRpcHarnessSession implements HarnessSession {
         // A real successful retry supersedes a transient failure. An empty
         // receipt is not proof of recovery and must not erase its diagnosis.
         turn.failed = false;
+        turn.policyRefused = false;
         turn.lastErrorMessage = undefined;
       }
       if (this.#streamTurn === turn) this.#streamTurn = null;
@@ -1707,7 +1713,8 @@ export class PiRpcHarnessSession implements HarnessSession {
       const providerMessage = (this.#resident?.context.api ?? this.#initialContext.api) === "anthropic-messages" && /\b413\b|request_too_large|request_body_too_large/i.test(providerCause)
         ? `${providerCause}\nRequest too large: reduce this agent's tools or ask the board. Paperclip did not trim tools or retry with a smaller catalog.` : providerCause;
       const error = turn.toolLimitFailure ?? (truncated ? { code: "pi_output_truncated", message: "Pi's final assistant response reached its output limit.", recoverable: false }
-        : turn.failed ? { code: "pi_provider_error", message: providerMessage }
+        : turn.failed ? { code: turn.policyRefused ? "provider_policy_refusal" : "pi_provider_error", message: providerMessage,
+          ...(turn.policyRefused ? { recoverable: false } : {}) }
         : empty ? { code: "opencode_empty_response", message: "Pi ended without a final answer or an accepted completion report.", recoverable: false } : undefined);
       await this.#finishTurn(turn, status, { piAgentSettled: true, ...(error && status === "failed" ? { error } : {}) });
       if (this.#nativeAbortSettled?.turn === turn) this.#nativeAbortSettled.resolve();
@@ -1918,6 +1925,7 @@ async function cleanPiPrivateDirectory(resident: Pick<PiResidentState, "socketPa
 
 function capturePiProviderFailure(turn: PiTurnState, message: Record<string, unknown>): void {
   turn.failed = true;
+  if (message.rawStopReason === "refusal") turn.policyRefused = true;
   turn.lastErrorMessage = typeof message.errorMessage === "string" && message.errorMessage.trim()
     ? message.errorMessage : turn.lastErrorMessage ?? `Pi provider ended with ${typeof message.stopReason === "string" ? message.stopReason : "an error"}.`;
 }
@@ -2048,6 +2056,35 @@ function usageDelta(usage: Record<string, unknown>): Record<string, unknown> {
 }
 
 const SAFE_PI_ENV_KEYS = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SystemRoot", "WINDIR", "PATHEXT"] as const;
+
+const PI_INSTRUCTION_BOUNDARY = /^paperclip-host-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+
+/** The host-instructions boundary of one native session, stored beside its Pi session
+ * file (`<name>.jsonl`) in the runner's private 0700 runtime directory. Random, never
+ * derived from the session id. A session without one (new, or checkpointed before the
+ * boundary was persisted) gets ONE new random value, created exclusively and reused. */
+export async function piSessionInstructionBoundary(directory: string, normalizedSessionId: string): Promise<string> {
+  const file = join(directory, `${safeSessionName(normalizedSessionId)}.instruction-boundary`);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const handle = await openFile(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const value = (await handle.readFile("utf8"));
+        if ((await handle.stat()).isFile() && PI_INSTRUCTION_BOUNDARY.test(value)) return value;
+      } finally { await handle.close(); }
+      // Corrupt or foreign: replacing it only costs one cache miss. Set it aside, never follow it.
+      await unlink(file).catch(error => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ELOOP") { await unlink(file); continue; } // a symlink: remove the link, never its target
+      if (code !== "ENOENT") throw error;
+    }
+    const value = `paperclip-host-${randomUUID()}`;
+    try { await writeFile(file, value, { mode: 0o600, flag: "wx" }); return value; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+  throw new Error("Pi instruction boundary unavailable");
+}
 
 function piProcessEnvironment(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
