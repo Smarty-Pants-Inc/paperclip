@@ -4696,9 +4696,14 @@ mod tests {
 
         // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): this
         // half formerly asserted that a frame too small for the complete answer
-        // keeps the 4,096-byte preview ending "…[truncated]". Now the person is
-        // told plainly, and the whole answer is kept in a referenced file.
+        // keeps the 4,096-byte preview ending "…[truncated]", and then (pack-n5b)
+        // that the person's text names a TMPDIR file. Now the person is told
+        // plainly that the full text is kept, with a labelled excerpt and no
+        // box path; the whole answer is kept in the Runner state directory (the
+        // server checkpoints it), and its path and sha256 are in the event for
+        // the agent.
         let mut small_frame = config.clone();
+        small_frame.state_dir = temporary_directory("final-answer-notice");
         small_frame.max_frame_bytes = 8_000;
         let mut small = DurableState::new(&small_frame);
         small
@@ -4709,26 +4714,47 @@ mod tests {
                 json!({"kind": "agentMessage", "channel": "final", "text": answer}),
             )
             .unwrap();
-        let shown = small.outbox[0]
+        let payload = small.outbox[0]
             .envelope
-            .pointer("/payload/payload/text")
-            .and_then(Value::as_str)
+            .pointer("/payload/payload")
             .unwrap()
-            .to_owned();
-        assert_oversized_answer_notice(&shown, &answer.replace("secret-value", "[REDACTED]"));
+            .clone();
+        assert_oversized_answer_notice(
+            &payload,
+            &answer.replace("secret-value", "[REDACTED]"),
+            &small_frame.state_dir,
+        );
+        let _ = std::fs::remove_dir_all(&small_frame.state_dir);
     }
 
-    /// The person sees a plain statement (not a cut copy presented as the
-    /// answer), and the referenced file holds the whole redacted answer.
-    fn assert_oversized_answer_notice(shown: &str, whole: &str) {
-        assert!(!shown.contains("…[truncated]"), "{shown}");
-        assert!(shown.starts_with("This answer is too large"), "{shown}");
-        assert!(shown.contains("excerpt, not the whole answer"), "{shown}");
-        let path = shown
-            .split("The whole answer is saved at ")
-            .nth(1)
-            .and_then(|rest| rest.split(' ').next())
-            .expect("spill path in the notice");
+    /// The person sees one plain, true line (the full text is kept; ask for
+    /// any part) and a clearly labelled excerpt: never a cut marker, a box
+    /// path or a digest. The event carries the path and sha256 for the agent,
+    /// and that file, in the Runner state directory the server checkpoints,
+    /// holds the whole redacted answer.
+    fn assert_oversized_answer_notice(payload: &Value, whole: &str, state_dir: &Path) {
+        let shown = payload.get("text").and_then(Value::as_str).unwrap();
+        let kb = whole.len().div_ceil(1000);
+        assert!(
+            shown.starts_with(&format!(
+                "This answer is longer than one message ({kb} KB). The full text is kept; ask me to show any part.\n\nExcerpt (the start of the answer, not the whole answer):\n\n"
+            )),
+            "{}",
+            &shown[..shown.len().min(400)]
+        );
+        assert!(!shown.to_lowercase().contains("truncat"));
+        let full = payload.get("fullText").expect("fullText for the agent");
+        let path = full.get("path").and_then(Value::as_str).unwrap();
+        let digest = full.get("sha256").and_then(Value::as_str).unwrap();
+        assert!(!shown.contains(path));
+        assert!(!shown.contains(digest));
+        assert!(!shown.contains("final-answers"));
+        assert!(Path::new(path).starts_with(state_dir), "{path}");
+        assert_eq!(digest, format!("{:x}", Sha256::digest(whole.as_bytes())));
+        assert_eq!(
+            full.get("bytes").and_then(Value::as_u64),
+            Some(whole.len() as u64)
+        );
         assert_eq!(std::fs::read_to_string(path).unwrap(), whole);
     }
 
@@ -4765,10 +4791,10 @@ mod tests {
 
     #[test]
     fn final_answer_frame_check_counts_json_escaping_and_hex_encoding() {
-        let mut frame = config(PathBuf::from("unused"));
+        let mut frame = config(temporary_directory("final-answer-frame"));
         frame.max_frame_bytes = 64 * 1024;
         frame.max_outbox_bytes = 1024 * 1024;
-        let final_text = |answer: &str| {
+        let final_payload = |answer: &str| {
             let mut state = DurableState::new(&frame);
             state
                 .enqueue_event(
@@ -4785,23 +4811,23 @@ mod tests {
                 envelope_bytes * 2 < frame.max_frame_bytes,
                 "{envelope_bytes}"
             );
-            envelope
-                .pointer("/payload/payload/text")
-                .and_then(Value::as_str)
-                .unwrap()
-                .to_owned()
+            envelope.pointer("/payload/payload").unwrap().clone()
         };
 
         // superseded-by-replacement (RFL 11-17, Paul NOTE 5 / org 06:16Z): was
         // assert!(final_text(&quotes).ends_with("…[truncated]")). 20,000 raw
-        // bytes, about 40,000 once JSON-escaped, do not fit: say so plainly and
-        // keep the whole answer in a referenced file; the frame bound still holds.
+        // bytes, about 40,000 once JSON-escaped, do not fit: say so plainly
+        // (no box path) and keep the whole answer in the Runner state
+        // directory; the frame bound still holds.
         let quotes = "\"".repeat(20_000);
-        assert_oversized_answer_notice(&final_text(&quotes), &quotes);
+        assert_oversized_answer_notice(&final_payload(&quotes), &quotes, &frame.state_dir);
 
         // The same length of plain prose fits and is kept complete.
         let prose = "a".repeat(20_000);
-        assert_eq!(final_text(&prose), prose);
+        let payload = final_payload(&prose);
+        assert_eq!(payload.get("text").and_then(Value::as_str), Some(prose.as_str()));
+        assert!(payload.get("fullText").is_none());
+        let _ = std::fs::remove_dir_all(&frame.state_dir);
     }
 
     #[test]
