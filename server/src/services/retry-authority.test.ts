@@ -14,7 +14,7 @@ import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-s
 // state; the decision gives canRetry, the card text, the transcript note, the
 // structured next action and the user action TOGETHER (R15: card = transcript).
 const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; userAction: string; text: string | null;
-  admission?: "held" }> = [
+  admission?: "held" | "preserve" }> = [
   { row: "R1 A manager Stop, Retry accepted", facts: { stopKind: "manager", retrySource: true }, canRetry: true, userAction: "retry", text: STOPPED_TASK_RETRY_MESSAGE },
   { row: "R1/R10 F1 manager Stop, Retry source refused", facts: { stopKind: "manager", retrySource: false }, canRetry: false, userAction: "new_task", text: STOPPED_TASK_NEW_TASK_MESSAGE },
   { row: "R2 C own Stop unproven, waiting", facts: { stopGate: "waiting", retrySource: true }, canRetry: false, userAction: "wait", text: RETRY_STOP_WAIT_MESSAGE },
@@ -25,7 +25,8 @@ const rows: Array<{ row: string; facts: RetryAuthorityFacts; canRetry: boolean; 
   { row: "supersedes: R4/R11 D row-D", facts: { heldConversation: true, heldRefusal: "prior_owner_scope_mismatch", savedWork: "recovered", retrySource: true, runStatus: "failed" }, canRetry: true, userAction: "retry", text: HELD_RECOVERED_WORK_MESSAGE },
   { row: "supersedes: R4 D refusal alone", facts: { heldRefusal: "prior_owner_scope_mismatch", retrySource: true }, canRetry: true, userAction: "retry", text: HELD_PREDECESSOR_NOTICE },
   { row: "R5 M person's settled Stop", facts: { savedWork: "recovered", runStatus: "cancelled", retrySource: false }, canRetry: false, userAction: "message", text: RECOVERED_WORK_CONTINUE_MESSAGE },
-  { row: "R6 G agent paused", facts: { agentPaused: true, savedWork: "recovered", runStatus: "failed", retrySource: true }, canRetry: false, userAction: "resume", text: AGENT_PAUSED_RETRY_MESSAGE },
+  // fam-retry5: was a refusal; now accepted for preservation only (no Retry button, no provider turn while paused).
+  { row: "(superseded by replacement: upstream paused-Retry preservation, RFL record SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117) R6 G agent paused", facts: { agentPaused: true, savedWork: "recovered", runStatus: "failed", retrySource: true }, canRetry: false, userAction: "resume", text: AGENT_PAUSED_RETRY_MESSAGE, admission: "preserve" },
   { row: "supersedes: R7 M1 dead end", facts: { heldConversation: true, savedWork: "recovered", runStatus: "failed", retrySource: true }, canRetry: true, userAction: "retry", text: HELD_RECOVERED_WORK_MESSAGE },
   { row: "R9 automatic recovery pending", facts: { automaticRecovery: true, heldConversation: true, retrySource: true }, canRetry: false, userAction: "wait", text: AUTOMATIC_RECOVERY_MESSAGE },
   { row: "recovered failure, Retry accepted", facts: { savedWork: "recovered", runStatus: "failed", retrySource: true }, canRetry: true, userAction: "retry", text: RECOVERED_WORK_RETRY_MESSAGE },

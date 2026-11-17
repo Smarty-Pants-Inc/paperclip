@@ -304,7 +304,9 @@ async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string
   const decided = await readRetryAdmissionAuthority(db, { companyId: issue.companyId, issueId: issue.id, sourceRunId });
   // fam-retry2 (upstream wins): a restore hold Paperclip can still release is
   // accepted and HELD, never refused; the caller answers accepted with `held`.
-  if (decided.admission === "held") return decided;
+  // fam-retry5 (upstream wins): a paused agent's Retry is accepted for file
+  // preservation only (no provider turn while paused); same answer shape.
+  if (decided.admission === "held" || decided.admission === "preserve") return decided;
   const authority = !decided.canRetry && retryRefusedBeforeAdmissionReason(decided.reason) ? decided : null;
   // restore-card7's exhausted stop wait keeps its answer shape (not accepted,
   // waitingOnStop), now with the authority's words; the caller returns it.
@@ -321,8 +323,13 @@ async function refuseRetryTheCardDoesNotOffer(db: Db, issue: { companyId: string
 
 /** fam-retry2: an accepted Retry held behind a restore hold says so, in the hold's words. */
 function heldAnswer(authority: RetryAuthority | null | undefined) {
-  return authority?.admission === "held" ? { held: { reason: authority.reason, message: authority.cardText! } } : {};
+  // fam-retry5: a paused agent's preservation-only Retry answers in the card's
+  // paused words (Resume), never "working" or a retry countdown.
+  return authority?.admission === "held" || authority?.admission === "preserve"
+    ? { held: { reason: authority.reason, message: authority.cardText! } } : {};
 }
+
+function admittedAuthority(authority: RetryAuthority) { return authority.admission === "held" || authority.admission === "preserve"; }
 
 /** restore-card7's not-accepted answer for a Retry its exhausted stop wait refuses. */
 function stopWaitAnswer(authority: RetryAuthority, observedRunId: string | null) {
@@ -351,7 +358,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
       const intent = readTaskRetryIntent(sameRequest.payload);
       const repeatWait = !sameRequest.runId
         ? await refuseRetryTheCardDoesNotOffer(db, issue, intent?.sourceRunId ?? null) : null;
-      if (repeatWait && repeatWait.admission !== "held") return stopWaitAnswer(repeatWait, intent?.sourceRunId ?? null);
+      if (repeatWait && !admittedAuthority(repeatWait)) return stopWaitAnswer(repeatWait, intent?.sourceRunId ?? null);
       const [coalescedRun] = sameRequest.status === "coalesced" && sameRequest.runId
         ? await tx.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns)
           .where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, sameRequest.runId)))
@@ -374,7 +381,7 @@ function admitTaskRetry(input: TaskRetryRequest) {
     // of this authority, decided here, before preservation and adoption, which
     // never create an exhausted systemRecovery (see readRestoreStopWait).
     const stopWait = await refuseRetryTheCardDoesNotOffer(db, issue, latest.id);
-    if (stopWait && stopWait.admission !== "held") return stopWaitAnswer(stopWait, latest.id);
+    if (stopWait && !admittedAuthority(stopWait)) return stopWaitAnswer(stopWait, latest.id);
     if (input.retryAction === "move_forward" && !["queued", "running"].includes(latest.status) &&
         !(await undeliveredContinuation(tx, { companyId: issue.companyId, issueId: issue.id })))
       return { requestId: null, accepted: false, stale: false, alreadyMovedOn: true, observedRunId: latest.id, chatActionId: undefined };

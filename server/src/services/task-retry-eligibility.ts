@@ -99,7 +99,7 @@ export type RetryAuthority = {
   /** fam-retry2 (upstream's restore-hold semantics): "held" = Retry is accepted
    * once and held behind the restore hold; it runs through upstream's
    * restore-held admission when the files are back (no immediate wake). */
-  admission?: "held";
+  admission?: "held" | "preserve";
   userAction: RetryUserAction;
   /** The card's text; null keeps the surface's own neutral text (no instruction to contradict). */
   cardText: string | null;
@@ -126,9 +126,18 @@ function decision(userAction: RetryUserAction, reason: string, text: string | nu
  * chooses the words, which name Retry's real effect (a fresh run with history).
  */
 export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority {
-  if (facts.agentPaused) return decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION);
+  // fam-retry5 (RFL SUPERSEDE-PAUSED-RETRY-UPSTREAM-1117, upstream
+  // workspace-recovery-warm-handoff.test.ts "wakes physical preservation from
+  // HTTP Retry ... without replaying the provider"): a paused agent's Retry is
+  // ACCEPTED for file preservation only ("preserve"). Upstream admits it
+  // (task-retry.ts admission, workspace recovery preserves the files) and its
+  // heartbeat defers the wake while the agent is not invokable, so no provider
+  // turn and no run row. The card still offers no Retry: paused + Resume only.
+  if (facts.agentPaused)
+    return { ...decision("resume", "agent_paused", AGENT_PAUSED_RETRY_MESSAGE, AGENT_PAUSED_ACTION), admission: "preserve" };
   // fam-retry3: the message is answered above; a Retry is a no-op that says so.
-  // A paused agent still wins (R6 G): its refusal runs nothing either.
+  // A paused agent still wins (R6 G) on every surface: its Retry preserves files
+  // and runs no turn either.
   if (facts.personMessageAnswered)
     return decision("message", PERSON_MESSAGE_ANSWERED_REASON, PERSON_MESSAGE_ANSWERED_MESSAGE, null);
   if (facts.automaticRecovery) return decision("wait", "automatic_recovery", AUTOMATIC_RECOVERY_MESSAGE, null);
@@ -294,7 +303,7 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
  * anything is saved, on every Retry path (task Retry API and chat Retry):
  * (A held conversation is not refused: PV2's judged rule, Retry rotates it onto
  * a fresh thread with its history; card, API and chat accept it alike.)
- * - agent_paused: the card says "Resume this agent"; a Retry runs nothing.
+ * - (agent_paused is accepted for preservation only since fam-retry5, not refused.)
  * A refusal that admission itself records (previous_execution_unverified,
  * cleanup_quarantined, the fence reasons, ...) is answered by upstream #21497's
  * taskRetryRefusal on the Retry route after admission, not here.
@@ -309,7 +318,9 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
 //   stop; a repeat refuses too (the fact does not depend on the click).
 // - person_message_already_answered (fam-retry3): the source run's person message
 //   has an answer above; a Retry, a repeat included, runs nothing.
-const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven",
+// fam-retry5: agent_paused is NOT refused here any more (upstream accepts it for
+// preservation only; see decideRetryAuthority's "preserve" admission).
+const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["workspace_repair_required", "execution_stop_unproven",
   RESTORE_STOP_WAIT_REASON, PERSON_MESSAGE_ANSWERED_REASON]);
 // fam-retry2: a restore hold Paperclip can still release is an accept-held
 // outcome (canRetry, admission "held"), not a refusal, for a new click and for
