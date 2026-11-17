@@ -288,7 +288,7 @@ import {
   nativeRunResults,
 } from "@paperclipai/db";
 import { PaperclipControlPlanePort } from "./paperclip-control-plane-port.js";
-import { assertNativeRetainedSandboxBinding, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
+import { assertNativeRetainedSandboxBinding, resumedBoxHeldOnlyByFenceRefusedRuns, deferNativeControllerRecovery, NativeControllerRecoveryWaitingError, readNativeControllerRecovery, resolveNativeControllerRecovery } from "./native-controller-recovery.js";
 import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import type { EnvironmentDriverExecuteInput } from "../environment-runtime.js";
 import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
@@ -8276,6 +8276,37 @@ export async function restoreRemoteSuspendedRunnerCheckpoint(input: {
   savePluginRunnerCheckpoint(root, state, prior);
 }
 
+/** metaformat-box (b): the root restored for `ownerRunId` is exactly that
+ * owner's DB controller checkpoint (every checkpointed file sha-equal), and the
+ * checkpoint is the one the owner's recovery pointer names. A missing, other-
+ * session or mismatched checkpoint, or a root that drifted from it, is false:
+ * never a session-only restore onto files from elsewhere. Local reads only. */
+async function rootHoldsOwnerDbCheckpoint(input: { db: Db; execution: NativeExecutionInput }, root: string,
+  ownerRunId: string): Promise<boolean> {
+  const { companyId, issueId } = input.execution.binding;
+  if (!issueId) return false;
+  const checkpoint = await loadNativeRunnerCheckpoint(input.db, { companyId, issueId, runId: ownerRunId }).catch(() => null);
+  if (!checkpoint || checkpoint.recoveryEvidence.normalizedSessionId !== nativeSessionKey(input.execution)) return false;
+  const [owner] = await input.db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, ownerRunId)));
+  const profile = record(owner?.runnerProfileJson);
+  const pointer = readNativeControllerRecovery(profile.nativeControllerRecovery, profile.sessionCheckpoint);
+  if (pointer?.checkpoint?.runId !== ownerRunId
+    || pointer.checkpoint.runnerInstanceId !== checkpoint.recoveryEvidence.runnerInstanceId) return false;
+  const scratch = mkdtempSync(join(tmpdir(), "paperclip-owner-checkpoint-"));
+  try {
+    checkpoint.restoreSessionDirectory(scratch);
+    if (readRunnerdDurableIdentity(scratch)?.runId !== ownerRunId) return false;
+    const files = (readdirSync(scratch, { recursive: true }) as string[])
+      .filter(name => lstatSync(resolve(scratch, name)).isFile());
+    const digest = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
+    return files.length > 0 && files.every(name => existsSync(resolve(root, name))
+      && lstatSync(resolve(root, name)).isFile() && digest(resolve(root, name)) === digest(resolve(scratch, name)));
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 /** The Runner saves `suspended` and a terminal fence for its suspend result
  * before it sends that result. When a restart stops the controller first, the
  * fence stays: the suspension finished, and only its acknowledgement is
@@ -8318,13 +8349,59 @@ function controllerProjectionInput(input: { db: Db; execution: NativeExecutionIn
 /** Materialize opaque controller state before ordinary warm admission reads it.
  * A retained owner or server checkpoint identifies the last completed run;
  * the original external marker can precede several in-process warm turns. */
-async function restoreWarmRunnerdController(input: {
+type WarmRunnerdControllerRestoreInput = {
   db: Db; execution: NativeExecutionInput;
   predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
   managedAiAccountIdentity?: string; managedAiCredentialIdentity?: string;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   restartRecovery?: NativeRestartRecoveryClaim;
-}): Promise<void> {
+};
+
+/** metaformat-box: targets re-routed by routeFenceRefusedResumedBoxAsCreated,
+ * mapped to the owner whose DB checkpoint must be the restored root. */
+const fenceRefusedBoxOwners = new WeakMap<object, string>();
+
+/** metaformat-box (RFL 11-17 19:39Z). A resumed box that the selected owner
+ * never held, and whose every other holder was refused at the prior-owner
+ * fence before any launch (resumedBoxHeldOnlyByFenceRefusedRuns), carries no
+ * foreign work: it is the box a created lease would give. Route it into the
+ * created-box path (the same controller restore from the owner's DB checkpoint
+ * in restoreWarmRunnerdController -> restoreNativeControllerProjections, and
+ * the same post-admission workspace restore, restoreIntoCreatedSandbox ->
+ * restoreVerifiedHarnessBackup) instead of the retained-sandbox binding, which
+ * needs an owner lease row on this box that the owner can never have.
+ * Database reads only and outside any transaction; no box or network call.
+ * Every other target is returned unchanged. */
+async function routeFenceRefusedResumedBoxAsCreated(input: {
+  db: Db; execution: NativeExecutionInput; runnerExecutionTarget?: AdapterExecutionTarget | null;
+  restartRecovery?: unknown; predecessorEnvironmentRuntime?: FailedNativePredecessorProbe;
+}): Promise<AdapterExecutionTarget | null | undefined> {
+  const target = input.runnerExecutionTarget;
+  const { companyId, issueId, runId } = input.execution.binding;
+  if (input.restartRecovery || !issueId || input.execution.session.lifecyclePolicy.mode !== "warm"
+    || !resumedSandboxRunner(target) || target?.kind !== "remote"
+    || target.transport !== "sandbox" || fenceRefusedBoxOwners.has(target)) return target;
+  const recovered = await resolveNativeControllerRecovery(input.db, { ...input.execution.binding, issueId,
+    currentRunId: runId, normalizedSessionId: nativeSessionKey(input.execution),
+    predecessorEnvironmentRuntime: input.predecessorEnvironmentRuntime });
+  if (recovered.kind !== "recoverable" || !await resumedBoxHeldOnlyByFenceRefusedRuns(input.db, {
+    companyId, issueId, ownerRunId: recovered.checkpoint.runId, successorRunId: runId, target })) return target;
+  const created = { ...target, sandboxLeaseAcquisition: { ...target.sandboxLeaseAcquisition!, outcome: "created" as const } };
+  fenceRefusedBoxOwners.set(created, recovered.checkpoint.runId);
+  return created;
+}
+
+async function restoreWarmRunnerdController(input: WarmRunnerdControllerRestoreInput): Promise<void> {
+  await restoreWarmRunnerdControllerState(input);
+  const owner = input.runnerExecutionTarget ? fenceRefusedBoxOwners.get(input.runnerExecutionTarget) : undefined;
+  // (b) WORK is the owner's checkpointed files: never a session-only restore
+  // onto files from elsewhere. Otherwise the binding's own typed refusal.
+  if (owner !== undefined && !await rootHoldsOwnerDbCheckpoint(input, scopedRunnerdStateRoot(input.execution), owner)) {
+    throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
+  }
+}
+
+async function restoreWarmRunnerdControllerState(input: WarmRunnerdControllerRestoreInput): Promise<void> {
   if (input.restartRecovery || input.runnerExecutionTarget?.kind !== "remote" ||
       input.execution.session.lifecyclePolicy.mode !== "warm") return;
   const root = scopedRunnerdStateRoot(input.execution);
@@ -11722,6 +11799,8 @@ async function executePaperclipNativeSessionAttempt(
       companyId: input.execution.binding.companyId, model: input.execution.provider.model, target,
     }, process.env)) throw new Error("paperclip_runner_kimi_candidate_ineligible: exact trusted target admission is required");
   }
+  input = { ...input, runnerExecutionTarget: await routeFenceRefusedResumedBoxAsCreated({ ...input,
+    restartRecovery: input.restartRecovery ?? input.restartRecoveryFence }) };
   const restoredController = input.restartRecovery?.kind === "reattach_remote_runner"
     ? await restoreNativeRunnerCheckpoint(input.db, input.execution.binding, scopedRunnerdStateRoot(input.execution))
     : null;
@@ -17866,6 +17945,7 @@ export async function createRunnerdBackend(input: {
       throw new NativeCancellationPendingRecoveryError();
     }
   }
+  input = { ...input, runnerExecutionTarget: await routeFenceRefusedResumedBoxAsCreated(input) };
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {

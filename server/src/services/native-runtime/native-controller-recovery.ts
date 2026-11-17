@@ -15,7 +15,7 @@ import { redactRunnerApiPayloads } from "./runner-api-log-redaction.js";
 import { retiredReusableLeasePredecessors } from "../environment-lease-handoff.js";
 import { hasRemoteTerminationReceipt } from "../remote-execution-termination.js";
 import { isQuiescentRetainedPiSource, readStoppedRemotePiSource } from "./native-retained-pi-source.js";
-import type { FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
+import { refusedAtPriorOwnerFenceBeforeLaunch, type FailedNativePredecessorProbe } from "./native-provider-work-proof.js";
 import { hasAcknowledgedNativeStopIntent } from "../acknowledged-native-stop.js";
 import { nativeUserStopRecoveryHeld, stopJournalLeftUndeliveredTool, userStopLeftUncertainty } from "./native-user-stop-settlement.js";
 import { probePiSessionResumeFile } from "./pi-session-file-repair.js";
@@ -385,6 +385,39 @@ export async function assertNativeRetainedSandboxBinding(db: Db, input: Retained
     throw nativeReconciliationError("native_controller_recovery_missing_evidence:retained_sandbox_binding");
   }
   return { remoteCwd: recordedCwd };
+}
+
+/** metaformat-box (RFL 11-17 19:39Z): a resumed box that the selected owner
+ * never held, and that every other holder only reached to be refused at the
+ * prior-owner fence before any launch, carries no foreign work: it is what a
+ * created box would be. Only then may the owner's DB checkpoint stand in for
+ * the retained-sandbox binding (the caller still proves the restored root is
+ * sha-equal to that checkpoint). An owner that held the box, a holder with no
+ * run, another company/issue, or any holder failing
+ * refusedAtPriorOwnerFenceBeforeLaunch (process, launch, tool, provider work,
+ * checkpoint, result, claim) keeps the binding. Database reads only: no box,
+ * runner or network call, so it is safe inside or outside a transaction. */
+export async function resumedBoxHeldOnlyByFenceRefusedRuns(db: Db, input: {
+  companyId: string; issueId: string; ownerRunId: string; successorRunId: string;
+  target: Extract<AdapterExecutionTarget, { kind: "remote" }>;
+}): Promise<boolean> {
+  const { target } = input;
+  if (target.transport !== "sandbox") return false;
+  const providerLeaseId = target.sandboxLeaseAcquisition?.providerLeaseId;
+  if (target.sandboxLeaseAcquisition?.outcome !== "resumed"
+    || !target.providerKey || !providerLeaseId || input.ownerRunId === input.successorRunId) return false;
+  const history = await db.select({ companyId: environmentLeases.companyId, issueId: environmentLeases.issueId,
+    heartbeatRunId: environmentLeases.heartbeatRunId }).from(environmentLeases).where(and(
+    eq(environmentLeases.provider, target.providerKey), eq(environmentLeases.providerLeaseId, providerLeaseId)));
+  // The owner held this box: the ordinary binding decides, unchanged.
+  if (history.some(lease => lease.heartbeatRunId === input.ownerRunId)) return false;
+  const holders = history.filter(lease => lease.heartbeatRunId !== input.successorRunId && lease.heartbeatRunId !== input.ownerRunId);
+  if (holders.length === 0) return false;
+  for (const lease of holders) {
+    if (!lease.heartbeatRunId || lease.companyId !== input.companyId || lease.issueId !== input.issueId) return false;
+    if (!await refusedAtPriorOwnerFenceBeforeLaunch(db, { companyId: lease.companyId, runId: lease.heartbeatRunId })) return false;
+  }
+  return true;
 }
 
 /** Only the existing bounded selector chooses history. Never search backwards

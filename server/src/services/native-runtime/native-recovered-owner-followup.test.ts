@@ -30,6 +30,24 @@ import {
 } from "./predecessor-retirement.js";
 
 const toolDefinitions = vi.hoisted(() => vi.fn());
+/** metaformat-box: the executor's own re-read of the owner's DB checkpoint
+ * (after the selector, in native-controller-recovery.ts, restored the root
+ * from the real one) finds it missing or bound to another runner instance. */
+const checkpointTamper = vi.hoisted(() => ({ runId: null as string | null, mode: null as "missing" | "mismatched" | null, reads: 0 }));
+vi.mock("./native-runner-checkpoint.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./native-runner-checkpoint.js")>();
+  return { ...original, loadNativeRunnerCheckpoint: async (...args: Parameters<typeof original.loadNativeRunnerCheckpoint>) => {
+    const checkpoint = await original.loadNativeRunnerCheckpoint(...args);
+    if (!checkpoint || !checkpointTamper.mode || args[1].runId !== checkpointTamper.runId) return checkpoint;
+    checkpointTamper.reads += 1;
+    if (checkpointTamper.mode === "missing") return null;
+    return new Proxy(checkpoint, { get(object, key) {
+      if (key === "recoveryEvidence") return { ...object.recoveryEvidence, runnerInstanceId: "another-runner-instance" };
+      const value = Reflect.get(object, key, object);
+      return typeof value === "function" ? value.bind(object) : value;
+    } });
+  } };
+});
 vi.mock("../../runtime-api.js", async importOriginal => ({ ...await importOriginal<typeof import("../../runtime-api.js")>(), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:43219" }));
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
@@ -81,6 +99,7 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
     stateDirectory = await mkdtemp(join(tmpdir(), "native-recovered-owner-state-"));
     process.env.PAPERCLIP_RUNNER_STATE_DIR = stateDirectory;
     toolDefinitions.mockReset().mockRejectedValue(new Error(ADMITTED));
+    Object.assign(checkpointTamper, { runId: null, mode: null, reads: 0 });
   });
   afterEach(async () => {
     if (previousStateDirectory === undefined) delete process.env.PAPERCLIP_RUNNER_STATE_DIR;
@@ -830,26 +849,142 @@ describe.skipIf(!recoveryPostgresSupport.supported)("follow-up after a recovered
       .toBe("provider-session-before-recovery");
   }, 60_000);
 
-  // R1 on the live lease shape: 18613087 RESUMED bx_qmv8g5qk, the box the
-  // refused 78bd0dd2 had created; the owner's box (bx_cue58jb5) is retained.
-  // The selector now names the owner; the owner never ran on this box, so the
-  // existing retained-sandbox binding refuses with its typed fresh-thread code
-  // (floor (c)), never the dead metadata_format of a non-owner source.
-  it("R1 metaformat (resumed box): the next message on the refused run's resumed box gets the typed outcome", async () => {
-    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+  /** metaformat-box: the live R1 lease rows (leases.json). dd45b4c1 keeps its
+   * own box bx_cue58jb5 `retained`; 78bd0dd2 created bx_qmv8g5qk (lease
+   * 2bf970a5, expired); 18613087 RESUMED bx_qmv8g5qk on lease 9951aee5. */
+  async function liveResumedBox(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>) {
     await startedThenStopped(prior);
     const refused = await failUnstartedFollowUp(prior);
-    const next = await admitFollowUp(prior);
-    await db.insert(environments).values({ id: next.environmentId, name: `bx-${next.environmentId}`, driver: "sandbox" });
-    await db.insert(environmentLeases).values({ companyId, environmentId: next.environmentId, issueId: prior.issueId,
-      heartbeatRunId: refused, provider: "daytona", providerLeaseId: next.providerLeaseId, status: "expired",
-      releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
     await db.update(heartbeatRuns).set({ errorCode: "native_continuation_requires_reconciliation" }).where(eq(heartbeatRuns.id, refused));
+    const next = await admitFollowUp(prior);
+    const ownerEnvironmentId = randomUUID();
+    await db.insert(environments).values([{ id: ownerEnvironmentId, name: `bx_cue58jb5-${ownerEnvironmentId}`, driver: "sandbox" },
+      { id: next.environmentId, name: `bx_qmv8g5qk-${next.environmentId}`, driver: "sandbox" }]);
+    await db.insert(environmentLeases).values([
+      { companyId, environmentId: ownerEnvironmentId, issueId: prior.issueId, heartbeatRunId: prior.runId, provider: "daytona",
+        providerLeaseId: `bx_cue58jb5-${prior.runId}`, status: "retained", metadata: { remoteCwd: "/workspace" } },
+      { companyId, environmentId: next.environmentId, issueId: prior.issueId, heartbeatRunId: refused, provider: "daytona",
+        providerLeaseId: next.providerLeaseId, status: "expired", releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } },
+      { id: next.leaseId, companyId, environmentId: next.environmentId, issueId: prior.issueId, heartbeatRunId: next.runId,
+        provider: "daytona", providerLeaseId: next.providerLeaseId, status: "active", metadata: { remoteCwd: "/workspace" } },
+    ]);
+    return { refused, next };
+  }
+
+  /** Another holder of the resumed box: refused at the prior-owner fence, plus
+   * (optionally) a launch request or provider work of its own. It is outside
+   * the conversation, so only the box equivalence reads it, not the selector. */
+  async function addBoxHolder(prior: Awaited<ReturnType<typeof seedRecoveredPriorRun>>,
+    next: Awaited<ReturnType<typeof admitFollowUp>>, own: "launched" | "provider-work" | "none") {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "failed", runtimeMode: "native",
+      nativeIssueId: prior.issueId, finishedAt: new Date(), errorCode: "native_continuation_requires_reconciliation",
+      contextSnapshot: { issueId: prior.issueId } });
+    await db.insert(nativeRunFinalizations).values({ companyId, issueId: prior.issueId, runId, phase: "terminal_failure",
+      failureCode: "native_continuation_requires_reconciliation" });
+    await db.insert(heartbeatRunEvents).values([
+      { companyId, agentId, runId, seq: 1, stream: "system", payload: {}, eventType: "native.prior_owner_fence_refused" },
+      ...(own === "none" ? [] : [{ companyId, agentId, runId, seq: 2, stream: "system", payload: {},
+        eventType: own === "launched" ? "native.process_start_requested" : "session.started" }]),
+    ]);
+    await db.insert(environmentLeases).values({ companyId, environmentId: next.environmentId, issueId: prior.issueId,
+      heartbeatRunId: runId, provider: "daytona", providerLeaseId: next.providerLeaseId, status: "expired",
+      releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    return runId;
+  }
+
+  /** Every file of `runId`'s DB controller checkpoint, by relative path -> sha256. */
+  async function checkpointFiles(issueId: string, runId: string) {
+    const checkpoint = await loadNativeRunnerCheckpoint(db, { companyId, issueId, runId });
+    expect(checkpoint).not.toBeNull();
+    const scratch = await mkdtemp(join(tmpdir(), "owner-checkpoint-files-"));
+    try {
+      checkpoint!.restoreSessionDirectory(scratch);
+      return await shaTree(scratch);
+    } finally { await rm(scratch, { recursive: true, force: true }); }
+  }
+
+  async function shaTree(root: string) {
+    const files: Record<string, string> = {};
+    for (const entry of await readdir(root, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile()) continue;
+      const path = join(entry.parentPath, entry.name);
+      files[path.slice(root.length + 1)] = createHash("sha256").update(await readFile(path)).digest("hex");
+    }
+    return files;
+  }
+
+  // R1 on the live lease shape (metaformat-box): 18613087 RESUMED bx_qmv8g5qk,
+  // the box only the fence-refused 78bd0dd2 held; the owner dd45b4c1 never
+  // held it. Base f49c6ef8: the selector names the owner, then the retained
+  // binding refuses with retained_sandbox_binding. Head: the box carries no
+  // foreign work, so the owner's DB checkpoint restores it as on a created box
+  // and the +30 s message is admitted on the owner's thread.
+  it("R1 metaformat (resumed box): the next message on the refused run's resumed box is answered from the owner's checkpoint", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const { refused, next } = await liveResumedBox(prior);
+    expect(await fenceEvents(refused)).toEqual(["native.prior_owner_fence_refused"]);
+    const ownerFiles = await checkpointFiles(prior.issueId, prior.runId);
     const outcome = await next.start("resumed");
-    // Base: { selected: the refused run, outcome and typed: native_controller_recovery_unsupported:metadata_format }.
-    expect({ selected: next.selectedRunId, outcome, typed: freshThreadRefusalCode(next.failures.at(-1)) }).toEqual({
-      selected: prior.runId, outcome: "native_controller_recovery_missing_evidence:retained_sandbox_binding",
-      typed: "native_controller_recovery_missing_evidence:retained_sandbox_binding" });
+    // Base: { selected: owner, outcome: native_controller_recovery_missing_evidence:retained_sandbox_binding }.
+    expect({ selected: next.selectedRunId, outcome }).toEqual({ selected: prior.runId, outcome: ADMITTED });
+    // Nothing reached the box: no retained Runner read, no launch.
+    expect(next.remoteExecute).not.toHaveBeenCalled();
+    // The owner's thread, recalled from its checkpoint.
+    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, next.runId));
+    expect((current.runnerProfileJson!.sessionCheckpoint as { providerSessionId: string }).providerSessionId)
+      .toBe("provider-session-before-recovery");
+    // WORK: the controller root admitted is the owner's checkpointed files, sha-equal.
+    const root = await sessionRoot();
+    const archived = await archivedOwners(root);
+    const restored = archived.length ? join(root, "continuity-breaks", (await readdir(join(root, "continuity-breaks")))[0]!) : root;
+    const restoredFiles = await shaTree(restored);
+    expect(Object.keys(ownerFiles).length).toBeGreaterThan(0);
+    expect(Object.fromEntries(Object.keys(ownerFiles).map(name => [name, restoredFiles[name]]))).toEqual(ownerFiles);
+    // The restored context holds the owner's earlier facts: its identity and committed terminal.
+    const state = JSON.parse(await readFile(join(restored, "control-plane", "control-plane-state.json"), "utf8"));
+    expect(state.identity.runId).toBe(prior.runId);
+    expect(JSON.stringify(state)).toContain("recovered-terminal");
+  }, 60_000);
+
+  const BINDING = "native_controller_recovery_missing_evidence:retained_sandbox_binding";
+
+  it("metaformat-box negative: an owner that held the resumed box still goes through the retained binding", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const { next } = await liveResumedBox(prior);
+    await db.insert(environmentLeases).values({ companyId, environmentId: next.environmentId, issueId: prior.issueId,
+      heartbeatRunId: prior.runId, provider: "daytona", providerLeaseId: next.providerLeaseId, status: "released",
+      releasedAt: new Date(), metadata: { remoteCwd: "/workspace" } });
+    const outcome = await next.start("resumed");
+    expect(next.selectedRunId).toBe(prior.runId);
+    expect(outcome).not.toBe(ADMITTED);
+    // The binding accepted the owner's lease and read its retained Runner on the box.
+    expect(next.remoteExecute).toHaveBeenCalled();
+  }, 60_000);
+
+  it.each(["launched", "provider-work"] as const)("metaformat-box negative: a box holder that %s blocks the equivalence", async own => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const { next } = await liveResumedBox(prior);
+    await addBoxHolder(prior, next, own);
+    expect(await next.start("resumed")).toBe(BINDING);
+    expect(next.remoteExecute).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it("metaformat-box control: a second fence-refused holder with no work of its own is still answered", async () => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const { next } = await liveResumedBox(prior);
+    await addBoxHolder(prior, next, "none");
+    expect(await next.start("resumed")).toBe(ADMITTED);
+  }, 60_000);
+
+  it.each(["missing", "mismatched"] as const)("metaformat-box negative: a %s owner checkpoint blocks the equivalence", async mode => {
+    const prior = await seedRecoveredPriorRun("settled", { provider: "pi_rpc", lifecycle: "warm" });
+    const { next } = await liveResumedBox(prior);
+    Object.assign(checkpointTamper, { runId: prior.runId, mode });
+    expect(await next.start("resumed")).toBe(BINDING);
+    expect(next.selectedRunId).toBe(prior.runId);
+    expect(checkpointTamper.reads).toBeGreaterThan(0);
+    expect(next.remoteExecute).not.toHaveBeenCalled();
   }, 60_000);
 
   // R2, fresh 9f543b9a: after Boat blips, the source run had itself opened a
