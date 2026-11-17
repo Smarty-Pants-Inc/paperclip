@@ -299,7 +299,7 @@ it("re-arms a live sandbox provider's launchers after its controller restarts", 
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const before = await broker(undefined, remote, false, undefined, undefined, { root, launcherKey: "session-a" });
   const operation = liveParent(before.env);
-  const releaseBefore = before.activate(run("run-a"));
+  const releaseBefore = await before.activate(run("run-a"));
   const first = await operation();
   expect(first.value).toBe("fixture-run-a");
   releaseBefore();
@@ -311,7 +311,7 @@ it("re-arms a live sandbox provider's launchers after its controller restarts", 
   })), remote, false, undefined, undefined, { root, launcherKey: "session-a" });
   expect(after.env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBe(launchers);
   expect(after.env.PAPERCLIP_GITHUB_BROKER_TOKEN).not.toBe(before.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
-  const releaseAfter = after.activate(run("run-a"));
+  const releaseAfter = await after.activate(run("run-a"));
   const adopted = await operation();
   expect(adopted).toMatchObject({ pid: first.pid, value: "adopted-run-a", stderr: "" });
   expect(await readFile(path.join(launchers, "gh"), "utf8")).not.toContain(after.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
@@ -328,7 +328,7 @@ it("keeps launchers a successor re-armed when a superseded access stops", async 
     true, false, undefined, undefined, { root, launcherKey: "session-a" });
   const operation = liveParent(superseded.env);
   await superseded.stop();
-  successor.activate(run("run-b"));
+  await successor.activate(run("run-b"));
   expect(await operation()).toMatchObject({ value: "successor", stderr: "" });
   const other = await broker(undefined, true, false, undefined, undefined, { root, launcherKey: "session-b" });
   expect(other.env.PAPERCLIP_GITHUB_LAUNCHER_DIR).not.toBe(successor.env.PAPERCLIP_GITHUB_LAUNCHER_DIR);
@@ -338,14 +338,14 @@ it("keeps a previous-release provider running without managed GitHub after the c
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const previous = await broker(undefined, true, false, undefined, undefined, { root });
   const operation = liveParent(previous.env);
-  const releasePrevious = previous.activate(run("run-a"));
+  const releasePrevious = await previous.activate(run("run-a"));
   expect((await operation()).value).toBe("fixture-run-a");
   releasePrevious();
   await previous.stop();
   await expect(access(previous.env.PAPERCLIP_GITHUB_LAUNCHER_DIR)).rejects.toThrow();
   const current = await broker(undefined, true, false, undefined, undefined, { root, launcherKey: "session-a" });
   expect(current.env.PAPERCLIP_GITHUB_LAUNCHER_DIR).not.toBe(previous.env.PAPERCLIP_GITHUB_LAUNCHER_DIR);
-  current.activate(run("run-a"));
+  await current.activate(run("run-a"));
   expect(await operation()).toMatchObject({ value: "anonymous", stderr: "" });
   expect(current.resolveCredentials).not.toHaveBeenCalled();
   await expect(liveParent(current.env)()).resolves.toMatchObject({ value: "fixture-run-a" });
@@ -355,12 +355,12 @@ it("tells a local provider adopted after a restart that managed GitHub is unavai
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const before = await broker(undefined, false, false, undefined, undefined, { root, launcherKey: "session-a" });
   const operation = liveParent(before.env);
-  const releaseBefore = before.activate(run("run-a"));
+  const releaseBefore = await before.activate(run("run-a"));
   expect((await operation()).value).toBe("fixture-run-a");
   releaseBefore();
   await before.stop({ preserveLaunchers: true });
   const after = await broker(undefined, false, false, undefined, undefined, { root, launcherKey: "session-a" });
-  after.activate(run("run-a"));
+  await after.activate(run("run-a"));
   const adopted = await operation();
   expect(adopted.value).toBe("anonymous");
   expect(adopted.stderr).toMatch(/^Paperclip: GitHub (broker_transport_unavailable|capability_rejected|broker_response_unavailable); continuing without managed credentials\.\n$/);
@@ -374,7 +374,7 @@ it("keeps the broker capability out of local launcher files", async () => {
     const target = path.join(b.env.PAPERCLIP_GITHUB_LAUNCHER_DIR, file);
     if ((await stat(target)).isFile()) expect(await readFile(target, "utf8")).not.toContain(b.env.PAPERCLIP_GITHUB_BROKER_TOKEN);
   }
-  b.activate(run("local"));
+  await b.activate(run("local"));
   expect(await liveParent(b.env)()).toMatchObject({ value: "fixture-local", stderr: "" });
 });
 it("rejects other scopes, concurrent bindings, browser requests and forged authority", async () => {
