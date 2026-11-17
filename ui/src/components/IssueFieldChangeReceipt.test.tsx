@@ -20,7 +20,7 @@ describe("IssueFieldChangeReceipt", () => {
     const changes = buildIssueChanges({ description: "old" }, { description: "new" });
     expect(changes.description).toEqual({ from: "old", to: "new", updated: true });
     const html = renderToStaticMarkup(<IssueFieldChangeReceipt event={event({ details: { changes } })} />);
-    expect(html).not.toMatch(/runner saved only part|full text is kept/);
+    expect(html).not.toMatch(/runner saved only part|full output is kept/);
     expect(html).toContain("old");
     expect(html).toContain("new");
   });
@@ -33,7 +33,7 @@ describe("IssueFieldChangeReceipt", () => {
     // A receipt without run provenance cannot offer a saved-run instruction.
     // The producer must retain the values instead of manufacturing a cut.
     expect(html).not.toContain("Open the run log");
-    expect(html).not.toMatch(/runner saved only part|full text is kept/);
+    expect(html).not.toMatch(/runner saved only part|full output is kept/);
     expect(html).toContain(from);
     expect(html).toContain(to);
   });
@@ -113,7 +113,7 @@ describe("IssueFieldChangeReceipt", () => {
     );
 
     expect(html).toContain("Description");
-    expect(html).not.toMatch(/runner saved only part|full text is kept/);
+    expect(html).not.toMatch(/runner saved only part|full output is kept/);
     expect(html).not.toContain(">preview<");
   });
 

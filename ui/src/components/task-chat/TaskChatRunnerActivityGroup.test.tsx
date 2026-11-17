@@ -120,7 +120,7 @@ describe("TaskChatRunnerActivityGroup", () => {
     </ThemeProvider></MemoryRouter>));
     act(() => container.querySelector<HTMLButtonElement>(`[data-activity-item-id="${item.id}"] button`)!.click());
     expect(container.querySelector("pre")?.textContent).toBe(output);
-    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
     expect(container.textContent).not.toMatch(/\[Full output:|\/tmp\/native-spill|saved only part|truncated/i);
     expect(container.querySelector('a[href*="/agents/a/runs/r"]')).not.toBeNull();
   });
@@ -136,7 +136,7 @@ describe("TaskChatRunnerActivityGroup", () => {
     act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="spilled-edit"] button')!.click());
     expect(container.querySelector('[data-testid="task-chat-diff-view"]')).not.toBeNull();
     expect(container.querySelector("pre")?.textContent).toBe("EDIT_RESULT\n");
-    expect(container.textContent?.split("The full text is kept; ask me to show any part.")).toHaveLength(2);
+    expect(container.textContent?.split("The full output is kept on the agent's machine while it runs.")).toHaveLength(2);
     expect(container.innerHTML).not.toMatch(/\[Full output:|\/tmp\/edit-spill/);
   });
 
@@ -146,7 +146,7 @@ describe("TaskChatRunnerActivityGroup", () => {
     </ThemeProvider></MemoryRouter>));
     act(() => container.querySelector<HTMLButtonElement>('[data-activity-item-id="whole"] button')!.click());
     expect(container.textContent).toContain("output-whole");
-    expect(container.textContent).not.toMatch(/full text is kept|saved only part/);
+    expect(container.textContent).not.toMatch(/full output is kept|saved only part/);
   });
 
   const toggle = () =>
