@@ -18,7 +18,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { createNativeRunLogCoverageVerifier, formatNativeRunLogEvent } from "../native-runtime/native-run-log-export.js";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agents, agentWakeupRequests, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
+import { activityLog, agents, authUsers, agentWakeupRequests, approvals, issueApprovals, budgetReservations, caseHandoffs, cases, companies, completionContracts, costEvents, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, heartbeatRunEvents, issueComments, issueQuestionResponseDeliveries, issueRecoveryActions, issues, issueThreadInteractions, nativeRunFinalizations } from "@paperclipai/db";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -59,6 +59,9 @@ import { createReleaseIssueExecution } from "../../modules/wake-queue/applicatio
 import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapters/postgres.js";
 import { claimFirstTurnQueuedInput } from "../native-runtime/first-turn-queued-input.js";
 import { settleUnansweredPersonMessage } from "../recovery/unanswered-person-message.js";
+import { NativeRunCoordinatorStore } from "../native-runtime/native-run-coordinator-store.js";
+import { finalizeNativeRun, NativeFinalizationDeferredError, recoverCommittedNativeChatResponse } from "../native-runtime/native-run-finalizer.js";
+import { nativeResponsePresentationWork } from "../native-runtime/native-response-presentation-work.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -100,7 +103,7 @@ vi.mock("../../vendor/paperclip-runner/index.js", async importOriginal => {
 
 
 type Dependencies = HeartbeatRunCompletionDependencies;
-function callbacks(db: Db) {
+function callbacks(db: Db, realPresentation = false) {
   const state = createHeartbeatRunState(db);
   const lifecycleDeps = {
     ...state, ...createHeartbeatRunPreparation(db),
@@ -124,8 +127,8 @@ function callbacks(db: Db) {
     classifyAndPersistRunLiveness: vi.fn<Dependencies["classifyAndPersistRunLiveness"]>(async run => run),
     completeSkillTestRunForHeartbeatOutcome: vi.fn<Dependencies["completeSkillTestRunForHeartbeatOutcome"]>(async () => null),
     refreshContinuationSummaryForRun: vi.fn<Dependencies["refreshContinuationSummaryForRun"]>(async () => null),
-    findRunIssueComment: vi.fn<Dependencies["findRunIssueComment"]>(async () => null),
-    findLatestCompletedFinalAgentMessage: vi.fn<Dependencies["findLatestCompletedFinalAgentMessage"]>(async () => null),
+    findRunIssueComment: vi.fn<Dependencies["findRunIssueComment"]>(realPresentation ? lifecycle.findRunIssueComment : async () => null),
+    findLatestCompletedFinalAgentMessage: vi.fn<Dependencies["findLatestCompletedFinalAgentMessage"]>(realPresentation ? lifecycle.findLatestCompletedFinalAgentMessage : async () => null),
     finalizeIssueCommentPolicy: vi.fn<Dependencies["finalizeIssueCommentPolicy"]>(async () => ({ outcome: "not_applicable", queuedRun: null })),
     handleIssueReviewPathDisposition: vi.fn<Dependencies["handleIssueReviewPathDisposition"]>(async () => undefined),
     handleRunLivenessContinuation: vi.fn<Dependencies["handleRunLivenessContinuation"]>(),
@@ -176,12 +179,12 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   afterAll(async () => { await db?.$client.end(); await database?.cleanup(); vi.restoreAllMocks(); });
   beforeEach(async () => { await db.execute(sql`truncate table companies restart identity cascade`); });
 
-  async function fixture(patch: Partial<typeof heartbeatRuns.$inferInsert> = {}, issuePrefix = "CMP") {
+  async function fixture(patch: Partial<typeof heartbeatRuns.$inferInsert> = {}, issuePrefix = "CMP", realPresentation = false) {
     const [company] = await db.insert(companies).values({ name: "Completion", issuePrefix }).returning();
     const [agent] = await db.insert(agents).values({ companyId: company.id, name: "Completing agent", adapterType: "process" }).returning();
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "on_demand", status: "claimed" }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, wakeupRequestId: wake.id, status: "running", runtimeMode: "legacy", ...patch }).returning();
-    const deps = callbacks(db);
+    const deps = callbacks(db, realPresentation);
     const controller = new AbortController();
     const input: CompleteHeartbeatRunInput = {
       run, agent, issueId: null, issueRef: null, signal: controller.signal,
@@ -650,6 +653,133 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     // The posted answer (or the run's own card) is the turn's response: the
     // conversation waits for the person.
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].conversationState).toBe("waiting");
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  // Gate 3, run f5c33c68 (stack-lane/): the native result was accepted at
+  // precommit (seq 234, yielded/response_wake), the live finalizer found the
+  // finalization lease busy (server log 09:10:51.013), the commit worker then
+  // committed conversation_turn_finished (09:10:51.112), and only after that
+  // did the live path resolve its presentation (seq 250, 09:10:51.185) from
+  // the precommit fields it had read. The final reply (seq 228) must still be
+  // published once, from the committed state; the run's own open question card
+  // (SMA-627) still owns its turn.
+  async function leaseBusyConversationTurn(shape: "gate3" | "own open card" | "SMA-627" | "lease free") {
+    const f = await fixture({ runtimeMode: "native" }, `LB${randomUUID().slice(0, 6)}`, true);
+    const userId = `gate3-${randomUUID()}`, sessionId = randomUUID(), runnerId = randomUUID(), turnId = "pi-turn-4d6e60de";
+    await db.insert(authUsers).values({ id: userId, name: "Conversation owner", email: `${userId}@example.test`,
+      createdAt: new Date("2020-01-01T00:00:00Z"), updatedAt: new Date("2020-01-01T00:00:00Z") });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId, title: "Chat with TEST PS1-S2p-fg-2",
+      status: "in_progress", assigneeAgentId: f.agent.id, responsibleUserId: userId, executionRunId: f.run.id,
+      conversationAgentId: f.agent.id, conversationUserId: userId, conversationState: "active", conversationSessionGeneration: 0 }).returning();
+    const [contract] = await db.insert(completionContracts).values({ companyId: f.run.companyId, issueId: issue.id, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard", completionAuthority: "server_arbiter",
+      incompleteCriteriaPolicy: "preserve_non_terminal", contractJson: { revision: "2", objective: "Answer the person", criteria: [] },
+      canonicalSha256: "gate3-conversation-contract", createdByActorType: "system", createdByActorId: "test" }).returning();
+    await db.update(heartbeatRuns).set({ nativeIssueId: issue.id, nativeSessionId: sessionId, runnerInstanceId: runnerId,
+      completionContractId: contract.id, completionContractSha256: contract.canonicalSha256, responsibleUserId: userId,
+      contextSnapshot: { issueId: issue.id, source: "execution.reconciled", wakeReason: "issue_recovery_action_restored",
+        conversationSessionGeneration: 0 } }).where(eq(heartbeatRuns.id, f.run.id));
+    if (shape === "own open card" || shape === "SMA-627") await db.insert(issueThreadInteractions).values({ companyId: f.run.companyId, issueId: issue.id,
+      kind: "ask_user_questions", status: "pending", sourceRunId: f.run.id, createdByAgentId: f.agent.id,
+      payload: { version: 1, questions: [{ id: "continue", prompt: "Repeat the 3 facts when I continue?",
+        selectionMode: "single", required: true, options: [{ id: "yes", label: "Yes: repeat the 3 facts" }] }] } });
+    // seq 228: the final agentMessage.
+    const answer = "The foreground sleep completed. The question key was rejected as already used. I'm parked and waiting for you.";
+    // SMA-627 (7b5cc899) parked on its own pending card with no agentMessage.
+    if (shape !== "SMA-627") await appendHeartbeatRunEvent(db, { companyId: f.run.companyId, runId: f.run.id, agentId: f.agent.id, eventType: "item.completed",
+      payload: { prpEvent: { runId: f.run.id, normalizedSessionId: sessionId, turnId, schema: "paperclip.prp.event.v1",
+        itemId: `${turnId}:pi-message:3:block:0`, sourceEventId: "gate3-final-228",
+        payload: { kind: "agentMessage", channel: "final", text: answer } } } });
+    // seq 234/236: run.result.accepted + run.terminal, precommit.
+    const result = { schema: "paperclip.run_result.v1" as const, reportedWorkDisposition: "yielded" as const,
+      summary: "TEST PS1-S2p-fg-2 result: I sent both calls together in one response, but only one of them succeeded.",
+      continuation: { kind: "response_wake" as const, idempotencyKey: "PS1-S2p-fg-2-park-response-wake",
+        summary: "Parked waiting for the person's answer or next message; on wake, repeat the three seeded facts immediately without tools." },
+      completionClaim: { contractRevision: "2", objectiveSatisfied: true, criteria: [], remainingWork: [] },
+      evidence: [], verification: [], attentionRequests: [], artifacts: [] };
+    const terminal = { schema: "paperclip.prp.terminal.v1" as const, runTerminalState: "succeeded" as const,
+      turnTerminalState: "completed" as const, reportedWorkDisposition: "yielded" as const };
+    await new NativeRunCoordinatorStore(db, { companyId: f.run.companyId, issueId: issue.id, runId: f.run.id, agentId: f.agent.id,
+      normalizedSessionId: sessionId, runnerSourceInstanceId: runnerId, completionContractId: contract.id,
+      completionContractSha256: contract.canonicalSha256, completionContractRevision: "2", completionContractCriterionIds: [] })
+      .completeRun({ result, terminal, turnId });
+    const finalization = () => db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.run.id)).then(rows => rows[0]!);
+    expect((await finalization()).phase).not.toBe("committed");
+    if (shape !== "lease free") {
+      // 09:10:51.013: native_finalization_lease_busy; the live finalizer defers.
+      await db.update(nativeRunFinalizations).set({ leaseOwner: "native-finalizer:commit-worker",
+        leaseExpiresAt: new Date(Date.now() + 5 * 60_000) }).where(eq(nativeRunFinalizations.runId, f.run.id));
+      await expect(finalizeNativeRun({ db, runId: f.run.id, workspaceFinalizeStatus: "succeeded" }))
+        .rejects.toBeInstanceOf(NativeFinalizationDeferredError);
+    } else {
+      await finalizeNativeRun({ db, runId: f.run.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: false });
+    }
+    f.input.issueId = issue.id;
+    f.input.issueRef = issue;
+    f.input.issueContext = await createHeartbeatRunPreparation(db).getIssueExecutionContext(f.run.companyId, issue.id);
+    f.input.adapterResult.resultJson = { stopReason: "completed", nativeResult: result, nativeTerminal: terminal };
+    f.input.adapterResult.nativeFinalization = { schema: "paperclip.native-finalization.v1", runtimeMode: "native", runId: f.run.id,
+      companyId: f.run.companyId, issueId: issue.id, result, terminal, turnId, sourceInstanceId: runnerId, normalizedSessionId: sessionId,
+      providerSessionId: "provider-session", driverKind: "pi_rpc", driverVersion: "phase6-v1", nativeEventCount: 1,
+      highestContiguousSourceSeq: 1, workspaceFinalizeStatus: "succeeded" };
+    // 09:10:51.112: the lease holder (the result-commit worker) commits after
+    // the live terminal write and before the live presentation.
+    if (shape !== "lease free") f.deps.classifyAndPersistRunLiveness.mockImplementationOnce(async run => {
+      await db.update(nativeRunFinalizations).set({ leaseOwner: null, leaseExpiresAt: null }).where(eq(nativeRunFinalizations.runId, f.run.id));
+      await finalizeNativeRun({ db, runId: f.run.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true,
+        onlyWhenDue: true, skipNativeResponsePresentation: true, skipNativeReviewResponse: true });
+      return run;
+    });
+    f.deps.issuesSvc.addComment.mockImplementation(async (issueId, body) => {
+      const [comment] = await db.insert(issueComments).values({ companyId: f.run.companyId, issueId, body,
+        authorType: "agent", authorAgentId: f.agent.id, createdByRunId: f.run.id }).returning();
+      return { ...comment, authorType: "agent" as const };
+    });
+    await f.completion.completeRun(f.input);
+    expect((await finalization()).phase).toBe("committed");
+    // The presentation worker, woken by the commit, resolves from committed state.
+    const scope = { companyId: f.run.companyId, issueId: issue.id };
+    const publish = async () => {
+      const work = nativeResponsePresentationWork(db), entries = await work.load(scope);
+      for (const entry of entries) await work.check(entry);
+      await recoverCommittedNativeChatResponse(db, { ...scope, runId: f.run.id });
+      return entries.map(entry => entry.id);
+    };
+    const posted = () => db.select().from(issueComments).where(and(eq(issueComments.issueId, issue.id), eq(issueComments.createdByRunId, f.run.id)));
+    return { f, issue, answer, publish, posted };
+  }
+
+  it("publishes a lease-busy conversation turn's final reply once from its committed state (gate 3 f5c33c68)", async () => {
+    const { f, answer, publish, posted } = await leaseBusyConversationTurn("gate3");
+    const run = await read(f.run.id);
+    expect(run.status).toBe("succeeded");
+    expect(run.resultJson).toMatchObject({ finalizationPhase: "committed", finalizationReasonCode: "conversation_turn_finished" });
+    // seq 250: the live path resolved from precommit fields, as on gate 3.
+    expect(run.resultJson?.presentationDecision).toMatchObject({ chosenSource: "none", commentAction: "none", commentId: null,
+      reasonCodes: expect.arrayContaining(["interaction_owns_conversation_response"]) });
+    // The pending publication is a presentation-worker candidate.
+    expect(await publish()).toEqual([f.run.id]);
+    expect((await posted()).map(comment => comment.body)).toEqual([answer]);
+    expect((await read(f.run.id)).resultJson?.presentationDecision).toMatchObject({
+      chosenSource: "final_agent_message", commentAction: "create", commentId: (await posted())[0]?.id });
+    expect(await publish()).toEqual([]);
+    await f.completion.completeRun(f.input).catch(() => undefined);
+    expect(await posted()).toHaveLength(1);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it.each(["own open card", "SMA-627"] as const)("keeps a run's own open question card's park under a busy finalization lease: %s", async shape => {
+    const { f, publish, posted } = await leaseBusyConversationTurn(shape);
+    await publish();
+    expect(await posted()).toEqual([]);
+    expect((await read(f.run.id)).resultJson?.presentationDecision).toMatchObject({ chosenSource: "none", commentAction: "none" });
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("publishes a committed conversation turn's final reply once when the lease is free", async () => {
+    const { f, answer, publish, posted } = await leaseBusyConversationTurn("lease free");
+    expect((await posted()).map(comment => comment.body)).toEqual([answer]);
+    await publish();
+    expect(await posted()).toHaveLength(1);
+    expect((await read(f.run.id)).resultJson?.presentationDecision).toMatchObject({ chosenSource: "final_agent_message", commentAction: "create" });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   it("settles the accepted native exact rate-card price without replacing it with zero", async () => {

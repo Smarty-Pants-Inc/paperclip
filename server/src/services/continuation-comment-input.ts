@@ -1,5 +1,5 @@
 import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { heartbeatRuns, issueComments, type Db } from "@paperclipai/db";
+import { heartbeatRuns, issueComments, issueThreadInteractions, type Db } from "@paperclipai/db";
 import { carryContinuationCommentInput } from "../modules/wake-queue/domain/continuation-comment-input.js";
 import { answeredPersonMessageSql } from "./person-message-answer.js";
 
@@ -26,14 +26,46 @@ export async function pendingContinuationCommentInput(db: Pick<Db, "select">, in
     wakeCommentId: commentIds.at(-1), commentId: commentIds.at(-1) };
 }
 
+/** The predecessor's interaction references, only those a person resolved for a
+ * question that agent asked on this task. They are candidates: the successor's
+ * runtime selection revalidates them through the existing materializer
+ * (materializeNativeInteractionResponses), so the person's answer is its input. */
+export async function pendingContinuationInteractionInput(db: Pick<Db, "select">, input: {
+  companyId: string; issueId: string; agentId: string; contextSnapshot: unknown;
+}): Promise<Record<string, unknown>> {
+  const context = input.contextSnapshot && typeof input.contextSnapshot === "object" && !Array.isArray(input.contextSnapshot)
+    ? input.contextSnapshot as Record<string, unknown> : {};
+  const candidates = [...new Set([context.interactionId, ...(Array.isArray(context.interactionIds) ? context.interactionIds : [])]
+    .filter((id): id is string => typeof id === "string" && UUID.test(id)))];
+  if (candidates.length === 0) return {};
+  const rows = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
+    inArray(issueThreadInteractions.id, candidates), eq(issueThreadInteractions.createdByAgentId, input.agentId),
+    sql`${issueThreadInteractions.resolvedByUserId} is not null`, isNull(issueThreadInteractions.resolvedByAgentId),
+    inArray(issueThreadInteractions.status, ["answered", "accepted", "rejected"]),
+  )).orderBy(asc(issueThreadInteractions.resolvedAt), asc(issueThreadInteractions.id));
+  const interactionIds = rows.map(row => row.id);
+  return interactionIds.length ? { interactionIds, interactionId: interactionIds.at(-1) } : {};
+}
+
 /** For fresh recovery seeds whose caller keeps only a predecessor id. */
 export async function readContinuationCommentInput(db: Pick<Db, "select">, input: {
   companyId: string; issueId: string; runId: string | null | undefined;
 }): Promise<Record<string, unknown>> {
   if (!input.runId || !UUID.test(input.runId)) return {};
-  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+  const [source] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, agentId: heartbeatRuns.agentId })
+    .from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, input.runId),
     or(eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
   )).limit(1);
-  return source ? pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot }) : {};
+  if (!source) return {};
+  // A person's answer to the predecessor's question is pending input exactly as
+  // a pending comment is: an automatic successor that drops it re-asks (RFL 09:35Z).
+  const answered = await pendingContinuationInteractionInput(db, { ...input, agentId: source.agentId, contextSnapshot: source.contextSnapshot });
+  // The current state is the answer. An interaction-respond wake also names the
+  // asking turn's origin comment; carrying it makes the successor's contract
+  // re-request that turn and cuts its fresh history before the answer (upstream's
+  // seed carries no comment ids at all).
+  if (answered.interactionIds) return answered;
+  return pendingContinuationCommentInput(db, { ...input, contextSnapshot: source.contextSnapshot });
 }
