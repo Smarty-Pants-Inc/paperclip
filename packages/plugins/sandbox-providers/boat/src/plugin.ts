@@ -648,6 +648,13 @@ async function acquisitionMatches(config: Config, attemptId: string, owner: { co
   } while (cursor);
   return [...ids];
 }
+/** The HTTP status of a definite Boat refusal: a 4xx our own requestError
+ * carries that the host does not retry (not 408, 425 or 429). */
+function definiteRefusalStatus(error: unknown): number | undefined {
+  const status = error && typeof error === "object" ? (error as { status?: unknown }).status : undefined;
+  return typeof status === "number" && Number.isInteger(status) && status >= 400 && status <= 499
+    && ![408, 425, 429].includes(status) ? status : undefined;
+}
 async function cleanupAcquisition(config: Config, ids: string[], owner: { companyId: string; environmentId: string; runId?: string }, attemptId: string, cause: unknown): Promise<void> {
   const failures: unknown[] = []; let firstFailed: string | undefined;
   for (const id of ids) {
@@ -1372,7 +1379,21 @@ const plugin = definePlugin(trackBoatHooks(gateBoatHooks({
         return await finishAcquisition(params, c, sb.id, { ...ready, ...ownershipObservation }, labels, remoteCwd, snapshot, null);
       } catch (error) {
         if (shuttingDown && !id) throw error;
-        const ids = id ? [id] : await acquisitionMatches(c, attemptId, params);
+        const ids = id ? [id] : await acquisitionMatches(c, attemptId, params).catch(lookupError => {
+          // frozen7-VERDICT F2: Boat definitely refused this create. A failing
+          // ownership lookup must not replace that refusal with its own
+          // (transient) error. The cleanup obligation stays with core's durable
+          // creation intent: its inspection repeats this lookup until it settles.
+          const createStatus = definiteRefusalStatus(error);
+          if (createStatus === undefined) throw lookupError;
+          const lookup = lookupError as { httpStatus?: unknown; code?: unknown };
+          duplexLogger?.warn("Boat acquisition ownership lookup failed after a refused create; cleanup stays with the creation intent", {
+            companyId: params.companyId, environmentId: params.environmentId, attemptId, createStatus,
+            lookupStatus: typeof lookup?.httpStatus === "number" ? lookup.httpStatus : null,
+            ...(typeof lookup?.code === "string" && TRANSPORT_ERROR_CODES.has(lookup.code) ? { lookupCode: lookup.code } : {}),
+          });
+          throw error;
+        });
         if (id) {
           await duplexChannels.suspend({ ...params, providerLeaseId: id });
           await retireForLifecycle({ ...params, providerLeaseId: id });
