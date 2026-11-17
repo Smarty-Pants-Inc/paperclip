@@ -975,6 +975,31 @@ describe("persistent agent directories", () => {
     expect.soft(await fx.surviving()).toBe(fx.note);
   }, 60_000);
 
+  // KEEP (never-OK): rf-4's D3 review-generic-release; a held source must not be erased.
+  it("REVIEW D3: ordinary non-reusable generic-plugin release cannot erase a held source", async () => {
+    const fx = await boundLeaseFixture();
+    const source = await fx.lease();
+    await db.update(environments).set({ driver: "plugin", config: { pluginKey: source.provider, driverKey: source.provider, driverConfig: {} } }).where(eq(environments.id, fx.environment.id));
+    await db.update(environmentLeases).set({ status: "active", leasePolicy: "ephemeral", provider: `plugin:${source.provider}:${source.provider}`, metadata: { driver: "plugin", pluginId: source.metadata?.pluginId, pluginKey: source.provider, driverKey: source.provider, environmentId: fx.environment.id, remoteCwd: source.metadata?.remoteCwd } }).where(eq(environmentLeases.id, source.id));
+    expect((await copies.collectStopped({ companyId, runId: fx.copy.runId }))?.receipt?.savePending).toBeTruthy();
+    let heldAtProvider = false, claimAtProvider: unknown = "not-called";
+    const call = vi.fn(async (_plugin: string, method: string, input: any) => {
+      if (method !== "environmentReleaseLease") throw new Error(`Unexpected ${method}`);
+      heldAtProvider = Boolean((await copies.get(companyId, fx.copy.runId))?.receipt?.savePending);
+      claimAtProvider = (await fx.lease()).metadata?.agentFileDestroyClaim ?? null;
+      await fs.rm(String(source.metadata?.remoteCwd), { recursive: true, force: true });
+      return { providerLeaseId: input.providerLeaseId, state: "destroyed" };
+    });
+    const runtime = environmentRuntimeService(db, { pluginWorkerManager: { isRunning: () => true, call,
+      getWorker: () => ({ supportedMethods: ["environmentReleaseLease", "environmentDestroyLease"] }) } as any });
+    await runtime.releaseRunLeases(fx.copy.runId, "released");
+    const proof = { providerCalls: call.mock.calls.map(c => c[1]), heldAtProvider, claimAtProvider, surviving: await fx.surviving(), expected: fx.note };
+    console.log("REVIEW_GENERIC_RELEASE", JSON.stringify(proof));
+    await writeJudgeEvidence("review-generic-release.json", proof);
+    expect.soft(call).not.toHaveBeenCalled();
+    expect.soft(await fx.surviving()).toBe(fx.note);
+  }, 60_000);
+
   it("round trips nested text, empty directories and binary bytes independently of task files", async () => {
     const first = await run();
     expect(first.localRoot.startsWith(path.join(home, ".paperclip-runtime"))).toBe(false);
