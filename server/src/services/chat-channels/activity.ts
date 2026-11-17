@@ -570,9 +570,13 @@ export function createChatActivity(db: Db, options: ChatActivityOptions) {
               : "GitHub webhook redelivery requested",
         detail:
           row.status === "cancelled"
-            ? row.result?.code === "source_changed_or_unavailable"
-              ? "The original comment changed or is no longer available. Paperclip did not replay its old contents."
-              : "This callback was not an eligible current user comment. Paperclip did not replay it."
+            ? row.result?.code === "github_webhook_recovery_delivered_meanwhile"
+              ? "GitHub reported that this delivery completed meanwhile. Paperclip did not request redelivery or cancel accepted work."
+              : row.result?.code === "github_webhook_recovery_attempt_not_eligible"
+                ? "The latest delivery attempt was not eligible for recovery. Paperclip did not request redelivery or cancel accepted work."
+                : row.result?.code === "source_changed_or_unavailable"
+                  ? "The original comment changed or is no longer available. Paperclip did not replay its old contents."
+                  : "This callback was not an eligible current user comment. Paperclip did not replay it."
             : ingressStatus
               ? "Paperclip received this callback. Its normal access checks and processing still apply."
               : "Paperclip asked GitHub to resend a recent missed message. This does not yet confirm receipt or a reply. Automatic requests are limited; if it remains unanswered, check the App's Recent Deliveries and send your request again in the current conversation.",
