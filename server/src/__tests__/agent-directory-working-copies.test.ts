@@ -747,6 +747,18 @@ describe("persistent agent directories", () => {
         } finally { capture.mockRestore(); upload.mockRestore(); }
       }, 90_000);
 
+      // SUPERSEDED-BY-SAME-NOTE (rebase onto collector+same-note): when a sibling
+      // and this run both changed one file, store.apply's three-way compare keeps
+      // the sibling's saved bytes at the path and saves this run's bytes as a
+      // named conflict copy (<name>.conflict-<run8>-<ms><ext>). Part 2's tests
+      // asserted the old last-sync-wins canonical; the never-OK claim (the run's
+      // bytes survive retirement and are saved) is unchanged.
+      async function conflictCopyOf(dir: string, file: string, runId: string) {
+        const ext = path.extname(file), stem = path.basename(file, ext);
+        const names = (await fs.readdir(path.join(dir, path.dirname(file)))).filter(name => name.startsWith(`${stem}.conflict-${runId.slice(0, 8)}-`) && name.endsWith(ext));
+        expect(names, `${file}: one conflict copy for run ${runId.slice(0, 8)}`).toHaveLength(1);
+        return fs.readFile(path.join(dir, path.dirname(file), names[0]!));
+      }
       it("REMOTE sandbox never-OK: two writers never touch one file; dirty and mid-delivery writes survive retirement", async () => {
         await paulBundle();
         const f = "memory/warm-writer.md";
@@ -807,10 +819,15 @@ describe("persistent agent directories", () => {
             // The existing retirement contract: save the old owner FIRST, then
             // restore this same proposed run fresh, after the handoff releases its lock.
             expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("saved");
-            expect(await fs.readFile(path.join(root, f))).toEqual(bytes);
+            // SUPERSEDED-BY-SAME-NOTE: a same-file race keeps the sibling's F at
+            // the path and the warm writer's bytes as this run's conflict copy.
+            const kept = timing === "between-capture-and-rename" ? bytes : Buffer.from(`sibling F ${timing}\n`);
+            expect(await fs.readFile(path.join(root, f))).toEqual(kept);
+            if (timing !== "between-capture-and-rename") expect(await conflictCopyOf(root, f, chatA.runId)).toEqual(bytes);
             const fresh = (await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true }))!;
             expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
-            expect(await fs.readFile(path.join(fresh.executionRoot, f))).toEqual(bytes);
+            expect(await fs.readFile(path.join(fresh.executionRoot, f))).toEqual(kept);
+            if (timing !== "between-capture-and-rename") expect(await conflictCopyOf(fresh.executionRoot, f, chatA.runId)).toEqual(bytes);
             expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe(`sibling ${timing}\n`);
             await copies.collectStopped({ companyId, runId, target: boat.executionTarget });
           } finally { capture.mockRestore(); upload.mockRestore(); shell.mockRestore(); }
@@ -901,7 +918,10 @@ describe("persistent agent directories", () => {
         expect(result.handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
         expect(await fs.readFile(path.join(result.chatA.executionRoot, f))).toEqual(bytes);
         expect((await copies.collectStopped({ companyId, runId: result.chatA.runId, target: result.boat.executionTarget }))?.state).toBe("saved");
-        expect(await fs.readFile(path.join(root, f))).toEqual(bytes);
+        // SUPERSEDED-BY-SAME-NOTE: the sibling's F' stays at the path; the
+        // child's bytes are saved as this run's named conflict copy.
+        expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+        expect(await conflictCopyOf(root, f, result.chatA.runId)).toEqual(bytes);
       }, 90_000);
 
       it("REMOTE sandbox never-OK: an fd write AFTER the swap lands in the retained aside copy and is surfaced at the next checkpoint", async () => {
@@ -1053,7 +1073,10 @@ describe("persistent agent directories", () => {
           expect(found.length, `${shape}: held-inode bytes must be collected before cleanup`).toBe(1);
           expect(found[0]!.startsWith(`${f}.aside-`)).toBe(true);
           expect(await fs.readFile(path.join(root, found[0]!), "utf8")).toBe("checkpoint baseline\nLATE-FD\n");
-          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("AGENT RECREATED\n");
+          // SUPERSEDED-BY-SAME-NOTE: the sibling's F' stays at the path; the
+          // agent's recreated file is saved as this run's named conflict copy.
+          expect(await fs.readFile(path.join(root, f), "utf8")).toBe("sibling F'\n");
+          expect((await conflictCopyOf(root, f, chatA.runId)).toString("utf8")).toBe("AGENT RECREATED\n");
           await expect(fs.stat(chatA.executionRoot)).rejects.toMatchObject({ code: "ENOENT" });
         } finally { await handle.close(); }
       }, 90_000);
