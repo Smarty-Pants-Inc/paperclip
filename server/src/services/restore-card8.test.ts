@@ -12,6 +12,7 @@ import { getExecutionBlocker } from "./execution-blocker.js";
 import { requestTaskRetry } from "./task-retry.js";
 import { retryRefusedBeforeAdmission } from "./task-retry-eligibility.js";
 import { adoptHistoricalWorkspaceRecoveries } from "./workspace-recovery-backfill.js";
+import { taskInterruptionPresentation } from "./task-interruption-presentation.js";
 
 // An adoption that throws every time (J9's blocked adoption), toggled per test.
 const adoptionFault = vi.hoisted(() => ({ on: false }));
@@ -155,6 +156,54 @@ const FAILURE_WORDS = /could not recover|could not be put back|restore failed/i;
     expect(blocker?.workspaceRecovery?.message ?? "").not.toMatch(/new task/i);
     expect(await retry(f)).toMatchObject({ accepted: true });
   }, 120_000);
+
+  // fam-retry-r2 (3-way): the card the UI renders (taskInterruptionPresentation,
+  // fam-retry4's retryAdmission) and the Retry API (fam-retry2/3's authority)
+  // give ONE state per authority outcome on card8's real-producer holds:
+  // accept-held -> held state, no Retry; refused -> its reason, no Retry, the
+  // API refuses with the same words; offered -> Retry, the API accepts plainly.
+  const card = async (f: { issueId: string }) => taskInterruptionPresentation(db,
+    (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!);
+  it("fam-retry-r2: J9 blocked adoption under the bound is accept-held on card and API with the same words", async () => {
+    const f = await seedOwed(false);
+    await blockAdoption(f);
+    const shown = await card(f);
+    expect(shown).toMatchObject({ canRetry: false, retryAdmission: "held" });
+    expect(shown?.retryWait?.message ?? "").toMatch(RECOVERING);
+    const answer = await retry(f) as Record<string, any>;
+    expect(answer).toMatchObject({ accepted: true, held: { message: shown!.retryWait!.message } });
+  }, 120_000);
+  it("fam-retry-r2: J5 NEGATIVE stop wait under the bound is refused on card and API with the same words, never held", async () => {
+    const f = await seedOwed();
+    await exhaust(f, { code: "copyback_stop_unconfirmed", retryClass: "recheck_evidence", evidenceFingerprint: "x" });
+    await ageHold(f, 59);
+    const shown = await card(f);
+    expect(shown?.canRetry).toBe(false);
+    expect(shown?.retryAdmission).toBeUndefined();
+    const answer = await retry(f) as Record<string, any>;
+    expect(answer).toMatchObject({ accepted: false, refused: { reason: "workspace_restore_stop_wait" } });
+    expect(shown?.retryWait?.message).toBe(answer.refused.message);
+  }, 120_000);
+  for (const kind of ["J8", "J5-past-bound"] as const) {
+    it(`fam-retry-r2: ${kind} offered -> card shows Retry (not held) and the API accepts it plainly`, async () => {
+      const f = await seedOwed();
+      if (kind === "J8") {
+        await exhaust(f, { code: "agent_stop_unconfirmed", retryClass: "recheck_evidence", evidenceFingerprint: "x" });
+        await db.update(issueRecoveryActions).set({ evidence: { ...(await hold(f)).evidence,
+          stopProofRecovery: { schema: STOP_PROOF_RECOVERY_SCHEMA, rearms: STOP_PROOF_MAX_REARMS } } })
+          .where(eq(issueRecoveryActions.id, f.actionId));
+      } else {
+        await exhaust(f, { code: "agent_stop_unconfirmed", retryClass: "recheck_evidence", evidenceFingerprint: "x" });
+        await ageHold(f, 61);
+      }
+      const shown = await card(f);
+      expect(shown).toMatchObject({ canRetry: true });
+      expect(shown?.retryAdmission).toBeUndefined();
+      const answer = await retry(f) as Record<string, any>;
+      expect(answer).toMatchObject({ accepted: true });
+      expect(answer.held).toBeUndefined();
+    }, 120_000);
+  }
 
   // J4 (item 5): an unadopted owed hold (no workspaceRecovery yet) at 61 min.
   it("J4: an unadopted owed hold past the person bound -> card and chat agree: delayed, Retry offered and accepted", async () => {
