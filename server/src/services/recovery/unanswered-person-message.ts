@@ -29,7 +29,7 @@ import { freshContinuationChain, freshContinuationDescendsFrom } from "../fresh-
 import { nativeStartupNeverConnectedExhausted } from "../continuation-cause.js";
 import { isFreshThreadRefusal } from "../native-runtime/runner-reconciliation-refusal.js";
 import { isNativeContinuationRefusal } from "../native-continuation-refusal.js";
-import { personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
+import { personHeldChatMessageSql, personStoppedCarrierSql, runStartedAnswering, stoppedBySender } from "./person-stopped-message.js";
 import { automaticRecoveryPending } from "./automatic-recovery-pending.js";
 
 /**
@@ -255,7 +255,7 @@ export function unansweredPersonMessageCondition(issueId: AnyPgColumn, companyId
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
       and starts_with(n.metadata->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX})
-      and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
+      and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")} or ${personHeldChatMessageSql(rawMessage("m"))}))
     or exists (select 1 from ${issueComments} n
       where n.company_id = ${companyId} and n.issue_id = ${issueId}
       and n.author_type = 'system' and n.deleted_at is null
@@ -316,13 +316,13 @@ export function unansweredPersonMessageCommentCondition(): SQL {
       and (exists (select 1 from ${issueComments} m
         where m.company_id = ${issueComments.companyId} and m.issue_id = ${issueComments.issueId}
           and m.id::text = substr(${issueComments.metadata}->>'authorizationReason', ${UNANSWERED_MESSAGE_REASON_PREFIX.length + 1})
-          and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")}))
+          and (${answeredSql(rawMessage("m"))} or ${personStoppedNoticeSql("m")} or ${personHeldChatMessageSql(rawMessage("m"))}))
         or ${cardAnswerNoticeAnsweredSql(sql`${issueComments.companyId}`, sql`${issueComments.issueId}`,
           sql`${issueComments.metadata}->>'authorizationReason'`)})))`;
 }
 
 export type UnansweredMessageOutcome =
-  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" }
+  | { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_stopped" | "person_held" }
   | { kind: "pending"; recheckAt: number }
   | { kind: "noticed"; code: string; commentId: string };
 
@@ -373,8 +373,8 @@ export async function settleUnansweredPersonMessage(
   if (!issue) return { kind: "none" };
   if (input.issueCreatedAtGte && issue.createdAt < input.issueCreatedAtGte) return { kind: "out_of_scope" };
 
-  // An answer to a message supersedes that message's notice (and its
-  // retrying line): the relation is message -> answer, not the notice's time.
+  // An answer or the person-stopped held list supersedes that message's
+  // notice (and its retrying line), including notices for older held messages.
   // Written under the same issue fence, in the same order (issue row, then its
   // comments) as the notice writers.
   const [liveNotice] = await db.select({ id: issueComments.id }).from(issueComments).where(and(
@@ -391,7 +391,7 @@ export async function settleUnansweredPersonMessage(
         or starts_with(n.metadata->>'authorizationReason', ${RETRYING_MESSAGE_REASON_PREFIX}))
       and (exists (select 1 from ${issueComments} m where m.company_id = n.company_id and m.issue_id = n.issue_id
         and m.id::text = substr(n.metadata->>'authorizationReason', strpos(n.metadata->>'authorizationReason', ':') + 1)
-        and ${answeredSql(rawMessage("m"))})
+        and (${answeredSql(rawMessage("m"))} or ${personHeldChatMessageSql(rawMessage("m"))}))
         or ${cardAnswerNoticeAnsweredSql(sql`n.company_id`, sql`n.issue_id`, sql`n.metadata->>'authorizationReason'`)})`);
   });
 
@@ -457,7 +457,7 @@ export async function settleUnansweredPersonMessage(
 type DecisionIssue = { id: string; companyId: string; status: string; hiddenAt: Date | null;
   assigneeAgentId: string | null; assigneeUserId: string | null };
 type WaitRecord = { messageId: string; runId: string | null; waitKind?: "setup"; startedAt?: string; boundMs?: number };
-type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" }
+type Decision = { kind: "none" | "answered" | "noticed_before" | "explained" | "out_of_scope" | "person_held" }
   | { kind: "person_stopped"; noticeId: string | null }
   | { kind: "pending"; recheckAt: number; recordDeferral?: { runId: string; agentId: string; messageId: string };
       recordWait?: WaitRecord }
@@ -521,6 +521,17 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
     .from(issueComments).where(and(
     eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issue.id),
     sql`${reasonOf(issueComments.metadata)} = ${reason}`)).limit(1);
+  // A message in the person's stopped chat list awaits Send, not recovery or
+  // a resend. Read the durable queue state again under the issue fence before
+  // any notice write. A clock, a cancelled carrier or a generic deferred wake
+  // alone must never silence ordinary queued-message duties.
+  if (!cardAnswer) {
+    const [held] = await q.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.companyId, issue.companyId), eq(issueComments.id, message.id),
+      personHeldChatMessageSql({ id: sql`${issueComments.id}`, companyId: sql`${issueComments.companyId}`,
+        issueId: sql`${issueComments.issueId}` })));
+    if (held) return { kind: "person_held" };
+  }
   const issueRun = or(eq(heartbeatRuns.nativeIssueId, issue.id), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`);
   // The SENDER stopped (Stop or Interrupt) the run that had STARTED answering
   // this message: they ended it on purpose, so "send it again" would redo the
