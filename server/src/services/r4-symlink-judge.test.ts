@@ -9,7 +9,8 @@
  * and the acquisition reuse filter (nativeWorkspaceExportPendingForResource).
  * Doubled: only the provider turn (executePaperclipNativeSession), which plays
  * the agent's own tool editing the TASK WORKSPACE on the box and then the
- * person's Stop settling as NSE does (acknowledged Stop + retained idle receipt),
+ * person's Stop settling as NSE does (acknowledged Stop + terminal_failure /
+ * native_retry_cancelled, without a retained idle receipt under stop_and_retain),
  * plus the unrelated MCP / wake / usage boundaries (as warm-rebind-recovery-policy.test.ts).
  */
 import { execFile } from "node:child_process";
@@ -23,7 +24,9 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, issues, issueRecoveryActions,
+  nativeRunFinalizations,
 } from "@paperclipai/db";
+import { hasRemoteTerminationReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import type { EnvironmentLease } from "@paperclipai/shared";
 import { withDirectoryMergeLock, captureDirectorySnapshot, directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -193,7 +196,8 @@ const support = await getEmbeddedPostgresTestSupport();
     vi.spyOn(nativeExecutor, "executePaperclipNativeSession").mockImplementationOnce(async () => {
       // The agent's own tool edits the task workspace on the box, mid-turn.
       if (variant.edit) await writeFile(join(box, "task.txt"), EDIT);
-      // The person's Stop, acknowledged; NSE settles it (retained idle receipt) only after a clean cancellation.
+      // U: a clean acknowledged Stop settles the coordinator; stop_and_retain
+      // never writes the warm-HANDOFF retained idle receipt.
       const stoppedAt = new Date();
       const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "cancelled", finishedAt: stoppedAt,
@@ -202,10 +206,10 @@ const support = await getEmbeddedPostgresTestSupport();
           nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId, scope: "run",
             reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
             intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID(), recordedAt: stoppedAt.toISOString() } },
-        runnerProfileJson: { ...current.runnerProfileJson,
-          ...(variant.settled ? { nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-            companyId, issueId, runId, sessionId, bootId: "boot", generation: 1 } } : {}) },
+        runnerProfileJson: { ...current.runnerProfileJson },
       }).where(eq(heartbeatRuns.id, runId));
+      if (variant.settled) await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId,
+        phase: "terminal_failure", failureCode: "native_retry_cancelled" });
       runnerState.fail = variant.exportFails;
       callsAtStop = runnerState.calls;
       throw stop;
@@ -245,14 +249,21 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(executeHeartbeatRuntime(db, executionInput)).rejects.toBe(stop);
     executionControl.finish();
 
-    // Heartbeat teardown hands the warm box off (environment-runtime records it retained).
-    await db.update(environmentLeases).set({ status: "retained" }).where(eq(environmentLeases.id, leaseId));
+    // U: teardown releases stop_and_retain after the export, with the provider's
+    // bound stop receipt. No handed-off lease or retained idle checkpoint exists.
+    const [active] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    await db.update(environmentLeases).set({ status: "released", cleanupStatus: "success", releasedAt: new Date(),
+      metadata: { ...active.metadata, remoteExecutionTermination: remoteTerminationReceipt(active,
+        { providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, leaseId));
     const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     const reference = readNativeWorkspaceSyncReference(stopped.runnerProfileJson?.nativeWorkspaceSync);
     const successorRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: successorRunId, companyId, agentId, nativeIssueId: issueId, issueId,
       runtimeMode: "native", status: "running", contextSnapshot: { issueId } });
     const [retained] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, leaseId));
+    expect(stopped.runnerProfileJson?.nativeRetainedIdleCheckpoint).toBeUndefined();
+    expect(retained).toMatchObject({ status: "released", cleanupStatus: "success" });
+    expect(hasRemoteTerminationReceipt(retained)).toBe(true);
     const excluded = await nativeWorkspaceExportPendingForResource(db, retained, successorRunId);
     const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId)));
     return { root, host, box, companyId, workspaceId, leaseId, providerLeaseId, runnerState, callsAtStop, stopped,
@@ -323,11 +334,8 @@ const support = await getEmbeddedPostgresTestSupport();
   // ---- pl/cancel-finalize2: rf-4's three findings ----
   /** Settles a Stop that executeHeartbeatRuntime saw unsettled, so the bounded export can be driven directly. */
   async function settleLater(f: Awaited<ReturnType<typeof stopMidTurn>>) {
-    const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
-    await db.update(heartbeatRuns).set({ runnerProfileJson: { ...current.runnerProfileJson,
-      nativeRetainedIdleCheckpoint: { schema: "paperclip.native-retained-idle-checkpoint.v1",
-        companyId: f.companyId, issueId: f.issueId, runId: f.runId, sessionId: f.sessionId, bootId: "boot", generation: 1 } },
-    }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(nativeRunFinalizations).values({ runId: f.runId, companyId: f.companyId, issueId: f.issueId,
+      phase: "terminal_failure", failureCode: "native_retry_cancelled" });
   }
 
   it("aggregate bound + late stamp: a stamp write held past the deadline publishes nothing; the lock is free at the deadline", async () => {
@@ -470,13 +478,19 @@ const support = await getEmbeddedPostgresTestSupport();
     }
   }, 60_000);
 
-  it("AUDIT Q2 cancelled deferred export must have an actionable recovery record", async () => {
+  it("AUDIT Q2 cancelled deferred export names no recovery action that this state lacks", async () => {
     const f = await stopMidTurn({ edit: true, settled: true, exportFails: true });
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
     console.log("AUDIT_Q2_ACTIONS", JSON.stringify({ runStatus: f.stopped.status, result: f.stopped.resultJson,
       mark: f.stoppedRunProfile?.nativeCancelledWarmExport, actions }));
     await writeFile(join(process.env.TASK_OUT!, "not-copied-events.json"), JSON.stringify({ actualHostText: await readFile(join(f.host, "task.txt"), "utf8"), actions, events: f.events }, null, 2));
-    expect(actions.filter(a => ["active", "escalated"].includes(a.status) && ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"].includes(a.cause))).not.toHaveLength(0);
+    expect(actions).toHaveLength(0);
+    expect(f.stoppedRunProfile?.nativeCancelledWarmExport).toMatchObject({ state: "unproven", reason: "export_failed" });
+    const notice = f.events.find(event => event.eventType === "workspace_export_deferred");
+    expect(notice?.message).toContain("The box is kept, so nothing on it is lost.");
+    expect(notice?.message).not.toMatch(/Recover saved files|\b(?:click|choose|press)\b/i);
+    expect(await readFile(join(f.host, "task.txt"), "utf8")).toBe(BASE);
+    expect(await readFile(join(f.box, "task.txt"), "utf8")).toBe(EDIT);
   }, 60_000);
 
   it('AUDIT A1 actual deadline during symlink parent mkdir must not overwrite the next owner', async () => {
