@@ -8,6 +8,7 @@ import { readNativeWorkspaceMigration } from "./native-runtime/native-workspace-
 import { ReusableSandboxResumeError } from "./reusable-sandbox-resume-error.js";
 import { sandboxProviderFailureLabel } from "./remote-workspace-transport.js";
 import { NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, readReplaceBeforeReuseMarker } from "./native-runtime/predecessor-retirement.js";
+import { awaitWarmOwnerSandboxCloses, warmSessionReleaseWait } from "./native-runtime/warm-owner-sandbox-closes.js";
 import {
   REUSABLE_SANDBOX_IDLE_RESUME_BUDGET_MS,
   REUSABLE_SANDBOX_KEPT_AFTER_REPLACEMENT_KEY,
@@ -4657,6 +4658,9 @@ export function environmentRuntimeService(
       // error through `onLeaseReleaseError` for its log path. Keep the order
       // serial.
       const released: EnvironmentRuntimeLeaseRecord[] = [];
+      // release-order: ONE bound per release call for its waits on warm
+      // owners still closing on a released sandbox.
+      const warmOwnerCloseDeadline = Date.now() + warmSessionReleaseWait.timeoutMs;
       for (let leaseRow of leaseRows) {
         try {
           let providerResourceDisposition = desiredProviderResourceDisposition;
@@ -4670,6 +4674,12 @@ export function environmentRuntimeService(
               eq(environmentLeases.id, leaseRow.id), eq(environmentLeases.companyId, leaseRow.companyId),
             )))[0] ?? leaseRow;
           }
+          // release-order: a warm owner still closing on this sandbox (its
+          // checkpoint copies the harness out through the provider) finishes
+          // before any release, stop or destroy of the sandbox, which would
+          // revoke that copy mid-flight. Past the bound the lease is left for
+          // retry (onLeaseReleaseError). No owner closing: release at once.
+          await awaitWarmOwnerSandboxCloses(leaseRow.providerLeaseId, warmOwnerCloseDeadline);
           const warmRetention = await settleWarmRetention(db, leaseRow, providerResourceDisposition);
           if (!warmRetention) continue; // Another release or handoff already settled this owner.
           leaseRow = warmRetention.lease;

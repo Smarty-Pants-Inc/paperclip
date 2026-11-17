@@ -76,6 +76,7 @@ import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
 import { findNativeFailedBeforeProviderTurn, NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE, NativeFailedBeforeProviderTurnError } from "./failed-before-provider-turn.js";
+import { trackWarmOwnerSandboxClose, warmSessionReleaseWait } from "./warm-owner-sandbox-closes.js";
 import { findNativePredecessorRetirementUnproven, NATIVE_PREDECESSOR_RETIREMENT_UNPROVEN_CODE, NativePredecessorRetirementDirectoryBusyError, NativePredecessorRetirementUnprovenError } from "./predecessor-retirement.js";
 import {
   inspectSandboxSessionRunner, retireSandboxRunnerPortHolders, sandboxSessionRunnerExited, type SandboxSessionRunnerInspection,
@@ -869,7 +870,15 @@ function isSuspendedRemoteCheckpointRefusal(error: unknown): boolean {
   return false;
 }
 
-async function closeWarmNativeSession(entry: WarmNativeSession, reason: string, options?: {
+// release-order: every warm owner close is recorded on its sandbox, so a
+// provider release of that sandbox waits for it (environment-runtime
+// releaseRunLeases) instead of revoking its checkpoint mid-flight.
+function closeWarmNativeSession(entry: WarmNativeSession, reason: string,
+  options?: Parameters<typeof closeWarmNativeSessionOnSandbox>[2]) {
+  return trackWarmOwnerSandboxClose(entry.providerLeaseId, closeWarmNativeSessionOnSandbox(entry, reason, options));
+}
+
+async function closeWarmNativeSessionOnSandbox(entry: WarmNativeSession, reason: string, options?: {
   preserveInstructionsForRunId?: string;
   discardUnsettledSession?: boolean;
   /** Retirement by a successor: a checkpoint the fence refused as superseded
@@ -1090,15 +1099,7 @@ subscribeRunStartHandoverChanges(() => {
   }
 });
 
-/**
- * How long a new run's admission waits for the warm session to stop being busy.
- * A follow-up comment can wake the next run within milliseconds of the previous
- * run settling, while that run's warm release is still finishing. Waiting out
- * the release lets the follow-up reuse the session instead of failing. A
- * session still busy at the deadline is a real concurrent owner and fails as
- * before.
- */
-export const warmSessionReleaseWait = { timeoutMs: 30_000, pollMs: 25 };
+export { warmSessionReleaseWait } from "./warm-owner-sandbox-closes.js";
 
 async function waitForWarmNativeSessionSettled(scope: string): Promise<void> {
   const deadline = Date.now() + warmSessionReleaseWait.timeoutMs;
