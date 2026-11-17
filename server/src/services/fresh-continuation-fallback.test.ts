@@ -23,6 +23,13 @@ import {
 } from "./fresh-continuation-fallback.js";
 import { deriveTaskKeyWithHeartbeatFallback, heartbeatService, shouldResetTaskSessionForWake } from "./heartbeat.js";
 import { prepareHeartbeatSession } from "./heartbeat/session-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
+import { issueService } from "./issues.js";
+import { buildNativeExecutionInput } from "./native-runtime/native-execution-input.js";
+import { nativeRuntimeContextFixture } from "./native-runtime/runtime-context.test-fixture.js";
+import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
+import { selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
 import { getAdapterSessionCodec, normalizeSessionParams } from "./heartbeat/run-state.js";
 import { attachPaperclipSessionMetadataToSessionParams } from "./heartbeat/workspaces.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
@@ -311,6 +318,64 @@ suite("fresh-continuation fallback", () => {
     // successor.session_id_before (the session the runner resumes) == silent.session_id_after
     expect(prepared.taskResumeSessionId).toBe(silent!.sessionIdAfter);
     expect(prepared.taskResumeSessionId).toBe(sessionId);
+  }, 120_000);
+
+  // rf-3 R-REPLAY on the WIDENED re-offer (18:38Z): a FAILED own turn that a later
+  // run replaced is re-offered once. Assert on what the PROVIDER receives for the
+  // re-offered turn, built the way heartbeat.ts builds it (prepareHeartbeatTaskContext
+  // :2880 -> runtime-selection.ts buildNativeExecutionInput -> runner model envelope):
+  // the person's message exactly once, and nothing of the replaced run's wake
+  // context (its assignment, agent message, stale wake/task text) as new work.
+  it("R-REPLAY provider input: the re-offered turn carries the person's message once and none of the replaced run's work", async () => {
+    const t = new Date(Date.now() - 600_000);
+    const f = await silentConversationTurn(t);
+    const OLD = "OLD-ASSIGNMENT-7f3 rotate the production signing keys and redeploy";
+    const [person] = await db.select().from(issueComments).where(eq(issueComments.id, f.messageId));
+    // The replaced run: failed, and its wake context carried an assignment as well as the message.
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed", error: "adapter failed before an answer",
+      contextSnapshot: { issueId: f.issueId, wakeReason: "issue_assigned", wakeCommentId: f.messageId, wakeCommentIds: [f.messageId],
+        paperclipAgentMessage: { text: OLD }, paperclipTaskMarkdown: OLD, paperclipWake: { reason: "issue_assigned", instructions: OLD },
+        executionStage: { stage: "execute", instructions: OLD } } }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, issueId: f.issueId, invocationSource: "timer", status: "succeeded",
+      createdAt: new Date(t.getTime() + 5_000), startedAt: new Date(t.getTime() + 10_000), finishedAt: new Date(t.getTime() + 20_000),
+      responsibleUserId: userId, contextSnapshot: { issueId: f.issueId, wakeReason: "heartbeat_timer", wakeSource: "timer" } });
+    await occupySlot();
+    const heartbeat = heartbeatService(db);
+    for (let pass = 0; pass < 3; pass++) await heartbeat.reconcileStrandedAssignedIssues({ companyId, issueId: f.issueId });
+    const wakes = await f.redeliveries();
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.payload).toMatchObject({ redeliveredAfterRunId: f.runId, redeliveredAfterRunStatus: "failed" });
+    const [next] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, wakes[0]!.id));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    const preparation = createHeartbeatRunPreparation(db);
+    const issueContext = await preparation.getIssueExecutionContext(companyId, f.issueId);
+    const context = { ...(next!.contextSnapshot ?? {}) } as Record<string, unknown>;
+    await prepareHeartbeatTaskContext(db, { run: next!, agent: agent!,
+      task: { issueRef: issueContext!, issueContext, context, taskSession: null },
+      policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+      services: { issuesSvc: issueService(db), getPinnedSkillTestContext: preparation.getPinnedSkillTestContext } });
+    const input = buildNativeExecutionInput({ companyId, agentId, runId: next!.id,
+      issue: { id: f.issueId, identifier: issueContext!.identifier, title: issueContext!.title, description: issueContext!.description ?? null, workMode: issueContext!.workMode },
+      taskPrompt: selectPaperclipTaskMarkdown(context, { resumedSession: false, includeCommunicationGuidance: false }) || `# ${issueContext!.title}`,
+      wakePayload: context.paperclipWake, turnContext: context.paperclipTurnContext, resumedSession: true, conversationMode: true,
+      workspace: { id: randomUUID(), cwd: "/workspace", repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: randomUUID(),
+      provider: "pi_rpc", model: "openai/gpt-5", runtimeContext: nativeRuntimeContextFixture(),
+      completionContract: { id: randomUUID(), sha256: `sha256:${"a".repeat(64)}`, schemaVersion: "paperclip.run-result.v1",
+        contract: { revision: "1", objective: "Answer the person", criteria: [{ id: "answer", requirement: "Answer the person" }] } } } as never);
+    const provider = JSON.stringify(buildNativeModelEnvelope(input as never));
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    const wakeComments = ((context.paperclipWake as Record<string, unknown> | undefined)?.comments as Array<{ id: string }> | undefined) ?? [];
+    console.info(JSON.stringify({ rReplayProviderInput: { nextRunId: next!.id, messageInPrompt: count(input.task.prompt, person!.body),
+      messageInEnvelope: count(provider, person!.body), oldInEnvelope: count(provider, "OLD-ASSIGNMENT-7f3"), wakeCommentIds: wakeComments.map(c => c.id),
+      wakeReason: context.wakeReason ?? null } }));
+    // The person's message is the new input, exactly once.
+    expect(wakeComments.map(c => c.id)).toEqual([f.messageId]);
+    expect(count(input.task.prompt, person!.body)).toBe(1);
+    // None of the replaced run's assignment or instructions reaches the provider.
+    expect(provider).not.toContain("OLD-ASSIGNMENT-7f3");
+    expect(next!.contextSnapshot).not.toHaveProperty("paperclipAgentMessage");
+    expect(next!.contextSnapshot).not.toHaveProperty("executionStage");
+    expect(next!.contextSnapshot?.wakeReason ?? null).not.toBe("issue_assigned");
   }, 120_000);
 
   // RFL DESIGN-F1 condition 3, enforced with H3 stacked: a live `none` recorded
