@@ -1,4 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -16,17 +19,26 @@ import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } fro
 // keep_running release, the lifecycle driver and the pause. Only the s3 fence's
 // boolean answer (a live Boat Runner) is stood in for, as in
 // explicit-native-send-after-stop.test.ts.
-const proof = vi.hoisted(() => ({ exited: true }));
+// pl/pausing2 adds: calls counts the stood-in TERM+exit proof, busy stands in
+// for the warm entry's own busy/preparing flag (the real handedOffWarmOwnerRunnerExited
+// answers false for it without stopping anything), hang for a proof that never answers.
+const proof = vi.hoisted(() => ({ exited: true, calls: 0, busy: false, hang: false }));
 vi.mock("./native-runtime/native-session-executor.js", async importOriginal => ({
   ...await importOriginal<Record<string, unknown>>(),
-  handedOffWarmOwnerRunnerExited: async () => proof.exited,
+  handedOffWarmOwnerRunnerExited: async () => {
+    proof.calls += 1;
+    if (proof.busy) return false;
+    if (proof.hang) return new Promise<boolean>(() => undefined);
+    return proof.exited;
+  },
+  handedOffWarmOwnerBusy: () => proof.busy,
 }));
 const { heartbeatService } = await import("./heartbeat.js");
 const { environmentService } = await import("./environments.js");
 const { createAgentLifecycle, configureAgentLifecycle } = await import("./agent-lifecycle.js");
 const { createLifecycleDriver } = await import("./agent-lifecycle-driver.js");
 const { agentExecutionStopBlocker } = await import("./agent-execution-stop.js");
-const { HANDED_OFF_WARM_EXIT_KEY } = await import("./native-runtime/handed-off-warm-lease.js");
+const { HANDED_OFF_WARM_EXIT_KEY, HANDED_OFF_WARM_STOP_KEY, handedOffWarmProofTimeout } = await import("./native-runtime/handed-off-warm-lease.js");
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("pl/pausing: pause after a Send's successor on the handed-off warm box", () => {
@@ -201,5 +213,116 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(environmentLeases).set({ metadata: { ...aLease.metadata, reusableLeaseSuccessor: {
       ...(aLease.metadata?.reusableLeaseSuccessor as Record<string, unknown>), previousRunId: randomUUID() } } }).where(eq(environmentLeases.id, f.leaseId));
     expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("remote_stop_unconfirmed");
+  }, 90_000);
+
+  // pl/pausing2: a warm Stop and NO Send. A's box is the retained warm handoff
+  // (retained/success, no receipt, the warm Runner idle and alive); the pause
+  // runs the Send's own out-of-transaction runner-exit proof and settles on it.
+  async function noSendLease(f: Awaited<ReturnType<typeof seedStoppedWarmTurn>>) {
+    return (await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId)))[0]!;
+  }
+  async function resume(agentId: string) {
+    const work = configureAgentLifecycle(db, { requiredPluginIds: async () => [], runPlugin: async () => "complete",
+      runHost: createLifecycleDriver(db, {} as never).runHost });
+    await createAgentLifecycle(db).resumeAgent(agentId);
+    return work;
+  }
+  /** The stopped turn's files (stand-in for the box's workspace): sha of every file. */
+  async function filesSha(dir: string) {
+    const hash = createHash("sha256");
+    for (const name of (await readdir(dir)).sort()) hash.update(name).update(await readFile(join(dir, name)));
+    return hash.digest("hex");
+  }
+
+  it("pausing2: warm Stop, NO Send, pause -> runner-exit proof stamps A -> 'paused' in 60 s; box kept; resume -> ONE run, files sha-equal", async () => {
+    const f = await seedStoppedWarmTurn();
+    const files = await mkdtemp(join(tmpdir(), "pl-pausing2-files-"));
+    try {
+      await writeFile(join(files, "notes.md"), "turn A wrote this\n");
+      await writeFile(join(files, "data.json"), JSON.stringify({ step: 3 }));
+      const shaBefore = await filesSha(files);
+      proof.calls = 0; proof.exited = true;
+      const before = Date.now();
+      const work = await pause(f.agentId);
+      try {
+        const agent = await processUntil(work, f.agentId, "paused");
+        expect(agent).toMatchObject({ status: "paused", lifecycleState: "paused", lifecycleError: null });
+        expect(Date.now() - before).toBeLessThan(60_000);
+      } finally { await work.stop(); }
+      // The pause TERMed the idle Runner (the stood-in proof) and persisted the stamp naming A.
+      expect(proof.calls).toBeGreaterThanOrEqual(1);
+      const a = await noSendLease(f);
+      expect(a.metadata?.[HANDED_OFF_WARM_EXIT_KEY]).toMatchObject({ runId: f.sourceRunId });
+      // GUARD 2: the box is kept: retained/success, unreleased, no stop/destroy intent or receipt.
+      expect(a).toMatchObject({ status: "retained", cleanupStatus: "success", releasedAt: null, providerLeaseId: f.providerLeaseId });
+      expect(a.metadata?.sandboxStopAndRetain).toBeUndefined();
+      expect(a.metadata?.[HANDED_OFF_WARM_STOP_KEY]).toBeUndefined();
+      expect(a.metadata?.remoteExecutionTermination).toBeUndefined();
+      // Resume, then the held message: ONE run admitted (no refusal).
+      const resumed = await resume(f.agentId);
+      try {
+        const agent = await processUntil(resumed, f.agentId, "ready");
+        expect(agent.lifecycleState).toBe("ready");
+      } finally { await resumed.stop(); }
+      // (the pause cancels the earlier held wake; the person's message after the resume is a new one)
+      const [held] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.queueId));
+      expect(held.runId).toBeNull();
+      const commentId = randomUUID(), queueId = randomUUID();
+      await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+        authorUserId: "board", body: "M4 after resume" });
+      await db.insert(agentWakeupRequests).values({ id: queueId, companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board",
+        payload: { issueId: f.issueId, _paperclipWakeContext: { wakeCommentIds: [commentId] },
+          queuedCommentInterrupt: { actorId: "board", requestedAt: new Date().toISOString() } } });
+      const runsBefore = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      const successor = await send({ ...f, queueId });
+      const runsAfter = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId));
+      expect(runsAfter.length - runsBefore.length).toBe(1);
+      expect(runsAfter.filter(run => run.id !== f.sourceRunId).map(run => run.id)).toEqual([successor]);
+      expect(await filesSha(files)).toBe(shaBefore);
+    } finally { await rm(files, { recursive: true, force: true }); }
+  }, 120_000);
+
+  it("pausing2 NEG GUARD 1: busy warm Runner -> no TERM, no stamp, no stop intent; stays 'pausing'", async () => {
+    const f = await seedStoppedWarmTurn();
+    proof.calls = 0; proof.busy = true;
+    const work = await pause(f.agentId);
+    try {
+      const agent = await processUntil(work, f.agentId, "paused", 3_000);
+      expect(agent.lifecycleState).toBe("pausing");
+      expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("remote_stop_unconfirmed");
+    } finally { await work.stop(); proof.busy = false; }
+    expect(proof.calls).toBe(0);
+    const a = await noSendLease(f);
+    expect(a.metadata?.[HANDED_OFF_WARM_EXIT_KEY]).toBeUndefined();
+    expect(a.metadata?.sandboxStopAndRetain).toBeUndefined();
+    expect(a).toMatchObject({ status: "retained", cleanupStatus: "success", releasedAt: null });
+  }, 90_000);
+
+  it("pausing2 NEG: another run's runner-exit stamp on A's retained lease is refused", async () => {
+    const f = await seedStoppedWarmTurn();
+    const a = await noSendLease(f);
+    await db.update(environmentLeases).set({ metadata: { ...a.metadata,
+      [HANDED_OFF_WARM_EXIT_KEY]: { runId: randomUUID(), provenAt: new Date().toISOString() } } }).where(eq(environmentLeases.id, f.leaseId));
+    expect(await agentExecutionStopBlocker(db, [f.agentId])).toBe("remote_stop_unconfirmed");
+  }, 90_000);
+
+  it("pausing2 NEG: proof timeout -> 'pausing' (no stamp, no stop intent); the next attempt proves -> 'paused'", async () => {
+    const f = await seedStoppedWarmTurn();
+    const saved = handedOffWarmProofTimeout.ms;
+    handedOffWarmProofTimeout.ms = 300;
+    proof.hang = true;
+    const work = await pause(f.agentId);
+    try {
+      const agent = await processUntil(work, f.agentId, "paused", 3_000);
+      expect(agent.lifecycleState).toBe("pausing");
+      const a = await noSendLease(f);
+      expect(a.metadata?.[HANDED_OFF_WARM_EXIT_KEY]).toBeUndefined();
+      expect(a.metadata?.sandboxStopAndRetain).toBeUndefined();
+      expect(a.metadata?.[HANDED_OFF_WARM_STOP_KEY]).toBeUndefined();
+      proof.hang = false; proof.exited = true;
+      const paused = await processUntil(work, f.agentId, "paused");
+      expect(paused).toMatchObject({ status: "paused", lifecycleState: "paused" });
+    } finally { await work.stop(); proof.hang = false; handedOffWarmProofTimeout.ms = saved; }
   }, 90_000);
 });
