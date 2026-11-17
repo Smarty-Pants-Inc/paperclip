@@ -1,0 +1,60 @@
+{
+  "provenance": {
+    "source": "server/src/services/cancel-finalize-warm-stop.test.ts (export failure after a settled Stop): the rows finishCancelledWarmWorkspaceExport wrote, unmodified; the server test pins them to this file.",
+    "normalized": "payload.detail (it carries the per-run box path) and prpEvent.emittedAt are compared as placeholders."
+  },
+  "run": {
+    "id": "f05af367-3d4a-4f7d-bd66-0b47edfd3b25",
+    "status": "cancelled"
+  },
+  "events": [
+    {
+      "id": 13,
+      "companyId": "893431e4-0890-4fd0-a73e-883def37c051",
+      "runId": "f05af367-3d4a-4f7d-bd66-0b47edfd3b25",
+      "agentId": "683ad523-751f-4119-8149-2c2ff703182c",
+      "seq": 2,
+      "eventType": "workspace_export_deferred",
+      "stream": "system",
+      "level": "warn",
+      "color": null,
+      "message": "Stopped turn's workspace export could not be proven (export_failed); the warm box stays protected and its files are not yet on the host.",
+      "payload": {
+        "detail": "<per-run box command detail>",
+        "reason": "export_failed",
+        "timeoutMs": 30000
+      },
+      "createdAt": "2026-11-17T18:33:56.740Z"
+    },
+    {
+      "id": 14,
+      "companyId": "893431e4-0890-4fd0-a73e-883def37c051",
+      "runId": "f05af367-3d4a-4f7d-bd66-0b47edfd3b25",
+      "agentId": "683ad523-751f-4119-8149-2c2ff703182c",
+      "seq": 3,
+      "eventType": "provider.notice.recorded",
+      "stream": "system",
+      "level": "warn",
+      "color": null,
+      "message": "Stopped turn's workspace export could not be proven (export_failed); the warm box stays protected and its files are not yet on the host.",
+      "payload": {
+        "prpEvent": {
+          "runId": "f05af367-3d4a-4f7d-bd66-0b47edfd3b25",
+          "schema": "paperclip.prp.event.v1",
+          "payload": {
+            "schema": "paperclip.provider.notice.v1",
+            "message": "Stopped turn's workspace export could not be proven (export_failed); the warm box stays protected and its files are not yet on the host.",
+            "summary": "Stopped turn's workspace export could not be proven (export_failed); the warm box stays protected and its files are not yet on the host.",
+            "category": "workspace_export_deferred",
+            "severity": "warning"
+          },
+          "emittedAt": "2026-11-17T18:33:56.743Z",
+          "eventType": "provider.notice.recorded",
+          "sourceKind": "control_plane",
+          "schemaVersion": 1
+        }
+      },
+      "createdAt": "2026-11-17T18:33:56.743Z"
+    }
+  ]
+}
