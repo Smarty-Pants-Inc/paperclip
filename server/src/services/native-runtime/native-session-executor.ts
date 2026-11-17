@@ -18677,7 +18677,26 @@ async function createRunnerdBackendWithinSessionClaim(
   let providerPackAuthority = adoptingPersistedRemoteRunner ? null : selectProviderPackAuthority(reattachProviderPack);
   let expectedProviderPackManifest: RemoteProviderPackManifest | null = providerPackAuthority?.manifest
     ?? providerArtifacts?.manifest as RemoteProviderPackManifest ?? null;
-  let providerPackVerified = false;
+  // This existing per-start memo also survives a provider-thread archive: that
+  // moves session state, not the admitted pack. Bind the success to every input
+  // of the exact verifier rather than a boolean or just the pack's path.
+  const providerPackVerificationKey = (packRoot: string) => nativeSha256({
+    transport: remoteTarget?.transport, environmentId: remoteTarget?.environmentId,
+    providerKey: remoteTarget?.transport === "sandbox" ? remoteTarget.providerKey : undefined,
+    leaseId: remoteTarget?.leaseId,
+    providerLeaseId: remoteTarget?.transport === "sandbox" ? remoteTarget.sandboxLeaseAcquisition?.providerLeaseId : undefined,
+    environmentLeaseId: effectiveEnvironmentLeaseId,
+    ssh: remoteTarget?.transport === "ssh" ? {
+      host: remoteTarget.spec.host, port: remoteTarget.spec.port, username: remoteTarget.spec.username,
+      remoteWorkspacePath: remoteTarget.spec.remoteWorkspacePath,
+    } : undefined,
+    cwd: remoteTarget?.remoteCwd, packRoot, manifest: expectedProviderPackManifest,
+    provider: packProvider, requireExactIdentity: false,
+    requireCurrentOpenCodeProxy: false, acceptProvenance: false,
+  });
+  let providerPackVerified: string | null = null;
+  const isProviderPackVerified = () => providerPackVerified !== null
+    && providerPackVerified === providerPackVerificationKey(activeRemoteProviderPackRoot ?? providerArtifacts?.launchRoot ?? "");
   // Set when a persisted-runner reattachment finds that runner settled and
   // exited. The transport then relaunches it from durable state, which needs
   // the admitted provider pack's launch inputs that adoption does not.
@@ -18830,7 +18849,7 @@ async function createRunnerdBackendWithinSessionClaim(
   if (input.retainedSandboxOwner) (resolveRemoteRunnerProcessSpawned as (() => void) | null)?.();
 
   const verifyRemoteProviderPack = async (packRoot: string) => {
-    if (providerPackVerified && packRoot === activeRemoteProviderPackRoot) return;
+    if (providerPackVerified === providerPackVerificationKey(packRoot)) return;
     if (!remoteTarget || !remoteCommandRunner || !expectedProviderPackManifest)
       return;
     await verifyRemoteProviderPackIdentity({ runner: remoteCommandRunner,
@@ -18840,7 +18859,7 @@ async function createRunnerdBackendWithinSessionClaim(
         name: "provider_pack.verify_memo_hit", startedAtMs, endedAtMs,
       }); },
     });
-    providerPackVerified = true;
+    providerPackVerified = providerPackVerificationKey(packRoot);
   };
 
   const remoteNativeArtifacts = remoteTarget && remoteCommandRunner && remoteBinary && remoteRuntimeRoot
@@ -18880,7 +18899,7 @@ async function createRunnerdBackendWithinSessionClaim(
         if (!retainProviderPack) providerPackAuthority!.select(manifest);
         expectedProviderPackManifest = manifest;
         activeRemoteProviderPackRoot = installation.root;
-        providerPackVerified = true;
+        providerPackVerified = providerPackVerificationKey(installation.root);
         return true;
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") throw error;
@@ -18919,7 +18938,7 @@ async function createRunnerdBackendWithinSessionClaim(
     }
     await remoteNativeArtifacts?.prepare(requiredMode);
     if (artifactStorage && providerArtifacts) {
-      providerPackVerified = true;
+      providerPackVerified = providerPackVerificationKey(providerArtifacts.launchRoot);
       remotePrepared = true;
       return;
     }
@@ -18948,7 +18967,9 @@ async function createRunnerdBackendWithinSessionClaim(
         expectedProviderPackManifest = prepared.manifest;
       }
       activeRemoteProviderPackRoot = prepared.root;
-      providerPackVerified = true;
+      // Provenance reuse returns the sealed selected manifest, so the full
+      // verifier has proved this exact identity, not just the requested digest.
+      providerPackVerified = providerPackVerificationKey(prepared.root);
     }
     remotePrepared = true;
   };
@@ -20257,7 +20278,8 @@ async function createRunnerdBackendWithinSessionClaim(
     openCodeLaunchArtifacts = undefined;
     providerPackAuthority = selectProviderPackAuthority(false);
     expectedProviderPackManifest = providerPackAuthority?.manifest ?? null;
-    providerPackVerified = false;
+    // Keep the per-start pack proof. A changed authority/box/lease fails its key;
+    // a new createRunnerdBackend invocation starts with an empty memo.
   };
   // J3-22 member (a) (SMA-60, RFL 09:55Z). Host preparation on a created box
   // refused a current backup with RESTORE_UNAVAILABLE_ON_NEW_BOX_CODE: its
@@ -20993,11 +21015,11 @@ async function createRunnerdBackendWithinSessionClaim(
           try { await input.onLog?.("stderr", "[paperclip-runner] prior provider-pack admission receipt is unavailable\n"); } catch {}
         }
       }
-    } else if (providerPackVerified && providerPackAuthority && expectedProviderPackManifest) {
+    } else if (isProviderPackVerified() && providerPackAuthority && expectedProviderPackManifest) {
       rememberAdmittedNativeProviderPack(session, { identity, manifest: expectedProviderPackManifest,
         runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId: effectiveEnvironmentLeaseId });
     }
-    if (providerPackVerified && providerPackAuthority) {
+    if (isProviderPackVerified() && providerPackAuthority) {
       await recordAdmittedRemoteProviderPack(providerPackAuthority, message => input.onLog?.("stderr", message));
     }
   };

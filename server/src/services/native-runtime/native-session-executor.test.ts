@@ -90,6 +90,7 @@ import { createServer as createNetServer } from "node:net";
 import { DatabaseSync } from "node:sqlite";
 import { nativeSha256 } from "./canonical.js";
 import { resolveRemoteProviderPackAuthority } from "./remote-provider-pack-authority.js";
+import * as packAuthorityModule from "./remote-provider-pack-authority.js";
 import { REMOTE_RECOVERY_PROCESS_CHECK_SCRIPT, RemoteRunnerRecoveryError, readRemoteRunnerRecoveryError } from "./remote-runner-recovery-diagnostics.js";
 import { REMOTE_RUNNER_RECONNECT_GRACE_MS } from "./native-runner-recovery-contract.js";
 import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
@@ -3348,7 +3349,7 @@ describe("remote provider pack manifest", () => {
     return JSON.stringify(value);
   };
 
-  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-new-durable-slow-capture", "opencode-new-durable-ready", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-continuation-prior-receipt", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64", "pi-rpc-low", "pi-rpc-xhigh", "pi-rpc-max", "pi-rpc-missing-native"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
+  it.each(["opencode", "opencode-new-durable", "opencode-new-durable-reset", "opencode-new-durable-inspect-reset", "opencode-new-durable-provider-reset", "opencode-new-durable-store-failed", "opencode-new-durable-publish-failed", "opencode-new-durable-slow-capture", "opencode-new-durable-ready", "opencode-continuation", "opencode-continuation-missing", "opencode-continuation-no-receipt", "opencode-continuation-replacement", "opencode-continuation-cold", "opencode-continuation-legacy-durable", "opencode-continuation-prior-receipt", "opencode-dirty", "opencode-diagnostics", "opencode-diagnostics-stale", "cursor", "claude-x64", "claude-arm64", "pi-rpc-low", "pi-rpc-xhigh", "pi-rpc-max", "pi-rpc-missing-native", "pi-rpc-start-same", "pi-rpc-start-digest", "pi-rpc-start-box", "pi-rpc-start-lease"] as const)("uses the bundled Linux image authority for remote %s without controller overrides", async provider => {
     const firstDurable = provider.startsWith("opencode-new-durable");
     // A sandbox connection drops once while the settled state is read out.
     let checkpointReadResets = provider === "opencode-new-durable-reset" ? 1 : 0;
@@ -3359,6 +3360,7 @@ describe("remote provider pack manifest", () => {
     const architecture = provider === "claude-arm64" ? "arm64" : "x64";
     const claude = provider.startsWith("claude-");
     const nativePi = provider.startsWith("pi-rpc-");
+    const startMemo = provider.startsWith("pi-rpc-start-");
     const piRpcThinkingLevel = provider === "pi-rpc-xhigh" ? "xhigh" : provider === "pi-rpc-max" ? "max" : "low";
     const opencode = provider.startsWith("opencode");
     const diagnostics = provider.startsWith("opencode-diagnostics");
@@ -3515,6 +3517,34 @@ describe("remote provider pack manifest", () => {
       };
     });
     const runLogs: string[] = [];
+    let changeManifest = false;
+    if (startMemo) {
+      const original = packAuthorityModule.resolveRemoteProviderPackAuthority;
+      const authority = vi.spyOn(packAuthorityModule, "resolveRemoteProviderPackAuthority").mockImplementation((input) => original({
+        ...input, current: () => {
+          const selected = structuredClone(input.current());
+          if (changeManifest) {
+            selected.payload.runnerSourceRevision = "b".repeat(40);
+            selected.digest = "sha256:" + createHash("sha256").update(canonical(selected.payload)).digest("hex");
+          }
+          return selected;
+        },
+      }));
+      onTestFinished(() => authority.mockRestore());
+      execute.mockImplementation(async (command) => ({
+        exitCode: command.args?.[1]?.includes("base64 <") || command.args?.[1]?.startsWith("test -f ") ? 1 : 0,
+        signal: null, timedOut: false, stderr: "",
+        stdout: command.args?.[0] === "--build-metadata" ? JSON.stringify({
+          schema: "paperclip-runner/runnerd-build-metadata/v1", binaryName: "paperclip-runnerd",
+          packageName: "@paperclipai/paperclip-runner", binaryContractVersion: 2,
+          durableSessionCapabilities: ["unlimited_runtime", "connection_lease_renewal"], prpTransportModes: ["listen_ws"], providerPacks: [],
+        }) : command.args?.[0] === "--version" ? "1.18.34\n"
+          : command.args?.[0] === "-e" ? `\npaperclip-pack-manifest=${Buffer.from(JSON.stringify(installed)).toString("base64")}\n` : "",
+      }));
+    }
+    const startTarget = startMemo ? { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
+      environmentId: "environment", leaseId: "lease", providerKey: "daytona",
+      effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn } } : null;
     try {
       let coldAdmission: ReturnType<typeof admittedNativeProviderPack> = null;
       const prepare = createRunnerdBackend({ db: preparedDb, execution: remoteExecution,
@@ -3522,9 +3552,9 @@ describe("remote provider pack manifest", () => {
         onLog: async (_stream, chunk) => { runLogs.push(chunk); },
         ...(firstDurable ? { controllerPersistence: { bootId: randomUUID() } } : {}),
         ...(opencode ? { runnerEnvironment: { ...configuredEnvironmentProjection(diagnostics ? { PAPERCLIP_OPENCODE_PERFORMANCE_DIAGNOSTICS: "1" } : {}), PAPERCLIP_NATIVE_MCP_NAME: "assigned-fixture", PAPERCLIP_NATIVE_MCP_URL: "http://127.0.0.1/mcp/gateways/assigned-fixture", PAPERCLIP_NATIVE_MCP_TOKEN: "private-fixture" } } : {}),
-        runnerExecutionTarget: { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
+        runnerExecutionTarget: (startTarget ?? { kind: "remote", transport: "sandbox", remoteCwd: "/workspace",
           environmentId: "environment", leaseId: "lease", providerKey: "daytona",
-          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn, ...(firstDurable ? { syncOut } : {}) } } as never });
+          effectiveCapabilities: { runnerWebSocketIngress: true }, runner: { execute, syncIn, ...(firstDurable ? { syncOut } : {}) } }) as never });
       if (provider === "opencode-diagnostics-stale") {
         await expect(prepare).rejects.toThrow("image provider pack did not match the bundled release identity");
         expect(state.createBackend).not.toHaveBeenCalled();
@@ -3543,6 +3573,38 @@ describe("remote provider pack manifest", () => {
         environment?: NodeJS.ProcessEnv;
         runnerArtifact?: { version: string; digest: string };
       };
+      if (startMemo) {
+        const fullVerifies = () => execute.mock.calls.filter(([command]) => command.args?.[0] === "-e"
+          && command.args?.[1]?.includes("const differing=")).length;
+        expect(fullVerifies()).toBe(1);
+        const backend = state.createBackend.mock.results.at(-1)!.value;
+        const prepareState = (transport as typeof transport & { prepareExternalRunnerState: () => Promise<void> }).prepareExternalRunnerState;
+        const identity = { ...remoteExecution.binding, sessionId: remoteExecution.session.normalizedSessionId! };
+        Object.assign(backend, { openSession: vi.fn(async () => {
+          await prepareState();
+          return { identity: () => identity };
+        }) });
+        // Exercise the real same-start archive/reset, installer and verifier.
+        if (provider === "pi-rpc-start-digest") changeManifest = true;
+        if (provider === "pi-rpc-start-box") startTarget!.environmentId = "different-box";
+        if (provider === "pi-rpc-start-lease") startTarget!.leaseId = "different-lease";
+        const started = performance.now();
+        await managedBackend.openReplacementSession!({ identity }, {
+          backendKind: "runner", driverKind: "pi_rpc", identity, workingDirectory: remoteExecution.workspace.cwd,
+          sessionId: "prior-provider-session", cursor: null, activeTurnId: null, pendingRuntimeRequests: [], lineage: [],
+        } as never);
+        process.stdout.write(JSON.stringify({ evidence: provider, resetWallMs: performance.now() - started, fullVerifies: fullVerifies() }) + "\n");
+        expect(fullVerifies()).toBe(provider === "pi-rpc-start-same" ? 1 : 2);
+        if (provider === "pi-rpc-start-same") {
+          await createRunnerdBackend({ db: preparedDb, execution: { ...remoteExecution,
+            binding: { ...remoteExecution.binding, runId: randomUUID() },
+            session: { ...remoteExecution.session, normalizedSessionId: randomUUID() } },
+            runnerInstanceId: "second-start-runner", runnerIngressAuthorized: true,
+            runnerExecutionTarget: startTarget as never });
+          expect(fullVerifies()).toBe(2);
+        }
+        return;
+      }
       if (nativePi) {
         expect(transport).toMatchObject({ provider: "pi_rpc", piRpcThinkingLevel,
           piCommand: "/opt/paperclip-runner/provider-pack/provider-assets/pi_rpc/linux-x64/runtime/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js",
