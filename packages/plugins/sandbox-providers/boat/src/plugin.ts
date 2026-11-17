@@ -414,6 +414,10 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
       if (sideEffecting) assertBoatActivityAdmission();
       if (boxKey && sideEffecting && !responseOptions.ownStop && boxLifecycle(boxKey) !== generation) throw new Error("Boat sandbox lease is no longer active.");
       responseOptions.sendGuard?.();
+      // F-03-R: a late response must not authorize another send, including a
+      // recovery resume or a retry after a late ready observation.
+      callSignal.throwIfAborted();
+      if (Date.now() >= deadline) throw new DOMException("Boat call budget expired.", "TimeoutError");
     };
     const maxSends = Math.max(1, Math.min(BOAT_MAX_ATTEMPTS, responseOptions.maxSends ?? BOAT_MAX_ATTEMPTS));
     const headers = new Headers(init.headers);
@@ -576,7 +580,8 @@ async function request(config: Config, path: string, init: RequestInit = {}, all
  *   once per resume; then the call is retried once.
  * - sandbox_stopping (troubleshooting: the resume answer carries Retry-After;
  *   'Wait that many seconds ... Then run the same resume again'): resume only.
- * - Anything else is surfaced as is: snapshot_data_expired (troubleshooting:
+ * - Anything else is surfaced as is: snapshot_data_expired
+ *   (https://docs.boat.dev/troubleshooting.md, section '409 snapshot_data_expired':
  *   'Resume, fork and a saved snapshot save of this sandbox fail. You cannot get
  *   the data back.') and any code outside the closed list.
  */
