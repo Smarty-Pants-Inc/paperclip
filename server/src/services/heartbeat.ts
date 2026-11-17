@@ -1,5 +1,5 @@
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, agentFileSaveHeld } from "./agent-directory-working-copies.js";
+import { agentFileHoldInstruction, agentFileSaveHeld } from "./agent-directory-working-copies.js";
 import { registerCompletedTurnCleanupResumer } from "./native-runtime/completed-turn-cleanup-hold-settlement.js";
 import { endStorageOutageWaitOn, reportStorageOutageWaitsTo, runInOwnStorageScope } from "../storage/storage-unavailable.js";
 import { createStorageWaitNotice } from "./heartbeat/storage-wait-notice.js";
@@ -47,7 +47,7 @@ import { hasStoppedLocalProcessTree, legacyAdapterNeedsLocalProcessSettlement } 
 import { dotRunnerBroker } from "./dot-runner-broker.js";
 import { withRunExecutionTiming, measureRunPhase, measureWorkspaceSyncPhase, isWorkspaceSyncDetailPhase } from "./execution-preparation-timing.js";
 import { createHeartbeatPreparationTiming } from "./heartbeat/preparation-timing.js";
-import { createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
+import { createAgentFileRetirementCollector, createHeartbeatInstructionCopyRelease, createHeartbeatInstructionWorkingCopy } from "./heartbeat/instruction-working-copy.js";
 import { AgentDirectoryPreparationDeferral, deferRunForBusyAgentDirectory, prepareWithAgentDirectoryDeferral, REATTACH_AGENT_DIRECTORY_WAIT_MS } from "./heartbeat/agent-directory-busy.js";
 import { preparePredecessorRetirementFallback } from "./heartbeat/predecessor-retirement-fallback.js";
 import { prepareHeartbeatRuntimeServiceIntents, startHeartbeatRuntimeServices, recordHeartbeatAdapterRuntimeServices } from "./heartbeat/runtime-services.js";
@@ -1003,6 +1003,7 @@ export function heartbeatService(
       pluginWorkerManager: options.pluginWorkerManager,
     });
   const instructionCopies = agentInstructionWorkingCopyService(db, { environmentRuntime });
+  environmentRuntime.bindAgentFileRetirementCollector?.(createAgentFileRetirementCollector({ db, instructionCopies, environmentRuntime }));
   const envOrchestrator = environmentRunOrchestrator(db, {
     pluginWorkerManager: options.pluginWorkerManager,
     environmentRuntime,
@@ -4224,7 +4225,8 @@ export function heartbeatService(
           if (agentFileSaveHeld(heldInstructions)) {
             providerResourceDispositionForRun = "stop_and_retain";
             await appendRunEvent(run, { eventType: "instruction_save", stream: "system", level: "warn",
-              message: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+              // The hold's own instruction: a failed save, or unsurfaced aside copies.
+              message: agentFileHoldInstruction(heldInstructions),
               payload: { state: "pending_collection", savePending: true, code: heldInstructions?.errorCode ?? null } });
           }
           await withAdapterExecutionPhase(executionPhaseContext, "lease_release", () => releaseEnvironmentLeasesForRun({

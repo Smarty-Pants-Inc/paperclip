@@ -1,5 +1,5 @@
 import { environmentConfigRevision } from "./environment-config-revision.js";
-import { agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, releaseLeaseDestroyClaim } from "./agent-file-save-hold.js";
+import { AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY, AGENT_FILE_DESTROY_CLAIM_KEY, agentFileCopiesToCollectOnLease, agentFileCopyRetirementSettled, agentFileSaveHeldOnLease, claimLeaseForDestroyUnlessHeld, holdUncollectedAgentFileCopy, releaseLeaseDestroyClaim, withLeaseDestroyClaim } from "./agent-file-save-hold.js";
 import { settleWarmRetention } from "./environment-warm-retention.js";
 import { readPluginLoginCredential } from "./plugin-login-credential.js";
 import { ENVIRONMENT_LEASE_CONTROLLER_KEY, readEnvironmentLeaseController } from "./environment-lease-controller.js";
@@ -418,6 +418,49 @@ export function buildEnvironmentLeaseContext(input: {
  * The transport selection reads this input in a later phase; this phase only
  * delivers the setting and the per-run read.
  */
+/**
+ * The Stop collector for one agent-file copy on a box that is being retired
+ * (CR6). Bound by the owner of the instruction-copy service (heartbeat), so the
+ * runtime never imports it. Returns the copy row after collection.
+ */
+export type AgentFileRetirementCollector = (input: { environment: Environment; lease: EnvironmentLease; runId: string;
+  /** AF-ABORT: aborted at the aggregate deadline; the collection then starts no
+   * further remote command or write and ends its lock transaction at once. */
+  signal?: AbortSignal }) =>
+  Promise<{ state: string; receipt?: Record<string, unknown> | null; processStoppedAt?: Date | null } | null>;
+
+/**
+ * rf-4 A2: ONE aggregate deadline over all collect-before-retire work (the
+ * collection inspections and every Stop-collector call) in one obsolete-lease
+ * cleanup, i.e. in one acquisition. The collector's own retries bound calls,
+ * not time, and its remote checkpoint shell allows 120 s per attempt; this
+ * deadline is what keeps the person's next acquisition bounded. 60 s is below
+ * the 90 s reusable resume budget (REUSABLE_SANDBOX_RESUME_BUDGET_MS). On expiry
+ * the box is stopped and kept WITHOUT collection, its copies keep (or get) a
+ * durable savePending hold, and the acquisition proceeds.
+ */
+export const AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS = 60_000;
+/** AF-ABORT: after the abort, the stop waits this long at most for the aborted
+ * collection to end (its lock transaction and session), then proceeds. */
+export const AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS = 1_000;
+const RETIREMENT_COLLECTION_TIMED_OUT = Symbol("agent-file retirement collection deadline");
+/** Waits for `work` until the monotonic `deadlineAt` (performance.now()), with
+ * its rejection owned here. A timed-out collection is then aborted (AF-ABORT). Same race-and-clear
+ * pattern as controller-instance-lease.ts withTimeout (module-private there). */
+async function settleBeforeDeadline<T>(work: Promise<T>, deadlineAt: number): Promise<T | typeof RETIREMENT_COLLECTION_TIMED_OUT> {
+  work.catch(() => undefined);
+  const remaining = deadlineAt - performance.now();
+  if (remaining <= 0) return RETIREMENT_COLLECTION_TIMED_OUT;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([work, new Promise<typeof RETIREMENT_COLLECTION_TIMED_OUT>(resolve => {
+      timer = setTimeout(() => resolve(RETIREMENT_COLLECTION_TIMED_OUT), remaining);
+    })]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface ResolvedSandboxDuplexBridgeInput {
   /** True only when the instance opts in to the sandbox duplex command stream. */
   enableDuplexBridge: boolean;
@@ -1398,8 +1441,13 @@ function createSandboxEnvironmentDriver(
     deferredOrphanCleanupBufferLimit?: number;
     orphanCleanupSpool?: SandboxOrphanCleanupSpool;
     orphanCleanupSpoolDir?: string;
+    agentFileCollector?: { current: AgentFileRetirementCollector | null };
+    agentFileRetirementCollectionDeadlineMs?: number;
   } = {},
 ): EnvironmentRuntimeDriver {
+  const agentFileRetirementCollectionDeadlineMs = Number.isFinite(options.agentFileRetirementCollectionDeadlineMs)
+    && options.agentFileRetirementCollectionDeadlineMs! > 0
+    ? options.agentFileRetirementCollectionDeadlineMs! : AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS;
   const pluginWorkerManager = options.pluginWorkerManager;
   const pluginWorkerReadyTimeoutMs = options.pluginWorkerReadyTimeoutMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_TIMEOUT_MS;
   const pluginWorkerReadyPollMs = options.pluginWorkerReadyPollMs ?? DEFAULT_PLUGIN_SANDBOX_WORKER_READY_POLL_MS;
@@ -1853,6 +1901,7 @@ function createSandboxEnvironmentDriver(
 
   async function cleanupObsoleteReusableSandboxLeases(input: {
     environment: Environment;
+    providerConfigForLease: Record<string, unknown>;
     leases: EnvironmentLease[];
     reusableLeases: EnvironmentLease[];
     adapterType: string | null;
@@ -1861,6 +1910,19 @@ function createSandboxEnvironmentDriver(
   }) {
     const reusableIds = new Set(input.reusableLeases.map((lease) => lease.id));
     const closedActiveTipIds = new Set(input.closedActiveTips?.leases.map(lease => lease.id) ?? []);
+    // rf-4 A2: one aggregate deadline, started by the first collection work.
+    let collectionDeadlineAt: number | null = null;
+    let collectionTimedOut = false;
+    const collectionDeadline = () => collectionDeadlineAt ??= performance.now() + agentFileRetirementCollectionDeadlineMs;
+    // AF-ABORT (RFL row-22, rf-4): at the deadline the collection is ABORTED,
+    // not abandoned. The abort lands before any stop is prepared, and the stop
+    // waits (bounded) for the aborted work to end, so no collector transaction,
+    // lock session or new remote call outlives the deadline + 1 s.
+    const collectionAbort = new AbortController();
+    const abortCollection = async (work: Promise<unknown>) => {
+      if (!collectionAbort.signal.aborted) collectionAbort.abort(new Error("agent-file retirement collection deadline expired"));
+      await settleBeforeDeadline(work.catch(() => undefined), performance.now() + AGENT_FILE_RETIREMENT_ABORT_SETTLE_MS);
+    };
     // Re-read and re-prove right before acting: the tip may have changed since it was admitted.
     const closedActiveTipStill = async (id: string) => {
       if (!input.closedActiveTips || !closedActiveTipIds.has(id)) return null;
@@ -1871,6 +1933,61 @@ function createSandboxEnvironmentDriver(
     for (const lease of [...input.leases, ...(input.closedActiveTips?.leases ?? [])]) {
       if (reusableIds.has(lease.id)) continue;
       if (!reusableLeaseCanBeCleanedUp(lease) && !closedActiveTipIds.has(lease.id)) continue;
+      // CR6: save post-turn agent files to the server before stopping and
+      // keeping the old source. A held save stays held; never destroy its box.
+      const copiesToCollect = await agentFileCopiesToCollectOnLease(db, lease);
+      let agentFilesSettled = true;
+      let inspectedForCollection = false;
+      let collectionObservation: PluginEnvironmentLeaseObservation | undefined;
+      // Copies left uncollected because the aggregate deadline expired.
+      const uncollected: string[] = [];
+      if (copiesToCollect.length && ["released", "expired"].includes(lease.status)) {
+        // G7: never resume an idled-out box to collect. Turn-end saves remain
+        // on the server; any later box-only files stay on the kept disk.
+        if (hasBoundRemoteStopReceipt(lease) || hasStopOnlyCleanup(lease)
+          || lease.metadata?.pendingCleanupInFlight === true) continue;
+        if (!collectionTimedOut) {
+          inspectedForCollection = true;
+          const observed = await settleBeforeDeadline((sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(lease) })
+            ?? Promise.resolve(undefined)).catch(() => undefined), collectionDeadline());
+          if (observed === RETIREMENT_COLLECTION_TIMED_OUT) {
+            collectionTimedOut = true;
+            // The stop path inspects for itself, as before collection existed.
+            inspectedForCollection = false;
+          } else collectionObservation = observed;
+        }
+        if (collectionTimedOut) uncollected.push(...copiesToCollect);
+      }
+      const canCollect = !collectionTimedOut && (!inspectedForCollection || collectionObservation?.providerLeaseId === lease.providerLeaseId
+        && ["active", "running"].includes(String(collectionObservation?.state)));
+      if (!canCollect && copiesToCollect.length) agentFilesSettled = false;
+      if (collectionTimedOut && !uncollected.length) uncollected.push(...copiesToCollect);
+      for (const runId of canCollect ? copiesToCollect : []) {
+        const work = collectionTimedOut ? null : options.agentFileCollector?.current?.({ environment: input.environment, lease, runId, signal: collectionAbort.signal })
+          .catch((error: unknown) => {
+            if (!collectionAbort.signal.aborted) logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file collection before source-change retirement failed");
+            return null;
+          }) ?? Promise.resolve(null);
+        const collected = work === null ? RETIREMENT_COLLECTION_TIMED_OUT : await settleBeforeDeadline(work, collectionDeadline());
+        if (collected === RETIREMENT_COLLECTION_TIMED_OUT && work) await abortCollection(work);
+        if (collected === RETIREMENT_COLLECTION_TIMED_OUT) {
+          collectionTimedOut = true;
+          agentFilesSettled = false;
+          uncollected.push(runId);
+          continue;
+        }
+        if (!collected || !agentFileCopyRetirementSettled(collected)) agentFilesSettled = false;
+      }
+      // Deadline expired: stop and keep WITHOUT collection. The files are on the
+      // kept disk; a durable savePending hold keeps any destroy/expiry off it.
+      // A late collector result still writes its own outcome afterwards.
+      for (const runId of uncollected) {
+        logger.warn({ leaseId: lease.id, runId, deadlineMs: agentFileRetirementCollectionDeadlineMs },
+          "agent-file collection before source-change retirement exceeded its deadline; stopping and keeping the box without collection");
+        await holdUncollectedAgentFileCopy(db, { companyId: lease.companyId, runId,
+          reason: `Collection before retirement exceeded ${agentFileRetirementCollectionDeadlineMs} ms; the box is stopped and kept.` })
+          .catch((error: unknown) => logger.warn({ err: error, leaseId: lease.id, runId }, "agent-file retirement hold write failed; the box is still stopped and kept"));
+      }
       // Destroying an obsolete source deletes its box. A native session there
       // needs verified custody first: upstream's own resume-replacement guard
       // (verifyRecoverableNativeHarnessBackup). Without it nothing is
@@ -1885,7 +2002,7 @@ function createSandboxEnvironmentDriver(
       // Harness custody excludes workspace writes after finalize: a changed
       // source must stop and keep even with a verified backup or non-native adapter.
       // Boat keeps stopped disks >=14 days, without compute: https://docs.boat.dev/limits
-      if (!sandboxLeaseSourceMatches(input.environment.config, lease.metadata ?? {})
+      if (!agentFilesSettled || !sandboxLeaseSourceMatches(input.providerConfigForLease, lease.metadata ?? {})
         || (!knownNonNative
           && (!lease.providerLeaseId || !await verifyRecoverableNativeHarnessBackup({ db, companyId: lease.companyId,
             stamp: await obsoleteLeaseCustodyStamp(lease), providerLeaseId: lease.providerLeaseId })))) {
@@ -1903,8 +2020,9 @@ function createSandboxEnvironmentDriver(
           && stale.metadata?.pendingCleanupInFlight !== true) {
           // A stale boot source is not stop authority. GET the recorded resource
           // outside transactions, then reuse the fallback's snapshot/CAS owner.
-          const observation = await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(stale) })
-            .catch(() => undefined);
+          const observation = inspectedForCollection ? collectionObservation
+            : await sandboxDriver.inspectLeaseResource?.({ environment: input.environment, lease: toEnvironmentLeaseSnapshot(stale) })
+              .catch(() => undefined);
           await prepareInspectedSourceSandboxStop(db, stale, observation);
         }
         continue;
@@ -2151,6 +2269,7 @@ function createSandboxEnvironmentDriver(
         if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
           await cleanupObsoleteReusableSandboxLeases({
             environment: input.environment,
+            providerConfigForLease,
             leases: reusableCandidateLeases,
             reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
             adapterType: input.adapterType ?? null,
@@ -2590,6 +2709,7 @@ function createSandboxEnvironmentDriver(
       if (reusableCandidateLeases.length > reusableExistingLeases.length || closedActiveTips.length > 0) {
         await cleanupObsoleteReusableSandboxLeases({
           environment: input.environment,
+          providerConfigForLease,
           leases: reusableCandidateLeases,
           reusableLeases: [...reusableExistingLeases, ...compatible.compatibleLeases],
           adapterType: input.adapterType ?? null,
@@ -2778,11 +2898,15 @@ function createSandboxEnvironmentDriver(
 
       let cleanupStatus: "success" | "failed" = "success";
       try {
-        await releaseSandboxProviderLease({
+        const release = () => releaseSandboxProviderLease({
           config: parsed.config,
           providerLeaseId: input.lease.providerLeaseId,
           status: input.status,
         });
+        // A non-reusable release erases the box: it takes the destroy claim
+        // (refused, so the cleanup fails closed, while the allocation is held).
+        if (releaseErasesSandbox(input.lease)) await withLeaseDestroyClaim(db, input.lease, release);
+        else await release();
       } catch {
         cleanupStatus = "failed";
       }
@@ -2937,9 +3061,10 @@ function createSandboxEnvironmentDriver(
           },
           resolvePluginSandboxRpcTimeoutMs(workerConfig),
         );
-        return failedCreation
+        // The destroy authority, serialized with the save-hold write.
+        return await withLeaseDestroyClaim(db, input.lease, async () => failedCreation
           ? await destroyWithCreationObservation({ leaseId: input.lease.id, metadata: input.lease.metadata ?? {}, teardown })
-          : await teardown(input.lease.metadata ?? {});
+          : await teardown(input.lease.metadata ?? {}));
       }
 
       // Built-in provider path. Resolve the recorded config secrets through the
@@ -2964,10 +3089,11 @@ function createSandboxEnvironmentDriver(
         }
         return receipt;
       }
-      await destroySandboxProviderLease({
+      // The destroy authority, serialized with the save-hold write.
+      await withLeaseDestroyClaim(db, input.lease, () => destroySandboxProviderLease({
         config: cleanupConfig,
         providerLeaseId: input.lease.providerLeaseId,
-      });
+      }));
     },
 
     async isPendingCleanupWorkerReady(input) {
@@ -3524,6 +3650,10 @@ function createSandboxEnvironmentDriver(
     return advertised.includes(method);
   }
 
+  function releaseErasesSandbox(lease: EnvironmentLease): boolean {
+    return lease.leasePolicy !== "reuse_by_environment";
+  }
+
   async function releasePluginBackedSandboxLease(
     input: EnvironmentDriverReleaseInput,
   ): Promise<EnvironmentLease | null> {
@@ -3548,7 +3678,7 @@ function createSandboxEnvironmentDriver(
           lease: input.lease,
           provider: providerKey,
         });
-        const receipt = await runLeaseReleaseWithRunParent(input.lease.id, () =>
+        const releaseCall = () => runLeaseReleaseWithRunParent(input.lease.id, () =>
           pluginWorkerManager.call(pluginId, "environmentReleaseLease", {
             driverKey: providerKey,
             companyId: input.lease.companyId,
@@ -3560,6 +3690,11 @@ function createSandboxEnvironmentDriver(
             ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
           }, resolvePluginSandboxRpcTimeoutMs(stripSandboxProviderEnvelope(config as SandboxEnvironmentConfig))),
         );
+        // A non-reusable release erases the box: it takes the destroy claim
+        // (refused, so the cleanup fails closed, while the allocation is held).
+        const receipt = releaseErasesSandbox(input.lease)
+          ? await withLeaseDestroyClaim(db, input.lease, releaseCall)
+          : await releaseCall();
         termination = remoteTerminationReceipt(input.lease, receipt);
         if (input.cancelActiveWork && !termination) cleanupStatus = "failed";
       } catch {
@@ -3627,7 +3762,9 @@ function createSandboxEnvironmentDriver(
     try {
       return await destroyReusableSandboxLeaseClaimed({ ...input, claim });
     } finally {
-      await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => {
+      // Fallback only: the settlement below clears the claim atomically. A
+      // lease another writer settled meanwhile keeps that writer's row.
+      await releaseLeaseDestroyClaim(db, input.lease.id, claim, input.lease.metadata?.remoteExecutionTermination).catch(() => {
         logger.warn({ leaseId: input.lease.id }, "agent-file destroy claim release failed");
       });
     }
@@ -3694,10 +3831,8 @@ function createSandboxEnvironmentDriver(
     } catch {
       cleanupStatus = "failed";
     }
-    // The provider call settled: drop the destroy claim so the lease snapshot
-    // the settlement CAS compares is the one this destroy read.
-    await releaseLeaseDestroyClaim(db, input.lease.id, input.claim);
-    // Only a destroy the provider confirmed reaches this gap.
+    // Only a destroy the provider confirmed reaches this gap. The claim stays
+    // until the settlement below clears it with this destroy's receipt.
     if (cleanupStatus === "success") crashPoint("environment.teardown.after_destroy_before_lease");
 
     return await environmentsSvc.releaseLease(
@@ -3706,7 +3841,12 @@ function createSandboxEnvironmentDriver(
       {
         ...(input.lease.status === "pending_cleanup" && typeof metadata.pendingCleanupAttemptId === "string"
           ? { expectedPendingCleanupAttemptId: metadata.pendingCleanupAttemptId }
-          : { expectedSnapshot: { status: input.lease.status, metadata: input.lease.metadata } }),
+          // The row this destroy read, plus its own claim (nothing else may
+          // write the lease while the claim is live).
+          : { expectedSnapshot: { status: input.lease.status,
+            metadata: { ...(input.lease.metadata ?? {}), [AGENT_FILE_DESTROY_CLAIM_KEY]: input.claim,
+              [AGENT_FILE_DESTROY_CLAIM_ATTEMPT_KEY]: input.lease.metadata?.pendingCleanupAttemptId ?? null } } }),
+        destroyClaim: input.claim,
         failureReason: input.failureReason,
         cleanupStatus,
         ...(cleanupStatus === "success" && termination ? { remoteExecutionTermination: termination } : {}),
@@ -3906,7 +4046,7 @@ function createPluginEnvironmentDriver(
   }
 
   async function cleanupPluginRunLease(input: { environment: Environment | null; lease: EnvironmentLease },
-    executionStopObserved = false) {
+    executionStopObserved = false, claimDestroy = false) {
     const settled = await settleDispatchedEnvironmentTask(db, workerManager, input.lease, { executionStopObserved });
     const [current] = await db.select().from(environmentLeases).where(and(eq(environmentLeases.id, input.lease.id),
       eq(environmentLeases.companyId, input.lease.companyId)));
@@ -3915,10 +4055,17 @@ function createPluginEnvironmentDriver(
     const { plugin, driverKey, driverConfig } = await resolvePluginDriverForRelease({ ...input, lease });
     const environmentId = input.environment?.id ?? readString(lease.metadata?.environmentId);
     if (!environmentId) throw new Error("Plugin lease cleanup has no saved environment identity");
-    const receipt = await workerManager.call(plugin.id, lease.metadata?.pluginLeaseCleanupMethod === "destroy" ? "environmentDestroyLease" : "environmentReleaseLease", {
+    const destroying = lease.metadata?.pluginLeaseCleanupMethod === "destroy";
+    const call = () => workerManager.call(plugin.id, destroying ? "environmentDestroyLease" : "environmentReleaseLease", {
       driverKey, companyId: lease.companyId, environmentId, issueId: lease.issueId,
       config: driverConfig, providerLeaseId: lease.providerLeaseId, leaseMetadata: lease.metadata ?? undefined,
     });
+    // Every recorded plugin destroy (also with the environment gone), pending
+    // teardown retry and non-reusable release takes the destroy claim: release
+    // can erase the allocation too. Refuse (throw) before provider IO while a
+    // save hold, a collection pin or another destroy protects the allocation.
+    const receipt = destroying || claimDestroy || lease.leasePolicy !== "reuse_by_environment"
+      ? await withLeaseDestroyClaim(db, lease, call) : await call();
     const taskStopped = settled !== false ||
       (lease.metadata?.runnerTaskLease === true && lease.metadata?.runnerTaskDispatched !== true && !lease.metadata?.runnerTaskStartup && !lease.metadata?.runnerTaskStartupCleanup);
     return remoteTerminationReceipt(lease, receipt) ? receipt
@@ -4130,10 +4277,9 @@ function createPluginEnvironmentDriver(
         providerLeaseId: input.lease.providerLeaseId,
         leaseMetadata: input.lease.metadata ?? undefined,
       });
-      } finally {
-        await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => undefined);
-      }
+      // The settlement of this destroy clears its own claim atomically.
       return await environmentsSvc.releaseLease(input.lease.id, "failed", {
+        destroyClaim: claim,
         failureReason: input.failureReason ?? "lease_destroyed",
         cleanupStatus: "success",
         ...(input.lease.status === "pending_cleanup" && typeof input.lease.metadata?.pendingCleanupAttemptId === "string"
@@ -4141,6 +4287,9 @@ function createPluginEnvironmentDriver(
         ...(taskStopped ? { remoteExecutionTermination: remoteTerminationReceipt(input.lease,
           { providerLeaseId: input.lease.providerLeaseId, state: "stopped" }) } : {}),
       });
+      } finally {
+        await releaseLeaseDestroyClaim(db, input.lease.id, claim, input.lease.metadata?.remoteExecutionTermination).catch(() => undefined);
+      }
     },
 
     async isPendingCleanupWorkerReady(input) {
@@ -4152,7 +4301,7 @@ function createPluginEnvironmentDriver(
       } catch { return false; }
     },
 
-    retryPendingSandboxTeardown: cleanupPluginRunLease,
+    retryPendingSandboxTeardown: input => cleanupPluginRunLease(input, false, !hasStopOnlyCleanup(input.lease)),
 
     async realizeWorkspace(input) {
       const { plugin, pluginKey, driverKey, driverConfig } = await resolvePluginDriverForRelease({
@@ -4308,6 +4457,8 @@ export function environmentRuntimeService(
     deferredOrphanCleanupBufferLimit?: number;
     orphanCleanupSpool?: SandboxOrphanCleanupSpool;
     orphanCleanupSpoolDir?: string;
+    /** Aggregate collect-before-retire deadline; default AGENT_FILE_RETIREMENT_COLLECTION_DEADLINE_MS. */
+    agentFileRetirementCollectionDeadlineMs?: number;
   } = {},
 ) {
   // One dispatch fence shared by sandbox/plugin drivers AND the task runtime.
@@ -4332,6 +4483,7 @@ export function environmentRuntimeService(
     },
   } };
   const environmentsSvc = environmentService(db);
+  const agentFileCollector: { current: AgentFileRetirementCollector | null } = { current: null };
   let orphanRecoveryFlush: Promise<{ recovered: number; pending: number }> | null = null;
   const drivers = new Map<string, EnvironmentRuntimeDriver>();
 
@@ -4347,6 +4499,8 @@ export function environmentRuntimeService(
       deferredOrphanCleanupBufferLimit: options.deferredOrphanCleanupBufferLimit,
       orphanCleanupSpool: options.orphanCleanupSpool,
       orphanCleanupSpoolDir: options.orphanCleanupSpoolDir,
+      agentFileCollector,
+      agentFileRetirementCollectionDeadlineMs: options.agentFileRetirementCollectionDeadlineMs,
     }),
     ...(options.pluginWorkerManager
       ? [createPluginEnvironmentDriver(db, options.pluginWorkerManager)]
@@ -4489,6 +4643,11 @@ export function environmentRuntimeService(
 
   return {
     getDriver,
+
+    /** CR6: the instruction-copy owner binds the Stop collector for box retirements. */
+    bindAgentFileRetirementCollector(collector: AgentFileRetirementCollector | null) {
+      agentFileCollector.current = collector;
+    },
 
     async destroyRemoteWorkspaceLease(input: {
       companyId: string; workspaceId: string; leaseId: string; environmentId: string; providerLeaseId: string;
@@ -4874,17 +5033,10 @@ export function environmentRuntimeService(
           `Environment driver "${driver.driver}" does not support orphan sandbox teardown.`,
         );
       }
-      if (hasStopOnlyCleanup(input.lease)) return await driver.retryPendingSandboxTeardown(input);
-      // The destroy authority, serialized with the save-hold write (lease row lock).
-      const claim = await claimLeaseForDestroyUnlessHeld(db, input.lease);
-      if (!claim) {
-        throw new Error("Agent-file changes are not saved. The original source is retained; retry collection before discarding or releasing this sandbox.");
-      }
-      try {
-        return await driver.retryPendingSandboxTeardown(input);
-      } finally {
-        await releaseLeaseDestroyClaim(db, input.lease.id, claim).catch(() => undefined);
-      }
+      // Each driver's teardown takes the hold-serialized destroy claim right
+      // before its provider destroy (withLeaseDestroyClaim), so direct driver
+      // callers (environment-missing release, export recovery) are covered too.
+      return await driver.retryPendingSandboxTeardown(input);
     },
 
     // Report whether the provider worker can run an orphan teardown now. The

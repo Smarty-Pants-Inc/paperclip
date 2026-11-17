@@ -11,12 +11,32 @@ import { collectStoppedInstructionCopyWithRetries, instructionWorkingCopyGuidanc
 import { claimWarmNativeInstructionCopy, nativeSessionWorkspaceScope, reserveWarmNativeInstructionDirectory } from "../native-runtime/index.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { supportsNativeWarmFiles } from "../native-runtime/native-warm-capability.js";
+import { resolveEnvironmentExecutionTarget } from "../environment-execution-target.js";
+import type { AgentFileRetirementCollector, EnvironmentRuntimeService } from "../environment-runtime.js";
 import type { HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { EffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import type { NativeLifecyclePolicy } from "./native-lifecycle.js";
 
 type Copies = ReturnType<typeof agentInstructionWorkingCopyService>;
+
+/**
+ * CR6: the Stop collector for a warm box that a source change retires. It is
+ * the same call Stop makes (collectStoppedInstructions below), aimed at the
+ * retiring box's own target: saved/unchanged releases, a failed save is held.
+ */
+export function createAgentFileRetirementCollector(input: {
+  db: Db; instructionCopies: Pick<Copies, "collectStopped">; environmentRuntime: EnvironmentRuntimeService;
+}): AgentFileRetirementCollector {
+  return async ({ environment, lease, runId, signal }) => {
+    signal?.throwIfAborted();
+    const target = await resolveEnvironmentExecutionTarget({ db: input.db, companyId: lease.companyId, adapterType: "paperclip_runner",
+      environment, leaseId: lease.id, leaseMetadata: lease.metadata, lease, environmentRuntime: input.environmentRuntime });
+    return collectStoppedInstructionCopyWithRetries(() => input.instructionCopies.collectStopped({
+      companyId: lease.companyId, runId, target, signal,
+    }), signal);
+  };
+}
 type Selection = HeartbeatRuntimeSelectionInput;
 type AppendRunEvent = ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
 
