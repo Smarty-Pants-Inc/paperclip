@@ -3013,6 +3013,44 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
     },
   );
 
+  // Hold50 RFL: the whole-file run lost the next message's wake to a Postgres
+  // deadlock (1 wake where 2 were expected). The route's wakeup is
+  // fire-and-forget and only logs a failure, so admission itself must retry a
+  // wake insert that loses a deadlock. Force exactly one 40P01 on the insert
+  // (a sequence is not rolled back with the aborted transaction).
+  it("retries a wake insert that loses a deadlock and still queues the next message (stopped run)", async () => {
+    const seeded = await seedDeclinedConnectionReceipt("stopped");
+    await db.execute(sql.raw("create sequence if not exists hold50_forced_deadlock"));
+    await db.execute(sql.raw(`create or replace function hold50_forced_deadlock() returns trigger language plpgsql as $$
+      begin
+        if nextval('hold50_forced_deadlock') = 1 then
+          raise exception 'forced deadlock on wake insert' using errcode = '40P01';
+        end if;
+        return new;
+      end $$`));
+    await db.execute(sql.raw(`create trigger hold50_forced_deadlock before insert on agent_wakeup_requests
+      for each row execute function hold50_forced_deadlock()`));
+    try {
+      const client = app(seeded.companyId);
+      const sent = await request(client).post(`/api/issues/${seeded.issueId}/comments`)
+        .send({ body: "Skip Slack for now and continue" }).expect(201);
+      await vi.waitFor(async () => expect(await db.select().from(agentWakeupRequests)).toHaveLength(2),
+        { timeout: 10_000, interval: 50 });
+      const [{ calls }] = await db.execute(sql.raw("select last_value as calls from hold50_forced_deadlock")) as unknown as
+        [{ calls: string }];
+      // The first insert was the deadlock victim; a later attempt saved it.
+      expect(Number(calls)).toBeGreaterThanOrEqual(2);
+      const queue = await request(client).get(`/api/issues/${seeded.issueId}/queued-comments`).expect(200);
+      expect(queue.body.entries.find((entry: any) => entry.comment.id === sent.body.id))
+        .toMatchObject({ canEdit: true, canDiscard: true });
+      await new Promise(resolve => setTimeout(resolve, 250));
+    } finally {
+      await db.execute(sql.raw("drop trigger if exists hold50_forced_deadlock on agent_wakeup_requests"));
+      await db.execute(sql.raw("drop function if exists hold50_forced_deadlock()"));
+      await db.execute(sql.raw("drop sequence if exists hold50_forced_deadlock"));
+    }
+  });
+
   it.each(["legacy", "stopped"] as const)(
     "queues every later message together after a declined connection (%s run)",
     async (runState) => {
