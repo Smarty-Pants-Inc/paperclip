@@ -69,7 +69,7 @@ import { createRunUsageRecorder } from "../usage-receipts.js";
 import { syncPluginTaskCredentialHandoff, registerPluginTaskCredentialHandoff } from "../plugin-task-credential-writeback.js";
 import { resolvePluginTaskResume, type PluginTaskDescription } from "../environment-task-runtime.js";
 import { assertAttachedPortableTask, readyPortableTaskSource, unlaunchedPortableTaskLease } from "../plugin-task-ownership.js";
-import { environmentTaskOperationSchema, environmentTaskResultSchema } from "@paperclipai/plugin-sdk";
+import { environmentTaskOperationSchema, environmentTaskResultSchema, JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { preparePluginRunnerCredentials } from "./plugin-runner-credentials.js";
 import { createPluginRunnerTaskOwner, verifyPluginRunnerTaskReattachment } from "./plugin-runner-task.js";
 import { createSandboxRunnerRetention, createSandboxRunnerSupervision, type SandboxRunnerRetention } from "./sandbox-runner-retention.js";
@@ -9423,6 +9423,7 @@ export function nativeSessionFailureDisposition(
     sourceFailureCode === "pi_conversation_identity_missing" ||
     sourceFailureCode === "native_session_cleanup_quarantined" ||
     sourceFailureCode === "native_adopted_runner_authentication_timeout" ||
+    sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED ||
     sourceFailureCode === "native_provider_usage_limit" ||
     sourceFailureCode === NATIVE_PROVIDER_SESSION_CLOSED ||
     sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED ||
@@ -9621,6 +9622,7 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
   | "native_session_cleanup_quarantined"
   | "native_adopted_runner_authentication_timeout"
+  | typeof REMOTE_RUNNER_OBSERVATION_EXHAUSTED
   | "runner_remote_provider_artifact_incompatible"
   | "runner_remote_provider_verification_unavailable"
   | "provider_process_exited"
@@ -9651,6 +9653,8 @@ export function nativeSessionFailureSourceCode(
   | typeof NATIVE_FAILED_BEFORE_PROVIDER_TURN_CODE
   | "native_session_interrupted"
   | FreshThreadRefusalCode {
+  if (error instanceof Error && /^(?:Notification transport failed closed: )?runner_process_observation_budget_exhausted:/.test(error.message))
+    return REMOTE_RUNNER_OBSERVATION_EXHAUSTED;
   const freshRefusal = freshThreadRefusalCode(error);
   if (freshRefusal) return freshRefusal;
   if (error instanceof Error && error.message === "pi_conversation_identity_missing") return "pi_conversation_identity_missing";
@@ -14192,6 +14196,8 @@ async function executePaperclipNativeSessionAttempt(
                   ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
                   : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
                   ? startupRejectedAction
+                  : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+                  ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
                   : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
                   ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
                   : sourceFailureCode === "native_session_cleanup_quarantined"
@@ -14480,6 +14486,8 @@ async function executePaperclipNativeSessionAttempt(
               ? NATIVE_PROVIDER_SESSION_CLOSED_ACTION
               : sourceFailureCode === NATIVE_PROVIDER_STARTUP_REJECTED
               ? startupRejectedAction
+              : sourceFailureCode === REMOTE_RUNNER_OBSERVATION_EXHAUSTED
+              ? REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION
               : sourceFailureCode === NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER
               ? NATIVE_CONTROLLER_JOURNAL_BEHIND_RUNNER_ACTION
               : sourceFailureCode === "native_session_cleanup_quarantined"
@@ -16381,6 +16389,28 @@ export async function readRemoteRunnerProviderState(input: {
 
 const REMOTE_RUNNER_PROCESS_IDENTITY_WAIT_MS = 20_000;
 const REMOTE_RUNNER_PROCESS_POLL_MS = 5_000;
+// A named sandbox refusal is no observation, not exit. Charge failed probes
+// AND their event-wakeable waits; healthy reads/parking never replenish this.
+const REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS = 10 * 60_000;
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED = "runner_process_observation_budget_exhausted";
+export const REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION =
+  "The sandbox is still changing state after the ten-minute observation allowance. Runner termination is not confirmed. Wait for archiving to finish, then retry recovery of this run after verifying the retained runner. Do not start a replacement while that runner may still be alive.";
+
+function remoteRunnerObservationExhausted(cause: unknown): Error {
+  return Object.assign(new Error(`${REMOTE_RUNNER_OBSERVATION_EXHAUSTED}: ${REMOTE_RUNNER_OBSERVATION_EXHAUSTED_ACTION}`, { cause }),
+    { code: REMOTE_RUNNER_OBSERVATION_EXHAUSTED });
+}
+
+function remoteRunnerSandboxTransitionRefusal(error: unknown): boolean {
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth++) {
+    if ((cause as { code?: unknown }).code === "boat_sandbox_state_transition") return true;
+    // Worker RPC drops string codes. Only Boat's exact closed-code prefix in
+    // its typed envelope qualifies, never the acquisition-only prose classifier.
+    if (cause instanceof JsonRpcCallError && cause.code === PLUGIN_RPC_ERROR_CODES.WORKER_ERROR &&
+        cause.message.startsWith("boat_sandbox_state_transition: ")) return true;
+  }
+  return false;
+}
 
 // Linux boot identity plus start ticks identifies a process generation across
 // PID reuse. exec preserves both the launch shell's PID and its start ticks.
@@ -17379,6 +17409,7 @@ export function createRemoteRunnerProcessLauncher(input: {
       });
 
       let supervisionUnknownSince: number | null = null;
+      let retainedTransitionMs = 0;
       // A socket close alone is never permission to replace a possibly live PID.
       while (true) {
         const supervision = input.sandboxRetention?.supervision;
@@ -17387,10 +17418,13 @@ export function createRemoteRunnerProcessLauncher(input: {
         if (supervision?.detached) return await new Promise<Awaited<RunnerProcessHandle["completion"]>>(() => {});
         const monitorGeneration = supervision?.generation;
         verificationRequested = false;
+        const observationStartedAt = Date.now();
+        let transitionRefusal: unknown;
         const observed = await readRemoteRunnerRecoveryProbe({
           runner,
           stage: "process_verification",
-          deadline: Date.now() + REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+          deadline: observationStartedAt + Math.min(REMOTE_RUNNER_RECOVERY_PROBE_BUDGET_MS,
+            REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs),
           readOnly: true,
           request: {
             command: "sh",
@@ -17409,12 +17443,30 @@ export function createRemoteRunnerProcessLauncher(input: {
         }).catch(error => {
           if (supervision && !supervision.accepts(monitorGeneration!)) return null;
           supervisionUnknownSince ??= Date.now();
+          if (remoteRunnerSandboxTransitionRefusal(error)) {
+            if (pendingSignal) throw error;
+            retainedTransitionMs += Math.max(0, Date.now() - observationStartedAt);
+            if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(error);
+            transitionRefusal = error;
+            return null;
+          }
+          // Preserve this line's independent connected-runner grace for other
+          // observation errors. A named refusal alone may outlive disconnect.
           if (spec.isRunnerConnected?.() !== true || Date.now() - supervisionUnknownSince >= REMOTE_RUNNER_RECONNECT_GRACE_MS) throw error;
           return null;
         });
         if (supervision && !supervision.accepts(monitorGeneration!)) continue;
         if (!observed) {
-          await waitForExitVerification(REMOTE_RUNNER_PROCESS_POLL_MS);
+          const waitStartedAt = Date.now();
+          await waitForExitVerification(transitionRefusal
+            ? Math.min(REMOTE_RUNNER_PROCESS_POLL_MS, REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS - retainedTransitionMs)
+            : REMOTE_RUNNER_PROCESS_POLL_MS);
+          if (supervision && !supervision.accepts(monitorGeneration!)) continue;
+          if (transitionRefusal) {
+            retainedTransitionMs += Math.max(0, Date.now() - waitStartedAt);
+            if (pendingSignal) throw transitionRefusal;
+            if (retainedTransitionMs >= REMOTE_RUNNER_PROCESS_TRANSITION_BUDGET_MS) throw remoteRunnerObservationExhausted(transitionRefusal);
+          }
           continue;
         }
         supervisionUnknownSince = null;

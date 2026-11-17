@@ -36,7 +36,12 @@ export async function readRemoteRunnerRecoveryProbe(input: {
   stall?: RemoteRunnerPluginStall;
 }) {
   return retryRemoteRunnerRecoveryAttempt({ ...input,
-    attempt: timeoutMs => input.runner.execute({ ...input.request, readOnlyProbe: input.readOnly, timeoutMs }) });
+    attempt: timeoutMs => input.runner.execute({ ...input.request, readOnlyProbe: input.readOnly, timeoutMs,
+      // Carry the remaining allowance through the existing plugin abort path;
+      // never grant provider transport grace beyond this probe's deadline.
+      commandTimeoutMs: Math.min(timeoutMs, input.request.commandTimeoutMs && input.request.commandTimeoutMs > 0
+        ? input.request.commandTimeoutMs : Infinity),
+    }) });
 }
 
 /**
