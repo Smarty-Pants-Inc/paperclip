@@ -1,0 +1,995 @@
+{
+  "mode": "absent",
+  "verdict": "PASS",
+  "observedAtMs": 6227,
+  "failure": null,
+  "resumes": 1,
+  "launches": 2,
+  "monitorRuns": 6,
+  "monitorSuccessAfterResume": 4,
+  "exit45": 1,
+  "monitorError": null,
+  "pendingAtArchive": {
+    "at": 730,
+    "personMessage": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+    "commands": [
+      {
+        "schema": "paperclip.prp.command.v1",
+        "commandId": "command_lab_da3ca2c928514952af3649a84f2c6cca",
+        "controllerSeq": 3,
+        "type": "turn.start",
+        "issuedAt": "2026-11-17T12:13:24.102Z",
+        "payload": {
+          "text": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+          "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00"
+        },
+        "status": "pending",
+        "result": null
+      }
+    ],
+    "providerTokenTurns": 0,
+    "answerCount": 0,
+    "oldRunnerPids": [
+      980176
+    ],
+    "oldRunnerStatuses": [
+      {
+        "pid": 980176,
+        "state": "T"
+      }
+    ],
+    "beforeArchiveReceipts": [
+      {
+        "at": 1794917604028,
+        "pid": 980193,
+        "event": "provider-start",
+        "upstreamPid": 980203
+      }
+    ]
+  },
+  "once": {
+    "token": "633410e0-0d12-4a7c-9b86-74a78d3f1759",
+    "personMessage": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+    "turnInputs": [
+      {
+        "at": 1794917605935,
+        "pid": 980277,
+        "event": "turn-input",
+        "requestId": 4,
+        "input": [
+          {
+            "text": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+            "text_elements": [],
+            "type": "text"
+          }
+        ],
+        "upstreamPid": 980287
+      }
+    ],
+    "answers": [
+      {
+        "at": 1794917605939,
+        "pid": 980277,
+        "event": "answer",
+        "turnId": "provider-turn-1",
+        "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759."
+      }
+    ],
+    "visibleAnswers": [
+      {
+        "at": 2695,
+        "method": "item/completed",
+        "params": {
+          "channel": "progress",
+          "itemId": "message-1",
+          "kind": "agentMessage",
+          "provider": "codex",
+          "status": "completed",
+          "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759.",
+          "threadId": "codex-thread-1",
+          "turnId": "provider-turn-1",
+          "item": {
+            "id": "message-1",
+            "type": "agentMessage",
+            "status": "completed",
+            "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759.",
+            "phase": "commentary",
+            "channel": "progress"
+          }
+        }
+      }
+    ],
+    "tokenTurnCount": 1,
+    "tokenAnswerCount": 1,
+    "visibleTokenAnswerCount": 1,
+    "completedTurnCount": 1,
+    "providerReceipts": [
+      {
+        "at": 1794917604028,
+        "pid": 980193,
+        "event": "provider-start",
+        "upstreamPid": 980203
+      },
+      {
+        "at": 1794917605924,
+        "pid": 980277,
+        "event": "provider-start",
+        "upstreamPid": 980287
+      },
+      {
+        "at": 1794917605935,
+        "pid": 980277,
+        "event": "turn-input",
+        "requestId": 4,
+        "input": [
+          {
+            "text": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+            "text_elements": [],
+            "type": "text"
+          }
+        ],
+        "upstreamPid": 980287
+      },
+      {
+        "at": 1794917605939,
+        "pid": 980277,
+        "event": "answer",
+        "turnId": "provider-turn-1",
+        "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759."
+      }
+    ]
+  },
+  "checks": {
+    "uniqueFact": true,
+    "pendingBeforeArchive": true,
+    "confirmedExitBeforeRestart": true,
+    "oneProviderTurn": true,
+    "noOldRunnerTurn": true,
+    "oneMatchingProviderAnswer": true,
+    "oneMatchingDeliveredAnswer": true,
+    "oneCompletedTurn": true,
+    "sameDurableCommandCompleted": true,
+    "finalStateSettled": true
+  },
+  "requestAdmission": {
+    "verdict": "FAIL",
+    "error": "runnerd exited while waiting for turn.start",
+    "result": null
+  },
+  "finalRunState": {
+    "controllerCommands": [
+      {
+        "schema": "paperclip.prp.command.v1",
+        "commandId": "command_lab_da3ca2c928514952af3649a84f2c6cca",
+        "controllerSeq": 3,
+        "type": "turn.start",
+        "issuedAt": "2026-11-17T12:13:24.102Z",
+        "payload": {
+          "text": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+          "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00"
+        },
+        "status": "completed",
+        "result": {
+          "commandId": "command_lab_da3ca2c928514952af3649a84f2c6cca",
+          "commandType": "turn.start",
+          "controllerSeq": 3,
+          "result": {
+            "providerTurnId": "provider-turn-1",
+            "status": "accepted"
+          },
+          "status": "completed"
+        }
+      }
+    ],
+    "runnerLifecycle": "ready",
+    "runnerActiveTurn": null,
+    "providerState": {
+      "threadId": "codex-thread-1",
+      "activeTurnId": null,
+      "nextTurn": 0,
+      "goal": null
+    },
+    "thread": {
+      "id": "codex-thread-1",
+      "sessionId": "codex-account-session",
+      "cwd": "/srv/scratch/paul/tasks/tmp/sl-task-s1K85dTR/monitor-absent-979273",
+      "turns": [
+        {
+          "id": "provider-turn-1",
+          "status": "completed",
+          "error": null
+        }
+      ]
+    },
+    "transportFailure": null,
+    "turnResult": null,
+    "turnError": "runnerd exited while waiting for turn.start",
+    "notificationsDone": false
+  },
+  "authenticatedAnswer": {
+    "thread": {
+      "id": "codex-thread-1",
+      "sessionId": "codex-account-session",
+      "cwd": "/srv/scratch/paul/tasks/tmp/sl-task-s1K85dTR/monitor-absent-979273",
+      "turns": [
+        {
+          "id": "provider-turn-1",
+          "status": "completed",
+          "error": null
+        }
+      ]
+    }
+  },
+  "evidence": {
+    "runnerPid": null,
+    "runnerProcessGroupId": null,
+    "providerPid": 980277,
+    "providerProcessStartedAt": "2026-11-17T12:13:25.320Z",
+    "codexPid": 980277,
+    "codexProcessStartedAt": "2026-11-17T12:13:25.320Z",
+    "sidecarPid": null,
+    "sidecarProcessStartedAt": null,
+    "agentPid": null,
+    "agentProcessStartedAt": null,
+    "providerDriver": "codex_app_server",
+    "providerVersion": "codex-app-server-v1",
+    "acpxAgent": null,
+    "agentServerVersion": null,
+    "agentRuntimeVersion": null,
+    "acpProtocolVersion": null,
+    "providerExecutionKind": null,
+    "providerService": null,
+    "runnerExited": false,
+    "runnerExitCode": null,
+    "runnerSignal": null,
+    "childEnvironmentKeys": [],
+    "diagnostics": [
+      "lab transport selected authenticated durable PRP",
+      "runnerd authenticated to the durable PRP control plane",
+      "runner_remote_process_exited lifecycle=ready",
+      "runner process disconnected; recovery is allowed for 10000ms",
+      "runner process restored its durable PRP session"
+    ]
+  },
+  "diagnostics": [
+    {
+      "at": 720,
+      "message": "runnerd authenticated to the durable PRP control plane"
+    },
+    {
+      "at": 2401,
+      "message": "runner_remote_process_exited lifecycle=ready"
+    },
+    {
+      "at": 2401,
+      "message": "runner process disconnected; recovery is allowed for 10000ms"
+    },
+    {
+      "at": 2518,
+      "message": "runner process restored its durable PRP session"
+    },
+    {
+      "at": 6839,
+      "message": "runner_remote_process_exited lifecycle=suspended diagnostics=[\"runner restored its durable identity after process recovery\"]"
+    },
+    {
+      "at": 6839,
+      "message": "runner_remote_process_exited lifecycle=suspended diagnostics=[\"runner restored its durable identity after process recovery\"]"
+    }
+  ],
+  "calls": [
+    {
+      "at": 471,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 492,
+      "route": "/sandboxes/bx_f47np3kk/files",
+      "method": "PUT",
+      "state": "ready"
+    },
+    {
+      "at": 493,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 536,
+      "route": "/sandboxes/bx_f47np3kk/files",
+      "method": "DELETE",
+      "state": "ready"
+    },
+    {
+      "at": 537,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 1
+    },
+    {
+      "at": 652,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 672,
+      "event": "spawn",
+      "pid": 980176
+    },
+    {
+      "at": 672,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 672,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 720,
+      "event": "authenticated-thread-start"
+    },
+    {
+      "at": 721,
+      "event": "monitor-result",
+      "exitCode": 0,
+      "timedOut": false,
+      "resumes": 0
+    },
+    {
+      "at": 730,
+      "event": "person-message-durably-pending-before-archive"
+    },
+    {
+      "at": 730,
+      "event": "archive-start"
+    },
+    {
+      "at": 1722,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 1722,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "archiving",
+      "refused": true
+    },
+    {
+      "at": 1723,
+      "route": "/sandboxes/bx_f47np3kk",
+      "method": "GET",
+      "state": "archiving",
+      "observed": "archiving"
+    },
+    {
+      "at": 2223,
+      "route": "/sandboxes/bx_f47np3kk",
+      "method": "GET",
+      "state": "archiving",
+      "observed": "archived"
+    },
+    {
+      "at": 2224,
+      "route": "/sandboxes/bx_f47np3kk/resume",
+      "method": "POST",
+      "state": "archived"
+    },
+    {
+      "at": 2225,
+      "event": "archive-process-killed",
+      "pid": 980176
+    },
+    {
+      "at": 2225,
+      "event": "archive-process-killed",
+      "pid": 980193
+    },
+    {
+      "at": 2225,
+      "event": "archive-process-killed",
+      "pid": 980203
+    },
+    {
+      "at": 2326,
+      "route": "/sandboxes/bx_f47np3kk",
+      "method": "GET",
+      "state": "ready",
+      "observed": "ready"
+    },
+    {
+      "at": 2326,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 45
+    },
+    {
+      "at": 2368,
+      "event": "monitor-result",
+      "exitCode": 45,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 2368,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 1
+    },
+    {
+      "at": 2385,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 2401,
+      "event": "handle-resolved",
+      "exitConfirmed": true,
+      "code": null
+    },
+    {
+      "at": 2406,
+      "route": "/sandboxes/bx_f47np3kk/files",
+      "method": "PUT",
+      "state": "ready"
+    },
+    {
+      "at": 2406,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 2451,
+      "route": "/sandboxes/bx_f47np3kk/files",
+      "method": "DELETE",
+      "state": "ready"
+    },
+    {
+      "at": 2452,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 2569,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 2586,
+      "event": "spawn",
+      "pid": 980260
+    },
+    {
+      "at": 2586,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 2586,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 2624,
+      "event": "monitor-result",
+      "exitCode": 0,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 3624,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 3624,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 3665,
+      "event": "monitor-result",
+      "exitCode": 0,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 4665,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 4665,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 4709,
+      "event": "monitor-result",
+      "exitCode": 0,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 5715,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 5715,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 5759,
+      "event": "monitor-result",
+      "exitCode": 0,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 6227,
+      "event": "case-verdict",
+      "verdict": "PASS"
+    },
+    {
+      "at": 6227,
+      "event": "cleanup-start"
+    },
+    {
+      "at": 6761,
+      "event": "monitor-call",
+      "timeoutMs": 10000,
+      "scriptMatches": true
+    },
+    {
+      "at": 6762,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 45
+    },
+    {
+      "at": 6804,
+      "event": "monitor-result",
+      "exitCode": 45,
+      "timedOut": false,
+      "resumes": 1
+    },
+    {
+      "at": 6805,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 1
+    },
+    {
+      "at": 6823,
+      "route": "/sandboxes/bx_f47np3kk/commands",
+      "method": "POST",
+      "state": "ready",
+      "exitCode": 0
+    },
+    {
+      "at": 6839,
+      "event": "handle-resolved",
+      "exitConfirmed": true,
+      "code": null
+    }
+  ],
+  "events": [
+    {
+      "at": 2638,
+      "method": "paperclip/canonicalProviderEvent",
+      "params": {
+        "threadId": "codex-thread-1",
+        "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00",
+        "eventType": "harness.diagnostic",
+        "payload": {
+          "code": "provider_startup_ownership",
+          "startup": {
+            "attemptedProcessGeneration": 1,
+            "authenticatedThreadId": null,
+            "beforeSpawn": true,
+            "command": {
+              "commandId": "command_prp_00000002",
+              "commandType": "session.open",
+              "controllerSeq": 2
+            },
+            "configurationFingerprint": "sha256:18eb6bc5e16d2d486cfb27a4ea45cc06e1510bfcfc002e70c9239974bb363a4d",
+            "directChildExitObserved": false,
+            "exitCode": null,
+            "failedStage": null,
+            "launchId": "d90edac6-53c5-40d2-b324-cd3e3c4f1b0a",
+            "origin": {
+              "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "normalizedSessionId": "session_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runId": "run_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runnerInstanceId": "runner_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "turnId": "turn_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+            },
+            "phase": "intent",
+            "processGroupId": null,
+            "processId": null,
+            "processTreeRetired": false,
+            "requestedThreadId": null,
+            "schema": "paperclip.provider_startup.v1",
+            "signal": null,
+            "trigger": "ensure"
+          }
+        },
+        "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+      }
+    },
+    {
+      "at": 2649,
+      "method": "paperclip/canonicalProviderEvent",
+      "params": {
+        "threadId": "codex-thread-1",
+        "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00",
+        "eventType": "harness.diagnostic",
+        "payload": {
+          "code": "provider_startup_ownership",
+          "startup": {
+            "attemptedProcessGeneration": 1,
+            "authenticatedThreadId": null,
+            "command": {
+              "commandId": "command_prp_00000002",
+              "commandType": "session.open",
+              "controllerSeq": 2
+            },
+            "configurationFingerprint": "sha256:18eb6bc5e16d2d486cfb27a4ea45cc06e1510bfcfc002e70c9239974bb363a4d",
+            "directChildExitObserved": false,
+            "exitCode": null,
+            "failedStage": null,
+            "launchId": "d90edac6-53c5-40d2-b324-cd3e3c4f1b0a",
+            "origin": {
+              "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "normalizedSessionId": "session_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runId": "run_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runnerInstanceId": "runner_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "turnId": "turn_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+            },
+            "phase": "spawned",
+            "processGroupId": 980193,
+            "processId": 980193,
+            "processTreeRetired": false,
+            "requestedThreadId": null,
+            "schema": "paperclip.provider_startup.v1",
+            "signal": null,
+            "trigger": "ensure"
+          }
+        },
+        "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+      }
+    },
+    {
+      "at": 2649,
+      "method": "paperclip/canonicalProviderEvent",
+      "params": {
+        "threadId": "codex-thread-1",
+        "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00",
+        "eventType": "harness.diagnostic",
+        "payload": {
+          "code": "provider_startup_ownership",
+          "startup": {
+            "attemptedProcessGeneration": 2,
+            "authenticatedThreadId": null,
+            "beforeSpawn": true,
+            "command": {
+              "commandId": "command_lab_da3ca2c928514952af3649a84f2c6cca",
+              "commandType": "turn.start",
+              "controllerSeq": 3
+            },
+            "configurationFingerprint": "sha256:18eb6bc5e16d2d486cfb27a4ea45cc06e1510bfcfc002e70c9239974bb363a4d",
+            "directChildExitObserved": false,
+            "exitCode": null,
+            "failedStage": null,
+            "launchId": "07f694a1-9b3a-4d33-8855-3d7aad9f21a1",
+            "origin": {
+              "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "normalizedSessionId": "session_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runId": "run_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runnerInstanceId": "runner_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "turnId": "turn_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+            },
+            "phase": "intent",
+            "processGroupId": null,
+            "processId": null,
+            "processTreeRetired": false,
+            "requestedThreadId": "codex-thread-1",
+            "schema": "paperclip.provider_startup.v1",
+            "signal": null,
+            "trigger": "restore"
+          }
+        },
+        "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+      }
+    },
+    {
+      "at": 2649,
+      "method": "paperclip/canonicalProviderEvent",
+      "params": {
+        "threadId": "codex-thread-1",
+        "turnId": "turn_lab_4971191dae794539a37053a4bb1d4d00",
+        "eventType": "harness.diagnostic",
+        "payload": {
+          "code": "provider_startup_ownership",
+          "startup": {
+            "attemptedProcessGeneration": 2,
+            "authenticatedThreadId": null,
+            "command": {
+              "commandId": "command_lab_da3ca2c928514952af3649a84f2c6cca",
+              "commandType": "turn.start",
+              "controllerSeq": 3
+            },
+            "configurationFingerprint": "sha256:18eb6bc5e16d2d486cfb27a4ea45cc06e1510bfcfc002e70c9239974bb363a4d",
+            "directChildExitObserved": false,
+            "exitCode": null,
+            "failedStage": null,
+            "launchId": "07f694a1-9b3a-4d33-8855-3d7aad9f21a1",
+            "origin": {
+              "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "normalizedSessionId": "session_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runId": "run_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "runnerInstanceId": "runner_lab_6c4b9b80ee1e460986bd10ceb6236e4f",
+              "turnId": "turn_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+            },
+            "phase": "spawned",
+            "processGroupId": 980277,
+            "processId": 980277,
+            "processTreeRetired": false,
+            "requestedThreadId": "codex-thread-1",
+            "schema": "paperclip.provider_startup.v1",
+            "signal": null,
+            "trigger": "restore"
+          }
+        },
+        "itemId": "item_lab_6c4b9b80ee1e460986bd10ceb6236e4f"
+      }
+    },
+    {
+      "at": 2690,
+      "method": "turn/started",
+      "params": {
+        "provider": "codex",
+        "providerTurnId": "provider-turn-1",
+        "threadId": "codex-thread-1",
+        "turnId": "provider-turn-1",
+        "turn": {
+          "id": "provider-turn-1"
+        }
+      }
+    },
+    {
+      "at": 2695,
+      "method": "item/completed",
+      "params": {
+        "channel": "progress",
+        "itemId": "message-1",
+        "kind": "agentMessage",
+        "provider": "codex",
+        "status": "completed",
+        "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759.",
+        "threadId": "codex-thread-1",
+        "turnId": "provider-turn-1",
+        "item": {
+          "id": "message-1",
+          "type": "agentMessage",
+          "status": "completed",
+          "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759.",
+          "phase": "commentary",
+          "channel": "progress"
+        }
+      }
+    },
+    {
+      "at": 2700,
+      "method": "thread/tokenUsage/updated",
+      "params": {
+        "cumulative": {
+          "activeSeconds": 0,
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "inputTokens": 12,
+          "outputTokens": 3,
+          "providerCostUsd": 0,
+          "requests": 0
+        },
+        "model": null,
+        "provider": "codex",
+        "providerRequestId": null,
+        "providerSessionId": "codex-thread-1",
+        "runDelta": {
+          "activeSeconds": 0,
+          "cacheReadTokens": 0,
+          "cacheWriteTokens": 0,
+          "inputTokens": 12,
+          "outputTokens": 3,
+          "providerCostUsd": 0,
+          "requests": 0
+        },
+        "runDeltaAvailable": true,
+        "runDeltaBasis": "run",
+        "threadId": "codex-thread-1",
+        "turnId": "provider-turn-1",
+        "tokenUsage": {
+          "total": {
+            "activeSeconds": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "inputTokens": 12,
+            "outputTokens": 3,
+            "providerCostUsd": 0,
+            "requests": 0
+          },
+          "runDelta": {
+            "activeSeconds": 0,
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "inputTokens": 12,
+            "outputTokens": 3,
+            "providerCostUsd": 0,
+            "requests": 0
+          },
+          "runDeltaComplete": true
+        }
+      }
+    },
+    {
+      "at": 2700,
+      "method": "turn/completed",
+      "params": {
+        "error": null,
+        "provider": "codex",
+        "providerTurnId": "provider-turn-1",
+        "status": "completed",
+        "threadId": "codex-thread-1",
+        "turnId": "provider-turn-1",
+        "turn": {
+          "id": "provider-turn-1",
+          "status": "completed",
+          "error": null
+        }
+      }
+    }
+  ],
+  "endLine": "packages/paperclip-runner/src/live/runnerd-codex-transport.ts:8896-8898",
+  "cleanup": {
+    "turnRequestSettled": true,
+    "notificationsDone": true,
+    "handleResults": [
+      {
+        "status": "fulfilled",
+        "value": {
+          "code": null,
+          "signal": null,
+          "stdout": "",
+          "stderr": "runner_remote_process_exited lifecycle=ready"
+        }
+      },
+      {
+        "status": "fulfilled",
+        "value": {
+          "code": null,
+          "signal": null,
+          "stdout": "",
+          "stderr": "runner_remote_process_exited lifecycle=suspended diagnostics=[\"runner restored its durable identity after process recovery\"]"
+        }
+      }
+    ],
+    "ownedPids": [
+      980176,
+      980260,
+      980193,
+      980203,
+      980277,
+      980287
+    ],
+    "processes": [
+      {
+        "pid": 980176,
+        "state": "absent"
+      },
+      {
+        "pid": 980260,
+        "state": "absent"
+      },
+      {
+        "pid": 980193,
+        "state": "absent"
+      },
+      {
+        "pid": 980203,
+        "state": "absent"
+      },
+      {
+        "pid": 980277,
+        "state": "absent"
+      },
+      {
+        "pid": 980287,
+        "state": "absent"
+      }
+    ],
+    "terminalReceipts": [
+      {
+        "at": 1794917604028,
+        "pid": 980193,
+        "event": "provider-start",
+        "upstreamPid": 980203
+      },
+      {
+        "at": 1794917605924,
+        "pid": 980277,
+        "event": "provider-start",
+        "upstreamPid": 980287
+      },
+      {
+        "at": 1794917605935,
+        "pid": 980277,
+        "event": "turn-input",
+        "requestId": 4,
+        "input": [
+          {
+            "text": "The code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759. Tell me my code word.",
+            "text_elements": [],
+            "type": "text"
+          }
+        ],
+        "upstreamPid": 980287
+      },
+      {
+        "at": 1794917605939,
+        "pid": 980277,
+        "event": "answer",
+        "turnId": "provider-turn-1",
+        "text": "Your code word is 633410e0-0d12-4a7c-9b86-74a78d3f1759."
+      },
+      {
+        "at": 1794917609646,
+        "pid": 980277,
+        "event": "provider-exit",
+        "code": 0,
+        "signal": null
+      }
+    ],
+    "terminalInputCount": 1,
+    "terminalAnswerCount": 1
+  }
+}
