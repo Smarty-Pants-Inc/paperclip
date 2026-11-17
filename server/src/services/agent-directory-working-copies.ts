@@ -799,8 +799,8 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
-          // A verified save ends any earlier failed save's hold (both stopped
-          // paths strip it; collectStopped's cold path does the same).
+          // A verified save ends any earlier failed save's hold. This warm
+          // path and collectStopped's cold path both strip it.
           receipt: { ...withoutSaveHold(row.receipt), baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
             checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning, conflicts,
             pendingConflicts: [...pendingConflicts(row), ...conflicts] } });
