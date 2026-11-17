@@ -2,7 +2,7 @@ import { notifyStrandedAgentStatus } from "../live-run-recovery-notifications.js
 import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
-import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, lte, ne, sql } from "drizzle-orm";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../../telemetry.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
@@ -12,6 +12,7 @@ import { finishedIdleRun, finishedIdleWake, finishedFailedIdleLease } from "../i
 type Outcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
 
 const RECONCILIATION_GRACE_MS = 5 * 60_000;
+const TERMINAL_RUN_STATUSES = new Set(["succeeded", "failed", "cancelled", "timed_out", "interrupted"]);
 const RECONCILIATION_BATCH_SIZE = 25;
 
 function errorReason(reason: string | null | undefined) {
@@ -119,6 +120,52 @@ export function createHeartbeatAgentStatus(db: Db) {
     publishStatus(result.updated, outcome);
   }
 
+  /**
+   * Settle the agent of a run whose terminal status another path already
+   * committed (for a native run, the finalizer's projection), when the live
+   * owner lost the compare-and-set and so skipped its own settlement
+   * (smarty-dev#21005). Only a `running` agent of a ready lifecycle moves, only
+   * when this run is terminal and the agent has no other running or queued run,
+   * and the conditional write makes a repeated call a no-op.
+   */
+  async function settleAgentAfterCommittedRun(run: { id: string; companyId: string; agentId: string }) {
+    const result = await db.transaction(async (tx) => {
+      const [existing] = await tx.select().from(agents)
+        .where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId))).for("no key update");
+      if (!existing || existing.lifecycleState !== "ready" || existing.status !== "running") return null;
+      const [committed] = await tx.select({ status: heartbeatRuns.status, error: heartbeatRuns.error })
+        .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.agentId, run.agentId))).limit(1);
+      if (!committed || !TERMINAL_RUN_STATUSES.has(committed.status)) return null;
+      const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+        ne(heartbeatRuns.id, run.id), inArray(heartbeatRuns.status, ["running", "queued"]),
+      )).limit(1);
+      if (active) return null;
+      const nextStatus = settledStatus(committed.status);
+      const now = new Date();
+      await notifyStrandedAgentStatus(tx, { companyId: run.companyId, agentId: run.agentId });
+      await notifyAttentionRetentionWork(tx, { companyId: run.companyId });
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
+      const [updated] = await tx.update(agents).set({
+        status: nextStatus,
+        errorReason: nextStatus === "error" ? errorReason(committed.error) : null,
+        lastHeartbeatAt: now,
+        updatedAt: now,
+      }).where(and(eq(agents.id, run.agentId), eq(agents.companyId, run.companyId),
+        eq(agents.status, "running"), eq(agents.lifecycleState, "ready"),
+        // The agent row lock does not block a new run's insert (its foreign key
+        // takes only KEY SHARE), so re-check in the write itself.
+        sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs r
+          WHERE r.company_id = ${run.companyId} AND r.agent_id = ${run.agentId}
+            AND r.id <> ${run.id} AND r.status IN ('running', 'queued'))`)).returning();
+      return updated ? { updated, outcome: committed.status } : null;
+    });
+    if (!result) return null;
+    publishStatus(result.updated, result.outcome);
+    return result.updated;
+  }
+
   async function reconcileStrandedAgentStatuses(liveRunIds: () => ReadonlySet<string>, scope: { companyId?: string; agentId?: string; onDeferredDeadline?: (at: number) => void } = {}) {
     const now = new Date();
     const cutoff = new Date(now.getTime() - RECONCILIATION_GRACE_MS);
@@ -193,5 +240,5 @@ export function createHeartbeatAgentStatus(db: Db) {
     return reconciled;
   }
 
-  return { finalizeAgentStatus, reconcileStrandedAgentStatuses };
+  return { finalizeAgentStatus, settleAgentAfterCommittedRun, reconcileStrandedAgentStatuses };
 }
