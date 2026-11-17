@@ -72,6 +72,14 @@ const support = await getEmbeddedPostgresTestSupport();
     return { f, receipt };
   }
 
+  it("catches the real Send enqueue transaction awaiting the handed-off warm Runner proof", async () => {
+    const f = await seed("handoff");
+    proof.calls.length = 0;
+    await expect(heartbeatService(db).resumeQueuedCommentInterrupt(f.companyId, f.queueId))
+      .rejects.toThrow("network_call_in_db_transaction: runner:handedOffWarmOwnerRunnerExited");
+    expect(proof.calls).toEqual([]); // Guard stops the real path before the mocked network proof.
+  });
+
   it.each(["handoff", "with_file"] as const)("admits ONE successor onto the handed-off warm box at once: %s", async variant => {
     const { f, receipt } = await send(variant);
     expect(receipt.payload?.executionWait).toBeUndefined();

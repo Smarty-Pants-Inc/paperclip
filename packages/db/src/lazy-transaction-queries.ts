@@ -59,17 +59,19 @@ export function drizzleWithLazyTransactionQueries<TSchema extends Record<string,
       Object.defineProperty(this, "query", resolved(value));
     },
   };
-  const within = (callback: Callback, nestedSavepoint = false): Callback => (tx) => {
+  const within = (callback: Callback, nestedSavepoint = false, opener?: string): Callback => (tx) => {
     tx._.schema = tables;
     tx._.fullSchema = fullSchema;
     tx._.tableNamesMap = tableNamesMap;
     Object.defineProperty(tx, "query", lazyQuery);
     const savepoint = tx.transaction;
     tx.transaction = function (this: Transaction, nested, ...rest) {
-      return Reflect.apply(savepoint, this, [within(nested, true), ...rest]);
+      return Reflect.apply(savepoint, this, [within(nested, true, new Error("DB savepoint opened").stack), ...rest]);
     };
-    return runInTransactionContext(() => callback(tx), nestedSavepoint);
+    return runInTransactionContext(() => callback(tx), nestedSavepoint, opener);
   };
-  (db as unknown as Transaction).transaction = (callback, ...rest) => transactions.transaction(within(callback), ...rest);
+  (db as unknown as Transaction).transaction = (callback, ...rest) => transactions.transaction(
+    within(callback, false, new Error("DB transaction opened").stack), ...rest,
+  );
   return db;
 }

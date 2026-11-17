@@ -5,17 +5,17 @@ import { appendFileSync } from "node:fs";
  * so work merely started inside a transaction (fire and forget) is not counted once that transaction ends.
  * A transaction opened directly in a dedicated lock session (and its savepoints) is marked 'dedicated lock
  * session', not counted: upstream's designed finalization-lock pattern (workspace-source-lock.ts). */
-type Frame = { open: boolean; dedicated: boolean; lockSession?: true; parent: Frame | undefined };
+type Frame = { open: boolean; dedicated: boolean; lockSession?: true; opener?: string; parent: Frame | undefined };
 const openTransaction = new AsyncLocalStorage<Frame>();
 
 export function runInDedicatedLockSession<T>(work: () => T): T {
   return openTransaction.run({ open: false, dedicated: true, lockSession: true, parent: openTransaction.getStore() }, work);
 }
 
-export function runInTransactionContext<T>(work: () => T, savepoint = false): T {
+export function runInTransactionContext<T>(work: () => T, savepoint = false, opener?: string): T {
   const parent = openTransaction.getStore();
   const dedicated = parent?.dedicated === true && (savepoint ? !parent.lockSession : parent.lockSession === true);
-  const frame: Frame = { open: true, dedicated, parent };
+  const frame: Frame = { open: true, dedicated, parent, opener };
   return openTransaction.run(frame, () => {
     const close = () => { frame.open = false; };
     try {
@@ -41,8 +41,11 @@ export function assertNoOpenTransaction(client: string): void {
   const stack = error.stack ?? "";
   const site = `${client}@${stack.split("\n").slice(2, 4).map(line => line.trim()).join(" <- ")}`;
   const worker = (globalThis as { __vitest_worker__?: { filepath?: string; current?: { name?: string } } }).__vitest_worker__;
+  const transactionOpeners: string[] = [];
+  for (let frame = openTransaction.getStore(); frame; frame = frame.parent)
+    if (frame.open && !frame.dedicated && frame.opener) transactionOpeners.push(frame.opener);
   const record = { level: "warn", event: "network_call_in_db_transaction", client, site, mode: mode ?? "log",
-    testFile: worker?.filepath, test: worker?.current?.name, stack };
+    testFile: worker?.filepath, test: worker?.current?.name, stack, transactionOpeners };
   const report = process.env.PAPERCLIP_TX_NETWORK_GUARD_REPORT;
   if (report) appendFileSync(report, `${JSON.stringify(record)}\n`);
   if (mode === "throw") throw error;
