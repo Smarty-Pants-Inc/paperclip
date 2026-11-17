@@ -1,5 +1,5 @@
 import { withAccountingTransaction } from "../accounting-transaction.js";
-import { workspaceRestoreDelayedProjectionSql, workspaceRestorePendingProjectionSql, workspaceRestoreRecoveredProjectionSql } from "../workspace-restore-recovery-state.js";
+import { workspaceRestoreDelayedProjectionSql, workspaceRestorePendingProjectionSql, workspaceRestoreRecoveredProjectionSql, workspaceRestoreStopWaitProjectionSql } from "../workspace-restore-recovery-state.js";
 import { assertAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
 import { preservePiConversation } from "../native-runtime/pi-conversation-record.js";
@@ -252,6 +252,7 @@ const heartbeatRunSafeResultJsonColumn = sql<Record<string, unknown> | null>`
         'workspaceRestorePending', ${workspaceRestorePendingProjectionSql},
         'workspaceRestoreRecovered', ${workspaceRestoreRecoveredProjectionSql},
         'workspaceRestoreDelayed', ${workspaceRestoreDelayedProjectionSql},
+        'workspaceRestoreStopWait', ${workspaceRestoreStopWaitProjectionSql},
         'cancellation', case when jsonb_typeof(${heartbeatRuns.resultJson} -> 'cancellation') = 'object'
           then jsonb_strip_nulls(jsonb_build_object(
             'source', case when ${heartbeatRuns.resultJson} #>> '{cancellation,source}'

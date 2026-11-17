@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { heartbeatRuns } from "@paperclipai/db";
+import { STOP_PROOF_MAX_REARMS, STOP_PROOF_RECOVERY_SCHEMA } from "./system-recovery-state.js";
 import { hasWorkspaceRestoreFailure, WORKSPACE_RESTORE_PENDING_KEY, WORKSPACE_RESTORE_PERSON_BOUND_MS } from "@paperclipai/shared";
 
 export const LEGACY_WORKSPACE_RECOVERY_KEY = "workspaceRestoreRecovery";
@@ -65,6 +66,25 @@ export const workspaceRestorePendingProjectionSql = sql`case when ${runRestoreIn
 /** Projection: still in progress past the person bound; the person may Retry. */
 export const workspaceRestoreDelayedProjectionSql = sql`case when ${runRestoreInProgressSql}
   and ${runRestorePastBoundSql} then to_jsonb(true) end`;
+/** rf-3 15:30Z (3): the run's latest hold is exhausted on an unconfirmed stop
+ * (the SQL form of exhaustedStopWait in system-recovery-state.ts): the value is
+ * the failure code; the chat reads it as waiting with the card's words, no Retry.
+ * A recovered sibling wins, as for the status above. */
+export const workspaceRestoreStopWaitProjectionSql = sql`(select case
+    when hold.evidence #>> '{systemRecovery,state}' = 'exhausted'
+      and (hold.evidence #>> '{systemRecovery,failure,code}' = 'copyback_stop_unconfirmed'
+        or (hold.evidence #>> '{systemRecovery,failure,code}' = 'agent_stop_unconfirmed'
+          and hold.evidence #>> '{systemRecovery,failure,retryClass}' = 'recheck_evidence'
+          and coalesce(case when hold.evidence #>> '{stopProofRecovery,schema}' = ${STOP_PROOF_RECOVERY_SCHEMA}
+            and jsonb_typeof(hold.evidence #> '{stopProofRecovery,rearms}') = 'number'
+            then (hold.evidence #>> '{stopProofRecovery,rearms}')::numeric end, 0) < ${STOP_PROOF_MAX_REARMS}))
+    then hold.evidence #> '{systemRecovery,failure,code}' end
+  from issue_recovery_actions hold
+  where hold.company_id = ${heartbeatRuns.companyId}
+    and hold.evidence ->> 'runId' = ${heartbeatRuns.id}::text
+    and hold.evidence #>> '{workspaceRecovery,runId}' = ${heartbeatRuns.id}::text
+  order by (hold.evidence #>> '{workspaceRecovery,status}' = 'recovered') desc, hold.updated_at desc
+  limit 1)`;
 /** Projection of the run's owed fact once the worker recovered the files. */
 export const workspaceRestoreRecoveredProjectionSql = sql`case when ${runOwesRestoreSql}
   and ${runRestoreHoldStatusSql} = 'recovered' then to_jsonb(true) end`;

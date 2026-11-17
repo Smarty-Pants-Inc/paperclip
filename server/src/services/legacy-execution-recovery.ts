@@ -184,6 +184,17 @@ export async function terminalizeLegacyExecution(input: {
       const { [WORKSPACE_RESTORE_PENDING_KEY]: _owed, ...marker } = patch.resultJson;
       patch = { ...patch, resultJson: input.workspaceRestorePending === true ? { ...marker, [WORKSPACE_RESTORE_PENDING_KEY]: true } : marker };
     }
+    // rf-3 ad0eabf3 F1: an owed run whose source was not retained (a released
+    // reusable LEGACY source: preserveLegacyWorkspaceRestoreSources retains
+    // reusable sources for native runs only, matchesOriginalSource ephemeral
+    // only) has no workspaceRestoreRecovery, so the preservation above keeps
+    // nothing. A terminal patch that records no real restore failure keeps the
+    // run's existing marker and owed fact, the same rule as a lease-backed hold;
+    // the watchdog card below then reads it (isWorkspaceRestorePending).
+    if (!input.recordRestoreFailureOnly && patch?.resultJson && isWorkspaceRestorePending(current.resultJson)
+        && !hasRequiredWorkspaceRecovery(current.resultJson) && !hasWorkspaceRestoreFailure(patch.resultJson))
+      patch = { ...patch, resultJson: { ...patch.resultJson,
+        workspaceRestoreFailure: current.resultJson!.workspaceRestoreFailure, [WORKSPACE_RESTORE_PENDING_KEY]: true } };
     if (issueId) await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: current.companyId, issueId });
     await notifyInstructionCollection(tx, { companyId: current.companyId, runId: current.id });
     await notifyExecutionRunWork(tx, { companyId: current.companyId });
@@ -263,14 +274,6 @@ export async function terminalizeLegacyExecution(input: {
       // already records this exact no-replay decision, or a fresh continuation
       // already took it over: rewriting it would only churn its timestamps and
       // reset a coalesced continuation's delivery state.
-      const recorded = existing?.evidence.automaticRecovery as Record<string, unknown> | undefined;
-      const continuation = existing?.evidence.freshContinuation as Record<string, unknown> | undefined;
-      if (existing && (continuation?.sourceRunId === run.id || (existing.status === "resolved"
-        && recorded?.runId === run.id && recorded.replay === "blocked"
-        && existing.evidence.workspaceRestoreFailure === updated.resultJson!.workspaceRestoreFailure
-        && JSON.stringify(existing.evidence.workspaceRestoreRecovery) === JSON.stringify(updated.resultJson!.workspaceRestoreRecovery))))
-        return updated;
-      const now = new Date();
       // The hold keeps the persisted owed fact (run or existing hold) unless
       // THIS call records a real restore failure: a non-owed recorded failure,
       // or a terminal patch reporting one. Those cleared the run's fact above.
@@ -279,6 +282,16 @@ export async function terminalizeLegacyExecution(input: {
       const restorePending = input.workspaceRestorePending === true || (!recordsRealFailure
         && (updated.resultJson?.[WORKSPACE_RESTORE_PENDING_KEY] === true
           || existing?.evidence?.[WORKSPACE_RESTORE_PENDING_KEY] === true));
+      const recorded = existing?.evidence.automaticRecovery as Record<string, unknown> | undefined;
+      const continuation = existing?.evidence.freshContinuation as Record<string, unknown> | undefined;
+      if (existing && (continuation?.sourceRunId === run.id || (existing.status === "resolved"
+        && recorded?.runId === run.id && recorded.replay === "blocked"
+        && existing.evidence.workspaceRestoreFailure === updated.resultJson!.workspaceRestoreFailure
+        && JSON.stringify(existing.evidence.workspaceRestoreRecovery) === JSON.stringify(updated.resultJson!.workspaceRestoreRecovery)
+        // A recorded real failure must still clear an owed hold's words (and vice versa).
+        && (existing.evidence[WORKSPACE_RESTORE_PENDING_KEY] === true) === restorePending)))
+        return updated;
+      const now = new Date();
       const evidence = {
         ...existing?.evidence,
         runId: run.id,
