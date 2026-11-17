@@ -1,8 +1,10 @@
-import { and, desc, eq, inArray, isNull, not, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT, WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT } from "@paperclipai/shared";
 import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { executionBlockerPredicate, NEW_TASK_CONTINUE_ACTION, restoreHoldPredicate, restoreHoldReleasedForCurrentOwnerPredicate,
   withoutUnavailableRetry } from "./execution-blocker.js";
 import { WORKSPACE_RESTORE_PENDING_KEY, workspaceRestoreHoldNextAction } from "./legacy-execution-recovery.js";
+import { exhaustedStopWait, readSystemRecovery } from "./system-recovery-state.js";
 import {
   AGENT_PAUSED_ACTION, AGENT_PAUSED_RETRY_MESSAGE, AUTOMATIC_RECOVERY_MESSAGE, HELD_CONDITION, HELD_PREDECESSOR_NOTICE,
   HELD_NEW_TASK_MESSAGE, HELD_RECOVERED_NEW_TASK_MESSAGE, HELD_RECOVERED_WORK_MESSAGE, HELD_RETRY_ACTION, NEW_TASK_ACTION, NO_SAVED_WORK_NEW_TASK_MESSAGE, NO_SAVED_WORK_RETRY_ACTION, NO_SAVED_WORK_RETRY_MESSAGE,
@@ -62,6 +64,12 @@ export type RetryAuthorityFacts = {
   stopGate?: "waiting" | "expired" | null;
   /** A standing held-conversation notice, or the latest run's own prior-owner refusal. */
   heldConversation?: boolean;
+  /** restore-card7 (rf-3 15:30Z (3)): the source run's restore hold is exhausted
+   * on an unconfirmed stop (system-recovery-state.ts exhaustedStopWait). Retry
+   * cannot release it; the stop must be proven first. An agent stop whose every
+   * re-arm is spent is NOT this fact (exhaustedStopWait's carve-out): it keeps
+   * its Retry. */
+  restoreStopWait?: "copyback_stop_unconfirmed" | "agent_stop_unconfirmed" | null;
   /** An active restore hold's evidence (legacy-execution-recovery.ts owns its words). */
   restoreHold?: Record<string, unknown> | null;
   /** The latest deferred Retry's recorded refusal reason. */
@@ -110,6 +118,14 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
   if (facts.stopGate === "waiting") return decision("wait", "execution_settling", RETRY_STOP_WAIT_MESSAGE, RETRY_STOP_WAIT_ACTION);
   if (facts.stopGate === "expired")
     return decision("new_task", "execution_stop_unproven", RETRY_STOP_UNPROVEN_MESSAGE, RETRY_STOP_UNPROVEN_ACTION);
+  // restore-card7's exhausted stop wait: a wait, not a failure, in card7's shared
+  // words (the card's exhaustedSystemRecoveryAction and the chat's
+  // workspaceRestoreStopWaitText read the same constants). Before the restore
+  // hold: it is that hold's own state, and Retry cannot release it.
+  if (facts.restoreStopWait) {
+    const text = restoreStopWaitText(facts.restoreStopWait);
+    return decision("wait", RESTORE_STOP_WAIT_REASON, text, text);
+  }
   // Restore hold: the words are legacy-execution-recovery.ts's (restore-card),
   // never a second mapping here. Files owed: wait while they are recovered.
   if (facts.restoreHold) {
@@ -149,14 +165,46 @@ export function decideRetryAuthority(facts: RetryAuthorityFacts): RetryAuthority
  * Paperclip Cut B R4): the executor's durable HELD notice is. */
 export async function readRetryAuthorityFacts(db: Db, input: { companyId: string; issueId: string }) {
   const { readUnsupersededHeldConversationNotice } = await import("./native-runtime/pi-session-recovery-notice.js");
-  const [[assignee], notice, refusals] = await Promise.all([
+  const [[assignee], notice, refusals, restoreStopWait] = await Promise.all([
     db.select({ status: agents.status }).from(issues).innerJoin(agents, and(eq(agents.companyId, issues.companyId),
       eq(agents.id, issues.assigneeAgentId))).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1),
     readUnsupersededHeldConversationNotice(db, { companyId: input.companyId, issueId: input.issueId }),
     heldTaskRetryRefusals(db, input.companyId, [input.issueId]),
+    readRestoreStopWait(db, input),
   ]);
   return { agentPaused: assignee?.status === "paused", heldConversation: Boolean(notice),
-    heldRefusal: refusals.get(input.issueId) ?? null } satisfies RetryAuthorityFacts;
+    heldRefusal: refusals.get(input.issueId) ?? null, restoreStopWait } satisfies RetryAuthorityFacts;
+}
+
+export const RESTORE_STOP_WAIT_REASON = "workspace_restore_stop_wait";
+function restoreStopWaitText(code: "copyback_stop_unconfirmed" | "agent_stop_unconfirmed") {
+  return code === "copyback_stop_unconfirmed" ? WORKSPACE_RESTORE_COPYBACK_STOP_WAIT_TEXT : WORKSPACE_RESTORE_AGENT_STOP_WAIT_TEXT;
+}
+/** The restoreStopWait fact of one hold's evidence (card7's exhaustedStopWait,
+ * carve-out included). */
+export function restoreStopWaitFact(evidence: Record<string, unknown> | null | undefined) {
+  return exhaustedStopWait(readSystemRecovery(evidence), evidence);
+}
+/** The restoreStopWait fact for a task: the same rows restore-card7's admission
+ * check read (task-retry.ts, deleted there): any recovery action of this task
+ * whose source run is the task's latest run (Retry's source), while that run is
+ * not queued, running or a scheduled retry. The exhausted state pre-exists any
+ * Retry: admission's adoption only adds a 'scheduled' systemRecovery to a row
+ * that has none (system-recovery.ts adoptSystemRecovery / createSystemRecovery). */
+async function readRestoreStopWait(db: Db, input: { companyId: string; issueId: string }) {
+  const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId), or(eq(heartbeatRuns.issueId, input.issueId),
+      eq(heartbeatRuns.nativeIssueId, input.issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`)))
+    .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+  if (!latest || ["queued", "running", "scheduled_retry"].includes(latest.status)) return null;
+  const records = await db.select({ evidence: issueRecoveryActions.evidence }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, input.companyId), eq(issueRecoveryActions.sourceIssueId, input.issueId),
+    sql`${issueRecoveryActions.evidence}->>'runId' = ${latest.id}`));
+  for (const record of records) {
+    const code = restoreStopWaitFact(record.evidence);
+    if (code) return code;
+  }
+  return null;
 }
 
 /** The task's active restore hold evidence (the hold the execution blocker
@@ -184,7 +232,10 @@ export async function readRestoreHoldEvidence(db: Db, input: { companyId: string
 //   Retry for (the card's own check); its words are restore-card's.
 // - execution_stop_unproven: the Retry's source Stop expired unproven (the
 //   Stop gate); a waiting Stop is not refused (admission defers it visibly).
-const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven"]);
+// - workspace_restore_stop_wait (restore-card7): the hold waits on an unconfirmed
+//   stop; a repeat refuses too (the fact does not depend on the click).
+const REFUSED_BEFORE_ADMISSION: ReadonlySet<string> = new Set(["agent_paused", "workspace_repair_required", "execution_stop_unproven",
+  RESTORE_STOP_WAIT_REASON]);
 // A repeat of an already accepted Retry (`repeat`) is refused only where the card
 // now refuses for good (an expired Stop, a pause, a restore that failed): a
 // restore still pending is a wait whose own words keep the message and run it
