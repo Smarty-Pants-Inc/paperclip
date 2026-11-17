@@ -21,8 +21,10 @@ describe("recovered-work receipt respects the conversation's held state", () => 
   beforeEach(async () => { await db.execute(sql`truncate companies cascade`); });
   afterAll(async () => { await db?.$client.end({ timeout: 1 }); await database?.cleanup(); });
 
-  it("the actual held-predecessor notice gives the one action that does not reuse the held owner", () => {
-    expect(HELD_PREDECESSOR_NOTICE).toBe("Your message and saved work are kept, but this conversation cannot continue. Assign this agent a new task to continue.");
+  // SUPERSEDE (rf-3 STOP 2, RFL ruling 14:12Z; follow-Paperclip Cut B R8): the held
+  // notice names Retry (a fresh run with the conversation's history), never a new task.
+  it("supersedes: the actual held-predecessor notice gives the one action that does not reuse the held owner", () => {
+    expect(HELD_PREDECESSOR_NOTICE).toBe("Your message and saved work are kept, but the previous run of this conversation did not finish. Press Retry to continue in a fresh run with this conversation's history.");
   });
 
   async function fixture(held: boolean) {

@@ -1075,9 +1075,9 @@ async function decideUnansweredMessage(q: Db, issue: DecisionIssue, now: Date,
         : supervisionUnconfirmed ? "Retry or send a new message to continue through fenced recovery."
         : heldAtEndBound ? "Send a new message to try again."
         : cardAnswer ? "Retry; if it fails again, assign this agent a new task."
-        // Retry fold: a HELD body names only a new task; its Next action is the same one instruction.
+        // rf-3 STOP 2: a HELD body names Retry (a held notice never withholds it); its Next action is that same one instruction.
         : boundReached ? "Send a new message to try again."
-        : held ? decideRetryAuthority({ heldConversation: true }).nextAction!
+        : held ? decideRetryAuthority({ heldConversation: true, retrySource: true }).nextAction!
         : "Send the message again; if it fails again, assign this agent a new task.",
     },
     recoveryActionId: boardHold?.id ?? null,
