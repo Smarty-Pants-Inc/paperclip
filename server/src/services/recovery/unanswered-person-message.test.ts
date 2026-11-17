@@ -34,7 +34,8 @@ import { HELD_PREDECESSOR_NOTICE as HELD, noticeHeldUnfinishedPredecessor } from
 import { buildNoRunningExecutionNoticeSeed, buildStrandedRecoveryEscalationNotice } from "./stranded-notice.js";
 import { settleUnansweredPersonMessage, unansweredPersonMessageCommentCondition,
   UNANSWERED_MESSAGE_TEXT as NOT_ANSWERED, UNANSWERED_MESSAGE_NO_RUN_TEXT as NO_RUN,
-  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING } from "./unanswered-person-message.js";
+  UNANSWERED_MESSAGE_NO_REPLY_TEXT as NO_REPLY, UNANSWERED_MESSAGE_WAITING_TEXT as WAITING,
+  PENDING_WAIT_ACTION, PENDING_WAIT_BOUND_MS, PENDING_WAIT_START_BOUND_MS } from "./unanswered-person-message.js";
 
 // C9 (Smarty fork): a person's message that nothing answers gets exactly ONE
 // visible notice from the stranded sweep, in plain words, with the code in the
@@ -752,6 +753,108 @@ describe.skipIf(!support.supported)("unanswered person message notice (C9, the s
   const queueWake = (f: { companyId: string; agentId: string; issueId: string }, payload: Record<string, unknown>) =>
     db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "automation",
       reason: "issue_continuation_needed", status: "queued", payload }).returning().then(rows => rows[0]!);
+
+  // Keep: S10-1, gate 3, 2026-11-17: Stop cancelled 6a1cdfa9; the next
+  // message's 6558f709 wake waited on remote_cleanup, then 0a65c27c answered.
+  // The sweep falsely said "no run started" while that attempt was pending.
+  async function stoppedMessageWithWait(status: string, executionWait: unknown) {
+    const f = await fixture();
+    await f.run({ commentId: await f.message("Before Stop"), status: "cancelled", errorCode: "cancelled" });
+    const commentId = await f.message("After Stop, please continue.");
+    const now = new Date();
+    const createdAt = new Date(now.getTime() - 120_000);
+    await db.update(issueComments).set({ createdAt }).where(eq(issueComments.id, commentId));
+    const payload = { issueId: f.issueId, commentId, executionWait };
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "on_demand", reason: "issue_execution_deferred", requestedByActorType: "user",
+      requestedByActorId: f.userId, status, payload, createdAt, updatedAt: createdAt }).returning();
+    return { ...f, commentId, wakeId: wake!.id, now };
+  }
+
+  it.each(["deferred", "deferred_issue_execution"])(
+    "waitnote S10-1: %s remote_cleanup after Stop stays pending, then its completed wake's run answers without a resend notice", async status => {
+      const f = await stoppedMessageWithWait(status, { reason: "remote_cleanup",
+        message: "Waiting for the previous environment to stop. Your message will start automatically.", recoveryActionId: null });
+      // The production sweep entry, not just its decision helper, must be quiet
+      // at message +2 min (the original false-notice time).
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
+      const [waiting] = await f.visible();
+      expect(waiting?.body).toBe(WAITING);
+      expect(waiting?.presentation).toMatchObject({ title: "Your message is waiting to start" });
+      expect(codeOf(waiting!)).toBeUndefined();
+      await settleAt(f, 5 * 60_000);
+      expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+      f.at(15 * 60_000); // the later run/reply are after the saved message
+      const runId = await f.run({ commentId: f.commentId, status: "running" });
+      await db.update(agentWakeupRequests).set({ status: "completed", runId, finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, f.wakeId));
+      await settleAt(f, 6 * 60_000);
+      expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      await f.reply(runId);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(0);
+      const history = await db.select().from(issueComments).where(and(eq(issueComments.issueId, f.issueId), eq(issueComments.authorType, "system")));
+      expect(history.map(note => note.body)).toEqual([WAITING]);
+      expect(history[0]!.deletedAt).not.toBeNull();
+    });
+
+  it("waitnote: execution_recovery uses the existing start bound and upgrades the SAME waiting note after it", async () => {
+    const f = await stoppedMessageWithWait("deferred_issue_execution", { reason: "execution_recovery", message: "Recovery will retry automatically." });
+    await f.sweep();
+    expect(await f.visible()).toHaveLength(0);
+    await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
+    const [waiting] = await f.visible();
+    expect(waiting?.body).toBe(WAITING);
+    await settleAt(f, PENDING_WAIT_START_BOUND_MS - 1_000);
+    expect((await f.visible()).map(note => note.body)).toEqual([WAITING]);
+    await settleAt(f, PENDING_WAIT_START_BOUND_MS + 1_000);
+    const notes = await f.visible();
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.id).toBe(waiting!.id);
+    expect(notes[0]!.body).toBe(NO_RUN);
+    expect(codeOf(notes[0]!)).toBe("no_run");
+    await settleAt(f, PENDING_WAIT_START_BOUND_MS + 60_000);
+    expect(await f.visible()).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, PENDING_WAIT_ACTION))))
+      .toHaveLength(1);
+  });
+
+  it.each(["deferred", "deferred_issue_execution"].flatMap(status =>
+    [undefined, null, "remote_cleanup", {}, { reason: "remote_cleanup" },
+      { reason: " ", message: "Waiting" }, { reason: "remote_cleanup", message: false },
+      [{ reason: "remote_cleanup", message: "Waiting" }]].map(executionWait => ({ status, executionWait }))))(
+    "waitnote guard: malformed or missing wait retains today's behaviour (%j)", async ({ status, executionWait }) => {
+      const f = await stoppedMessageWithWait(status, executionWait);
+      await f.sweep();
+      expect(await f.visible()).toHaveLength(status === "deferred" ? 1 : 0); // unchanged initial pending grace
+      await settleAt(f, PENDING_WAIT_BOUND_MS + 1_000);
+      const notes = await f.visible();
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toBe(NO_RUN);
+    });
+
+  it("waitnote guard: an unrelated deferred wait and a coalesced receipt alone do not silence a failed message", async () => {
+    const f = await fixture();
+    const commentId = await f.message();
+    await f.run({ commentId, status: "failed", errorCode: "adapter_failed" });
+    for (const [status, carriedId] of [["deferred", randomUUID()], ["coalesced", commentId]]) {
+      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId, source: "on_demand",
+        status, payload: { issueId: f.issueId, commentId: carriedId,
+          executionWait: { reason: "remote_cleanup", message: "Waiting" } } });
+    }
+    await f.sweep();
+    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+  });
+
+  it("waitnote guard: a failed run with no deferred wake still gets its resend notice", async () => {
+    const f = await fixture();
+    await f.run({ commentId: await f.message(), status: "failed", errorCode: "adapter_failed" });
+    await f.sweep();
+    expect((await f.visible()).map(note => note.body)).toEqual([NOT_ANSWERED]);
+  });
 
   it("M1.1 (1): a queued wake carrying the issue that never runs -> no notice inside the bound, exactly one after it", async () => {
     const f = await fixture();
