@@ -159,6 +159,22 @@ export function userStopBoundaryAt(run: Pick<Run, "status" | "finishedAt" | "res
   return Number.isFinite(requestedAt.getTime()) && requestedAt < run.finishedAt ? requestedAt : run.finishedAt;
 }
 
+/** A saved queue's Send receipt that a user recorded after a Stop. Input queued
+ * before the Stop is not a new direction on its own; that user's later Send of
+ * the queue is. Only the board queue route writes the receipt, so the dispatch
+ * fallback carries it under its own key, which wake callers can never supply. */
+export const QUEUED_SEND_AFTER_STOP_KEY = "queuedCommentSentAfterStop";
+
+export function queuedSendAfterStop(payloadValue: unknown, input: { stoppedAt: Date; actorId: string | null; key?: string }) {
+  const payload = payloadValue && typeof payloadValue === "object" ? payloadValue as Record<string, unknown> : {};
+  const raw = payload[input.key ?? "queuedCommentInterrupt"];
+  const intent = raw && typeof raw === "object" ? raw as Record<string, unknown> : {};
+  const sentAt = typeof intent.requestedAt === "string" ? new Date(intent.requestedAt) : null;
+  if (!input.actorId || intent.actorId !== input.actorId || !sentAt || !Number.isFinite(sentAt.getTime()) ||
+      sentAt <= input.stoppedAt) return null;
+  return { actorId: input.actorId, requestedAt: sentAt.toISOString() };
+}
+
 export function isUnexpectedRunCancellation(run: Run): boolean {
   const bootstrap = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   return run.status === "cancelled" && Boolean(run.startedAt) &&

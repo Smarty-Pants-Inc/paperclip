@@ -1,5 +1,6 @@
 import { assertAgentLifecycleAuthority, lockAgentLifecycleAuthority } from "../agent-subtree-management.js";
 import { createAgentLifecycle } from "../agent-lifecycle.js";
+import { QUEUED_SEND_AFTER_STOP_KEY } from "../run-cancellation.js";
 import { QUEUED_MESSAGES_DELIVERED_REASON } from "../../modules/wake-queue/index.js";
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
@@ -2712,6 +2713,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
       delete payload.taskRetry;
+      delete payload[QUEUED_SEND_AFTER_STOP_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
