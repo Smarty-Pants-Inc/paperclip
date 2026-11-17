@@ -7864,7 +7864,16 @@ export function issueRoutes(
           ?? (await getNativeSessionSteeringState(steering.steeringRunId)
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
-    const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    let wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
+    // pl/no-default-wait heal: an ownerless default execution_recovery wait (no
+    // recovery action named, no execution blocker, no recovery action on the
+    // task) owns nothing; it must not hide the person's Stop line with Send.
+    // The saved JSON is kept; only this view ignores it.
+    if (wait.reason === "execution_recovery" && wait.recoveryActionId == null && input.issue.conversationAgentId &&
+        !(await getExecutionBlocker(input.executor as Db, input.issue.companyId, input.issue.id)) &&
+        !(await input.executor.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+          eq(issueRecoveryActions.companyId, input.issue.companyId), eq(issueRecoveryActions.sourceIssueId, input.issue.id),
+        )).limit(1)).length) wait = {};
     // The user's Interrupt click is delivering these messages. Its stopped run
     // settling is not something to read about under the composer; the task
     // notice owns any wait that needs the user.
