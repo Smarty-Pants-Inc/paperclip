@@ -464,6 +464,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     if (row.location !== "local" && target?.kind !== "remote") {
       // A missing controller cache is not the remote directory. Retain the
       // pending save until its exact remote collector or destruction proof exists.
+      if (agentFileSaveHeld(row)) return retryHeldSave(row);
       return patch(row, { ...(stopped ? { state: "pending_collection", processStoppedAt: row.processStoppedAt ?? new Date() } : {}),
         errorCode: "INSTRUCTION_REMOTE_COLLECTOR_UNAVAILABLE", errorMessage: "The remote agent directory is retained; its collector is unavailable. No save or discard is claimed.",
         nextAttemptAt: stopped ? new Date(Date.now() + 30_000) : null });
@@ -505,6 +506,11 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // (no release, no lease destruction) and retry the save durably.
     return holdUnsaved(row, storageLimit ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED", failure,
       storageLimit ? agentStorageWarning(failure instanceof AgentFileLimitError ? failure.message : "Agent folder exceeds a storage limit") : null);
+  }
+  function retryHeldSave(row: Copy) {
+    const since = (row.receipt?.savePending as { since?: string } | undefined)?.since;
+    return patch(row, { errorMessage: AGENT_FILES_SAVE_PENDING_INSTRUCTION,
+      nextAttemptAt: saveRetryAt(typeof since === "string" ? new Date(since) : row.processStoppedAt ?? row.createdAt) });
   }
   function holdUnsaved(row: Copy, errorCode: string, failure: unknown, storageWarning: string | null, mirrorHash?: string) {
     const stoppedAt = row.processStoppedAt ?? new Date();
@@ -713,6 +719,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     const destroyed = lease && hasRemoteTerminationReceipt(lease)
       && (lease.metadata?.remoteExecutionTermination as { state?: string } | undefined)?.state === "destroyed";
     if (!destroyed) {
+      if (agentFileSaveHeld(row)) return retryHeldSave(row);
       // execute (including bypassSession) may restart a stopped sandbox. Keep
       // the only remaining bytes; a stop receipt is not a destruction receipt.
       return patch(row, { state: "pending_collection", errorCode: lease ? "INSTRUCTION_STOPPED_REMOTE_COLLECTION_PENDING" : "INSTRUCTION_REMOTE_LEASE_UNVERIFIED",

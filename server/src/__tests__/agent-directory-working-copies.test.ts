@@ -977,6 +977,24 @@ describe("persistent agent directories", () => {
       await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
     }, 60_000);
 
+    it("old warm-remote hold without collector keeps its backoff and one instruction", async () => {
+      const { copy, held } = await holdUnsavedNote(true, "quota");
+      const environmentId = randomUUID(), leaseId = randomUUID(), remoteCwd = "/fixture/old-hold";
+      await db.insert(environments).values({ id: environmentId, name: environmentId, driver: "sandbox" });
+      await db.insert(environmentLeases).values({ id: leaseId, companyId, environmentId, heartbeatRunId: copy.runId,
+        provider: "boat", providerLeaseId: leaseId, status: "released", releasedAt: new Date(), metadata: { remoteCwd } });
+      await db.update(agentInstructionWorkingCopies).set({ location: `remote:${environmentId}`,
+        executionRoot: path.posix.join(remoteCwd, ".paperclip-runtime", "agent-files", agentId, copy.runId),
+        receipt: { ...held.receipt, cleanup: { leaseId, remoteCwd }, savePending: { ...(held.receipt?.savePending as object),
+          since: new Date(Date.now() - 48 * 3600_000).toISOString() } } }).where(eq(agentInstructionWorkingCopies.runId, copy.runId));
+      const before = Date.now();
+      const retry = (await copies.collectStopped({ companyId, runId: copy.runId }))!;
+      expect(retry.errorMessage).toBe(AGENT_FILES_SAVE_PENDING_INSTRUCTION);
+      expect(retry.nextAttemptAt!.getTime() - before).toBeGreaterThanOrEqual(6 * 3600_000);
+      expect(agentFileSaveHeld(retry)).toBe(true);
+      expect(await fs.readFile(path.join(copy.localRoot, "unsaved-note.txt"), "utf8")).toContain("unsaved note");
+    });
+
     it("a held save does not block the next message: the next run starts from canonical and the instruction stays visible", async () => {
       const { copy, note } = await holdUnsavedNote(false, "apply");
       const next = await run();
