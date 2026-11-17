@@ -3,6 +3,7 @@ import { notifyDeferredExecutionWork, notifyDeferredWakesForIssue } from "../../
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
 import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
+import { isWellFormedExecutionWait, UNNAMED_EXECUTION_WAIT } from "../../../services/deferred-execution-wait.js";
 import { isAgentDirectoryPreparationWait } from "../../../services/pre-dispatch-execution-evidence.js";
 import { isUserCommentContinuationReason } from "../../../services/explicit-native-continuation.js";
 import { queuedCommentIdsFromRunContext, withQueuedCommentIdsInRunContext, withQueuedCommentIdsInWakePayload } from "../../../services/issue-queued-comment-queue.js";
@@ -232,6 +233,19 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
     issueId: readNonEmptyString(parseObject(run.contextSnapshot).issueId),
     previousStatus,
   };
+}
+
+/**
+ * The wait a verified pre-dispatch restore saves on a held user message. A
+ * more specific wait already saved on that receipt (a person's Stop, remote
+ * cleanup, an interrupt handoff) keeps its reason and message; the generic
+ * recovery wait is used only when no gate named one.
+ */
+export function preDispatchRestoreWait(runWait: Record<string, unknown>, ...savedWaits: unknown[]) {
+  const named = savedWaits.find((wait): wait is { reason: string; message: string } => isWellFormedExecutionWait(wait) &&
+    wait.reason !== UNNAMED_EXECUTION_WAIT.reason && wait.message.trim().length > 0);
+  const wait = named ?? UNNAMED_EXECUTION_WAIT;
+  return { ...runWait, reason: wait.reason, message: wait.message };
 }
 
 export function createPostgresRunDispatchAdapter(
@@ -1190,8 +1204,8 @@ export function createPostgresRunDispatchAdapter(
     const [deferred] = await tx.update(agentWakeupRequests).set({
       status: "deferred_issue_execution", runId: null, claimedAt: null, finishedAt: null, error: null,
       payload: withQueuedCommentIdsInWakePayload({ ...payload, _paperclipWakeContext: context,
-        executionWait: { ...parseObject(run.resultJson?.executionWait), reason: "execution_recovery",
-          message: "Waiting for execution recovery. Your message is saved." } }, commentIds), updatedAt: now,
+        executionWait: preDispatchRestoreWait(parseObject(run.resultJson?.executionWait),
+          payload.executionWait, parseObject(ownWake.payload).executionWait) }, commentIds), updatedAt: now,
     }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, run.companyId),
       eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.runId, receiptRunId),
       inArray(agentWakeupRequests.status, origin ? ["cancelled", "skipped"] : ["queued", "claimed"])))

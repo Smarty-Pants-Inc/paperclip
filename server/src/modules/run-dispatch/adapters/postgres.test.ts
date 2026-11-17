@@ -35,7 +35,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../../../__tests__/helpers/embedded-postgres.js";
-import { createPostgresRunDispatchAdapter } from "./postgres.js";
+import { createPostgresRunDispatchAdapter, preDispatchRestoreWait } from "./postgres.js";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { projectTaskInterruption } from "../../../services/task-interruption-presentation.js";
@@ -1725,4 +1725,27 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId: null, agentId: null });
   });
 
+});
+
+// S027: the verified pre-dispatch restore is the third writer of a held
+// message's wait. It keeps a more specific saved wait (a person's Stop, remote
+// cleanup, an interrupt handoff); the generic recovery wait is only the default.
+describe("preDispatchRestoreWait (S027)", () => {
+  const runWait = { issueId: "issue-1", recoveryActionId: "action-1", reason: "execution_recovery" };
+  it.each([
+    { reason: "stopped_by_person", message: "Stopped. These messages are waiting: Send them, or delete any first." },
+    { reason: "remote_cleanup", message: "Waiting for the previous environment to stop. Your message will start automatically." },
+    { reason: "interrupt_handoff", message: "Sending your messages." },
+  ])("keeps a saved $reason wait and its message", saved => {
+    expect(preDispatchRestoreWait(runWait, saved)).toEqual({ ...runWait, ...saved });
+    // A retry's own receipt can carry the saved wait when the user receipt has none.
+    expect(preDispatchRestoreWait(runWait, undefined, saved)).toEqual({ ...runWait, ...saved });
+  });
+  it.each([undefined, null, "remote_cleanup", {}, { reason: " ", message: "Waiting" }, { reason: "remote_cleanup" },
+    { reason: "remote_cleanup", message: " " },
+    { reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." }])(
+    "uses the generic recovery wait when no gate named one (%j)", saved => {
+      expect(preDispatchRestoreWait(runWait, saved)).toEqual({ ...runWait,
+        reason: "execution_recovery", message: "Waiting for execution recovery. Your message is saved." });
+    });
 });
