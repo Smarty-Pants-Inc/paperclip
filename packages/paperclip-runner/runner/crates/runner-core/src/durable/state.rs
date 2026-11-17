@@ -4656,6 +4656,37 @@ mod tests {
             .ends_with("…[truncated]"));
     }
 
+    // C4 (pack-n5): at the production frame (paperclip-runnerd default 1 MiB)
+    // a 40,000-character final answer leaves the outbox whole.
+    #[test]
+    fn c4_final_answer_of_40000_characters_leaves_the_outbox_whole() {
+        let mut frame = config(PathBuf::from("unused"));
+        frame.max_frame_bytes = 1024 * 1024;
+        frame.max_outbox_bytes = 4 * 1024 * 1024;
+        let unit = "Line \"quoted\" 🦀 naïve\n";
+        let answer: String = unit
+            .repeat(40_000 / unit.chars().count() + 1)
+            .chars()
+            .take(40_000)
+            .collect();
+        let mut state = DurableState::new(&frame);
+        state
+            .enqueue_event(
+                &frame,
+                "item.completed",
+                EventPriority::P1,
+                json!({"kind": "agentMessage", "channel": "final", "text": answer}),
+            )
+            .unwrap();
+        let text = state.outbox[0]
+            .envelope
+            .pointer("/payload/payload/text")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_owned();
+        assert_eq!(text.as_bytes(), answer.as_bytes());
+    }
+
     #[test]
     fn final_answer_frame_check_counts_json_escaping_and_hex_encoding() {
         let mut frame = config(PathBuf::from("unused"));
