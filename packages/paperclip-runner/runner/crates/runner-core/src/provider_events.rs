@@ -1678,10 +1678,10 @@ pub(crate) fn normalize_pi_notification_in(
     // retaining redaction and the durable outbox's unchanged frame guard.
     let streamed = match method {
         "item/agentMessage/delta" => Some(("agentMessage", "progress", params.get("delta"))),
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-            Some(("reasoning", "summary", params.get("delta")))
-        }
-        // Retain the older Pi facade's generic reasoning/answer delta shape.
+        "item/reasoning/summaryTextDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        "item/reasoning/textDelta" => Some(("reasoning", "summary", params.get("delta"))),
+        // Older Pi facades forward reasoning item.delta as item/delta. Keep
+        // accepting that wire shape alongside the current textDelta method.
         "item/delta" => match string(params.get("kind").or_else(|| item(params).get("type"))) {
             "agentMessage" => Some((
                 "agentMessage",
