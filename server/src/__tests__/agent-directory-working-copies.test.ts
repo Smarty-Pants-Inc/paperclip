@@ -3,6 +3,7 @@ import { queueGitExclusionNextTry } from "./helpers/git-exclusion-next-try.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
 import * as fileStoreModule from "../services/agent-file-store.js";
+import * as fileCheckpoints from "../services/agent-file-checkpoints.js";
 import * as instructionAuthorization from "../services/agent-instruction-authorization.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
@@ -33,11 +34,11 @@ import { buildNativeModelEnvelope } from "../vendor/paperclip-runner/index.js";
 import type { EnvironmentRuntimeService } from "../services/environment-runtime.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
 import { createReusableLeaseHandoff } from "../services/environment-lease-handoff.js";
-import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld } from "../services/agent-directory-working-copies.js";
+import { AGENT_FILES_SAVE_PENDING_INSTRUCTION, AgentDirectoryReuseInvalidatedError, agentDirectoryWorkingCopyService, agentFileSaveHeld, applyWarmNotesProgram } from "../services/agent-directory-working-copies.js";
 import { agentFileSaveHeldOnLease } from "../services/agent-file-save-hold.js";
 import { collectStoppedInstructionCopyWithRetries } from "../services/agent-instruction-working-copies.js";
 import { HttpError } from "../errors.js";
-import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
+import { withDirectoryMergeLock, directorySnapshotSha256 } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { heartbeatRunEvents } from "@paperclipai/db";
 import { agentFileRoots } from "@paperclipai/db";
 import * as storageModule from "../storage/index.js";
@@ -650,6 +651,116 @@ describe("persistent agent directories", () => {
         expect(await onDisk(root)).toEqual([...before, note, "memory/2026-11-17-chat-a.md"].sort());
         expect(await fs.readFile(path.join(root, note), "utf8")).toContain("NOTE-FACT");
       }, 30_000);
+
+      // Data-safety guards: exercise the real remote capture, subset upload and
+      // rename program, not a mocked manifest or a source-text assertion.
+      it("REMOTE sandbox never-OK: delete propagation delivers A' and removes B before the canonical post-check", async () => {
+        await paulBundle();
+        const a = "memory/notes-a.md", b = "memory/notes-b.md";
+        await fs.writeFile(path.join(root, a), "A\n");
+        await fs.writeFile(path.join(root, b), "B\n");
+        const boat = await sandbox();
+        const chatA = await boat.prepare({ warm: true });
+        expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+        expect(await fs.readFile(path.join(chatA.executionRoot, a), "utf8")).toBe("A\n");
+        expect(await fs.readFile(path.join(chatA.executionRoot, b), "utf8")).toBe("B\n");
+        const sibling = await boat.prepare();
+        await fs.writeFile(path.join(sibling.executionRoot, a), "A'\n");
+        await fs.unlink(path.join(sibling.executionRoot, b));
+        expect((await copies.collectStopped({ companyId, runId: sibling.runId, target: boat.executionTarget }))?.state).toBe("saved");
+        expect(await fs.readFile(path.join(root, a), "utf8")).toBe("A'\n");
+        await expect(fs.stat(path.join(root, b))).rejects.toMatchObject({ code: "ENOENT" });
+
+        const capture = vi.spyOn(fileCheckpoints, "captureAgentFileCheckpoint");
+        const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+        const stagedPaths: string[][] = [];
+        const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+          if (input.adapterKey.startsWith("agent-notes-")) stagedPaths.push(await onDisk(input.assets![0]!.localDir));
+          return actualUpload(input);
+        });
+        try {
+          const turn2 = await boat.prepare({ warm: true, reuseRunId: chatA.runId });
+          expect(turn2.executionRoot).toBe(chatA.executionRoot);
+          expect(await fs.readFile(path.join(turn2.executionRoot, a), "utf8")).toBe("A'\n");
+          await expect(fs.stat(path.join(turn2.executionRoot, b))).rejects.toMatchObject({ code: "ENOENT" });
+          const deliveries = upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"));
+          expect(deliveries).toHaveLength(1);
+          expect(stagedPaths).toEqual([[a]]);
+          const captures = capture.mock.calls.flatMap(([input], index) => input.runId === chatA.runId ? [capture.mock.results[index]!.value] : []);
+          expect(captures).toHaveLength(2);
+          const verified = await captures[1]!;
+          const canonical = fileCheckpoints.checkpointSnapshot(await fileCheckpoints.cachedAgentFileManifest(root));
+          expect(fileCheckpoints.checkpointSnapshot(verified.manifest)).toEqual(canonical);
+          expect(turn2.baseHash).toBe(directorySnapshotSha256(canonical));
+        } finally { capture.mockRestore(); upload.mockRestore(); }
+      }, 90_000);
+
+      it("REMOTE sandbox never-OK: two writers never touch one file; dirty and mid-delivery writes survive retirement", async () => {
+        await paulBundle();
+        const f = "memory/warm-writer.md";
+        const bytes = Buffer.concat([Buffer.from("warm writer\r\n☃\n"), Buffer.from([0, 255, 127])]);
+        for (const timing of ["after-checkpoint", "between-capture-and-rename", "same-file-between-capture-and-rename"] as const) {
+          await fs.writeFile(path.join(root, f), "checkpoint baseline\n");
+          const boat = await sandbox();
+          const chatA = await boat.prepare({ warm: true });
+          expect((await copies.checkpointWarm({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("warm_saved");
+          if (timing === "after-checkpoint") await fs.writeFile(path.join(chatA.executionRoot, f), bytes);
+          await boat.siblingSavesRemote(note, `sibling ${timing}\n`);
+          // Check both disjoint and overlapping writes. Only a disjoint-file
+          // race would miss a rename overwriting F before the post-capture.
+          if (timing !== "between-capture-and-rename") await boat.siblingSavesRemote(f, `sibling F ${timing}\n`);
+          const actualUpload = executionTargetTools.prepareAdapterExecutionTargetRuntime;
+          const capture = vi.spyOn(fileCheckpoints, "captureAgentFileCheckpoint");
+          let raced = false;
+          const upload = vi.spyOn(executionTargetTools, "prepareAdapterExecutionTargetRuntime").mockImplementation(async input => {
+            if (input.adapterKey.startsWith("agent-notes-") && timing !== "after-checkpoint") {
+              expect(capture.mock.calls.filter(([input]) => input.runId === chatA.runId)).toHaveLength(1);
+              await fs.writeFile(path.join(chatA.executionRoot, f), bytes);
+              raced = true;
+            }
+            return actualUpload(input);
+          });
+          const shell = vi.spyOn(executionTargetTools, "runAdapterExecutionTargetShellCommand");
+          const runId = await nextRun();
+          try {
+            let handoffError: unknown;
+            await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true, reuseRunId: chatA.runId })
+              .catch(error => { handoffError = error; });
+            expect({ bytes: await fs.readFile(path.join(chatA.executionRoot, f)), refused: handoffError instanceof AgentDirectoryReuseInvalidatedError },
+              `${timing}: never overwrite the warm writer's bytes or accept a raced handoff`).toEqual({ bytes, refused: true });
+            expect(handoffError).toBeInstanceOf(AgentDirectoryReuseInvalidatedError);
+            expect((handoffError as Error).message).toBe(timing === "after-checkpoint" ? "Warm agent directory changed after its checkpoint" : "Warm agent directory note refresh could not be verified");
+            const deliveries = upload.mock.calls.filter(([input]) => input.adapterKey.startsWith("agent-notes-"));
+            const renames = shell.mock.calls.filter(([, , command]) => command.includes(applyWarmNotesProgram));
+            expect(deliveries).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
+            expect(renames).toHaveLength(timing === "after-checkpoint" ? 0 : 1);
+            expect(raced).toBe(timing !== "after-checkpoint");
+            const captures = capture.mock.calls.flatMap(([input], index) => input.runId === chatA.runId ? [capture.mock.results[index]!.value] : []);
+            expect(captures).toHaveLength(timing === "after-checkpoint" ? 1 : 2);
+            const observed = fileCheckpoints.checkpointSnapshot((await captures[0]!).manifest);
+            expect(directorySnapshotSha256(observed) === chatA.baseHash).toBe(timing !== "after-checkpoint");
+            if (timing !== "after-checkpoint") {
+              const verified = fileCheckpoints.checkpointSnapshot((await captures[1]!).manifest);
+              const canonical = fileCheckpoints.checkpointSnapshot(await fileCheckpoints.cachedAgentFileManifest(root));
+              expect(directorySnapshotSha256(verified)).not.toBe(directorySnapshotSha256(canonical));
+            }
+            if (timing === "after-checkpoint") {
+              await expect(fs.stat(path.join(chatA.executionRoot, note))).rejects.toMatchObject({ code: "ENOENT" });
+            }
+            expect(await copies.get(companyId, runId)).toBeNull();
+            expect((await copies.get(companyId, chatA.runId))?.state).toBe("warm_saved");
+            // The existing retirement contract: save the old owner FIRST, then
+            // restore this same proposed run fresh, after the handoff releases its lock.
+            expect((await copies.collectStopped({ companyId, runId: chatA.runId, target: boat.executionTarget }))?.state).toBe("saved");
+            expect(await fs.readFile(path.join(root, f))).toEqual(bytes);
+            const fresh = (await copies.prepare({ ...target(), runId, cwd: home, target: boat.executionTarget, warm: true }))!;
+            expect(fresh.executionRoot).not.toBe(chatA.executionRoot);
+            expect(await fs.readFile(path.join(fresh.executionRoot, f))).toEqual(bytes);
+            expect(await fs.readFile(path.join(fresh.executionRoot, note), "utf8")).toBe(`sibling ${timing}\n`);
+            await copies.collectStopped({ companyId, runId, target: boat.executionTarget });
+          } finally { capture.mockRestore(); upload.mockRestore(); shell.mockRestore(); }
+        }
+      }, 90_000);
 
       it("REMOTE sandbox never-OK: chat A's unsynced write survives a sibling note (no refresh over a dirty tree)", async () => {
         await paulBundle();
